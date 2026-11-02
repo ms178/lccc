@@ -1,0 +1,73 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "lz4_match_extend",
+    "nbody"
+  ],
+  "results": {
+    "nbody": {
+      "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3567,
+          3567
+        ],
+        "d1_misses": [
+          1844,
+          1835
+        ],
+        "i1_misses": [
+          1391,
+          1387
+        ],
+        "indirect_mispredicts": [
+          202,
+          206
+        ],
+        "ir_mine": 611586,
+        "ir_ratio": 1.1841426579925651,
+        "ir_ref": 516480,
+        "ll_misses": [
+          2869,
+          2864
+        ]
+      },
+      "manifest": "/home/user/audit/callgrind/nbody/manifest.json"
+    },
+    "lz4_match_extend": {
+      "flags": "-std=gnu17 -O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          8303,
+          8351
+        ],
+        "d1_misses": [
+          14044,
+          14036
+        ],
+        "i1_misses": [
+          1337,
+          1339
+        ],
+        "indirect_mispredicts": [
+          214,
+          221
+        ],
+        "ir_mine": 1068469,
+        "ir_ratio": 1.157893082783359,
+        "ir_ref": 922770,
+        "ll_misses": [
+          4264,
+          4264
+        ]
+      },
+      "manifest": "/home/user/audit/callgrind/lz4_match_extend/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "nbody",
+    "lz4_match_extend"
+  ]
+}

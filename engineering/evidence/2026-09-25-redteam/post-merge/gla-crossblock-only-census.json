@@ -1,0 +1,423 @@
+{
+  "env": {
+    "CCC_GLA_SPILL_GAPS": "1"
+  },
+  "flags": [
+    "-O2",
+    "-march=x86-64-v3"
+  ],
+  "total_a": {
+    "insns": 7527,
+    "rrmov": 779,
+    "stkref": 661,
+    "push": 268,
+    "acc": 1
+  },
+  "total_b": {
+    "insns": 7630,
+    "rrmov": 780,
+    "stkref": 761,
+    "push": 266,
+    "acc": 1
+  },
+  "skipped": [],
+  "functions": [
+    {
+      "file": "i686_alu_chains.c",
+      "fn": "main",
+      "a": {
+        "insns": 193,
+        "rrmov": 12,
+        "stkref": 75,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 190,
+        "rrmov": 10,
+        "stkref": 69,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "sqlite_varint.c",
+      "fn": "main",
+      "a": {
+        "insns": 69,
+        "rrmov": 6,
+        "stkref": 9,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 64,
+        "rrmov": 6,
+        "stkref": 6,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "i686_alu_chains.c",
+      "fn": "k_digits",
+      "a": {
+        "insns": 34,
+        "rrmov": 8,
+        "stkref": 0,
+        "push": 3,
+        "acc": 0
+      },
+      "b": {
+        "insns": 30,
+        "rrmov": 8,
+        "stkref": 0,
+        "push": 1,
+        "acc": 0
+      }
+    },
+    {
+      "file": "matmul.c",
+      "fn": "main",
+      "a": {
+        "insns": 40,
+        "rrmov": 2,
+        "stkref": 2,
+        "push": 0,
+        "acc": 0
+      },
+      "b": {
+        "insns": 39,
+        "rrmov": 2,
+        "stkref": 2,
+        "push": 0,
+        "acc": 0
+      }
+    },
+    {
+      "file": "double_reduction.c",
+      "fn": "main",
+      "a": {
+        "insns": 135,
+        "rrmov": 7,
+        "stkref": 7,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 136,
+        "rrmov": 7,
+        "stkref": 8,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "linux_rbtree.c",
+      "fn": "main",
+      "a": {
+        "insns": 237,
+        "rrmov": 26,
+        "stkref": 10,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 238,
+        "rrmov": 26,
+        "stkref": 11,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "matmul.c",
+      "fn": "matmul",
+      "a": {
+        "insns": 84,
+        "rrmov": 6,
+        "stkref": 4,
+        "push": 5,
+        "acc": 0
+      },
+      "b": {
+        "insns": 85,
+        "rrmov": 6,
+        "stkref": 5,
+        "push": 5,
+        "acc": 0
+      }
+    },
+    {
+      "file": "moving_stats.c",
+      "fn": "main",
+      "a": {
+        "insns": 222,
+        "rrmov": 35,
+        "stkref": 5,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 223,
+        "rrmov": 35,
+        "stkref": 6,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "spectral_norm.c",
+      "fn": "mul_AtAv",
+      "a": {
+        "insns": 236,
+        "rrmov": 21,
+        "stkref": 6,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 238,
+        "rrmov": 22,
+        "stkref": 7,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "zstd_count.c",
+      "fn": "main",
+      "a": {
+        "insns": 134,
+        "rrmov": 22,
+        "stkref": 8,
+        "push": 6,
+        "acc": 1
+      },
+      "b": {
+        "insns": 137,
+        "rrmov": 23,
+        "stkref": 10,
+        "push": 6,
+        "acc": 1
+      }
+    },
+    {
+      "file": "zlib_ng_adler32.c",
+      "fn": "main",
+      "a": {
+        "insns": 350,
+        "rrmov": 47,
+        "stkref": 32,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 352,
+        "rrmov": 45,
+        "stkref": 36,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "strlen_bench.c",
+      "fn": "main",
+      "a": {
+        "insns": 199,
+        "rrmov": 26,
+        "stkref": 19,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 202,
+        "rrmov": 24,
+        "stkref": 23,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "loop_patterns.c",
+      "fn": "main",
+      "a": {
+        "insns": 260,
+        "rrmov": 11,
+        "stkref": 7,
+        "push": 7,
+        "acc": 0
+      },
+      "b": {
+        "insns": 266,
+        "rrmov": 11,
+        "stkref": 13,
+        "push": 7,
+        "acc": 0
+      }
+    },
+    {
+      "file": "expat_xml_scan.c",
+      "fn": "main",
+      "a": {
+        "insns": 154,
+        "rrmov": 16,
+        "stkref": 17,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 161,
+        "rrmov": 22,
+        "stkref": 23,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "fir_filter.c",
+      "fn": "main",
+      "a": {
+        "insns": 106,
+        "rrmov": 6,
+        "stkref": 0,
+        "push": 0,
+        "acc": 0
+      },
+      "b": {
+        "insns": 113,
+        "rrmov": 4,
+        "stkref": 7,
+        "push": 0,
+        "acc": 0
+      }
+    },
+    {
+      "file": "fannkuch.c",
+      "fn": "main",
+      "a": {
+        "insns": 153,
+        "rrmov": 9,
+        "stkref": 7,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 161,
+        "rrmov": 8,
+        "stkref": 15,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "glibc_strstr.c",
+      "fn": "main",
+      "a": {
+        "insns": 194,
+        "rrmov": 25,
+        "stkref": 19,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 204,
+        "rrmov": 23,
+        "stkref": 31,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "lz4_compress.c",
+      "fn": "main",
+      "a": {
+        "insns": 250,
+        "rrmov": 36,
+        "stkref": 46,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 262,
+        "rrmov": 37,
+        "stkref": 60,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "conv_u8_3x3.c",
+      "fn": "main",
+      "a": {
+        "insns": 137,
+        "rrmov": 14,
+        "stkref": 4,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 160,
+        "rrmov": 15,
+        "stkref": 21,
+        "push": 6,
+        "acc": 0
+      }
+    },
+    {
+      "file": "nbody.c",
+      "fn": "main",
+      "a": {
+        "insns": 308,
+        "rrmov": 7,
+        "stkref": 31,
+        "push": 6,
+        "acc": 0
+      },
+      "b": {
+        "insns": 337,
+        "rrmov": 9,
+        "stkref": 55,
+        "push": 6,
+        "acc": 0
+      }
+    }
+  ],
+  "gate": {
+    "enabled": false,
+    "kernel_stkref_delta": 2,
+    "kernel_insns_delta": -1
+  },
+  "kernel_totals": {
+    "a": {
+      "insns": 354,
+      "rrmov": 35,
+      "stkref": 10,
+      "push": 14,
+      "acc": 0
+    },
+    "b": {
+      "insns": 353,
+      "rrmov": 36,
+      "stkref": 12,
+      "push": 12,
+      "acc": 0
+    }
+  },
+  "driver_totals": {
+    "a": {
+      "insns": 3141,
+      "rrmov": 307,
+      "stkref": 298,
+      "push": 91,
+      "acc": 1
+    },
+    "b": {
+      "insns": 3245,
+      "rrmov": 307,
+      "stkref": 396,
+      "push": 91,
+      "acc": 1
+    }
+  }
+}

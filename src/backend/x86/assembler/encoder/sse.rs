@@ -1,0 +1,1426 @@
+use super::*;
+
+impl super::InstructionEncoder {
+    // ---- SSE/SSE2 encoding helpers ----
+
+    /// Encode SSE instruction: load (xmm<-xmm/mem) or store (xmm->mem).
+    pub(crate) fn encode_sse_rr_rm(
+        &mut self,
+        ops: &[Operand],
+        load_opcode: &[u8],
+        store_opcode: &[u8],
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("SSE mov requires 2 operands".to_string());
+        }
+
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst))
+                if is_xmm(&src.name) && is_xmm(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                // `.s` on an SSE move selects the store-direction opcode
+                // with the roles kept in place (GAS 2.47: `movaps.s
+                // %xmm6,%xmm2' = 0f 29 e6, `movdqa.s %xmm6,%xmm2' =
+                // 66 0f 7f e6) — the store half of the load/store pair.
+                // `.s` picks the store row with the ROLES UNCHANGED:
+                // reg = data source, r/m = destination (GAS 2.47:
+                // `movaps.s %xmm4,%xmm6' = 0f 29 e6, `movsd.s %xmm4,%xmm6'
+                // = f2 0f 11 e6).  The load row keeps reg=dst, r/m=src.
+                let (opcode, reg_name, rm_name, reg_num_v, rm_num_v) = if self.s_flip {
+                    (store_opcode, &src.name, &dst.name, src_num, dst_num)
+                } else {
+                    (load_opcode, &dst.name, &src.name, dst_num, src_num)
+                };
+                // Emit mandatory prefix bytes (e.g. 0x66, 0xF2, 0xF3) before REX.
+                // The prefix ends where the 0x0F escape byte begins.
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_rr(0, reg_name, rm_name);
+                // Emit remaining opcode bytes (0x0F + opcode byte)
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, reg_num_v, rm_num_v));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = load_opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &load_opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_rm(0, &dst.name, mem);
+                self.bytes.extend_from_slice(&load_opcode[prefix_len..]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            (Operand::Register(src), Operand::Memory(mem)) if is_xmm(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let prefix_len = store_opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &store_opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_rm(0, &src.name, mem);
+                self.bytes.extend_from_slice(&store_opcode[prefix_len..]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported SSE mov operands".to_string()),
+        }
+    }
+
+    /// Encode a standard SSE operation: op xmm/mem, xmm
+    pub(crate) fn encode_sse_op(&mut self, ops: &[Operand], opcode: &[u8]) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("SSE op requires 2 operands".to_string());
+        }
+
+        // Check if operands are MMX registers - if so, skip the 0x66 prefix
+        let use_mmx = match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                is_mmx(&src.name) || is_mmx(&dst.name)
+            }
+            (Operand::Memory(_), Operand::Register(dst)) => is_mmx(&dst.name),
+            (Operand::Register(src), Operand::Memory(_)) => is_mmx(&src.name),
+            _ => false,
+        };
+
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                if use_mmx {
+                    if !is_mmx(&src.name) || !is_mmx(&dst.name) {
+                        return Err("mixed MMX/XMM operands are invalid".to_string());
+                    }
+                } else if !is_xmm(&src.name) || !is_xmm(&dst.name) {
+                    return Err("SSE operation requires XMM operands".to_string());
+                }
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                if use_mmx && self.apx_rex2 {
+                    // GAS 2.47: `{rex2}` on an MMX form emits the REX2
+                    // prefix and folds the 0F escape into its M bit
+                    // (`{rex2} pmullw %mm0,%mm6` = d5 80 d5 f0 — the MMX
+                    // registers are untouched by every REX2 bit, so the
+                    // prefix is carried verbatim rather than dropped).
+                    // fixup_rex2_map1 performs the 0F strip/M0 set.
+                    self.emit_rex2(false, false, false, false, false, false, false);
+                    self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    return Ok(());
+                }
+                if !use_mmx {
+                    for &b in &opcode[..prefix_len] {
+                        self.bytes.push(b);
+                    }
+                }
+                if !use_mmx {
+                    self.emit_rex_rr(0, &dst.name, &src.name);
+                }
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                if !use_mmx {
+                    for &b in &opcode[..prefix_len] {
+                        self.bytes.push(b);
+                    }
+                }
+                if use_mmx {
+                    // MMX has no extended register bank, but 64-bit addressing
+                    // still needs REX.X/REX.B for r8-r15 base/index registers.
+                    self.emit_rex_rm(0, "", mem);
+                } else {
+                    self.emit_rex_rm(0, &dst.name, mem);
+                }
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported SSE op operands".to_string()),
+        }
+    }
+
+    /// Encode a 0F 38-map SSE op (e.g. pmaddubsw, pshufb, pabsb).
+    pub(crate) fn encode_sse_op_38(&mut self, ops: &[Operand], op: u8) -> Result<(), String> {
+        self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, op])
+    }
+
+    pub(crate) fn encode_sse_store(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("SSE store requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Memory(mem))
+                if is_xmm(&src.name) || is_mmx(&src.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let use_mmx = is_mmx(&src.name);
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                if !use_mmx {
+                    for &b in &opcode[..prefix_len] {
+                        self.bytes.push(b);
+                    }
+                }
+                self.emit_rex_rm(0, &src.name, mem);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported SSE store operands".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_sse_op_imm8(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("SSE op+imm8 requires 3 operands".to_string());
+        }
+
+        let use_mmx = crate::backend::x86::assembler::encoder::check_legacy_simd_imm8(ops, opcode)?;
+
+        let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if !use_mmx {
+                    for &b in &opcode[..prefix_len] {
+                        self.bytes.push(b);
+                    }
+                    self.emit_rex_rr(0, &dst.name, &src.name);
+                }
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Memory(mem),
+                Operand::Register(dst),
+            ) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if !use_mmx {
+                    for &b in &opcode[..prefix_len] {
+                        self.bytes.push(b);
+                    }
+                }
+                self.emit_rex_rm(0, if use_mmx { "" } else { dst.name.as_str() }, mem);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.encode_modrm_mem_imm8(dst_num, mem, *imm as u8)
+            }
+            _ => Err(format!("unsupported SSE op+imm8 operands: {:?}", ops)),
+        }
+    }
+
+    pub(crate) fn encode_movd(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("movd requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            // GP -> MMX: 0F 6E /r (REX.W for an r64 source)
+            (Operand::Register(src), Operand::Register(dst))
+                if is_mmx(&dst.name) && !is_mmx(&src.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let size = if is_reg64(&src.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x6E]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            // MMX -> GP: 0F 7E /r (REX.W for an r64 destination)
+            (Operand::Register(src), Operand::Register(dst))
+                if is_mmx(&src.name) && !is_mmx(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let size = if is_reg64(&dst.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &src.name, &dst.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                Ok(())
+            }
+            // mem -> MMX: 0F 6E /r
+            (Operand::Memory(mem), Operand::Register(dst)) if is_mmx(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.emit_rex_rm(0, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x6E]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            // MMX -> mem: 0F 7E /r
+            (Operand::Register(src), Operand::Memory(mem)) if is_mmx(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_rex_rm(0, &src.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            // GP -> XMM: 66 0F 6E /r (REX.W for an r64 source)
+            (Operand::Register(src), Operand::Register(dst))
+                if is_xmm(&dst.name) && !is_xmm(&src.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(0x66);
+                let size = if is_reg64(&src.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x6E]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            // XMM -> GP: 66 0F 7E /r (REX.W for an r64 destination)
+            (Operand::Register(src), Operand::Register(dst))
+                if is_xmm(&src.name) && !is_xmm(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(0x66);
+                let size = if is_reg64(&dst.name) { 8 } else { 0 };
+                self.emit_rex_rr(size, &src.name, &dst.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                Ok(())
+            }
+            // mem -> XMM: 66 0F 6E /r
+            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(0x66);
+                self.emit_rex_rm(0, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x6E]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            // XMM -> mem: 66 0F 7E /r
+            (Operand::Register(src), Operand::Memory(mem)) if is_xmm(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.bytes.push(0x66);
+                self.emit_rex_rm(0, &src.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported movd operands".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_movnti(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("movnti requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let size = if is_reg64(&src.name) { 8 } else { 4 };
+                self.emit_rex_rm(size, &src.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0xC3]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported movnti operands".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_movnti_q(&mut self, ops: &[Operand]) -> Result<(), String> {
+        // movntiq: 0F C3 /r with REX.W (always 64-bit)
+        if ops.len() != 2 {
+            return Err("movntiq requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Memory(mem)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.emit_rex_rm(8, &src.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0xC3]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported movntiq operands".to_string()),
+        }
+    }
+
+    /// Encode the 64-bit ADX forms (`adcxq`/`adoxq`).
+    ///
+    /// These are `<prefix> REX.W 0F 38 F6 /r`.  The mandatory prefix must come
+    /// BEFORE the REX byte, so the generic SSE path (which emits the whole
+    /// opcode array first) cannot be reused for the W=1 spelling.
+    pub(crate) fn encode_adx(
+        &mut self,
+        ops: &[Operand],
+        prefix: u8,
+        size: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("ADX requires 2 operands".to_string());
+        }
+        if self.apx_nf {
+            return Err("{nf} unsupported for `adcx'/`adox'".to_string());
+        }
+        // APX map-4: opcode 0x66 (not 0F38 F6); pp carries the 66/F3 distinction.
+        let use_evex = self.apx_wants_evex() || operands_have_egpr(ops);
+        let pp = if prefix == 0x66 { 1 } else { 2 };
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if use_evex {
+                    self.emit_apx_evex_rr_pp(size == 8, &dst.name, &src.name, None, false, pp)?;
+                    self.bytes.push(0x66);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    return Ok(());
+                }
+                self.bytes.push(prefix);
+                self.emit_rex_rr(size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF6]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if use_evex {
+                    self.emit_apx_evex_rm_pp(size == 8, &dst.name, mem, None, false, pp)?;
+                    self.bytes.push(0x66);
+                    return self.encode_modrm_mem(dst_num, mem);
+                }
+                self.bytes.push(prefix);
+                self.emit_rex_rm(size, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF6]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported ADX operands".to_string()),
+        }
+    }
+
+    /// Encode MOVBE (load/store with byte-order swap).
+    ///
+    /// `0F 38 F0 /r` moves memory to register, `0F 38 F1 /r` register to
+    /// memory.  There is no register-to-register form.  The 16-bit spelling
+    /// takes the 0x66 operand-size prefix ahead of any REX byte.
+    pub(crate) fn encode_movbe(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("movbe requires 2 operands".to_string());
+        }
+        if self.apx_nf {
+            return Err("{nf} unsupported for `movbe'".to_string());
+        }
+        // APX map-4 remaps 0F38 F0/F1 → 60/61; 16-bit uses EVEX.pp=66.
+        // The reg-reg form exists ONLY as APX EVEX (GAS 2.47 emits
+        // `62 f4 7c 08 60 d8` for `movbe %eax, %ebx` unconditionally).
+        let use_evex = self.apx_wants_evex() || operands_have_egpr(ops);
+        let pp = if size == 2 { 1 } else { 0 };
+        // GAS rejects vector/wrong-size registers ("operand type mismatch").
+        let gpr_ok = |name: &str| match size {
+            2 => is_reg16(name),
+            8 => is_reg64(name),
+            _ => is_reg32(name),
+        };
+        match (&ops[0], &ops[1]) {
+            (Operand::Memory(mem), Operand::Register(reg)) if gpr_ok(&reg.name) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                if use_evex {
+                    self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
+                    self.bytes.push(0x60);
+                    return self.encode_modrm_mem(num, mem);
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rm(size, &reg.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF0]);
+                self.encode_modrm_mem(num, mem)
+            }
+            (Operand::Register(reg), Operand::Memory(mem)) if gpr_ok(&reg.name) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                if use_evex {
+                    self.emit_apx_evex_rm_pp(size == 8, &reg.name, mem, None, false, pp)?;
+                    self.bytes.push(0x61);
+                    return self.encode_modrm_mem(num, mem);
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rm(size, &reg.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, 0xF1]);
+                self.encode_modrm_mem(num, mem)
+            }
+            // reg -> reg: APX-only (EVEX map-4 0x60, no legacy encoding).
+            (Operand::Register(src), Operand::Register(dst))
+                if gpr_ok(&src.name) && gpr_ok(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.emit_apx_evex_rr_pp(size == 8, &dst.name, &src.name, None, false, pp)?;
+                self.bytes.push(0x60);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            _ => Err("movbe requires one memory and one register operand".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_rdrand(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        opcode2: u8,
+        reg_ext: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("rdrand requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                let size = if mnemonic.ends_with('q') {
+                    8
+                } else if mnemonic.ends_with('l') {
+                    4
+                } else {
+                    infer_reg_size(&reg.name)
+                };
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_unary(size, &reg.name);
+                self.bytes.extend_from_slice(&[0x0F, opcode2]);
+                self.bytes.push(self.modrm(3, reg_ext, num));
+                Ok(())
+            }
+            _ => Err("rdrand requires register operand".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_sldt(&mut self, ops: &[Operand]) -> Result<(), String> {
+        // sldt %reg: 0F 00 /0
+        if ops.len() != 1 {
+            return Err("sldt requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                let size = infer_reg_size(&reg.name);
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                // SLDT never sets REX.W, even for a 64-bit dest (upper bits zero).
+                self.emit_rex_unary(4, &reg.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x00]);
+                self.bytes.push(self.modrm(3, 0, num));
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x00]);
+                self.encode_modrm_mem(0, mem)
+            }
+            _ => Err("unsupported sldt operand".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_str_insn(&mut self, ops: &[Operand]) -> Result<(), String> {
+        // str %reg: 0F 00 /1
+        if ops.len() != 1 {
+            return Err("str requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let num = reg_num(&reg.name).ok_or("bad register")?;
+                let size = infer_reg_size(&reg.name);
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_unary(4, &reg.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x00]);
+                self.bytes.push(self.modrm(3, 1, num));
+                Ok(())
+            }
+            _ => Err("unsupported str operand".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_sse_cvt_gp_to_xmm(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        gp_size: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("cvt requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                // Need REX.W for 64-bit source
+                self.emit_rex_rr(gp_size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            // Integer source may also come from memory: `cvtsi2sdl (%rdi),%xmm0`.
+            // The `l`/`q` suffix (not any register) decides REX.W here, which is
+            // exactly what the caller already passed in `gp_size`.
+            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_rm(gp_size, &dst.name, mem);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported cvt operands".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_sse_cvt_xmm_to_gp(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        gp_size: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("cvt requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) if is_xmm(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_rr(gp_size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            // Memory source: `cvttss2si (%rax),%eax` reads the 32-bit
+            // float from memory directly (GAS: f3 0f 2c 00); the 64-bit
+            // `cvttsd2siq` reads a double. GAS accepts the memory form
+            // for the whole cvt*-2si family and so do we.
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_rm(gp_size, &dst.name, mem);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported cvt operands".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_sse_shift(
+        &mut self,
+        ops: &[Operand],
+        reg_opcode: &[u8],
+        imm_ext: u8,
+        imm_opcode: &[u8],
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("SSE shift requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            // psll*/psrl*/psra* $imm8, %xmmN/%mmN
+            // XMM immediate forms use the 66 prefix; MMX immediate forms use the
+            // same opcode without 66.  GAS accepts both and FFmpeg uses both.
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(dst))
+                if is_xmm(&dst.name) || is_mmx(&dst.name) =>
+            {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let use_mmx = is_mmx(&dst.name);
+                let prefix_len = imm_opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                if !use_mmx {
+                    for &b in &imm_opcode[..prefix_len] {
+                        self.bytes.push(b);
+                    }
+                }
+                if !use_mmx {
+                    self.emit_rex_unary(4, &dst.name);
+                }
+                self.bytes.extend_from_slice(&imm_opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, imm_ext, dst_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            // psll*/psrl*/psra* %xmmM/%mmM, %xmmN/%mmN
+            (Operand::Register(src), Operand::Register(dst))
+                if (is_xmm(&src.name) && is_xmm(&dst.name))
+                    || (is_mmx(&src.name) && is_mmx(&dst.name)) =>
+            {
+                self.encode_sse_op(&[ops[0].clone(), ops[1].clone()], reg_opcode)
+            }
+            // psll*/psrl*/psra* mem, %xmmN/%mmN — used by FFmpeg GAS output.
+            (Operand::Memory(_), Operand::Register(dst))
+                if is_xmm(&dst.name) || is_mmx(&dst.name) =>
+            {
+                self.encode_sse_op(&[ops[0].clone(), ops[1].clone()], reg_opcode)
+            }
+            _ => Err(format!("unsupported SSE shift operands: {:?}", ops)),
+        }
+    }
+
+    pub(crate) fn encode_sse_shift_imm_only(
+        &mut self,
+        ops: &[Operand],
+        imm_ext: u8,
+        opcode: &[u8],
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("SSE shift requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            (Operand::Immediate(ImmediateValue::Integer(imm)), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                self.emit_rex_unary(4, &dst.name);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, imm_ext, dst_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported SSE shift operands".to_string()),
+        }
+    }
+
+    pub(crate) fn encode_sse_insert(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        rex_w: bool,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("pinsrX requires 3 operands".to_string());
+        }
+        // pinsrX $imm, r/m, xmm
+        let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                let size = if rex_w { 8 } else { 0 };
+                self.emit_rex_rr(size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Memory(mem),
+                Operand::Register(dst),
+            ) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                let size = if rex_w { 8 } else { 0 };
+                self.emit_rex_rm(size, &dst.name, mem);
+                self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                let rc = self.relocations.len();
+                self.encode_modrm_mem(dst_num, mem)?;
+                self.bytes.push(*imm as u8);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            _ => Err("unsupported pinsrX operands".to_string()),
+        }
+    }
+
+    /// Encode SSE/SSE4.1 extract instructions (pextrw, pextrd, pextrb, pextrq).
+    /// `swap_reg_rm`: if true, the GP register goes in the ModRM "reg" field and the
+    /// XMM register goes in "r/m". This is needed for legacy pextrw (66 0F C5) which
+    /// uses inverted field assignment compared to SSE4.1 extracts (66 0F 3A xx).
+    pub(crate) fn encode_sse_extract(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        rex_w: bool,
+        swap_reg_rm: bool,
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("pextrX requires 3 operands".to_string());
+        }
+        // pextrX $imm, xmm, r/m
+        let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                for &b in &opcode[..prefix_len] {
+                    self.bytes.push(b);
+                }
+                let size = if rex_w { 8 } else { 0 };
+                if swap_reg_rm {
+                    // Legacy pextrw: GP in reg field, XMM in r/m field
+                    self.emit_rex_rr(size, &dst.name, &src.name);
+                    self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                } else {
+                    // SSE4.1: XMM in reg field, GP in r/m field
+                    self.emit_rex_rr(size, &src.name, &dst.name);
+                    self.bytes.extend_from_slice(&opcode[prefix_len..]);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                }
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) => {
+                // Memory destination. The legacy pextrw form (66 0F C5) is
+                // REGISTER-ONLY per the Intel SDM; a memory destination
+                // requires the SSE4.1 encoding 66 0F 3A 15 /r ib. Emitting
+                // the legacy bytes with a mem ModRM silently produced a
+                // different instruction. Swap opcodes transparently.
+                let (mem_opcode, mem_prefix_len): (&[u8], usize) =
+                    if swap_reg_rm && opcode == [0x66, 0x0F, 0xC5] {
+                        (&[0x66, 0x0F, 0x3A, 0x15], 1)
+                    } else {
+                        (opcode, prefix_len)
+                    };
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                for &b in &mem_opcode[..mem_prefix_len] {
+                    self.bytes.push(b);
+                }
+                let size = if rex_w { 8 } else { 0 };
+                self.emit_rex_rm(size, &src.name, mem);
+                self.bytes.extend_from_slice(&mem_opcode[mem_prefix_len..]);
+                let rc = self.relocations.len();
+                self.encode_modrm_mem(src_num, mem)?;
+                self.bytes.push(*imm as u8);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            _ => Err("unsupported pextrX operands".to_string()),
+        }
+    }
+
+    // ---- MOVQ with XMM registers ----
+
+    /// Encode movq with XMM register operands.
+    /// Forms:
+    ///   movq %gp64, %xmm  -> 66 REX.W 0F 6E /r (GP -> XMM)
+    ///   movq %xmm, %gp64  -> 66 REX.W 0F 7E /r (XMM -> GP)
+    ///   movq mem, %xmm    -> F3 0F 7E /r (load 64-bit from memory)
+    ///   movq %xmm, mem    -> 66 0F D6 /r (store 64-bit to memory)
+    ///   movq %xmm, %xmm   -> F3 0F 7E /r (xmm-to-xmm)
+    pub(crate) fn encode_movq_xmm(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("movq requires 2 operands".to_string());
+        }
+        match (&ops[0], &ops[1]) {
+            // movq %gp64, %xmm -> 66 REX.W 0F 6E /r
+            (Operand::Register(src), Operand::Register(dst))
+                if !is_xmm(&src.name) && is_xmm(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(0x66);
+                self.emit_rex_rr(8, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x6E]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            // movq %xmm, %gp64 -> 66 REX.W 0F 7E /r
+            (Operand::Register(src), Operand::Register(dst))
+                if is_xmm(&src.name) && !is_xmm(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(0x66);
+                self.emit_rex_rr(8, &src.name, &dst.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                Ok(())
+            }
+            // movq %xmm, %xmm -> F3 0F 7E /r (load) — `.s` selects the
+            // store form 66 0F D6 /r (GAS 2.47: `movq.s %xmm4,%xmm6' =
+            // 66 0f d6 e6; plain movq keeps the F3 load form).
+            (Operand::Register(src), Operand::Register(dst))
+                if is_xmm(&src.name) && is_xmm(&dst.name) =>
+            {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                if self.s_flip {
+                    self.bytes.push(0x66);
+                    self.emit_rex_rr(0, &src.name, &dst.name);
+                    self.bytes.extend_from_slice(&[0x0F, 0xD6]);
+                    self.bytes.push(self.modrm(3, src_num, dst_num));
+                } else {
+                    self.bytes.push(0xF3);
+                    self.emit_rex_rr(0, &dst.name, &src.name);
+                    self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                }
+                Ok(())
+            }
+            // movq mem, %xmm -> F3 0F 7E /r (load)
+            (Operand::Memory(mem), Operand::Register(dst)) if is_xmm(&dst.name) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.push(0xF3);
+                self.emit_rex_rm(0, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x7E]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            // movq %xmm, mem -> 66 0F D6 /r (store)
+            (Operand::Register(src), Operand::Memory(mem)) if is_xmm(&src.name) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.bytes.push(0x66);
+                self.emit_rex_rm(0, &src.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0xD6]);
+                self.encode_modrm_mem(src_num, mem)
+            }
+            _ => Err("unsupported movq operand combination".to_string()),
+        }
+    }
+
+    // ---- CRC32 encoding ----
+
+    /// Encode CRC32 instruction.
+    /// crc32b: F2 0F 38 F0 /r (8-bit source)
+    /// crc32w: 66 F2 0F 38 F1 /r (16-bit source)
+    /// crc32l: F2 0F 38 F1 /r (32-bit source)
+    /// crc32q: F2 REX.W 0F 38 F1 /r (64-bit source)
+    pub(crate) fn encode_crc32(&mut self, ops: &[Operand], src_size: u8) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("crc32 requires 2 operands".to_string());
+        }
+        if self.apx_nf {
+            return Err("{nf} unsupported for `crc32'".to_string());
+        }
+        // APX map-4 keeps F0/F1 but drops the F2 prefix (pp=66 only for crc32w).
+        let opc = if src_size == 1 { 0xF0 } else { 0xF1 };
+        let pp = if src_size == 2 { 1 } else { 0 };
+        let use_evex = self.apx_wants_evex() || operands_have_egpr(ops);
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let w = is_reg64(&dst.name);
+                if use_evex {
+                    self.emit_apx_evex_rr_pp(w, &dst.name, &src.name, None, false, pp)?;
+                    self.bytes.push(opc);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    return Ok(());
+                }
+                if src_size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.bytes.push(0xF2);
+                // W follows the destination, not the source: `crc32b %al, %rax`
+                // is F2 REX.W 0F 38 F0 (GAS 2.47).
+                self.emit_rex_rr(if w { 8 } else { 4 }, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, opc]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let w = is_reg64(&dst.name);
+                if use_evex {
+                    self.emit_apx_evex_rm_pp(w, &dst.name, mem, None, false, pp)?;
+                    self.bytes.push(opc);
+                    return self.encode_modrm_mem(dst_num, mem);
+                }
+                if src_size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.bytes.push(0xF2);
+                self.emit_rex_rm(if w { 8 } else { 4 }, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, 0x38, opc]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err("unsupported crc32 operands".to_string()),
+        }
+    }
+
+    // ---- SSE memory-only encoding (ldmxcsr, stmxcsr) ----
+
+    /// Encode an SSE instruction with a single memory operand and a ModR/M extension.
+    /// Format: [opcode bytes] ModR/M(ext, mem)
+    /// Used for ldmxcsr (0F AE /2) and stmxcsr (0F AE /3).
+    pub(crate) fn encode_sse_mem_only(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("SSE mem-only op requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                // No REX.W needed for 32-bit memory operations
+                self.emit_rex_rm(0, "", mem);
+                self.bytes.extend_from_slice(opcode);
+                self.encode_modrm_mem(ext, mem)
+            }
+            _ => Err("SSE mem-only op requires memory operand".to_string()),
+        }
+    }
+
+    /// Encode a VEX-prefixed memory-only instruction (vldmxcsr/vstmxcsr):
+    /// VEX.128.0F.WIG 0F AE /r. Map 0F is implicit in VEX.
+    pub(crate) fn encode_vex_mem_only(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("VEX mem-only op requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                let (x_bit, b_bit) = mem_vex_xb_bits(mem);
+                self.emit_vex(false, x_bit, b_bit, 1, 0, 0, 0, 0);
+                // VEX.128.0F implies map 0F: emit only the final opcode byte.
+                self.bytes.push(opcode[opcode.len() - 1]);
+                self.encode_modrm_mem(ext, mem)
+            }
+            _ => Err("VEX mem-only op requires memory operand".to_string()),
+        }
+    }
+
+    // ---- BSF/BSR encoding ----
+
+    /// Encode BSF (Bit Scan Forward) or BSR (Bit Scan Reverse).
+    /// bsfl/bsfq: 0F BC r/m -> reg
+    /// bsrl/bsrq: 0F BD r/m -> reg
+    pub(crate) fn encode_bsf_bsr(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err(format!("{} requires 2 operands", mnemonic));
+        }
+        let size = mnemonic_size_suffix(mnemonic).unwrap_or(8);
+        let opcode_byte = if mnemonic.starts_with("bsf") {
+            0xBC
+        } else {
+            0xBD
+        };
+
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(src), Operand::Register(dst)) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_rex_rr(size, &dst.name, &src.name);
+                self.bytes.extend_from_slice(&[0x0F, opcode_byte]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                Ok(())
+            }
+            (Operand::Memory(mem), Operand::Register(dst)) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                self.emit_rex_rm(size, &dst.name, mem);
+                self.bytes.extend_from_slice(&[0x0F, opcode_byte]);
+                self.encode_modrm_mem(dst_num, mem)
+            }
+            _ => Err(format!("unsupported {} operands", mnemonic)),
+        }
+    }
+
+    fn evex_vec_reg(name: &str) -> Option<(u8, u8)> {
+        for (prefix, ll) in [("zmm", 2u8), ("ymm", 1u8), ("xmm", 0u8)] {
+            if let Some(num) = name.strip_prefix(prefix) {
+                let n: u8 = num.parse().ok()?;
+                if n < 32 {
+                    return Some((n, ll));
+                }
+            }
+        }
+        None
+    }
+
+    /// 5-bit GP register id for EVEX addressing (0–31). Low 3 bits go in
+    /// ModRM/SIB; B4/X4 are applied by `emit_evex_memop`.
+    fn evex_gp_num(name: &str) -> Option<u8> {
+        gp_id(name)
+    }
+
+    /// EVEX memory operand: ModRM/SIB/disp with disp8 scaled by `scale_n`
+    /// (EVEX disp8 is multiplied by the vector length: 16/32/64).
+    pub(crate) fn encode_evex_mem(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+        scale_n: u32,
+    ) -> Result<(), String> {
+        let start = self.bytes.len();
+        let result = self.encode_evex_mem_body(reg_field, mem, scale_n);
+        if result.is_ok() && self.track_memory_emission {
+            self.memory_emission = Some(super::MemoryEmission {
+                start,
+                end: self.bytes.len(),
+                disp8_scale: scale_n,
+            });
+        }
+        result
+    }
+
+    /// Emit an EVEX memory operand followed by imm8. RIP-relative displacement
+    /// relocations are based on the end of the whole instruction, not the end
+    /// of disp32. Keep the immediate and its relocation adjustment together so
+    /// new immediate-memory instruction families cannot omit the trailing byte.
+    pub(crate) fn encode_evex_mem_imm8(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+        scale_n: u32,
+        imm: u8,
+    ) -> Result<(), String> {
+        let reloc_start = self.relocations.len();
+        self.encode_evex_mem(reg_field, mem, scale_n)?;
+        self.adjust_rip_reloc_addend(reloc_start, 1);
+        self.bytes.push(imm);
+        Ok(())
+    }
+
+    fn encode_evex_mem_body(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+        scale_n: u32,
+    ) -> Result<(), String> {
+        // The same index-only scale-1 fold as `encode_modrm_mem`, with the
+        // same evidence class: classic ICC folds the whole AVX-512 load
+        // family (`vmovdqu8 (,%r10,1),%xmm0` -> `62 d1 7f 08 6f 02`, 6
+        // bytes vs the 11-byte SIB+disp32 form every other oracle emits),
+        // moving the extension bit X->B in the EVEX P0 byte. `evex_addr_bits`
+        // derives its prefix bits from this same folded view, and the
+        // disp8*N compression below then applies to the folded base form
+        // (a folded `-N` displacement compresses to disp8 = -N/N, which is
+        // how lccc beats even ICC's own mod=10+disp32 fold).
+        let folded = fold_index_into_base(mem);
+        let mem = folded.as_ref().unwrap_or(mem);
+        // RIP-relative: same ModRM (mod=00 rm=101 + disp32) as the legacy
+        // encoder, including `sym@GOTPCREL` / `@GOTTPOFF` / `@TLSDESC`.
+        // `gotpcrel_x_type` then classifies AVX-512 EVEX as plain
+        // `R_X86_64_GOTPCREL` (9); only APX-promoted ALU is CODE_6.
+        if mem.base.as_ref().is_some_and(|b| b.name == "rip") {
+            return self.encode_modrm_mem(reg_field, mem);
+        }
+
+        let base_num = match &mem.base {
+            Some(b) => Some(
+                Self::evex_gp_num(&b.name)
+                    .ok_or_else(|| format!("bad EVEX base register: {}", b.name))?,
+            ),
+            None => None,
+        };
+        let index_num = match &mem.index {
+            // A vector index is VSIB (gather/scatter): the SIB index field
+            // is the low 3 bits either way; the prefix X/V' bits are the
+            // caller's job (see encode_evex_gather).
+            Some(i) => Some(
+                Self::evex_gp_num(&i.name)
+                    .or_else(|| vec_reg_id(&i.name))
+                    .ok_or_else(|| format!("bad EVEX index register: {}", i.name))?,
+            ),
+            None => None,
+        };
+        let (disp, has_symbol, deferred_reloc, diff_sym) =
+            Self::symbol_disp_parts(&mem.displacement);
+        // Absolute: SIB-absolute (mod=00 rm=100, SIB base=101) + disp32,
+        // like the legacy encoder and GAS — never the mod=05/RIP form.
+        if base_num.is_none() && index_num.is_none() {
+            self.bytes.push(self.modrm(0, reg_field, 4));
+            self.bytes.push(self.sib(1, 4, 5));
+            if let Some((sym, reloc_type, addend)) = deferred_reloc {
+                match &diff_sym {
+                    Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                    None => self.add_relocation(&sym, reloc_type, addend),
+                }
+            }
+            self.bytes.extend_from_slice(&(disp as i32).to_le_bytes());
+            return Ok(());
+        }
+        let scale = mem.scale.unwrap_or(1);
+        let scale_bits = match scale {
+            1 => 0u8,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            _ => 0,
+        };
+        // Symbols always take disp32 (the value is a reloc placeholder,
+        // never compressible).
+        let d8_ok = !has_symbol
+            && disp % i64::from(scale_n) == 0
+            && i8::try_from(disp / i64::from(scale_n)).is_ok();
+        // rsp-like (low 3 bits = 4) always need SIB; rbp-like (low 3 = 5)
+        // always need a displacement. r20/r28 and r21/r29 share those lows.
+        let needs_sib = index_num.is_some() || base_num.is_some_and(|b| (b & 7) == 4);
+        let rbp_like = base_num.is_some_and(|b| (b & 7) == 5);
+
+        // The SIB byte and the displacement are one and four bytes wide, so they
+        // are built in fixed buffers.  They used to be `Vec<u8>`, i.e. up to
+        // three heap allocations for every EVEX memory operand.
+        let mut sib_bytes = [0u8; 1];
+        let mut sib_len = 0usize;
+        if needs_sib {
+            let base7 = base_num.map(|b| b & 7).unwrap_or(5); // SIB base=5 => no base
+            let idx7 = index_num.map(|i| i & 7).unwrap_or(4); // SIB index=4 => no index
+            sib_bytes[0] = scale_bits << 6 | idx7 << 3 | base7;
+            sib_len = 1;
+        }
+
+        let mut disp_bytes = [0u8; 4];
+        let mut disp_len = 0usize;
+        let (mod_, rm) = match (base_num, index_num) {
+            (Some(b), _) => {
+                let rm = if needs_sib { 4 } else { b & 7 };
+                if has_symbol {
+                    disp_bytes = (disp as i32).to_le_bytes();
+                    disp_len = 4;
+                    (2u8, rm)
+                } else if disp == 0 && !rbp_like {
+                    (0u8, rm)
+                } else if d8_ok {
+                    disp_bytes[0] = (disp / i64::from(scale_n)) as u8;
+                    disp_len = 1;
+                    (1u8, rm)
+                } else {
+                    disp_bytes = (disp as i32).to_le_bytes();
+                    disp_len = 4;
+                    (2u8, rm)
+                }
+            }
+            (None, Some(_)) => {
+                // no base: mod=00, rm=100 (SIB, base=5), disp32
+                disp_bytes = (disp as i32).to_le_bytes();
+                disp_len = 4;
+                (0u8, 4u8)
+            }
+            (None, None) => {
+                unreachable!("EVEX absolute takes the SIB-absolute arm above")
+            }
+        };
+
+        self.bytes.push(self.modrm(mod_, reg_field, rm));
+        self.bytes.extend_from_slice(&sib_bytes[..sib_len]);
+        if let Some((sym, reloc_type, addend)) = deferred_reloc {
+            match &diff_sym {
+                Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
+                None => self.add_relocation(&sym, reloc_type, addend),
+            }
+        }
+        self.bytes.extend_from_slice(&disp_bytes[..disp_len]);
+        Ok(())
+    }
+
+    /// Encode EVEX vmovdqa64/vmovdqa32 reg<->mem (AVX-512, glibc dl-trampoline).
+    pub(crate) fn encode_evex_vmovdqa(
+        &mut self,
+        ops: &[Operand],
+        is_64: bool,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("vmovdqa64/32 requires 2 operands".to_string());
+        }
+        let w = if is_64 { 1u8 } else { 0u8 };
+        match (&ops[0], &ops[1]) {
+            (Operand::Register(reg), Operand::Memory(mem)) => {
+                let (reg5, ll) = Self::evex_vec_reg(&reg.name)
+                    .ok_or_else(|| format!("bad EVEX vector register: {}", reg.name))?;
+                let scale_n = [16u32, 32, 64][ll as usize];
+                let r3 = (reg5 >> 3) & 1;
+                let r4 = (reg5 >> 4) & 1;
+                let b3 = mem
+                    .base
+                    .as_ref()
+                    .map(|b| {
+                        Self::evex_gp_num(&b.name)
+                            .map(|n| (n >> 3) & 1)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let x3 = mem
+                    .index
+                    .as_ref()
+                    .map(|i| {
+                        Self::evex_gp_num(&i.name)
+                            .map(|n| (n >> 3) & 1)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let p1 = 0x01u8
+                    | ((!r3 & 1) << 7)
+                    | ((!x3 & 1) << 6)
+                    | ((!b3 & 1) << 5)
+                    | ((!r4 & 1) << 4);
+                // P2: 0x7D | (W << 7)  (vvvv=1111, pp=01=66; bit7 carries W)
+                let p2 = 0x7Du8 | (w << 7);
+                let p3 = (ll << 5) | 0b0000_1000; // z=0, L'L=ll, b=0, V'=1, aaa=0
+                self.bytes.push(0x62);
+                self.bytes.push(p1);
+                self.bytes.push(p2);
+                self.bytes.push(p3);
+                self.bytes.push(0x7F); // store
+                self.encode_evex_mem(reg5 & 7, mem, scale_n)
+            }
+            (Operand::Memory(mem), Operand::Register(reg)) => {
+                let (reg5, ll) = Self::evex_vec_reg(&reg.name)
+                    .ok_or_else(|| format!("bad EVEX vector register: {}", reg.name))?;
+                let scale_n = [16u32, 32, 64][ll as usize];
+                let r3 = (reg5 >> 3) & 1;
+                let r4 = (reg5 >> 4) & 1;
+                let b3 = mem
+                    .base
+                    .as_ref()
+                    .map(|b| {
+                        Self::evex_gp_num(&b.name)
+                            .map(|n| (n >> 3) & 1)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let x3 = mem
+                    .index
+                    .as_ref()
+                    .map(|i| {
+                        Self::evex_gp_num(&i.name)
+                            .map(|n| (n >> 3) & 1)
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                let p1 = 0x01u8
+                    | ((!r3 & 1) << 7)
+                    | ((!x3 & 1) << 6)
+                    | ((!b3 & 1) << 5)
+                    | ((!r4 & 1) << 4);
+                let p2 = 0x7Du8 | (w << 7);
+                let p3 = (ll << 5) | 0b0000_1000;
+                self.bytes.push(0x62);
+                self.bytes.push(p1);
+                self.bytes.push(p2);
+                self.bytes.push(p3);
+                self.bytes.push(0x6F); // load
+                self.encode_evex_mem(reg5 & 7, mem, scale_n)
+            }
+            _ => Err("vmovdqa64/32 requires register, memory operands".to_string()),
+        }
+    }
+
+    /// SSE extract-to-GPR/mem with imm8: extractps (66 0F3A 17 /r ib).
+    /// AT&T ($imm, src, dst); ModRM.reg = src (xmm), r/m = dst (r32/m32),
+    /// matching GNU as (src in reg field, dst in r/m).
+    pub(crate) fn encode_sse_extract_gpr_imm8(
+        &mut self,
+        ops: &[Operand],
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("SSE extract-gpr requires 3 operands (imm, src, dst)".to_string());
+        }
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
+                if bytes.first() == Some(&0x66) {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rr(0, &src.name, &dst.name);
+                for &b in &bytes[1..] {
+                    self.bytes.push(b);
+                }
+                self.bytes.push(self.modrm(3, src_num, dst_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad src register")?;
+                if bytes.first() == Some(&0x66) {
+                    self.bytes.push(0x66);
+                }
+                self.emit_rex_rm(0, &src.name, mem);
+                for &b in &bytes[1..] {
+                    self.bytes.push(b);
+                }
+                let rc = self.relocations.len();
+                self.encode_modrm_mem(src_num, mem)?;
+                self.bytes.push(*imm as u8);
+                self.adjust_rip_reloc_addend(rc, 1);
+                Ok(())
+            }
+            _ => Err("unsupported SSE extract-gpr operands".to_string()),
+        }
+    }
+
+    /// SSE convert signed integer to scalar float: cvtsi2ss (F3) / cvtsi2sd (F2),
+    /// 0F 2A /r with ModRM.reg = xmm dest, r/m = GPR src (REX.W for r64).
+    pub(crate) fn encode_cvtsi2x(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        pp: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("cvtsi2ss/cvtsi2sd requires 2 operands".to_string());
+        }
+        // Unsuffixed forms infer GPR width from the source register (`r8d` is
+        // 32-bit, not 64-bit) and default memory sources to 32-bit, then reuse
+        // `encode_sse_cvt_gp_to_xmm` so REX.R (xmm8–15) and REX.B (r8–r15) share
+        // a single REX byte.
+        let gp_size = match &ops[0] {
+            Operand::Register(src) => {
+                let sz = infer_reg_size(&src.name);
+                if sz == 4 || sz == 8 {
+                    sz
+                } else {
+                    return Err("cvtsi2ss/cvtsi2sd source must be a 32- or 64-bit GPR".to_string());
+                }
+            }
+            Operand::Memory(_) => 4,
+            _ => {
+                return Err(
+                    "cvtsi2ss/cvtsi2sd requires gpr/mem source and xmm destination".to_string(),
+                );
+            }
+        };
+        let opc = match pp {
+            2 => [0xF3, 0x0F, opcode],
+            3 => [0xF2, 0x0F, opcode],
+            _ => return Err("cvtsi2ss/cvtsi2sd: bad prefix".to_string()),
+        };
+        self.encode_sse_cvt_gp_to_xmm(ops, &opc, gp_size)
+    }
+}

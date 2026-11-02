@@ -1,0 +1,224 @@
+name: Benchmarks
+
+# Reusable lane of ci.yml: consume the SAME compiler tested by the build lane.
+# The caller owns push/PR triggers and cancellation, avoiding duplicate runs.
+#
+# SHARDED. The complete corpus is ~49 kernels x 2 compilers x (warm-up + timed
+# rounds), which measured 466 s of wall clock in run 39752334266 and was, by a
+# wide margin, the longest lane in the pipeline. The kernels are independent,
+# so the corpus is split into balanced shards that run on separate runners and
+# a merge job publishes ONE report: `ci-bench.py --merge` refuses an incomplete
+# shard, a duplicated kernel, a foreign schema, mismatched settings or a
+# different compiler identity, so the published evidence has exactly the shape
+# a single job produced. tests/corpus/test_benchmark_merge.py pins those
+# refusals, and tests/corpus/test_benchmark_shard_plan.py pins that the shards
+# are a partition of the registry.
+on:
+  workflow_call:
+    # Every input has a default so this workflow is walkable (and runnable)
+    # on its own: the parity checker resolves `workflow_call` inputs to prove a
+    # step runs on the green path, and an unresolvable input would make the
+    # lane's gates unverifiable rather than covered. The caller passes all four
+    # explicitly; the defaults describe a single, unsharded run of the corpus.
+    inputs:
+      shard:
+        description: shard label used in step names and artifact names (a, b, ...)
+        type: string
+        default: a
+      only:
+        description: comma-separated benchmark IDs this shard owns (empty = all)
+        type: string
+        default: ""
+      report:
+        description: shard report file name
+        type: string
+        default: bench-a.json
+      artifact:
+        description: artifact name for this shard's report and logs
+        type: string
+        default: benchmark-shard-a
+      gate_steps:
+        description: run the cheap static gates (fib, codegen baseline, self-test)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: LCCC vs GCC (shard ${{ inputs.shard }})
+    # A hung compiler in the corpus step would otherwise burn the default six
+    # hours before failing; the timed corpus is ~9 minutes on a good day.
+    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Enable bounded swap for benchmark execution
+        run: bash scripts/ci_enable_swap.sh
+      - name: Compute weekly apt cache key
+        id: apt-epoch
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Cache GCC 16 package downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-apt
+          key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+          restore-keys: |
+            lccc-apt-debs-v1-${{ runner.os }}-
+      # Same key as ci.yml: one bundle serves every lane, so whichever lane
+      # misses first pays the apt transaction and the rest restore it.  The
+      # historical `--base` mode is gone because a 64-bit-only bundle cannot
+      # satisfy the shared `verify` contract (gcc-16 -m32) and would therefore
+      # be rejected -- and re-installed -- by every other lane.
+      - name: Cache the provisioned oracle toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-toolchain
+          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+      - name: Provision oracle toolchain (cached bundle, else apt)
+        env:
+          LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
+        run: bash scripts/ci_provision_toolchain.sh
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: lccc-fast-${{ github.sha }}
+      - name: Verify exact compiler build
+        run: |
+          set -euo pipefail
+          tar -xzf lccc-fast.tar.gz
+          test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
+          sha256sum -c target/ci-build.sha256
+
+      - name: Detect GCC include path
+        id: gcc
+        run: |
+          GCC_INC="$(gcc-16 -print-file-name=include)"
+          echo "inc=$GCC_INC" >> "$GITHUB_OUTPUT"
+          echo "GCC 16 include: $GCC_INC"
+          gcc-16 --version | head -1
+
+      - name: Verify Fibonacci rec2iter optimization
+        if: inputs.gate_steps
+        env:
+          GCC_INC: ${{ steps.gcc.outputs.inc }}
+        run: |
+          echo "Compiling rec2iter correctness test..."
+          target/fastbuild/lccc -I"$GCC_INC" -O2 -o /tmp/fib_rec2iter tests/regression/fixtures/rec2iter/fib_rec2iter.c
+          echo "Running (includes fib(90) — impossible without rec2iter)..."
+          /tmp/fib_rec2iter
+
+      # MS-01a codegen-quality gate. The runtime gate above can only catch
+      # what the timed benchmarks measure; this one pins static, noise-free
+      # codegen metrics (insns / stackmem / pushes / ymm / fma) for the six
+      # golden workloads against .github/scripts/ci-codegen-baseline.json
+      # with per-workload tolerance bands.
+      #
+      # MOVED EARLIER, NOT NEW: these two steps already existed in this
+      # workflow, but they ran *after* the timed corpus (~8.5 minutes of build
+      # plus two -O3 benchmark runs). A regression in the six golden workloads
+      # therefore only surfaced once the slow steps had burned their time, and
+      # any earlier failing step skipped them outright (there was no
+      # `if: always()`). Running the cheap, deterministic gate first means a
+      # static-codegen regression is reported before the timed corpus.  The
+      # corpus itself still uses the default success condition: if the gate
+      # fails, it will be skipped.  Only the later summary/artifact steps use
+      # `if: always()`; they cannot rescue a skipped corpus. Baseline refreshes go through --update-baseline in
+      # the PR that lands the improvement, per the gate's header contract.
+      - name: Gate self-test (stackmem accounting)
+        if: inputs.gate_steps
+        run: python3 .github/scripts/test_ci_codegen_gate.py
+
+      - name: Codegen quality gate (golden workloads)
+        if: inputs.gate_steps
+        env:
+          GCC_INC: ${{ steps.gcc.outputs.inc }}
+          # Opt-in assembly dump. The numbers AND the emitted code are
+          # published as workflow annotations, because the job log is not
+          # queryable from the API: without this, a codegen metric can only be
+          # read by a human scrolling a log, and an agent auditing a PR cannot
+          # see what the compiler actually emitted. Set the repository variable
+          # LCCC_CODEGEN_ASM=1 to include the `-S` text (~40 KiB, chunked).
+          LCCC_CODEGEN_ASM: ${{ vars.LCCC_CODEGEN_ASM }}
+        run: |
+          set -o pipefail
+          # The metrics/assembly payload is published at warning level, because
+          # that is the only level the checks API returns; it must stay OPT-IN
+          # so a normal run carries no annotations at all. Set the repository
+          # variable LCCC_CODEGEN_ASM=1 (or "asm" for the emitted code too) to
+          # turn it on for an audit run.
+          evidence_flag=""
+          case "${LCCC_CODEGEN_ASM:-}" in
+            1|metrics) evidence_flag="--annotate" ;;
+            asm)       evidence_flag="--annotate --annotate-asm" ;;
+          esac
+          python3 .github/scripts/ci-codegen-gate.py \
+            --lccc target/fastbuild/lccc \
+            --gcc-inc "$GCC_INC" \
+            $evidence_flag 2>&1 | tee codegen-gate.txt
+
+      - name: Run benchmark corpus shard
+        env:
+          SHARD: ${{ inputs.shard }}
+          ONLY: ${{ inputs.only }}
+          REPORT: ${{ inputs.report }}
+        run: |
+          # GitHub's default Linux shell for `run:` steps is `bash -e`
+          # WITHOUT pipefail: a failing left-hand side of a pipeline is
+          # masked by `tee`'s success.  ci-bench.py --strict is a GATE
+          # (compile failure, runtime failure, output mismatch, missing
+          # compiler), so the pipe must propagate it — same contract as
+          # the regression gate in ci.yml.
+          set -o pipefail
+          # ci-bench.py delegates to tests/benchmark/run_benchmarks.py. With
+          # no --only selection this is the complete checked-in corpus:
+          # synthetic kernels plus every pinned workload-derived kernel.
+          python3 .github/scripts/ci-bench.py \
+            --lccc target/fastbuild/lccc \
+            --compilers lccc,gcc \
+            --gcc gcc-16 \
+            --cflag=-std=gnu17 \
+            --reps 9 \
+            --warmup 1 \
+            --only "$ONLY" \
+            --artifact-dir "bench-artifacts-$SHARD" \
+            --json "$REPORT" \
+            --markdown "bench-summary-$SHARD.md" \
+            --strict | tee "bench-terminal-$SHARD.txt"
+
+      # The ratios otherwise exist only in a log (not queryable from the API)
+      # and in an artifact (not readable either); a reusable-workflow job's
+      # step summary does not surface in `output.summary`. One annotation
+      # makes what the shard measured API-visible, which is what a performance
+      # change has to be judged on. Publishing at warning level is the only
+      # level the checks API returns, so the instrument stays opt-in
+      # (LCCC_BENCH_RATIOS=1) and a normal run carries no annotation.
+      - name: Publish paired ratios
+        if: always()
+        env:
+          REPORT: ${{ inputs.report }}
+          LCCC_BENCH_RATIOS: ${{ vars.LCCC_BENCH_RATIOS }}
+        run: python3 .github/scripts/ci_bench_ratios.py --report "$REPORT"
+
+      - name: Post shard summary
+        if: always()
+        env:
+          SHARD: ${{ inputs.shard }}
+        run: cat "bench-summary-$SHARD.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ inputs.report }}
+            bench-summary-${{ inputs.shard }}.md
+            bench-terminal-${{ inputs.shard }}.txt
+            bench-artifacts-${{ inputs.shard }}/
+            codegen-gate.txt

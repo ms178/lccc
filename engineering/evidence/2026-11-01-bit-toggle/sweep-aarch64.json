@@ -1,0 +1,16 @@
+{
+ "level": "-O2",
+ "files": 3079,
+ "shorter": [
+  [
+   "engineering/evidence/2026-11-01-bit-selection/bit-selection.c",
+   283,
+   294
+  ]
+ ],
+ "same": 1225,
+ "longer": [],
+ "both_reject": 1853,
+ "verdict": [],
+ "net_delta": -11
+}

@@ -1,0 +1,1 @@
+-std=gnu2y -O2 -Wl,-z,pack-relative-relocs

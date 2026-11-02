@@ -1,0 +1,718 @@
+{
+ "provenance": {
+  "session": "S13 codegen-gate fix (re-remove bogus x86-64 indexed-fold staging rule)",
+  "lccc_head": "685da054dbd329148238452f29fa8ec2be45d690",
+  "upstream_base": "563fb0bcb39488a97a6aa69858458196cf91710c (PR #653)",
+  "command": "ci-bench.py --lccc target/fastbuild/lccc --compilers lccc,gcc --reps 9 --warmup 1 --strict",
+  "utc": "2026-09-27T21:20:44.995231+00:00",
+  "cpu": [
+   "Intel(R) Xeon(R) Processor @ 2.60GHz"
+  ],
+  "hypervisor": true,
+  "pinning": {
+   "allowed_cpus": [
+    0,
+    1
+   ],
+   "applied": true,
+   "cpu": 0,
+   "reason": "taskset pinning",
+   "requested": "auto"
+  },
+  "compiler_versions": {
+   "gcc": "gcc (Debian 14.2.0-19) 14.2.0",
+   "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+  },
+  "note": "Curated from the 1.1MB raw ci-bench JSON (per-round samples dropped; medians, bootstrap CIs, verdicts kept). Ratios are LCCC/GCC paired medians; <1 means LCCC faster."
+ },
+ "aggregate_lccc_vs_gcc": {
+  "arithmetic_mean_ratio": 0.9465438931806838,
+  "best": {
+   "benchmark": "fib",
+   "ratio": 0.013717219841008299
+  },
+  "geometric_mean_ratio": 0.7239055165324253,
+  "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+  "n_correct_benchmarks": 41,
+  "worst": {
+   "benchmark": "lz4_match_extend",
+   "ratio": 1.9367070466941414
+  }
+ },
+ "benchmarks": [
+  {
+   "name": "arith_loop",
+   "correct": true,
+   "lccc_median_s": 0.129488827,
+   "gcc_median_s": 0.124769016,
+   "ratio": 1.0600084408510668,
+   "ci95": [
+    0.9476675254789121,
+    1.0844916436484737
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 7.1% (>5%)"
+   ]
+  },
+  {
+   "name": "fib",
+   "correct": true,
+   "lccc_median_s": 0.00272602,
+   "gcc_median_s": 0.222902626,
+   "ratio": 0.013717219841008299,
+   "ci95": [
+    0.011214931232510853,
+    0.014471065707597973
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 11.5% (>5%)",
+    "wall-clock coefficient of variation is 13.2% (>5%)"
+   ]
+  },
+  {
+   "name": "matmul",
+   "correct": true,
+   "lccc_median_s": 0.007885529,
+   "gcc_median_s": 0.007707226,
+   "ratio": 1.0307450271187826,
+   "ci95": [
+    0.9917674645589952,
+    1.067700493017851
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 10.5% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "qsort",
+   "correct": true,
+   "lccc_median_s": 0.133025509,
+   "gcc_median_s": 0.138246425,
+   "ratio": 1.0061691875923644,
+   "ci95": [
+    0.9166268233383248,
+    1.0422898530649165
+   ],
+   "n": 9,
+   "warnings": []
+  },
+  {
+   "name": "sieve",
+   "correct": true,
+   "lccc_median_s": 0.049975418,
+   "gcc_median_s": 0.046337018,
+   "ratio": 1.1008939798052115,
+   "ci95": [
+    0.8746327403427224,
+    1.2015971323721155
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 19.4% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)",
+    "wall-clock coefficient of variation is 22.6% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "tce_sum",
+   "correct": true,
+   "lccc_median_s": 0.002738108,
+   "gcc_median_s": 0.002612058,
+   "ratio": 1.0158131584978485,
+   "ci95": [
+    0.9046627031428225,
+    1.274416418544383
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 20.1% (>5%)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 57.0% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "nbody",
+   "correct": true,
+   "lccc_median_s": 0.52772317,
+   "gcc_median_s": 0.374409449,
+   "ratio": 1.4140922617686313,
+   "ci95": [
+    1.4074489385600801,
+    1.5478789967962971
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 6.6% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "binary_trees",
+   "correct": true,
+   "lccc_median_s": 1.916249701,
+   "gcc_median_s": 1.733329309,
+   "ratio": 1.0998671765385373,
+   "ci95": [
+    1.0742115062497095,
+    1.16237920832414
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 9.0% (>5%)",
+    "wall-clock coefficient of variation is 8.5% (>5%)"
+   ]
+  },
+  {
+   "name": "spectral_norm",
+   "correct": true,
+   "lccc_median_s": 0.265495697,
+   "gcc_median_s": 0.249172037,
+   "ratio": 1.0473893129225864,
+   "ci95": [
+    0.958999051721667,
+    1.0698887133802184
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 8.1% (>5%)",
+    "wall-clock coefficient of variation is 11.2% (>5%)"
+   ]
+  },
+  {
+   "name": "mandelbrot",
+   "correct": true,
+   "lccc_median_s": 1.445371956,
+   "gcc_median_s": 1.60108252,
+   "ratio": 0.9032584351378251,
+   "ci95": [
+    0.8829161236023101,
+    0.9219149265714031
+   ],
+   "n": 9,
+   "warnings": [
+    "2 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "hash_table",
+   "correct": true,
+   "lccc_median_s": 15.817156746,
+   "gcc_median_s": 13.412666901,
+   "ratio": 1.1760866970329305,
+   "ci95": [
+    1.0760622490476506,
+    1.222943977788379
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 5.1% (>5%)",
+    "wall-clock coefficient of variation is 6.6% (>5%)",
+    "3 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "strlen_bench",
+   "correct": true,
+   "lccc_median_s": 0.309334859,
+   "gcc_median_s": 0.288979154,
+   "ratio": 1.0422948231432925,
+   "ci95": [
+    0.9984342878744655,
+    1.1120350950989357
+   ],
+   "n": 9,
+   "warnings": []
+  },
+  {
+   "name": "switch_dispatch",
+   "correct": true,
+   "lccc_median_s": 0.579661613,
+   "gcc_median_s": 0.549522655,
+   "ratio": 1.0737273262674132,
+   "ci95": [
+    1.0365021820791585,
+    1.0884044178209318
+   ],
+   "n": 9,
+   "warnings": [
+    "2 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "struct_copy",
+   "correct": true,
+   "lccc_median_s": 0.027180904,
+   "gcc_median_s": 0.031944266,
+   "ratio": 0.808711987844138,
+   "ci95": [
+    0.7744069911656697,
+    0.890648914471694
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 11.3% (>5%)",
+    "wall-clock coefficient of variation is 13.3% (>5%)"
+   ]
+  },
+  {
+   "name": "loop_patterns",
+   "correct": true,
+   "lccc_median_s": 0.075722659,
+   "gcc_median_s": 0.082311151,
+   "ratio": 0.9567134704549665,
+   "ci95": [
+    0.8526228069776419,
+    1.0274360691319666
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 5.9% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)",
+    "wall-clock coefficient of variation is 5.5% (>5%)"
+   ]
+  },
+  {
+   "name": "fannkuch",
+   "correct": true,
+   "lccc_median_s": 3.039746724,
+   "gcc_median_s": 2.68149032,
+   "ratio": 1.146278849387598,
+   "ci95": [
+    1.0811190586482937,
+    1.1632793872088552
+   ],
+   "n": 9,
+   "warnings": []
+  },
+  {
+   "name": "ackermann",
+   "correct": true,
+   "lccc_median_s": 0.002560649,
+   "gcc_median_s": 0.186211346,
+   "ratio": 0.01449742600636334,
+   "ci95": [
+    0.012984702067903668,
+    0.015223248146083194
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 10.8% (>5%)",
+    "wall-clock coefficient of variation is 7.9% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "constant_recursion",
+   "correct": true,
+   "lccc_median_s": 0.002721848,
+   "gcc_median_s": 0.16411081,
+   "ratio": 0.016364723323222887,
+   "ci95": [
+    0.015222466538935987,
+    0.01723632567394676
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 6.3% (>5%)"
+   ]
+  },
+  {
+   "name": "bitops",
+   "correct": true,
+   "lccc_median_s": 0.275196591,
+   "gcc_median_s": 0.479215088,
+   "ratio": 0.5712227681487891,
+   "ci95": [
+    0.5390813845902094,
+    0.6347210095050332
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 7.3% (>5%)",
+    "2 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "double_reduction",
+   "correct": true,
+   "lccc_median_s": 0.101537719,
+   "gcc_median_s": 0.135497343,
+   "ratio": 0.7389886537634225,
+   "ci95": [
+    0.7266937799898109,
+    0.7831049641021242
+   ],
+   "n": 9,
+   "warnings": []
+  },
+  {
+   "name": "ascii_case_fold",
+   "correct": true,
+   "lccc_median_s": 0.002795347,
+   "gcc_median_s": 0.002835927,
+   "ratio": 0.9223280328143718,
+   "ci95": [
+    0.8473324595449743,
+    1.1543074065540007
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 11.3% (>5%)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 12.8% (>5%)"
+   ]
+  },
+  {
+   "name": "binary_search",
+   "correct": true,
+   "lccc_median_s": 0.002620137,
+   "gcc_median_s": 0.002395678,
+   "ratio": 1.059488002503054,
+   "ci95": [
+    0.9473347222590832,
+    1.1520671466207995
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 9.6% (>5%)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 10.2% (>5%)"
+   ]
+  },
+  {
+   "name": "ring_fifo",
+   "correct": true,
+   "lccc_median_s": 0.003154912,
+   "gcc_median_s": 0.003033932,
+   "ratio": 1.0097191782224864,
+   "ci95": [
+    0.8866006566942981,
+    1.0742849416743927
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 9.8% (>5%)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 10.0% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "aarch64_select_patterns",
+   "correct": true,
+   "lccc_median_s": 0.176459183,
+   "gcc_median_s": 0.153226026,
+   "ratio": 1.103403834683897,
+   "ci95": [
+    1.0500422499999857,
+    1.1771042638123816
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 30.2% (>5%)",
+    "wall-clock coefficient of variation is 26.5% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "histogram",
+   "correct": true,
+   "lccc_median_s": 0.002864149,
+   "gcc_median_s": 0.002838117,
+   "ratio": 0.970244715057491,
+   "ci95": [
+    0.8362240491293605,
+    1.0230557772140467
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 9.0% (>5%)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 14.4% (>5%)"
+   ]
+  },
+  {
+   "name": "gzip_crc32",
+   "correct": true,
+   "lccc_median_s": 0.152890449,
+   "gcc_median_s": 0.16903907,
+   "ratio": 0.9048458944364188,
+   "ci95": [
+    0.9006383911233162,
+    0.9068287151199522
+   ],
+   "n": 9,
+   "warnings": [
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "libm_round_family",
+   "correct": true,
+   "lccc_median_s": 0.301313793,
+   "gcc_median_s": 1.274001742,
+   "ratio": 0.23098479191319046,
+   "ci95": [
+    0.22113951986902822,
+    0.24352039119313473
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 7.3% (>5%)"
+   ]
+  },
+  {
+   "name": "tls_seg_access",
+   "correct": true,
+   "lccc_median_s": 0.012926096,
+   "gcc_median_s": 0.012194421,
+   "ratio": 1.0587556493454868,
+   "ci95": [
+    1.033443715794267,
+    1.0639123782561497
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 9.9% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "zlib_ng_adler32",
+   "correct": true,
+   "lccc_median_s": 0.040275205,
+   "gcc_median_s": 0.040012424,
+   "ratio": 1.0125371809515966,
+   "ci95": [
+    0.9949574307311314,
+    1.0160758138172532
+   ],
+   "n": 9,
+   "warnings": [
+    "1 MAD outlier(s) retained (never silently discarded)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "expat_xml_scan",
+   "correct": true,
+   "lccc_median_s": 0.052158654,
+   "gcc_median_s": 0.041521665,
+   "ratio": 1.2464176143504542,
+   "ci95": [
+    1.0450666958101005,
+    1.3061078101590196
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 7.0% (>5%)",
+    "2 MAD outlier(s) retained (never silently discarded)",
+    "wall-clock coefficient of variation is 12.5% (>5%)",
+    "4 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "sqlite_varint",
+   "correct": true,
+   "lccc_median_s": 0.036750495,
+   "gcc_median_s": 0.037523606,
+   "ratio": 0.970192471978051,
+   "ci95": [
+    0.8251350040877251,
+    1.0793172181553985
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 6.0% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)",
+    "wall-clock coefficient of variation is 10.1% (>5%)"
+   ]
+  },
+  {
+   "name": "linux_find_bit",
+   "correct": true,
+   "lccc_median_s": 0.01857398,
+   "gcc_median_s": 0.01889521,
+   "ratio": 1.0364553922429414,
+   "ci95": [
+    0.9532592478923217,
+    1.762461323894999
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 27.3% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 11.4% (>5%)"
+   ]
+  },
+  {
+   "name": "linux_find_bit_scaled",
+   "correct": true,
+   "lccc_median_s": 1.057959295,
+   "gcc_median_s": 0.932941093,
+   "ratio": 1.1615766769148093,
+   "ci95": [
+    1.0777630426447513,
+    1.2352157469677676
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 6.5% (>5%)"
+   ]
+  },
+  {
+   "name": "glibc_memcmp",
+   "correct": true,
+   "lccc_median_s": 0.01177607,
+   "gcc_median_s": 0.011726868,
+   "ratio": 1.0284562991867723,
+   "ci95": [
+    0.9046432450137049,
+    1.241067273119135
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 5.9% (>5%)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 11.8% (>5%)"
+   ]
+  },
+  {
+   "name": "chacha20_block",
+   "correct": true,
+   "lccc_median_s": 0.252204499,
+   "gcc_median_s": 0.317401768,
+   "ratio": 0.7945907188519505,
+   "ci95": [
+    0.7732058443135793,
+    0.8929881877439249
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 7.3% (>5%)"
+   ]
+  },
+  {
+   "name": "sha256_transform",
+   "correct": true,
+   "lccc_median_s": 0.322895422,
+   "gcc_median_s": 0.344139601,
+   "ratio": 0.9595992823589314,
+   "ci95": [
+    0.8536250238985247,
+    0.9990468659543837
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 6.2% (>5%)",
+    "wall-clock coefficient of variation is 9.3% (>5%)"
+   ]
+  },
+  {
+   "name": "linux_rbtree",
+   "correct": true,
+   "lccc_median_s": 0.018435195,
+   "gcc_median_s": 0.017966788,
+   "ratio": 1.0519849093262512,
+   "ci95": [
+    0.9835936600457168,
+    1.203118081111898
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 7.0% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate"
+   ]
+  },
+  {
+   "name": "zstd_count",
+   "correct": true,
+   "lccc_median_s": 0.015012764,
+   "gcc_median_s": 0.013503601,
+   "ratio": 1.1579262612992822,
+   "ci95": [
+    1.0293308189771184,
+    1.328336543661518
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 16.2% (>5%)",
+    "2 MAD outlier(s) retained (never silently discarded)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 11.5% (>5%)"
+   ]
+  },
+  {
+   "name": "lz4_compress",
+   "correct": true,
+   "lccc_median_s": 0.003910349,
+   "gcc_median_s": 0.003992303,
+   "ratio": 1.0061145351687923,
+   "ci95": [
+    0.948139970889222,
+    1.067163775758616
+   ],
+   "n": 9,
+   "warnings": [
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 15.4% (>5%)",
+    "2 MAD outlier(s) retained (never silently discarded)",
+    "median runtime below 20 ms; process-launch and scheduler noise may dominate",
+    "wall-clock coefficient of variation is 10.2% (>5%)",
+    "1 MAD outlier(s) retained (never silently discarded)"
+   ]
+  },
+  {
+   "name": "lz4_match_extend",
+   "correct": true,
+   "lccc_median_s": 2.331994479,
+   "gcc_median_s": 1.250613455,
+   "ratio": 1.9367070466941414,
+   "ci95": [
+    1.786550921374254,
+    2.0592098889128665
+   ],
+   "n": 9,
+   "warnings": [
+    "wall-clock coefficient of variation is 5.8% (>5%)"
+   ]
+  },
+  {
+   "name": "glibc_strstr",
+   "correct": true,
+   "lccc_median_s": 4.395114372,
+   "gcc_median_s": 4.632321553,
+   "ratio": 0.9491302066616693,
+   "ci95": [
+    0.9451482751484214,
+    0.9519622734473121
+   ],
+   "n": 9,
+   "warnings": []
+  }
+ ]
+}

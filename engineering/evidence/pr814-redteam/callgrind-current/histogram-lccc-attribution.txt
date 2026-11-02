@@ -1,0 +1,27 @@
+--------------------------------------------------------------------------------
+Profile data file '/home/user/artifacts/pr814-callgrind-current/histogram/aa/histogram.cg' (creator: callgrind-3.24.0)
+--------------------------------------------------------------------------------
+I1 cache: 32768 B, 64 B, 8-way associative
+D1 cache: 32768 B, 64 B, 8-way associative
+LL cache: 33554432 B, 64 B, 16-way associative
+Timerange: Basic block 0 - 357472
+Trigger: Program termination
+Profiled target:  /home/user/artifacts/pr814-callgrind-current/histogram/aa/histogram (PID 76778, part 1)
+Events recorded:  Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim
+Events shown:     Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim
+Event sort order: Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim
+Thresholds:       95 0 0 0 0 0 0 0 0 0 0 0 0
+Include dirs:     
+User annotated:   
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir                 Dr               Dw               I1mr           D1mr           D1mw           ILmr           DLmr         DLmw           Bc               Bcm            Bi           Bim          
+--------------------------------------------------------------------------------
+3,223,573 (100.0%) 361,225 (100.0%) 539,318 (100.0%) 1,165 (100.0%) 5,349 (100.0%) 4,719 (100.0%) 1,146 (100.0%) 932 (100.0%) 4,678 (100.0%) 352,815 (100.0%) 3,170 (100.0%) 380 (100.0%) 216 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                 Dr               Dw               I1mr        D1mr           D1mw           ILmr        DLmr         DLmw           Bc               Bcm          Bi           Bim          file:function
+--------------------------------------------------------------------------------
+3,082,018 (95.61%) 327,939 (90.79%) 524,290 (97.21%)  4 ( 0.34%) 4,106 (76.76%) 4,120 (87.31%)  4 ( 0.35%)   9 ( 0.97%) 4,120 (88.07%) 327,940 (92.95%)  31 ( 0.98%)   .           .           ???:main [/home/user/artifacts/pr814-callgrind-current/histogram/aa/histogram]
+

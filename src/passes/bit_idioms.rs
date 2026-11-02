@@ -1,0 +1,6521 @@
+//! Recognition of common integer bit-manipulation idioms.
+//!
+//! Source code often spells operations such as population count using portable
+//! shifts and masks.  Recognizing the complete data-flow graph here lets every
+//! backend select its native instruction without making codegen source-specific.
+
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::reexports::{
+    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand, Value,
+};
+
+// Carrier-view comparisons remain only for small, nonnegative shift counts
+// and rotate complements. They cannot alias a negative carrier to those
+// accepted constants. Arithmetic masks/ranges use const_in_ring instead.
+fn const_u64(op: Operand) -> Option<u64> {
+    match op {
+        Operand::Const(IrConst::I8(v)) => Some(v as u8 as u64),
+        Operand::Const(IrConst::I16(v)) => Some(v as u16 as u64),
+        Operand::Const(IrConst::I32(v)) => Some(v as u32 as u64),
+        Operand::Const(IrConst::I64(v)) => Some(v as u64),
+        Operand::Const(IrConst::Zero) => Some(0),
+        _ => None,
+    }
+}
+
+fn peel(mut op: Operand, defs: &[Option<Instruction>]) -> Operand {
+    // Casts between the IR's integer carrier types are common after inlining.
+    // The masks below constrain the recognized computation to 32 bits.
+    for _ in 0..32 {
+        let Operand::Value(v) = op else { break };
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.is_integer() && to_ty.is_integer() => op = *src,
+            Some(Instruction::Copy { src, .. }) => op = *src,
+            _ => break,
+        }
+    }
+    op
+}
+
+/// Peel through `Copy` chains only.  The generic `peel` also crosses
+/// integer casts, which is correct only for matchers whose operation is
+/// cast-transparent.  A rotate is not: its two halves must consume the SAME
+/// SSA value at the SAME width, and `zext(x)`/`sext(x)`/`trunc(x)` are all
+/// different values even though they peel to the same root.  Matching a
+/// `(zext(x) << n) | (sext(x) >> (W - n))` as a rotate of `x` silently drops
+/// the extension half and miscompiles (observed: `(z << 16) | ((uint32_t)s
+/// >> 16)` with `z = (uint32_t)(uint8_t)a`, `s = (int32_t)(int8_t)a` folded
+/// to `rol a, 16`, losing the `0xffff` sign half).
+fn peel_copies(mut op: Operand, defs: &[Option<Instruction>]) -> Operand {
+    for _ in 0..32 {
+        let Operand::Value(v) = op else { break };
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => op = *src,
+            _ => break,
+        }
+    }
+    op
+}
+
+fn same(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
+    match (peel(a, defs), peel(b, defs)) {
+        (Operand::Value(a), Operand::Value(b)) => a == b,
+        (Operand::Const(a), Operand::Const(b)) => a.to_i128() == b.to_i128(),
+        _ => false,
+    }
+}
+
+/// Value identity: both operands must name the SAME SSA value, modulo
+/// `Copy` chains.  Unlike `same`, this does NOT cross integer casts --
+/// `zext(x)`, `sext(x)` and `trunc(x)` all peel to `x` but are different
+/// values, and an idiom whose halves (or whose input and its uses) run
+/// through different casts is not the idiom.  Every identity check in the
+/// matchers below that guards a VALUE uses this; cast-peeling remains
+/// correct only where constants or shift AMOUNTS are extracted (amounts are
+/// taken modulo the width, so a cast of a small count is harmless).
+fn same_value(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
+    match (peel_copies(a, defs), peel_copies(b, defs)) {
+        (Operand::Value(a), Operand::Value(b)) => a == b,
+        (Operand::Const(a), Operand::Const(b)) => a.to_i128() == b.to_i128(),
+        _ => false,
+    }
+}
+
+/// If `opnd` names a value defined by `And`, its operands and type.
+/// Copy-only peeling: an `And` reached through an integer cast is a
+/// DIFFERENT width's and — repurposing it would change semantics.
+fn and_parts(opnd: Operand, defs: &[Option<Instruction>]) -> Option<(Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty,
+            ..
+        }) => Some((*lhs, *rhs, *ty)),
+        _ => None,
+    }
+}
+
+/// If `opnd` names a value defined by `Xor` or `Or`, its op, operands and
+/// type (copy-only peeling, same discipline as [`and_parts`]).
+fn xor_or_or_parts(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<(IrBinOp, Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::BinOp {
+            op: op @ (IrBinOp::Xor | IrBinOp::Or),
+            lhs,
+            rhs,
+            ty,
+            ..
+        }) => Some((*op, *lhs, *rhs, *ty)),
+        _ => None,
+    }
+}
+
+/// If `opnd` names a value defined by `Not(x)`, the source `x`
+/// (copy-only peeling).
+/// Follow a copy chain only while every alias on it is single-use.
+///
+/// A rewrite that retargets a producer changes the value every alias of that
+/// producer observes.  `peel_copies` answers "which definition is behind this
+/// operand", which is the right question for a *read*; for a rewrite the chain
+/// must be linear as well, or a second reader of an intervening copy would
+/// silently see the new bits.  Returns `None` when the chain branches (or is
+/// implausibly long), so the caller refuses instead of guessing.
+fn peel_linear_copies(
+    op: Operand,
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+) -> Option<Operand> {
+    let mut cur = op;
+    for _ in 0..32 {
+        let Operand::Value(v) = cur else {
+            return Some(cur);
+        };
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => {
+                if use_counts.get(v.0 as usize).copied().unwrap_or(0) != 1 {
+                    return None;
+                }
+                cur = *src;
+            }
+            _ => return Some(cur),
+        }
+    }
+    None
+}
+
+fn not_source(opnd: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::UnaryOp {
+            op: IrUnaryOp::Not,
+            src,
+            ..
+        }) => Some(*src),
+        _ => None,
+    }
+}
+
+/// Build an integer constant of `ty`'s width from a raw bit pattern.
+fn int_const(value: u64, ty: IrType) -> Operand {
+    let v = value as i128;
+    Operand::Const(match ty {
+        IrType::I8 | IrType::U8 => IrConst::I8(v as i8),
+        IrType::I16 | IrType::U16 => IrConst::I16(v as i16),
+        IrType::I32 | IrType::U32 => IrConst::I32(v as i32),
+        IrType::I128 | IrType::U128 => IrConst::I128(v),
+        _ => IrConst::I64(v as i64),
+    })
+}
+
+/// `(~x & C) == 0` and `(~x & C) != 0` are the same statements as
+/// `(x & C) == C` and `(x & C) != C`: a bit of C is set in `~x` exactly when
+/// it is clear in x, so "no mask bit survives the complement" means "every
+/// mask bit is set in x".  Both forms are pure integer identities, independent
+/// of signedness, poison or no-wrap flags, and of how the mask was formed.
+///
+/// Returns the And's destination, the un-complemented operand, the mask and
+/// the comparison type so the caller can retarget the And at `x` (dropping the
+/// Not) and compare against C.  That is only legal when this comparison is the
+/// And's ONLY reader (`and_uses`): the rewrite changes what the And computes,
+/// so a second reader of the old value would observe the wrong bits.  For the
+/// same reason every copy between the And and the comparison must itself be
+/// single-use — one reader of the value is not one alias of it.
+fn match_not_mask_cmp(
+    inst: &Instruction,
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+) -> Option<(u32, Operand, u64, IrType)> {
+    let Instruction::Cmp {
+        op, lhs, rhs, ty, ..
+    } = inst
+    else {
+        return None;
+    };
+    if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) || !ty.is_integer() {
+        return None;
+    }
+    // One side is the complement-and, the other is the literal zero.
+    let and_op = if const_u64(*rhs) == Some(0) {
+        *lhs
+    } else if const_u64(*lhs) == Some(0) {
+        *rhs
+    } else {
+        return None;
+    };
+    let Operand::Value(and_dest) = peel_linear_copies(and_op, defs, use_counts)? else {
+        return None;
+    };
+    if use_counts.get(and_dest.0 as usize).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    let Instruction::BinOp {
+        op: IrBinOp::And,
+        lhs,
+        rhs,
+        ty: and_ty,
+        ..
+    } = defs.get(and_dest.0 as usize).and_then(Option::as_ref)?
+    else {
+        return None;
+    };
+    if and_ty != ty {
+        return None;
+    }
+    let width = ty.size() * 8;
+    let (x, mask) = match (not_source(*lhs, defs), const_in_ring(*rhs, width)) {
+        (Some(x), Some(mask)) => (x, mask),
+        _ => match (not_source(*rhs, defs), const_in_ring(*lhs, width)) {
+            (Some(x), Some(mask)) => (x, mask),
+            _ => return None,
+        },
+    };
+    // C == 0 is a constant comparison the folder already owns.
+    (mask != 0).then_some((and_dest.0, x, mask, *ty))
+}
+
+/// The value `opnd` names, after copy peeling — for single-use proofs the
+/// proof must cover every alias that reads the producer.
+fn peeled_value(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<crate::ir::reexports::Value> {
+    match peel_copies(opnd, defs) {
+        Operand::Value(v) => Some(v),
+        _ => None,
+    }
+}
+
+// ── Boolean mux / majority algebra (the CH/MAJ family) ────────────────────
+//
+// Three bit-exact boolean identities, each strictly reducing the op count:
+//
+//   (distributive)   (x&y) ^ (x&z)   →  x & (y^z)          3 ops → 2
+//   (mux / CH)       (x&y) ^ (~x&z)  →  z ^ (x & (y^z))    4 ops → 3
+//   (majority / MAJ) (x&y) ^ (x&z) ^ (y&z) → (x&y) ^ (z&(x^y))   5 → 4
+//
+// Per-bit proofs (exhaustive over the shared-variable cases):
+//   mux: x=1 → y ^ 0... (x&y)^(~x&z) at x=1 is y|0 = y; the target is
+//   z ^ (1&(y^z)) = z^y^z = y. At x=0: 0^z = z; target z^(0&·) = z. ✓
+//   maj: (x&y)^(x&z)^(y&z) — the three terms are pairwise disjoint unless
+//   all three are set (T1&T2=1 ⇒ x=y=z=1 ⇒ T3=1), so the xor equals the
+//   majority; (x&y) ^ (z&(x^y)): at z=1 this is (x&y)^(x^y) = x|y = maj
+//   at z=1; at z=0 it is x&y = maj at z=0. ✓
+//
+// The mux form is exactly SHA-256's CH and the majority form its MAJ (the
+// same shapes appear in Keccak/SHA-3 chi, in bitplane codecs, and in every
+// `(a & m) | (b & ~m)` select spell). GCC -O2 also reduces MAJ to the
+// 4-op form but leaves CH at 4 ops with a NOT; this canonicalization takes
+// CH to 3.
+//
+// Repurposing discipline (the soundness core): producers are rewritten
+// IN PLACE (an `And` becomes the `Xor`, etc.), so (a) every repurposed
+// producer needs a single-use proof — a second reader would see the new
+// value; (b) every operand NEWLY introduced into a repurposed producer
+// must still dominate that producer's position. Within one block that is
+// the index check below; a cross-block def of an operand already read by
+// another instruction of the same block dominates the whole block by SSA
+// (its use there is dominated, and a foreign dominator of a position in B
+// dominates B). To keep that argument airtight without a dominator tree,
+// v1 additionally restricts every REPURPOSED producer to the consumer's
+// own block. Producers that are only KEPT (read, not rewritten) may live
+// anywhere.
+
+/// Fold-time prediction of the backend's Not+And → `andn` fusion
+/// (`detect_and_not_fusions` + `emit_and_not_impl`): a single-use `Not`
+/// whose type is `c_ty` inside the shared ALU-fusion width domain, sitting
+/// at the immediately preceding index of the SAME block as `and_opnd`'s
+/// And.  The predicate is COMPLETE — it validates `and_opnd`'s own
+/// definition (an `And` of the Not's type reading the Not's dest) rather
+/// than trusting a caller precondition — so it agrees with the backend
+/// detector on every shape, including non-And consumers. Extracted from
+/// the Pattern-B closure so the contract test can run BOTH predicates
+/// (this one and the backend detector) over the same constructed
+/// scenarios — the audit's point was that the two spellings of the
+/// criteria must never drift apart silently.
+pub(super) fn andn_fusion_predicted_at(
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+    def_loc: &[Option<(usize, usize)>],
+    c_ty: IrType,
+    not_opnd: Operand,
+    and_opnd: Operand,
+) -> bool {
+    let Operand::Value(nv) = not_opnd else {
+        return false;
+    };
+    match defs.get(nv.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::UnaryOp {
+            op: crate::ir::reexports::IrUnaryOp::Not,
+            ty: nty,
+            ..
+        }) => {
+            if *nty != c_ty || !crate::backend::generation::alu_fusion_width_ok(*nty) {
+                return false;
+            }
+            if use_counts.get(nv.0 as usize).copied() != Some(1) {
+                return false;
+            }
+            // The consumer must BE an `And` of the Not's type reading the
+            // Not's dest — mirroring `detect_and_not_fusions` exactly. No
+            // caller precondition: Pattern B establishes this anyway (via
+            // `and_strict`), but the prediction is only meaningful as a
+            // standalone predicate if it checks the full shape itself.
+            let Operand::Value(av) = and_opnd else {
+                return false;
+            };
+            match defs.get(av.0 as usize).and_then(Option::as_ref) {
+                Some(Instruction::BinOp {
+                    op: IrBinOp::And,
+                    lhs,
+                    rhs,
+                    ty: aty,
+                    ..
+                }) if *aty == *nty
+                    && (matches!(lhs, Operand::Value(v) if *v == nv)
+                        || matches!(rhs, Operand::Value(v) if *v == nv)) => {}
+                _ => return false,
+            }
+            let loc = |op: &Operand| -> Option<(usize, usize)> {
+                match op {
+                    Operand::Value(v) => def_loc.get(v.0 as usize).copied().flatten(),
+                    _ => None,
+                }
+            };
+            match (loc(&not_opnd), loc(&and_opnd)) {
+                (Some((nb, ni)), Some((ab, ai))) => nb == ab && ni + 1 == ai,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Result of [`match_bool_mux_algebra`]: the consumer's replacement plus
+/// deferred producer rewrites `(block, index, instruction)` for the
+/// pass-end application (dest-verified, like `pending_masks`).
+/// `has_scalar_andn` is the BMI1 ANDN capability resolved once by the
+/// pipeline (target + `-mbmi`/`-march` + the `CCC_NO_ANDN_FUSION` kill
+/// switch): when the backend's Not+And fusion is selectable, Pattern B
+/// defers to it — see the pattern's comment.
+pub(super) fn match_bool_mux_algebra(
+    c_lhs: Operand,
+    c_rhs: Operand,
+    c_op: IrBinOp,
+    c_dest: crate::ir::reexports::Value,
+    c_ty: IrType,
+    block_bi: usize,
+    _index: usize,
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+    def_loc: &[Option<(usize, usize)>],
+    has_scalar_andn: bool,
+) -> Option<(Instruction, Vec<(usize, usize, Instruction)>)> {
+    // Structural resolution is COPY-FREE: the consumer must name its
+    // producers directly. A producer reached through a `Copy` chain would
+    // forward the repurposed value through the copy to any other reader,
+    // and the single-use proof on the underlying value would not see them.
+    let direct_def = |op: &Operand| -> Option<&Instruction> {
+        let Operand::Value(v) = op else {
+            return None;
+        };
+        defs.get(v.0 as usize).and_then(Option::as_ref)
+    };
+    let and_strict = |op: &Operand| -> Option<(Operand, Operand)> {
+        match direct_def(op) {
+            Some(Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs,
+                rhs,
+                ty,
+                ..
+            }) if *ty == c_ty => Some((*lhs, *rhs)),
+            _ => None,
+        }
+    };
+    let single_use = |op: &Operand| -> bool {
+        match op {
+            Operand::Value(v) => use_counts.get(v.0 as usize).copied() == Some(1),
+            _ => false,
+        }
+    };
+    let same_block_before = |op: &Operand, before: usize| -> bool {
+        // May `op` be read at position `before` of this block? Constants and
+        // def-less values (function parameters — every instruction-carried
+        // def, phis included, has a `def_loc` entry): yes, they dominate the
+        // whole function. Same-block defs: index order. Other cross-block
+        // defs: `op` is already an operand of one of the matched
+        // instructions in this block, so its def dominates that use; a
+        // foreign-block dominator of a position in B dominates all of B.
+        match op {
+            Operand::Const(_) => true,
+            Operand::Value(v) => match def_loc.get(v.0 as usize).copied().flatten() {
+                None => true,
+                Some((b, i)) => b != block_bi || i < before,
+            },
+        }
+    };
+    let loc_of = |op: &Operand| -> Option<(usize, usize)> {
+        match op {
+            Operand::Value(v) => def_loc.get(v.0 as usize).copied().flatten(),
+            _ => None,
+        }
+    };
+
+    // ── Pattern C: majority ────────────────────────────────────────────
+    // consumer {Xor|Or}( inner{Xor|Or}(And(·,·), And(·,·)), And(·,·) )
+    //   (inner Or with consumer Xor is a DIFFERENT function — rejected)
+    // maj(x,y,z) = (x&y) ^ (z & (x^y)): ANY of the three pairwise Ands may
+    // be the KEPT term (it is only read); the other two repurpose — the
+    // earlier-positioned slot becomes Xor(p,q) (the kept term's operands)
+    // and the later becomes And(r, xor) (r = the third variable). Every
+    // sound role assignment is collected and the one whose KEPT term is
+    // defined EARLIEST wins: the composite then computes last — the shape
+    // GCC emits (kept-And first, composite last — nothing parks between
+    // the composite and its consumer) and the empirically best ordering
+    // measured on the sha256 corpus.  NOTE: "earliest kept" does NOT
+    // minimise the kept term's live-range LENGTH — keeping an early def
+    // alive to the consumer lengthens it; the preference is an
+    // entry-availability heuristic (a kept term already available at loop
+    // entry costs no intra-loop register), validated by measurement, not
+    // by a live-range optimality proof.  The preference is dominance-safe
+    // by construction: the kept term is only ever READ, at the consumer,
+    // where it already dominates (SSA argument above); a wrong pick is
+    // therefore a perf slip, never a miscompile.
+    for (inner_opnd, third_opnd) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+        let Some(Instruction::BinOp {
+            op: inner_op,
+            lhs: i_lhs,
+            rhs: i_rhs,
+            ty: inner_ty,
+            ..
+        }) = direct_def(&inner_opnd).cloned()
+        else {
+            continue;
+        };
+        if !matches!(inner_op, IrBinOp::Xor | IrBinOp::Or) || inner_ty != c_ty {
+            continue;
+        }
+        if inner_op == IrBinOp::Or && c_op == IrBinOp::Xor {
+            continue; // mixed spelling is not the majority function
+        }
+        let Some((a1_lhs, a1_rhs)) = and_strict(&i_lhs) else {
+            continue;
+        };
+        let Some((a2_lhs, a2_rhs)) = and_strict(&i_rhs) else {
+            continue;
+        };
+        let Some((a3_lhs, a3_rhs)) = and_strict(&third_opnd) else {
+            continue;
+        };
+        // The inner node's value is repurposed away — its only reader
+        // (the consumer) stops reading it — so its dest needs the
+        // single-use proof. The three Ands are named directly
+        // (copy-free), one ty.
+        if !single_use(&inner_opnd) {
+            continue;
+        }
+        let arm_opnds = [i_lhs, i_rhs, third_opnd];
+        let arm_pairs = [(a1_lhs, a1_rhs), (a2_lhs, a2_rhs), (a3_lhs, a3_rhs)];
+        let is_and_of = |pair: (Operand, Operand), a: Operand, b: Operand| {
+            (same_value(pair.0, a, defs) && same_value(pair.1, b, defs))
+                || (same_value(pair.0, b, defs) && same_value(pair.1, a, defs))
+        };
+        // (rank, new_early, new_late, new_consumer, early_idx, late_idx)
+        let mut best: Option<(
+            (u32, u32),
+            Instruction,
+            Instruction,
+            Instruction,
+            usize,
+            usize,
+        )> = None;
+        for kept in 0..3 {
+            let (k_lhs, k_rhs) = arm_pairs[kept];
+            let others = [(kept + 1) % 3, (kept + 2) % 3];
+            for (p, q) in [(k_lhs, k_rhs), (k_rhs, k_lhs)] {
+                if same_value(p, q, defs) {
+                    continue;
+                }
+                // r candidates: the operands of the two non-kept Ands. The
+                // pair must be And(p,r) and And(q,r) for one common r.
+                for r in [
+                    arm_pairs[others[0]].0,
+                    arm_pairs[others[0]].1,
+                    arm_pairs[others[1]].0,
+                    arm_pairs[others[1]].1,
+                ] {
+                    if same_value(r, p, defs) || same_value(r, q, defs) {
+                        continue;
+                    }
+                    let roles_ok = (is_and_of(arm_pairs[others[0]], p, r)
+                        && is_and_of(arm_pairs[others[1]], q, r))
+                        || (is_and_of(arm_pairs[others[0]], q, r)
+                            && is_and_of(arm_pairs[others[1]], p, r));
+                    if !roles_ok {
+                        continue;
+                    }
+                    // Repurposed producers: the consumer's own block (v1).
+                    let (Some((b1, i1)), Some((b2, i2))) =
+                        (loc_of(&arm_opnds[others[0]]), loc_of(&arm_opnds[others[1]]))
+                    else {
+                        continue;
+                    };
+                    if b1 != block_bi || b2 != block_bi {
+                        continue;
+                    }
+                    // Both repurposed Ands change value: single-use proofs.
+                    if !single_use(&arm_opnds[others[0]]) || !single_use(&arm_opnds[others[1]]) {
+                        continue;
+                    }
+                    // The And(r, ·) reads the Xor's dest: earlier slot first.
+                    let (early, late, ei, li) = if i1 < i2 {
+                        (others[0], others[1], i1, i2)
+                    } else {
+                        (others[1], others[0], i2, i1)
+                    };
+                    // New operands must dominate their new positions: the
+                    // Xor reads the KEPT term's operands (p, q) at the
+                    // early slot; the And reads r at the late slot.
+                    if !same_block_before(&p, ei) || !same_block_before(&q, ei) {
+                        continue;
+                    }
+                    if !same_block_before(&r, li) {
+                        continue;
+                    }
+                    let (Operand::Value(ev), Operand::Value(lv), Operand::Value(kv)) =
+                        (arm_opnds[early], arm_opnds[late], arm_opnds[kept])
+                    else {
+                        continue;
+                    };
+                    let new_early = Instruction::BinOp {
+                        dest: ev,
+                        op: IrBinOp::Xor,
+                        lhs: p,
+                        rhs: q,
+                        ty: c_ty,
+                    };
+                    let new_late = Instruction::BinOp {
+                        dest: lv,
+                        op: IrBinOp::And,
+                        lhs: r,
+                        rhs: Operand::Value(ev),
+                        ty: c_ty,
+                    };
+                    let new_consumer = Instruction::BinOp {
+                        dest: c_dest,
+                        op: IrBinOp::Xor,
+                        lhs: Operand::Value(kv),
+                        rhs: Operand::Value(lv),
+                        ty: c_ty,
+                    };
+                    // Kept-term rank: entry-available first, then the
+                    // same-block def order.
+                    let rank = match def_loc.get(kv.0 as usize).copied().flatten() {
+                        Some((b, i)) if b == block_bi => (1, i as u32),
+                        _ => (0, 0),
+                    };
+                    if best.as_ref().is_none_or(|(br, ..)| rank < *br) {
+                        // Store the INSTRUCTION indices (ei, li) — the
+                        // pending rewrites address block slots, not arms.
+                        best = Some((rank, new_early, new_late, new_consumer, ei, li));
+                    }
+                }
+            }
+        }
+        if let Some((_, new_early, new_late, new_consumer, ei, li)) = best {
+            let pending = vec![(block_bi, ei, new_early), (block_bi, li, new_late)];
+            return Some((new_consumer, pending));
+        }
+    }
+
+    // ── Pattern B: mux (CH) ────────────────────────────────────────────
+    // consumer {Xor|Or}( And(x,y), And(~x,z) )  (either arm order)
+    // →  early := Xor(y, z);  late := And(x, early);  consumer := Xor(z, late)
+    // The EARLIER-defined And always becomes the inner xor; the roles
+    // ((x,y)-side vs (~x,z)-side) are found either way round, and BOTH of
+    // the xor's operands (y and z) must dominate the early position — in
+    // each role assignment exactly one of them is new to it.
+    //
+    // BMI1 defer: the backend fuses a single-use `Not` that IMMEDIATELY
+    // precedes its `And` into one 3-operand `andn` (detect_and_not_fusions
+    // + emit_and_not_impl) — the shape GCC, Clang and ICX all emit for
+    // CH. Folding here would erase the Not the fusion needs. The fold
+    // defers exactly when that fusion is predictable at THIS point:
+    // `has_scalar_andn` (the pipeline resolved BMI1 + the kill switch),
+    // the Not's type is in the fusion's width domain, its dest is
+    // single-use, and it sits at the immediately preceding index of the
+    // SAME block as the ~x-side And. A Not reached through a Copy chain
+    // never predicts (the fusion needs the raw adjacency).
+    let andn_fusion_predicted = |not_opnd: Operand, and_opnd: Operand| -> bool {
+        andn_fusion_predicted_at(defs, use_counts, def_loc, c_ty, not_opnd, and_opnd)
+    };
+    for (first, second) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+        let Some((f_lhs, f_rhs)) = and_strict(&first) else {
+            continue;
+        };
+        let Some((s_lhs, s_rhs)) = and_strict(&second) else {
+            continue;
+        };
+        let (Some((fb, fi)), Some((sb, si))) = (loc_of(&first), loc_of(&second)) else {
+            continue;
+        };
+        if fb != block_bi || sb != block_bi || !(fi < si) {
+            continue;
+        }
+        if !single_use(&first) || !single_use(&second) {
+            continue;
+        }
+        let Operand::Value(fv) = first else { continue };
+        let Operand::Value(sv) = second else { continue };
+        for swap_roles in [false, true] {
+            let (xy_lhs, xy_rhs) = if swap_roles {
+                (s_lhs, s_rhs)
+            } else {
+                (f_lhs, f_rhs)
+            };
+            let (nz_lhs, nz_rhs) = if swap_roles {
+                (f_lhs, f_rhs)
+            } else {
+                (s_lhs, s_rhs)
+            };
+            let nz_and = if swap_roles { first } else { second };
+            for (x, y) in [(xy_lhs, xy_rhs), (xy_rhs, xy_lhs)] {
+                for (maybe_not, z) in [(nz_lhs, nz_rhs), (nz_rhs, nz_lhs)] {
+                    if let Some(nx) = not_source(maybe_not, defs) {
+                        if !same_value(nx, x, defs) {
+                            continue;
+                        }
+                        // The andn fusion is the better form under BMI1:
+                        // defer the whole mux fold to the backend.
+                        if has_scalar_andn && andn_fusion_predicted(maybe_not, nz_and) {
+                            continue;
+                        }
+                        // The repurposed early And becomes Xor(y, z); both
+                        // must dominate its position (whichever of the two
+                        // is an operand of the LATE arm is new here).
+                        if !same_block_before(&y, fi) || !same_block_before(&z, fi) {
+                            continue;
+                        }
+                        let new_first = Instruction::BinOp {
+                            dest: fv,
+                            op: IrBinOp::Xor,
+                            lhs: y,
+                            rhs: z,
+                            ty: c_ty,
+                        };
+                        let new_second = Instruction::BinOp {
+                            dest: sv,
+                            op: IrBinOp::And,
+                            lhs: x,
+                            rhs: Operand::Value(fv),
+                            ty: c_ty,
+                        };
+                        let new_consumer = Instruction::BinOp {
+                            dest: c_dest,
+                            op: IrBinOp::Xor,
+                            lhs: z,
+                            rhs: Operand::Value(sv),
+                            ty: c_ty,
+                        };
+                        let pending = vec![(fb, fi, new_first), (sb, si, new_second)];
+                        return Some((new_consumer, pending));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Pattern A: distributive ────────────────────────────────────────
+    // consumer {Xor|Or}( And(x,y), And(x,z) )  →  repurposed := Xor/Or(y,z);
+    // consumer := And(x, repurposed). Creates no new dominance edges beyond
+    // the repurposed operand's def, checked below.
+    //
+    // MAJ defer: when this pair is the INNER of a majority tree, firing
+    // here destroys the structure Pattern C needs — the pair's Ands get
+    // folded into `x & (y^z)`, and the third pairwise And is left reading
+    // a composite computed before it (the park the emitter then pays
+    // for; sha256_transform's MAJ was exactly this). Defer when C would
+    // fire at the outer consumer: find the {Xor|Or} that reads this
+    // consumer's dest and ask the matcher, recursively, on the same defs
+    // snapshot. The probe is exact under the scan order (C runs before A
+    // at the outer's own turn, and no pattern between here and there
+    // touches a three-And majority); if an intermediate fold ever did,
+    // the loss is a missed optimization, never a miscompile. The
+    // recursion cannot re-enter: at the outer, both arms' defs must be
+    // Ands for A to fire, and one of them is this consumer (a Xor/Or).
+    for (a, b) in [(c_lhs, c_rhs), (c_rhs, c_lhs)] {
+        let Some((a_lhs, a_rhs)) = and_strict(&a) else {
+            continue;
+        };
+        let Some((b_lhs, b_rhs)) = and_strict(&b) else {
+            continue;
+        };
+        if !single_use(&a) {
+            continue;
+        }
+        let Some((ab, ai)) = loc_of(&a) else {
+            continue;
+        };
+        if ab != block_bi {
+            continue;
+        }
+        for (x, y) in [(a_lhs, a_rhs), (a_rhs, a_lhs)] {
+            for (x2, z) in [(b_lhs, b_rhs), (b_rhs, b_lhs)] {
+                if !same_value(x, x2, defs) || same_value(y, z, defs) {
+                    continue;
+                }
+                // z is new to the repurposed `a`.
+                if !same_block_before(&z, ai) {
+                    continue;
+                }
+                // Majority-defer probe (cheap pre-filter: the outer
+                // reader exists only when this dest is single-use).
+                if use_counts.get(c_dest.0 as usize).copied() == Some(1) {
+                    let mut deferred = false;
+                    for cand in defs.iter().filter_map(Option::as_ref) {
+                        let Instruction::BinOp {
+                            op: u_op,
+                            lhs: u_lhs,
+                            rhs: u_rhs,
+                            dest: u_dest,
+                            ty: u_ty,
+                        } = cand
+                        else {
+                            continue;
+                        };
+                        if !matches!(u_op, IrBinOp::Xor | IrBinOp::Or)
+                            || *u_ty != c_ty
+                            || (*u_lhs != Operand::Value(c_dest)
+                                && *u_rhs != Operand::Value(c_dest))
+                        {
+                            continue;
+                        }
+                        let Some((ub, ui)) = def_loc.get(u_dest.0 as usize).copied().flatten()
+                        else {
+                            continue;
+                        };
+                        if match_bool_mux_algebra(
+                            *u_lhs,
+                            *u_rhs,
+                            *u_op,
+                            *u_dest,
+                            *u_ty,
+                            ub,
+                            ui,
+                            defs,
+                            use_counts,
+                            def_loc,
+                            has_scalar_andn,
+                        )
+                        .is_some()
+                        {
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if deferred {
+                        continue;
+                    }
+                }
+                let Operand::Value(av) = a else { continue };
+                let inner_op = if c_op == IrBinOp::Or {
+                    IrBinOp::Or
+                } else {
+                    IrBinOp::Xor
+                };
+                let new_a = Instruction::BinOp {
+                    dest: av,
+                    op: inner_op,
+                    lhs: y,
+                    rhs: z,
+                    ty: c_ty,
+                };
+                let new_consumer = Instruction::BinOp {
+                    dest: c_dest,
+                    op: IrBinOp::And,
+                    lhs: x,
+                    rhs: Operand::Value(av),
+                    ty: c_ty,
+                };
+                let pending = vec![(ab, ai, new_a)];
+                return Some((new_consumer, pending));
+            }
+        }
+    }
+
+    None
+}
+
+// A cast is not a structural alias of an arithmetic node. In particular,
+// traversing trunc/zext can drop significant bits inside SWAR/swap networks.
+// Count-only canonicalization uses `peel` separately; values do not.
+fn binop(
+    opnd: Operand,
+    wanted: IrBinOp,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        }) if *op == wanted => Some((*lhs, *rhs, *ty)),
+        _ => None,
+    }
+}
+
+/// Interpret a literal in the arithmetic node's ring, not its storage
+/// carrier. For example I16(-1) used by a 64-bit AND is all 64 bits set,
+/// NOT the low-16 mask. `const_u64` alone would confuse these two cases.
+fn const_in_ring(op: Operand, bits: usize) -> Option<u64> {
+    let Operand::Const(c) = op else {
+        return None;
+    };
+    if !(1..=64).contains(&bits) {
+        return None;
+    }
+    let mask = u64::MAX >> (64 - bits);
+    c.to_i128().map(|n| n as u64 & mask)
+}
+
+fn commutative_const(
+    opnd: Operand,
+    wanted: IrBinOp,
+    constant: u64,
+    bits: usize,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    let (lhs, rhs, ty) = binop(opnd, wanted, defs)?;
+    if !ty.is_integer() || ty.size() * 8 != bits {
+        return None;
+    }
+    if const_in_ring(rhs, bits) == Some(constant) {
+        Some(lhs)
+    } else if const_in_ring(lhs, bits) == Some(constant) {
+        Some(rhs)
+    } else {
+        None
+    }
+}
+
+fn shift(
+    opnd: Operand,
+    wanted: IrBinOp,
+    amount: u64,
+    bits: usize,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    let (lhs, rhs, ty) = binop(opnd, wanted, defs)?;
+    if !ty.is_integer() || ty.size() * 8 != bits {
+        return None;
+    }
+    (const_u64(rhs) == Some(amount)).then_some(lhs)
+}
+
+/// One half of a rotate: `value` shifted by `amount` with the shift kind the
+/// caller asked for.  Unlike `shift`, the amount is returned as an `Operand`
+/// rather than matched against a constant, because the complementary half of a
+/// run-time rotate is a live `W - n` subtraction, not a literal.
+fn shift_any(
+    opnd: Operand,
+    wanted: IrBinOp,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, IrType)> {
+    let (lhs, rhs, ty) = binop(opnd, wanted, defs)?;
+    Some((lhs, rhs, ty))
+}
+
+/// Is `opnd` the expression `width - other`?  The complementary half of a
+/// variable-count rotate is spelled exactly this way (`ROTL32(v, n)` expands
+/// to `(v << n) | (v >> (32 - n))`), and recognizing it lets the rotate keep
+/// `n` directly so the subtraction dies with its last use.
+fn is_width_minus(opnd: Operand, other: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
+    let Some((lhs, rhs, _)) = binop(opnd, IrBinOp::Sub, defs) else {
+        return false;
+    };
+    const_u64(peel(lhs, defs)) == Some(width) && same(rhs, other, defs)
+}
+
+/// Recognize the portable rotate idiom; returns `(value, amount, is_left)`.
+///
+/// For a width-`W` integer `x` the two source spellings are
+///
+/// ```c
+/// #define ROTL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+/// #define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+/// ```
+///
+/// They appear verbatim in ChaCha20/Salsa20, SHA-1/SHA-256/SHA-512, MD5,
+/// BLAKE2, SipHash, RC5, Speck, in the Linux kernel's `rol32`/`ror32`/
+/// `rol64`/`ror64`, and in zlib-ng's and zstd's hash/xxh paths.  Left as a
+/// shift/or triple each rotate costs three instructions and two dependent ALU
+/// results; x86 `rol`/`ror`, AArch64 `ror`/`extr` and RISC-V's funnel shift
+/// all do the same work in one (RISC-V in four, but still without the
+/// temporary the triple's `or` needs).
+///
+/// Both `Or` operand orders are matched, and the complementary amount may be a
+/// literal the frontend already folded (`>> 16`) or a live `W - n`, so constant
+/// and run-time rotation amounts are both recognized.
+///
+/// Two deliberate restrictions:
+///
+/// * The right-shift half must be *logical*.  With an arithmetic shift the sign
+///   bit is replicated rather than wrapped around, so the expression is not a
+///   rotate and folding it would be a miscompile.
+/// * Only 32- and 64-bit types are recognized.  C's integer promotions already
+///   run a narrower rotate at `int` width, and the x86 hardware count mask is
+///   mod 32 for every operand size below 64 bits, so an 8- or 16-bit `rol`
+///   would wrap at the wrong width.
+///
+/// Direction is chosen to match what the reference compilers emit, so oracle
+/// diffs stay readable: for a run-time amount the direction whose count is the
+/// *direct* value (not the `W - n` subtraction) wins, which also makes that
+/// subtraction dead; for two constants the smaller amount wins, reproducing
+/// GCC's `ror $7` for `(x >> 7) | (x << 25)` and its `rol $12` for
+/// `(x << 12) | (x >> 20)`.
+fn match_rotate(
+    result: Operand,
+    max_bits: u32,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, bool)> {
+    let (a, b, ty) = binop(result, IrBinOp::Or, defs)?;
+    let width = match ty {
+        IrType::I32 | IrType::U32 => 32u64,
+        IrType::I64 | IrType::U64 => 64u64,
+        // Narrower and wider types are deliberately not recognized; see the
+        // function comment for the count-mask and promotion reasons.
+        _ => return None,
+    };
+    // Per-target capability: i686 routes I64/U64 arithmetic through its
+    // paired-register path rather than the 32-bit ALU path that owns the
+    // native `rol`/`ror` lowering, so it only advertises 32-bit rotates.
+    if width > u64::from(max_bits) {
+        return None;
+    }
+
+    // The two halves in either `Or` order.  Each shift must run at the
+    // OR's own width: `binop` peels the OR's operands through casts before
+    // matching the shift defs, and a shift found that way (e.g. a u32 shift
+    // widened by `(uint64_t)(x << n)` for a u64 OR) computes at a different
+    // width than the rotate would, so the amounts cannot be checked against
+    // `width` at all.  Only same-width halves are a rotate.
+    let halves = [(a, b), (b, a)];
+    let mut matched = None;
+    for (x, y) in halves {
+        if let (Some(shl), Some(lshr)) = (
+            shift_any(x, IrBinOp::Shl, defs),
+            shift_any(y, IrBinOp::LShr, defs),
+        ) {
+            matched = Some((shl, lshr));
+            break;
+        }
+    }
+    let ((shl_val, shl_amt, shl_ty), (lshr_val, lshr_amt, lshr_ty)) = matched?;
+    if shl_ty != ty || lshr_ty != ty {
+        return None;
+    }
+    // The halves must read the SAME SSA value at that width.  Cast-peeling
+    // is unsound here (`zext(x)` and `sext(x)` peel to one root but are
+    // different values), so only `Copy` chains are transparent; the
+    // returned rotate source is the value the shifts actually consume.
+    let value = peel_copies(shl_val, defs);
+    if value != peel_copies(lshr_val, defs) {
+        return None;
+    }
+
+    // The halves must be complementary: either both amounts are constants
+    // summing to the width, or one is literally `width - the_other`.
+    let (amount, is_left) = match (
+        const_u64(peel(shl_amt, defs)),
+        const_u64(peel(lshr_amt, defs)),
+    ) {
+        (Some(left), Some(right)) => {
+            if left.wrapping_add(right) != width || left == 0 || right == 0 {
+                return None;
+            }
+            if left <= right {
+                (shl_amt, true)
+            } else {
+                (lshr_amt, false)
+            }
+        }
+        // Exactly one amount folded to a constant: the other must still be the
+        // explicit `width - amount` subtraction (a frontend that folded one
+        // side usually folds both, but an unfolded `32 - 16` does occur after
+        // inlining), otherwise the halves are not complementary.
+        (Some(_), None) => {
+            if !is_width_minus(lshr_amt, shl_amt, width, defs) {
+                return None;
+            }
+            (shl_amt, true)
+        }
+        (None, Some(_)) => {
+            if !is_width_minus(shl_amt, lshr_amt, width, defs) {
+                return None;
+            }
+            (lshr_amt, false)
+        }
+        (None, None) => {
+            // Both amounts dynamic: accept either complement direction, but
+            // only one of them needs to hold.
+            if is_width_minus(lshr_amt, shl_amt, width, defs)
+                || is_masked_complement(lshr_amt, shl_amt, width, defs)
+            {
+                (shl_amt, true)
+            } else if is_width_minus(shl_amt, lshr_amt, width, defs)
+                || is_masked_complement(shl_amt, lshr_amt, width, defs)
+            {
+                (lshr_amt, false)
+            } else {
+                return None;
+            }
+        }
+    };
+
+    Some((value, strip_rotate_count_mask(amount, width, defs), is_left))
+}
+
+/// The operand under `& (W-1)` when `opnd` is exactly that mask (either
+/// `And` order).
+fn width_masked(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let (lhs, rhs, _) = binop(opnd, IrBinOp::And, defs)?;
+    if const_u64(peel(rhs, defs)) == Some(width - 1) {
+        Some(lhs)
+    } else if const_u64(peel(lhs, defs)) == Some(width - 1) {
+        Some(rhs)
+    } else {
+        None
+    }
+}
+
+/// `m` when `opnd` negates it modulo `W`: `Neg(m)` or `c - m` with
+/// `c ≡ 0 (mod W)` (`0 - m`, `W - m`).
+fn negated_mod_width(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+    if let Operand::Value(v) = peel(opnd, defs)
+        && let Some(Instruction::UnaryOp {
+            op: IrUnaryOp::Neg,
+            src,
+            ..
+        }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    {
+        return Some(*src);
+    }
+    let (lhs, rhs, _) = binop(opnd, IrBinOp::Sub, defs)?;
+    (const_u64(peel(lhs, defs))? % width == 0).then_some(rhs)
+}
+
+/// Is `neg_amt` the UB-free complement `(-n) & (W-1)` of `pos_amt`, which is
+/// `n` or `n & (W-1)`?  This is the spelling portable code uses precisely
+/// because `x >> (W - n)` is undefined for `n == 0` (Linux `rol32`, Regehr's
+/// rotate, hash and cipher kernels).  With `k = n mod W` the halves are
+/// `x << k` and `x >> ((W - k) mod W)`: `x | x == x` for `k == 0`, and the
+/// exact rotate otherwise.  Amounts are compared through integer casts
+/// (`same`), which is sound because every carrier is at least 8 bits wide
+/// and a cast changes a count only by a multiple of `2^8`, a multiple of
+/// `W`.  The complement's mask must be exactly `W-1`: a wider one could
+/// leave an oversize *shift*, whose result the IR does not define modularly.
+/// An unmasked `n` on the positive side matches every backend's native
+/// count masking (x86 `shl %cl`, AArch64 `lslv`, RISC-V `sll`) and C's
+/// undefined oversize shift alike, and `RotateLeft` reduces its count
+/// modulo `W`, so the rewrite is exact for all `n`.
+fn is_masked_complement(
+    neg_amt: Operand,
+    pos_amt: Operand,
+    width: u64,
+    defs: &[Option<Instruction>],
+) -> bool {
+    let Some(m) = width_masked(neg_amt, width, defs)
+        .and_then(|negated| negated_mod_width(negated, width, defs))
+    else {
+        return false;
+    };
+    let core = |op: Operand| width_masked(op, width, defs).unwrap_or(op);
+    same(core(m), core(pos_amt), defs)
+}
+
+/// `RotateLeft`/`RotateRight` reduce their count modulo `W`, so a direct
+/// `n & c` whose low `log2(W)` bits are all ones is the rotate by `n`; the
+/// mask then dies with its last use instead of surviving as an `and`
+/// before `rol %cl`.  Only a mask defined directly (through `Copy` chains,
+/// never a cast) is stripped, so the replacement keeps the amount's type.
+fn strip_rotate_count_mask(amount: Operand, width: u64, defs: &[Option<Instruction>]) -> Operand {
+    let Operand::Value(v) = peel_copies(amount, defs) else {
+        return amount;
+    };
+    let Some(Instruction::BinOp {
+        op: IrBinOp::And,
+        lhs,
+        rhs,
+        ..
+    }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    else {
+        return amount;
+    };
+    let low = width - 1;
+    let full = |c: Operand| const_u64(c).is_some_and(|c| c & low == low);
+    if full(*rhs) && !matches!(lhs, Operand::Const(_)) {
+        *lhs
+    } else if full(*lhs) && !matches!(rhs, Operand::Const(_)) {
+        *rhs
+    } else {
+        amount
+    }
+}
+
+/// Width in bits of the sub-word integer types, or `None` for wider ones.
+fn narrow_width_bits(ty: IrType) -> Option<u64> {
+    match ty {
+        IrType::I8 | IrType::U8 => Some(8),
+        IrType::I16 | IrType::U16 => Some(16),
+        _ => None,
+    }
+}
+
+/// Prove that `opnd`'s bits at positions `[width, 32)` are zero.
+///
+/// The truncation-aware narrow-rotate pattern needs this twice: the two
+/// promoted halves are exact at the narrow width only when the shared source
+/// carries nothing above it.  `AShr` on such a value is `LShr` (the sign bit
+/// it would replicate is provably zero), which is what makes the
+/// C-promotion spelling of the idiom — `(uint16_t)((v << 8) | (v >> 8))`
+/// where both shifts run on the *signed* `int` promotion of `v` — fold.
+///
+/// Only definitions that *construct* the zero-extension are accepted
+/// (`peel_copies` first, so `Copy` webs are transparent):
+///
+/// * a widening cast from an unsigned type no wider than `width` — the
+///   extension fills with zeros (`CastKind::IntWiden` zero-extends exactly
+///   when `from_ty` is unsigned);
+/// * `And` with the full low-`width` mask on either side;
+/// * a constant below `2^width`.
+///
+/// Anything else — `sext` of a narrow value, a phi, a load — is refused:
+/// an unprovable pattern stays unfolded, never miscompiles.
+fn high_bits_zero(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> bool {
+    let v = peel_copies(opnd, defs);
+    // A 64-bit signed-value interpretation is conservative for the promoted
+    // 32-bit use and retains this helper's wider constant-range contract.
+    // In particular an I8(-128) carrier must NOT become the positive 0x80.
+    if let Some(c) = const_in_ring(v, 64) {
+        if width >= 64 {
+            return true;
+        }
+        return c < (1u64 << width);
+    }
+    let Operand::Value(id) = v else {
+        return false;
+    };
+    match defs.get(id.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::Cast { from_ty, to_ty, .. }) => {
+            to_ty.size() > from_ty.size()
+                && from_ty.is_unsigned()
+                && (from_ty.size() as u64) * 8 <= width
+        }
+        Some(Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty,
+            ..
+        }) if matches!(ty, IrType::I32 | IrType::U32) => {
+            let mask = (1u64 << width) - 1;
+            const_in_ring(peel_copies(*lhs, defs), 32) == Some(mask)
+                || const_in_ring(peel_copies(*rhs, defs), 32) == Some(mask)
+        }
+        _ => false,
+    }
+}
+
+/// Truncation-aware narrow rotate.
+///
+/// C runs all 8/16-bit arithmetic at `int` width, so a narrow rotate arrives
+/// promoted: the complements meet only at the NARROW width, and the result is
+/// consumed by a truncation back to it:
+///
+/// ```c
+/// uint16_t rol16_sw(uint16_t v)  { return (uint16_t)((v << 8) | (v >> 8)); }
+/// uint16_t rol16_var(uint16_t v, int c)
+///                                 { return (uint16_t)((v << c) | (v >> (16 - c))); }
+/// ```
+///
+/// The IR shape is `Trunc_W(Or_{32}(Shl_{32}(x, a), Shr_{32}(x, b)))` with
+/// `a + b == W` and `x` provably zero above bit `W` (see [`high_bits_zero`]).
+/// Both shift kinds are accepted on the right half: the promotion of an
+/// unsigned narrow value shifts a signed `int`, arriving as `AShr`, but the
+/// proof makes it exact.
+///
+/// Value identity follows the post-beb28b4c discipline: the halves must read
+/// the SAME SSA value (Copy chains transparent, casts opaque) at the Or's own
+/// width.
+///
+/// The rewrite is exact for every count the IR defines: constant counts in
+/// `[1, W-1]`; run-time counts in `[0, W]` (0 and W both degenerate to the
+/// identity — `Shl(x, 0)` contributes `x` and `Shr(x, W)` contributes zero
+/// under the proof — matching `rol` by `c mod W`).  The x86 hardware count
+/// for 8/16-bit rotates is `(count & 31) mod W` (measured: `rolw` by 16 is
+/// the identity, by 17 a rotate of 1), i.e. exactly count-mod-width, so the
+/// backend needs no masking.
+///
+/// Returns `(value, amount, is_left)` like [`match_rotate`], where `value`
+/// is the *wide* source — the driver emits `Rol_W(Trunc(value), amount)`.
+fn match_narrow_rotate(
+    or_src: Operand,
+    narrow: u64,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, bool)> {
+    let (a, b, ty) = binop(or_src, IrBinOp::Or, defs)?;
+    if !matches!(ty, IrType::I32 | IrType::U32) {
+        return None;
+    }
+    // The two halves in either `Or` order, the right half as LShr or AShr.
+    let mut matched = None;
+    for (x, y) in [(a, b), (b, a)] {
+        if let (Some(shl), Some(shr)) = (
+            shift_any(x, IrBinOp::Shl, defs),
+            shift_any(y, IrBinOp::LShr, defs).or_else(|| shift_any(y, IrBinOp::AShr, defs)),
+        ) {
+            matched = Some((shl, shr));
+            break;
+        }
+    }
+    let ((shl_val, shl_amt, shl_ty), (shr_val, shr_amt, shr_ty)) = matched?;
+    if shl_ty != ty || shr_ty != ty {
+        return None;
+    }
+    let value = peel_copies(shl_val, defs);
+    if value != peel_copies(shr_val, defs) {
+        return None;
+    }
+    if !high_bits_zero(value, narrow, defs) {
+        return None;
+    }
+    // Complementary at the NARROW width, with the same constant / live
+    // `W - n` spellings (and the same direction choice) as `match_rotate`.
+    let (amount, is_left) = match (
+        const_u64(peel(shl_amt, defs)),
+        const_u64(peel(shr_amt, defs)),
+    ) {
+        (Some(left), Some(right)) => {
+            if left + right != narrow || left == 0 || right == 0 {
+                return None;
+            }
+            if left <= right {
+                (shl_amt, true)
+            } else {
+                (shr_amt, false)
+            }
+        }
+        (Some(_), None) => {
+            if !is_width_minus(shr_amt, shl_amt, narrow, defs) {
+                return None;
+            }
+            (shl_amt, true)
+        }
+        (None, Some(_)) => {
+            if !is_width_minus(shl_amt, shr_amt, narrow, defs) {
+                return None;
+            }
+            (shr_amt, false)
+        }
+        (None, None) => {
+            if is_width_minus(shr_amt, shl_amt, narrow, defs) {
+                (shl_amt, true)
+            } else if is_width_minus(shl_amt, shr_amt, narrow, defs) {
+                (shr_amt, false)
+            } else {
+                return None;
+            }
+        }
+    };
+    Some((value, amount, is_left))
+}
+
+// Selected data is also width-sensitive: a truncation between CLZ/CTZ
+// stages changes the next stage's input, even when the predicates still match.
+fn select(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ty,
+            ..
+        }) => Some((*cond, *true_val, *false_val, *ty)),
+        _ => None,
+    }
+}
+
+fn unsigned_le_const(
+    opnd: Operand,
+    constant: u64,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    let Operand::Value(v) = peel(opnd, defs) else {
+        return None;
+    };
+    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+        Some(Instruction::Cmp {
+            op: IrCmpOp::Ule,
+            lhs,
+            rhs,
+            ty,
+            ..
+        }) if matches!(ty, IrType::U32 | IrType::I32)
+            && const_in_ring(*rhs, 32) == Some(constant) =>
+        {
+            Some(*lhs)
+        }
+        _ => None,
+    }
+}
+
+/// A nested select reached through one arm already knows the outer
+/// predicate's truth value. Keep SSA identity (Copy-only): integer casts of
+/// predicates can change zero-ness. No producer is removed or repurposed.
+fn fold_same_condition_select(
+    inst: &Instruction,
+    defs: &[Option<Instruction>],
+) -> Option<Instruction> {
+    let Instruction::Select {
+        dest,
+        cond,
+        true_val,
+        false_val,
+        ty,
+    } = inst
+    else {
+        return None;
+    };
+    if !ty.is_integer() {
+        return None;
+    }
+    let arm = |value: Operand, truth: bool| {
+        if let Some((inner_cond, yes, no, inner_ty)) = select(value, defs) {
+            if inner_ty == *ty && same_value(*cond, inner_cond, defs) {
+                return if truth { yes } else { no };
+            }
+        }
+        value
+    };
+    let yes = arm(*true_val, true);
+    let no = arm(*false_val, false);
+    (yes != *true_val || no != *false_val).then_some(Instruction::Select {
+        dest: *dest,
+        cond: *cond,
+        true_val: yes,
+        false_val: no,
+        ty: *ty,
+    })
+}
+
+/// LLVM #233753: negation is a bijection of the fixed-width integer ring,
+/// so select(c, -x, x) is zero exactly when x is zero, independently of c.
+/// Only Eq/Ne and identical 32/64-bit integer types are admitted. Copies are
+/// transparent; casts, shifts, FP operations and different roots are not.
+/// Producers (including an observable condition load) are never edited here.
+fn fold_sign_choice_zero(inst: &Instruction, defs: &[Option<Instruction>]) -> Option<Instruction> {
+    let Instruction::Cmp {
+        dest,
+        op,
+        lhs,
+        rhs,
+        ty,
+    } = inst
+    else {
+        return None;
+    };
+    if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne)
+        || !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+    {
+        return None;
+    }
+    let width = ty.size() * 8;
+    let value = if const_in_ring(*rhs, width) == Some(0) {
+        *lhs
+    } else if const_in_ring(*lhs, width) == Some(0) {
+        *rhs
+    } else {
+        return None;
+    };
+    let (_, yes, no, select_ty) = select(value, defs)?;
+    if select_ty != *ty {
+        return None;
+    }
+    for (negative, original) in [(yes, no), (no, yes)] {
+        let Operand::Value(v) = peel_copies(negative, defs) else {
+            continue;
+        };
+        let source = match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::UnaryOp {
+                op: IrUnaryOp::Neg,
+                src,
+                ty: neg_ty,
+                ..
+            }) if neg_ty == ty => *src,
+            Some(Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs: zero,
+                rhs: src,
+                ty: neg_ty,
+                ..
+            }) if neg_ty == ty && const_in_ring(*zero, width) == Some(0) => *src,
+            _ => continue,
+        };
+        if same_value(source, original, defs) {
+            return Some(Instruction::Cmp {
+                dest: *dest,
+                op: *op,
+                lhs: original,
+                rhs: Operand::Const(IrConst::from_i64(0, *ty)),
+                ty: *ty,
+            });
+        }
+    }
+    None
+}
+
+/// `(x << k) >>u k` is `x & (2^(W-k) - 1)` for every constant `k` in `1..W`.
+///
+/// The left shift drops the top `k` bits and moves the low `W-k` bits up; the
+/// LOGICAL right shift returns zeros above them, so the pair keeps exactly the
+/// low `W-k` bits of `x`.  (`k`, not `W-k`, is the amount that leaves the
+/// value: the first draft of this fold masked with `2^k - 1` and was wrong for
+/// every `x` with a bit at or above `k`; the oracle differential caught it.)  Two shifts and a temporary become one AND, and
+/// on every supported target the AND is one instruction while the pair is
+/// two plus a move (the same register cannot serve both shifts without a
+/// copy on x86, and the mask is an immediate).
+///
+/// `AShr` is deliberately not admitted: `(x << k) >>s k` sign-extends a low
+/// bit field, which differs from the mask on every negative input.  A
+/// mismatched amount, a mismatched width, `k == 0` (already the identity) and
+/// `k >= W` (undefined in C, and the frontend never creates it) are refused,
+/// so the fold is total and its rewrite is exact for all admitted shapes.
+/// Only the consumer is rewritten; the shifts become dead and the ordinary
+/// dead-code pass removes them, so a live user of the left shift keeps its
+/// value.
+fn fold_shift_pair_into_mask(
+    inst: &Instruction,
+    defs: &[Option<Instruction>],
+) -> Option<Instruction> {
+    let Instruction::BinOp {
+        dest,
+        op: IrBinOp::LShr,
+        lhs,
+        rhs,
+        ty,
+    } = inst
+    else {
+        return None;
+    };
+    if !ty.is_integer() {
+        return None;
+    }
+    let bits = ty.size() * 8;
+    let amount = const_in_ring(*rhs, bits)?;
+    if amount == 0 || amount as usize >= bits {
+        return None;
+    }
+    // Only masks that fit an unsigned 32-bit immediate.  A wider mask has to be
+    // materialized: `(x << 1) >>u 1` on u64 became `movabsq $0x7fff…, %rax;
+    // andq %rax, %rdi`, four instructions and ten bytes of constant, where the
+    // shift pair was four instructions and eight bytes, and GCC emits
+    // `movq; btrq $63` — three.  Counting instructions alone called that a tie;
+    // the corpus sweep found it in clang-c/C2y/n3369_3.c.  The guard keeps the
+    // fold where every supported target has a one-instruction AND, and leaves
+    // wider masks to the backend, which can still choose the pair.
+    if bits - amount as usize > 32 {
+        return None;
+    }
+    let Operand::Value(v) = peel_copies(*lhs, defs) else {
+        return None;
+    };
+    let Some(Instruction::BinOp {
+        op: IrBinOp::Shl,
+        lhs: source,
+        rhs: shl_amount,
+        ty: shl_ty,
+        ..
+    }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    else {
+        return None;
+    };
+    if *shl_ty != *ty || const_in_ring(*shl_amount, bits)? != amount {
+        return None;
+    }
+    // `1 <= amount < bits`, so `bits - amount` is in `1..=63`.
+    let mask = (1u64 << (bits - amount as usize)) - 1;
+    Some(Instruction::BinOp {
+        dest: *dest,
+        op: IrBinOp::And,
+        lhs: *source,
+        rhs: Operand::Const(IrConst::from_i64(mask as i64, *ty)),
+        ty: *ty,
+    })
+}
+
+/// A comparison of one SSA value against a constant, viewed through `Copy`
+/// chains: the comparison op, the value, the constant (in the ring of the
+/// compared type) and that type.  Ordering comparisons are admitted only
+/// because the caller checks which op it received; the constant may sit on
+/// either side here only for the symmetric Eq/Ne ops.
+fn cmp_against_constant(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<(IrCmpOp, Operand, u64, IrType)> {
+    let Operand::Value(v) = peel_copies(opnd, defs) else {
+        return None;
+    };
+    let Some(Instruction::Cmp {
+        op, lhs, rhs, ty, ..
+    }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    else {
+        return None;
+    };
+    if !ty.is_integer() || !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+        return None;
+    }
+    let bits = ty.size() * 8;
+    if let Some(c) = const_in_ring(*rhs, bits) {
+        return Some((*op, *lhs, c, *ty));
+    }
+    if let Some(c) = const_in_ring(*lhs, bits) {
+        return Some((*op, *rhs, c, *ty));
+    }
+    None
+}
+
+/// `(x == 0) | (x == 1)` is `x <=u 1`, and `(x != 0) & (x != 1)` is
+/// `x >u 1`.
+///
+/// Both sides test the same value against two constants that form the
+/// half-open membership set `{0, 1}`, which a single unsigned comparison
+/// expresses exactly: every other value of the ring, including every
+/// negative one, is unsigned-above `1`.  The rule is the comparator form of
+/// LLVM #234703's implied-false disjunct and #237533's guarded-OR fold, kept
+/// to the one set whose single-comparison rewrite needs no subtract (a
+/// shifted set such as `{A, A+1}` would need `x - A`, which is a second
+/// instruction and not this fold's business).
+///
+/// The two comparisons must have the same op, the same compared value (after
+/// `Copy` peeling) and the same integer type; the constants may appear in
+/// either order on either comparison.  A mixed pair (`== 0` with `!= 1`)
+/// is a different function and is refused, as is any constant other than
+/// `{0, 1}`.  Only the consumer is rewritten, so shared comparisons keep
+/// their values.
+fn fold_unit_interval_test(
+    inst: &Instruction,
+    defs: &[Option<Instruction>],
+) -> Option<Instruction> {
+    let Instruction::BinOp {
+        dest,
+        op: logic @ (IrBinOp::Or | IrBinOp::And),
+        lhs,
+        rhs,
+        ty: _,
+    } = inst
+    else {
+        return None;
+    };
+    let (op_a, value_a, const_a, ty_a) = cmp_against_constant(*lhs, defs)?;
+    let (op_b, value_b, const_b, ty_b) = cmp_against_constant(*rhs, defs)?;
+    if ty_a != ty_b || op_a != op_b {
+        return None;
+    }
+    if !same_value(value_a, value_b, defs) {
+        return None;
+    }
+    if !matches!((const_a, const_b), (0, 1) | (1, 0)) {
+        return None;
+    }
+    let op = match (logic, op_a) {
+        (IrBinOp::Or, IrCmpOp::Eq) => IrCmpOp::Ule,
+        (IrBinOp::And, IrCmpOp::Ne) => IrCmpOp::Ugt,
+        _ => return None,
+    };
+    Some(Instruction::Cmp {
+        dest: *dest,
+        op,
+        lhs: value_a,
+        rhs: Operand::Const(IrConst::from_i64(1, ty_a)),
+        ty: ty_a,
+    })
+}
+
+fn add_const(
+    opnd: Operand,
+    amount: u64,
+    bits: usize,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    commutative_const(opnd, IrBinOp::Add, amount, bits, defs)
+}
+
+struct ZeroMaskArms {
+    tested: Operand,
+    zero_arm: Operand,
+    nonzero_arm: Operand,
+    ty: IrType,
+}
+
+struct Expansion {
+    block: usize,
+    index: usize,
+    dest: Value,
+    replacement: Vec<Instruction>,
+}
+
+/// Normalize one CTZ select by semantic zero/nonzero polarity.
+/// If-conversion often uses the mask itself as its condition, reversing the
+/// arms. Explicit Eq/Ne comparisons are accepted only at the 64-bit value
+/// width. Casts are NOT aliases: truncating a mask can change its zero-ness.
+fn zero_mask_select(
+    result: Operand,
+    mask: u64,
+    defs: &[Option<Instruction>],
+) -> Option<ZeroMaskArms> {
+    let (cond, yes, no, ty) = select(result, defs)?;
+    if let Some(x) = commutative_const(cond, IrBinOp::And, mask, 64, defs) {
+        return Some(ZeroMaskArms {
+            tested: x,
+            zero_arm: no,
+            nonzero_arm: yes,
+            ty,
+        });
+    }
+    let Operand::Value(v) = peel_copies(cond, defs) else {
+        return None;
+    };
+    let Instruction::Cmp {
+        op,
+        lhs,
+        rhs,
+        ty: cmp_ty,
+        ..
+    } = defs.get(v.0 as usize).and_then(Option::as_ref)?
+    else {
+        return None;
+    };
+    if !matches!(cmp_ty, IrType::U64 | IrType::I64) {
+        return None;
+    }
+    let tested = if const_in_ring(*rhs, 64) == Some(0) {
+        *lhs
+    } else if const_in_ring(*lhs, 64) == Some(0) {
+        *rhs
+    } else {
+        return None;
+    };
+    let x = commutative_const(tested, IrBinOp::And, mask, 64, defs)?;
+    match op {
+        IrCmpOp::Eq => Some(ZeroMaskArms {
+            tested: x,
+            zero_arm: yes,
+            nonzero_arm: no,
+            ty,
+        }),
+        IrCmpOp::Ne => Some(ZeroMaskArms {
+            tested: x,
+            zero_arm: no,
+            nonzero_arm: yes,
+            ty,
+        }),
+        _ => None,
+    }
+}
+
+fn is_incremented(
+    incremented: Operand,
+    base: Operand,
+    amount: u64,
+    bits: usize,
+    defs: &[Option<Instruction>],
+) -> bool {
+    if add_const(incremented, amount, bits, defs).is_some_and(|value| same_value(value, base, defs))
+    {
+        return true;
+    }
+    // Compare literals in the count's ring. Do not peel casts here: e.g.
+    // trunc8(256) is NOT the 32-bit increment of 255, even though the
+    // uncast storage literals differ by one.
+    match (
+        const_in_ring(peel_copies(incremented, defs), bits),
+        const_in_ring(peel_copies(base, defs), bits),
+    ) {
+        (Some(a), Some(b)) => a == b.wrapping_add(amount) & (u64::MAX >> (64 - bits)),
+        _ => false,
+    }
+}
+
+/// Match the canonical 32-bit parallel population-count expression:
+///
+/// `x -= (x >> 1) & 0x55555555; ...; (x * 0x01010101) >> 24`
+fn match_popcount32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    // Every arithmetic node must run in the 32-bit ring. The masks do NOT
+    // make intervening truncations harmless: trunc16 before the final mask
+    // counts only the low two bytes (16, not 32, for UINT32_MAX). Likewise,
+    // a widened multiply followed by a widened shift is not a 32-bit count.
+    // Structural matching is Copy-only, and shared values retain cast identity.
+    let bin = |value, op| {
+        let (lhs, rhs, ty) = binop(value, op, defs)?;
+        matches!(ty, IrType::U32 | IrType::I32).then_some((lhs, rhs))
+    };
+    let with_const = |value, op, constant| {
+        let (lhs, rhs) = bin(value, op)?;
+        if const_in_ring(rhs, 32) == Some(constant) {
+            Some(lhs)
+        } else if const_in_ring(lhs, 32) == Some(constant) {
+            Some(rhs)
+        } else {
+            None
+        }
+    };
+    let shifted_by = |value, amount| {
+        let (lhs, rhs) = bin(value, IrBinOp::LShr)?;
+        (const_u64(rhs) == Some(amount)).then_some(lhs)
+    };
+    let multiplied = shifted_by(result, 24)?;
+    let stage3 = with_const(multiplied, IrBinOp::Mul, 0x0101_0101)?;
+    let stage3_add = with_const(stage3, IrBinOp::And, 0x0f0f_0f0f)?;
+    let (a, b) = bin(stage3_add, IrBinOp::Add)?;
+    let stage2 = if shifted_by(a, 4).is_some_and(|base| same_value(base, b, defs)) {
+        b
+    } else if shifted_by(b, 4).is_some_and(|base| same_value(base, a, defs)) {
+        a
+    } else {
+        return None;
+    };
+
+    let (a, b) = bin(stage2, IrBinOp::Add)?;
+    let a_base = with_const(a, IrBinOp::And, 0x3333_3333)?;
+    let b_base = with_const(b, IrBinOp::And, 0x3333_3333)?;
+    let stage1 = if shifted_by(a_base, 2).is_some_and(|base| same_value(base, b_base, defs)) {
+        b_base
+    } else if shifted_by(b_base, 2).is_some_and(|base| same_value(base, a_base, defs)) {
+        a_base
+    } else {
+        return None;
+    };
+
+    let (original, subtracted) = bin(stage1, IrBinOp::Sub)?;
+    let shifted = with_const(subtracted, IrBinOp::And, 0x5555_5555)?;
+    let shifted_base = shifted_by(shifted, 1)?;
+    same_value(original, shifted_base, defs).then_some(peel_copies(original, defs))
+}
+
+/// Match the common binary-search implementation of 32-bit count-leading-zeros.
+/// If-conversion turns each source-level `if` into paired selects: one shifts the
+/// working value and the other increments the count.  Requiring both chains to
+/// agree makes this substantially stricter than merely matching the constants.
+fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let (final_cond, final_true, final_false, final_ty) = select(result, defs)?;
+    if final_ty != IrType::I32 && final_ty != IrType::U32 {
+        return None;
+    }
+    let mut count = final_false;
+    if !is_incremented(final_true, count, 1, 32, defs) {
+        return None;
+    }
+    let mut working = unsigned_le_const(final_cond, 0x7fff_ffff, defs)?;
+
+    for (amount, threshold) in [
+        (2, 0x3fff_ffff),
+        (4, 0x0fff_ffff),
+        (8, 0x00ff_ffff),
+        (16, 0x0000_ffff),
+    ] {
+        let (count_cond, count_true, count_false, count_ty) = select(count, defs)?;
+        if !matches!(count_ty, IrType::U32 | IrType::I32) {
+            return None;
+        }
+        if !is_incremented(count_true, count_false, amount, 32, defs) {
+            return None;
+        }
+        let (value_cond, value_true, value_false, value_ty) = select(working, defs)?;
+        if value_ty != IrType::U32 && value_ty != IrType::I32 {
+            return None;
+        }
+        if !same_value(count_cond, value_cond, defs) {
+            return None;
+        }
+        if !shift(value_true, IrBinOp::Shl, amount, 32, defs)
+            .is_some_and(|base| same_value(base, value_false, defs))
+        {
+            return None;
+        }
+        let compared = unsigned_le_const(value_cond, threshold, defs)?;
+        if !same_value(compared, value_false, defs) {
+            return None;
+        }
+        count = count_false;
+        working = value_false;
+    }
+    (const_in_ring(peel_copies(count, defs), 32) == Some(0)).then_some(peel_copies(working, defs))
+}
+
+/// Match the six-stage portable 64-bit `__ffs` tree used by Linux:
+///
+/// ```text
+/// if ((x & 0xffffffff) == 0) { n += 32; x >>= 32; }
+/// if ((x & 0xffff) == 0)     { n += 16; x >>= 16; }
+/// ...
+/// ```
+///
+/// If-conversion produces a select chain for `x` and a parallel select chain
+/// for `n`. Requiring every condition, shift, mask and increment to agree is
+/// what makes this safe. The zero case is preserved explicitly: the Linux tree
+/// returns 63 for zero, while native `tzcnt` returns the operand width. The
+/// rewrite sets bit 63 before CtzNonZero, mapping zero to 63 without a guard.
+fn match_ctz64(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let final_arms = zero_mask_select(result, 1, defs)?;
+    let mut working = final_arms.tested;
+    let mut count = final_arms.nonzero_arm;
+    if !matches!(final_arms.ty, IrType::I32 | IrType::U32)
+        || !is_incremented(final_arms.zero_arm, count, 1, 32, defs)
+    {
+        return None;
+    }
+    for (amount, mask) in [(2, 3), (4, 15), (8, 255), (16, 65535), (32, 0xffff_ffff)] {
+        let counts = zero_mask_select(count, mask, defs)?;
+        if !matches!(counts.ty, IrType::I32 | IrType::U32)
+            || !is_incremented(counts.zero_arm, counts.nonzero_arm, amount, 32, defs)
+        {
+            return None;
+        }
+        let values = zero_mask_select(working, mask, defs)?;
+        if !matches!(values.ty, IrType::I64 | IrType::U64)
+            || !same_value(counts.tested, values.tested, defs)
+            || !same_value(values.tested, values.nonzero_arm, defs)
+            || !shift(values.zero_arm, IrBinOp::LShr, amount, 64, defs)
+                .is_some_and(|base| same_value(base, values.nonzero_arm, defs))
+        {
+            return None;
+        }
+        working = values.nonzero_arm;
+        count = counts.nonzero_arm;
+    }
+    (const_in_ring(peel_copies(count, defs), 32) == Some(0)).then_some(peel_copies(working, defs))
+}
+
+fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let (a, b, ty) = binop(opnd, IrBinOp::Or, defs)?;
+    if !matches!(ty, IrType::U32 | IrType::I32) {
+        return None;
+    }
+    if let (Some(x), Some(y)) = (
+        shift(a, IrBinOp::LShr, amount, 32, defs),
+        shift(b, IrBinOp::Shl, amount, 32, defs),
+    ) {
+        if same_value(x, y, defs) {
+            return Some(x);
+        }
+    }
+    if let (Some(x), Some(y)) = (
+        shift(b, IrBinOp::LShr, amount, 32, defs),
+        shift(a, IrBinOp::Shl, amount, 32, defs),
+    ) {
+        if same_value(x, y, defs) {
+            return Some(x);
+        }
+    }
+    None
+}
+
+/// Match the final byte-swap portion of a mask-and-shift bit reversal:
+///
+/// `y = ((x >> 8) & 0x00ff00ff) | ((x & 0x00ff00ff) << 8);`
+/// `result = (y >> 16) | (y << 16);`
+fn match_bswap32_network(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let byte_swapped = match_shift_pair(result, 16, defs)?;
+    let (a, b, ty) = binop(byte_swapped, IrBinOp::Or, defs)?;
+    if ty != IrType::U32 && ty != IrType::I32 {
+        return None;
+    }
+
+    let match_halves = |right: Operand, left: Operand| -> Option<Operand> {
+        let right_shifted = commutative_const(right, IrBinOp::And, 0x00ff_00ff, 32, defs)?;
+        let original = shift(right_shifted, IrBinOp::LShr, 8, 32, defs)?;
+        let left_masked = shift(left, IrBinOp::Shl, 8, 32, defs)?;
+        let left_original = commutative_const(left_masked, IrBinOp::And, 0x00ff_00ff, 32, defs)?;
+        same_value(original, left_original, defs).then_some(peel_copies(original, defs))
+    };
+    match_halves(a, b).or_else(|| match_halves(b, a))
+}
+
+fn match_masked_swap_stage(
+    result: Operand,
+    amount: u64,
+    mask: u64,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    let (a, b, ty) = binop(result, IrBinOp::Or, defs)?;
+    if ty != IrType::U32 && ty != IrType::I32 {
+        return None;
+    }
+    let match_halves = |right: Operand, left: Operand| -> Option<Operand> {
+        let shifted = commutative_const(right, IrBinOp::And, mask, 32, defs)?;
+        let original = shift(shifted, IrBinOp::LShr, amount, 32, defs)?;
+        let masked = shift(left, IrBinOp::Shl, amount, 32, defs)?;
+        let left_original = commutative_const(masked, IrBinOp::And, mask, 32, defs)?;
+        same_value(original, left_original, defs).then_some(peel_copies(original, defs))
+    };
+    match_halves(a, b).or_else(|| match_halves(b, a))
+}
+
+fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let mut value = match_bswap32_network(result, defs)?;
+    for (amount, mask) in [(4, 0x0f0f_0f0f), (2, 0x3333_3333), (1, 0x5555_5555)] {
+        value = match_masked_swap_stage(value, amount, mask, defs)?;
+    }
+    Some(peel_copies(value, defs))
+}
+
+/// Preserve the existing exact portable 32-bit reversal idiom before
+/// pre-inlining scalar reassociation can merge its first shift stage with
+/// a caller's shift. Called only for the native AArch64 target, under the
+/// existing bit_idioms policy; other targets retain their old scheduling.
+pub(crate) fn recognize_reverse_ladders(func: &mut IrFunction) -> usize {
+    // The inliner deliberately retains a callee's parameter-home bridge.
+    // Analyze a bounded single-block SSA projection instead of promoting
+    // those homes in the real function. Promotion creates no join PHIs here;
+    // existing scalar value IDs retain their original runtime bits.
+    if func.blocks.len() != 1 || func.blocks[0].instructions.len() > 512 {
+        return 0;
+    }
+    if !func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::Or,
+                    ty: IrType::I32 | IrType::U32,
+                    ..
+                }
+            )
+        })
+    }) {
+        return 0;
+    }
+    let mut projected = func.clone();
+    crate::ir::mem2reg::promote::promote_function(&mut projected, true);
+    let mut defs = vec![None; projected.max_value_id() as usize + 1];
+    for block in &projected.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+            }
+        }
+    }
+    let mut changes = 0;
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Or,
+                ty: IrType::I32 | IrType::U32,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let dest = *dest;
+            if let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs) {
+                *inst = Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::BitReverse,
+                    src,
+                    ty: IrType::U32,
+                };
+                defs[dest.0 as usize] = Some(inst.clone());
+                changes += 1;
+            }
+        }
+    }
+    changes
+}
+
+/// `enable_bit_reverse` gates the idiom whose native lowering is target
+/// specific (AArch64 `rbit`).
+///
+/// `max_rotate_bits` is the widest rotate the target can lower natively, or 0
+/// to disable recognition entirely: x86-64 `rol`/`ror`, AArch64 `ror`/`extr`
+/// and the RISC-V funnel shift all handle 64 bits, while i686's paired-register
+/// route for I64 arithmetic means only its 32-bit ALU path is wired.  Passing
+/// the capability instead of a boolean keeps a backend from ever receiving a
+/// node it cannot lower.
+///
+/// `min_rotate_bits` is the NARROWEST rotate the target can lower natively:
+/// x86 `rolb`/`rolw` rotate at the operand width (hardware count is
+/// `(count & 31) mod width`), but AArch64 and RISC-V only rotate at the full
+/// register width, so their sub-word idioms must stay in shift form.  It gates
+/// the truncation-aware narrow-rotate pattern.
+/// True when `op`'s value provably fits in `bits` bits (zero-extended into
+/// the carrying type), so `op & (2^bits - 1) == op`.
+///
+/// Provable shapes: an unsigned narrow constant, a widening `Cast` whose
+/// SOURCE type is an unsigned narrow integer (a zero-extension of a value in
+/// `[0, 2^bits)`), and a direct `Load` of an unsigned narrow type. A cast
+/// from a SIGNED narrow type sign-extends and can be negative in the wide
+/// domain — refused.
+fn fits_low_bits(
+    mut op: Operand,
+    bits: u32,
+    mut ring_bits: usize,
+    defs: &[Option<Instruction>],
+    def_counts: &[u32],
+) -> bool {
+    let mask = (1u64 << bits) - 1;
+    // This query follows one chain, never a tree. A fixed budget avoids heap
+    // allocation, recursion, and stack growth; cycles and deep webs fail closed.
+    for _ in 0..64 {
+        match op {
+            Operand::Const(_) => return const_in_ring(op, ring_bits).is_some_and(|v| v <= mask),
+            Operand::Value(v) => {
+                if def_counts.get(v.0 as usize).copied() != Some(1) {
+                    return false;
+                }
+                match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                    Some(Instruction::Copy { src, .. }) => op = *src,
+                    Some(Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    }) if to_ty.is_integer() && to_ty.size() * 8 == ring_bits => {
+                        if matches!((to_ty, bits), (IrType::U8, 8) | (IrType::U16, 16)) {
+                            return true;
+                        }
+                        if !matches!((from_ty, bits), (IrType::U8, 8) | (IrType::U16, 16)) {
+                            return false;
+                        }
+                        op = *src;
+                        ring_bits = from_ty.size() * 8;
+                    }
+                    Some(Instruction::Load { ty, .. } | Instruction::ParamRef { ty, .. }) => {
+                        return matches!((ty, bits), (IrType::U8, 8) | (IrType::U16, 16));
+                    }
+                    Some(Instruction::BinOp {
+                        op: IrBinOp::And,
+                        lhs,
+                        rhs,
+                        ty,
+                        ..
+                    }) if ty.is_integer() && ty.size() * 8 == ring_bits => {
+                        return const_in_ring(*rhs, ring_bits).is_some_and(|m| m <= mask)
+                            || const_in_ring(*lhs, ring_bits).is_some_and(|m| m <= mask);
+                    }
+                    _ => return false,
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Canonicalize two narrow-integer patterns before the main `bit_idioms` scan:
+/// 1. A single-use non-volatile `Load` of `I8`/`I16` whose sole consumer is a
+///    same-width unsigned `Cast` (`I8 -> U8` or `I16 -> U16`, e.g. `(uint8_t)buf[i]`
+///    where `buf` is `const char *`) becomes an unsigned `Load` (`U8`/`U16`) plus
+///    a `Copy`, allowing `load_cast_fold` and `fits_low_bits` to treat the load
+///    directly as zero-extending (`movzbl`/`movzwl` instead of `movsbq`+`movzbl`).
+/// 2. A narrow unsigned truncation `Cast(a ^ b, W -> U8/U16)` whose sole consumer
+///    widens `U8/U16 -> final_ty` (e.g. `crc_tab[(uint8_t)(crc ^ buf[i])]`)
+///    distributes the narrow mask onto the wide operand when the other operand
+///    already fits in the low 8/16 bits: `x = a & 0xff; c1 = x ^ b; c2 = Cast(c1, W.to_unsigned() -> final_ty)`.
+fn canonicalize_narrow_crc_casts(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize + 1;
+    let mut defs = vec![None; max_id];
+    let mut def_loc = vec![None; max_id];
+    let mut def_counts = vec![0u32; max_id];
+    let mut use_counts = vec![0u32; max_id];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                let idx = dest.0 as usize;
+                def_counts[idx] += 1;
+                defs[idx] = Some(inst.clone());
+                def_loc[idx] = Some((bi, ii));
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_counts[v.0 as usize] += 1;
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_counts[v.0 as usize] += 1;
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                use_counts[v.0 as usize] += 1;
+            }
+        });
+    }
+
+    let mut rewrites: Vec<(usize, usize, Instruction)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Cast {
+                dest: c_dest,
+                src: Operand::Value(lv),
+                from_ty: c_from @ (IrType::I8 | IrType::I16),
+                to_ty: c_to @ (IrType::U8 | IrType::U16),
+            } = inst
+                && c_from.to_unsigned() == *c_to
+                && def_counts.get(lv.0 as usize).copied() == Some(1)
+                && use_counts.get(lv.0 as usize).copied() == Some(1)
+                && def_counts.get(c_dest.0 as usize).copied() == Some(1)
+                && let Some((lbi, lii)) = def_loc.get(lv.0 as usize).copied().flatten()
+                && let Some(Some(Instruction::Load {
+                    dest: l_dest,
+                    ptr,
+                    ty: l_ty,
+                    seg_override,
+                    volatile: false,
+                })) = defs.get(lv.0 as usize)
+                && *l_dest == *lv
+                && *l_ty == *c_from
+            {
+                let new_load = Instruction::Load {
+                    dest: *l_dest,
+                    ptr: *ptr,
+                    ty: *c_to,
+                    seg_override: *seg_override,
+                    volatile: false,
+                };
+                let new_copy = Instruction::Copy {
+                    dest: *c_dest,
+                    src: Operand::Value(*lv),
+                };
+                defs[lv.0 as usize] = Some(new_load.clone());
+                defs[c_dest.0 as usize] = Some(new_copy.clone());
+                rewrites.push((lbi, lii, new_load));
+                rewrites.push((bi, ii, new_copy));
+            }
+        }
+    }
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Cast {
+                dest: c2_dest,
+                src: Operand::Value(c1),
+                from_ty: narrow_ty @ (IrType::U8 | IrType::U16),
+                to_ty: final_ty,
+            } = inst
+            else {
+                continue;
+            };
+            let bits = (narrow_ty.size() * 8) as u32;
+            if !final_ty.is_integer()
+                || final_ty.size() < 4
+                || def_counts.get(c2_dest.0 as usize).copied() != Some(1)
+                || def_counts.get(c1.0 as usize).copied() != Some(1)
+                || use_counts.get(c1.0 as usize).copied() != Some(1)
+            {
+                continue;
+            }
+            let Some((c1_bi, c1_ii)) = def_loc.get(c1.0 as usize).copied().flatten() else {
+                continue;
+            };
+            let Some(Some(Instruction::Cast {
+                dest: c1_d,
+                src: Operand::Value(x),
+                from_ty: wide_ty,
+                to_ty: c1_to,
+            })) = defs.get(c1.0 as usize).cloned()
+            else {
+                continue;
+            };
+            if c1_d != *c1
+                || c1_to != *narrow_ty
+                || !matches!(
+                    wide_ty,
+                    IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64
+                )
+                || final_ty.size() < wide_ty.size()
+                || def_counts.get(x.0 as usize).copied() != Some(1)
+                || use_counts.get(x.0 as usize).copied() != Some(1)
+            {
+                continue;
+            }
+            let Some((x_bi, x_ii)) = def_loc.get(x.0 as usize).copied().flatten() else {
+                continue;
+            };
+            let Some(Some(Instruction::BinOp {
+                dest: x_d,
+                op: op @ (IrBinOp::Xor | IrBinOp::Or),
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ty: x_ty,
+            })) = defs.get(x.0 as usize).cloned()
+            else {
+                continue;
+            };
+            if x_d != x || x_ty != wide_ty {
+                continue;
+            }
+            let ring_bits = wide_ty.size() * 8;
+            let a_fits = fits_low_bits(Operand::Value(a), bits, ring_bits, &defs, &def_counts);
+            let b_fits = fits_low_bits(Operand::Value(b), bits, ring_bits, &defs, &def_counts);
+            if a_fits == b_fits {
+                continue;
+            }
+            let (masked, narrow) = if b_fits { (a, b) } else { (b, a) };
+            let mask_val = (1i64 << bits) - 1;
+            let mask_const = if wide_ty.size() == 8 {
+                crate::ir::reexports::IrConst::I64(mask_val)
+            } else {
+                crate::ir::reexports::IrConst::I32(mask_val as i32)
+            };
+            let new_x = Instruction::BinOp {
+                dest: x,
+                op: IrBinOp::And,
+                lhs: Operand::Value(masked),
+                rhs: Operand::Const(mask_const),
+                ty: wide_ty,
+            };
+            let new_c1 = Instruction::BinOp {
+                dest: *c1,
+                op,
+                lhs: Operand::Value(x),
+                rhs: Operand::Value(narrow),
+                ty: wide_ty,
+            };
+            let new_c2 = if *final_ty == wide_ty {
+                Instruction::Copy {
+                    dest: *c2_dest,
+                    src: Operand::Value(*c1),
+                }
+            } else {
+                Instruction::Cast {
+                    dest: *c2_dest,
+                    src: Operand::Value(*c1),
+                    from_ty: wide_ty.to_unsigned(),
+                    to_ty: *final_ty,
+                }
+            };
+            rewrites.push((x_bi, x_ii, new_x));
+            rewrites.push((c1_bi, c1_ii, new_c1));
+            rewrites.push((bi, ii, new_c2));
+        }
+    }
+
+    let count = rewrites.len();
+    for (bi, ii, new_inst) in rewrites {
+        func.blocks[bi].instructions[ii] = new_inst;
+    }
+    count
+}
+
+/// Union-punned copysign through memory: `r = mag(a)|sign(b)` spelled with
+/// two address-taken unions, integer and/or, and a reloaded result.
+///
+/// C source shape (musl `copysign`, glibc `s_copysign`, the corpus `copysign`
+/// TU — and any hand-rolled float-bits tweak through a union):
+/// ```c
+/// union d { double f; uint64_t u; } a = {x}, b = {y};
+/// a.u = (a.u & 0x7FFF...) | (b.u & 0x8000...);
+/// return a.f;
+/// ```
+/// In IR (all in one block): two `F64` init stores into distinct allocas, two
+/// `U64`/`I64` loads, two `And`s with the exact `ABS`/`SIGN` masks, one `Or`,
+/// a result store of the or into the magnitude slot, and a final `F64` reload
+/// that flows to the return.  GVN's store forwarding is exact-type-only, so
+/// the float/int type pun survives into the backend, which forwards the slots
+/// into GPRs and emits scalar bit ops plus `movq` bitcasts (9 insns) where
+/// every oracle emits three vector mask ops (4 insns with `ret`).
+///
+/// The rewrite replaces the final reload with
+/// `Intrinsic(CopysignF64, mag_init, sign_init)` and each of the three stores
+/// with a dead `Copy` of its stored value; DCE's mark-and-sweep retires the
+/// orphaned or/ands/loads/copies transitively in its next run.  No new IR
+/// value-numbering facility is needed because every proof below is a complete
+/// local enumeration — anything unexpected bails (fail-closed):
+///
+/// * **Slot identity.** Both slots are `Alloca` dests (distinct allocas are
+///   disjoint objects), non-volatile throughout, default address space.
+/// * **Complete use enumeration.** The magnitude slot is used by EXACTLY four
+///   instructions (init store, int load, result store, float reload) and the
+///   sign slot by EXACTLY two (init store, int load) — operand, address, and
+///   terminator uses all counted, in every block.  No fifth use means no GEP
+///   of either alloca, no escape (call argument, stored pointer, asm use), no
+///   cross-block reader: every access to both objects is one of the matched
+///   ones, in this block, in this order.
+/// * **Single-use chain.** The or, both ands, both int loads, and every
+///   peeled int cast/copy between them have exactly one use — the pattern
+///   use — so nothing outside the pattern anchors the chain and DCE removes
+///   it whole.  (A shared subexpression would stay live next to the new
+///   intrinsic: a regression, hence the bail.)
+/// * **Mask pairing.** The and fed by the magnitude slot's load carries the
+///   `ABS` mask and the and fed by the sign slot's load the `SIGN` mask —
+///   matched by exact `u64` bits, either or-order.  The pairing is what makes
+///   the pattern a copysign; swapped masks are some other computation.
+/// * **Clean window.** Every non-pattern instruction between the first init
+///   store and the reload is side-effect-free (DCE's own predicate) and any
+///   load/store there resolves through copies/casts to a KNOWN alloca that is
+///   neither slot (disjoint object).  Calls — even pure ones, which read
+///   memory — asm, fences, atomics, and unknown-base memory ops all bail, so
+///   no access can observe the deleted stores' values or clobber the slots
+///   mid-pattern.
+/// * **Availability.** Both init values dominate the reload (same block, SSA),
+///   so they are valid intrinsic operands there; the float/int widths match
+///   (`F64` with `U64`/`I64`, `F32` with `U32`/`I32`).
+///
+/// Replacing a store with a dead copy is sound exactly because the enumeration
+/// proves no remaining load observes it: the reload is rewritten to the
+/// intrinsic (same value: `mag|sign` of the inits, bitwise) and no other load
+/// of either slot exists.  Replacements are index-preserving (never
+/// insert/delete), so multiple matches per block stay valid, and consumer
+/// positions never move.  Idempotent: after firing, the reload is gone.
+fn recognize_copysign_mem(func: &mut IrFunction) -> usize {
+    use crate::ir::reexports::Value;
+    // Trigger scan needs defs + use locations; built locally (mirror the main
+    // scan's counting so operand, address, and terminator uses all count).
+    // Terminator uses record `usize::MAX` so they can never match a role.
+    let nvals = func.max_value_id() as usize + 1;
+    let mut defs: Vec<Option<Instruction>> = vec![None; nvals];
+    let mut use_locs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nvals];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_locs[v.0 as usize].push((bi, ii));
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_locs[v.0 as usize].push((bi, ii));
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                use_locs[v.0 as usize].push((bi, usize::MAX));
+            }
+        });
+    }
+
+    struct Match {
+        bi: usize,
+        load_ii: usize,
+        result_store_ii: usize,
+        init1_ii: usize,
+        init2_ii: usize,
+        dest: Value,
+        mag_init: Operand,
+        sign_init: Operand,
+        op: IntrinsicOp,
+    }
+    let mut matches: Vec<Match> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+            } = inst
+            else {
+                continue;
+            };
+            if *volatile || *seg_override != AddressSpace::Default {
+                continue;
+            }
+            // Float width selects the integer carrier + masks + intrinsic.
+            let (ity_ok, abs_mask, sign_mask, op): (fn(IrType) -> bool, u64, u64, IntrinsicOp) =
+                match ty {
+                    IrType::F64 => (
+                        (|t| matches!(t, IrType::U64 | IrType::I64)) as fn(IrType) -> bool,
+                        0x7FFF_FFFF_FFFF_FFFF,
+                        0x8000_0000_0000_0000,
+                        IntrinsicOp::CopysignF64,
+                    ),
+                    IrType::F32 => (
+                        (|t| matches!(t, IrType::U32 | IrType::I32)) as fn(IrType) -> bool,
+                        0x7FFF_FFFF,
+                        0x8000_0000,
+                        IntrinsicOp::CopysignF32,
+                    ),
+                    _ => continue,
+                };
+            let r = *dest;
+            let p1 = *ptr;
+            // Magnitude slot: an Alloca used by exactly the four pattern
+            // accesses.  Set equality (sorted) pins the roles by program
+            // order: init store < int load < result store < this reload.
+            let alloca_ok = |p: Value| -> bool {
+                matches!(
+                    defs.get(p.0 as usize).and_then(Option::as_ref),
+                    Some(Instruction::Alloca {
+                        volatile: false,
+                        semantic_volatile: false,
+                        ..
+                    })
+                )
+            };
+            if !alloca_ok(p1) {
+                continue;
+            }
+            let mut locs1 = use_locs[p1.0 as usize].clone();
+            if locs1.len() != 4 {
+                continue;
+            }
+            locs1.sort();
+            if locs1[3] != (bi, ii) || locs1.iter().any(|(b, _)| *b != bi) {
+                continue;
+            }
+            let init1_ii = locs1[0].1;
+            let t1_ii = locs1[1].1;
+            let rs_ii = locs1[2].1;
+            // Init store: float-typed value into the magnitude slot.
+            let mag_init = match &block.instructions[init1_ii] {
+                Instruction::Store {
+                    val,
+                    ptr,
+                    ty: sty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p1
+                    && *sty == *ty
+                    && *seg_override == AddressSpace::Default
+                    && !volatile =>
+                {
+                    *val
+                }
+                _ => continue,
+            };
+            // Magnitude int load: same-width integer carrier, single use.
+            let t1 = match &block.instructions[t1_ii] {
+                Instruction::Load {
+                    dest,
+                    ptr,
+                    ty: lty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p1
+                    && ity_ok(*lty)
+                    && *seg_override == AddressSpace::Default
+                    && !volatile
+                    && use_locs[dest.0 as usize].len() == 1 =>
+                {
+                    (*dest, *lty)
+                }
+                _ => continue,
+            };
+            // Result store: the or of the masked halves into the slot.
+            let o = match &block.instructions[rs_ii] {
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ptr,
+                    ty: sty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p1
+                    && *sty == t1.1
+                    && *seg_override == AddressSpace::Default
+                    && !volatile
+                    && use_locs[v.0 as usize].len() == 1 =>
+                {
+                    *v
+                }
+                _ => continue,
+            };
+            // The or: exact carrier type, arms peeled through int-only
+            // casts/copies (every peeled step single-use).
+            let (a1, a2) = match defs[o.0 as usize].as_ref() {
+                Some(Instruction::BinOp {
+                    op: IrBinOp::Or,
+                    lhs,
+                    rhs,
+                    ty: oty,
+                    ..
+                }) if *oty == t1.1 => (*lhs, *rhs),
+                _ => continue,
+            };
+            // Tracked peel: like `peel` but records every intermediate
+            // value for the single-use proof.
+            let peel_tracked = |mut op: Operand| -> (Operand, Vec<Value>) {
+                let mut chain = Vec::new();
+                for _ in 0..32 {
+                    let Operand::Value(v) = op else { break };
+                    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                        Some(Instruction::Cast {
+                            src,
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if from_ty.is_integer() && to_ty.is_integer() => {
+                            chain.push(v);
+                            op = *src;
+                        }
+                        Some(Instruction::Copy { src, .. }) => {
+                            chain.push(v);
+                            op = *src;
+                        }
+                        _ => break,
+                    }
+                }
+                (op, chain)
+            };
+            let (pa1, c1) = peel_tracked(a1);
+            let (pa2, c2) = peel_tracked(a2);
+            if c1
+                .iter()
+                .chain(c2.iter())
+                .any(|v| use_locs[v.0 as usize].len() != 1)
+            {
+                continue;
+            }
+            // Each peeled arm: `And(int_load, exact_mask)`, single-use, with
+            // the (slot, mask) pairing that defines a copysign.
+            let mut mag_and: Option<Value> = None;
+            let mut sign_load: Option<(Value, Value)> = None;
+            for pa in [pa1, pa2] {
+                let Operand::Value(av) = pa else { continue };
+                if use_locs[av.0 as usize].len() != 1 {
+                    continue;
+                }
+                let Some(Instruction::BinOp {
+                    op: IrBinOp::And,
+                    lhs,
+                    rhs,
+                    ty: aty,
+                    ..
+                }) = defs[av.0 as usize].as_ref()
+                else {
+                    continue;
+                };
+                if *aty != t1.1 {
+                    continue;
+                }
+                // One side a single-use int load, the other the exact mask.
+                for (maybe_load, maybe_mask) in [(lhs, rhs), (rhs, lhs)] {
+                    let Operand::Value(lv) = maybe_load else {
+                        continue;
+                    };
+                    if use_locs[lv.0 as usize].len() != 1 {
+                        continue;
+                    }
+                    let Some(Instruction::Load {
+                        dest,
+                        ptr,
+                        ty: lty,
+                        seg_override,
+                        volatile,
+                    }) = defs[lv.0 as usize].as_ref()
+                    else {
+                        continue;
+                    };
+                    if *dest != *lv
+                        || *lty != t1.1
+                        || *seg_override != AddressSpace::Default
+                        || *volatile
+                    {
+                        continue;
+                    }
+                    let Some(bits) = const_in_ring(*maybe_mask, t1.1.size() * 8) else {
+                        continue;
+                    };
+                    if *ptr == p1 && bits == abs_mask && *lv == t1.0 {
+                        mag_and = Some(av);
+                    } else if *ptr != p1 && bits == sign_mask {
+                        sign_load = Some((*lv, *ptr));
+                    }
+                }
+            }
+            let (Some(_), Some((t2, p2))) = (mag_and, sign_load) else {
+                continue;
+            };
+            // Sign slot: a second alloca used by exactly its init store +
+            // int load (sorted order pins the roles, as above).
+            if !alloca_ok(p2) {
+                continue;
+            }
+            let mut locs2 = use_locs[p2.0 as usize].clone();
+            if locs2.len() != 2 {
+                continue;
+            }
+            locs2.sort();
+            if locs2[0].0 != bi || locs2[1].0 != bi {
+                continue;
+            }
+            let init2_ii = locs2[0].1;
+            let t2_ii = locs2[1].1;
+            // The enumerated second use must BE t2's definition (a load
+            // of the sign slot); the first the float init store.
+            if !matches!(
+                block.instructions.get(t2_ii),
+                Some(Instruction::Load { dest, ptr, .. }) if *dest == t2 && *ptr == p2
+            ) {
+                continue;
+            }
+            let sign_init = match &block.instructions[init2_ii] {
+                Instruction::Store {
+                    val,
+                    ptr,
+                    ty: sty,
+                    seg_override,
+                    volatile,
+                } if *ptr == p2
+                    && *sty == *ty
+                    && *seg_override == AddressSpace::Default
+                    && !volatile =>
+                {
+                    *val
+                }
+                _ => continue,
+            };
+            // Clean window: every non-pattern instruction from the first
+            // init store to the reload is side-effect-free, and any
+            // load/store there resolves to a KNOWN alloca that is neither
+            // slot.  Calls (even pure ones), asm, fences, atomics, and
+            // unknown-base memory ops all bail — see the fn docs.
+            let mut window_ok = true;
+            let first = init1_ii.min(init2_ii);
+            // Pattern index set for the window check: an in-window
+            // instruction is a pattern member iff its dest (if any) is one
+            // of the chain values, or it is one of the six indexed memops.
+            let mut pattern: Vec<usize> = vec![init1_ii, t1_ii, rs_ii, ii, init2_ii, t2_ii];
+            let in_chain = |v: Value| -> bool {
+                v == o
+                    || v == t1.0
+                    || v == t2
+                    || Some(v) == mag_and
+                    || pa1 == Operand::Value(v)
+                    || pa2 == Operand::Value(v)
+                    || c1.contains(&v)
+                    || c2.contains(&v)
+            };
+            // Alloca-base walker for the window memory check: through
+            // copies and int casts to a known Alloca, else unknown.
+            let base_alloca = |mut op: Operand| -> Option<Value> {
+                for _ in 0..32 {
+                    let Operand::Value(v) = op else { return None };
+                    match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                        Some(Instruction::Alloca { .. }) => return Some(v),
+                        Some(Instruction::Copy { src, .. }) => op = *src,
+                        Some(Instruction::Cast {
+                            src,
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if from_ty.is_integer() && to_ty.is_integer() => op = *src,
+                        _ => return None,
+                    }
+                }
+                None
+            };
+            for (wi, winst) in block.instructions.iter().enumerate() {
+                if wi < first || wi > ii {
+                    continue;
+                }
+                if pattern.contains(&wi) {
+                    continue;
+                }
+                if let Some(d) = winst.dest() {
+                    if in_chain(d) {
+                        if !pattern.contains(&wi) {
+                            pattern.push(wi);
+                        }
+                        continue;
+                    }
+                }
+                // Non-pattern memory ops: non-volatile, and through a
+                // KNOWN alloca that is neither slot (a disjoint object —
+                // window-safe regardless of DCE's deletability verdict,
+                // which answers a different question and always fires on
+                // stores).  Volatile or unknown-base memops bail.
+                match winst {
+                    Instruction::Load { ptr, volatile, .. }
+                    | Instruction::Store { ptr, volatile, .. } => {
+                        if *volatile {
+                            window_ok = false;
+                            break;
+                        }
+                        match base_alloca(Operand::Value(*ptr)) {
+                            Some(b) if b != p1 && b != p2 => {}
+                            _ => {
+                                window_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
+                        window_ok = false;
+                        break;
+                    }
+                    _ => {
+                        if crate::passes::dce::has_side_effects(winst) {
+                            window_ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !window_ok {
+                continue;
+            }
+            matches.push(Match {
+                bi,
+                load_ii: ii,
+                result_store_ii: rs_ii,
+                init1_ii,
+                init2_ii,
+                dest: r,
+                mag_init,
+                sign_init,
+                op,
+            });
+        }
+    }
+
+    // Apply: index-preserving replacements only (never insert/delete), so
+    // multiple matches per block/function stay valid.  Dead stores become
+    // dead copies of their stored value (DCE retires them with the orphaned
+    // chain); the reload becomes the copysign intrinsic.
+    let mut next_fresh = func.max_value_id().saturating_add(1);
+    let mut changes = 0;
+    for m in &matches {
+        let block = &mut func.blocks[m.bi];
+        // Defense in depth: re-verify the three stores (indices were
+        // validated at match time; replacements are index-preserving so
+        // earlier matches cannot disturb them — skip rather than rewrite
+        // anything unexpected).
+        let stored_val = |idx: usize| -> Option<Operand> {
+            match block.instructions.get(idx) {
+                Some(Instruction::Store { val, .. }) => Some(*val),
+                _ => None,
+            }
+        };
+        let (Some(s_rs), Some(s_i1), Some(s_i2)) = (
+            stored_val(m.result_store_ii),
+            stored_val(m.init1_ii),
+            stored_val(m.init2_ii),
+        ) else {
+            continue;
+        };
+        if !matches!(
+            block.instructions.get(m.load_ii),
+            Some(Instruction::Load { dest, .. }) if *dest == m.dest
+        ) {
+            continue;
+        }
+        block.instructions[m.load_ii] = Instruction::Intrinsic {
+            dest: Some(m.dest),
+            op: m.op,
+            dest_ptr: None,
+            args: vec![m.mag_init, m.sign_init],
+        };
+        for (idx, src) in [
+            (m.result_store_ii, s_rs),
+            (m.init1_ii, s_i1),
+            (m.init2_ii, s_i2),
+        ] {
+            block.instructions[idx] = Instruction::Copy {
+                dest: Value(next_fresh),
+                src,
+            };
+            next_fresh = next_fresh.saturating_add(1);
+        }
+        changes += 4;
+    }
+    if next_fresh > func.next_value_id {
+        func.next_value_id = next_fresh;
+    }
+    // No map refresh needed: these maps are local to this pre-pass (the
+    // main scan rebuilds its own afterward), and within this pre-pass each
+    // reload yields at most one match — applied matches are disjoint by
+    // construction (every chain value is single-use, every slot use
+    // enumerated), and replacements preserve indices and use counts.
+    changes
+}
+
+/// Charge (`add`) or discharge one direct read of `operand` in `use_counts`.
+///
+/// Counts are seeded from the two canonical visitors — scalar operands plus
+/// bare value uses (addresses, `dest_ptr`s, memcpy endpoints) — so every
+/// in-place rewrite that changes an instruction's operand set goes through
+/// here; otherwise a later single-use proof can reason about a producer whose
+/// value is still live.  An underflow means the accounting itself is wrong:
+/// debug-assertion builds (CI) fail loudly there, while release builds saturate
+/// rather than wrap, so a miscount can only ever cost an optimization, never a
+/// miscompile.
+fn note_use(use_counts: &mut [u32], operand: Operand, add: bool) {
+    let Operand::Value(v) = operand else { return };
+    let Some(count) = use_counts.get_mut(v.0 as usize) else {
+        return;
+    };
+    if add {
+        *count = count.saturating_add(1);
+    } else {
+        debug_assert!(*count > 0, "use-count underflow for value {}", v.0);
+        *count = count.saturating_sub(1);
+    }
+}
+
+/// Move every read count recorded for `old` to its replacement `new`.
+///
+/// Applying both canonical visitors keeps the counts exact for any instruction
+/// shape, not merely for the `BinOp`/`Or` -> `UnaryOp` rewrites that call it
+/// today, so a future rewrite cannot silently inherit a narrower assumption.
+fn retarget_use_counts(old: &Instruction, new: &Instruction, use_counts: &mut [u32]) {
+    note_instruction_uses(old, use_counts, false);
+    note_instruction_uses(new, use_counts, true);
+}
+
+/// Add every read `inst` performs to the use counts (`add`), or remove them
+/// (`!add`).  The 1 -> N expansions have to account for each written
+/// instruction individually, so the visit is exposed separately.
+fn note_instruction_uses(inst: &Instruction, use_counts: &mut [u32], add: bool) {
+    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+        note_use(use_counts, *op, add);
+    });
+    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+        note_use(use_counts, Operand::Value(*v), add);
+    });
+}
+
+/// The source of the zero-defined `Ctz` that defines `count`, when that Ctz
+/// runs at exactly the consuming shift's width.
+///
+/// The width agreement is what makes the lowest-set-bit rewrite exact: a
+/// narrower count would make `1 << W` land on a live bit of the wider shift
+/// instead of wrapping back to 1.
+fn ctz_source(count: Value, ty: IrType, defs: &[Option<Instruction>]) -> Option<Value> {
+    match defs.get(count.0 as usize).and_then(Option::as_ref)? {
+        Instruction::UnaryOp {
+            op: IrUnaryOp::Ctz,
+            src: Operand::Value(v),
+            ty: t,
+            ..
+        } if *t == ty => Some(*v),
+        _ => None,
+    }
+}
+
+pub(crate) fn recognize_function(
+    func: &mut IrFunction,
+    enable_bit_reverse: bool,
+    max_rotate_bits: u32,
+    min_rotate_bits: u32,
+    has_scalar_andn: bool,
+    native_bswap: bool,
+) -> usize {
+    let pre_changes = canonicalize_narrow_crc_casts(func);
+    let shared_bit_changes = if !facts::bit_select_disabled() {
+        bit_select::fold_shared_bit_select(func)
+    } else {
+        0
+    };
+    let mut defs = vec![None; func.max_value_id() as usize + 1];
+    let mut def_counts = vec![0u32; defs.len()];
+    // (block index, instruction index) of each value's defining instruction,
+    // for in-place rewrites of the PRODUCER while visiting the consumer.
+    let mut def_loc = vec![None; func.max_value_id() as usize + 1];
+    // Total read counts (operands + address uses + terminator operands), for
+    // single-use proofs when repurposing a producer's operation.
+    let mut use_counts = vec![0u32; func.max_value_id() as usize + 1];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                def_counts[dest.0 as usize] += 1;
+                defs[dest.0 as usize] = Some(inst.clone());
+                def_loc[dest.0 as usize] = Some((bi, ii));
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_counts[v.0 as usize] += 1;
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_counts[v.0 as usize] += 1;
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                use_counts[v.0 as usize] += 1;
+            }
+        });
+    }
+
+    // Union-punned copysign first: it mints fresh IDs (written back to
+    // `func.next_value_id`) before the main scan seeds its own counter.
+    let mut changes = pre_changes + shared_bit_changes + recognize_copysign_mem(func);
+    let mut next_value_id = func.max_value_id().saturating_add(1);
+    // Boolean mux/majority algebra kill switch (same authority contract as
+    // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
+    let bool_algebra_disabled = facts::bool_algebra_disabled();
+    // Lowest-set-bit kill switch (`1 << Ctz(y)` -> `y & -y` plus the zero arm).
+    let lowest_set_bit_disabled = facts::lowest_set_bit_disabled();
+    // Comparison-dominance kill switch (`(x != 0) & (x > 4)` -> `x > 4`).
+    let compare_dominance_disabled = facts::compare_dominance_disabled();
+    let bit_select_disabled = facts::bit_select_disabled();
+    // Deferred cross-block rewrites (mask distribution): the producer and
+    // consumer may live in different blocks; both mutations are applied
+    // after the scan ends so no &mut borrow of `func.blocks` overlaps the
+    // loop's. Entries: (producer block, producer index, new producer
+    // instruction, consumer block, consumer index, new consumer
+    // instruction).
+    let mut pending_masks: Vec<(usize, usize, Instruction, usize, usize, Instruction)> = Vec::new();
+    // `(~x & C) == 0` -> `(x & C) == C` pairs. Same deferred two-sided
+    // rewrite as the mask pairs above and for the same borrow reason; the
+    // producer and the comparison may sit in different blocks.
+    let mut pending_not_mask: Vec<(usize, usize, Instruction, usize, usize, Instruction)> =
+        Vec::new();
+    // No insertion is allowed during the scan: def_loc and pending mask
+    // coordinates refer to the original layout. Boolean producer rewrites
+    // remain immediate (with coherent defs/use_counts); every expanding
+    // rewrite is applied after the atomic mask pairs, highest coordinate first.
+    let mut expansions: Vec<Expansion> = Vec::new();
+    // Partial byte reversals, ranked after the scan: a merge chain makes every
+    // prefix node a candidate, and only the widest one covers the whole
+    // network.  Entries: (tree ops, block, index, dest, ty, match).
+    let mut partial: Vec<(u16, usize, usize, Value, IrType, bytes::Match)> = Vec::new();
+    for (block_bi, block) in func.blocks.iter_mut().enumerate() {
+        let mut index = 0;
+        while index < block.instructions.len() {
+            // Shift/rotate count canonicalization: forward integer casts and
+            // Copies on the COUNT operand. Every backend consumes a variable
+            // count masked at the shift's own width (x86 `%cl` with
+            // `(count & 31) mod width`; AArch64/RISC-V register shifts mask
+            // at the operand width), and every integer cast preserves the
+            // count's low bits, so `Rol(x, (i64)c)` is exactly `Rol(x, c)`.
+            // Forwarding deletes the cast's last use (DCE retires it) and
+            // lets the count stage with one 32-bit move instead of a 64-bit
+            // extension dance (`movslq %esi,%rdx; mov %edx,%rcx`). GCC's
+            // equivalent is folding the extension into the count's single
+            // use.
+            //
+            // Runs before the match so the idiom arms below see the
+            // canonicalized amounts (a `32 - (i64)n` complement matches
+            // against a plain `n` on both halves after forwarding).
+            if let Instruction::BinOp { op, rhs, .. } = &block.instructions[index] {
+                if matches!(
+                    op,
+                    IrBinOp::Shl
+                        | IrBinOp::LShr
+                        | IrBinOp::AShr
+                        | IrBinOp::RotateLeft
+                        | IrBinOp::RotateRight
+                ) {
+                    let start = *rhs;
+                    let mut forwarded = start;
+                    let mut hops = 0;
+                    let mut changed_here = false;
+                    while hops < 8 {
+                        hops += 1;
+                        let Operand::Value(v) = forwarded else { break };
+                        let next = match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                            Some(Instruction::Cast {
+                                src,
+                                from_ty,
+                                to_ty,
+                                ..
+                            }) if from_ty.is_integer() && to_ty.is_integer() => Some(*src),
+                            Some(Instruction::Copy { src, .. }) => Some(*src),
+                            _ => None,
+                        };
+                        match next {
+                            Some(next_src) => {
+                                forwarded = next_src;
+                                changed_here = true;
+                            }
+                            None => break,
+                        }
+                    }
+                    if changed_here {
+                        if let Instruction::BinOp { rhs, .. } = &mut block.instructions[index] {
+                            *rhs = forwarded;
+                        }
+                        // This is a read transfer, not a free rename: the old
+                        // count operand loses this instruction's use and the
+                        // forwarded one gains it. Leaving the counts stale can
+                        // understate a value by one, and a later single-use
+                        // proof would then repurpose the producer of a value
+                        // that still feeds this shift.
+                        note_use(&mut use_counts, start, false);
+                        note_use(&mut use_counts, forwarded, true);
+                        changes += 1;
+                    }
+                }
+            }
+
+            // Lowest-set-bit idiom: `1 << Ctz(~x)`.
+            //
+            // The shift count is masked modulo the operand width -- every
+            // backend emits a bare `shl %cl` and `fold_binop` evaluates the
+            // same way -- so the expression is exactly
+            //
+            //     1 << (ctz(~x) mod W) == ~x & -~x == (x + 1) & ~x   for ~x != 0
+            //                         == 1                              for ~x == 0
+            //
+            // The negate disappears through `-~x IS x + 1`, which leaves one
+            // add and one and for the isolation; the zero case cannot be
+            // dropped (`1 << W` wraps back to 1, while the isolated bit is 0)
+            // and costs one `cmov` on the flags the `and` already set.
+            //
+            // The non-complemented `1 << Ctz(y)` deliberately stays alone, and
+            // the numbers are why: the count path is `bsf` plus the count
+            // staging plus the shift (5 instructions at 32 bits, 6 at 64,
+            // because the 32-bit zero fixup is the `mov $32,%ecx` that `bsf`
+            // leaves untouched), while `y & -y` plus the zero arm measures 8
+            // at both widths. Recognising it would be a pessimisation, so the
+            // matcher requires the complement. (With BMI1 available the
+            // isolated bit is a single `blsi`; that selection happens in the
+            // backend and would make the general form worth revisiting.)
+            //
+            // Measured with the two folds on and off, x86-64 at -O2,
+            // instructions including `ret`:
+            //     `1u   << __builtin_ctz(~x)`     9  ->  8   (GCC 6, Clang 4)
+            //     `1ull << __builtin_ctzll(~x)`  12  ->  8   (GCC 6, Clang 4)
+            //     `1u   << __builtin_ctz(y)`      5  ->  5   (refused, above)
+            //     `1ull << __builtin_ctzll(y)`    6  ->  6   (refused, above)
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Shl,
+                lhs,
+                rhs,
+                ty,
+            } = &block.instructions[index]
+            {
+                let (dest, ty, count) = (*dest, *ty, *rhs);
+                if !lowest_set_bit_disabled
+                    && matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+                    && const_in_ring(*lhs, ty.size() * 8) == Some(1)
+                    && let Operand::Value(count_v) = count
+                    && let Some(src_v) = ctz_source(count_v, ty, &defs)
+                    && let Some(Instruction::UnaryOp {
+                        op: IrUnaryOp::Not,
+                        src: inner,
+                        ty: not_ty,
+                        ..
+                    }) = defs.get(src_v.0 as usize).and_then(Option::as_ref)
+                    && *not_ty == ty
+                {
+                    let x = *inner;
+                    let incremented = Value(next_value_id);
+                    let isolated = Value(next_value_id + 1);
+                    let zero = Value(next_value_id + 2);
+                    next_value_id = next_value_id.saturating_add(3);
+                    // `x + 1` is `-~x`: the negate is folded into the add.
+                    let mut replacement = Vec::with_capacity(4);
+                    replacement.push(Instruction::BinOp {
+                        dest: incremented,
+                        op: IrBinOp::Add,
+                        lhs: x,
+                        rhs: int_const(1, ty),
+                        ty,
+                    });
+                    replacement.push(Instruction::BinOp {
+                        dest: isolated,
+                        op: IrBinOp::And,
+                        lhs: Operand::Value(incremented),
+                        rhs: Operand::Value(src_v),
+                        ty,
+                    });
+                    // Exactly the adjacent Cmp+Select the backend fuses into a
+                    // `cmov` off the `and`'s own flags.
+                    replacement.push(Instruction::Cmp {
+                        dest: zero,
+                        op: IrCmpOp::Eq,
+                        lhs: Operand::Value(isolated),
+                        rhs: int_const(0, ty),
+                        ty,
+                    });
+                    replacement.push(Instruction::Select {
+                        dest,
+                        cond: Operand::Value(zero),
+                        true_val: int_const(1, ty),
+                        false_val: Operand::Value(isolated),
+                        ty,
+                    });
+                    note_instruction_uses(&block.instructions[index], &mut use_counts, false);
+                    for inst in &replacement {
+                        note_instruction_uses(inst, &mut use_counts, true);
+                    }
+                    expansions.push(Expansion {
+                        block: block_bi,
+                        index,
+                        dest,
+                        replacement,
+                    });
+                    changes += 1;
+                }
+            }
+
+            // Complement-mask comparison: `(~x & C) == 0` is `(x & C) == C`.
+            // x86 lowers the right form as a single `and` against an immediate
+            // plus `cmp`, while the complement form additionally materialises
+            // `not` and a zero test.  Deferred (see `pending_not_mask`).
+            if let Instruction::Cmp { dest, op, ty, .. } = block.instructions[index] {
+                if let Some((and_dest, x, mask, cmp_ty)) =
+                    match_not_mask_cmp(&block.instructions[index], &defs, &use_counts)
+                {
+                    if let Some((pbi, pii)) = def_loc.get(and_dest as usize).copied().flatten() {
+                        pending_not_mask.push((
+                            pbi,
+                            pii,
+                            Instruction::BinOp {
+                                dest: Value(and_dest),
+                                op: IrBinOp::And,
+                                lhs: x,
+                                rhs: int_const(mask, cmp_ty),
+                                ty: cmp_ty,
+                            },
+                            block_bi,
+                            index,
+                            Instruction::Cmp {
+                                dest,
+                                op,
+                                lhs: Operand::Value(Value(and_dest)),
+                                rhs: int_const(mask, cmp_ty),
+                                ty,
+                            },
+                        ));
+                    }
+                }
+            }
+
+            // Mask distribution over a zero-extended operand:
+            // `(a ^ b) & 0xff` -> `(a & 0xff) ^ b` when b is a zero-extended
+            // byte (same for `|`, and for 0xffff/`movzwl`). See
+            // `fits_low_bits` for the range proof. The rewrite moves the mask
+            // onto the recurrence operand — where x86 lowers it to a
+            // rename-eliminable cross-register movz that only READS the
+            // recurrence register — and off the xor result, where the mask
+            // always executes on the loop-carried chain (`and $255` or a
+            // same-register movz, both uneliminable).
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::And,
+                lhs: Operand::Value(x),
+                rhs: mask_op @ Operand::Const(_),
+                ty,
+                ..
+            } = &block.instructions[index]
+            {
+                let dest = *dest;
+                let x = *x;
+                let mask_op = *mask_op;
+                let ty = *ty;
+                let bits = match const_in_ring(mask_op, ty.size() * 8) {
+                    Some(0xff) => 8,
+                    Some(0xffff) => 16,
+                    _ => 0,
+                };
+                if bits != 0
+                    && matches!(ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64)
+                    && def_counts.get(x.0 as usize).copied() == Some(1)
+                    && def_counts.get(dest.0 as usize).copied() == Some(1)
+                    && use_counts.get(x.0 as usize).copied() == Some(1)
+                {
+                    let xor = defs.get(x.0 as usize).and_then(Option::as_ref).cloned();
+                    if let Some(Instruction::BinOp {
+                        op: op @ (IrBinOp::Xor | IrBinOp::Or),
+                        lhs: Operand::Value(a),
+                        rhs: Operand::Value(b),
+                        ty: x_ty,
+                        ..
+                    }) = xor
+                    {
+                        let a = a;
+                        let b = b;
+                        let op = op;
+                        let x_ty = x_ty;
+                        if x_ty == ty {
+                            let a_fits = fits_low_bits(
+                                Operand::Value(a),
+                                bits,
+                                ty.size() * 8,
+                                &defs,
+                                &def_counts,
+                            );
+                            let b_fits = fits_low_bits(
+                                Operand::Value(b),
+                                bits,
+                                ty.size() * 8,
+                                &defs,
+                                &def_counts,
+                            );
+                            // Exactly one side carries the narrow value; the
+                            // other receives the mask. Both fitting is
+                            // already optimal as-is (both and-free), and
+                            // masking either side would only add work.
+                            if a_fits != b_fits {
+                                let (masked, narrow) = if b_fits { (a, b) } else { (b, a) };
+                                // Rewrite the producer: xor/or -> and-with-mask;
+                                // rewrite the consumer: and -> xor/or.
+                                if let Some((pbi, pii)) =
+                                    def_loc.get(x.0 as usize).copied().flatten()
+                                {
+                                    if matches!(
+                                        defs.get(x.0 as usize),
+                                        Some(Some(Instruction::BinOp { dest: d, .. })) if *d == x
+                                    ) {
+                                        pending_masks.push((
+                                            pbi,
+                                            pii,
+                                            Instruction::BinOp {
+                                                dest: x,
+                                                op: IrBinOp::And,
+                                                lhs: Operand::Value(masked),
+                                                rhs: mask_op,
+                                                ty,
+                                            },
+                                            block_bi,
+                                            index,
+                                            Instruction::BinOp {
+                                                dest,
+                                                op,
+                                                lhs: Operand::Value(x),
+                                                rhs: Operand::Value(narrow),
+                                                ty,
+                                            },
+                                        ));
+                                        changes += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs)
+                .or_else(|| fold_sign_choice_zero(&block.instructions[index], &defs))
+                .or_else(|| fold_shift_pair_into_mask(&block.instructions[index], &defs))
+                .or_else(|| {
+                    (!compare_dominance_disabled)
+                        .then(|| {
+                            compare_dominance::fold_compare_dominance(
+                                &block.instructions[index],
+                                &defs,
+                            )
+                        })
+                        .flatten()
+                })
+                .or_else(|| {
+                    (!bit_select_disabled)
+                        .then(|| {
+                            bit_select::fold_bit_select(
+                                &block.instructions[index],
+                                &defs,
+                                &use_counts,
+                            )
+                        })
+                        .flatten()
+                })
+                .or_else(|| fold_unit_interval_test(&block.instructions[index], &defs))
+            {
+                // New direct arm uses must be counted BEFORE a later boolean
+                // matcher can repurpose a supposedly single-use producer.
+                crate::backend::liveness::for_each_operand_in_instruction(
+                    &block.instructions[index],
+                    |op| {
+                        if let Operand::Value(v) = op {
+                            if let Some(n) = use_counts.get_mut(v.0 as usize) {
+                                *n = n.saturating_sub(1);
+                            }
+                        }
+                    },
+                );
+                crate::backend::liveness::for_each_operand_in_instruction(&new, |op| {
+                    if let Operand::Value(v) = op {
+                        if let Some(n) = use_counts.get_mut(v.0 as usize) {
+                            *n = n.saturating_add(1);
+                        }
+                    }
+                });
+                if let Some(dest) = new.dest() {
+                    defs[dest.0 as usize] = Some(new.clone());
+                }
+                block.instructions[index] = new;
+                changes += 1;
+            }
+
+            // ── Boolean mux/majority algebra (CH/MAJ family) ────────────
+            //
+            // COHERENCE CONTRACT (the soundness core, learned the hard
+            // way): every rewrite — the in-place consumer AND the producer
+            // repurposes — is applied IMMEDIATELY, and `defs`/`use_counts`
+            // are updated in the same step. All repurposed producers sit at
+            // earlier indices of THIS block (the matcher requires it), so
+            // mutating them mid-scan only touches already-visited slots,
+            // and every later matcher in the same run resolves structure
+            // against the POST-rewrite truth. The first version deferred
+            // the producer rewrites to pass end and left `defs` stale:
+            // Pattern A rewrote the inner xor of a MAJ tree, then Pattern
+            // C matched the outer consumer on the PRE-rewrite snapshot and
+            // emitted a consumer reading a value whose definition had
+            // already changed — sha256_transform returned the wrong digest
+            // (exit 2). Deferred application is only sound for rewrites
+            // whose result cannot re-enter matching (the mask
+            // distribution's And-with-mask); these can.
+            if !bool_algebra_disabled {
+                if let Instruction::BinOp {
+                    dest,
+                    op: c_op @ (IrBinOp::Xor | IrBinOp::Or),
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                } = &block.instructions[index]
+                {
+                    let (c_dest, c_ty) = (*dest, *ty);
+                    let (c_lhs, c_rhs, c_op) = (*lhs, *rhs, *c_op);
+                    if let Some((new_consumer, rewrites)) = match_bool_mux_algebra(
+                        c_lhs,
+                        c_rhs,
+                        c_op,
+                        c_dest,
+                        c_ty,
+                        block_bi,
+                        index,
+                        &defs,
+                        &use_counts,
+                        &def_loc,
+                        has_scalar_andn,
+                    ) {
+                        // Apply producer repurposes (same block, earlier
+                        // indices), then the consumer, keeping defs and
+                        // use_counts coherent for the rest of the scan.
+                        // For BinOps the operand iterator is the complete
+                        // use set (the value-use iterator covers only
+                        // address operands), so the accounting is exact.
+                        let mut adjust_counts = |old: &Instruction, new: &Instruction| {
+                            crate::backend::liveness::for_each_operand_in_instruction(old, |op| {
+                                if let Operand::Value(v) = op {
+                                    if let Some(c) = use_counts.get_mut(v.0 as usize) {
+                                        *c = c.saturating_sub(1);
+                                    }
+                                }
+                            });
+                            crate::backend::liveness::for_each_operand_in_instruction(new, |op| {
+                                if let Operand::Value(v) = op {
+                                    if let Some(c) = use_counts.get_mut(v.0 as usize) {
+                                        *c = c.saturating_add(1);
+                                    }
+                                }
+                            });
+                        };
+                        for (rbi, rii, rinst) in rewrites {
+                            debug_assert_eq!(rbi, block_bi, "v1 repurposes are same-block");
+                            let old = block.instructions[rii].clone();
+                            adjust_counts(&old, &rinst);
+                            block.instructions[rii] = rinst.clone();
+                            if let Some(d) = rinst.dest() {
+                                if let Some(slot) = defs.get_mut(d.0 as usize) {
+                                    *slot = Some(rinst);
+                                }
+                            }
+                        }
+                        let old_consumer = block.instructions[index].clone();
+                        adjust_counts(&old_consumer, &new_consumer);
+                        block.instructions[index] = new_consumer.clone();
+                        if let Some(d) = new_consumer.dest() {
+                            if let Some(slot) = defs.get_mut(d.0 as usize) {
+                                *slot = Some(new_consumer);
+                            }
+                        }
+                        changes += 1;
+                    }
+                }
+            }
+
+            match &block.instructions[index] {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::LShr,
+                    ty,
+                    ..
+                } if *ty == IrType::U32 || *ty == IrType::I32 => {
+                    let dest = *dest;
+                    if let Some(src) = match_popcount32(Operand::Value(dest), &defs) {
+                        let replacement = Instruction::UnaryOp {
+                            dest,
+                            op: IrUnaryOp::Popcount,
+                            src,
+                            ty: IrType::U32,
+                        };
+                        retarget_use_counts(
+                            &block.instructions[index],
+                            &replacement,
+                            &mut use_counts,
+                        );
+                        defs[dest.0 as usize] = Some(replacement.clone());
+                        block.instructions[index] = replacement;
+                        changes += 1;
+                    }
+                }
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Or | IrBinOp::Xor,
+                    ty,
+                    ..
+                } if matches!(*ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64) => {
+                    let dest = *dest;
+                    let ty = *ty;
+                    let is_32bit = ty == IrType::U32 || ty == IrType::I32;
+                    // Bit reversal and byte swap are strictly MORE specific than
+                    // a rotate: bswap32's final stage is literally
+                    // `(y >> 16) | (y << 16)`, which is a rotate by 16.  Trying
+                    // the rotate first would strip that stage out from under
+                    // `match_bswap32_network` and turn a one-instruction `bswap`
+                    // back into the five-instruction network, so both specific
+                    // matchers run first and bail out of this iteration when
+                    // either fires.  The width-generic byte matcher below is
+                    // strictly more specific than a rotate as well: it only
+                    // accepts a full 32- or 64-bit lane permutation, so it
+                    // cannot claim a rotate's partial rotation.
+                    if is_32bit {
+                        if enable_bit_reverse
+                            && let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs)
+                        {
+                            let replacement = Instruction::UnaryOp {
+                                dest,
+                                op: IrUnaryOp::BitReverse,
+                                src,
+                                ty: IrType::U32,
+                            };
+                            retarget_use_counts(
+                                &block.instructions[index],
+                                &replacement,
+                                &mut use_counts,
+                            );
+                            defs[dest.0 as usize] = Some(replacement.clone());
+                            block.instructions[index] = replacement;
+                            changes += 1;
+                            index += 1;
+                            continue;
+                        }
+                        if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
+                            let replacement = Instruction::UnaryOp {
+                                dest,
+                                op: IrUnaryOp::Bswap,
+                                src,
+                                ty: IrType::U32,
+                            };
+                            retarget_use_counts(
+                                &block.instructions[index],
+                                &replacement,
+                                &mut use_counts,
+                            );
+                            defs[dest.0 as usize] = Some(replacement.clone());
+                            block.instructions[index] = replacement;
+                            changes += 1;
+                            index += 1;
+                            continue;
+                        }
+                    }
+                    if let Some(hit) = bytes::bswap(Operand::Value(dest), ty, &defs, native_bswap) {
+                        // Later producer-repurposing rules consume these maps.
+                        // Keep direct read counts exact after replacing the
+                        // consumer.
+                        match hit.mask {
+                            // Full reversal: replace the consumer in place.
+                            None => {
+                                let replacement = Instruction::UnaryOp {
+                                    dest,
+                                    op: IrUnaryOp::Bswap,
+                                    src: hit.src,
+                                    ty,
+                                };
+                                // Discharge the tree before its root definition
+                                // is replaced: every value that this full swap
+                                // leaves without a reader is dead, so a deferred
+                                // candidate inside it is never applied on top.
+                                let mut budget = bytes::DISCHARGE_BUDGET;
+                                bytes::discharge(
+                                    &block.instructions[index],
+                                    &replacement,
+                                    &defs,
+                                    &mut use_counts,
+                                    &mut budget,
+                                );
+                                defs[dest.0 as usize] = Some(replacement.clone());
+                                block.instructions[index] = replacement;
+                                changes += 1;
+                            }
+                            // Partial reversal: ranked against every other
+                            // partial match below, because a merge chain makes
+                            // every prefix node a candidate and only the widest
+                            // one leaves no network behind.
+                            Some(_) => partial.push((hit.ops, block_bi, index, dest, ty, hit)),
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    if max_rotate_bits > 0
+                        && let Some((value, amount, is_left)) =
+                            match_rotate(Operand::Value(dest), max_rotate_bits, &defs)
+                    {
+                        let replacement = Instruction::BinOp {
+                            dest,
+                            op: if is_left {
+                                IrBinOp::RotateLeft
+                            } else {
+                                IrBinOp::RotateRight
+                            },
+                            lhs: value,
+                            rhs: amount,
+                            ty,
+                        };
+                        retarget_use_counts(
+                            &block.instructions[index],
+                            &replacement,
+                            &mut use_counts,
+                        );
+                        defs[dest.0 as usize] = Some(replacement.clone());
+                        block.instructions[index] = replacement;
+                        changes += 1;
+                    }
+                }
+                Instruction::Select { dest, ty, .. } if matches!(ty, IrType::U32 | IrType::I32) => {
+                    let dest = *dest;
+                    let ty = *ty;
+                    if let Some(src) = match_ctz64(Operand::Value(dest), &defs) {
+                        // The portable tree returns 63 at zero. Setting bit
+                        // 63 preserves every nonzero input's trailing count,
+                        // maps zero to 63, and proves the intrinsic nonzero.
+                        // This replaces the old compare/two-select expansion.
+                        let safe = Value(next_value_id);
+                        let count = Value(next_value_id + 1);
+                        next_value_id = next_value_id.saturating_add(2);
+                        expansions.push(Expansion {
+                            block: block_bi,
+                            index,
+                            dest,
+                            replacement: vec![
+                                Instruction::BinOp {
+                                    dest: safe,
+                                    op: IrBinOp::Or,
+                                    lhs: src,
+                                    rhs: Operand::Const(IrConst::I64(i64::MIN)),
+                                    ty: IrType::U64,
+                                },
+                                Instruction::UnaryOp {
+                                    dest: count,
+                                    op: IrUnaryOp::CtzNonZero,
+                                    src: Operand::Value(safe),
+                                    ty: IrType::U64,
+                                },
+                                Instruction::Cast {
+                                    dest,
+                                    src: Operand::Value(count),
+                                    from_ty: IrType::U64,
+                                    to_ty: ty,
+                                },
+                            ],
+                        });
+                        changes += 1;
+                    } else if let Some(src) = match_clz32(Operand::Value(dest), &defs) {
+                        // clz(x | 1) is exact, including the tree's zero -> 31.
+                        // Record its nonzero proof in the IR, otherwise the
+                        // baseline x86 lowering emits an unnecessary diamond.
+                        let safe = Value(next_value_id);
+                        next_value_id = next_value_id.saturating_add(1);
+                        expansions.push(Expansion {
+                            block: block_bi,
+                            index,
+                            dest,
+                            replacement: vec![
+                                Instruction::BinOp {
+                                    dest: safe,
+                                    op: IrBinOp::Or,
+                                    lhs: src,
+                                    rhs: Operand::Const(IrConst::I32(1)),
+                                    ty,
+                                },
+                                Instruction::UnaryOp {
+                                    dest,
+                                    op: IrUnaryOp::ClzNonZero,
+                                    src: Operand::Value(safe),
+                                    ty,
+                                },
+                            ],
+                        });
+                        changes += 1;
+                    }
+                }
+                // Truncation-aware narrow rotate: the promoted halves'
+                // complements meet at the truncation's width, not the Or's.
+                // Targets without sub-word rotates (`min_rotate_bits` above
+                // the narrow width) never take this arm, so their backends
+                // cannot receive a node they cannot lower.
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } if matches!(from_ty, IrType::I32 | IrType::U32)
+                    && narrow_width_bits(*to_ty).is_some_and(|w| {
+                        w >= u64::from(min_rotate_bits) && min_rotate_bits > 0
+                    }) =>
+                {
+                    let dest = *dest;
+                    let src = *src;
+                    let from_ty = *from_ty;
+                    let to_ty = *to_ty;
+                    let Some(narrow) = narrow_width_bits(to_ty) else {
+                        continue;
+                    };
+                    if let Some((value, amount, is_left)) = match_narrow_rotate(src, narrow, &defs)
+                    {
+                        // Trunc the shared source down to the rotate's own
+                        // width, then rotate there.  The Or/Shl/Shr chain
+                        // loses this consumer; DCE retires it when nothing
+                        // else reads it (multiple consumers just keep the
+                        // chain — the rewrite never touches it).
+                        let trunc = crate::ir::reexports::Value(next_value_id);
+                        next_value_id = next_value_id.saturating_add(1);
+                        expansions.push(Expansion {
+                            block: block_bi,
+                            index,
+                            dest,
+                            replacement: vec![
+                                Instruction::Cast {
+                                    dest: trunc,
+                                    src: value,
+                                    from_ty,
+                                    to_ty,
+                                },
+                                Instruction::BinOp {
+                                    dest,
+                                    op: if is_left {
+                                        IrBinOp::RotateLeft
+                                    } else {
+                                        IrBinOp::RotateRight
+                                    },
+                                    lhs: Operand::Value(trunc),
+                                    rhs: amount,
+                                    ty: to_ty,
+                                },
+                            ],
+                        });
+                        changes += 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+    // Apply the partial byte reversals, widest first.  Accepting a match
+    // discharges the reads of every instruction it makes dead, so the strictly
+    // narrower candidates inside a merge chain drop to zero remaining readers
+    // and are skipped: the widest node covers the whole network, and the
+    // prefixes become dead code for DCE.  A narrower node that is still read
+    // outside the tree keeps a positive count and is folded on its own — the
+    // alternative would leave its whole expansion alive for the sake of one
+    // surviving consumer.
+    partial.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, block_bi, index, dest, ty, hit) in partial {
+        let Some(mask) = hit.mask else { continue };
+        if use_counts.get(dest.0 as usize).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let block = &mut func.blocks[block_bi];
+        if block.instructions.get(index).and_then(Instruction::dest) != Some(dest) {
+            continue;
+        }
+        // `Bswap` needs a value of its own, and the scan forbids insertion, so
+        // this pair is spliced in after every coordinate-based rewrite.
+        let swapped = Value(next_value_id);
+        next_value_id = next_value_id.saturating_add(1);
+        let masked = Instruction::BinOp {
+            dest,
+            op: IrBinOp::And,
+            lhs: Operand::Value(swapped),
+            rhs: Operand::Const(IrConst::from_i64(mask as i64, ty)),
+            ty,
+        };
+        // Account for the pair while `defs[dest]` still names the network.
+        let mut budget = bytes::DISCHARGE_BUDGET;
+        bytes::discharge(
+            &block.instructions[index],
+            &masked,
+            &defs,
+            &mut use_counts,
+            &mut budget,
+        );
+        defs[dest.0 as usize] = Some(masked.clone());
+        expansions.push(Expansion {
+            block: block_bi,
+            index,
+            dest,
+            replacement: vec![
+                Instruction::UnaryOp {
+                    dest: swapped,
+                    op: IrUnaryOp::Bswap,
+                    src: hit.src,
+                    ty,
+                },
+                masked,
+            ],
+        });
+        changes += 1;
+    }
+    func.next_value_id = next_value_id.max(func.next_value_id);
+    for (pbi, pii, new_prod, cbi, cii, new_cons) in pending_masks {
+        let x_dest = match &new_prod {
+            Instruction::BinOp { dest, .. } => *dest,
+            _ => unreachable!("mask distribution producer is always a BinOp"),
+        };
+        let c_dest = match &new_cons {
+            Instruction::BinOp { dest, .. } => *dest,
+            _ => unreachable!("mask distribution consumer is always a BinOp"),
+        };
+        // Validate BOTH destinations before writing either half. A rejected
+        // pair must not leave a producer/consumer with mismatched semantics.
+        let valid = |bi: usize, ii: usize, dest: Value| {
+            matches!(func.blocks.get(bi).and_then(|b| b.instructions.get(ii)),
+                Some(Instruction::BinOp { dest: d, .. }) if *d == dest)
+        };
+        if valid(pbi, pii, x_dest) && valid(cbi, cii, c_dest) {
+            func.blocks[pbi].instructions[pii] = new_prod;
+            func.blocks[cbi].instructions[cii] = new_cons;
+        }
+    }
+    // Complement-mask pairs: validate BOTH destinations before writing either
+    // half, exactly like the mask pairs above, so a rejected pair can never
+    // leave the And and the comparison disagreeing about the mask.
+    for (pbi, pii, new_prod, cbi, cii, new_cons) in pending_not_mask {
+        let (Instruction::BinOp { dest: and_dest, .. }, Instruction::Cmp { dest: cmp_dest, .. }) =
+            (&new_prod, &new_cons)
+        else {
+            continue;
+        };
+        let (and_dest, cmp_dest) = (*and_dest, *cmp_dest);
+        let prod_ok = matches!(
+            func.blocks.get(pbi).and_then(|b| b.instructions.get(pii)),
+            Some(Instruction::BinOp { dest: d, op: IrBinOp::And, .. }) if *d == and_dest
+        );
+        let cons_ok = matches!(
+            func.blocks.get(cbi).and_then(|b| b.instructions.get(cii)),
+            Some(Instruction::Cmp { dest: d, .. }) if *d == cmp_dest
+        );
+        if prod_ok && cons_ok {
+            func.blocks[pbi].instructions[pii] = new_prod;
+            func.blocks[cbi].instructions[cii] = new_cons;
+            changes += 1;
+        }
+    }
+    // Applications must run from the highest coordinate down: a splice inserts
+    // instructions, shifting every later index in the same block, so applying a
+    // lower index first would invalidate a higher one. Scan-time rewrites are
+    // pushed in lexicographic order already, but the deferred partial
+    // reversals are pushed in profit order, so sort explicitly rather than
+    // relying on push order — a stale index is silently dropped by the
+    // destination check below.
+    expansions.sort_by(|a, b| (b.block, b.index).cmp(&(a.block, a.index)));
+    // Preserve each replaced instruction's source span on ALL nodes, including
+    // the original dest.
+    for Expansion {
+        block: bi,
+        index: ii,
+        dest,
+        replacement,
+    } in expansions
+    {
+        let block = &mut func.blocks[bi];
+        if block.instructions.get(ii).and_then(Instruction::dest) != Some(dest) {
+            continue;
+        }
+        if !block.source_spans.is_empty() {
+            let span = block
+                .source_spans
+                .get(ii)
+                .copied()
+                .unwrap_or_else(crate::common::source::Span::dummy);
+            block.source_spans.resize(block.instructions.len(), span);
+            block
+                .source_spans
+                .splice(ii..=ii, std::iter::repeat_n(span, replacement.len()));
+        }
+        block.instructions.splice(ii..=ii, replacement);
+    }
+    // The demand-driven consumer sweep runs after all coordinate-based
+    // producer edits/expansions. Reuse the existing allocations, but rebuild
+    // a coherent immutable snapshot from the final layout. Ambiguous defs
+    // must not supply algebraic facts.
+    defs.resize(func.max_value_id() as usize + 1, None);
+    defs.fill(None);
+    def_counts.resize(defs.len(), 0);
+    def_counts.fill(0);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+                def_counts[dest.0 as usize] += 1;
+            }
+        }
+    }
+    for (definition, count) in defs.iter_mut().zip(&def_counts) {
+        if *count != 1 {
+            *definition = None;
+        }
+    }
+    changes + observe::run(func, &defs) + demand::run(func) + facts::run(func)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::reexports::Value;
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, Terminator};
+
+    fn swar_defs(second_mask: i64) -> Vec<Option<Instruction>> {
+        let value = |id| Operand::Value(Value(id));
+        let constant = |n| Operand::Const(IrConst::I64(n));
+        let mut defs = vec![None; 13];
+        let mut put = |id, op, lhs, rhs| {
+            defs[id as usize] = Some(Instruction::BinOp {
+                dest: Value(id),
+                op,
+                lhs,
+                rhs,
+                ty: IrType::U32,
+            });
+        };
+        put(1, IrBinOp::LShr, value(0), constant(1));
+        put(2, IrBinOp::And, value(1), constant(0x5555_5555));
+        put(3, IrBinOp::Sub, value(0), value(2));
+        put(4, IrBinOp::And, value(3), constant(0x3333_3333));
+        put(5, IrBinOp::LShr, value(3), constant(2));
+        put(6, IrBinOp::And, value(5), constant(second_mask));
+        put(7, IrBinOp::Add, value(4), value(6));
+        put(8, IrBinOp::LShr, value(7), constant(4));
+        put(9, IrBinOp::Add, value(7), value(8));
+        put(10, IrBinOp::And, value(9), constant(0x0f0f_0f0f));
+        put(11, IrBinOp::Mul, value(10), constant(0x0101_0101));
+        put(12, IrBinOp::LShr, value(11), constant(24));
+        defs
+    }
+
+    #[test]
+    fn recognizes_canonical_swar_popcount32() {
+        let defs = swar_defs(0x3333_3333);
+        assert!(same(
+            match_popcount32(Operand::Value(Value(12)), &defs).unwrap(),
+            Operand::Value(Value(0)),
+            &defs
+        ));
+    }
+
+    #[test]
+    fn swar_literals_are_compared_in_the_u32_ring() {
+        for modulus in [1i128 << 32, -(1i128 << 32), 1i128 << 96] {
+            let mut defs = swar_defs(0x3333_3333);
+            for instruction in defs.iter_mut().flatten() {
+                if let Instruction::BinOp {
+                    op: IrBinOp::And | IrBinOp::Mul,
+                    rhs: Operand::Const(value),
+                    ..
+                } = instruction
+                {
+                    *value = IrConst::I128(value.to_i128().unwrap() + modulus);
+                }
+            }
+            assert_eq!(
+                match_popcount32(Operand::Value(Value(12)), &defs),
+                Some(Operand::Value(Value(0)))
+            );
+            // Changing one real bit of a mask is not a carrier-only change.
+            if let Some(Instruction::BinOp { rhs, .. }) = &mut defs[6] {
+                *rhs = Operand::Const(IrConst::I128(0x3333_3331 + modulus));
+            }
+            assert!(match_popcount32(Operand::Value(Value(12)), &defs).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_near_miss_swar_popcount32() {
+        let defs = swar_defs(0x3333_3331);
+        assert!(match_popcount32(Operand::Value(Value(12)), &defs).is_none());
+    }
+
+    #[test]
+    fn clz_zero_guard_preserves_two_networks_and_spans() {
+        use crate::common::source::Span;
+        let mut insts = Vec::new();
+        let mut next = 1;
+        let input = Operand::Value(Value(0));
+        // Keep the input unknown: with a literal zero the new Boolean
+        // synthesis can legitimately reduce the generated `0 | 1` guard.
+        // An unknown parameter requires both guards, including at runtime zero.
+        insts.push(Instruction::ParamRef {
+            dest: Value(0),
+            param_idx: 0,
+            ty: IrType::U32,
+        });
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let mut working = input;
+            let mut count = Operand::Const(IrConst::I32(0));
+            for amount in [16, 8, 4, 2, 1] {
+                let cond = Value(next);
+                let added = Value(next + 1);
+                let shifted = Value(next + 2);
+                let selected = Value(next + 3);
+                let counted = Value(next + 4);
+                next += 5;
+                insts.push(Instruction::Cmp {
+                    dest: cond,
+                    op: IrCmpOp::Ule,
+                    lhs: working,
+                    rhs: Operand::Const(IrConst::I32((u32::MAX >> amount) as i32)),
+                    ty: IrType::U32,
+                });
+                insts.push(Instruction::BinOp {
+                    dest: added,
+                    op: IrBinOp::Add,
+                    lhs: count,
+                    rhs: Operand::Const(IrConst::I32(amount)),
+                    ty: IrType::U32,
+                });
+                if amount != 1 {
+                    insts.push(Instruction::BinOp {
+                        dest: shifted,
+                        op: IrBinOp::Shl,
+                        lhs: working,
+                        rhs: Operand::Const(IrConst::I32(amount)),
+                        ty: IrType::U32,
+                    });
+                    insts.push(Instruction::Select {
+                        dest: selected,
+                        cond: Operand::Value(cond),
+                        true_val: Operand::Value(shifted),
+                        false_val: working,
+                        ty: IrType::U32,
+                    });
+                    working = Operand::Value(selected);
+                }
+                insts.push(Instruction::Select {
+                    dest: counted,
+                    cond: Operand::Value(cond),
+                    true_val: Operand::Value(added),
+                    false_val: count,
+                    ty: IrType::U32,
+                });
+                count = Operand::Value(counted);
+            }
+            outputs.push(count);
+        }
+        let old_len = insts.len();
+        let spans: Vec<_> = (0..old_len)
+            .map(|i| Span::new(i as u32, i as u32 + 1, 1))
+            .collect();
+        let mut func = IrFunction::new("clz_guard".into(), IrType::U32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            source_spans: spans,
+            terminator: Terminator::Return(Some(outputs[1])),
+        });
+        assert_eq!(recognize_function(&mut func, false, 64, 8, false, true), 2);
+        let b = &func.blocks[0];
+        assert_eq!(b.instructions.len(), old_len + 2);
+        assert_eq!(b.source_spans.len(), b.instructions.len());
+        let mut seen = Vec::new();
+        for (i, inst) in b.instructions.iter().enumerate() {
+            if let Instruction::UnaryOp {
+                dest,
+                op: IrUnaryOp::ClzNonZero,
+                src: Operand::Value(safe),
+                ..
+            } = inst
+            {
+                assert!(matches!(&b.instructions[i-1], Instruction::BinOp {
+                    dest: d, op: IrBinOp::Or, rhs: Operand::Const(IrConst::I32(1)), .. } if d == safe));
+                assert_eq!(b.source_spans[i - 1], b.source_spans[i]);
+                seen.push(Operand::Value(*dest));
+            }
+        }
+        assert_eq!(seen, outputs);
+        assert_eq!(recognize_function(&mut func, false, 64, 8, false, true), 0);
+    }
+
+    #[test]
+    fn select_structure_preserves_intermediate_casts() {
+        for wide in [IrType::U32, IrType::U64] {
+            let defs = vec![
+                None,
+                Some(Instruction::Select {
+                    dest: Value(1),
+                    cond: Operand::Value(Value(0)),
+                    true_val: Operand::Const(IrConst::I64(0x10000)),
+                    false_val: Operand::Const(IrConst::I64(2)),
+                    ty: wide,
+                }),
+                Some(Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                }),
+                Some(Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(1)),
+                    from_ty: wide,
+                    to_ty: IrType::U16,
+                }),
+                Some(Instruction::Cast {
+                    dest: Value(4),
+                    src: Operand::Value(Value(3)),
+                    from_ty: IrType::U16,
+                    to_ty: wide,
+                }),
+            ];
+            assert!(select(Operand::Value(Value(1)), &defs).is_some());
+            assert!(select(Operand::Value(Value(2)), &defs).is_some());
+            assert!(select(Operand::Value(Value(3)), &defs).is_none());
+            assert!(select(Operand::Value(Value(4)), &defs).is_none());
+        }
+    }
+
+    #[test]
+    fn swar_intermediate_casts_are_not_structural_aliases() {
+        // Attack every internal edge, including both readers of shared nodes.
+        // Copy aliases remain legal; truncation followed by extension does not.
+        for id in 1..12 {
+            for narrow in [None, Some(IrType::U8), Some(IrType::U16), Some(IrType::I16)] {
+                let mut defs = swar_defs(0x3333_3333);
+                let replacement = Value(if narrow.is_some() { 14 } else { 13 });
+                for inst in defs.iter_mut().flatten() {
+                    if let Instruction::BinOp { lhs, rhs, .. } = inst {
+                        for op in [lhs, rhs] {
+                            if *op == Operand::Value(Value(id)) {
+                                *op = Operand::Value(replacement);
+                            }
+                        }
+                    }
+                }
+                if let Some(ty) = narrow {
+                    defs.push(Some(Instruction::Cast {
+                        dest: Value(13),
+                        src: Operand::Value(Value(id)),
+                        from_ty: IrType::U32,
+                        to_ty: ty,
+                    }));
+                    defs.push(Some(Instruction::Cast {
+                        dest: Value(14),
+                        src: Operand::Value(Value(13)),
+                        from_ty: ty,
+                        to_ty: IrType::U32,
+                    }));
+                } else {
+                    defs.push(Some(Instruction::Copy {
+                        dest: Value(13),
+                        src: Operand::Value(Value(id)),
+                    }));
+                }
+                assert_eq!(
+                    match_popcount32(Operand::Value(Value(12)), &defs).is_some(),
+                    narrow.is_none(),
+                    "edge {id}, cast {narrow:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn swar_requires_32_bit_arithmetic_at_every_node() {
+        for id in 1..=12 {
+            for ty in [IrType::U8, IrType::U16, IrType::U64, IrType::I64] {
+                let mut defs = swar_defs(0x3333_3333);
+                if let Some(Instruction::BinOp { ty: node_ty, .. }) = &mut defs[id] {
+                    *node_ty = ty;
+                }
+                assert!(
+                    match_popcount32(Operand::Value(Value(12)), &defs).is_none(),
+                    "node {id}, width {ty:?}"
+                );
+            }
+        }
+    }
+
+    /// Build `Or(Shl(shl_src, c1), LShr(lshr_src, c2))` at `ty`; ids 1..4.
+    fn rotate_defs(
+        ty: IrType,
+        shl_src: Operand,
+        lshr_src: Operand,
+        c1: i64,
+        c2: i64,
+    ) -> Vec<Option<Instruction>> {
+        let value = |id| Operand::Value(Value(id));
+        let constant = |n| Operand::Const(IrConst::I64(n));
+        let mut defs = vec![None; 5];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Shl,
+            lhs: shl_src,
+            rhs: constant(c1),
+            ty,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::LShr,
+            lhs: lshr_src,
+            rhs: constant(c2),
+            ty,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Or,
+            lhs: value(1),
+            rhs: value(2),
+            ty,
+        });
+        defs
+    }
+
+    #[test]
+    fn recognizes_rotate_both_operand_orders() {
+        let v = |id| Operand::Value(Value(id));
+        // Or(Shl(x, 12), LShr(x, 20)) — shl on the lhs, smaller count wins.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 12, 20);
+        let (value, amount, is_left) = match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+        assert_eq!(value, v(0));
+        assert_eq!(amount, Operand::Const(IrConst::I64(12)));
+        assert!(is_left);
+
+        // Swapped OR operands: still the rotate by 12.
+        let mut defs = rotate_defs(IrType::U32, v(0), v(0), 12, 20);
+        if let Some(Instruction::BinOp { lhs, rhs, .. }) = defs[3].as_mut() {
+            std::mem::swap(lhs, rhs);
+        }
+        let (value, _, _) = match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+        assert_eq!(value, v(0));
+
+        // Larger shl count: direction flips to the rotate-right view.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 25, 7);
+        let (_, amount, is_left) = match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+        assert_eq!(amount, Operand::Const(IrConst::I64(7)));
+        assert!(!is_left);
+    }
+
+    #[test]
+    fn recognizes_rotate_64_bit_and_extreme_counts() {
+        let v = |id| Operand::Value(Value(id));
+        for c in [1u64, 63, 33, 40] {
+            let defs = rotate_defs(IrType::U64, v(0), v(0), c as i64, (64 - c) as i64);
+            let (value, amount, is_left) =
+                match_rotate(Operand::Value(Value(3)), 64, &defs).unwrap();
+            assert_eq!(value, v(0));
+            // The smaller count wins, matching the reference compilers'
+            // spelling choice: rol $1, not ror $63.
+            let small = c.min(64 - c);
+            assert_eq!(amount, Operand::Const(IrConst::I64(small as i64)));
+            assert_eq!(is_left, c < 64 - c);
+        }
+        // i686 advertises 32-bit rotates only.
+        let defs = rotate_defs(IrType::U64, v(0), v(0), 33, 31);
+        assert!(match_rotate(Operand::Value(Value(3)), 32, &defs).is_none());
+    }
+
+    #[test]
+    fn recognizes_variable_amount_rotate() {
+        let v = |id| Operand::Value(Value(id));
+        let constant = |n| Operand::Const(IrConst::I64(n));
+        // Or(Shl(x, n), LShr(x, Sub(32, n)))
+        let mut defs = vec![None; 6];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Shl,
+            lhs: v(0),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::Sub,
+            lhs: constant(32),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::LShr,
+            lhs: v(0),
+            rhs: v(2),
+            ty: IrType::U32,
+        });
+        defs[4] = Some(Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::Or,
+            lhs: v(1),
+            rhs: v(3),
+            ty: IrType::U32,
+        });
+        let (value, amount, is_left) = match_rotate(Operand::Value(Value(4)), 64, &defs).unwrap();
+        assert_eq!(value, v(0));
+        assert_eq!(amount, v(4));
+        assert!(is_left);
+    }
+
+    /// `Or(Shl(x, shl_amt), LShr(x, lshr_amt))` at `ty` over extra defs;
+    /// the OR is value 9, `x` is value 0 and `n` is value 1.
+    fn masked_rotate_defs(
+        ty: IrType,
+        extra: &[(u32, Instruction)],
+        shl_amt: Operand,
+        lshr_amt: Operand,
+    ) -> Vec<Option<Instruction>> {
+        let v = |id| Operand::Value(Value(id));
+        let mut defs = vec![None; 10];
+        for (id, inst) in extra {
+            defs[*id as usize] = Some(inst.clone());
+        }
+        defs[7] = Some(Instruction::BinOp {
+            dest: Value(7),
+            op: IrBinOp::Shl,
+            lhs: v(0),
+            rhs: shl_amt,
+            ty,
+        });
+        defs[8] = Some(Instruction::BinOp {
+            dest: Value(8),
+            op: IrBinOp::LShr,
+            lhs: v(0),
+            rhs: lshr_amt,
+            ty,
+        });
+        defs[9] = Some(Instruction::BinOp {
+            dest: Value(9),
+            op: IrBinOp::Or,
+            lhs: v(7),
+            rhs: v(8),
+            ty,
+        });
+        defs
+    }
+
+    fn bin(id: u32, op: IrBinOp, lhs: Operand, rhs: Operand) -> (u32, Instruction) {
+        let ty = IrType::I32;
+        (
+            id,
+            Instruction::BinOp {
+                dest: Value(id),
+                op,
+                lhs,
+                rhs,
+                ty,
+            },
+        )
+    }
+
+    /// The UB-free spellings `(x << (n & (W-1))) | (x >> (-n & (W-1)))`,
+    /// with the negation as `Neg`, `0 - m` or `W - m`, the negated operand
+    /// masked or not, in both directions and at both widths; the rotate
+    /// count drops the redundant mask.
+    #[test]
+    fn recognizes_masked_complement_rotate() {
+        let v = |id| Operand::Value(Value(id));
+        let k = |n| Operand::Const(IrConst::I64(n));
+        for (ty, w) in [(IrType::U32, 32i64), (IrType::U64, 64)] {
+            let masked_n = bin(2, IrBinOp::And, v(1), k(w - 1));
+            let negs = [
+                (
+                    3,
+                    Instruction::UnaryOp {
+                        dest: Value(3),
+                        op: IrUnaryOp::Neg,
+                        src: v(1),
+                        ty: IrType::I32,
+                    },
+                ),
+                bin(3, IrBinOp::Sub, k(0), v(1)),
+                bin(3, IrBinOp::Sub, k(w), v(1)),
+                bin(3, IrBinOp::Sub, k(0), v(2)),
+            ];
+            for neg in negs {
+                let comp = bin(4, IrBinOp::And, v(3), k(w - 1));
+                let extra = [masked_n.clone(), neg.clone(), comp.clone()];
+                // Left: shl by n & (W-1), lshr by the complement.
+                let defs = masked_rotate_defs(ty, &extra, v(2), v(4));
+                let (value, amount, left) = match_rotate(v(9), 64, &defs).expect("left");
+                assert_eq!((value, amount, left), (v(0), v(1), true), "{ty:?} {neg:?}");
+                // Unmasked positive count.
+                let defs = masked_rotate_defs(ty, &extra, v(1), v(4));
+                assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(1)));
+                // Right: the complement on the shl side.
+                let defs = masked_rotate_defs(ty, &extra, v(4), v(2));
+                let (_, amount, left) = match_rotate(v(9), 64, &defs).expect("right");
+                assert_eq!((amount, left), (v(1), false), "{ty:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_inexact_masked_complements() {
+        let v = |id| Operand::Value(Value(id));
+        let k = |n| Operand::Const(IrConst::I64(n));
+        let masked_n = bin(2, IrBinOp::And, v(1), k(31));
+        let neg = bin(3, IrBinOp::Sub, k(0), v(1));
+        // Complement mask wider than W-1: (-n) & 63 can be an oversize shift.
+        let extra = [
+            masked_n.clone(),
+            neg.clone(),
+            bin(4, IrBinOp::And, v(3), k(63)),
+        ];
+        assert!(
+            match_rotate(
+                v(9),
+                64,
+                &masked_rotate_defs(IrType::U32, &extra, v(2), v(4))
+            )
+            .is_none()
+        );
+        // Negation of a different count.
+        let other = bin(3, IrBinOp::Sub, k(0), v(5));
+        let extra = [masked_n.clone(), other, bin(4, IrBinOp::And, v(3), k(31))];
+        assert!(
+            match_rotate(
+                v(9),
+                64,
+                &masked_rotate_defs(IrType::U32, &extra, v(2), v(4))
+            )
+            .is_none()
+        );
+        // `16 - n` is not a negation modulo 32.
+        let off = bin(3, IrBinOp::Sub, k(16), v(1));
+        let extra = [masked_n, off, bin(4, IrBinOp::And, v(3), k(31))];
+        assert!(
+            match_rotate(
+                v(9),
+                64,
+                &masked_rotate_defs(IrType::U32, &extra, v(2), v(4))
+            )
+            .is_none()
+        );
+    }
+
+    /// `ROTL(x, n & 31)` in the `W - m` spelling: the mask is stripped only
+    /// when the amount is the `And` itself, never across a cast.
+    #[test]
+    fn rotate_count_mask_is_stripped_only_without_a_cast() {
+        let v = |id| Operand::Value(Value(id));
+        let k = |n| Operand::Const(IrConst::I64(n));
+        let masked = bin(2, IrBinOp::And, v(1), k(31));
+        let comp = bin(4, IrBinOp::Sub, k(32), v(2));
+        let defs = masked_rotate_defs(IrType::U32, &[masked.clone(), comp.clone()], v(2), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(1)));
+        // 0xFF keeps the low five bits: still the rotate by n.
+        let wide = bin(2, IrBinOp::And, k(0xFF), v(1));
+        let defs = masked_rotate_defs(IrType::U32, &[wide, comp.clone()], v(2), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(1)));
+        // A mask that clears a count bit is not redundant.
+        let narrow = bin(2, IrBinOp::And, v(1), k(15));
+        let defs = masked_rotate_defs(IrType::U32, &[narrow, comp.clone()], v(2), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(2)));
+        // Reached through a widening cast: keep the cast operand.
+        let cast = (
+            3,
+            Instruction::Cast {
+                dest: Value(3),
+                src: v(2),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+        );
+        let comp64 = bin(4, IrBinOp::Sub, k(32), v(3));
+        let defs = masked_rotate_defs(IrType::U32, &[masked, cast, comp64], v(3), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(3)));
+    }
+
+    #[test]
+    fn rejects_non_complementary_rotate_counts() {
+        let v = |id| Operand::Value(Value(id));
+        // 5 + 20 != 32.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 5, 20);
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+        // Degenerate full-width shift (C1 == W) with C2 == 0.
+        let defs = rotate_defs(IrType::U32, v(0), v(0), 32, 0);
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+        // Arithmetic right shift half: not a rotate.
+        let mut defs = rotate_defs(IrType::U32, v(0), v(0), 12, 20);
+        if let Some(Instruction::BinOp { op, .. }) = defs[2].as_mut() {
+            *op = IrBinOp::AShr;
+        }
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_rotate_with_differing_sources() {
+        let v = |id| Operand::Value(Value(id));
+        let defs = rotate_defs(IrType::U32, v(0), v(9), 5, 27);
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_rotate_across_width_mismatch() {
+        let v = |id| Operand::Value(Value(id));
+        // The shifts run at u32 under a u64 OR: the amounts cannot be
+        // checked against the OR's width, so this must not fold.
+        let mut defs = rotate_defs(IrType::U64, v(0), v(0), 12, 20);
+        if let Some(Instruction::BinOp { ty, .. }) = defs[1].as_mut() {
+            *ty = IrType::U32;
+        }
+        if let Some(Instruction::BinOp { ty, .. }) = defs[2].as_mut() {
+            *ty = IrType::U32;
+        }
+        assert!(match_rotate(Operand::Value(Value(3)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_rotate_halves_through_different_casts_of_one_root() {
+        // Or(Shl(zext(a), 16), LShr(sext(a), 16)): both halves peel to `a`
+        // but zext/sext are different 32-bit values.  Folding this to a
+        // rotate of anything silently drops the sign half — this is the
+        // regression test for the cast-peeling soundness hole.
+        let v = |id| Operand::Value(Value(id));
+        let mut defs = vec![None; 7];
+        defs[1] = Some(Instruction::Cast {
+            dest: Value(1),
+            src: v(0),
+            from_ty: IrType::I8,
+            to_ty: IrType::U32,
+        });
+        defs[2] = Some(Instruction::Cast {
+            dest: Value(2),
+            src: v(0),
+            from_ty: IrType::I8,
+            to_ty: IrType::I32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Shl,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I64(16)),
+            ty: IrType::U32,
+        });
+        defs[4] = Some(Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::LShr,
+            lhs: v(2),
+            rhs: Operand::Const(IrConst::I64(16)),
+            ty: IrType::U32,
+        });
+        defs[5] = Some(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Or,
+            lhs: v(3),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        assert!(match_rotate(Operand::Value(Value(5)), 64, &defs).is_none());
+    }
+
+    #[test]
+    fn recognizes_rotate_through_one_shared_cast() {
+        // Both halves read the SAME cast value: a rotate of the extended
+        // value.  The fold must fire and keep the cast as the source (the
+        // rotate runs at the cast's width), not peel to the narrow root.
+        let v = |id| Operand::Value(Value(id));
+        let mut defs = vec![None; 7];
+        defs[1] = Some(Instruction::Cast {
+            dest: Value(1),
+            src: v(0),
+            from_ty: IrType::U16,
+            to_ty: IrType::U32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Shl,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I64(8)),
+            ty: IrType::U32,
+        });
+        defs[4] = Some(Instruction::BinOp {
+            dest: Value(4),
+            op: IrBinOp::LShr,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I64(24)),
+            ty: IrType::U32,
+        });
+        defs[5] = Some(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Or,
+            lhs: v(3),
+            rhs: v(4),
+            ty: IrType::U32,
+        });
+        let (value, _, is_left) = match_rotate(Operand::Value(Value(5)), 64, &defs).unwrap();
+        assert_eq!(value, v(1)); // the cast, not the u16 root
+        assert!(is_left);
+    }
+
+    /// IR shape of `(uint16_t)((v << 8) | (v >> 8))` after integer
+    /// promotion: both halves shift the SAME zext of the u16 value at i32,
+    /// the right half arrives as AShr (the promoted type is signed), and a
+    /// truncation consumes the Or.
+    fn narrow_rotate_defs(
+        right_op: IrBinOp,
+        shr_amt: Operand,
+        value: Operand,
+    ) -> Vec<Option<Instruction>> {
+        let mut defs = vec![None; 7];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Shl,
+            lhs: value,
+            rhs: Operand::Const(IrConst::I64(8)),
+            ty: IrType::I32,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: right_op,
+            lhs: value,
+            rhs: shr_amt,
+            ty: IrType::I32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::Or,
+            lhs: v(1),
+            rhs: v(2),
+            ty: IrType::I32,
+        });
+        defs
+    }
+
+    fn v(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    fn zext_u16(id: u32) -> Instruction {
+        Instruction::Cast {
+            dest: Value(id),
+            src: v(id - 1),
+            from_ty: IrType::U16,
+            to_ty: IrType::I32,
+        }
+    }
+
+    #[test]
+    fn not_mask_comparison_matches_the_boolean_identity() {
+        // Exhaustive over the whole 8-bit domain: the rewrite the pass
+        // performs is a theorem, not a heuristic.
+        for c in 0..=255u8 {
+            for x in 0..=255u8 {
+                assert_eq!(((!x) & c) == 0, (x & c) == c, "x={x} c={c}");
+                assert_eq!(((!x) & c) != 0, (x & c) != c, "x={x} c={c}");
+            }
+        }
+    }
+
+    #[test]
+    fn not_mask_comparison_is_recognized_and_bounded_by_its_reader() {
+        let ty = IrType::U32;
+        let defs = vec![
+            None,
+            Some(Instruction::UnaryOp {
+                dest: Value(1),
+                op: IrUnaryOp::Not,
+                src: v(0),
+                ty,
+            }),
+            Some(Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::And,
+                lhs: v(1),
+                rhs: Operand::Const(IrConst::I32(0x5a5a)),
+                ty,
+            }),
+            Some(Instruction::Cmp {
+                dest: Value(3),
+                op: IrCmpOp::Eq,
+                lhs: v(2),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty,
+            }),
+        ];
+        // The And's only reader is the comparison.
+        let (and_dest, x, mask, cmp_ty) =
+            match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0]).unwrap();
+        assert_eq!((and_dest, mask, cmp_ty), (2, 0x5a5a, ty));
+        assert!(matches!(x, Operand::Value(Value(0))));
+
+        // A second reader of the And would observe the retargeted bits.
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 2, 0]).is_none());
+
+        // A comparison against a nonzero constant is a different statement.
+        let mut nonzero = defs.clone();
+        nonzero[3] = Some(Instruction::Cmp {
+            dest: Value(3),
+            op: IrCmpOp::Eq,
+            lhs: v(2),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty,
+        });
+        assert!(
+            match_not_mask_cmp(nonzero[3].as_ref().unwrap(), &nonzero, &[0, 1, 1, 0]).is_none()
+        );
+
+        // Without the complement there is nothing to undo.
+        let mut plain = defs.clone();
+        plain[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::And,
+            lhs: v(0),
+            rhs: Operand::Const(IrConst::I32(0x5a5a)),
+            ty,
+        });
+        assert!(match_not_mask_cmp(plain[3].as_ref().unwrap(), &plain, &[0, 1, 1, 0]).is_none());
+    }
+
+    #[test]
+    fn not_mask_refuses_a_branching_copy_between_and_and_comparison() {
+        // `and` -> copy -> copy -> cmp: the And has exactly one reader, but the
+        // intermediate copy has two, so the second reader would observe the
+        // retargeted bits.  Only a linear chain is rewritable.
+        let ty = IrType::U32;
+        let and = Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::And,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I32(0x5a5a)),
+            ty,
+        };
+        let not = Instruction::UnaryOp {
+            dest: Value(1),
+            op: IrUnaryOp::Not,
+            src: v(0),
+            ty,
+        };
+        let copy = Instruction::Copy {
+            dest: Value(4),
+            src: v(2),
+        };
+        let cmp = Instruction::Cmp {
+            dest: Value(3),
+            op: IrCmpOp::Eq,
+            lhs: v(4),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty,
+        };
+        let defs = vec![None, Some(not), Some(and), Some(cmp), Some(copy)];
+        // Linear chain: the copy is read only by the comparison.
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0, 1]).is_some());
+        // Shared alias: the copy has a second reader, so the rewrite is refused.
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0, 2]).is_none());
+        // A missing use-count entry must fail closed, never default to "single".
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0]).is_none());
+    }
+
+    #[test]
+    fn not_mask_comparison_handles_the_not_on_either_and_side() {
+        let ty = IrType::U32;
+        let defs = vec![
+            None,
+            Some(Instruction::UnaryOp {
+                dest: Value(1),
+                op: IrUnaryOp::Not,
+                src: v(0),
+                ty,
+            }),
+            Some(Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::And,
+                lhs: Operand::Const(IrConst::I32(0x00ff)),
+                rhs: v(1),
+                ty,
+            }),
+            Some(Instruction::Cmp {
+                dest: Value(3),
+                op: IrCmpOp::Ne,
+                lhs: Operand::Const(IrConst::I32(0)),
+                rhs: v(2),
+                ty,
+            }),
+        ];
+        let (and_dest, x, mask, _) =
+            match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0]).unwrap();
+        assert_eq!((and_dest, mask), (2, 0xff));
+        assert!(matches!(x, Operand::Value(Value(0))));
+    }
+
+    #[test]
+    fn recognizes_narrow_rotate_constant_ashr() {
+        // `(uint16_t)((v << 8) | (v >> 8))`: complements meet only at 16;
+        // the promoted right shift is AShr but the zext proof makes it exact.
+        let mut defs = narrow_rotate_defs(IrBinOp::AShr, Operand::Const(IrConst::I64(8)), v(5));
+        defs[5] = Some(zext_u16(5));
+        let (value, amount, is_left) = match_narrow_rotate(v(3), 16, &defs).unwrap();
+        assert_eq!(value, v(5)); // the zext, not the u16 root
+        assert_eq!(const_u64(peel(amount, &defs)), Some(8));
+        assert!(is_left);
+    }
+
+    #[test]
+    fn recognizes_narrow_rotate_variable_count() {
+        // `(uint16_t)((v << c) | (v >> (16 - c)))`: the complement is the
+        // live `16 - c` subtraction, matched at the NARROW width.
+        let mut defs = vec![None; 8];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Sub,
+            lhs: Operand::Const(IrConst::I64(16)),
+            rhs: v(4),
+            ty: IrType::I32,
+        });
+        defs[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::Shl,
+            lhs: v(5),
+            rhs: v(4),
+            ty: IrType::I32,
+        });
+        defs[3] = Some(Instruction::BinOp {
+            dest: Value(3),
+            op: IrBinOp::LShr,
+            lhs: v(5),
+            rhs: v(1),
+            ty: IrType::I32,
+        });
+        defs[6] = Some(Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::Or,
+            lhs: v(2),
+            rhs: v(3),
+            ty: IrType::I32,
+        });
+        defs[5] = Some(zext_u16(5));
+        let (value, amount, is_left) = match_narrow_rotate(v(6), 16, &defs).unwrap();
+        assert_eq!(value, v(5));
+        assert_eq!(amount, v(4)); // the direct count, not the subtraction
+        assert!(is_left);
+    }
+
+    #[test]
+    fn rejects_narrow_rotate_without_high_bits_proof() {
+        // Same shape but the source is a SEXT of an i16: bits above 16 are
+        // the sign replication, not zero, so the narrow pattern must not
+        // fire (the AShr half is not an LShr of the low word).
+        let mut defs = narrow_rotate_defs(IrBinOp::AShr, Operand::Const(IrConst::I64(8)), v(5));
+        defs[5] = Some(Instruction::Cast {
+            dest: Value(5),
+            src: v(4),
+            from_ty: IrType::I16,
+            to_ty: IrType::I32,
+        });
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_narrow_rotate_wrong_complement() {
+        // 8 + 12 != 16: not complementary at the narrow width either.
+        let mut defs = narrow_rotate_defs(IrBinOp::LShr, Operand::Const(IrConst::I64(12)), v(5));
+        defs[5] = Some(zext_u16(5));
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+        // 8 + 24 complements at 32, not 16: that is the WIDE rotate's shape
+        // (already handled by `match_rotate`), never a narrow one.
+        let mut defs = narrow_rotate_defs(IrBinOp::LShr, Operand::Const(IrConst::I64(24)), v(5));
+        defs[5] = Some(zext_u16(5));
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+    }
+
+    #[test]
+    fn rejects_narrow_rotate_differing_sources() {
+        // The halves read different zexts of one root: different values, no
+        // fold (the post-beb28b4c identity discipline).
+        let mut defs = narrow_rotate_defs(IrBinOp::LShr, Operand::Const(IrConst::I64(8)), v(5));
+        defs[5] = Some(zext_u16(5));
+        defs[6] = Some(zext_u16(6));
+        if let Some(Instruction::BinOp { lhs, .. }) = defs[2].as_mut() {
+            *lhs = v(6);
+        }
+        assert!(match_narrow_rotate(v(3), 16, &defs).is_none());
+    }
+
+    #[test]
+    fn high_bits_zero_accepts_mask_and_rejects_sext() {
+        let mut defs = vec![None; 4];
+        defs[1] = Some(Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::And,
+            lhs: v(0),
+            rhs: Operand::Const(IrConst::I64(0xffff)),
+            ty: IrType::I32,
+        });
+        assert!(high_bits_zero(v(1), 16, &defs));
+        assert!(!high_bits_zero(v(1), 8, &defs)); // mask covers 16, not 8
+        defs[2] = Some(Instruction::Cast {
+            dest: Value(2),
+            src: v(0),
+            from_ty: IrType::I16,
+            to_ty: IrType::I32,
+        });
+        assert!(!high_bits_zero(v(2), 16, &defs)); // sext: not zeros above 16
+        defs[3] = Some(Instruction::Cast {
+            dest: Value(3),
+            src: v(0),
+            from_ty: IrType::U8,
+            to_ty: IrType::I32,
+        });
+        assert!(high_bits_zero(v(3), 16, &defs)); // zext of u8: zeros above 8 ⊇ above 16
+        assert!(high_bits_zero(
+            Operand::Const(IrConst::I64(0x1234)),
+            16,
+            &defs
+        ));
+        assert!(!high_bits_zero(
+            Operand::Const(IrConst::I64(0x12345)),
+            16,
+            &defs
+        ));
+    }
+
+    #[test]
+    fn high_bits_zero_width64_accepts_any_const() {
+        // At width >= 64 a u64 has no upper bits: every constant passes.
+        // (Before the fix this computed `1u64 << 64`: debug panic, and in
+        // release `c < 1`, wrongly rejecting every nonzero constant.)
+        let defs: Vec<Option<Instruction>> = Vec::new();
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(5)), 64, &defs));
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(-1)), 64, &defs));
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(0)), 64, &defs));
+        // Narrow widths still enforce the bound.
+        assert!(!high_bits_zero(
+            Operand::Const(IrConst::I64(1 << 33)),
+            32,
+            &defs
+        ));
+        assert!(high_bits_zero(Operand::Const(IrConst::I64(0)), 0, &defs));
+    }
+
+    // ── Boolean mux/majority algebra ────────────────────────────────────
+
+    /// A one-block fixture: instructions in order, defs/def_loc/use_counts
+    /// derived exactly the way `recognize_function` derives them, plus the
+    /// operand-use counting it performs.
+    struct BoolFixture {
+        defs: Vec<Option<Instruction>>,
+        def_loc: Vec<Option<(usize, usize)>>,
+        use_counts: Vec<u32>,
+        insts: Vec<Instruction>,
+    }
+
+    fn fixture(insts: Vec<Instruction>) -> BoolFixture {
+        let mut n = 4usize;
+        for inst in &insts {
+            if let Some(dest) = inst.dest() {
+                n = n.max(dest.0 as usize + 1);
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    n = n.max(v.0 as usize + 1);
+                }
+            });
+        }
+        let mut defs = vec![None; n];
+        let mut def_loc = vec![None; n];
+        let mut use_counts = vec![0u32; n];
+        for (ii, inst) in insts.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+                def_loc[dest.0 as usize] = Some((0, ii));
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_counts[v.0 as usize] += 1;
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_counts[v.0 as usize] += 1;
+            });
+        }
+        BoolFixture {
+            defs,
+            def_loc,
+            use_counts,
+            insts,
+        }
+    }
+
+    /// Multi-block variant of [`fixture`] (audit work order P0-3): one
+    /// instruction list per block; every def's location records the block
+    /// it actually lives in, so rank and cross-block logic can be pinned.
+    /// `insts` carries the LAST block (the consumer's) flattened.
+    fn fixture_blocks(blocks: &[Vec<Instruction>]) -> BoolFixture {
+        let mut n = 4usize;
+        for blk in blocks {
+            for inst in blk {
+                if let Some(dest) = inst.dest() {
+                    n = n.max(dest.0 as usize + 1);
+                }
+                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(vv) = op {
+                        n = n.max(vv.0 as usize + 1);
+                    }
+                });
+            }
+        }
+        let mut defs = vec![None; n];
+        let mut def_loc = vec![None; n];
+        let mut use_counts = vec![0u32; n];
+        for (bi, blk) in blocks.iter().enumerate() {
+            for (ii, inst) in blk.iter().enumerate() {
+                if let Some(dest) = inst.dest() {
+                    defs[dest.0 as usize] = Some(inst.clone());
+                    def_loc[dest.0 as usize] = Some((bi, ii));
+                }
+                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(vv) = op {
+                        use_counts[vv.0 as usize] += 1;
+                    }
+                });
+                crate::backend::liveness::for_each_value_use_in_instruction(inst, |vv| {
+                    use_counts[vv.0 as usize] += 1;
+                });
+            }
+        }
+        BoolFixture {
+            defs,
+            def_loc,
+            use_counts,
+            insts: blocks.last().cloned().unwrap_or_default(),
+        }
+    }
+
+    fn and3(d: u32, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::And,
+            lhs: a,
+            rhs: b,
+            ty: IrType::U32,
+        }
+    }
+    fn xor3(d: u32, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Xor,
+            lhs: a,
+            rhs: b,
+            ty: IrType::U32,
+        }
+    }
+    fn or3(d: u32, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Or,
+            lhs: a,
+            rhs: b,
+            ty: IrType::U32,
+        }
+    }
+    fn not3(d: u32, a: Operand) -> Instruction {
+        Instruction::UnaryOp {
+            dest: Value(d),
+            op: IrUnaryOp::Not,
+            src: a,
+            ty: IrType::U32,
+        }
+    }
+    fn and_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::And,
+            lhs: a,
+            rhs: b,
+            ty,
+        }
+    }
+    fn xor_ty(d: u32, ty: IrType, a: Operand, b: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Xor,
+            lhs: a,
+            rhs: b,
+            ty,
+        }
+    }
+    fn not_ty(d: u32, ty: IrType, a: Operand) -> Instruction {
+        Instruction::UnaryOp {
+            dest: Value(d),
+            op: IrUnaryOp::Not,
+            src: a,
+            ty,
+        }
+    }
+
+    /// Evaluate a value under an environment for the def-less inputs
+    /// (ids 0,1,2 = x,y,z) — the exhaustive truth-table oracle.
+    fn eval_val(op: &Operand, fx: &BoolFixture, env: &[u32; 3]) -> u32 {
+        match op {
+            Operand::Value(v) => {
+                let id = v.0 as usize;
+                if id < 3 {
+                    env[id]
+                } else {
+                    eval_inst(fx.defs[id].as_ref().unwrap(), fx, env)
+                }
+            }
+            Operand::Const(c) => c.to_i64().unwrap_or(0) as u32,
+        }
+    }
+
+    fn eval_inst(inst: &Instruction, fx: &BoolFixture, env: &[u32; 3]) -> u32 {
+        match inst {
+            Instruction::BinOp { op, lhs, rhs, .. } => {
+                let a = eval_val(lhs, fx, env);
+                let b = eval_val(rhs, fx, env);
+                match op {
+                    IrBinOp::And => a & b,
+                    IrBinOp::Or => a | b,
+                    IrBinOp::Xor => a ^ b,
+                    _ => unreachable!("fixture uses only And/Or/Xor"),
+                }
+            }
+            Instruction::UnaryOp { op, src, .. } => {
+                let a = eval_val(src, fx, env);
+                match op {
+                    IrUnaryOp::Not => !a,
+                    _ => unreachable!("fixture uses only Not"),
+                }
+            }
+            _ => unreachable!("fixture uses only binops/unops"),
+        }
+    }
+
+    /// Run the matcher on the fixture's last instruction (the consumer) and
+    /// verify the rewrite is EXHAUSTIVELY bit-exact: for every assignment of
+    /// multi-bit values to x/y/z (all 2^3 sign patterns plus mixed-width
+    /// patterns), the rewritten program computes what the original did.
+    fn assert_rewrite_bit_exact(fx: &BoolFixture, consumer_idx: usize) {
+        let consumer = fx.insts[consumer_idx].clone();
+        let Instruction::BinOp {
+            dest, lhs, rhs, op, ..
+        } = &consumer
+        else {
+            panic!("fixture consumer must be a BinOp");
+        };
+        let (new_consumer, pending) = match_bool_mux_algebra(
+            *lhs,
+            *rhs,
+            *op,
+            *dest,
+            IrType::U32,
+            0,
+            consumer_idx,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the shape must match");
+        // Apply the rewrite to a copy of the program.
+        let mut rewritten = fx.insts.clone();
+        rewritten[consumer_idx] = new_consumer;
+        for (bi, ii, inst) in pending {
+            assert_eq!(bi, 0, "v1 repurposes stay in the consumer's block");
+            rewritten[ii] = inst;
+        }
+        // A second fixture over the REWRITTEN program (same env) must
+        // evaluate the consumer's dest identically on every pattern.
+        let rfx = fixture(rewritten.clone());
+        let old_dest = dest.0;
+        let new_dest = rewritten[consumer_idx].dest().unwrap().0;
+        assert_eq!(old_dest, new_dest, "the consumer keeps its dest");
+        let mut patterns = Vec::new();
+        for x in [0u32, 1, 0x8000_0000, 0x7fff_ffff, 0xffff_ffff, 0x1234_5678] {
+            for y in [0u32, 1, 0x8000_0000, 0x7fff_ffff, 0xffff_ffff, 0xdead_beef] {
+                for z in [0u32, 1, 0x8000_0000, 0x7fff_ffff, 0xffff_ffff, 0x0f0f_0f0f] {
+                    patterns.push([x, y, z]);
+                }
+            }
+        }
+        for env in patterns {
+            let before = eval_inst(&consumer, fx, &env);
+            let after = eval_inst(&rfx.insts[consumer_idx], &rfx, &env);
+            assert_eq!(
+                before, after,
+                "rewrite changed semantics at x={:#x} y={:#x} z={:#x}",
+                env[0], env[1], env[2]
+            );
+        }
+    }
+
+    #[test]
+    fn mux_ch_shape_rewrites_and_stays_bit_exact() {
+        // (x&y) ^ (~x&z)   →   z ^ (x & (y^z))   [4 ops → 3]
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)), // early: And(x, y)
+            and3(5, v(3), v(2)), // late:  And(~x, z)
+            xor3(6, v(4), v(5)), // consumer
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn mux_ch_shape_with_swapped_arms_rewrites() {
+        // (~x&z) first, (x&y) second — the orientation loop must find it.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(3), v(2)), // early: And(~x, z)
+            and3(5, v(0), v(1)), // late:  And(x, y)
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn mux_ch_shape_with_swapped_and_operands_rewrites() {
+        // And(y, x) and And(z, ~x) — operand order inside the Ands.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(1), v(0)),
+            and3(5, v(2), v(3)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn mux_ch_or_spelling_rewrites() {
+        // (x&y) | (~x&z) — arms disjoint, the Or spelling is the same mux.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            or3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 3);
+    }
+
+    #[test]
+    fn maj_shape_rewrites_and_stays_bit_exact() {
+        // (x&y) ^ (x&z) ^ (y&z)   →   (x&y) ^ (z & (x^y))   [5 → 4]
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // a1 = And(x, y)   [KEPT]
+            and3(5, v(0), v(2)), // a2 = And(x, z)   [repurposed: Xor(x,y)]
+            and3(6, v(1), v(2)), // a3 = And(y, z)   [repurposed: And(z, a2)]
+            xor3(7, v(4), v(5)), // inner
+            xor3(8, v(7), v(6)), // consumer
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+    }
+
+    #[test]
+    fn maj_shape_with_reordered_inner_arms_rewrites() {
+        // inner = Xor(a2, a1); consumer arms swapped.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(1), v(2)),
+            xor3(7, v(5), v(4)),
+            xor3(8, v(6), v(7)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+    }
+
+    #[test]
+    fn maj_all_or_spelling_rewrites() {
+        // (x&y) | (x&z) | (y&z) — the all-Or spelling is the same majority.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(1), v(2)),
+            or3(7, v(4), v(5)),
+            or3(8, v(7), v(6)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+    }
+
+    #[test]
+    fn maj_mixed_or_inner_xor_outer_is_rejected() {
+        // (x&y)|(x&z) ^ (y&z) is a DIFFERENT function — must NOT match.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(1), v(2)),
+            or3(7, v(4), v(5)),
+            xor3(8, v(7), v(6)),
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(7),
+                v(6),
+                IrBinOp::Xor,
+                Value(8),
+                IrType::U32,
+                0,
+                4,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn distributive_xor_shape_rewrites_and_stays_bit_exact() {
+        // (x&y) ^ (x&z)   →   x & (y^z)   [3 → 2]
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 2);
+    }
+
+    #[test]
+    fn distributive_or_shape_rewrites() {
+        // (x&y) | (x&z)   →   x & (y|z)
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            or3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx, 2);
+    }
+
+    #[test]
+    fn mux_with_a_multi_use_producer_declines() {
+        // The early And feeds another consumer: repurposing it would change
+        // what that reader sees. Must decline (fail-closed).
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+            xor3(7, v(4), v(2)), // second reader of v4
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn mux_without_a_shared_selector_declines() {
+        // (x&y) ^ (~w&z): the Not's source is not the And's operand — no
+        // selector, no mux.
+        let fx = fixture(vec![
+            not3(3, v(0)), // ~x where the And uses w = Value(9)
+            and3(4, Operand::Value(Value(9)), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_block_producer_declines() {
+        // The repurposed And lives in another block (block 1 here): v1
+        // repurposes only same-block producers.
+        let fx = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        let mut def_loc = fx.def_loc.clone();
+        def_loc[4] = Some((1, 0)); // v4 "defined" in block 1
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &def_loc,
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn maj_new_operand_late_finds_kept_earliest_assignment() {
+        // The literal v1 assignment (repurpose a2@0 into Xor(x,y)) reads y,
+        // which is defined AFTER a2 — rejected. The generalized matcher
+        // instead keeps the EARLIEST And (a2@0 = And(x,z)) and repurposes
+        // the two later Ands, whose new operands all dominate: kept=
+        // earliest is always the dominance-safe choice. The rewrite must
+        // fire and stay bit-exact.
+        let fx = fixture(vec![
+            and3(4, v(0), v(2)),                     // a2 = And(x, z) at idx 0  [KEPT]
+            xor3(5, v(1), v(2)),                     // y  = Xor(y_in, z) at idx 1
+            and3(6, v(0), Operand::Value(Value(5))), // a1 = And(x, y) at idx 2  [→ Xor(x,z)]
+            and3(7, Operand::Value(Value(5)), v(2)), // a3 = And(y, z) at idx 3  [→ And(y, xor)]
+            xor3(8, v(6), v(4)),                     // inner at idx 4
+            xor3(9, v(8), v(7)),                     // consumer at idx 5
+        ]);
+        assert_rewrite_bit_exact(&fx, 5);
+        // Pin the kept-term choice itself: the consumer reads the earliest
+        // And (v4) as its kept operand and the LATEST slot (v7, the old
+        // And(y,z)) as the composite.
+        let (new_consumer, _) = match_bool_mux_algebra(
+            v(8),
+            v(7),
+            IrBinOp::Xor,
+            Value(9),
+            IrType::U32,
+            0,
+            5,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the kept=earliest assignment must fire");
+        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is the earliest And");
+        assert_eq!(*rhs, v(7), "composite is computed at the latest slot");
+    }
+
+    #[test]
+    fn maj_kept_term_is_the_earliest_and() {
+        // The canonical left-associated MAJ source (sha256's spelling):
+        // ((x&y) ^ (x&z)) ^ (y&z). Three sound kept choices exist; the
+        // matcher must keep And(x,y) — the FIRST And — so the composite
+        // computes last (the GCC shape, no park between composite and
+        // consumer).
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y) at idx 0  [KEPT]
+            and3(5, v(0), v(2)), // And(x, z) at idx 1  [→ Xor(x,y)]
+            and3(6, v(1), v(2)), // And(y, z) at idx 2  [→ And(z, xor)]
+            xor3(7, v(4), v(5)), // inner at idx 3
+            xor3(8, v(7), v(6)), // consumer at idx 4
+        ]);
+        assert_rewrite_bit_exact(&fx, 4);
+        let (new_consumer, pending) = match_bool_mux_algebra(
+            v(7),
+            v(6),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            0,
+            4,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the majority must fold");
+        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
+        assert_eq!(*rhs, v(6), "composite is the old And(y,z) slot");
+        // The repurposes: idx 1 becomes the Xor, idx 2 the composite And.
+        let mut kinds = [None, None];
+        for (_, ii, inst) in &pending {
+            match *ii {
+                1 => kinds[0] = Some(inst.clone()),
+                2 => kinds[1] = Some(inst.clone()),
+                _ => panic!("unexpected repurpose index"),
+            }
+        }
+        assert!(matches!(
+            kinds[0],
+            Some(Instruction::BinOp {
+                op: IrBinOp::Xor,
+                ..
+            })
+        ));
+        assert!(matches!(
+            kinds[1],
+            Some(Instruction::BinOp {
+                op: IrBinOp::And,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn maj_right_assoc_source_keeps_earliest_too() {
+        // (x&y) ^ ((x&z) ^ (y&z)) — the third And is the consumer's FIRST
+        // arm. Same kept-earliest truth.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y) at idx 0  [KEPT]
+            and3(5, v(0), v(2)), // And(x, z) at idx 1
+            and3(6, v(1), v(2)), // And(y, z) at idx 2
+            xor3(7, v(5), v(6)), // inner at idx 3
+            xor3(8, v(4), v(7)), // consumer at idx 4
+        ]);
+        let (new_consumer, _) = match_bool_mux_algebra(
+            v(4),
+            v(7),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            0,
+            4,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the majority must fold");
+        let Instruction::BinOp { lhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
+    }
+
+    #[test]
+    fn distributive_defers_to_majority_outer() {
+        // The sha256 defect shape: at the INNER consumer
+        // ((x&y) ^ (x&z)) the plain distributive fold used to fire first
+        // and destroy the majority tree (fixing the kept term LAST — the
+        // park). With the outer completing the majority, the inner must
+        // DECLINE and leave the tree for Pattern C.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y)
+            and3(5, v(0), v(2)), // And(x, z)
+            and3(6, v(1), v(2)), // And(y, z)
+            xor3(7, v(4), v(5)), // INNER consumer (the distributive pair)
+            xor3(8, v(7), v(6)), // outer consumer (completes the majority)
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(7),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_none(),
+            "the inner distributive must defer to the majority"
+        );
+        // ... and the outer fires with kept = the earliest And.
+        let (new_consumer, _) = match_bool_mux_algebra(
+            v(7),
+            v(6),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            0,
+            4,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the outer majority must fold");
+        let Instruction::BinOp { lhs, .. } = &new_consumer else {
+            panic!("consumer stays a BinOp");
+        };
+        assert_eq!(*lhs, v(4), "kept term is And(x,y), the earliest");
+    }
+
+    #[test]
+    fn distributive_still_fires_when_outer_is_not_majority() {
+        // ((x&y) ^ (x&z)) ^ (x&w) — the outer shares the selector but is
+        // NOT a majority (no (y,z)-style third pairwise And): the inner
+        // distributive must still fire (cascading x & ((y^z)^w)).
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            and3(5, v(0), v(2)),
+            and3(6, v(0), Operand::Value(Value(9))),
+            xor3(7, v(4), v(5)),
+            xor3(8, v(7), v(6)),
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(7),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_some(),
+            "a non-majority outer must not suppress the distributive"
+        );
+    }
+
+    #[test]
+    fn mux_ch_defers_to_andn_fusion_under_bmi() {
+        // Not IMMEDIATELY before its And (the ~x-side arm): the fusion is
+        // predictable, so under BMI1 the mux fold must decline and leave
+        // the Not+And for emit_and_not_impl's 3-operand ANDN.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)), // And(x, y) at idx 0
+            not3(3, v(0)),       // ~x at idx 1 — adjacent to the And below
+            and3(5, v(3), v(2)), // And(~x, z) at idx 2
+            xor3(6, v(4), v(5)), // consumer at idx 3
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                true,
+            )
+            .is_none(),
+            "BMI1 must defer the CH fold to the andn fusion"
+        );
+        // Without BMI1 the same shape folds (the baseline truth).
+        let fx2 = fixture(vec![
+            not3(3, v(0)),
+            and3(4, v(0), v(1)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+        ]);
+        assert_rewrite_bit_exact(&fx2, 3);
+    }
+
+    #[test]
+    fn mux_ch_andn_defer_requires_not_single_use() {
+        // The Not feeds a second reader: the backend fusion cannot fire
+        // (detect_and_not_fusions requires the single-use Not), so the
+        // mux fold must fire even under BMI1.
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),
+            not3(3, v(0)),
+            and3(5, v(3), v(2)),
+            xor3(6, v(4), v(5)),
+            xor3(7, v(3), v(2)), // second reader of the Not
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                true,
+            )
+            .is_some(),
+            "a multi-use Not cannot fuse; the mux fold must fire"
+        );
+    }
+
+    #[test]
+    fn mux_ch_andn_defer_requires_adjacency() {
+        // The Not is NOT immediately before the ~x-side And (the (x,y)
+        // And sits between): the fusion cannot fire, so the mux fold
+        // must fire even under BMI1.
+        let fx = fixture(vec![
+            not3(3, v(0)),       // ~x at idx 0
+            and3(4, v(0), v(1)), // And(x, y) at idx 1 — in between
+            and3(5, v(3), v(2)), // And(~x, z) at idx 2
+            xor3(6, v(4), v(5)), // consumer at idx 3
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                IrType::U32,
+                0,
+                3,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                true,
+            )
+            .is_some(),
+            "a non-adjacent Not cannot fuse; the mux fold must fire"
+        );
+    }
+
+    /// Audit work order P0-2: the andn-defer predicate exists in THREE
+    /// layers that must agree or the CH shape silently loses its fusion
+    /// (a perf cliff no test would catch):
+    ///   1. `andn_fusion_predicted` here (fold-time defer),
+    ///   2. `detect_and_not_fusions` in backend/generation.rs (the actual
+    ///      fusion scan the emitter runs),
+    ///   3. `supports_and_not` + the `has_scalar_andn` resolution in
+    ///      passes/mod.rs (the permission both consult).
+    /// This test runs the PRODUCTION middle-end prediction (layer 1, via
+    /// `match_bool_mux_algebra`) over a table of shapes and asserts it
+    /// against a reference transcription of layer 2's criteria, written
+    /// out HERE so a future edit to either side surfaces as a loud
+    /// "middle-end and backend andn predicates disagree" failure.
+    ///
+    /// Layer-2 reference (backend/generation.rs :: detect_and_not_fusions):
+    /// a Not/And window fuses iff
+    ///   (a) pair[0] = UnaryOp Not with ty in {I32,U32,I64,U64},
+    ///   (b) use_counts[not_dest] == 1,
+    ///   (c) pair[1] = BinOp And with ty == not_ty,
+    ///   (d) the Not's dest is one of the And's two operands,
+    ///   (e) the two instructions are ADJACENT in the SAME block.
+    /// Layer 3 contributes the multiplicative `has_scalar_andn` gate
+    /// (x86-64 + BMI1 + no CCC_NO_ANDN_FUSION — resolved once per TU).
+    fn backend_andn_fusion_reference(fx: &BoolFixture, not_id: u32, and_idx: usize) -> bool {
+        let Some((nb, ni)) = fx.def_loc[not_id as usize] else {
+            return false;
+        };
+        if nb != 0 {
+            return false; // (e) different block
+        }
+        let insts = &fx.insts;
+        let Some(Instruction::UnaryOp {
+            op: crate::ir::reexports::IrUnaryOp::Not,
+            ty: not_ty,
+            ..
+        }) = insts.get(ni)
+        else {
+            return false; // (a) not a Not
+        };
+        if !matches!(
+            not_ty,
+            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+        ) {
+            return false; // (a) outside the fusion width domain
+        }
+        if fx.use_counts[not_id as usize] != 1 {
+            return false; // (b)
+        }
+        if ni + 1 != and_idx {
+            return false; // (e) not adjacent
+        }
+        let Some(Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty: and_ty,
+            ..
+        }) = insts.get(and_idx)
+        else {
+            return false; // (c) not an And
+        };
+        *and_ty == *not_ty // (c)
+            && (matches!(lhs, Operand::Value(vv) if vv.0 == not_id)
+                || matches!(rhs, Operand::Value(vv) if vv.0 == not_id)) // (d)
+    }
+
+    fn ch_mux_case(
+        not_ty: IrType,
+        and_ty: IrType,
+        extra_between: bool,
+        cross_block: bool,
+        multi_use_not: bool,
+        has_scalar_andn: bool,
+    ) -> (
+        Option<(Instruction, Vec<(usize, usize, Instruction)>)>,
+        bool,
+    ) {
+        // The CH mux over (x=v0, y=v1, z=v2): And(x,y)=v4, ~x=v3,
+        // And(~x,z)=v5, consumer Xor(v4,v5)=v6.  And(~x,z) sits at the
+        // index the prediction is checked against (idx 2, or 3 when a
+        // spacer instruction is inserted between the Not and the And).
+        let v = |id| Operand::Value(Value(id));
+        let mut insts: Vec<Instruction> = vec![
+            Instruction::BinOp {
+                dest: Value(4),
+                op: IrBinOp::And,
+                lhs: v(0),
+                rhs: v(1),
+                ty: and_ty,
+            },
+            Instruction::UnaryOp {
+                dest: Value(3),
+                op: crate::ir::reexports::IrUnaryOp::Not,
+                src: v(0),
+                ty: not_ty,
+            },
+        ];
+        if extra_between {
+            insts.push(Instruction::BinOp {
+                dest: Value(8),
+                op: IrBinOp::Or,
+                lhs: v(1),
+                rhs: v(2),
+                ty: and_ty,
+            });
+        }
+        insts.push(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::And,
+            lhs: v(3),
+            rhs: v(2),
+            ty: and_ty,
+        });
+        insts.push(Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::Xor,
+            lhs: v(4),
+            rhs: v(5),
+            ty: and_ty,
+        });
+        if multi_use_not {
+            insts.push(Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Xor,
+                lhs: v(3),
+                rhs: v(2),
+                ty: and_ty,
+            });
+        }
+        let mut fx = fixture(insts);
+        if cross_block {
+            // The Not lives in block 1 — the adjacency in block 0 must not
+            // predict a fusion the per-block backend scan can never see.
+            fx.def_loc[3] = Some((1, 0));
+        }
+        let and_idx = if extra_between { 3 } else { 2 };
+        let predicted_backend = backend_andn_fusion_reference(&fx, 3, and_idx);
+        let consumer_idx = fx.insts.len() - if multi_use_not { 2 } else { 1 };
+        (
+            match_bool_mux_algebra(
+                v(4),
+                v(5),
+                IrBinOp::Xor,
+                Value(6),
+                and_ty,
+                0,
+                consumer_idx,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                has_scalar_andn,
+            ),
+            predicted_backend,
+        )
+    }
+
+    #[test]
+    fn andn_defer_predicate_agrees_with_the_backend_fusion_scan() {
+        // (not_ty, and_ty, spacer between Not and And, cross-block Not,
+        //  multi-use Not, resolved has_scalar_andn) — every row asserts:
+        // the middle end defers (returns None) EXACTLY when the backend
+        // scan would fuse and the permission is on.
+        let rows: [(IrType, IrType, bool, bool, bool, bool); 12] = [
+            // canonical defer
+            (IrType::U32, IrType::U32, false, false, false, true),
+            (IrType::I32, IrType::I32, false, false, false, true),
+            (IrType::U64, IrType::U64, false, false, false, true),
+            (IrType::I64, IrType::I64, false, false, false, true),
+            // permission off (kill switch / no BMI1): never defer
+            (IrType::U32, IrType::U32, false, false, false, false),
+            // rejection reasons, permission on: must fold
+            (IrType::U32, IrType::U32, false, false, true, true), // multi-use
+            (IrType::U32, IrType::U32, true, false, false, true), // not adjacent
+            (IrType::U32, IrType::U32, false, true, false, true), // cross-block
+            (IrType::U64, IrType::U32, false, false, false, true), // ty mismatch (wide not)
+            (IrType::U32, IrType::U64, false, false, false, true), // ty mismatch (wide and)
+            (IrType::U16, IrType::U16, false, false, false, true), // below domain
+            (IrType::U8, IrType::U8, false, false, false, true),  // below domain
+        ];
+        for (not_ty, and_ty, spacer, cross, multi, andn) in rows {
+            let (fold, backend_fuses) = ch_mux_case(not_ty, and_ty, spacer, cross, multi, andn);
+            let expect_defer = andn && backend_fuses;
+            assert_eq!(
+                fold.is_none(),
+                expect_defer,
+                "middle-end and backend andn predicates disagree: \
+                 not_ty={not_ty:?} and_ty={and_ty:?} spacer={spacer} \
+                 cross_block={cross} multi_use_not={multi} \
+                 has_scalar_andn={andn} (backend fuses: {backend_fuses})"
+            );
+        }
+    }
+
+    #[test]
+    fn maj_prefers_entry_available_kept_term() {
+        // Audit P0-3: the kept-term rank has TWO branches — a same-block
+        // def ranks (1, index), anything else (an entry-available def in a
+        // dominator) ranks (0, 0) and must WIN.  Here all three pairwise
+        // Ands are valid kept candidates; the one defined in block 0 must
+        // be chosen, so the composite computes last and nothing parks
+        // between it and the consumer.
+        let fx = fixture_blocks(&[
+            vec![and3(4, v(0), v(1))], // block 0: a1 = And(x, y)
+            vec![
+                and3(5, v(0), v(2)), // block 1 idx 0: a2 = And(x, z)
+                and3(6, v(1), v(2)), //          idx 1: a3 = And(y, z)
+                xor3(7, v(5), v(6)), //          idx 2: inner = a2 ^ a3
+                xor3(8, v(7), v(4)), //          idx 3: consumer = inner ^ a1
+            ],
+        ]);
+        let (new_consumer, pending) = match_bool_mux_algebra(
+            v(7),
+            v(4),
+            IrBinOp::Xor,
+            Value(8),
+            IrType::U32,
+            1,
+            3,
+            &fx.defs,
+            &fx.use_counts,
+            &fx.def_loc,
+            false,
+        )
+        .expect("the majority shape must match across blocks");
+        let Instruction::BinOp { lhs, rhs, .. } = &new_consumer else {
+            panic!("the consumer rewrite must stay a BinOp");
+        };
+        let names = |op: &Operand, id: u32| matches!(op, Operand::Value(vv) if vv.0 == id);
+        assert!(
+            names(lhs, 4) || names(rhs, 4),
+            "the entry-available And(x,y) (rank (0,0)) must beat both \
+             same-block kept candidates (rank (1,i))"
+        );
+        // The repurposed rewrites stay in the consumer's block (v1).
+        for (bi, _, _) in &pending {
+            assert_eq!(*bi, 1, "repurposes belong to the consumer's block");
+        }
+    }
+
+    // ── audit P0-2: the andn-fusion contract test ────────────────────────────
+    //
+    // The fusion criteria used to exist in two independent spellings: the
+    // middle-end fold prediction (this file) and the backend detector
+    // (backend::generation::detect_and_not_fusions).  If they drift, the
+    // mux fold either erases a Not the backend cannot fuse (CH loses the
+    // 3-operand andn) or leaves one the backend would have fused.  This
+    // contract test runs BOTH REAL predicates over the same constructed
+    // scenarios and asserts they agree.
+    #[test]
+    fn andn_prediction_contract_with_backend_detector() {
+        use crate::backend::generation::detect_and_not_fusions;
+        use crate::ir::instruction::{BasicBlock, BlockId, Terminator};
+
+        fn typed_not(dest: u32, src: Operand, ty: IrType) -> Instruction {
+            Instruction::UnaryOp {
+                dest: Value(dest),
+                op: IrUnaryOp::Not,
+                src,
+                ty,
+            }
+        }
+        fn typed_and(dest: u32, a: Operand, b: Operand, ty: IrType) -> Instruction {
+            Instruction::BinOp {
+                dest: Value(dest),
+                op: IrBinOp::And,
+                lhs: a,
+                rhs: b,
+                ty,
+            }
+        }
+
+        // (label, block instructions, the Not operand value, the And operand
+        // value, the And's index inside the block, the mux type, expected)
+        //
+        // No caller preconditions: the helper validates the COMPLETE shape
+        // itself (Not def/type/use-count, And def/type/operand, adjacency),
+        // exactly like the backend detector. The "adjacent consumer is not
+        // an And" / "does not consume" / "type differs" scenarios fail
+        // against any helper that trusts `and_opnd` blindly.
+        let scenarios: Vec<(&str, Vec<Instruction>, u32, u32, usize, IrType, bool)> = vec![
+            (
+                "adjacent single-use U32",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(1), IrType::U32),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                true,
+            ),
+            (
+                "adjacent single-use I64",
+                vec![
+                    typed_not(3, v(0), IrType::U64),
+                    typed_and(4, v(3), v(1), IrType::U64),
+                ],
+                3,
+                4,
+                1,
+                IrType::U64,
+                true,
+            ),
+            (
+                "Not feeds a second reader",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(1), IrType::U32),
+                    xor3(5, v(3), v(2)),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "intervening instruction breaks adjacency",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    xor3(9, v(1), v(2)),
+                    typed_and(4, v(3), v(1), IrType::U32),
+                ],
+                3,
+                4,
+                2,
+                IrType::U32,
+                false,
+            ),
+            (
+                "I16 outside the fusion width domain",
+                vec![
+                    typed_not(3, v(0), IrType::U16),
+                    typed_and(4, v(3), v(1), IrType::U16),
+                ],
+                3,
+                4,
+                1,
+                IrType::U16,
+                false,
+            ),
+            (
+                "I8 outside the fusion width domain",
+                vec![
+                    typed_not(3, v(0), IrType::I8),
+                    typed_and(4, v(3), v(1), IrType::I8),
+                ],
+                3,
+                4,
+                1,
+                IrType::I8,
+                false,
+            ),
+            (
+                "And does not read the Not's dest",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(1), v(2), IrType::U32),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "And reads the Not twice (use_count 2)",
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(3), IrType::U32),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "operand is not a Not",
+                vec![and3(3, v(0), v(2)), typed_and(4, v(3), v(1), IrType::U32)],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "adjacent consumer is not an And",
+                // The Not is single-use and adjacent, but its consumer is a
+                // Xor: a helper that checks only the Not side predicts a
+                // fusion the backend will never perform.
+                vec![typed_not(3, v(0), IrType::U32), xor3(4, v(3), v(1))],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "adjacent And does not consume the Not",
+                // Single-use (elsewhere) and adjacent, but the And reads
+                // other values: no fusion either way.
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(1), v(2), IrType::U32),
+                    xor3(5, v(3), v(0)),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "adjacent And type differs from the Not",
+                // The backend requires And.ty == Not.ty; U32 Not with a U64
+                // And consumer must not predict.
+                vec![
+                    typed_not(3, v(0), IrType::U32),
+                    typed_and(4, v(3), v(1), IrType::U64),
+                ],
+                3,
+                4,
+                1,
+                IrType::U32,
+                false,
+            ),
+            (
+                "Not defined in another block",
+                // The block handed to the backend detector contains only the
+                // And: the Not lives in a foreign block, so no in-block
+                // windows(2) pair can contain both.
+                vec![typed_and(4, v(3), v(1), IrType::U32)],
+                3,
+                4,
+                0,
+                IrType::U32,
+                false,
+            ),
+        ];
+
+        for (label, insts, not_v, and_v, and_idx, c_ty, expected) in scenarios {
+            let mut fx = fixture(insts.clone());
+            if label == "Not defined in another block" {
+                // Give the Not a def + a FOREIGN block location (block 1).
+                fx.defs[not_v as usize] = Some(typed_not(not_v, v(0), IrType::U32));
+                fx.def_loc[not_v as usize] = Some((1, 0));
+                fx.use_counts[not_v as usize] = 1;
+            }
+            // The REAL middle-end predicate (the extracted closure body).
+            let predicted = andn_fusion_predicted_at(
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                c_ty,
+                Operand::Value(Value(not_v)),
+                Operand::Value(Value(and_v)),
+            );
+            // The REAL backend detector over the same instructions.
+            let block = BasicBlock {
+                label: BlockId(0),
+                instructions: insts,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            };
+            let fused = detect_and_not_fusions(&block, &fx.use_counts);
+            let backend = fused.contains(&and_idx);
+            assert_eq!(
+                predicted, expected,
+                "{label}: middle-end prediction wrong (got {predicted})"
+            );
+            assert_eq!(
+                backend, expected,
+                "{label}: backend detector wrong (got {backend})"
+            );
+            assert_eq!(
+                predicted, backend,
+                "{label}: CONTRACT VIOLATION — the fold prediction and the \
+                 backend detector disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn maj_declines_when_repurposed_and_is_in_another_block() {
+        // Audit P0-3: the cross-block rejection — a repurposed And whose
+        // def lives in a dominator block can never be rewritten in place
+        // (the pending rewrites address the consumer's block), so EVERY
+        // kept assignment declines and the shape stays untouched.
+        let fx = fixture_blocks(&[
+            vec![
+                and3(4, v(0), v(1)), // block 0: a1 = And(x, y)
+                and3(6, v(1), v(2)), // block 0: a3 = And(y, z) — dominator
+            ],
+            vec![
+                and3(5, v(0), v(2)), // block 1 idx 0: a2 = And(x, z)
+                xor3(7, v(5), v(6)), //          idx 1: inner = a2 ^ a3
+                xor3(8, v(7), v(4)), //          idx 2: consumer = inner ^ a1
+            ],
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(7),
+                v(4),
+                IrBinOp::Xor,
+                Value(8),
+                IrType::U32,
+                1,
+                2,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_none(),
+            "a repurposed And outside the consumer's block must decline"
+        );
+    }
+
+    #[test]
+    fn maj_two_multi_use_terms_decline() {
+        // Two of the three pairwise Ands have second readers: whichever
+        // term is kept, one multi-use And must be repurposed — the
+        // majority fold declines (fail-closed).
+        let fx = fixture(vec![
+            and3(4, v(0), v(1)),  // And(x, y) — multi-use below
+            and3(5, v(0), v(2)),  // And(x, z)
+            and3(6, v(1), v(2)),  // And(y, z) — multi-use below
+            xor3(7, v(4), v(5)),  // inner
+            xor3(8, v(7), v(6)),  // consumer
+            xor3(9, v(4), v(2)),  // second reader of And(x,y)
+            xor3(10, v(6), v(0)), // second reader of And(y,z)
+        ]);
+        assert!(
+            match_bool_mux_algebra(
+                v(7),
+                v(6),
+                IrBinOp::Xor,
+                Value(8),
+                IrType::U32,
+                0,
+                4,
+                &fx.defs,
+                &fx.use_counts,
+                &fx.def_loc,
+                false,
+            )
+            .is_none()
+        );
+    }
+
+    fn cs_mk(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(id),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn cs_alloca(d: u32, ty: IrType) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(d),
+            ty,
+            size: 8,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn cs_store(val: Operand, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            val,
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn cs_load(d: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Load {
+            dest: Value(d),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    /// Canonical union-punned copysign: values 0,1 are the float inits;
+    /// 2,3 the slots; 4,5 the int loads; 6,7 the masked ands; 8 the or;
+    /// 9 the float reload. Indices: 0,1 allocas; 2,3 init stores; 4,5 int
+    /// loads; 6,7 ands; 8 or; 9 result store; 10 reload.
+    fn copysign_base(fty: IrType, ity: IrType, mag_mask: u64, sign_mask: u64) -> IrFunction {
+        let v0 = Operand::Value(Value(0));
+        let v1 = Operand::Value(Value(1));
+        let mag = Operand::Const(IrConst::I64(mag_mask as i64));
+        let sign = Operand::Const(IrConst::I64(sign_mask as i64));
+        let mut f = IrFunction::new("t".to_string(), fty, vec![], false);
+        f.blocks = vec![cs_mk(
+            0,
+            vec![
+                cs_alloca(2, fty),
+                cs_alloca(3, fty),
+                cs_store(v0, 2, fty),
+                cs_store(v1, 3, fty),
+                cs_load(4, 2, ity),
+                cs_load(5, 3, ity),
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(4)),
+                    rhs: mag,
+                    ty: ity,
+                },
+                Instruction::BinOp {
+                    dest: Value(7),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: sign,
+                    ty: ity,
+                },
+                Instruction::BinOp {
+                    dest: Value(8),
+                    op: IrBinOp::Or,
+                    lhs: Operand::Value(Value(6)),
+                    rhs: Operand::Value(Value(7)),
+                    ty: ity,
+                },
+                cs_store(Operand::Value(Value(8)), 2, ity),
+                cs_load(9, 2, fty),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(9)))),
+        )];
+        f.next_value_id = 10;
+        f
+    }
+
+    #[test]
+    fn copysign_mem_f64_becomes_intrinsic() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
+        assert!(matches!(
+            f.blocks[0].instructions[10],
+            Instruction::Intrinsic {
+                dest: Some(Value(9)),
+                op: IntrinsicOp::CopysignF64,
+                dest_ptr: None,
+                ..
+            }
+        ));
+        if let Instruction::Intrinsic { args, .. } = &f.blocks[0].instructions[10] {
+            assert_eq!(
+                args,
+                &vec![Operand::Value(Value(0)), Operand::Value(Value(1))]
+            );
+        } else {
+            panic!("reload became the intrinsic");
+        }
+        for idx in [9, 2, 3] {
+            assert!(
+                matches!(f.blocks[0].instructions[idx], Instruction::Copy { .. }),
+                "store {idx} became a dead copy"
+            );
+        }
+        assert_eq!(recognize_copysign_mem(&mut f), 0, "idempotent");
+    }
+
+    #[test]
+    fn copysign_mem_f32_becomes_intrinsic() {
+        let mut f = copysign_base(IrType::F32, IrType::U32, 0x7FFF_FFFF, 0x8000_0000);
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
+        assert!(matches!(
+            f.blocks[0].instructions[10],
+            Instruction::Intrinsic {
+                op: IntrinsicOp::CopysignF32,
+                ..
+            }
+        ));
+        assert_eq!(recognize_copysign_mem(&mut f), 0, "idempotent");
+    }
+
+    #[test]
+    fn copysign_mem_either_or_order_fires() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::I64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // Reversed or arms (+ signed carrier): still a copysign.
+        f.blocks[0].instructions[8] = Instruction::BinOp {
+            dest: Value(8),
+            op: IrBinOp::Or,
+            lhs: Operand::Value(Value(7)),
+            rhs: Operand::Value(Value(6)),
+            ty: IrType::I64,
+        };
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
+    }
+
+    #[test]
+    fn copysign_mem_swapped_masks_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // SIGN on the magnitude slot, ABS on the sign slot: mag(b)|sign(a)
+        // is some other computation, not copysign(a, b).
+        f.blocks[0].instructions[6] = Instruction::BinOp {
+            dest: Value(6),
+            op: IrBinOp::And,
+            lhs: Operand::Value(Value(4)),
+            rhs: Operand::Const(IrConst::I64(i64::MIN)),
+            ty: IrType::U64,
+        };
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_extra_slot_use_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // A fifth use of the magnitude slot (dead load): the enumeration
+        // is no longer complete, so the stores cannot be proven dead.
+        f.blocks[0]
+            .instructions
+            .insert(10, cs_load(10, 2, IrType::U64));
+        f.next_value_id = 11;
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_pure_call_in_window_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // Even a pure call reads memory: fail closed (DCE would allow it).
+        f.blocks[0].instructions.insert(
+            5,
+            Instruction::Call {
+                func: "f".to_string(),
+                info: CallInfo {
+                    is_pure: true,
+                    ..Default::default()
+                },
+            },
+        );
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_volatile_init_rejected() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        f.blocks[0].instructions[2] = Instruction::Store {
+            val: Operand::Value(Value(0)),
+            ptr: Value(2),
+            ty: IrType::F64,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        };
+        assert_eq!(recognize_copysign_mem(&mut f), 0);
+    }
+
+    #[test]
+    fn copysign_mem_unrelated_alloca_in_window_ok() {
+        let mut f = copysign_base(
+            IrType::F64,
+            IrType::U64,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+        );
+        // Traffic to a disjoint object inside the window is harmless.
+        f.blocks[0]
+            .instructions
+            .insert(5, cs_load(12, 11, IrType::U64));
+        f.blocks[0].instructions.insert(
+            5,
+            cs_store(Operand::Const(IrConst::I64(0)), 11, IrType::U64),
+        );
+        f.blocks[0]
+            .instructions
+            .insert(5, cs_alloca(11, IrType::U64));
+        f.next_value_id = 13;
+        assert_eq!(recognize_copysign_mem(&mut f), 4);
+    }
+}
+
+#[cfg(test)]
+#[path = "bit_idioms_review_tests.rs"]
+mod review_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_range_tests.rs"]
+mod range_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_zero_choice_tests.rs"]
+mod zero_choice_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_mask_interval_tests.rs"]
+mod mask_interval_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_compare_dominance_tests.rs"]
+mod compare_dominance_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_bit_select_tests.rs"]
+mod bit_select_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_lowest_bit_tests.rs"]
+mod lowest_bit_tests;
+
+#[path = "bit_idioms_compare_dominance.rs"]
+mod compare_dominance;
+
+#[path = "bit_idioms_bit_select.rs"]
+mod bit_select;
+
+#[path = "bit_idioms_observe.rs"]
+mod observe;
+
+/// Demand observations before div/rem strength reduction loses their structure.
+pub(crate) fn observe_before_division(func: &mut IrFunction) -> usize {
+    facts::run(func) + observe::early(func) + demand::early(func)
+}
+
+#[path = "bit_idioms_demand.rs"]
+mod demand;
+
+#[path = "bit_idioms_facts.rs"]
+mod facts;
+
+#[path = "bit_idioms_bytes.rs"]
+mod bytes;

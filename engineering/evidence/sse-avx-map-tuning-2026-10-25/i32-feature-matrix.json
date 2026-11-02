@@ -1,0 +1,569 @@
+{
+  "complete": true,
+  "source_sha256": "bcf5f2bded5de75b3e9e8319bd3845674f7c9eaf53a5db7fe5f645f5de68a547",
+  "arms": [
+    {
+      "name": "gcc",
+      "command": [
+        "/home/user/.cache/oracle-bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/gcc"
+      ],
+      "env": {},
+      "version": "gcc-16 (GCC) 16.2.0\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302"
+    },
+    {
+      "name": "clang",
+      "command": [
+        "/home/user/artifacts/sse/clang23-gcc16",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/clang"
+      ],
+      "env": {},
+      "version": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /home/user/.cache/oracles/clang-23.1.3/bin\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302"
+    },
+    {
+      "name": "default",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/default"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "14159e9b3e23819d6c04f1897b22178f33a89a59a191a1409de266e77bf59ad1"
+    },
+    {
+      "name": "sse2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse2"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "14159e9b3e23819d6c04f1897b22178f33a89a59a191a1409de266e77bf59ad1"
+    },
+    {
+      "name": "sse3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-msse3",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse3"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "14159e9b3e23819d6c04f1897b22178f33a89a59a191a1409de266e77bf59ad1"
+    },
+    {
+      "name": "ssse3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-mssse3",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/ssse3"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "14159e9b3e23819d6c04f1897b22178f33a89a59a191a1409de266e77bf59ad1"
+    },
+    {
+      "name": "sse41",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-msse4.1",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse41"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "f0299aba2985940da4af059b6f5125480f6a05f15de6116c6abeb6365bc0e99f"
+    },
+    {
+      "name": "sse42",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse42"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "f0299aba2985940da4af059b6f5125480f6a05f15de6116c6abeb6365bc0e99f"
+    },
+    {
+      "name": "avx",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-mavx",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/avx"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "f813a271c0efb97df25f2e3808f0be55af91573f49553d1a94672c0d6e6a2e64"
+    },
+    {
+      "name": "avx2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/avx2"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "061e46062f4240f923bc37b9e78b67f0d4b61116399f3dc86dd2a01a9476ff4d"
+    },
+    {
+      "name": "sse41-denied",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-mno-sse4.1",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse41-denied"
+      ],
+      "env": {},
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "14159e9b3e23819d6c04f1897b22178f33a89a59a191a1409de266e77bf59ad1"
+    },
+    {
+      "name": "no-xmm",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/no-xmm"
+      ],
+      "env": {
+        "CCC_NO_XMM_REGALLOC": "1"
+      },
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "79103a080a4aa1b83cec683680a981011c5392755c80e1a88a63a63f7056d4a3"
+    },
+    {
+      "name": "no-vecreg",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/no-vecreg"
+      ],
+      "env": {
+        "CCC_NO_VECREG": "1"
+      },
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "14159e9b3e23819d6c04f1897b22178f33a89a59a191a1409de266e77bf59ad1"
+    },
+    {
+      "name": "no-homes",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/no-homes"
+      ],
+      "env": {
+        "CCC_NO_XMM_REGALLOC": "1",
+        "CCC_NO_VECREG": "1"
+      },
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "79103a080a4aa1b83cec683680a981011c5392755c80e1a88a63a63f7056d4a3"
+    },
+    {
+      "name": "no-promote",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/sse2_i32_product.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/no-promote"
+      ],
+      "env": {
+        "CCC_NO_VEX_PROMOTE": "1"
+      },
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "cases": 808,
+      "sha256": "5a831e0d7b0b1a9d7ef4dd42e228ec3e5c784a037a80016a7db04dad91360302",
+      "assembly_sha256": "14159e9b3e23819d6c04f1897b22178f33a89a59a191a1409de266e77bf59ad1"
+    }
+  ],
+  "mutations": [
+    {
+      "name": "wrong-odd",
+      "sites": 30,
+      "exit": 0,
+      "output_mismatch": true
+    },
+    {
+      "name": "swapped-lanes",
+      "sites": 15,
+      "exit": 0,
+      "output_mismatch": true
+    }
+  ],
+  "feature_order": [
+    {
+      "compiler": "/home/user/.cache/oracle-bin/gcc-16",
+      "flags": [
+        "-mno-sse2",
+        "-msse"
+      ],
+      "macros": [
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/.cache/oracle-bin/gcc-16",
+      "flags": [
+        "-msse",
+        "-mno-sse2"
+      ],
+      "macros": [
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/.cache/oracle-bin/gcc-16",
+      "flags": [
+        "-mno-sse",
+        "-msse"
+      ],
+      "macros": [
+        "__SSE2__",
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/.cache/oracle-bin/gcc-16",
+      "flags": [
+        "-mno-sse2",
+        "-msse2"
+      ],
+      "macros": [
+        "__SSE2__",
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-mno-sse2",
+        "-msse"
+      ],
+      "macros": [
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-msse",
+        "-mno-sse2"
+      ],
+      "macros": [
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-mno-sse",
+        "-msse"
+      ],
+      "macros": [
+        "__SSE2__",
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-mno-sse2",
+        "-msse2"
+      ],
+      "macros": [
+        "__SSE2__",
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/artifacts/sse/clang23-gcc16",
+      "flags": [
+        "-mno-sse2",
+        "-msse"
+      ],
+      "macros": [
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/artifacts/sse/clang23-gcc16",
+      "flags": [
+        "-msse",
+        "-mno-sse2"
+      ],
+      "macros": [
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/artifacts/sse/clang23-gcc16",
+      "flags": [
+        "-mno-sse",
+        "-msse"
+      ],
+      "macros": [
+        "__SSE2__",
+        "__SSE__"
+      ]
+    },
+    {
+      "compiler": "/home/user/artifacts/sse/clang23-gcc16",
+      "flags": [
+        "-mno-sse2",
+        "-msse2"
+      ],
+      "macros": [
+        "__SSE2__",
+        "__SSE__"
+      ]
+    }
+  ],
+  "denial_source_sha256": "b9be7ab0baa49fbee3bb967fdc051e530c8b3481e958f80f9c3a64307312440c",
+  "denial_arms": [
+    {
+      "name": "gcc-denial",
+      "command": [
+        "/home/user/.cache/oracle-bin/gcc-16",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-mno-sse2",
+        "-msse",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/gcc-denial"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb"
+    },
+    {
+      "name": "clang-denial",
+      "command": [
+        "/home/user/artifacts/sse/clang23-gcc16",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-mno-sse2",
+        "-msse",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/clang-denial"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb"
+    },
+    {
+      "name": "deny-then-sse1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-mno-sse2",
+        "-msse",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/deny-then-sse1"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb",
+      "assembly_sha256": "c028dd54efd3d0db6864ad1ff7c610d579c657d3dd1cfe396815ebfbea24cbed"
+    },
+    {
+      "name": "plain-sse2-denial",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-mno-sse2",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/plain-sse2-denial"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb",
+      "assembly_sha256": "c028dd54efd3d0db6864ad1ff7c610d579c657d3dd1cfe396815ebfbea24cbed"
+    },
+    {
+      "name": "sse1-then-denial",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-msse",
+        "-mno-sse2",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse1-then-denial"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb",
+      "assembly_sha256": "c028dd54efd3d0db6864ad1ff7c610d579c657d3dd1cfe396815ebfbea24cbed"
+    },
+    {
+      "name": "sse1-deny-sse1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-msse",
+        "-mno-sse2",
+        "-msse",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse1-deny-sse1"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb",
+      "assembly_sha256": "c028dd54efd3d0db6864ad1ff7c610d579c657d3dd1cfe396815ebfbea24cbed"
+    },
+    {
+      "name": "v3-deny-sse1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "-mno-sse2",
+        "-msse",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/v3-deny-sse1"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb",
+      "assembly_sha256": "c028dd54efd3d0db6864ad1ff7c610d579c657d3dd1cfe396815ebfbea24cbed"
+    },
+    {
+      "name": "sse2-regrant",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-fwrapv",
+        "-ffp-contract=off",
+        "-mno-sse2",
+        "-msse",
+        "-msse2",
+        "-DREQUIRE_SSE2",
+        "/home/user/lccc/tests/regression/sse2_denial_sse1_grant.c",
+        "-o",
+        "/tmp/sse2-product-mxhisesv/sse2-regrant"
+      ],
+      "cases": 44,
+      "sha256": "ed7e5ccd9410d04c4bf8411256b04ab15bd38a224127a457c85f9575bef9d8eb",
+      "assembly_sha256": "f2f1851a1f1082241998dafa7f09c5458413cbccb7acfb74d1024cdd605880b6"
+    }
+  ]
+}

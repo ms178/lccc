@@ -1,0 +1,46 @@
+op0/order-0: compiling and checking
+op0/order-1: compiling and checking
+op0/order-2: compiling and checking
+op0/order-3: compiling and checking
+op0/scalar: compiling and checking
+op0/no-ra: compiling and checking
+op0/-O0: compiling and checking
+op0/-O1: compiling and checking
+op0/-O3: compiling and checking
+op0/-Os: compiling and checking
+op0: PASS 10 native/ISA arms
+op1/order-0: compiling and checking
+op1/order-1: compiling and checking
+op1/order-2: compiling and checking
+op1/order-3: compiling and checking
+op1/scalar: compiling and checking
+op1/no-ra: compiling and checking
+op1: PASS 6 native/ISA arms
+op2/order-0: compiling and checking
+op2/order-1: compiling and checking
+op2/order-2: compiling and checking
+op2/order-3: compiling and checking
+op2/scalar: compiling and checking
+op2/no-ra: compiling and checking
+op2: PASS 6 native/ISA arms
+op3/order-0: compiling and checking
+op3/order-1: compiling and checking
+op3/order-2: compiling and checking
+op3/order-3: compiling and checking
+op3/scalar: compiling and checking
+op3/no-ra: compiling and checking
+op3: PASS 6 native/ISA arms
+op4/order-0: compiling and checking
+op4/order-1: compiling and checking
+op4/order-2: compiling and checking
+op4/order-3: compiling and checking
+op4/scalar: compiling and checking
+op4/no-ra: compiling and checking
+op4: PASS 6 native/ISA arms
+op5/order-0: compiling and checking
+op5/order-1: compiling and checking
+op5/order-2: compiling and checking
+op5/order-3: compiling and checking
+op5/scalar: compiling and checking
+op5/no-ra: compiling and checking
+op5: PASS 6 native/ISA arms

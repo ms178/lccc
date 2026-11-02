@@ -1,0 +1,19 @@
+   Compiling lccc v0.1.0 (/home/user/.cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 2m 58s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 1 test
+
+thread 'backend::x86::codegen::peephole::passes::vector_copy::tests::gather_mask_is_a_nontrailing_output_not_a_renameable_read' (510528) panicked at src/backend/x86/codegen/peephole/passes/vector_copy.rs:1350:13:
+renaming the gather mask also clobbers the copy source: vgatherdps
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test backend::x86::codegen::peephole::passes::vector_copy::tests::gather_mask_is_a_nontrailing_output_not_a_renameable_read ... FAILED
+
+failures:
+
+failures:
+    backend::x86::codegen::peephole::passes::vector_copy::tests::gather_mask_is_a_nontrailing_output_not_a_renameable_read
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4722 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

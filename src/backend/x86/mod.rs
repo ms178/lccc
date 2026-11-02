@@ -1,0 +1,14 @@
+pub(crate) mod arch_table;
+#[cfg_attr(feature = "gcc_assembler", allow(dead_code))]
+// Built-in assembler unused when gcc handles assembly
+pub(crate) mod assembler;
+pub(crate) mod codegen;
+pub(crate) mod cpu_model;
+pub(crate) mod isa;
+#[cfg_attr(feature = "gcc_linker", allow(dead_code))]
+// Built-in linker unused when gcc handles linking
+pub mod linker;
+pub(crate) mod ret_dup;
+pub(crate) mod shift_count;
+
+pub(crate) use codegen::emit::X86Codegen;

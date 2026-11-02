@@ -1,0 +1,23 @@
+clzero	1	0	0
+rdpru	2	5	5
+rdpkru	2	5	5
+ins	132	128	128
+insb	132	128	128
+insw	132	128	128
+insl	132	128	128
+rep insl	134	130	130
+mwaitx	11	0	0
+enter $8, $0	48	48	48
+sysenter	0	16	16
+sysexit	6	16	16
+sysexitl	6	16	16
+sysexitq	6	16	16
+mulw %bx	1	5	0
+divw %bx	5	5	0
+idivw %bx	5	5	0
+imulw %bx	1	5	0
+popaw	16	255	16
+popal	16	255	255
+mulb %bl	1	1	0
+sysretq	2050	0	0
+rdmsr	2	5	5

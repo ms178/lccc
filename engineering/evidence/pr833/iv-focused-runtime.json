@@ -1,0 +1,864 @@
+{
+  "complete": true,
+  "identity": {
+    "compilers": {
+      "lccc": {
+        "path": "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "sha256": "b9ec91853c3663d67d8872d2ded11cce8bd6f86a9265ec80064b0a35d96b9037",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "template": {
+        "path": "/home/user/.cache/pr833-research/template-trial-lccc",
+        "sha256": "fbf373ebe7dbf866be9aab7e4088ef4d9765cec3b197e75b347bf92a43291ac9",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "s47": {
+        "path": "/home/user/.cache/lccc-S47/target/fastbuild/lccc",
+        "sha256": "a3d70a582028b4f19b4f25d23e66913a982c95991aba908d15e32ea01a64335c",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "main": {
+        "path": "/home/user/.cache/lccc-main/target/fastbuild/lccc",
+        "sha256": "ed82cf485daf3e2cab35d208e09340bfa119e8520b94c43877fac4ce411024c3",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "gcc": {
+        "path": "/usr/bin/x86_64-linux-gnu-gcc-16",
+        "sha256": "d85726de39dccd87c573ee63d467caee8e69f56cc2edea710f02d1ba5e0ae477",
+        "version": "x86_64-linux-gnu-gcc-16 (Debian 16.2.0-3) 16.2.0"
+      },
+      "clang": {
+        "path": "/usr/lib/llvm-23/bin/clang",
+        "sha256": "baf97d9e7f31c950ec10f05ebfbea5aaf8df2effb2377d5d899adba3de62c2da",
+        "version": "Debian clang version 23.1.3 (1)"
+      }
+    },
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv",
+      "-ffp-contract=off"
+    ],
+    "driver_sha256": "51065a204ba2fd3da870a117cc96fc8efdff000e39c23aedb868f2897a869d37",
+    "object_protocol_sha256": "198eb4dd525eeb3c140f0df858f6ec4c909e89351822542650b8c500dc0047ce",
+    "header_provider": "gcc-16 (Debian 16.2.0-3) 16.2.0",
+    "sources": {
+      "fannkuch": {
+        "sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+        "flags": []
+      },
+      "expat_xml_scan": {
+        "sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+        "flags": []
+      }
+    }
+  },
+  "pinning": {
+    "requested": "auto",
+    "allowed_cpus": [
+      0,
+      1
+    ],
+    "applied": true,
+    "cpu": 0,
+    "reason": "taskset pinning"
+  },
+  "warnings": [],
+  "rows": [
+    {
+      "name": "fannkuch",
+      "measured_as": {
+        "lccc": "lccc",
+        "template": "template",
+        "s47": "template",
+        "main": "main",
+        "gcc": "gcc",
+        "clang": "clang"
+      },
+      "tags": [
+        "synthetic",
+        "integer",
+        "branch"
+      ],
+      "iterations": 1,
+      "calibration": {
+        "lccc": {
+          "ns": 3244736307,
+          "iterations": 1
+        },
+        "template": {
+          "ns": 3011791459,
+          "iterations": 1
+        },
+        "s47": {
+          "ns": 3011791459,
+          "iterations": 1
+        },
+        "main": {
+          "ns": 2744854954,
+          "iterations": 1
+        },
+        "gcc": {
+          "ns": 2457226548,
+          "iterations": 1
+        },
+        "clang": {
+          "ns": 2934415841,
+          "iterations": 1
+        }
+      },
+      "target_seconds": 0.2,
+      "max_batch_seconds": 3.0,
+      "samples": [
+        {
+          "order": [
+            "clang",
+            "main",
+            "template",
+            "gcc",
+            "lccc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 3275502622,
+              "iterations": 1
+            },
+            "template": {
+              "ns": 3006861812,
+              "iterations": 1
+            },
+            "s47": {
+              "ns": 3006861812,
+              "iterations": 1
+            },
+            "main": {
+              "ns": 2744131770,
+              "iterations": 1
+            },
+            "gcc": {
+              "ns": 2457628679,
+              "iterations": 1
+            },
+            "clang": {
+              "ns": 2989699055,
+              "iterations": 1
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "main",
+            "clang",
+            "gcc",
+            "template"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 3266054788,
+              "iterations": 1
+            },
+            "template": {
+              "ns": 3019006473,
+              "iterations": 1
+            },
+            "s47": {
+              "ns": 3019006473,
+              "iterations": 1
+            },
+            "main": {
+              "ns": 2723132240,
+              "iterations": 1
+            },
+            "gcc": {
+              "ns": 2449030956,
+              "iterations": 1
+            },
+            "clang": {
+              "ns": 2958472880,
+              "iterations": 1
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "template",
+            "main",
+            "lccc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 3250889170,
+              "iterations": 1
+            },
+            "template": {
+              "ns": 3022289398,
+              "iterations": 1
+            },
+            "s47": {
+              "ns": 3022289398,
+              "iterations": 1
+            },
+            "main": {
+              "ns": 2746244045,
+              "iterations": 1
+            },
+            "gcc": {
+              "ns": 2483549472,
+              "iterations": 1
+            },
+            "clang": {
+              "ns": 2953753908,
+              "iterations": 1
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "main",
+            "lccc",
+            "clang",
+            "template"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 3248031984,
+              "iterations": 1
+            },
+            "template": {
+              "ns": 3012921585,
+              "iterations": 1
+            },
+            "s47": {
+              "ns": 3012921585,
+              "iterations": 1
+            },
+            "main": {
+              "ns": 2779775022,
+              "iterations": 1
+            },
+            "gcc": {
+              "ns": 2579215054,
+              "iterations": 1
+            },
+            "clang": {
+              "ns": 2995562041,
+              "iterations": 1
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang",
+            "main",
+            "template"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 3266332740,
+              "iterations": 1
+            },
+            "template": {
+              "ns": 3042723292,
+              "iterations": 1
+            },
+            "s47": {
+              "ns": 3042723292,
+              "iterations": 1
+            },
+            "main": {
+              "ns": 2747168768,
+              "iterations": 1
+            },
+            "gcc": {
+              "ns": 2516606155,
+              "iterations": 1
+            },
+            "clang": {
+              "ns": 3053732305,
+              "iterations": 1
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "main",
+            "lccc",
+            "template",
+            "gcc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 3263393819,
+              "iterations": 1
+            },
+            "template": {
+              "ns": 3052530560,
+              "iterations": 1
+            },
+            "s47": {
+              "ns": 3052530560,
+              "iterations": 1
+            },
+            "main": {
+              "ns": 2771486564,
+              "iterations": 1
+            },
+            "gcc": {
+              "ns": 2497581724,
+              "iterations": 1
+            },
+            "clang": {
+              "ns": 2995623558,
+              "iterations": 1
+            }
+          }
+        },
+        {
+          "order": [
+            "main",
+            "clang",
+            "template",
+            "gcc",
+            "lccc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 3342914305,
+              "iterations": 1
+            },
+            "template": {
+              "ns": 3086234644,
+              "iterations": 1
+            },
+            "s47": {
+              "ns": 3086234644,
+              "iterations": 1
+            },
+            "main": {
+              "ns": 2790657881,
+              "iterations": 1
+            },
+            "gcc": {
+              "ns": 2475395893,
+              "iterations": 1
+            },
+            "clang": {
+              "ns": 3025223035,
+              "iterations": 1
+            }
+          }
+        }
+      ],
+      "comparisons": {
+        "lccc": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 3.248031984,
+          "median": 1.3089689602124424,
+          "paired_ratios": [
+            1.3327898758622845,
+            1.3336110676748831,
+            1.3089689602124424,
+            1.2593102614544525,
+            1.2979117664122537,
+            1.3066214361040063,
+            1.3504564318189245
+          ],
+          "exploratory_ci95": [
+            1.2979117664122537,
+            1.3336110676748831
+          ]
+        },
+        "template": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 3.006861812,
+          "median": 1.2221944654172205,
+          "paired_ratios": [
+            1.2234809260215342,
+            1.232735121458383,
+            1.2169233720019892,
+            1.1681544663471866,
+            1.2090581936926081,
+            1.2221944654172205,
+            1.2467640641754916
+          ],
+          "exploratory_ci95": [
+            1.2090581936926081,
+            1.232735121458383
+          ]
+        },
+        "s47": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 3.006861812,
+          "median": 1.2221944654172205,
+          "paired_ratios": [
+            1.2234809260215342,
+            1.232735121458383,
+            1.2169233720019892,
+            1.1681544663471866,
+            1.2090581936926081,
+            1.2221944654172205,
+            1.2467640641754916
+          ],
+          "exploratory_ci95": [
+            1.2090581936926081,
+            1.232735121458383
+          ]
+        },
+        "main": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 2.72313224,
+          "median": 1.109668019015341,
+          "paired_ratios": [
+            1.1165770457710384,
+            1.11192234354101,
+            1.1057738434292,
+            1.0777600796370042,
+            1.0916164861720288,
+            1.109668019015341,
+            1.1273582092026198
+          ],
+          "exploratory_ci95": [
+            1.0916164861720288,
+            1.1165770457710384
+          ]
+        },
+        "gcc": {
+          "identical_binary_to_reference": true,
+          "minimum_sample_seconds": 2.449030956,
+          "median": 1.0,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "exploratory_ci95": null
+        },
+        "clang": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 2.953753908,
+          "median": 1.2080177560646563,
+          "paired_ratios": [
+            1.2164974638139792,
+            1.2080177560646563,
+            1.1893275899277114,
+            1.161423913199601,
+            1.2134327411275048,
+            1.1994096246037393,
+            1.222116851512446
+          ],
+          "exploratory_ci95": [
+            1.1893275899277114,
+            1.2164974638139792
+          ]
+        }
+      }
+    },
+    {
+      "name": "expat_xml_scan",
+      "measured_as": {
+        "lccc": "lccc",
+        "template": "lccc",
+        "s47": "lccc",
+        "main": "main",
+        "gcc": "gcc",
+        "clang": "clang"
+      },
+      "tags": [
+        "workload",
+        "expat",
+        "parser",
+        "branch"
+      ],
+      "iterations": 6,
+      "calibration": {
+        "lccc": {
+          "ns": 60824561,
+          "iterations": 1
+        },
+        "template": {
+          "ns": 60824561,
+          "iterations": 1
+        },
+        "s47": {
+          "ns": 60824561,
+          "iterations": 1
+        },
+        "main": {
+          "ns": 43502798,
+          "iterations": 1
+        },
+        "gcc": {
+          "ns": 36329624,
+          "iterations": 1
+        },
+        "clang": {
+          "ns": 35893896,
+          "iterations": 1
+        }
+      },
+      "target_seconds": 0.2,
+      "max_batch_seconds": 3.0,
+      "samples": [
+        {
+          "order": [
+            "clang",
+            "lccc",
+            "gcc",
+            "main"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 375278708,
+              "iterations": 6
+            },
+            "template": {
+              "ns": 375278708,
+              "iterations": 6
+            },
+            "s47": {
+              "ns": 375278708,
+              "iterations": 6
+            },
+            "main": {
+              "ns": 258758943,
+              "iterations": 6
+            },
+            "gcc": {
+              "ns": 221421393,
+              "iterations": 6
+            },
+            "clang": {
+              "ns": 225178667,
+              "iterations": 6
+            }
+          }
+        },
+        {
+          "order": [
+            "main",
+            "clang",
+            "lccc",
+            "gcc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 367276053,
+              "iterations": 6
+            },
+            "template": {
+              "ns": 367276053,
+              "iterations": 6
+            },
+            "s47": {
+              "ns": 367276053,
+              "iterations": 6
+            },
+            "main": {
+              "ns": 270908567,
+              "iterations": 6
+            },
+            "gcc": {
+              "ns": 278755836,
+              "iterations": 6
+            },
+            "clang": {
+              "ns": 228190048,
+              "iterations": 6
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "main",
+            "clang"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 384630662,
+              "iterations": 6
+            },
+            "template": {
+              "ns": 384630662,
+              "iterations": 6
+            },
+            "s47": {
+              "ns": 384630662,
+              "iterations": 6
+            },
+            "main": {
+              "ns": 265380997,
+              "iterations": 6
+            },
+            "gcc": {
+              "ns": 224866206,
+              "iterations": 6
+            },
+            "clang": {
+              "ns": 214455482,
+              "iterations": 6
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "main",
+            "clang"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 366974073,
+              "iterations": 6
+            },
+            "template": {
+              "ns": 366974073,
+              "iterations": 6
+            },
+            "s47": {
+              "ns": 366974073,
+              "iterations": 6
+            },
+            "main": {
+              "ns": 258918090,
+              "iterations": 6
+            },
+            "gcc": {
+              "ns": 232374041,
+              "iterations": 6
+            },
+            "clang": {
+              "ns": 215050301,
+              "iterations": 6
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "main",
+            "gcc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 364078675,
+              "iterations": 6
+            },
+            "template": {
+              "ns": 364078675,
+              "iterations": 6
+            },
+            "s47": {
+              "ns": 364078675,
+              "iterations": 6
+            },
+            "main": {
+              "ns": 267099360,
+              "iterations": 6
+            },
+            "gcc": {
+              "ns": 219569799,
+              "iterations": 6
+            },
+            "clang": {
+              "ns": 220186067,
+              "iterations": 6
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "main",
+            "gcc",
+            "clang"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 385611655,
+              "iterations": 6
+            },
+            "template": {
+              "ns": 385611655,
+              "iterations": 6
+            },
+            "s47": {
+              "ns": 385611655,
+              "iterations": 6
+            },
+            "main": {
+              "ns": 275651458,
+              "iterations": 6
+            },
+            "gcc": {
+              "ns": 270224039,
+              "iterations": 6
+            },
+            "clang": {
+              "ns": 218282200,
+              "iterations": 6
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc",
+            "main"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 441705054,
+              "iterations": 6
+            },
+            "template": {
+              "ns": 441705054,
+              "iterations": 6
+            },
+            "s47": {
+              "ns": 441705054,
+              "iterations": 6
+            },
+            "main": {
+              "ns": 262860141,
+              "iterations": 6
+            },
+            "gcc": {
+              "ns": 222490011,
+              "iterations": 6
+            },
+            "clang": {
+              "ns": 216034333,
+              "iterations": 6
+            }
+          }
+        }
+      ],
+      "comparisons": {
+        "lccc": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.364078675,
+          "median": 1.6581455038814332,
+          "paired_ratios": [
+            1.69486201362666,
+            1.3175546681648667,
+            1.7104867327196334,
+            1.5792386766644042,
+            1.6581455038814332,
+            1.4270072212191307,
+            1.9852803818684697
+          ],
+          "exploratory_ci95": [
+            1.4270072212191307,
+            1.7104867327196334
+          ]
+        },
+        "template": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.364078675,
+          "median": 1.6581455038814332,
+          "paired_ratios": [
+            1.69486201362666,
+            1.3175546681648667,
+            1.7104867327196334,
+            1.5792386766644042,
+            1.6581455038814332,
+            1.4270072212191307,
+            1.9852803818684697
+          ],
+          "exploratory_ci95": [
+            1.4270072212191307,
+            1.7104867327196334
+          ]
+        },
+        "s47": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.364078675,
+          "median": 1.6581455038814332,
+          "paired_ratios": [
+            1.69486201362666,
+            1.3175546681648667,
+            1.7104867327196334,
+            1.5792386766644042,
+            1.6581455038814332,
+            1.4270072212191307,
+            1.9852803818684697
+          ],
+          "exploratory_ci95": [
+            1.4270072212191307,
+            1.7104867327196334
+          ]
+        },
+        "main": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.258758943,
+          "median": 1.1686266602071282,
+          "paired_ratios": [
+            1.1686266602071282,
+            0.9718489517112746,
+            1.1801728757766297,
+            1.1142298377468076,
+            1.216466750966967,
+            1.0200848859342229,
+            1.1814469324647567
+          ],
+          "exploratory_ci95": [
+            1.0200848859342229,
+            1.1814469324647567
+          ]
+        },
+        "gcc": {
+          "identical_binary_to_reference": true,
+          "minimum_sample_seconds": 0.219569799,
+          "median": 1.0,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "exploratory_ci95": null
+        },
+        "clang": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.214455482,
+          "median": 0.953702585260855,
+          "paired_ratios": [
+            1.0169688843028821,
+            0.8186018677650214,
+            0.953702585260855,
+            0.9254489015836326,
+            1.002806706581719,
+            0.8077823157694716,
+            0.9709844142171399
+          ],
+          "exploratory_ci95": [
+            0.8186018677650214,
+            1.002806706581719
+          ]
+        }
+      }
+    }
+  ],
+  "rounds": 7,
+  "measurement": "fresh fork child per entry; fork/exec/wait excluded; entry page faults included; whole-object identity and every stdout checked; identical binaries explicitly share samples",
+  "harness_sha256": "92572c8528a9b8d0dce67cf24e1abdce64f1b41b67b90eb4921d87b32fa7c4b7"
+}

@@ -1,0 +1,82 @@
+[
+  {
+    "kind": 19,
+    "requested_delta": -2147485697,
+    "returncode": 0,
+    "stderr": "",
+    "high": 2147479552,
+    "decoded_pair": 2147481599
+  },
+  {
+    "kind": 19,
+    "requested_delta": -2147485696,
+    "returncode": 0,
+    "stderr": "",
+    "high": -2147483648,
+    "decoded_pair": -2147485696
+  },
+  {
+    "kind": 19,
+    "requested_delta": 2147481599,
+    "returncode": 0,
+    "stderr": "",
+    "high": 2147479552,
+    "decoded_pair": 2147481599
+  },
+  {
+    "kind": 19,
+    "requested_delta": 2147481600,
+    "returncode": 0,
+    "stderr": "",
+    "high": -2147483648,
+    "decoded_pair": -2147485696
+  },
+  {
+    "kind": 19,
+    "requested_delta": 2147483647,
+    "returncode": 0,
+    "stderr": "",
+    "high": -2147483648,
+    "decoded_pair": -2147483649
+  },
+  {
+    "kind": 23,
+    "requested_delta": -2147485697,
+    "returncode": 0,
+    "stderr": "",
+    "high": 2147479552,
+    "decoded_pair": null
+  },
+  {
+    "kind": 23,
+    "requested_delta": -2147485696,
+    "returncode": 0,
+    "stderr": "",
+    "high": -2147483648,
+    "decoded_pair": null
+  },
+  {
+    "kind": 23,
+    "requested_delta": 2147481599,
+    "returncode": 0,
+    "stderr": "",
+    "high": 2147479552,
+    "decoded_pair": null
+  },
+  {
+    "kind": 23,
+    "requested_delta": 2147481600,
+    "returncode": 0,
+    "stderr": "",
+    "high": -2147483648,
+    "decoded_pair": null
+  },
+  {
+    "kind": 23,
+    "requested_delta": 2147483647,
+    "returncode": 0,
+    "stderr": "",
+    "high": -2147483648,
+    "decoded_pair": null
+  }
+]

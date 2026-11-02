@@ -1,0 +1,62 @@
+....................................................................................................verdict histogram drifted from the recorded baseline:
+     BEATS                 2    2
+     DECLINED-DATA16       0    0
+     DECLINED-FP           0    0
+     DECLINED-WRONG        0    0
+     DISAGREE              0    0
+     LONGER                0    0
+     NO-ORACLE             0    0
+     ORACLE-INVALID        0    0
+     REJECTS-VALID         0    0
+     UNVERIFIED-BEATS      0    0
+     UNVERIFIED-BYTES      0    0
+     WRONG-BYTES           0    0
+     both-reject           0    0
+     ok                    0    0
+     ok-best               0    0
+  -> rows-sha256       recorded 3a87fc379e26d1329c3cf1add9712f814811315b7d08216359e1b15a7b3c12ef
+     rows-sha256       actual   9cdf5f2c1cffcbc5ff26550b13933b960823d80919554c55bac22e04329159b1
+  update the baseline in the same commit that changed the corpus (the histogram is the aggregate coverage record, not a snapshot of bytes)
+...verdict histogram drifted from the recorded baseline:
+  -> BEATS                 2    1
+     DECLINED-DATA16       0    0
+     DECLINED-FP           0    0
+     DECLINED-WRONG        0    0
+     DISAGREE              0    0
+     LONGER                1    1
+     NO-ORACLE             0    0
+     ORACLE-INVALID        0    0
+     REJECTS-VALID         0    0
+     UNVERIFIED-BEATS      0    0
+     UNVERIFIED-BYTES      0    0
+     WRONG-BYTES           0    0
+     both-reject           0    0
+     ok                    0    0
+  -> ok-best               0    1
+  update the baseline in the same commit that changed the corpus (the histogram is the aggregate coverage record, not a snapshot of bytes)
+verdict histogram drifted from the recorded baseline:
+  -> BEATS                 2    1
+     DECLINED-DATA16       0    0
+     DECLINED-FP           0    0
+     DECLINED-WRONG        0    0
+     DISAGREE              0    0
+     LONGER                1    1
+     NO-ORACLE             0    0
+     ORACLE-INVALID        0    0
+     REJECTS-VALID         0    0
+     UNVERIFIED-BEATS      0    0
+     UNVERIFIED-BYTES      0    0
+     WRONG-BYTES           0    0
+     both-reject           0    0
+  -> ok                    0    1
+     ok-best               0    0
+  update the baseline in the same commit that changed the corpus (the histogram is the aggregate coverage record, not a snapshot of bytes)
+histogram baseline /tmp/tmpn88gf9kc/hist.txt: unparseable line 'BEATS two' (expected `VERDICT <nonnegative integer>')
+verdict histogram baseline /tmp/tmpn88gf9kc/nope.txt: unreadable ([Errno 2] No such file or directory: '/tmp/tmpn88gf9kc/nope.txt'). A missing baseline is not drift — create it from the gate's own output in the same commit as the corpus change.
+histogram baseline /tmp/tmpn88gf9kc/hist.txt: no verdict counts parsed — an empty baseline is not a contract. Record every verdict class (zeros included) plus the rows-sha256 digest, as the gate's own output spells them. Current digest: ea7fb08b7a2dc4619ffb7c7bb38d95a2047935fa165d71b12efd3852a2e6d0cc
+histogram baseline /tmp/tmpn88gf9kc/hist.txt: missing the `# rows-sha256:' digest line. Counts alone are a NET contract — a compensating delete+add of same-verdict rows nets to zero — so the baseline must also pin row identity. Add this line: # rows-sha256: ea7fb08b7a2dc4619ffb7c7bb38d95a2047935fa165d71b12efd3852a2e6d0cc
+............
+----------------------------------------------------------------------
+Ran 115 tests in 0.094s
+
+OK

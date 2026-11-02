@@ -1,0 +1,227 @@
+{
+  "compiler_sha256": "ba07916b0b144c01ff923e833ff5fdec5e5e2c3c9b59b218714e0db46e3ad084",
+  "rows": [
+    {
+      "environment": {},
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_MACHINST": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_GEP_FOLD": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_IV_WIDEN": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_DISABLE_PASSES": "licm"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_DISABLE_PASSES": "gvn"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE_PHASE1": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE_PHASE2": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE_PHASE3": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE_PHASE5": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE_PHASE6": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE_PHASE7": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    },
+    {
+      "environment": {
+        "CCC_NO_PEEPHOLE_RERUN": "1"
+      },
+      "compile": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-c",
+        "engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "-o",
+        "/home/user/.cache/zlib-fix/control.o"
+      ],
+      "exit": 0,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242",
+      "correct": true
+    }
+  ]
+}

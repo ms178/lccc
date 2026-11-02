@@ -1,0 +1,38 @@
+{
+  "archive": "S103-ZSTD-GNU17-EXECUTABLES.tar.xz",
+  "sha256": "3773d5e1377916e9c8ea900a83af1ee31ea9117103e8bb2539741151cbab31ad",
+  "members": [
+    {
+      "name": "driver-candidate",
+      "bytes": 755608,
+      "sha256": "a677f7469721891e7b905cae70c42a35932201709a345e41a9c262fdf8197b7f"
+    },
+    {
+      "name": "cli-candidate",
+      "bytes": 1044496,
+      "sha256": "0a2db0ab222d7a43d8e4d675e1114f340d0dcdb7e220389198a9647e5db0ef31"
+    },
+    {
+      "name": "driver-main",
+      "bytes": 755608,
+      "sha256": "a677f7469721891e7b905cae70c42a35932201709a345e41a9c262fdf8197b7f"
+    },
+    {
+      "name": "cli-main",
+      "bytes": 1044496,
+      "sha256": "0a2db0ab222d7a43d8e4d675e1114f340d0dcdb7e220389198a9647e5db0ef31"
+    },
+    {
+      "name": "driver-gcc",
+      "bytes": 1192712,
+      "sha256": "65403c8435be4ab420838bd428b6b920e4fb7d9d1c738a21a5752c4b90075be2"
+    },
+    {
+      "name": "cli-gcc",
+      "bytes": 1471376,
+      "sha256": "0f808b8cfc00add481c3a00526e724e5e60765904d2bfce5e10fcfd0c40028e7"
+    }
+  ],
+  "inputs_reuse": "artifacts/S101-ZSTD-INPUTS.tar.xz",
+  "input_hashes_match_S101": true
+}

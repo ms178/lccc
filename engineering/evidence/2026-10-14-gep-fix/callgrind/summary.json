@@ -1,0 +1,672 @@
+{
+  "metric": "whole-program simulated Ir; not runtime or PMU",
+  "paired_rounds": 3,
+  "baseline_executable": "saved pre-fix LCCC",
+  "reference_context": "local GCC 14.2.0; GCC 16.2 used separately through CE, not silently substituted",
+  "rows": [
+    {
+      "kernel": "expat_siphash24",
+      "before_after_binary_identical": true,
+      "after_over_before_Ir": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median": 1.0,
+      "after_over_local_GCC_Ir": 0.9909816509493524,
+      "paired_events": [
+        {
+          "before": {
+            "Bc": 2039597,
+            "Bcm": 116256,
+            "Bi": 9992,
+            "Bim": 1429,
+            "D1mr": 1239,
+            "D1mw": 655,
+            "DLmr": 963,
+            "DLmw": 610,
+            "Dr": 3393555,
+            "Dw": 2487222,
+            "I1mr": 1418,
+            "ILmr": 1389,
+            "Ir": 15209628
+          },
+          "after": {
+            "Bc": 2039597,
+            "Bcm": 116256,
+            "Bi": 9992,
+            "Bim": 1429,
+            "D1mr": 1239,
+            "D1mw": 655,
+            "DLmr": 963,
+            "DLmw": 610,
+            "Dr": 3393555,
+            "Dw": 2487222,
+            "I1mr": 1418,
+            "ILmr": 1389,
+            "Ir": 15209628
+          }
+        },
+        {
+          "before": {
+            "Bc": 2039597,
+            "Bcm": 116256,
+            "Bi": 9992,
+            "Bim": 1429,
+            "D1mr": 1239,
+            "D1mw": 655,
+            "DLmr": 963,
+            "DLmw": 610,
+            "Dr": 3393555,
+            "Dw": 2487222,
+            "I1mr": 1418,
+            "ILmr": 1389,
+            "Ir": 15209628
+          },
+          "after": {
+            "Bc": 2039597,
+            "Bcm": 116256,
+            "Bi": 9992,
+            "Bim": 1429,
+            "D1mr": 1239,
+            "D1mw": 655,
+            "DLmr": 963,
+            "DLmw": 610,
+            "Dr": 3393555,
+            "Dw": 2487222,
+            "I1mr": 1418,
+            "ILmr": 1389,
+            "Ir": 15209628
+          }
+        },
+        {
+          "before": {
+            "Bc": 2039597,
+            "Bcm": 116256,
+            "Bi": 9992,
+            "Bim": 1429,
+            "D1mr": 1239,
+            "D1mw": 655,
+            "DLmr": 963,
+            "DLmw": 610,
+            "Dr": 3393555,
+            "Dw": 2487222,
+            "I1mr": 1418,
+            "ILmr": 1389,
+            "Ir": 15209628
+          },
+          "after": {
+            "Bc": 2039597,
+            "Bcm": 116256,
+            "Bi": 9992,
+            "Bim": 1429,
+            "D1mr": 1239,
+            "D1mw": 655,
+            "DLmr": 963,
+            "DLmw": 610,
+            "Dr": 3393555,
+            "Dw": 2487222,
+            "I1mr": 1418,
+            "ILmr": 1389,
+            "Ir": 15209628
+          }
+        }
+      ]
+    },
+    {
+      "kernel": "glibc_memcmp",
+      "before_after_binary_identical": true,
+      "after_over_before_Ir": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median": 1.0,
+      "after_over_local_GCC_Ir": 1.0443628690763516,
+      "paired_events": [
+        {
+          "before": {
+            "Bc": 139679,
+            "Bcm": 3364,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 22577,
+            "D1mw": 2766,
+            "DLmr": 954,
+            "DLmw": 2656,
+            "Dr": 203758,
+            "Dw": 32320,
+            "I1mr": 1362,
+            "ILmr": 1335,
+            "Ir": 722640
+          },
+          "after": {
+            "Bc": 139679,
+            "Bcm": 3364,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 22577,
+            "D1mw": 2766,
+            "DLmr": 954,
+            "DLmw": 2656,
+            "Dr": 203758,
+            "Dw": 32320,
+            "I1mr": 1362,
+            "ILmr": 1335,
+            "Ir": 722640
+          }
+        },
+        {
+          "before": {
+            "Bc": 139679,
+            "Bcm": 3364,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 22577,
+            "D1mw": 2766,
+            "DLmr": 954,
+            "DLmw": 2656,
+            "Dr": 203758,
+            "Dw": 32320,
+            "I1mr": 1362,
+            "ILmr": 1335,
+            "Ir": 722640
+          },
+          "after": {
+            "Bc": 139679,
+            "Bcm": 3364,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 22577,
+            "D1mw": 2766,
+            "DLmr": 954,
+            "DLmw": 2656,
+            "Dr": 203758,
+            "Dw": 32320,
+            "I1mr": 1362,
+            "ILmr": 1335,
+            "Ir": 722640
+          }
+        },
+        {
+          "before": {
+            "Bc": 139679,
+            "Bcm": 3364,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 22577,
+            "D1mw": 2766,
+            "DLmr": 954,
+            "DLmw": 2656,
+            "Dr": 203758,
+            "Dw": 32320,
+            "I1mr": 1362,
+            "ILmr": 1335,
+            "Ir": 722640
+          },
+          "after": {
+            "Bc": 139679,
+            "Bcm": 3364,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 22577,
+            "D1mw": 2766,
+            "DLmr": 954,
+            "DLmw": 2656,
+            "Dr": 203758,
+            "Dw": 32320,
+            "I1mr": 1362,
+            "ILmr": 1335,
+            "Ir": 722640
+          }
+        }
+      ]
+    },
+    {
+      "kernel": "gzip_crc32",
+      "before_after_binary_identical": true,
+      "after_over_before_Ir": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median": 1.0,
+      "after_over_local_GCC_Ir": 0.9911338805085239,
+      "paired_events": [
+        {
+          "before": {
+            "Bc": 107367,
+            "Bcm": 3334,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1296,
+            "D1mw": 912,
+            "DLmr": 971,
+            "DLmw": 864,
+            "Dr": 165117,
+            "Dw": 32089,
+            "I1mr": 1364,
+            "ILmr": 1337,
+            "Ir": 800758
+          },
+          "after": {
+            "Bc": 107367,
+            "Bcm": 3334,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1296,
+            "D1mw": 912,
+            "DLmr": 971,
+            "DLmw": 864,
+            "Dr": 165117,
+            "Dw": 32089,
+            "I1mr": 1364,
+            "ILmr": 1337,
+            "Ir": 800758
+          }
+        },
+        {
+          "before": {
+            "Bc": 107367,
+            "Bcm": 3334,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1296,
+            "D1mw": 912,
+            "DLmr": 971,
+            "DLmw": 864,
+            "Dr": 165117,
+            "Dw": 32089,
+            "I1mr": 1364,
+            "ILmr": 1337,
+            "Ir": 800758
+          },
+          "after": {
+            "Bc": 107367,
+            "Bcm": 3334,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1296,
+            "D1mw": 912,
+            "DLmr": 971,
+            "DLmw": 864,
+            "Dr": 165117,
+            "Dw": 32089,
+            "I1mr": 1364,
+            "ILmr": 1337,
+            "Ir": 800758
+          }
+        },
+        {
+          "before": {
+            "Bc": 107367,
+            "Bcm": 3334,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1296,
+            "D1mw": 912,
+            "DLmr": 971,
+            "DLmw": 864,
+            "Dr": 165117,
+            "Dw": 32089,
+            "I1mr": 1364,
+            "ILmr": 1337,
+            "Ir": 800758
+          },
+          "after": {
+            "Bc": 107367,
+            "Bcm": 3334,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1296,
+            "D1mw": 912,
+            "DLmr": 971,
+            "DLmw": 864,
+            "Dr": 165117,
+            "Dw": 32089,
+            "I1mr": 1364,
+            "ILmr": 1337,
+            "Ir": 800758
+          }
+        }
+      ]
+    },
+    {
+      "kernel": "linux_find_bit",
+      "before_after_binary_identical": true,
+      "after_over_before_Ir": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median": 1.0,
+      "after_over_local_GCC_Ir": 1.1005004397389533,
+      "paired_events": [
+        {
+          "before": {
+            "Bc": 1131438,
+            "Bcm": 11852,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 132461,
+            "D1mw": 4767,
+            "DLmr": 956,
+            "DLmw": 4704,
+            "Dr": 1123675,
+            "Dw": 73671,
+            "I1mr": 1359,
+            "ILmr": 1332,
+            "Ir": 5957511
+          },
+          "after": {
+            "Bc": 1131438,
+            "Bcm": 11852,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 132461,
+            "D1mw": 4767,
+            "DLmr": 956,
+            "DLmw": 4704,
+            "Dr": 1123675,
+            "Dw": 73671,
+            "I1mr": 1359,
+            "ILmr": 1332,
+            "Ir": 5957511
+          }
+        },
+        {
+          "before": {
+            "Bc": 1131438,
+            "Bcm": 11852,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 132461,
+            "D1mw": 4767,
+            "DLmr": 956,
+            "DLmw": 4704,
+            "Dr": 1123675,
+            "Dw": 73671,
+            "I1mr": 1359,
+            "ILmr": 1332,
+            "Ir": 5957511
+          },
+          "after": {
+            "Bc": 1131438,
+            "Bcm": 11852,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 132461,
+            "D1mw": 4767,
+            "DLmr": 956,
+            "DLmw": 4704,
+            "Dr": 1123675,
+            "Dw": 73671,
+            "I1mr": 1359,
+            "ILmr": 1332,
+            "Ir": 5957511
+          }
+        },
+        {
+          "before": {
+            "Bc": 1131438,
+            "Bcm": 11852,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 132461,
+            "D1mw": 4767,
+            "DLmr": 956,
+            "DLmw": 4704,
+            "Dr": 1123675,
+            "Dw": 73671,
+            "I1mr": 1359,
+            "ILmr": 1332,
+            "Ir": 5957511
+          },
+          "after": {
+            "Bc": 1131438,
+            "Bcm": 11852,
+            "Bi": 411,
+            "Bim": 232,
+            "D1mr": 132461,
+            "D1mw": 4767,
+            "DLmr": 956,
+            "DLmw": 4704,
+            "Dr": 1123675,
+            "Dw": 73671,
+            "I1mr": 1359,
+            "ILmr": 1332,
+            "Ir": 5957511
+          }
+        }
+      ]
+    },
+    {
+      "kernel": "sqlite_varint",
+      "before_after_binary_identical": true,
+      "after_over_before_Ir": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median": 1.0,
+      "after_over_local_GCC_Ir": 1.0678816693079767,
+      "paired_events": [
+        {
+          "before": {
+            "Bc": 99724,
+            "Bcm": 12562,
+            "Bi": 2233,
+            "Bim": 2054,
+            "D1mr": 1280,
+            "D1mw": 948,
+            "DLmr": 955,
+            "DLmw": 896,
+            "Dr": 119689,
+            "Dw": 67708,
+            "I1mr": 1375,
+            "ILmr": 1348,
+            "Ir": 832858
+          },
+          "after": {
+            "Bc": 99724,
+            "Bcm": 12562,
+            "Bi": 2233,
+            "Bim": 2054,
+            "D1mr": 1280,
+            "D1mw": 948,
+            "DLmr": 955,
+            "DLmw": 896,
+            "Dr": 119689,
+            "Dw": 67708,
+            "I1mr": 1375,
+            "ILmr": 1348,
+            "Ir": 832858
+          }
+        },
+        {
+          "before": {
+            "Bc": 99724,
+            "Bcm": 12562,
+            "Bi": 2233,
+            "Bim": 2054,
+            "D1mr": 1280,
+            "D1mw": 948,
+            "DLmr": 955,
+            "DLmw": 896,
+            "Dr": 119689,
+            "Dw": 67708,
+            "I1mr": 1375,
+            "ILmr": 1348,
+            "Ir": 832858
+          },
+          "after": {
+            "Bc": 99724,
+            "Bcm": 12562,
+            "Bi": 2233,
+            "Bim": 2054,
+            "D1mr": 1280,
+            "D1mw": 948,
+            "DLmr": 955,
+            "DLmw": 896,
+            "Dr": 119689,
+            "Dw": 67708,
+            "I1mr": 1375,
+            "ILmr": 1348,
+            "Ir": 832858
+          }
+        },
+        {
+          "before": {
+            "Bc": 99724,
+            "Bcm": 12562,
+            "Bi": 2233,
+            "Bim": 2054,
+            "D1mr": 1280,
+            "D1mw": 948,
+            "DLmr": 955,
+            "DLmw": 896,
+            "Dr": 119689,
+            "Dw": 67708,
+            "I1mr": 1375,
+            "ILmr": 1348,
+            "Ir": 832858
+          },
+          "after": {
+            "Bc": 99724,
+            "Bcm": 12562,
+            "Bi": 2233,
+            "Bim": 2054,
+            "D1mr": 1280,
+            "D1mw": 948,
+            "DLmr": 955,
+            "DLmw": 896,
+            "Dr": 119689,
+            "Dw": 67708,
+            "I1mr": 1375,
+            "ILmr": 1348,
+            "Ir": 832858
+          }
+        }
+      ]
+    },
+    {
+      "kernel": "zlib_ng_adler32",
+      "before_after_binary_identical": true,
+      "after_over_before_Ir": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median": 1.0,
+      "after_over_local_GCC_Ir": 0.9078769316332546,
+      "paired_events": [
+        {
+          "before": {
+            "Bc": 48064,
+            "Bcm": 3372,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1269,
+            "D1mw": 918,
+            "DLmr": 954,
+            "DLmw": 866,
+            "Dr": 79796,
+            "Dw": 33419,
+            "I1mr": 1378,
+            "ILmr": 1351,
+            "Ir": 463601
+          },
+          "after": {
+            "Bc": 48064,
+            "Bcm": 3372,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1269,
+            "D1mw": 918,
+            "DLmr": 954,
+            "DLmw": 866,
+            "Dr": 79796,
+            "Dw": 33419,
+            "I1mr": 1378,
+            "ILmr": 1351,
+            "Ir": 463601
+          }
+        },
+        {
+          "before": {
+            "Bc": 48064,
+            "Bcm": 3372,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1269,
+            "D1mw": 918,
+            "DLmr": 954,
+            "DLmw": 866,
+            "Dr": 79796,
+            "Dw": 33419,
+            "I1mr": 1378,
+            "ILmr": 1351,
+            "Ir": 463601
+          },
+          "after": {
+            "Bc": 48064,
+            "Bcm": 3372,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1269,
+            "D1mw": 918,
+            "DLmr": 954,
+            "DLmw": 866,
+            "Dr": 79796,
+            "Dw": 33419,
+            "I1mr": 1378,
+            "ILmr": 1351,
+            "Ir": 463601
+          }
+        },
+        {
+          "before": {
+            "Bc": 48064,
+            "Bcm": 3372,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1269,
+            "D1mw": 918,
+            "DLmr": 954,
+            "DLmw": 866,
+            "Dr": 79796,
+            "Dw": 33419,
+            "I1mr": 1378,
+            "ILmr": 1351,
+            "Ir": 463601
+          },
+          "after": {
+            "Bc": 48064,
+            "Bcm": 3372,
+            "Bi": 412,
+            "Bim": 233,
+            "D1mr": 1269,
+            "D1mw": 918,
+            "DLmr": 954,
+            "DLmw": 866,
+            "Dr": 79796,
+            "Dw": 33419,
+            "I1mr": 1378,
+            "ILmr": 1351,
+            "Ir": 463601
+          }
+        }
+      ]
+    }
+  ],
+  "arithmetic_mean": 1.0,
+  "geometric_mean": 1.0,
+  "best": 1.0,
+  "worst": 1.0,
+  "wins": 0,
+  "regressions": 0,
+  "ties": 6,
+  "gcc_context_arithmetic_mean": 1.0171229068690688,
+  "gcc_context_geometric_mean": 1.0151532637060094,
+  "warning": "Initial separate before/after directories differ in length; their tiny Ir drift is not codegen improvement. Only the equal-length paired runs enter the patch comparison. All six paired binaries are byte-identical."
+}

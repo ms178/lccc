@@ -1,0 +1,1106 @@
+{
+  "passed": 105,
+  "failed": 67,
+  "skipped": 0,
+  "records": [
+    {
+      "case": "unknown-255-0-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-255-0-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-255-1-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-255-1-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-255-1-2-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-255-1-2-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-255-1-3-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-255-1-3-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-255-2-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-255-2-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-255-1-0-False",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-255-1-0-False",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-2147483647-0-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-2147483647-0-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-2147483647-1-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-2147483647-1-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-2147483647-1-2-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-2147483647-1-2-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-2147483647-1-3-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-2147483647-1-3-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-2147483647-2-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-2147483647-2-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-2147483647-1-0-False",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-2147483647-1-0-False",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-4294967295-0-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-4294967295-0-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-4294967295-1-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-4294967295-1-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-4294967295-1-2-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-4294967295-1-2-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-4294967295-1-3-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-4294967295-1-3-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-4294967295-2-0-True",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-4294967295-2-0-True",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "unknown-4294967295-1-0-False",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "unknown-4294967295-1-0-False",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-symbol-2-3",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-symbol-2-3",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-symbol-19-3",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-symbol-19-3",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-19-3.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-19-3-True-lccc.elf']: \nthread '<unnamed>' (9107) panicked at src/backend/riscv/linker/emit_shared.rs:66:47:\nindex out of bounds: the len is 3 but the index is 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 3\n"
+    },
+    {
+      "case": "bad-symbol-20-3",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-static', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-3.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-3-False-lccc.elf']: \nthread '<unnamed>' (9109) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 3\n"
+    },
+    {
+      "case": "bad-symbol-20-3",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-3.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-3-True-lccc.elf']: \nthread '<unnamed>' (9111) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 3\n"
+    },
+    {
+      "case": "bad-symbol-21-3",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-static', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-3.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-3-False-lccc.elf']: \nthread '<unnamed>' (9113) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 3\n"
+    },
+    {
+      "case": "bad-symbol-21-3",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-3.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-3-True-lccc.elf']: \nthread '<unnamed>' (9115) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 3\n"
+    },
+    {
+      "case": "bad-symbol-22-3",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-static', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-3.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-3-False-lccc.elf']: \nthread '<unnamed>' (9117) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 3\n"
+    },
+    {
+      "case": "bad-symbol-22-3",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-3.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-3-True-lccc.elf']: \nthread '<unnamed>' (9119) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 3\n"
+    },
+    {
+      "case": "bad-symbol-2-4294967295",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-symbol-2-4294967295",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-symbol-19-4294967295",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-symbol-19-4294967295",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-19-4294967295.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-19-4294967295-True-lccc.elf']: \nthread '<unnamed>' (9127) panicked at src/backend/riscv/linker/emit_shared.rs:66:47:\nindex out of bounds: the len is 3 but the index is 4294967295\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 4294967295\n"
+    },
+    {
+      "case": "bad-symbol-20-4294967295",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-static', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-4294967295.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-4294967295-False-lccc.elf']: \nthread '<unnamed>' (9129) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 4294967295\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 4294967295\n"
+    },
+    {
+      "case": "bad-symbol-20-4294967295",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-4294967295.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-20-4294967295-True-lccc.elf']: \nthread '<unnamed>' (9131) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 4294967295\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 4294967295\n"
+    },
+    {
+      "case": "bad-symbol-21-4294967295",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-static', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-4294967295.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-4294967295-False-lccc.elf']: \nthread '<unnamed>' (9133) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 4294967295\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 4294967295\n"
+    },
+    {
+      "case": "bad-symbol-21-4294967295",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-4294967295.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-21-4294967295-True-lccc.elf']: \nthread '<unnamed>' (9135) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 4294967295\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 4294967295\n"
+    },
+    {
+      "case": "bad-symbol-22-4294967295",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-static', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-4294967295.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-4294967295-False-lccc.elf']: \nthread '<unnamed>' (9137) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 4294967295\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 4294967295\n"
+    },
+    {
+      "case": "bad-symbol-22-4294967295",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "crash is not a diagnostic: ['/home/user/.cache/baseline/lccc-riscv', '-nostdlib', '-shared', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-4294967295.o', '-o', '/tmp/lccc-rv-reloc-rwm8t58a/bad-symbol-22-4294967295-True-lccc.elf']: \nthread '<unnamed>' (9139) panicked at src/backend/riscv/linker/symbols.rs:223:43:\nindex out of bounds: the len is 3 but the index is 4294967295\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\nccc: internal error: index out of bounds: the len is 3 but the index is 4294967295\n"
+    },
+    {
+      "case": "bad-extent-2-9",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-2-9",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-2-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-2-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-2-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-2-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-1-13",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-1-13",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-1-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-1-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-1-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-1-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-33-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-33-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-33-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-33-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-34-15",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-34-15",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-34-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-34-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-34-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-34-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-35-13",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-35-13",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-35-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-35-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-35-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-35-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-36-9",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-36-9",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-36-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-36-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-36-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-36-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-37-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-37-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-37-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-37-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-38-15",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-38-15",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-38-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-38-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-38-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-38-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-39-13",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-39-13",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-39-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-39-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-39-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-39-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-40-9",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-40-9",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-40-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-40-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-40-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-40-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-44-15",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-44-15",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-44-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-44-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-44-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-44-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-45-15",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-45-15",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-45-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-45-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-45-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-45-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-53-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-53-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-53-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-53-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-54-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-54-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-54-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-54-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-55-15",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-55-15",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-55-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-55-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-55-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-55-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-56-13",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-56-13",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-56-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-56-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-56-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-56-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-19-9",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-19-9",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-19-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-19-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-19-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-19-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-22-13",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-22-13",
+      "shared": true,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=False, exit=0: "
+    },
+    {
+      "case": "bad-extent-22-16",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-22-16",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-22-18446744073709551615",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "bad-extent-22-18446744073709551615",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-0--7",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-0--7",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-8--7",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-8--7",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-0-0",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-0-0",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-8-0",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-8-0",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-0-11",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-0-11",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-8-11",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-64-8-11",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-marker-0",
+      "shared": false,
+      "tool": "lccc",
+      "passed": false,
+      "error": "expected accept=True, exit=1: ccc: error: unsupported RISC-V relocation type 0 for symbol '' in '/tmp/lccc-rv-reloc-rwm8t58a/valid-marker-0.o'\n"
+    },
+    {
+      "case": "valid-marker-0",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-marker-51",
+      "shared": false,
+      "tool": "lccc",
+      "passed": true
+    },
+    {
+      "case": "valid-marker-51",
+      "shared": true,
+      "tool": "lccc",
+      "passed": true
+    }
+  ]
+}

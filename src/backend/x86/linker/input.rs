@@ -1,0 +1,253 @@
+//! Input file loading for the x86-64 linker.
+//!
+//! Handles loading of object files (.o), archives (.a), shared libraries (.so),
+//! and linker scripts. Delegates to `linker_common` for ELF parsing.
+
+use crate::backend::elf::{LinkerScriptInput, MAX_LINKER_SCRIPT_DEPTH};
+use crate::common::fx_hash::FxHashMap;
+use std::path::Path;
+
+use super::elf::parse_object_shared;
+use super::elf::*;
+use super::types::{GlobalSymbol, x86_should_replace_extra};
+use crate::backend::linker_common;
+
+pub(super) fn load_file(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    whole_archive: bool,
+) -> Result<(), String> {
+    // Default call sites keep GNU ld's historical behaviour for this linker
+    // (as-needed); positional callers use `load_file_as_needed`.
+    load_file_as_needed(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        whole_archive,
+        true,
+    )
+}
+
+/// As [`load_file`], but carries the positional `--as-needed` state that was
+/// in effect for this input.
+pub(super) fn load_file_as_needed(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    whole_archive: bool,
+    as_needed: bool,
+) -> Result<(), String> {
+    load_file_depth(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        whole_archive,
+        as_needed,
+        false,
+        0,
+    )
+}
+
+/// As [`load_file_as_needed`], for the library an `-l` search found at
+/// `path` (`linker_common::unsonamed_needed_name`).
+pub(super) fn load_library_as_needed(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    whole_archive: bool,
+    as_needed: bool,
+) -> Result<(), String> {
+    load_file_depth(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        whole_archive,
+        as_needed,
+        true,
+        0,
+    )
+}
+
+/// Resolve the file a script entry names, or explain which one is missing.
+///
+/// Dropping an unresolvable entry silently — as the previous shape did with
+/// `Path::exists` guards — turns a missing library into later undefined
+/// symbols with no mention of the script that named it.  GNU ld reports the
+/// operand, so this does too.
+fn resolve_script_input(
+    input: &LinkerScriptInput,
+    script_path: &str,
+    script_dir: Option<&str>,
+    lib_paths: &[String],
+) -> Result<String, String> {
+    let resolved = match &input.entry {
+        LinkerScriptEntry::Path(p) => linker_common::resolve_script_path(p, script_dir, lib_paths),
+        LinkerScriptEntry::Lib(name) => linker_common::resolve_lib(name, lib_paths, false),
+    };
+    resolved.ok_or_else(|| {
+        format!(
+            "cannot find {} (referenced from linker script {})",
+            linker_common::script_input_spelling(input),
+            script_path
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one loader state tuple threaded through script recursion"
+)]
+fn load_file_depth(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    whole_archive: bool,
+    as_needed: bool,
+    by_search: bool,
+    depth: usize,
+) -> Result<(), String> {
+    if std::env::var("LINKER_DEBUG").is_ok() {
+        eprintln!("load_file: {}", path);
+    }
+
+    // Map the file instead of reading it.
+    //
+    // `SectionData` already avoided a *second* copy by windowing into the read
+    // buffer (see `secdata.rs`), but the read itself still copied the whole
+    // file. On the gzip workload that copy was 3.46 M instructions, 6.6% of
+    // the entire link, essentially all `__memcpy_avx_unaligned_erms`.
+    //
+    // `mmap(PROT_READ, MAP_PRIVATE)` removes it: sections become windows into
+    // the page cache, and pages the linker never touches are never faulted in
+    // -- which is most of a large archive. `FileMap` falls back to
+    // `std::fs::read` when mapping is unavailable, so correctness never
+    // depends on it (`LCCC_NO_MMAP=1` forces that path for A/B measurement).
+    let file = linker_common::filemap::FileMap::open(path)?;
+    let data = file.as_slice();
+    let backing = file.backing();
+
+    // Regular archive
+    if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
+        return linker_common::load_archive_elf64_backed(
+            &backing,
+            path,
+            objects,
+            globals,
+            EM_X86_64,
+            x86_should_replace_extra,
+            whole_archive,
+        );
+    }
+
+    // Thin archive
+    if is_thin_archive(data) {
+        return linker_common::load_thin_archive_elf64(
+            data,
+            path,
+            objects,
+            globals,
+            EM_X86_64,
+            x86_should_replace_extra,
+            whole_archive,
+        );
+    }
+
+    // Not ELF? Try linker script (handles GROUP and INPUT directives).
+    //
+    // `parse_linker_script_inputs`, not `parse_linker_script_entries`: a
+    // script whose *whole* body is `AS_NEEDED ( ... )` — the shape distro
+    // `libgcc_s_asneeded.so` and `libc.so` use — has no non-as-needed entry
+    // at all, so the filtered accessor reports "no entries" and the file
+    // would be misdiagnosed as `not a valid ELF object or archive`.  The
+    // as-needed flag has to travel with the entry instead: it becomes
+    // `DT_NEEDED` state for a shared object, and is meaningless for a static
+    // input, exactly as GNU ld applies it.
+    if data.len() >= 4 && data[0..4] != ELF_MAGIC {
+        if let Ok(text) = std::str::from_utf8(data) {
+            if let Some(inputs) = parse_linker_script_inputs(text) {
+                if depth >= MAX_LINKER_SCRIPT_DEPTH {
+                    return Err(format!(
+                        "{}: linker scripts nested more than {} deep",
+                        path, MAX_LINKER_SCRIPT_DEPTH
+                    ));
+                }
+                let script_dir = Path::new(path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned());
+                for input in &inputs {
+                    let resolved =
+                        resolve_script_input(input, path, script_dir.as_deref(), lib_paths)?;
+                    load_file_depth(
+                        &resolved,
+                        objects,
+                        globals,
+                        needed_sonames,
+                        lib_paths,
+                        whole_archive,
+                        as_needed || input.as_needed,
+                        matches!(input.entry, LinkerScriptEntry::Lib(_)),
+                        depth + 1,
+                    )?;
+                }
+                return Ok(());
+            }
+        }
+        return Err(format!("{}: not a valid ELF object or archive", path));
+    }
+
+    // Shared library
+    if data.len() >= 18 {
+        let e_type = u16::from_le_bytes([data[16], data[17]]);
+        if e_type == ET_DYN {
+            linker_common::load_shared_library_elf64_as_needed(
+                path,
+                objects,
+                globals,
+                needed_sonames,
+                lib_paths,
+                as_needed,
+                by_search,
+            )?;
+            // A library's `.dynsym` names export the executable's definitions
+            // it references -- if it is part of the link.  An `--as-needed`
+            // library that nothing needed gets no DT_NEEDED and is never
+            // loaded, so its references must not export anything: GNU ld
+            // unloads such a library, its symbols included.  (It is in the
+            // link iff its soname is in the DT_NEEDED list, also when an
+            // earlier input put it there.)
+            let soname = linker_common::parse_soname(data)
+                .unwrap_or_else(|| linker_common::unsonamed_needed_name(path, by_search));
+            if needed_sonames.contains(&soname) {
+                objects.note_dso_names(linker_common::shared_library_dynsym_names(data));
+            }
+            return Ok(());
+        }
+    }
+
+    // Regular ELF object
+    let obj = linker_common::parse_object::parse_elf64_object_backed(
+        &backing,
+        0,
+        data.len(),
+        path,
+        EM_X86_64,
+    )?;
+    linker_common::register_symbols_elf64(objects, &obj, globals, x86_should_replace_extra)?;
+    objects.push(obj);
+    Ok(())
+}

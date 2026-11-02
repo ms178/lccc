@@ -1,0 +1,27 @@
+{
+  "source": "tests/benchmark/programs/gzip_crc32.c",
+  "function": null,
+  "arch": "x86",
+  "errors": [],
+  "records": [
+    {
+      "key": "icc",
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": "",
+      "flags": "-O2 -march=core-avx2",
+      "elapsed_s": 0.3004871399998592,
+      "instructions": 60,
+      "loads": 7,
+      "stores": 6,
+      "spills": 3,
+      "stack_refs": 3,
+      "xmm_reg_moves": 0,
+      "branches": 6,
+      "vectors": 2,
+      "calls": 2,
+      "ratio_vs_best": 1.0
+    }
+  ]
+}

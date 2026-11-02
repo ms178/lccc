@@ -1,0 +1,97 @@
+{
+  "label": "S22-steal sha256 (new main)",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_2e48wk_m/arm_a",
+    "sha256": "b60832fcbec7d4702c833b1103f1d4c958e91069a2e3c3a2ca68a5a374df5639",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_2e48wk_m/arm_b",
+    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "stealON",
+    "n": 15,
+    "min_ms": 449.212,
+    "median_ms": 460.844,
+    "mean_ms": 471.577,
+    "stdev_ms": 30.892,
+    "samples_ms": [
+      453.067,
+      451.889,
+      450.207,
+      462.198,
+      449.212,
+      451.093,
+      451.729,
+      549.281,
+      491.716,
+      461.741,
+      460.844,
+      466.256,
+      451.682,
+      538.565,
+      484.17
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "stealOFF",
+    "n": 15,
+    "min_ms": 406.266,
+    "median_ms": 408.907,
+    "mean_ms": 411.933,
+    "stdev_ms": 11.856,
+    "samples_ms": [
+      407.544,
+      406.496,
+      408.907,
+      407.059,
+      406.266,
+      409.524,
+      413.28,
+      410.032,
+      407.1,
+      409.229,
+      455.5,
+      414.165,
+      407.19,
+      407.481,
+      409.217
+    ]
+  },
+  "paired_diffs_ms": [
+    45.523,
+    45.393,
+    41.3,
+    55.139,
+    42.946,
+    41.569,
+    38.449,
+    139.249,
+    84.615,
+    52.512,
+    5.344,
+    52.091,
+    44.492,
+    131.084,
+    74.952
+  ],
+  "median_ratio_b_over_a": 0.8873,
+  "min_ratio_b_over_a": 0.9044,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "stealON SLOWER by 11.27% (median)"
+}

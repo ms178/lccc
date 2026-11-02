@@ -1,0 +1,92 @@
+[package]
+name = "lccc"
+version = "0.1.0"
+# Minimum supported Rust version.
+#
+# AUD-TOOLCHAIN-1: this said 1.98.1, a version no host in this project ever
+# built the tree with — an *assertion*, not a measurement, and one that made
+# `cargo build` refuse to start on the 1.97.0 toolchain the research sandbox
+# provisions (and on every host that has not caught up with `stable`). The
+# floor is now the version the tree is verified against:
+#   * verified locally: `cargo build --profile fastbuild --locked`
+#     with rustc 1.97.0 (2d8144b78), warnings denied (-D warnings) — clean.
+# The GitHub workflow's `msrv` job re-runs `cargo check --locked` on
+# exactly this toolchain (mirrored locally by ci_local.sh's `msrv-check`
+# gate), so the number stays a measurement. Raise the floor only together
+# with the job that tests the new floor.
+rust-version = "1.97.0"
+edition = "2024"
+description = "LCCC (Lev's C Compiler) — a high-performance C compiler fork targeting x86-64, i686, ARM64, and RISC-V"
+
+[lib]
+name = "lccc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lccc"
+path = "src/main.rs"
+
+[[bin]]
+name = "lccc-x86"
+path = "src/bin/ccc_x86.rs"
+
+[[bin]]
+name = "lccc-arm"
+path = "src/bin/ccc_arm.rs"
+
+[[bin]]
+name = "lccc-riscv"
+path = "src/bin/ccc_riscv.rs"
+
+[[bin]]
+name = "lccc-i686"
+path = "src/bin/ccc_i686.rs"
+
+[[bin]]
+name = "lccc-ld"
+path = "src/bin/lccc_ld.rs"
+
+[features]
+# Allow GCC as a linker fallback. When enabled and GCC is used, a warning is printed.
+gcc_linker = []
+# Allow GCC as an assembler fallback. When enabled and GCC is used, a warning is printed.
+gcc_assembler = []
+# Allow GCC passthrough for -m16 mode (16-bit real-mode boot code).
+# When enabled and GCC is used, a prominent warning is printed.
+gcc_m16 = []
+
+# Release profile for shipped compiler binaries.
+#
+# * thin LTO: most of fat-LTO's cross-crate inlining benefit at a fraction
+#   of the link time (the compiler is a single crate + std, so the delta
+#   between thin and fat is small here anyway).
+# * NOT panic = "abort": compiler_main() catches worker-thread panics via
+#   join() + downcast to print a proper "internal error" diagnostic instead
+#   of a raw abort; panic=abort would kill that reporting path.
+# * The research build script (scripts/build_lccc_o1_j2.sh) still overrides
+#   opt-level via CARGO_PROFILE_RELEASE_OPT_LEVEL=1 per project policy.
+[profile.release]
+lto = "thin"
+
+# Fast-iteration profile for development / research loops (`cargo build
+# --profile fastbuild`). The release profile's thin LTO quadruples rebuild
+# times on small machines because LTO disables incremental compilation and
+# serializes all codegen behind the cross-unit link step. This profile keeps
+# the optimizer at the project-policy -O1 level (same codegen quality class
+# as the research builds) while restoring the fast edit-compile-test cycle:
+#
+# * lto = "off":            no cross-unit link step, parallel codegen.
+# * incremental = true:     only re-optimize dirty CGUs on rebuilds.
+# * codegen-units = 256:    maximum intra-crate codegen parallelism.
+# * debug = "line-tables-only": usable panic backtraces / gdb line info at
+#                           a fraction of full debuginfo cost.
+#
+# Binaries land in target/fastbuild/. Use scripts/build_lccc_fast.sh.
+# Ship-quality binaries still come from the release profile.
+[profile.fastbuild]
+inherits = "release"
+opt-level = 1
+lto = "off"
+incremental = true
+codegen-units = 256
+debug = "line-tables-only"

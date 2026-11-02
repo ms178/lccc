@@ -1,0 +1,2 @@
+assembly identity: IDENTICAL=58 PGO_PID=0 DIFFERENT=0 COMPILE_FAIL=0 TOTAL=58 (6.79s)
+report: /home/user/.cache/pr821-identity/report.json

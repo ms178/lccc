@@ -1,0 +1,29 @@
+{
+  "base": "e047aa1eb2ae59b3943a64ab7ec5e5dddb89a3ff",
+  "implementation": "constant + indexed GEP map-aware MachInst admission; no optimizer pass disabled",
+  "implementation_source_sha256": "ff10069277d3daabc5e307609a9ff8fb07ef05f38a9ee1d211bfe56ec5c4873a",
+  "compiler_before_sha256": "a2c4e6aecfc1a6857bae644497039cfacf8779da465acc4c8a826e0d55dcd56a",
+  "compiler_after_sha256": "ba07916b0b144c01ff923e833ff5fdec5e5e2c3c9b59b218714e0db46e3ad084",
+  "build": "scripts/build_lccc_fast.sh; fastbuild opt-level=1; jobs=2; DEBUG=0; INCREMENTAL=0; 6 GiB active swap",
+  "late_constant_gep_gate": {
+    "command": "bash tests/regression/check_late_const_gep.sh",
+    "before_exit": 1,
+    "before_output": "FAIL late-constant-GEP -O2\n",
+    "after_exit": 0,
+    "after_output": "OK late-constant-GEP: small + zlib-derived two-TU fixtures O0/O1/O2/O3/Os; GAS control\n",
+    "levels": [
+      "O0",
+      "O1",
+      "O2",
+      "O3",
+      "Os"
+    ],
+    "full_expected_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+  },
+  "expat": {
+    "selftest_checks": 42,
+    "archived_ctest_and_config_replay": "comparable; 1 CTest wrapper per compiler, each previously reported 4932 internal checks"
+  },
+  "ci_parity": "PASS: 200 commands",
+  "certification": "targeted validation only; fast CI, Rust unit tests, rustfmt check and Clippy still required"
+}

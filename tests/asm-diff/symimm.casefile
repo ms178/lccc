@@ -1,0 +1,33 @@
+;;; symimm_accumulator
+.text
+add $sym, %al
+or $sym, %al
+adc $sym, %al
+sbb $sym, %al
+and $sym, %al
+sub $sym, %al
+xor $sym, %al
+cmp $sym, %al
+add $sym, %ax
+sub $sym, %ax
+cmp $sym, %ax
+add $sym, %eax
+add $sym, %rax
+or $sym, %eax
+;;; symimm_nonaccumulator
+add $sym, %bl
+addb $sym, (%rax)
+addw $sym, (%rax)
+addl $sym, (%rax)
+add $sym, %r9b
+sub $sym, %r10w
+;;; symimm_plussize
+add $sym+8, %al
+add $sym+8, %ax
+add $sym-4, %eax
+;;; symimm_high8
+.text
+add $sym, %ah
+add $sym, %bh
+;;; symimm_rejects2 reject
+addl $sym, %al

@@ -1,0 +1,77 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 08s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 69 tests
+test backend::x86::codegen::peephole::passes::load_op_fuse::lea_fold_tests::folds_a_segment_qualified_load ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::lea_fold_tests::folds_the_lea_inplace_step_and_renames_the_chain ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::lea_fold_tests::refuses_frame_register_bases ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::lea_fold_tests::refuses_when_the_base_is_not_dead_after_the_lea ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::lea_fold_tests::refuses_when_the_load_destination_is_live_after_the_lea ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::lea_fold_tests::refuses_when_the_next_instruction_cannot_carry_the_flags ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::adjacent_commute_preserves_fixed_cl_reader ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_refused_on_high_byte_in_product_range ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_refused_when_other_operand_stays_live ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_refuses_when_product_is_returned_in_rdx ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_rehomes_a_single_family_rmw_product_update ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_retargets_a_full_width_load_address ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_retargets_a_partial_source_of_full_width_definition ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_retargets_a_zero_extending_self_move_source ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_steps_over_full_width_self_move ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::commuting_adjacent_fuse_stops_rename_at_clean_kill ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_bridged_commutative_crc_shape ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_bridged_refuses_non_commutative_and_truncating_copy ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_bridged_refuses_when_partner_rewritten ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_bridged_segment_fold_requires_adjacency_too ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_fixed_cl_reader ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_commute_preserves_implicit_accumulator_reader ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_into_dying_operand_crc_index_shape ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::copy_into_dying_operand_refusals ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::family_rename_preserves_isa_constraints_not_just_text ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::fuses_across_flag_neutral_gap_and_rip_source ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::fuses_cmp_and_imul_consumers ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::fuses_commuting_adjacent_load_with_product_rename ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::fuses_segment_qualified_cmp_mirror_and_case_insensitive_prefix ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::fuses_segment_qualified_immediate_cmp_and_bmi_andn ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::fuses_segment_qualified_load_into_alu ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::fuses_sib_load_into_xor ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::malformed_segment_prefix_still_refused ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::may_write_model_is_conservative ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::may_write_model_is_exact_for_implicit_operands ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::narrows_wide_immediates_but_keeps_negative_and_large ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::recurrence_2op_reg_imul_still_folds ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::recurrence_3op_imul_src_equals_dst_folds_to_2op ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::recurrence_refuses_3op_imul_distinct_src ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::recurrence_update_in_place_crc_shape ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::recurrence_update_refuses_live_scratch_and_non_commutative ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::refuses_across_label_call_and_width_mismatch ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::refuses_across_store_or_address_write ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::refuses_intervening_load_volatile_order ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::refuses_when_loaded_register_live_after ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::segment_qualified_fold_requires_adjacency ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::symbol_cse_rejects_position_dependent_addresses ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::symbol_lea_cse_all_gprs_and_invalidation ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::tests::vector_flag_and_string_output_may_writes_are_precise ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::a_cf_only_flag_setter_does_not_hide_an_of_consumer ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::a_cf_only_flag_setter_does_not_veto_a_genuine_zf_cf_block ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::a_load_addressed_by_the_other_loads_destination_is_never_reordered ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::folds_64_bit_zero_extension ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::folds_the_match_extension_loop_to_gcc_shape ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::folds_word_wide_zero_extension ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::mirrored_operand_order_preserves_the_subtraction_direction ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::never_widens_the_memory_access_of_a_sign_extending_load ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::preserves_cf_selecting_branches ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::refuses_a_non_adjacent_triple ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::refuses_a_plain_full_width_pair ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::refuses_a_whole_flag_reader ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::refuses_mismatched_narrow_widths ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::refuses_setcc_selecting_on_sf ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::refuses_when_a_consumer_selects_on_sf ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::refuses_when_the_folded_register_is_live_after ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::sahf_is_treated_as_a_zf_clobber ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::the_deleted_load_is_always_the_second_one ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::lea_fold_tests::refuses_a_width_mismatch_between_load_and_lea ... ok
+test backend::x86::codegen::peephole::passes::load_op_fuse::zec_tests::the_emitted_assembly_computes_the_same_predicate_as_its_input ... ok
+
+test result: ok. 69 passed; 0 failed; 0 ignored; 0 measured; 4658 filtered out; finished in 0.12s
+

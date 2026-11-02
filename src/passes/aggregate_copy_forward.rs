@@ -1,0 +1,2533 @@
+//! Forward reads from short-lived aggregate copies to their original storage.
+//!
+//! Inlining structure-returning functions often leaves IR like:
+//! `memcpy(tmp, object); load(tmp.field)`.  When `tmp` never escapes or receives
+//! another write, copying the complete aggregate is unnecessary.  This pass is
+//! deliberately conservative: the copy and every read must be in the same
+//! block, with the copy preceding the reads.
+
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::ir::reexports::{BlockId, Instruction, IrFunction, Operand, Value};
+
+/// Bytes an access of `ty` may touch (`IrType::access_extent`; target-sized
+/// pointers).  Every use is a conflict or containment check, where the
+/// upper bound is the conservative one; unmodeled types count as 16 bytes.
+fn type_size(ty: crate::common::types::IrType) -> i64 {
+    ty.access_extent().map_or(16, |(_, may)| may)
+}
+
+/// Remove stores to fields of non-escaping stack aggregates that are never read.
+pub(crate) fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
+    // Track aggregate roots separately from precise paths. Loop pointer phis
+    // commonly merge offsets 0 and 48; they still share the same allocation
+    // root even though `pointer_paths` deliberately rejects the differing paths.
+    // suffix None = variable/unknown offset: such a pointer can reach ANY
+    // byte of the aggregate. Loads through it read the whole root; stores
+    // through it are never dead. (The previous code mapped variable offsets
+    // to 0, so a `exp[i]` loop-load only "read" bytes 0..size and every
+    // store at offset >= size was deleted — simd_vhaddps lane corruption.)
+    let mut root_suffix: FxHashMap<u32, (u32, Option<i64>)> = FxHashMap::default();
+    // Values whose defs reference two DIFFERENT roots: not attributable to a
+    // single allocation; permanently untracked (tombstone prevents the
+    // insert/remove oscillation a plain remove would cause in the fixpoint).
+    let mut mixed_root: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                root_suffix.insert(dest.0, (dest.0, Some(0)));
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let derived = match inst {
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => root_suffix.get(&base.0).copied().map(|(root, suffix)| {
+                        let next = match (offset, suffix) {
+                            (Operand::Const(c), Some(s)) => {
+                                c.to_i64().and_then(|o| s.checked_add(o))
+                            }
+                            _ => None, // variable or already-unknown offset
+                        };
+                        (dest.0, (root, next))
+                    }),
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    } => root_suffix.get(&src.0).copied().map(|p| (dest.0, p)),
+                    Instruction::Phi { dest, incoming, .. } => {
+                        let vals: Vec<(u32, Option<i64>)> = incoming
+                            .iter()
+                            .filter_map(|(op, _)| match op {
+                                Operand::Value(v) => root_suffix.get(&v.0).copied(),
+                                _ => None,
+                            })
+                            .collect();
+                        if !vals.is_empty() && vals.iter().all(|p| p.0 == vals[0].0) {
+                            // Diverging offsets across phi arms => unknown, NOT 0.
+                            let suffix = if vals.iter().all(|p| p.1 == vals[0].1) {
+                                vals[0].1
+                            } else {
+                                None
+                            };
+                            Some((dest.0, (vals[0].0, suffix)))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((dest, path)) = derived {
+                    if mixed_root.contains(&dest) {
+                        continue;
+                    }
+                    match root_suffix.get(&dest) {
+                        None => {
+                            root_suffix.insert(dest, path);
+                            changed = true;
+                        }
+                        // MULTI-DEF pointer (post-phi Copy web: `p = base; ...;
+                        // p = p+12` in a loop): the same SSA id denotes different
+                        // offsets at different times. Keeping the first-seen
+                        // suffix understated the read set and initializing
+                        // stores got deleted (structs_bitfields). Same root =>
+                        // demote to unknown offset; different root => not
+                        // attributable to one allocation — tombstone (fail closed).
+                        Some(&(old_root, old_suffix)) => {
+                            if old_root == path.0 {
+                                if old_suffix != path.1 && old_suffix.is_some() {
+                                    root_suffix.insert(dest, (old_root, None));
+                                    changed = true;
+                                }
+                            } else {
+                                root_suffix.remove(&dest);
+                                mixed_root.insert(dest);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // An aggregate is a volatile root when the object itself is volatile, or
+    // when a volatile load or store reaches it through a field path (`volatile
+    // int *p = &s.f; *p = 1;`): such an access is an observable side effect
+    // (C11 5.1.2.3), so no store into the aggregate may be removed.
+    let mut volatile_roots: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Alloca {
+                dest,
+                volatile: true,
+                ..
+            } => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        let (Instruction::Load {
+            ptr,
+            volatile: true,
+            ..
+        }
+        | Instruction::Store {
+            ptr,
+            volatile: true,
+            ..
+        }) = inst
+        else {
+            continue;
+        };
+        if let Some((root, _)) = root_suffix.get(&ptr.0) {
+            volatile_roots.insert(*root);
+        }
+    }
+    let mut escaping = FxHashSet::default();
+    let mut loaded: FxHashMap<u32, Vec<(i64, i64)>> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Load { ptr, ty, .. } = inst {
+                if let Some((root, suffix)) = root_suffix.get(&ptr.0) {
+                    match suffix {
+                        Some(off) => loaded
+                            .entry(*root)
+                            .or_default()
+                            .push((*off, type_size(*ty))),
+                        // Unknown offset: conservatively reads everything.
+                        None => {
+                            loaded
+                                .entry(*root)
+                                .or_default()
+                                .push((i64::MIN / 4, i64::MAX / 2));
+                        }
+                    }
+                }
+            }
+            // DEFAULT-CLOSED escape analysis: only instructions whose
+            // memory semantics this pass models precisely (Load's read range,
+            // Store's written range, and the GEP/Copy/Phi derivations above)
+            // may reference a tracked root without escaping it. EVERYTHING
+            // else — calls, intrinsics (dest_ptr AND args are raw pointers
+            // into aggregates!), memcpy, atomics, inline asm, va_arg, selects,
+            // terminator operands — escapes the root. The previous allowlist
+            // missed Intrinsic entirely, so SSE/AVX stores into __m128i
+            // allocas were "never read" and every initializing store was
+            // deleted (simd regression cluster: paddd on zeroed inputs).
+            match inst {
+                Instruction::Load { .. } => {}
+                Instruction::Store { ptr: _, val, .. } => {
+                    // The written-to pointer is modeled; a tracked root used
+                    // as the *value* being stored escapes (pointer written to
+                    // memory can be reloaded and read anywhere).
+                    if let Operand::Value(v) = val {
+                        if let Some((root, _)) = root_suffix.get(&v.0) {
+                            escaping.insert(*root);
+                        }
+                    }
+                }
+                Instruction::GetElementPtr { .. } | Instruction::Copy { .. } => {
+                    // Pure derivations, tracked in root_suffix above.
+                }
+                Instruction::Phi { incoming, .. } => {
+                    // A phi that merges pointers to DIFFERENT allocation roots
+                    // is not a precise aggregate-field derivation.  The fixpoint
+                    // deliberately tombstones the phi result in that case, but
+                    // the incoming roots still flow to an untracked pointer; if
+                    // a later load uses the phi, it may read any of those roots.
+                    // Treat all such incoming roots as escaped instead of
+                    // deleting their stores as "unread".  This is the STORE-CCP
+                    // family from gcc.c-torture/execute/20041019-1.c and
+                    // 20070212-2.c (`p = k ? &i1 : &j1; i1 = 0; return *p`).
+                    let mut value_incomings = 0usize;
+                    let roots: Vec<u32> = incoming
+                        .iter()
+                        .filter_map(|(op, _)| match op {
+                            Operand::Value(v) => {
+                                value_incomings += 1;
+                                root_suffix.get(&v.0).map(|(root, _)| *root)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !roots.is_empty()
+                        && (roots.len() != value_incomings || roots.iter().any(|r| *r != roots[0]))
+                    {
+                        escaping.extend(roots);
+                    }
+                }
+                _ => {
+                    // Escape every tracked root referenced by any operand,
+                    // value use (incl. Intrinsic dest_ptr/args, Memcpy
+                    // endpoints, call args), fail-closed.
+                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            if let Some((root, _)) = root_suffix.get(&v.0) {
+                                escaping.insert(*root);
+                            }
+                        }
+                    });
+                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                        if let Some((root, _)) = root_suffix.get(&v.0) {
+                            escaping.insert(*root);
+                        }
+                    });
+                }
+            }
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if let Some((root, _)) = root_suffix.get(&v.0) {
+                    escaping.insert(*root);
+                }
+            }
+        });
+    }
+    let mut changes = 0;
+    for block in &mut func.blocks {
+        let old = std::mem::take(&mut block.instructions);
+        let old_spans = std::mem::take(&mut block.source_spans);
+        // Spans are only trustworthy when they parallel the instruction list
+        // 1:1 (upstream convention, see dce.rs). Other passes may insert
+        // instructions without maintaining spans; indexing old_spans[ii]
+        // with a mismatched length was an out-of-bounds ICE.
+        let has_spans = old_spans.len() == old.len();
+        let mut kept = Vec::with_capacity(old.len());
+        let mut spans = Vec::with_capacity(old_spans.len());
+        for (ii, inst) in old.into_iter().enumerate() {
+            let dead = if let Instruction::Store { ptr, ty, .. } = &inst {
+                if let Some((root, Some(off))) = root_suffix.get(&ptr.0) {
+                    if !volatile_roots.contains(root) && !escaping.contains(root) {
+                        let size = type_size(*ty);
+                        !loaded.get(root).is_some_and(|ranges| {
+                            ranges
+                                .iter()
+                                .any(|(lo, ls)| *off < lo + ls && *lo < *off + size)
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                } // unknown store offset: never dead
+            } else {
+                false
+            };
+            if dead {
+                changes += 1;
+                continue;
+            }
+            kept.push(inst);
+            if has_spans {
+                spans.push(old_spans[ii]);
+            }
+        }
+        block.instructions = kept;
+        if has_spans {
+            block.source_spans = spans;
+        }
+    }
+    changes
+}
+
+#[derive(Clone)]
+struct CopyCandidate {
+    block: usize,
+    inst: usize,
+    source: Value,
+    source_root: u32,
+}
+
+/// Instructions that can write memory the pass cannot attribute to a tracked
+/// pointer path: calls (including libc `memset`/`memcpy` lowered as plain
+/// `Call`s), inline asm, atomics, va-machinery, and impure intrinsics. A
+/// snapshot window that spans one of these may only survive when the source
+/// is a provably unclobberable local (non-escaping alloca).
+fn is_opaque_memory_write(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaArgStruct { .. }
+        | Instruction::StackRestore { .. } => true,
+        Instruction::Intrinsic { op, dest_ptr, .. } => {
+            !op.is_pure() || dest_ptr.is_some() || op.writes_memory_via_args()
+        }
+        _ => false,
+    }
+}
+
+/// Return the alloca root and GEP path for pointer values derived from allocas.
+fn pointer_paths(
+    func: &IrFunction,
+) -> FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)> {
+    let mut paths = FxHashMap::default();
+    let multi_def = super::gvn::find_multi_def_values(func);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                if !multi_def.contains(&dest.0) {
+                    paths.insert(dest.0, (dest.0, Vec::new()));
+                }
+            }
+        }
+    }
+    // MULTI-DEF GUARD (gvn/copy_prop class): a value id with several
+    // definitions has position-dependent content; attributing ONE (root,
+    // path) to the id describes only the first-seen definition while its
+    // other definitions may point elsewhere.  Every access through such an
+    // id then takes the untracked (conservative, no-forwarding) fallback —
+    // the same refusal discipline as gvn/copy_prop/global_addr_cse.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GetElementPtr {
+                        dest,
+                        base,
+                        offset,
+                        ty,
+                    } => {
+                        if paths.contains_key(&dest.0) || multi_def.contains(&dest.0) {
+                            continue;
+                        }
+                        if let Some((root, parent)) = paths.get(&base.0).cloned() {
+                            let mut path = parent;
+                            path.push((offset.clone(), *ty));
+                            paths.insert(dest.0, (root, path));
+                            changed = true;
+                        }
+                    }
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    } => {
+                        if !paths.contains_key(&dest.0) && !multi_def.contains(&dest.0) {
+                            if let Some(path) = paths.get(&src.0).cloned() {
+                                paths.insert(dest.0, path);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Instruction::Phi { dest, incoming, .. } => {
+                        if paths.contains_key(&dest.0) || multi_def.contains(&dest.0) {
+                            continue;
+                        }
+                        let mut common = None;
+                        let mut compatible = true;
+                        for (op, _) in incoming {
+                            match op {
+                                Operand::Const(c) if c.to_i64() == Some(0) => {}
+                                Operand::Value(v) => {
+                                    if let Some(path) = paths.get(&v.0) {
+                                        if common.as_ref().is_some_and(
+                                            |p: &(
+                                                u32,
+                                                Vec<(Operand, crate::common::types::IrType)>,
+                                            )| {
+                                                p.0 != path.0 || p.1 != path.1
+                                            },
+                                        ) {
+                                            compatible = false;
+                                            break;
+                                        }
+                                        common = Some(path.clone());
+                                    } else {
+                                        compatible = false;
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    compatible = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if compatible {
+                            if let Some(path) = common {
+                                paths.insert(dest.0, path);
+                                changed = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Symbols that each value may use as an address root.  Unlike pointer_paths,
+/// this is deliberately a MAY analysis: unions are never narrowed, including
+/// for multiply-defined values and mixed phis.  That is the appropriate
+/// default for a liveness guard, where missing an alias can delete a copy.
+fn global_address_names(func: &IrFunction) -> FxHashMap<u32, FxHashSet<String>> {
+    let mut names: FxHashMap<u32, FxHashSet<String>> = FxHashMap::default();
+    let mut edges: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut add_edge = |src: u32, dest: u32| edges.entry(src).or_default().push(dest);
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GlobalAddr { dest, name } => {
+                    names.entry(dest.0).or_default().insert(name.clone());
+                }
+                Instruction::GetElementPtr { dest, base, .. } => add_edge(base.0, dest.0),
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                }
+                | Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    ..
+                } => add_edge(src.0, dest.0),
+                Instruction::Phi { dest, incoming, .. } => {
+                    for (op, _) in incoming {
+                        if let Operand::Value(src) = op {
+                            add_edge(src.0, dest.0);
+                        }
+                    }
+                }
+                Instruction::Select {
+                    dest,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    for op in [true_val, false_val] {
+                        if let Operand::Value(src) = op {
+                            add_edge(src.0, dest.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Propagate unions to a fixed point with a worklist.  A value is queued
+    // only when its set grew, so cycles and mixed phis terminate without the
+    // single-definition assumptions required by pointer_paths.
+    let mut pending: Vec<u32> = names.keys().copied().collect();
+    while let Some(src) = pending.pop() {
+        let Some(src_names) = names.get(&src).cloned() else {
+            continue;
+        };
+        for dest in edges.get(&src).into_iter().flatten() {
+            let dest_names = names.entry(*dest).or_default();
+            let old_len = dest_names.len();
+            dest_names.extend(src_names.iter().cloned());
+            if dest_names.len() != old_len {
+                pending.push(*dest);
+            }
+        }
+    }
+    names
+}
+
+fn global_names_may_alias(
+    a: &FxHashSet<String>,
+    b: &FxHashSet<String>,
+    facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> bool {
+    a.iter().any(|an| {
+        b.iter().any(|bn| {
+            an == bn || facts.is_none_or(|facts| !facts.globals_distinct(an.as_str(), bn.as_str()))
+        })
+    })
+}
+
+type PointerPaths = FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)>;
+type ConstructionCopies = FxHashMap<u32, (usize, usize, Value)>;
+
+/// Remove candidates whose earlier publication can change an intervening
+/// memory observation. Keeping this proof separate from candidate discovery
+/// and rewriting makes the alias boundary independently reviewable.
+fn reject_conflicting_constructions(
+    func: &IrFunction,
+    paths: &PointerPaths,
+    copies: &mut ConstructionCopies,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) {
+    let global_addresses = global_address_names(func);
+    // MAY provenance above detects aliases, but a partial global set from
+    // select(global, unknown) is NOT a no-alias proof. Use only unique,
+    // direct GlobalAddr definitions when proving distinct globals here.
+    let multi_def = super::gvn::find_multi_def_values(func);
+    let direct_globals: FxHashMap<u32, &str> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::GlobalAddr { dest, name } if !multi_def.contains(&dest.0) => {
+                Some((dest.0, name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut reject = FxHashSet::default();
+    for (&root, &(copy_b, copy_i, dest)) in copies.iter() {
+        // dest's aliasing root (dest may be a GEP into a larger object;
+        // any access to that object is conservatively a conflict).
+        let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
+        let dest_globals = global_addresses.get(&dest.0);
+        // Address construction does not publish bytes. Start at the
+        // first redirected WRITE, not Alloca/GEP, so loads used to build
+        // the temporary before its first store do not block forwarding.
+        let first_use = func.blocks[copy_b].instructions[..copy_i]
+            .iter()
+            .position(|inst| match inst {
+                Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => {
+                    paths.get(&ptr.0).is_some_and(|p| p.0 == root)
+                }
+                _ => false,
+            })
+            .unwrap_or(copy_i);
+        let access_may_alias = |pointer: Value| {
+            if pointer == dest {
+                return true;
+            }
+            let access_root = paths.get(&pointer.0).map(|p| p.0);
+            // Validation above proves the construction root non-escaping;
+            // its own stores cannot name the destination's old contents.
+            if access_root == Some(root) {
+                return false;
+            }
+            if let Some(dest_path) = paths.get(&dest.0) {
+                if let Some(access_root) = access_root {
+                    return access_root == dest_path.0;
+                }
+                if direct_globals.contains_key(&pointer.0) {
+                    return false;
+                }
+            } else if direct_globals.contains_key(&dest.0) && access_root.is_some() {
+                return false;
+            }
+            if let (Some(a), Some(b), Some(facts)) = (
+                direct_globals.get(&dest.0),
+                direct_globals.get(&pointer.0),
+                symbol_facts,
+            ) {
+                return !facts.globals_distinct(a, b);
+            }
+            // Different SSA ids, unknown roots, and partial MAY sets do
+            // not prove disjointness. In particular a parameter can point
+            // at the destination global, and a call can access it implicitly.
+            true
+        };
+        // dest's MEMORY must be untouched inside the window (the memcpy
+        // itself at copy_i is the legitimate final write). Pure address
+        // computations — GetElementPtr / Copy / Phi over pointers rooted
+        // at dest — do not read or write that memory and must not
+        // reject (the hoisted destination GEP itself sits inside the
+        // window by construction). Everything else that references a
+        // dest-rooted value is a read, a write, or an escape
+        // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
+        // fails closed. GlobalAddr values use symbol identity as well:
+        // the frontend may materialize the same object under many SSA
+        // ids, and pr126405 showed that comparing only those ids misses
+        // the destination loads in this window.
+        for ii in first_use..copy_i {
+            let inst = &func.blocks[copy_b].instructions[ii];
+            if matches!(
+                inst,
+                Instruction::GetElementPtr { .. }
+                    | Instruction::Copy { .. }
+                    | Instruction::Phi { .. }
+            ) {
+                continue;
+            }
+            let memory_conflict = match inst {
+                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                    access_may_alias(*ptr)
+                }
+                Instruction::Memcpy { dest, src, .. } => {
+                    access_may_alias(*dest) || access_may_alias(*src)
+                }
+                Instruction::AtomicLoad { .. } | Instruction::Fence { .. } => true,
+                _ => is_opaque_memory_write(inst) || inst.may_write_memory(),
+            };
+            let mut touches_dest = memory_conflict;
+            inst.for_each_used_value(|v| {
+                let alloca_alias = v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root);
+                let global_alias = dest_globals.is_some_and(|dest_names| {
+                    global_addresses.get(&v).is_some_and(|used_names| {
+                        global_names_may_alias(dest_names, used_names, symbol_facts)
+                    })
+                });
+                if alloca_alias || global_alias {
+                    touches_dest = true;
+                }
+            });
+            if let Some(d) = inst.dest() {
+                if d.0 == dest.0 || paths.get(&d.0).is_some_and(|p| p.0 == dest_root) {
+                    touches_dest = true;
+                }
+            }
+            if touches_dest {
+                reject.insert(root);
+                break;
+            }
+        }
+    }
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for r in &reject {
+            eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r);
+        }
+    }
+    for root in reject {
+        copies.remove(&root);
+    }
+}
+
+/// Redirect construction of a store-only temporary aggregate into the final
+/// memcpy destination.  This turns `build(tmp); memcpy(dst, tmp)` into
+/// `build(dst)` when every use of `tmp` is a same-block GEP/store or that copy.
+fn forward_store_only_temporaries(
+    func: &mut IrFunction,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> usize {
+    let paths = pointer_paths(func);
+    let roots: FxHashSet<u32> = paths
+        .iter()
+        .filter_map(|(&v, (root, path))| (v == *root && path.is_empty()).then_some(v))
+        .collect();
+    // Entry-block allocas homing register parameters are written by the
+    // PROLOGUE, not by IR-visible stores (find_param_alloca maps param i to
+    // the i-th entry-block alloca; the x86/arm prologues spill incoming
+    // registers there). Forwarding such a root redirects only the IR stores
+    // and deletes the copy — the implicit prologue write is lost and the
+    // copy destination stays uninitialized (dump128(__m128 v): the
+    // `memcpy tmp, v_home` snapshot was deleted outright because v_home has
+    // ZERO IR stores; tmp then fed printf with stack garbage).
+    //
+    // The exclusion set is `func.param_alloca_values` — the authoritative
+    // list recorded at lowering (also consumed by stack_layout/analysis).
+    // The old positional rule ("first params.len() entry allocas") went
+    // stale the moment mem2reg promoted scalar param allocas away: in
+    // `fill(ParticleGroup*, int)` both scalar param homes are deleted, so
+    // the position count excluded the first two makeparticle TEMPORARIES
+    // and half the struct-return copies stayed (struct_copy 3.1×). When
+    // the recorded list is empty (tail_call_elim clears it; inliner-built
+    // functions never had one) fall back to the positional rule, fail
+    // closed.
+    let param_slot_roots: FxHashSet<u32> = if !func.param_alloca_values.is_empty() {
+        func.param_alloca_values.iter().map(|v| v.0).collect()
+    } else {
+        func.blocks
+            .first()
+            .map(|b| {
+                b.instructions
+                    .iter()
+                    .filter_map(|i| match i {
+                        Instruction::Alloca { dest, .. } => Some(dest.0),
+                        _ => None,
+                    })
+                    .take(func.params.len())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut copies: FxHashMap<u32, (usize, usize, Value)> = FxHashMap::default();
+    let mut copy_sizes: FxHashMap<u32, i64> = FxHashMap::default();
+    let mut duplicate = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Memcpy { dest, src, size } = inst {
+                let Some((root, path)) = paths.get(&src.0) else {
+                    continue;
+                };
+                if !path.is_empty() || !roots.contains(root) {
+                    continue;
+                }
+                if param_slot_roots.contains(root) {
+                    continue;
+                }
+                if paths.get(&dest.0).is_some_and(|p| p.0 == *root) {
+                    continue;
+                }
+                if copies.insert(*root, (bi, ii, *dest)).is_some() {
+                    duplicate.insert(*root);
+                }
+                copy_sizes.insert(*root, *size as i64);
+            }
+        }
+    }
+    for root in duplicate {
+        copies.remove(&root);
+    }
+
+    // A destination value with position-dependent definitions has no single
+    // address that can dominate every redirected construction.  In
+    // particular, a redefine between the first root GEP and first store is
+    // outside the destination-liveness window but changes the eventual copy
+    // destination.  Reject the candidate rather than guessing which
+    // definition each rewritten use would observe.
+    let multi_def = super::gvn::find_multi_def_values(func);
+    copies.retain(|_, (_, _, dest)| !multi_def.contains(&dest.0));
+
+    // A candidate must have at least one write that this analysis can
+    // attribute to its root. Loop pointer promotion can replace a precise GEP
+    // with a marching phi that `pointer_paths` intentionally cannot prove;
+    // treating the then apparently write-free temporary as dead deletes the
+    // memcpy while leaving the real stores in the old object (GCC torture
+    // 20001026-1). Unknown writes therefore fail closed instead of proving an
+    // empty construction.
+    copies.retain(|root, _| {
+        func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|instruction| match instruction {
+                    Instruction::Store { ptr, .. } => {
+                        paths.get(&ptr.0).is_some_and(|path| path.0 == *root)
+                    }
+                    Instruction::Memcpy { dest, .. } => {
+                        paths.get(&dest.0).is_some_and(|path| path.0 == *root)
+                    }
+                    _ => false,
+                })
+        })
+    });
+
+    // Byte offset of a tracked pointer when its whole GEP path is constant.
+    let const_offset = |value: u32| -> Option<i64> {
+        let (_, path) = paths.get(&value)?;
+        let mut total = 0i64;
+        for (op, _) in path {
+            match op {
+                Operand::Const(c) => total = total.checked_add(c.to_i64()?)?,
+                _ => return None,
+            }
+        }
+        Some(total)
+    };
+
+    // The rewrite below redirects uses of `root` (at indices BEFORE the
+    // memcpy) onto `dest`. That is only sound if `dest` is already DEFINED
+    // at every redirected point. `dest` is frequently the sret pointer
+    // loaded immediately before the memcpy — rewriting an earlier Store to
+    // use it produced a use-before-def (uninitialized %r11 store, SIGSEGV
+    // in struct_by_value). Fail closed: `dest` must be defined in the same
+    // block strictly before the FIRST use of `root`, or be an entry-block
+    // definition when the copy lives in a later block.
+    let mut def_site: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(d) = inst.dest() {
+                def_site.entry(d.0).or_insert((bi, ii));
+            }
+        }
+    }
+    let mut first_root_use: FxHashMap<u32, usize> = FxHashMap::default();
+    for (root, (copy_b, _, _)) in &copies {
+        for (ii, inst) in func.blocks[*copy_b].instructions.iter().enumerate() {
+            let mut hit = false;
+            inst.for_each_used_value(|v| {
+                if v == *root {
+                    hit = true;
+                }
+            });
+            if hit {
+                first_root_use.insert(*root, ii);
+                break;
+            }
+        }
+    }
+    // HOIST: the copy destination is very often a pure-address GEP emitted
+    // immediately before the memcpy (`g->particles[i]` in
+    // `build(tmp); memcpy(&g->particles[i], tmp)`), i.e. AFTER the first
+    // store into the temporary. That alone made the ordering check below
+    // reject 3 of 4 struct-return copies per make_group (struct_copy 3.1×).
+    // A GetElementPtr with a constant offset has no side effects and reads
+    // only its base, so moving it earlier in the same block is sound
+    // whenever the base is already defined there. Hoist it to just before
+    // the first root use and let the ordering check pass. One hoist per
+    // run() call keeps every recorded index valid (the driver runs this
+    // pass to a fixed point, so all candidates get their turn).
+    {
+        let mut hoist: Option<(usize, usize, usize)> = None; // (block, gep_idx, insert_at)
+        for (root, (copy_b, _copy_i, dest)) in &copies {
+            let Some(&(db, di)) = def_site.get(&dest.0) else {
+                continue;
+            };
+            if db != *copy_b {
+                continue;
+            }
+            let first_use = first_root_use.get(root).copied().unwrap_or(usize::MAX);
+            if di < first_use {
+                continue;
+            } // already ordered
+            let inst = &func.blocks[db].instructions[di];
+            let Instruction::GetElementPtr {
+                base,
+                offset: Operand::Const(_),
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            // Base must be defined before the insertion point: an earlier
+            // instruction of this block, an entry-block value when this is
+            // a later block, or a function parameter (no def site).
+            let base_ok = match def_site.get(&base.0) {
+                Some(&(bb, bi)) => (bb == db && bi < first_use) || (bb == 0 && db != 0),
+                None => true,
+            };
+            if !base_ok {
+                continue;
+            }
+            hoist = Some((db, di, first_use));
+            break;
+        }
+        if let Some((bi, gep_idx, insert_at)) = hoist {
+            if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+                eprintln!(
+                    "[STOREFWD-HOIST] {} b{} gep@{} -> {}",
+                    func.name, bi, gep_idx, insert_at
+                );
+            }
+            let block = &mut func.blocks[bi];
+            // Source spans are optional metadata and must be parallel to the
+            // instruction list before they can be reordered.  Kernel builds
+            // can reach this hoist with a partially populated span vector;
+            // moving the IR is still valid, but indexing that vector would
+            // turn a recoverable metadata mismatch into a compiler ICE.
+            let spans_parallel = block.source_spans.len() == block.instructions.len();
+            let inst = block.instructions.remove(gep_idx);
+            block.instructions.insert(insert_at, inst);
+            if spans_parallel {
+                let span = block.source_spans.remove(gep_idx);
+                block.source_spans.insert(insert_at, span);
+            }
+            // Indices recorded in `copies`/`def_site` for this block are
+            // now stale; count the hoist as a change and let the caller's
+            // fixed-point loop re-run the analysis on fresh indices.
+            return 1;
+        }
+    }
+
+    copies.retain(|root, (copy_b, _, dest)| {
+        match def_site.get(&dest.0) {
+            Some((db, di)) => {
+                if db == copy_b {
+                    // Defined in the copy's block: must precede every
+                    // redirected use, i.e. the first use of root.
+                    *di < first_root_use.get(root).copied().unwrap_or(usize::MAX)
+                } else {
+                    // Only the entry block is guaranteed to dominate.
+                    *db == 0 && *copy_b != 0
+                }
+            }
+            // No def site: function parameter — defined on entry.
+            None => true,
+        }
+    });
+
+    let mut invalid = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let mut used = Vec::with_capacity(16);
+            inst.for_each_used_value(|v| used.push(v));
+            for value in used {
+                let Some((root, _)) = paths.get(&value) else {
+                    continue;
+                };
+                let Some((copy_b, copy_i, dest)) = copies.get(root) else {
+                    continue;
+                };
+                let copy_size = copy_sizes.get(root).copied().unwrap_or(0);
+                // Every redirected memory access must land STRICTLY inside the
+                // copied byte range [0, copy_size). A bitfield read-modify-write
+                // can legally overhang the source aggregate into its own
+                // padding — but after forwarding, the same overhang lands in
+                // the DESTINATION object and corrupts whatever neighbors it
+                // there (structs_bitfields: 12-byte memcpy, 8..16 store).
+                let within_copy = |v: u32, ty: crate::common::types::IrType| -> bool {
+                    const_offset(v).is_some_and(|off| {
+                        off >= 0
+                            && off
+                                .checked_add(type_size(ty))
+                                .is_some_and(|end| end <= copy_size)
+                    })
+                };
+                let allowed = match inst {
+                    Instruction::GetElementPtr { base, .. } => base.0 == value,
+                    Instruction::Store { ptr, val, ty, .. } => {
+                        // Even `store root, root` escapes the address through
+                        // the eventual copy. Redirecting only the write would
+                        // leave a self-pointer naming the unconstructed alloca.
+                        ptr.0 == value
+                            && !matches!(val, Operand::Value(v) if paths.get(&v.0).is_some_and(|p| p.0 == *root))
+                            && within_copy(value, *ty)
+                    }
+                    Instruction::Copy {
+                        src: Operand::Value(v),
+                        ..
+                    } => v.0 == value,
+                    Instruction::Phi { incoming, .. } => incoming
+                        .iter()
+                        .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == value)),
+                    Instruction::Memcpy { dest, src, .. } => {
+                        (src.0 == value && bi == *copy_b && ii == *copy_i)
+                            || (dest.0 == value && bi == *copy_b && ii < *copy_i)
+                    }
+                    _ => false,
+                };
+                let path_merge = matches!(inst, Instruction::Copy { .. } | Instruction::Phi { .. });
+                // The rewrite below only edits the memcpy block.  A path
+                // merge anywhere else would keep using the old root after
+                // the copy was deleted, even with an entry-defined final
+                // destination.  Phi inputs in this block additionally execute
+                // on predecessor edges, so their destination must be defined
+                // on entry rather than merely earlier in the block.
+                let destination_entry_available = def_site
+                    .get(&dest.0)
+                    .is_none_or(|(definition_block, _)| *definition_block == 0);
+                let needs_entry_destination = matches!(inst, Instruction::Phi { .. });
+                let ordered = path_merge || ii <= *copy_i;
+                let located = bi == *copy_b;
+                if (needs_entry_destination && !destination_entry_available)
+                    || !allowed
+                    || !located
+                    || !ordered
+                {
+                    invalid.insert(*root);
+                }
+            }
+        }
+    }
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for r in &invalid {
+            eprintln!("[STOREFWD-REJ] {} root=v{} invalid-use", func.name, r);
+        }
+    }
+    for root in invalid {
+        copies.remove(&root);
+    }
+    if copies.is_empty() {
+        return 0;
+    }
+
+    // DEST-LIVENESS WINDOW: forwarding moves every write of `root` up to the
+    // memcpy so that it lands in `dest` EARLY. That is only sound if dest's
+    // OLD contents are provably dead throughout [first redirected use, copy):
+    // any read of dest's memory in that window would now observe the new
+    // value; any write would be clobbered by the redirected stores. The
+    // previous validation only inspected uses of ROOT — never of DEST.
+    // zlib-ng fold_1: `x_tmp3=*c3; *c3=*c0; *c1=*c2; ...; *c2=x_tmp3` — the
+    // snapshot write was redirected into c2 while `*c1=*c2` still read c2's
+    // old value (CRC mismatch on every odd-length fold_copy+fold sequence).
+    reject_conflicting_constructions(func, &paths, &mut copies, symbol_facts);
+    if copies.is_empty() {
+        return 0;
+    }
+
+    // CHAINED CANDIDATES: every check above inspects the IR as it was before
+    // this round, but all surviving candidates are rewritten together. In a
+    // chain `store tmp1; memcpy tmp2 <- tmp1; memcpy obj <- tmp2` both
+    // `tmp1 -> tmp2` and `tmp2 -> obj` pass in isolation. Applying them
+    // together redirects tmp1's stores into tmp2 and deletes BOTH copies, so
+    // the value is stranded in tmp2 (now dead) and `obj` is read
+    // uninitialized (an inlined `static T make()` returning an i386 ext-vector
+    // carrier: `T b = make(2)` left `b` unwritten at -O2). Defer any candidate
+    // whose root is the destination object of another candidate; the
+    // driver's fixed point collapses the chain one link per round.
+    {
+        let dest_roots: FxHashSet<u32> = copies
+            .values()
+            .map(|&(_, _, dest)| paths.get(&dest.0).map_or(dest.0, |p| p.0))
+            .collect();
+        copies.retain(|root, _| !dest_roots.contains(root));
+    }
+    if copies.is_empty() {
+        return 0;
+    }
+
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for (&root, &(bi, copy_i, dest)) in &copies {
+            eprintln!(
+                "[STOREFWD] {} root=v{} dest=v{} at b{}:{}",
+                func.name, root, dest.0, bi, copy_i
+            );
+        }
+    }
+    let mut changes = 0;
+    for (&root, &(bi, copy_i, dest)) in &copies {
+        for (ii, inst) in func.blocks[bi].instructions.iter_mut().enumerate() {
+            match inst {
+                Instruction::GetElementPtr { base, .. } if ii < copy_i && base.0 == root => {
+                    *base = dest;
+                    changes += 1;
+                }
+                Instruction::Store { ptr, .. } if ii < copy_i && ptr.0 == root => {
+                    *ptr = dest;
+                    changes += 1;
+                }
+                Instruction::Copy {
+                    src: Operand::Value(v),
+                    ..
+                } if v.0 == root => {
+                    *v = dest;
+                    changes += 1;
+                }
+                Instruction::Phi { incoming, .. } => {
+                    for (op, _) in incoming {
+                        if matches!(op, Operand::Value(v) if v.0 == root) {
+                            *op = Operand::Value(dest);
+                            changes += 1;
+                        }
+                    }
+                }
+                Instruction::Memcpy {
+                    dest: copy_dest, ..
+                } if ii < copy_i && copy_dest.0 == root => {
+                    *copy_dest = dest;
+                    changes += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut removals: Vec<(usize, usize)> = copies.values().map(|(b, i, _)| (*b, *i)).collect();
+    removals.sort_unstable_by(|a, b| b.cmp(a));
+    for (bi, ii) in removals {
+        let block = &mut func.blocks[bi];
+        let spans_parallel = block.source_spans.len() == block.instructions.len();
+        block.instructions.remove(ii);
+        if spans_parallel {
+            block.source_spans.remove(ii);
+        }
+        changes += 1;
+    }
+    changes
+}
+
+pub(crate) fn run(func: &mut IrFunction) -> usize {
+    run_impl(func, None)
+}
+
+pub(crate) fn run_with_symbol_facts(
+    func: &mut IrFunction,
+    symbol_facts: &super::module_symbol_facts::ModuleSymbolFacts,
+) -> usize {
+    run_impl(func, Some(symbol_facts))
+}
+
+fn run_impl(
+    func: &mut IrFunction,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> usize {
+    // Sub-pass gates for miscompile bisection (this pass family has produced
+    // eight distinct unsoundness bugs; being able to isolate the store-only
+    // forwarding, the main forwarding, and the dead-store elimination
+    // independently cuts a bisection from hours to minutes).
+    let reverse_changes = if std::env::var("CCC_NO_AGG_STORE_FWD").is_ok() {
+        0
+    } else {
+        forward_store_only_temporaries(func, symbol_facts)
+    };
+    if std::env::var("CCC_NO_AGG_MAIN").is_ok() {
+        return reverse_changes
+            + if std::env::var("CCC_NO_AGG_DEAD_STORES").is_ok() {
+                0
+            } else {
+                eliminate_dead_aggregate_field_stores(func)
+            };
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    // `CfgAnalysis::idom` uses usize::MAX as the sentinel for blocks that are
+    // unreachable from entry, so the walk must bounds-check before indexing.
+    // Unreachable code does occur in real input (the kernel's BUG()/unreachable()
+    // paths leave blocks with no predecessors), and indexing with the sentinel
+    // panicked with "index out of bounds: the len is 154 but the index is
+    // 18446744073709551615" while compiling kernel/signal.c.
+    //
+    // An unreachable block is dominated by nothing, so returning false is both
+    // safe and correct: the caller then declines the transform.
+    let dominates = |a: usize, mut b: usize| {
+        if a == b {
+            return true;
+        }
+        for _ in 0..cfg.idom.len() {
+            if b >= cfg.idom.len() {
+                return false;
+            }
+            let parent = cfg.idom[b];
+            if parent == usize::MAX {
+                return false;
+            }
+            if parent == b {
+                break;
+            }
+            if parent == a {
+                return true;
+            }
+            b = parent;
+        }
+        false
+    };
+    let paths = pointer_paths(func);
+    let alloca_roots: FxHashSet<u32> = paths
+        .iter()
+        .filter_map(|(&v, (root, path))| (v == *root && path.is_empty()).then_some(v))
+        .collect();
+
+    let mut candidates: FxHashMap<u32, CopyCandidate> = FxHashMap::default();
+    let mut duplicate = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Memcpy { dest, src, .. } = inst {
+                // An arbitrary pointer (global, parameter, or loaded pointer) may be
+                // overwritten between this copy and a later read.  Restrict forwarding
+                // to compiler-known stack objects so those writes can be checked below.
+                if alloca_roots.contains(&dest.0) {
+                    let Some((source_root, _)) = paths.get(&src.0) else {
+                        continue;
+                    };
+                    if *source_root == dest.0 {
+                        continue;
+                    }
+                    if candidates
+                        .insert(
+                            dest.0,
+                            CopyCandidate {
+                                block: bi,
+                                inst: ii,
+                                source: *src,
+                                source_root: *source_root,
+                            },
+                        )
+                        .is_some()
+                    {
+                        duplicate.insert(dest.0);
+                    }
+                }
+            }
+        }
+    }
+    for root in duplicate {
+        candidates.remove(&root);
+    }
+    if candidates.is_empty() {
+        return reverse_changes + eliminate_dead_aggregate_field_stores(func);
+    }
+
+    // Reject escaping, written, cross-block, or pre-copy uses of each temporary.
+    //
+    // MIXED-POINT PHI HOLES: a candidate dest is only forwardable when every
+    // read of its memory is attributable to a tracked path. A phi that merges
+    // the dest (or a path-derived pointer) with an UNATTRIBUTABLE incoming
+    // (a loaded pointer, a marching `sm = phi(&dest, load sm->next)`) makes
+    // every memory op through the phi result invisible to `paths`; the
+    // memcpy deletion below would then strand the dest uninitialized while
+    // the walk still reads it (kernel 6.18 static_call __static_call_update:
+    // `first = (struct static_call_mod){...}; for (sm = &first; sm; sm = sm->next)
+    // ...` — boot died at __static_call_update+0xff reading site=1 from an
+    // uninitialized stack). Such phis fail closed here, exactly like the
+    // store-side escape rule in eliminate_dead_aggregate_field_stores.
+    fn phi_pure_root(
+        incoming: &[(Operand, BlockId)],
+        paths: &FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)>,
+    ) -> Option<u32> {
+        let mut saw_value = false;
+        let mut root: Option<u32> = None;
+        for (op, _) in incoming {
+            if let Operand::Value(v) = op {
+                saw_value = true;
+                let Some(&(r, _)) = paths.get(&v.0) else {
+                    return None;
+                };
+                match root {
+                    Some(prev) if prev != r => return None,
+                    _ => root = Some(r),
+                }
+            }
+        }
+        if saw_value { root } else { None }
+    }
+    let mut invalid = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let mut used = Vec::with_capacity(16);
+            inst.for_each_used_value(|v| used.push(v));
+            for value in used {
+                let Some((root, _)) = paths.get(&value) else {
+                    continue;
+                };
+                let Some(candidate) = candidates.get(root) else {
+                    continue;
+                };
+                let allowed_shape = match inst {
+                    Instruction::GetElementPtr { base, .. } => base.0 == value,
+                    Instruction::Load { ptr, .. } => ptr.0 == value,
+                    Instruction::Memcpy { dest, src, .. } => dest.0 == *root || src.0 == value,
+                    Instruction::Copy {
+                        src: Operand::Value(v),
+                        ..
+                    } => v.0 == value,
+                    Instruction::Phi { incoming, .. } => {
+                        // Only a PURE same-root phi keeps the derivation
+                        // attributable. A phi mixing this root with a loaded
+                        // or foreign pointer turns every later memory access
+                        // through it into an unattributable read of the
+                        // candidate dest: reject.
+                        phi_pure_root(incoming, &paths) == Some(*root)
+                    }
+                    _ => false,
+                };
+                let is_defining_copy = matches!(inst, Instruction::Memcpy { dest, .. } if dest.0 == *root)
+                    && bi == candidate.block
+                    && ii == candidate.inst;
+                // A second write to the candidate destroys the snapshot that
+                // its defining copy established.  This is easy to miss when
+                // the later memcpy has an UNTRACKED source (a global or an
+                // arbitrary pointer): candidate collection skips that copy,
+                // so the duplicate-source-copy guard never sees it.  The old
+                // destination-use allowlist then treated the overwrite as an
+                // ordinary post-copy use and forwarded even older snapshots
+                // to the original source (gcc.c-torture pr126405).
+                //
+                // Store and Memcpy are the two attributable memory writes.
+                // Every other writing shape already fails `allowed_shape`
+                // below.  Keep only the one defining write, irrespective of
+                // whether the other write occurs before or after it: a
+                // single full snapshot candidate must remain the sole write
+                // whose value all forwarded reads can observe.
+                let writes_candidate_dest = match inst {
+                    Instruction::Store { ptr, .. } => paths
+                        .get(&ptr.0)
+                        .is_some_and(|(written_root, _)| written_root == root),
+                    Instruction::Memcpy { dest, .. } => paths
+                        .get(&dest.0)
+                        .is_some_and(|(written_root, _)| written_root == root),
+                    _ => false,
+                };
+                if writes_candidate_dest && !is_defining_copy {
+                    invalid.insert(*root);
+                    continue;
+                }
+                let is_path_definition = matches!(inst, Instruction::GetElementPtr { base, .. } if base.0 == value)
+                    || matches!(inst, Instruction::Copy { src: Operand::Value(v), .. } if v.0 == value)
+                    || matches!(inst, Instruction::Phi { incoming, .. } if phi_pure_root(incoming, &paths) == Some(*root));
+                let ordered_read = if bi == candidate.block {
+                    ii > candidate.inst
+                } else {
+                    dominates(candidate.block, bi)
+                };
+                // Keep the snapshot lifetime local to one block.  This makes the
+                // source-mutation proof below exact even when the block is in a loop:
+                // a write in the next iteration cannot precede a read in this one.
+                let cross_block_read =
+                    !is_defining_copy && !is_path_definition && bi != candidate.block;
+                if !allowed_shape
+                    || cross_block_read
+                    || (!is_defining_copy && !is_path_definition && !ordered_read)
+                {
+                    invalid.insert(*root);
+                }
+            }
+        }
+    }
+    for root in invalid {
+        candidates.remove(&root);
+    }
+    if candidates.is_empty() {
+        return reverse_changes + eliminate_dead_aggregate_field_stores(func);
+    }
+
+    // The source must also remain unchanged after the copy.  Otherwise replacing
+    // a temporary read with a source read changes snapshot semantics (TinyCC's
+    // `tmp = *vtop; *vtop = ...; use(tmp)` exposed this).
+    //
+    // Writes come in two shapes:
+    //  * attributable — Store/Memcpy through a tracked pointer path; and
+    //  * opaque — calls, inline asm, atomics, impure intrinsics.  libc
+    //    `memset`/`memcpy` lower to plain `Call`s, so they land here.
+    //
+    // An opaque write can touch the source whenever the source's address has
+    // escaped (passed to a call, stored as data, or used outside the tracked
+    // load/store/GEP shapes).  SQLite memjrnlCreateFile miscompiled exactly
+    // so: `copy = *p; memset(p, 0, sizeof *p); use copy.pVfs` — the memset
+    // Call was invisible to the old Store/Memcpy-only scan, the copy was
+    // elided, and the forwarded reads observed the zeroed struct (speedtest1
+    // --testset json SIGSEGV via a NULL xOpen function pointer).
+    let mut escaped_roots: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let mut used = Vec::with_capacity(16);
+            inst.for_each_used_value(|v| used.push(v));
+            for value in used {
+                let Some((root, _)) = paths.get(&value) else {
+                    continue;
+                };
+                let non_escaping_shape = match inst {
+                    Instruction::GetElementPtr { base, .. } => base.0 == value,
+                    Instruction::Load { ptr, .. } => ptr.0 == value,
+                    Instruction::Store { ptr, val, .. } => {
+                        // Address position is fine; storing the POINTER as a
+                        // value escapes it.
+                        ptr.0 == value && !matches!(val, Operand::Value(v) if v.0 == value)
+                    }
+                    Instruction::Memcpy { dest, src, .. } => dest.0 == value || src.0 == value,
+                    Instruction::Copy {
+                        src: Operand::Value(v),
+                        ..
+                    } => v.0 == value,
+                    Instruction::Phi { incoming, .. } => incoming
+                        .iter()
+                        .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == value)),
+                    _ => false,
+                };
+                if !non_escaping_shape {
+                    escaped_roots.insert(*root);
+                }
+            }
+        }
+    }
+    let mut invalid = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let untracked_write = match inst {
+                Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => {
+                    !paths.contains_key(&ptr.0)
+                }
+                _ => false,
+            };
+            if is_opaque_memory_write(inst) || untracked_write {
+                for (&dest_root, candidate) in &candidates {
+                    let after_copy = bi == candidate.block && ii > candidate.inst;
+                    // A non-escaping alloca cannot be written by an opaque
+                    // instruction; anything else must be assumed clobbered.
+                    let source_provably_private = alloca_roots.contains(&candidate.source_root)
+                        && !escaped_roots.contains(&candidate.source_root);
+                    if after_copy && !source_provably_private {
+                        invalid.insert(dest_root);
+                    }
+                }
+                continue;
+            }
+            let written_root = match inst {
+                Instruction::Store { ptr, .. } => paths.get(&ptr.0).map(|p| p.0),
+                Instruction::Memcpy { dest, .. } => paths.get(&dest.0).map(|p| p.0),
+                _ => None,
+            };
+            let Some(written_root) = written_root else {
+                continue;
+            };
+            for (&dest_root, candidate) in &candidates {
+                let after_copy = bi == candidate.block && ii > candidate.inst;
+                if after_copy && written_root == candidate.source_root {
+                    invalid.insert(dest_root);
+                }
+            }
+        }
+    }
+    for root in invalid {
+        candidates.remove(&root);
+    }
+    if candidates.is_empty() {
+        return reverse_changes + eliminate_dead_aggregate_field_stores(func);
+    }
+
+    /// Where a read through `ptr` must go once every candidate copy is
+    /// deleted: the first pointer that is NOT inside a forwarded temporary,
+    /// plus the GEP path (outermost first) to re-apply on top of it.
+    ///
+    /// A candidate's source may itself be a path INTO another candidate
+    /// (`tmp2 = memcpy(tmp1 + 16)` after `tmp1 = memcpy(obj)`), so following
+    /// only exact-root chains left `tmp2`'s reads pointing at `tmp1 + 16`
+    /// while `tmp1`'s defining copy was removed: the second 16-byte XMM
+    /// image of every i686 ext_vector_type argument wider than 16 bytes was
+    /// read from uninitialized stack at -O2 (ABI-EXTVEC-I386-O2-1). Each
+    /// hop prepends that hop's path, so the result is `obj + 16` here.
+    fn resolve_read(
+        ptr: Value,
+        paths: &FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)>,
+        candidates: &FxHashMap<u32, CopyCandidate>,
+    ) -> (Value, Vec<(Operand, crate::common::types::IrType)>) {
+        let mut base = ptr;
+        let mut suffix: Vec<(Operand, crate::common::types::IrType)> = Vec::new();
+        let mut seen = FxHashSet::default();
+        while seen.insert(base.0) {
+            let Some((root, path)) = paths.get(&base.0) else {
+                break;
+            };
+            let Some(candidate) = candidates.get(root) else {
+                break;
+            };
+            let mut next = path.clone();
+            next.extend(suffix);
+            suffix = next;
+            base = candidate.source;
+        }
+        (base, suffix)
+    }
+
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for (root, c) in &candidates {
+            eprintln!(
+                "[AGGFWD] {} root=v{} src=v{} src_root=v{} at b{}:{}",
+                func.name, root, c.source.0, c.source_root, c.block, c.inst
+            );
+        }
+    }
+    let mut changes = 0;
+    for bi in 0..func.blocks.len() {
+        let old = std::mem::take(&mut func.blocks[bi].instructions);
+        let old_spans = std::mem::take(&mut func.blocks[bi].source_spans);
+        // Same 1:1 length requirement as above (mismatch => drop spans, never index OOB).
+        let has_spans = old_spans.len() == old.len();
+        let mut out = Vec::with_capacity(old.len());
+        let mut spans = Vec::with_capacity(16);
+        for (ii, mut inst) in old.into_iter().enumerate() {
+            if let Instruction::Memcpy { dest, .. } = &inst {
+                if candidates
+                    .get(&dest.0)
+                    .is_some_and(|c| c.block == bi && c.inst == ii)
+                {
+                    changes += 1;
+                    continue;
+                }
+            }
+            // Every read of a forwarded temporary — a Load through a tracked
+            // pointer path, or a Memcpy whose SOURCE is the temporary or a
+            // path into it — is redirected to the same path off the original
+            // object. The validation above admitted exactly these shapes
+            // (`src.0 == value` for any path-derived value), so the rewrite
+            // must cover them all; a Memcpy reading `tmp + 16` used to be
+            // left pointing at the deleted copy.
+            let read_ptr = match &mut inst {
+                Instruction::Memcpy { src, .. } => Some(src),
+                Instruction::Load { ptr, .. } => Some(ptr),
+                _ => None,
+            };
+            if let Some(ptr) = read_ptr {
+                let forwarded = paths
+                    .get(&ptr.0)
+                    .is_some_and(|(root, _)| candidates.contains_key(root));
+                if forwarded {
+                    let (mut base, path) = resolve_read(*ptr, &paths, &candidates);
+                    for (offset, ty) in path {
+                        let dest = Value(func.next_value_id);
+                        func.next_value_id += 1;
+                        out.push(Instruction::GetElementPtr {
+                            dest,
+                            base,
+                            offset,
+                            ty,
+                        });
+                        if has_spans {
+                            spans.push(old_spans[ii]);
+                        }
+                        base = dest;
+                    }
+                    *ptr = base;
+                    changes += 1;
+                }
+            }
+            out.push(inst);
+            if has_spans {
+                spans.push(old_spans[ii]);
+            }
+        }
+        func.blocks[bi].instructions = out;
+        if has_spans {
+            func.blocks[bi].source_spans = spans;
+        }
+    }
+    changes + reverse_changes + eliminate_dead_aggregate_field_stores(func)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+
+    #[test]
+    fn preserves_snapshot_when_untracked_source_overwrites_temporary() {
+        // pr126405: `old = tmp` must observe tmp's initial value even though
+        // a later copy from a global overwrites tmp.  The global source has
+        // no pointer_paths entry, so candidate collection cannot use its
+        // duplicate-copy guard to discover this second definition.
+        let mut func = IrFunction::new("snapshot_overwrite".into(), IrType::I64, vec![], false);
+        func.next_value_id = 5;
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 16,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(0), // original source
+                alloca(1), // overwritten temporary
+                alloca(2), // older snapshot
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 16,
+                },
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(1),
+                    size: 16,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(3),
+                    name: "global".into(),
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(3),
+                    size: 16,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(4),
+                    ptr: Value(2),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(run(&mut func), 0);
+        let copies: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                Instruction::Memcpy { dest, src, .. } => Some((*dest, *src)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            copies,
+            vec![
+                (Value(1), Value(0)),
+                (Value(2), Value(1)),
+                (Value(1), Value(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn store_forwarding_rejects_same_global_under_a_second_value_id() {
+        // pr126405: after forwarding the temporary's store into global g,
+        // this load would observe the NEW value.  Before the transform it
+        // reads g's old value, and the final memcpy happens only afterwards.
+        // A distinct GlobalAddr SSA id is not a distinct object.
+        let mut func = IrFunction::new("global_alias_window".into(), IrType::I32, vec![], false);
+        func.next_value_id = 4;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".into(),
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "g".into(),
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(0),
+                    src: Value(1),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+        assert!(func.blocks[0].instructions.iter().any(|instruction| {
+            matches!(instruction, Instruction::Store { ptr, .. } if *ptr == Value(1))
+        }));
+        assert!(func.blocks[0].instructions.iter().any(|instruction| {
+            matches!(instruction, Instruction::Memcpy { dest, src, .. }
+                if *dest == Value(0) && *src == Value(1))
+        }));
+    }
+
+    #[test]
+    fn pointer_paths_reject_equal_depth_but_different_offsets_and_redefined_allocas() {
+        let mut func = IrFunction::new("different_offsets".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(1),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I32,
+                },
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::Ptr,
+                    incoming: vec![
+                        (Operand::Value(Value(1)), BlockId(1)),
+                        (Operand::Value(Value(2)), BlockId(2)),
+                    ],
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+        assert!(!pointer_paths(&func).contains_key(&3));
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Value(Value(9)),
+        });
+        assert!(pointer_paths(&func).is_empty());
+    }
+
+    #[test]
+    fn self_pointer_construction_is_not_a_store_only_temporary() {
+        let mut func = IrFunction::new("self_pointer".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "out".into(),
+                },
+                alloca(0, 16),
+                Instruction::Store {
+                    volatile: false,
+                    ptr: Value(0),
+                    val: Operand::Value(Value(0)),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 16,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_rejects_destination_redefined_before_first_store() {
+        // The first destination definition dominates the first root use, but
+        // the second one determines the eventual memcpy destination.  A GEP
+        // rewritten before that second definition would still name A while
+        // the deleted copy names B.  The destination-liveness window starts
+        // at the first store and therefore cannot see this earlier redefine.
+        let mut func = IrFunction::new("redefined_destination".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "a".into(),
+                },
+                alloca(0, 4),
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "b".into(),
+                },
+                Instruction::Store {
+                    volatile: false,
+                    ptr: Value(2),
+                    val: Operand::Const(IrConst::I32(42)),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_rejects_cross_block_copy_before_local_destination_definition() {
+        // entry -> pointer copy -> construction/copy is a valid original CFG.
+        // Replacing the pointer copy's root with a destination defined only in
+        // the final block would create a use-before-def on that earlier edge.
+        let mut func =
+            IrFunction::new("cross_block_destination".into(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![alloca(0, 4)],
+                terminator: Terminator::Branch(BlockId(2)),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                source_spans: vec![],
+                instructions: vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(0)),
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(1),
+                        name: "out".into(),
+                    },
+                    Instruction::Store {
+                        volatile: false,
+                        ptr: Value(2),
+                        val: Operand::Const(IrConst::I32(42)),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::Memcpy {
+                        dest: Value(1),
+                        src: Value(0),
+                        size: 4,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            },
+        ];
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_rejects_cross_block_pointer_copy_with_entry_destination() {
+        // Entry-defined destinations pass the dominance guard, but the
+        // rewrite below only edits the memcpy block.  Accepting this earlier
+        // pointer copy would therefore delete the final memcpy while the
+        // store still writes through a pointer to the unconstructed alloca.
+        let mut func = IrFunction::new(
+            "cross_block_pointer_copy".into(),
+            IrType::I32,
+            vec![],
+            false,
+        );
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(1),
+                        name: "out".into(),
+                    },
+                    alloca(0, 4),
+                ],
+                terminator: Terminator::Branch(BlockId(2)),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                source_spans: vec![],
+                instructions: vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(0)),
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::Store {
+                        volatile: false,
+                        ptr: Value(2),
+                        val: Operand::Const(IrConst::I32(42)),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::Memcpy {
+                        dest: Value(1),
+                        src: Value(0),
+                        size: 4,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            },
+        ];
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_checks_unknown_reads_and_implicit_calls() {
+        use crate::ir::instruction::CallInfo;
+        for opaque_call in [false, true] {
+            let mut func = IrFunction::new(
+                "unknown_destination_observer".into(),
+                IrType::I32,
+                vec![],
+                false,
+            );
+            let observer = if opaque_call {
+                Instruction::Call {
+                    func: "observe_global".into(),
+                    info: CallInfo::default(),
+                }
+            } else {
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(9),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                }
+            };
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(0),
+                        name: "g".into(),
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(8),
+                        name: "gp".into(),
+                    },
+                    Instruction::Load {
+                        volatile: false,
+                        dest: Value(9),
+                        ptr: Value(8),
+                        ty: IrType::Ptr,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::Alloca {
+                        dest: Value(1),
+                        ty: IrType::Ptr,
+                        size: 4,
+                        align: 4,
+                        volatile: false,
+                        semantic_volatile: false,
+                    },
+                    Instruction::Store {
+                        volatile: false,
+                        val: Operand::Const(IrConst::I32(7)),
+                        ptr: Value(1),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    },
+                    observer,
+                    Instruction::Memcpy {
+                        dest: Value(0),
+                        src: Value(1),
+                        size: 4,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            });
+            let mut before_write = func.clone();
+            let observer = before_write.blocks[0].instructions.remove(5);
+            before_write.blocks[0].instructions.insert(4, observer);
+            assert_eq!(forward_store_only_temporaries(&mut before_write, None), 2);
+            assert_eq!(
+                forward_store_only_temporaries(&mut func, None),
+                0,
+                "call={opaque_call}"
+            );
+            if !opaque_call {
+                // Preserve useful forwarding when object identity really is
+                // known; a mixed global/unknown select must NOT reuse that proof.
+                let mut facts = super::super::module_symbol_facts::ModuleSymbolFacts::default();
+                facts.identity_witnesses.insert("g".into());
+                for mixed in [false, true] {
+                    let mut distinct = func.clone();
+                    distinct.blocks[0].instructions.insert(
+                        3,
+                        Instruction::GlobalAddr {
+                            dest: Value(2),
+                            name: "h".into(),
+                        },
+                    );
+                    let mut pointer = Value(2);
+                    if mixed {
+                        distinct.blocks[0].instructions.insert(
+                            4,
+                            Instruction::Select {
+                                dest: Value(4),
+                                cond: Operand::Const(IrConst::I32(1)),
+                                true_val: Operand::Value(Value(2)),
+                                false_val: Operand::Value(Value(9)),
+                                ty: IrType::Ptr,
+                            },
+                        );
+                        pointer = Value(4);
+                    }
+                    for inst in &mut distinct.blocks[0].instructions {
+                        if let Instruction::Load {
+                            dest: Value(3),
+                            ptr,
+                            ..
+                        } = inst
+                        {
+                            *ptr = pointer;
+                        }
+                    }
+                    assert_eq!(
+                        forward_store_only_temporaries(&mut distinct, Some(&facts)),
+                        2 * usize::from(!mixed)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_snapshot_source_may_be_written_through_an_untracked_pointer() {
+        let mut func = IrFunction::new("escaped_snapshot".into(), IrType::I32, vec![], false);
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::I32,
+            size: 4,
+            align: 4,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let load = |dest, ptr, ty| Instruction::Load {
+            volatile: false,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+        };
+        let store = |ptr, val, ty| Instruction::Store {
+            volatile: false,
+            ptr: Value(ptr),
+            val,
+            ty,
+            seg_override: AddressSpace::Default,
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                alloca(0),
+                alloca(1),
+                Instruction::GlobalAddr {
+                    dest: Value(4),
+                    name: "escaped".into(),
+                },
+                store(0, Operand::Const(IrConst::I32(42)), IrType::I32),
+                store(4, Operand::Value(Value(0)), IrType::Ptr),
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 4,
+                },
+                load(6, 0, IrType::I32),
+                load(9, 4, IrType::Ptr),
+                store(9, Operand::Const(IrConst::I32(7)), IrType::I32),
+                load(3, 1, IrType::I32),
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+        });
+        assert_eq!(run(&mut func), 0);
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Memcpy { .. }))
+        );
+    }
+
+    #[test]
+    fn preserves_copy_when_source_write_uses_untracked_pointer_arithmetic() {
+        let mut func = IrFunction::new("untracked_store".into(), IrType::I32, vec![], false);
+        func.next_value_id = 4;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: crate::ir::reexports::IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 4,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Memcpy { .. }))
+        );
+    }
+
+    #[test]
+    fn hoist_with_partial_source_spans_does_not_panic() {
+        // Some lowering paths attach only a subset of source spans.  The
+        // aggregate-copy hoist must still be able to move the pure address
+        // computation without indexing that non-parallel metadata vector.
+        let mut func = IrFunction::new("partial_spans".into(), IrType::I32, vec![], false);
+        func.next_value_id = 3;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(0),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            // Deliberately not one-to-one with instructions: this is the
+            // shape observed in the kernel's execmem_init_missing function.
+            source_spans: vec![crate::common::source::Span::dummy()],
+        });
+
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 1);
+        assert_eq!(func.blocks[0].instructions.len(), 5);
+        assert_eq!(func.blocks[0].source_spans.len(), 1);
+        assert!(matches!(
+            func.blocks[0].instructions[2],
+            Instruction::GetElementPtr { dest: Value(2), .. }
+        ));
+    }
+
+    /// `store tmp1; memcpy tmp2 <- tmp1; memcpy obj <- tmp2; load obj`:
+    /// the two store-only forwards must not be applied in the same round.
+    /// Whether applying both strands the value depends on candidate map
+    /// iteration order, so both value numberings of the temporaries run.
+    fn chained_store_only_copies_result(tmp1: u32, tmp2: u32) -> Option<i32> {
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 16,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let mut func = IrFunction::new("chain".into(), IrType::I32, vec![], false);
+        func.next_value_id = 4;
+        // Allocas live in the entry block and the chain in a successor, as
+        // after inlining (the dest-window scan then starts at the store).
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![alloca(0), alloca(1), alloca(2)],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(tmp1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(tmp2),
+                    src: Value(tmp1),
+                    size: 16,
+                },
+                Instruction::Memcpy {
+                    dest: Value(0),
+                    src: Value(tmp2),
+                    size: 16,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+
+        for _ in 0..8 {
+            if run(&mut func) == 0 {
+                break;
+            }
+        }
+        // Evaluate the straight-line result: each alloca holds one word.
+        let mut mem: FxHashMap<u32, i32> = FxHashMap::default();
+        let mut returned = None;
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I32(c)),
+                    ptr,
+                    ..
+                } => {
+                    mem.insert(ptr.0, *c);
+                }
+                Instruction::Memcpy { dest, src, .. } => match mem.get(&src.0).copied() {
+                    Some(v) => {
+                        mem.insert(dest.0, v);
+                    }
+                    None => {
+                        mem.remove(&dest.0);
+                    }
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr,
+                    ..
+                } => returned = mem.get(&ptr.0).copied(),
+                _ => {}
+            }
+        }
+        returned
+    }
+
+    #[test]
+    fn chained_store_only_copies_keep_final_object_initialized() {
+        assert_eq!(chained_store_only_copies_result(1, 2), Some(42));
+        assert_eq!(chained_store_only_copies_result(2, 1), Some(42));
+    }
+
+    #[test]
+    fn preserves_snapshot_when_copy_source_is_overwritten() {
+        let mut func = IrFunction::new("snapshot".into(), IrType::I32, vec![], false);
+        func.next_value_id = 3;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(1)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 4,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(2)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(2),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(run(&mut func), 0);
+        assert!(func.blocks[0].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(0),
+                ..
+            }
+        )));
+    }
+
+    fn alloca(dest: u32, size: usize) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    /// Every read of memory rooted at an alloca in `func`, as
+    /// `(root, byte offset)` after folding constant GEP chains, for Loads
+    /// and for Memcpy sources. Panics on a read through an undefined value.
+    fn resolved_reads(func: &IrFunction) -> Vec<(u32, i64)> {
+        let mut defs: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
+        let mut reads = Vec::new();
+        for inst in &func.blocks[0].instructions {
+            match inst {
+                Instruction::Alloca { dest, .. } => {
+                    defs.insert(dest.0, (dest.0, 0));
+                }
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } => {
+                    let (root, off) = defs[&base.0];
+                    defs.insert(dest.0, (root, off + c.to_i64().unwrap()));
+                }
+                Instruction::Load { ptr, .. } => reads.push(defs[&ptr.0]),
+                Instruction::Memcpy { src, .. } => reads.push(defs[&src.0]),
+                _ => {}
+            }
+        }
+        reads
+    }
+
+    /// `tmp1 = memcpy(obj); tmp2 = memcpy(tmp1 + 16); read tmp2` — the
+    /// second candidate's source is a PATH into the first. Both copies are
+    /// deleted, so every surviving read must resolve to `obj + 16 + ...`,
+    /// never to the dead `tmp1` (ABI-EXTVEC-I386-O2-1: the second XMM image
+    /// of an i686 ext_vector_type argument read uninitialized stack).
+    #[test]
+    fn forwards_reads_through_a_path_into_another_forwarded_temporary() {
+        let (obj, tmp1, tmp1_hi, tmp2, slot, out, field, loaded) = (0, 1, 2, 3, 4, 7, 5, 6);
+        let mut func = IrFunction::new("chain".into(), IrType::I32, vec![], false);
+        func.next_value_id = 9;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(obj, 32),
+                alloca(tmp1, 32),
+                alloca(tmp2, 16),
+                alloca(slot, 8),
+                // `out` is a LOADED pointer: a Memcpy into it is not a
+                // candidate, so that copy survives and only its source
+                // must be rewritten.
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(out),
+                    ptr: Value(slot),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(obj),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(tmp1),
+                    src: Value(obj),
+                    size: 32,
+                },
+                // Keep obj's storage identity observable so the reverse
+                // store-only pass cannot move its construction into tmp1.
+                // This fixture isolates MAIN read-path composition, not which
+                // valid allocation the reverse pass elects to construct in.
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(8),
+                    ptr: Value(obj),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(tmp1_hi),
+                    base: Value(tmp1),
+                    offset: Operand::Const(IrConst::I32(16)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Memcpy {
+                    dest: Value(tmp2),
+                    src: Value(tmp1_hi),
+                    size: 16,
+                },
+                // A Memcpy READING the chained temporary (the i686 XMM piece
+                // copy) and a Load through a path into it.
+                Instruction::Memcpy {
+                    dest: Value(out),
+                    src: Value(tmp2),
+                    size: 16,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(field),
+                    base: Value(tmp2),
+                    offset: Operand::Const(IrConst::I32(4)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(loaded),
+                    ptr: Value(field),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(loaded)))),
+            source_spans: vec![],
+        });
+
+        assert!(run(&mut func) > 0);
+        let insts = &func.blocks[0].instructions;
+        // Both temporaries' defining copies are gone ...
+        assert!(!insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Memcpy { dest, .. } if dest.0 == tmp1 || dest.0 == tmp2
+        )));
+        // ... the surviving copy into `out` still exists ...
+        assert!(insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Memcpy { dest, size: 16, .. } if dest.0 == out
+        )));
+        // ... and nothing reads the temporaries any more: the copy into
+        // `out` reads `obj + 16`, the field load reads `obj + 16 + 4`.
+        let reads = resolved_reads(&func);
+        assert!(
+            !reads.iter().any(|(root, _)| *root == tmp1 || *root == tmp2),
+            "a read still targets a deleted temporary: {reads:?}"
+        );
+        assert!(
+            reads.contains(&(obj, 16)),
+            "out copy must read obj+16: {reads:?}"
+        );
+        assert!(
+            reads.contains(&(obj, 20)),
+            "field load must read obj+20: {reads:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod intrinsic_write_contract {
+    use super::*;
+    use crate::ir::intrinsics::IntrinsicOp;
+
+    #[test]
+    fn pure_opcode_with_memory_result_is_a_write_barrier() {
+        for dest_ptr in [None, Some(Value(0))] {
+            let inst = Instruction::Intrinsic {
+                dest: Some(Value(1)),
+                op: IntrinsicOp::Paddw128,
+                dest_ptr,
+                args: vec![],
+            };
+            assert_eq!(is_opaque_memory_write(&inst), dest_ptr.is_some());
+        }
+        assert!(!is_opaque_memory_write(&Instruction::Intrinsic {
+            dest: Some(Value(1)),
+            op: IntrinsicOp::VecLoadI8x16,
+            dest_ptr: None,
+            args: vec![Operand::Value(Value(0))],
+        }));
+    }
+}

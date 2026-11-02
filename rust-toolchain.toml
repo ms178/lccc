@@ -1,0 +1,12 @@
+# LCCC research toolchain.
+#
+# Policy: track the LATEST STABLE Rust toolchain — never pin a specific
+# version. The compiler tree is kept warning-clean and clippy-clean against
+# the moving stable channel; any stable-only regression is fixed at the
+# source instead of freezing the toolchain. `rustup` resolves this file
+# automatically; the Arena restore / bootstrap scripts install the same
+# "stable" channel into the persisted cargo/rustup trees.
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

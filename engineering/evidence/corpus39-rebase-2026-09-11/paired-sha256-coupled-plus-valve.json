@@ -1,0 +1,25 @@
+{
+  "label": "sha256 under coupled counts + cost-ordered valve",
+  "arm_a": {
+    "binary": "/var/tmp/cv/sha_ship.bin",
+    "sha256": "503f6928c8516ee1f766bc27c35fcebe4e6aec0eed918514beada66ee810dbc0",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "arm_b": {
+    "binary": "/var/tmp/cv/sha_cv.bin",
+    "sha256": "503f6928c8516ee1f766bc27c35fcebe4e6aec0eed918514beada66ee810dbc0",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "identical_binaries": true,
+  "rounds": 31,
+  "warmup": 2,
+  "verdict": "uninformative-identical-binaries"
+}

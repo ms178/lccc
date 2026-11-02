@@ -1,0 +1,25 @@
+{
+  "label": "identity check: exact same compiler/source/flags/env",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_nq475gys/arm_a",
+    "sha256": "00cdfef7692b3df042c7482c9aa6a0de59a447a264d706607deadbec0bc49ff9",
+    "env": "CCC_VERIFY_IR=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_nq475gys/arm_b",
+    "sha256": "00cdfef7692b3df042c7482c9aa6a0de59a447a264d706607deadbec0bc49ff9",
+    "env": "CCC_VERIFY_IR=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "identical_binaries": true,
+  "rounds": 3,
+  "warmup": 1,
+  "verdict": "uninformative-identical-binaries"
+}

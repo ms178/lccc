@@ -1,0 +1,17 @@
+{
+  "compiler_sha256_after_permission_fix": "cc697a9f2d266d7ac904f8009e9821e774c1cad0e3df25bb7dc4a6e5d685f331",
+  "measured_program_sha256": "17d25aa677d0d859839f02386dab0dbdfe96220966b6d7532d80d4999dfd48df",
+  "regenerated_program_sha256": "17d25aa677d0d859839f02386dab0dbdfe96220966b6d7532d80d4999dfd48df",
+  "programs_byte_identical": true,
+  "command": [
+    "target/fastbuild/lccc",
+    "-I/home/user/.cache/oracles/gcc-16.2.0/lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+    "-O2",
+    "-march=x86-64",
+    "tests/benchmark/programs/i32_product_map.c",
+    "-o",
+    "/home/user/artifacts/sse/map-after-denial-fix.bin"
+  ],
+  "gzip_sse2_avx2_assembly_identical": true,
+  "map_sse41_avx2_assembly_identical": true
+}

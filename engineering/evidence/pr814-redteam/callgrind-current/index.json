@@ -1,0 +1,259 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "expat_xml_scan",
+    "glibc_memcmp",
+    "gzip_crc32",
+    "histogram",
+    "linux_find_bit",
+    "nbody",
+    "sqlite_varint",
+    "zlib_ng_adler32"
+  ],
+  "results": {
+    "nbody": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3454,
+          3559
+        ],
+        "d1_misses": [
+          1911,
+          1916
+        ],
+        "i1_misses": [
+          1444,
+          1436
+        ],
+        "indirect_mispredicts": [
+          234,
+          241
+        ],
+        "ir_mine": 694930,
+        "ir_ratio": 1.3039456303101264,
+        "ir_ref": 532944,
+        "ll_misses": [
+          2994,
+          3003
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/nbody/manifest.json"
+    },
+    "histogram": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          3170,
+          3239
+        ],
+        "d1_misses": [
+          10068,
+          10078
+        ],
+        "i1_misses": [
+          1165,
+          1168
+        ],
+        "indirect_mispredicts": [
+          216,
+          222
+        ],
+        "ir_mine": 3223573,
+        "ir_ratio": 1.9067254690994437,
+        "ir_ref": 1690633,
+        "ll_misses": [
+          6756,
+          6777
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/histogram/manifest.json"
+    },
+    "gzip_crc32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3337,
+          3438
+        ],
+        "d1_misses": [
+          2213,
+          2218
+        ],
+        "i1_misses": [
+          1367,
+          1366
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 800966,
+        "ir_ratio": 0.9911363161079482,
+        "ir_ref": 808129,
+        "ll_misses": [
+          3179,
+          3196
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/gzip_crc32/manifest.json"
+    },
+    "zlib_ng_adler32": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DDATA_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          3376,
+          3469
+        ],
+        "d1_misses": [
+          2194,
+          2199
+        ],
+        "i1_misses": [
+          1376,
+          1369
+        ],
+        "indirect_mispredicts": [
+          233,
+          240
+        ],
+        "ir_mine": 463788,
+        "ir_ratio": 0.9179558229752197,
+        "ir_ref": 505240,
+        "ll_misses": [
+          3174,
+          3184
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/zlib_ng_adler32/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25493,
+          31843
+        ],
+        "d1_misses": [
+          2185,
+          2198
+        ],
+        "i1_misses": [
+          1364,
+          1359
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 1666645,
+        "ir_ratio": 1.1619562671158383,
+        "ir_ref": 1434344,
+        "ll_misses": [
+          3159,
+          3173
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/expat_xml_scan/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          12574,
+          10368
+        ],
+        "d1_misses": [
+          2234,
+          2245
+        ],
+        "i1_misses": [
+          1375,
+          1374
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2061
+        ],
+        "ir_mine": 822567,
+        "ir_ratio": 1.0805946267621453,
+        "ir_ref": 761217,
+        "ll_misses": [
+          3203,
+          3223
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/sqlite_varint/manifest.json"
+    },
+    "linux_find_bit": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "metrics": {
+        "conditional_mispredicts": [
+          11854,
+          11895
+        ],
+        "d1_misses": [
+          137235,
+          137209
+        ],
+        "i1_misses": [
+          1358,
+          1360
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 5957942,
+        "ir_ratio": 1.1734623957576893,
+        "ir_ref": 5077233,
+        "ll_misses": [
+          6995,
+          7013
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/linux_find_bit/manifest.json"
+    },
+    "glibc_memcmp": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=16",
+      "metrics": {
+        "conditional_mispredicts": [
+          3367,
+          3475
+        ],
+        "d1_misses": [
+          25349,
+          25302
+        ],
+        "i1_misses": [
+          1365,
+          1365
+        ],
+        "indirect_mispredicts": [
+          232,
+          239
+        ],
+        "ir_mine": 722848,
+        "ir_ratio": 1.0447410867592053,
+        "ir_ref": 691892,
+        "ll_misses": [
+          4951,
+          4969
+        ]
+      },
+      "manifest": "/home/user/artifacts/pr814-callgrind-current/glibc_memcmp/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "histogram",
+    "nbody",
+    "linux_find_bit",
+    "expat_xml_scan",
+    "sqlite_varint",
+    "glibc_memcmp",
+    "gzip_crc32",
+    "zlib_ng_adler32"
+  ]
+}

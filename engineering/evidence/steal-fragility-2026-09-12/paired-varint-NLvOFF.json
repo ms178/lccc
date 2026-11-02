@@ -1,0 +1,25 @@
+{
+  "label": "varint no-locked vs OFF",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_mo34ol45/arm_a",
+    "sha256": "bdeea5e90f27172f9bebf7f4232cc28844f75436855cf772e8c9d177d80f291f",
+    "env": "CCC_SPAN_STEAL_NO_LOCKED=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "32165525e62db7a4b2cf7eb6f8618e6b1e895603c9c4ffed9639b83768c6d682"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_mo34ol45/arm_b",
+    "sha256": "bdeea5e90f27172f9bebf7f4232cc28844f75436855cf772e8c9d177d80f291f",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "32165525e62db7a4b2cf7eb6f8618e6b1e895603c9c4ffed9639b83768c6d682"
+    }
+  },
+  "identical_binaries": true,
+  "rounds": 5,
+  "warmup": 2,
+  "verdict": "uninformative-identical-binaries"
+}

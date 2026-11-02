@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""Whole-object differential between LCCC's integrated assembler and GNU as.
+
+Where `insndiff.py` compares ONE instruction at a time, this compares whole
+translation units: every allocated section's bytes, the full relocation table,
+and the symbol table. That matters because the three most damaging assembler
+bug classes are invisible in a single-instruction view:
+
+  * relocation errors     — link-time corruption, never seen in .text bytes
+  * symbol table errors   — wrong binding/type/size, breaks linking or ABI
+  * layout errors         — relaxation and alignment interacting across a
+                            whole section, which is exactly where jump
+                            relaxation and PGO block alignment collide
+
+GNU as is the oracle. LCCC must either agree exactly, or reject exactly what
+GNU as rejects: silently accepting a malformed instruction means emitting
+bytes for something the programmer did not write.
+
+Corpus format (`*.casefile`): a sequence of
+
+    ;;; case-name [flags]
+    <assembly>
+
+Flags:
+    reject   both assemblers must REFUSE this input
+    nosym    compare bytes and relocations but not the symbol table
+
+Usage:
+    scripts/asmdiff.py                       # all corpora under tests/asm-diff
+    scripts/asmdiff.py path/to/x.casefile -v
+    scripts/asmdiff.py --32 --lccc target/fastbuild/lccc-i686  # i686 vs as --32
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CORPUS = REPO_ROOT / "tests" / "asm-diff"
+
+# The disassembler is half the oracle pair. `allow_better` groups accept a
+# byte difference only when the two objects still disassemble identically,
+# so whatever objdump runs here ARBITRATES those verdicts — an unpinned
+# objdump is whatever binutils the host image ships (the exact
+# unpinned-tool class the 2.47 `as' pin exists to prevent). It is threaded
+# explicitly: main() resolves it once from --objdump / LCCC_OBJDUMP and
+# passes it through run_case; the corpus gates pin the 2.47 pair on the
+# command line so the parity checker sees it.
+
+
+# ─── Minimal ELF64 reader (no third-party dependency) ─────────────────────
+
+def _u(b: bytes, off: int, n: int) -> int:
+    return int.from_bytes(b[off:off + n], "little")
+
+
+@dataclass
+class ElfImage:
+    content: dict[str, bytes] = field(default_factory=dict)
+    relocs: dict[str, list[tuple]] = field(default_factory=dict)
+    symbols: list[tuple] = field(default_factory=list)
+    defined: dict[str, tuple[str, int]] = field(default_factory=dict)
+
+
+
+def _read_elf32(path: Path, b: bytes) -> ElfImage:
+    """Minimal ELF32 reader (i686 objects from `as --32` / lccc-i686)."""
+    e_shoff, e_shentsize = _u(b, 0x20, 4), _u(b, 0x2E, 2)
+    e_shnum, e_shstrndx = _u(b, 0x30, 2), _u(b, 0x32, 2)
+
+    sh = []
+    for i in range(e_shnum):
+        o = e_shoff + i * e_shentsize
+        sh.append(dict(
+            name=_u(b, o, 4), type=_u(b, o + 4, 4), flags=_u(b, o + 8, 4),
+            off=_u(b, o + 0x10, 4), size=_u(b, o + 0x14, 4),
+            link=_u(b, o + 0x18, 4), info=_u(b, o + 0x1C, 4)))
+
+    def raw(i):
+        s = sh[i]
+        return b"" if s["type"] == 8 else b[s["off"]: s["off"] + s["size"]]
+
+    shstr = raw(e_shstrndx)
+
+    def nm(tab: bytes, off: int) -> str:
+        end = tab.find(b"\0", off)
+        return tab[off:end].decode("utf-8", "replace")
+
+    names = [nm(shstr, s["name"]) for s in sh]
+    img = ElfImage()
+
+    SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL = 2, 3, 4, 9
+    syms: list[tuple] = []
+    for i, s in enumerate(sh):
+        if s["type"] != SHT_SYMTAB:
+            continue
+        strt, d = raw(s["link"]), raw(i)
+        for k in range(len(d) // 16):
+            o = k * 16
+            st_info = d[o + 12]
+            syms.append((nm(strt, _u(d, o, 4)), st_info >> 4, st_info & 0xF,
+                         _u(d, o + 14, 2), _u(d, o + 4, 4), _u(d, o + 8, 4)))
+        break
+
+    def sname(ix: int) -> str:
+        return {0: "UNDEF", 0xFFF1: "ABS", 0xFFF2: "COMMON"}.get(
+            ix, names[ix] if ix < len(names) else f"SHN{ix}")
+
+    img.symbols = [(n, bi, ty, sname(sx), v, sz)
+                   for (n, bi, ty, sx, v, sz) in syms]
+    for (n, _bi, ty, sx, v, _sz) in syms:
+        if n and ty not in (3, 4) and sx not in (0, 0xFFF1, 0xFFF2):
+            img.defined.setdefault(n, (sname(sx), v))
+
+    for i, s in enumerate(sh):
+        if s["type"] in (SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL):
+            continue
+        if names[i] in ("", ".shstrtab", ".strtab", ".symtab"):
+            continue
+        img.content[names[i]] = raw(i)
+
+    for i, s in enumerate(sh):
+        if s["type"] not in (SHT_RELA, SHT_REL):
+            continue
+        tgt = names[s["info"]] if s["info"] < len(names) else f"SEC{s['info']}"
+        step, d = (12 if s["type"] == SHT_RELA else 8), raw(i)
+        out = []
+        for k in range(len(d) // step):
+            o = k * step
+            info = _u(d, o + 4, 4)
+            add = 0
+            if s["type"] == SHT_RELA:
+                add = _u(d, o + 8, 4)
+                if add >= 1 << 31:
+                    add -= 1 << 32
+            si = info >> 8
+            sn = syms[si][0] if si < len(syms) else f"SYM{si}"
+            if not sn and si < len(syms):
+                sn = "@" + sname(syms[si][3])
+            out.append((_u(d, o, 4), info & 0xFF, sn, add))
+        img.relocs.setdefault(tgt, []).extend(sorted(out))
+    return img
+
+
+def read_elf(path: Path) -> ElfImage:
+    b = path.read_bytes()
+    if b[:4] != b"\x7fELF":
+        raise ValueError(f"{path}: not an ELF object")
+    if b[4] == 1:
+        return _read_elf32(path, b)
+    if b[4] != 2:
+        raise ValueError(f"{path}: not an ELF32/ELF64 object")
+    e_shoff, e_shentsize = _u(b, 0x28, 8), _u(b, 0x3A, 2)
+    e_shnum, e_shstrndx = _u(b, 0x3C, 2), _u(b, 0x3E, 2)
+
+    sh = []
+    for i in range(e_shnum):
+        o = e_shoff + i * e_shentsize
+        sh.append(dict(
+            name=_u(b, o, 4), type=_u(b, o + 4, 4), flags=_u(b, o + 8, 8),
+            off=_u(b, o + 0x18, 8), size=_u(b, o + 0x20, 8),
+            link=_u(b, o + 0x28, 4), info=_u(b, o + 0x2C, 4)))
+
+    def raw(i):
+        s = sh[i]
+        return b"" if s["type"] == 8 else b[s["off"]: s["off"] + s["size"]]
+
+    shstr = raw(e_shstrndx)
+
+    def nm(tab: bytes, off: int) -> str:
+        end = tab.find(b"\0", off)
+        return tab[off:end].decode("utf-8", "replace")
+
+    names = [nm(shstr, s["name"]) for s in sh]
+    img = ElfImage()
+
+    SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL = 2, 3, 4, 9
+    syms: list[tuple] = []
+    for i, s in enumerate(sh):
+        if s["type"] != SHT_SYMTAB:
+            continue
+        strt, d = raw(s["link"]), raw(i)
+        for k in range(len(d) // 24):
+            o = k * 24
+            syms.append((nm(strt, _u(d, o, 4)), d[o + 4] >> 4, d[o + 4] & 0xF,
+                         _u(d, o + 6, 2), _u(d, o + 8, 8), _u(d, o + 16, 8)))
+        break
+
+    def sname(ix: int) -> str:
+        return {0: "UNDEF", 0xFFF1: "ABS", 0xFFF2: "COMMON"}.get(
+            ix, names[ix] if ix < len(names) else f"SHN{ix}")
+
+    img.symbols = [(n, bi, ty, sname(sx), v, sz)
+                   for (n, bi, ty, sx, v, sz) in syms]
+    for (n, _bi, ty, sx, v, _sz) in syms:
+        if n and ty not in (3, 4) and sx not in (0, 0xFFF1, 0xFFF2):
+            img.defined.setdefault(n, (sname(sx), v))
+
+    for i, s in enumerate(sh):
+        if s["type"] in (SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL):
+            continue
+        if names[i] in ("", ".shstrtab", ".strtab", ".symtab"):
+            continue
+        img.content[names[i]] = raw(i)
+
+    for i, s in enumerate(sh):
+        if s["type"] not in (SHT_RELA, SHT_REL):
+            continue
+        tgt = names[s["info"]] if s["info"] < len(names) else f"SEC{s['info']}"
+        step, d = (24 if s["type"] == SHT_RELA else 16), raw(i)
+        out = []
+        for k in range(len(d) // step):
+            o = k * step
+            info = _u(d, o + 8, 8)
+            add = 0
+            if s["type"] == SHT_RELA:
+                add = _u(d, o + 16, 8)
+                if add >= 1 << 63:
+                    add -= 1 << 64
+            si = info >> 32
+            sn = syms[si][0] if si < len(syms) else f"SYM{si}"
+            if not sn and si < len(syms):
+                sn = "@" + sname(syms[si][3])
+            out.append((_u(d, o, 8), info & 0xFFFFFFFF, sn, add))
+        img.relocs.setdefault(tgt, []).extend(sorted(out))
+    return img
+
+
+# ─── Comparison ───────────────────────────────────────────────────────────
+
+def _interesting(name: str) -> bool:
+    if name.startswith((".debug", ".note")):
+        return False
+    # `.eh_frame` IS compared: CFA advances are sized from the final code
+    # layout and FDE lengths from the final CFI stream, and both corpora
+    # match GAS 2.47 byte for byte. Excluding it hid a CFA advance baked
+    # before a `.uleb128` in `.text` shrank (layout-edits/
+    # cfa_advance_across_shrinking_uleb).
+    return name not in (".comment", ".eh_frame_hdr", ".group", ".llvm_addrsig")
+
+
+def normalize_relocs(img: ElfImage) -> dict[str, list[tuple]]:
+    """Reduce each relocation to (offset, type, section-or-extern, addend).
+
+    A reference to a DEFINED LOCAL symbol may legitimately be encoded either
+    against that symbol with addend A, or against its section symbol with
+    addend (sym.value + A). GAS picks the latter, LCCC the former; both link
+    identically. Canonicalizing removes that cosmetic difference while still
+    catching a genuinely wrong target or addend.
+    """
+    out: dict[str, list[tuple]] = {}
+    for sec, rels in img.relocs.items():
+        norm = []
+        for (off, typ, sym, add) in rels:
+            if sym.startswith("@"):
+                norm.append((off, typ, sym[1:], add))
+            elif sym in img.defined:
+                s, v = img.defined[sym]
+                norm.append((off, typ, s, v + add))
+            else:
+                norm.append((off, typ, sym, add))
+        out[sec] = sorted(norm)
+    return out
+
+
+def hexdiff(a: bytes, b: bytes, limit: int = 8) -> str:
+    out, shown = [], 0
+    for i in range(max(len(a), len(b))):
+        x = a[i] if i < len(a) else None
+        y = b[i] if i < len(b) else None
+        if x != y:
+            out.append(f"    @{i:#06x}: lccc={'--' if x is None else f'{x:02x}'} "
+                       f"gas={'--' if y is None else f'{y:02x}'}")
+            shown += 1
+            if shown >= limit:
+                out.append(f"    ... (len lccc={len(a)} gas={len(b)})")
+                break
+    return "\n".join(out)
+
+
+_SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
+_ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
+
+
+# VEX 3-operand instructions whose two SOURCE operands may be exchanged with
+# no change to the result bits. Integer and bitwise only: FP add/mul propagate
+# SRC1's NaN payload, so exchanging them is observable and is NOT done.
+_COMMUTATIVE_VEX = {
+    "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
+    "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
+    "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
+    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
+    "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
+    # Integer 0F-map ops LCCC may source-swap to reach VEX2 (not FP add/mul).
+    "vpmuludq", "vpsadbw", "vpmaddwd",
+}
+# VEX packed-FP compare pseudos with operand-symmetric predicates
+# ((imm&31)&7 in {eq,unord,neq,ord}, every _q/_s flavor + true/false):
+# objdump always disassembles VEX C2 to these spellings (never `vcmpps $imm`),
+# and LCCC/clang/icx may exchange the sources to reach the 2-byte VEX prefix.
+# Scalar (ss/sd) and ordered-predicate pseudos are deliberately absent: the
+# merge lane makes scalar swaps unsound and no oracle swaps ordered compares.
+_COMMUTATIVE_VEX_CMP = {
+    "vcmpeqps", "vcmpeqpd", "vcmpunordps", "vcmpunordpd",
+    "vcmpneqps", "vcmpneqpd", "vcmpordps", "vcmpordpd",
+    "vcmpeq_uqps", "vcmpeq_uqpd", "vcmpfalseps", "vcmpfalsepd",
+    "vcmpneq_oqps", "vcmpneq_oqpd", "vcmptrueps", "vcmptruepd",
+    "vcmpeq_osps", "vcmpeq_ospd", "vcmpunord_sps", "vcmpunord_spd",
+    "vcmpneq_usps", "vcmpneq_uspd", "vcmpord_sps", "vcmpord_spd",
+    "vcmpeq_usps", "vcmpeq_uspd", "vcmpfalse_osps", "vcmpfalse_ospd",
+    "vcmpneq_osps", "vcmpneq_ospd", "vcmptrue_usps", "vcmptrue_uspd",
+}
+_VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
+_VEXCMP_IMM = re.compile(r"^(vcmpps|vcmppd)\s+\$(0x[0-9a-f]+|\d+),(%\S+),(%\S+),(%\S+)$")
+
+
+def _vcmp_imm_symmetric(text: str) -> bool:
+    """True when a VCMP numbered imm selects an operand-symmetric predicate.
+
+    objdump prints the pseudo-mnemonic only for imm 0-31; larger immediates
+    (GAS accepts the full imm8, e.g. `$0xab`) disassemble numbered. The
+    predicate lives in the low 5 bits; relations eq/unord/neq/ord (imm&7 in
+    {0,3,4,7}) are symmetric in every flavor, true/false included.
+    """
+    try:
+        imm = int(text, 0)
+    except ValueError:
+        return False
+    return ((imm & 31) & 7) in (0, 3, 4, 7)
+
+
+
+
+# A 32-bit register write zero-extends into its 64-bit parent, so
+# `mov $0xffffffff,%eax` and `movabs $0xffffffff,%rax` leave the same value in
+# %rax -- the first in 5 bytes, the second in 10. Canonicalise the pair so the
+# semantic comparison sees them as equal.
+_GP32_TO_64 = {
+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
+    **{f"r{n}d": f"r{n}" for n in range(8, 32)},
+}
+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
+
+
+def _canon_mov_imm(insn: str) -> str:
+    """Normalise a zero-extending 32-bit immediate load to its 64-bit meaning."""
+    m = _MOV_IMM.match(insn.strip())
+    if not m:
+        return insn
+    val = int(m.group(2), 0)
+    reg = m.group(3)
+    if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
+        return f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+    return f"mov ${val:#x},%{reg}"
+
+
+def _canon_commutative(insn: str) -> str:
+    """Put the two sources of a commutative VEX op in a canonical order.
+
+    An assembler may exchange them to reach the shorter 2-byte VEX prefix, so
+    the disassembly differs textually while denoting the same operation.
+    """
+    s = insn.strip()
+    m = _VEX3.match(s)
+    if m and (m.group(1) in _COMMUTATIVE_VEX or m.group(1) in _COMMUTATIVE_VEX_CMP):
+        a, b = sorted((m.group(2), m.group(3)))
+        return f"{m.group(1)} {a},{b},{m.group(4)}"
+    m = _VEXCMP_IMM.match(s)
+    if m and _vcmp_imm_symmetric(m.group(2)):
+        a, b = sorted((m.group(3), m.group(4)))
+        return f"{m.group(1)} ${m.group(2)},{a},{b},{m.group(5)}"
+    return insn
+
+
+# objdump renders the raw-byte column at a FIXED width per listing — on
+# x86 (both 64- and 32-bit output, binutils 2.44/2.47 verified) seven
+# bytes, i.e. three characters per byte ("XX " each) = 21 columns,
+# space-padded whenever an instruction is shorter — and wraps
+# instructions wider than the column onto continuation lines that carry
+# the RUNNING address (previous address + previous bytes) and the
+# remaining bytes but no instruction column. Both properties make
+# continuation lines mechanically checkable, which is what the stateful
+# parser below does; the width is never hardcoded but inferred from the
+# first anchor line and required to be consistent across the listing.
+_MAX_X86_INSN_BYTES = 15    # the architectural maximum instruction length
+_INSN_LINE = re.compile(r"^\s*([0-9a-f]+):\t(.*)$")
+_LABEL_LINE = re.compile(r"^[0-9a-f]{8,16} <[^>]*>:$")
+
+
+def _byte_tokens(field: str) -> list[str] | None:
+    """The two-hex-digit byte tokens of a byte column, or None if malformed."""
+    tokens = field.split()
+    if not tokens or any(not re.fullmatch(r"[0-9a-f]{2}", t) for t in tokens):
+        return None
+    return tokens
+
+
+def _parse_disasm(text: str) -> list[str] | None:
+    """Parse one `objdump -d` listing into its normalised instructions.
+
+    Fail-closed: the return value is the normalised instruction sequence,
+    or None whenever the listing is not admissible semantic evidence —
+    an undecodable instruction, a `...` gap (bytes present that the
+    decoder declined to decode), an unrecognised line shape, an
+    unanchored or inconsistent byte-continuation fragment, or an empty
+    instruction stream. Undecodable renderings are not semantic
+    evidence: objdump DOES print the raw bytes before `(bad)', but the
+    byte column is dropped here, so two different garbage streams can
+    render to the same instruction text — a `BETTER' verdict must never
+    stand on that, in either direction.
+
+    Continuation lines (address + bytes, no instruction column — objdump
+    emits them when an instruction is wider than the byte column) are
+    admitted ONLY under the full state machine real objdump implies: the
+    immediately preceding line must have filled the byte column
+    completely (objdump wraps only when the column overflows), the
+    fragment's address must be the running address (previous address +
+    previous bytes) — the byte-accounting invariant that also holds
+    between consecutive anchors within one symbol block — and the
+    accumulated instruction must stay within the 15-byte architectural
+    maximum. A byte-only line that fails any of these is not formatting
+    but an ORPHAN fragment: it is never skipped, because two listings
+    that differ only in orphan bytes would then compare equal and a
+    size-only `BETTER' could stand on streams the parser never proved
+    identical (the exact false pass this state machine closes).
+
+    Two encodings are equivalent when they decode to the same instruction
+    with the same effective address. The two spellings that differ purely
+    by encoding choice are a redundant scale-1 index (`-0x1(,%rdi,1)` is
+    the same address as `-0x1(%rdi)`) and an explicit zero displacement.
+    objdump's `{vex}`/`{evex}` annotations likewise describe only which
+    legal encoding was chosen (LCCC prefers the shorter VEX form for VNNI
+    memory sources where GAS defaults to EVEX), so they are stripped too.
+    `{nf}` is NOT stripped: it changes flags semantics.
+    """
+    out: list[str] = []
+    width: int | None = None   # byte-column capacity in characters (3/byte)
+    prev_addr: int | None = None    # address-chain state; reset at labels
+    prev_bytes = 0
+    prev_full = False           # a continuation is legal only after a FULL line
+    insn_bytes = 0              # accumulated bytes of the instruction in flight
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if " file format " in stripped:
+            continue                     # "<file>: file format <fmt>" header
+        if stripped.startswith("Disassembly of section "):
+            prev_addr = None             # new section: the chain restarts
+            continue
+        if _LABEL_LINE.match(stripped):
+            prev_addr = None             # symbol label: ADDR <name>:
+            continue
+        if stripped == "...":
+            # A gap marker: bytes exist here that the decoder declined to
+            # decode. That is undecidable content, not noise — the two
+            # objects' undecoded tails could differ behind identical
+            # decoded prefixes.
+            return None
+        m = _INSN_LINE.match(line)
+        if m is None:
+            return None                  # unknown line shape: parse failure
+        addr = int(m.group(1), 16)
+        bytes_col, sep, insn = m.group(2).partition("\t")
+        tokens = _byte_tokens(bytes_col)
+        if tokens is None:
+            return None
+        nbytes = len(tokens)
+        if not sep:
+            # Continuation candidate: needs a full predecessor, the
+            # running address, and an in-range accumulated instruction.
+            if prev_addr is None or not prev_full:
+                return None              # orphan fragment (or one that
+                                       # follows a non-overflowed column)
+            if addr != prev_addr + prev_bytes:
+                return None              # not the running address
+            insn_bytes += nbytes
+            if insn_bytes > _MAX_X86_INSN_BYTES:
+                return None
+            prev_addr, prev_bytes = addr, nbytes
+            prev_full = 3 * nbytes == (width or -1)
+            continue                     # the anchor line owns the record
+        # Anchor line: padded byte column, then the instruction column.
+        if prev_addr is not None and addr != prev_addr + prev_bytes:
+            return None                  # address-chain break within a block
+        if width is None:
+            width = len(bytes_col)
+            if width % 3:
+                return None              # the column is 3 chars per byte
+        elif len(bytes_col) != width:
+            return None                  # inconsistent column: not objdump
+        insn = insn.strip()
+        if not insn:
+            return None
+        if insn.startswith("(") or insn.startswith(".byte"):
+            # `(bad)' — and any future parenthesised synthetic — and the
+            # `.byte' fallback are objdump's undecodable renderings.
+            return None
+        insn = re.sub(r"^\{(?:vex|evex)\} ", "", insn)
+        insn = _SCALE1.sub(r"(%\1)", insn)
+        insn = _ZERODISP.sub("(", insn)
+        insn = re.sub(r"\s+", " ", insn)
+        insn = _canon_commutative(insn)
+        insn = _canon_mov_imm(insn)
+        # Drop the trailing branch-target comment objdump appends.
+        insn = insn.split("#")[0].strip()
+        if not insn:
+            return None
+        out.append(insn)
+        prev_addr, prev_bytes = addr, nbytes
+        prev_full = 3 * nbytes == width
+        insn_bytes = nbytes
+    return out or None
+
+
+def _disasm_stream(obj: Path, objdump: str) -> str | None:
+    """The normalised instruction stream of one object — or None.
+
+    None is the fail-closed verdict: the disassembler was missing,
+    failed, timed out, exited nonzero, or produced an inadmissible
+    listing. A failed run prints nothing, and two failures must never
+    compare equal — that is the fail-open hole this exists to close.
+    """
+    try:
+        proc = subprocess.run([objdump, "-d", str(obj)],
+                               capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    insns = _parse_disasm(proc.stdout)
+    return None if insns is None else "\n".join(insns)
+
+
+def semantically_equal(a_obj: Path, b_obj: Path, objdump: str) -> bool:
+    """True when two objects disassemble to the same instruction sequence.
+
+    Both disassemblies must be admissible evidence: a stream that failed
+    to decode — in part or whole — is not semantic evidence, so it never
+    compares equal, not to the other object and not to another failed
+    stream.
+    """
+    sa = _disasm_stream(a_obj, objdump)
+    if sa is None:
+        return False
+    sb = _disasm_stream(b_obj, objdump)
+    return sb is not None and sa == sb
+
+
+def compare(lo: ElfImage, go: ElfImage, *, check_symbols: bool) -> list[str]:
+    errs: list[str] = []
+    names = sorted({n for n in lo.content if _interesting(n)} |
+                   {n for n in go.content if _interesting(n)})
+    for n in names:
+        a, b = lo.content.get(n), go.content.get(n)
+        # A zero-length section carries no code or data; whether an assembler
+        # materializes its header is cosmetic.
+        if a is None:
+            if b:
+                errs.append(f"section {n}: missing in LCCC ({len(b)} bytes in gas)")
+            continue
+        if b is None:
+            if a:
+                errs.append(f"section {n}: extra in LCCC ({len(a)} bytes)")
+            continue
+        if a != b:
+            errs.append(f"section {n}: {len(a)} vs {len(b)} bytes differ\n"
+                        + hexdiff(a, b))
+
+    nla, nlb = normalize_relocs(lo), normalize_relocs(go)
+    for n in sorted(set(nla) | set(nlb)):
+        if not _interesting(n):
+            continue
+        ra, rb = nla.get(n, []), nlb.get(n, [])
+        if ra != rb:
+            errs.append(f"relocs {n}:\n  only-lccc={[x for x in ra if x not in rb]!r}"
+                        f"\n  only-gas ={[x for x in rb if x not in ra]!r}")
+
+    if check_symbols:
+        sa = sorted(s for s in lo.symbols if s[2] != 4 and s[0])
+        sb = sorted(s for s in go.symbols if s[2] != 4 and s[0])
+        if sa != sb:
+            errs.append(f"symbols:\n  only-lccc={[x for x in sa if x not in sb]!r}"
+                        f"\n  only-gas ={[x for x in sb if x not in sa]!r}")
+    return errs
+
+
+# ─── Cases ────────────────────────────────────────────────────────────────
+
+@dataclass
+class Case:
+    name: str
+    text: str
+    mode: str = "accept"
+    check_symbols: bool = True
+    # When set, a section may differ from GNU as provided LCCC's encoding is
+    # strictly shorter AND decodes to the same instruction sequence. This is
+    # how a deliberate encoding win is asserted without weakening the check
+    # into "any difference is fine".
+    allow_better: bool = False
+
+
+HEADER = re.compile(r"^;;;\s*(\S+)\s*(.*)$")
+
+
+def load_cases(path: Path) -> list[Case]:
+    cases: list[Case] = []
+    cur: Case | None = None
+    buf: list[str] = []
+    for line in path.read_text().splitlines():
+        m = HEADER.match(line)
+        if m:
+            if cur:
+                cur.text = "\n".join(buf) + "\n"
+                cases.append(cur)
+            flags = m.group(2).split()
+            cur = Case(f"{path.stem}/{m.group(1)}", "",
+                       "reject" if "reject" in flags else "accept",
+                       "nosym" not in flags,
+                       "betterok" in flags)
+            buf = []
+        elif cur is not None:
+            buf.append(line)
+    if cur:
+        cur.text = "\n".join(buf) + "\n"
+        cases.append(cur)
+    return cases
+
+
+def run_case(c: Case, lccc: str, gas: str, objdump: str, wd: str, verbose: bool,
+             bits32: bool = False):
+    tag = re.sub(r"[^A-Za-z0-9_.-]", "_", c.name)
+    src = Path(wd) / f"{tag}.s"
+    src.write_text(c.text)
+    lo, go = Path(wd) / f"{tag}.l.o", Path(wd) / f"{tag}.g.o"
+
+    r1 = subprocess.run([lccc, "-m32", "-c", str(src), "-o", str(lo)]
+                        if bits32 else
+                        [lccc, "-c", str(src), "-o", str(lo)],
+                        capture_output=True, text=True, timeout=180)
+    gas_bits = "--32" if bits32 else "--64"
+    r2 = subprocess.run([gas, gas_bits, "-o", str(go), str(src)],
+                        capture_output=True, text=True, timeout=180)
+
+    if c.mode == "reject":
+        if r2.returncode == 0:
+            return (c.name, False, "ORACLE BROKEN: GNU as accepted a 'reject' case")
+        if r1.returncode == 0:
+            return (c.name, False, "FALSE-ACCEPT: LCCC accepted invalid input")
+        return (c.name, True, "")
+
+    if r2.returncode != 0:
+        return (c.name, False, "ORACLE BROKEN: GNU as rejected an 'accept' case:\n"
+                + r2.stderr.strip()[:600])
+    if r1.returncode != 0:
+        return (c.name, False, "REJECTS-VALID: LCCC failed to assemble:\n"
+                + (r1.stderr or r1.stdout).strip()[:900])
+    try:
+        errs = compare(read_elf(lo), read_elf(go), check_symbols=c.check_symbols)
+    except Exception as exc:  # noqa: BLE001
+        return (c.name, False, f"ELF parse error: {exc}")
+
+    if errs and c.allow_better:
+        # Accept the difference only if every byte-level complaint is LCCC
+        # being smaller, and the two objects still decode identically.
+        # The disassembler is the caller's pinned oracle, never a PATH
+        # lookup: it decides BETTER verdicts, so it is as much an oracle
+        # as `as'.
+        size_l = len(read_elf(lo).content.get(".text", b""))
+        size_g = len(read_elf(go).content.get(".text", b""))
+        only_size = all("bytes differ" in e for e in errs)
+        if only_size and size_l < size_g and semantically_equal(lo, go, objdump):
+            return (c.name, True, f"BETTER: {size_l}B vs gas {size_g}B, "
+                                  f"same disassembly")
+    if errs:
+        body = "\n".join(errs)
+        return (c.name, False, body if verbose else body[:1800])
+    return (c.name, True, "")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cases", nargs="*", type=Path)
+    ap.add_argument("--lccc", default=str(REPO_ROOT / "target" / "release" / "lccc"))
+    ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
+    ap.add_argument("--objdump", default=os.environ.get("LCCC_OBJDUMP", "objdump"),
+                    help="disassembler that arbitrates allow_better verdicts "
+                         "(pin it with `as': an unpinned objdump is an "
+                         "unpinned oracle, whatever the host image ships)")
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--max-report", type=int, default=30)
+    ap.add_argument("--32", dest="bits32", action="store_true",
+                    help="i686: GNU as --32, ELF32 objects, default corpus "
+                         "tests/asm-diff/i686/")
+    args = ap.parse_args()
+
+    if not (shutil.which(args.gas) or Path(args.gas).exists()):
+        print(f"error: assembler oracle {args.gas!r} not found", file=sys.stderr)
+        return 2
+    if not (shutil.which(args.objdump) or Path(args.objdump).exists()):
+        print(f"error: disassembler oracle {args.objdump!r} not found "
+              "(it decides allow_better verdicts; provision the 2.47 pair "
+              "with scripts/ensure_gas_247.sh)", file=sys.stderr)
+        return 2
+    if not Path(args.lccc).exists():
+        print(f"error: lccc not built at {args.lccc!r}", file=sys.stderr)
+        return 2
+
+    if args.cases:
+        files = args.cases
+    elif args.bits32:
+        files = sorted((DEFAULT_CORPUS / "i686").glob("*.casefile"))
+    else:
+        files = sorted(DEFAULT_CORPUS.glob("*.casefile"))
+    # An explicitly named i686 casefile without --32 compares ELF32 lccc
+    # objects against ELF64 `as` output — every case then "fails" on
+    # encoding and relocation-type mismatches that say nothing about the
+    # compiler. Refuse the foot-gun instead of reporting bogus failures.
+    if not args.bits32 and any(
+        "asm-diff" in str(f) and f.parent.name == "i686" for f in files
+    ):
+        print("error: i686 casefiles given without --32; the GNU as oracle "
+              "would assemble them as ELF64 and every difference would be "
+              "spurious. Re-run with --32 (or drop the explicit case path "
+              "to use the default x86-64 corpus).", file=sys.stderr)
+        return 2
+    cases = [c for f in files for c in load_cases(f)]
+    if not cases:
+        print("error: no cases found", file=sys.stderr)
+        return 2
+
+    passed, failures = 0, []
+    with tempfile.TemporaryDirectory(prefix="asmdiff-") as wd:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+            for fut in concurrent.futures.as_completed(
+                    [ex.submit(run_case, c, args.lccc, args.gas, args.objdump,
+                               wd, args.verbose, args.bits32)
+                     for c in cases]):
+                name, ok, msg = fut.result()
+                if ok:
+                    passed += 1
+                else:
+                    failures.append((name, msg))
+
+    for name, msg in sorted(failures)[: args.max_report]:
+        print(f"FAIL {name}\n{msg}\n")
+    if len(failures) > args.max_report:
+        print(f"... and {len(failures) - args.max_report} more")
+
+    # Name both oracles' RELEASE, not just their paths: byte-exact layout
+    # cases (NOP tables, relaxation order) legitimately differ between GAS
+    # releases, the betterok verdicts are arbitrated by the disassembler,
+    # and a failure log must say which PAIR it was checked against.
+    def oracle_version(tool: str) -> str:
+        try:
+            return subprocess.run([tool, "--version"], capture_output=True,
+                                   text=True, check=False,
+                                   timeout=30).stdout.splitlines()[0]
+        except (OSError, IndexError, subprocess.SubprocessError):
+            return "unknown version"
+    print(f"=== asm-diff: {passed} passed, {len(failures)} failed "
+          f"({len(cases)} cases, as={args.gas}: {oracle_version(args.gas)}; "
+          f"objdump={args.objdump}: {oracle_version(args.objdump)}) ===")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

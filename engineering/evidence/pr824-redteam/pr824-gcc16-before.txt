@@ -1,0 +1,2 @@
+ccc: error: cannot find -lgcc
+compiler_exit=1 (GCC14 32-bit runtime temporarily hidden; GCC16 runtime present)

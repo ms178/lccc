@@ -1,0 +1,10 @@
+   Compiling lccc v0.1.0 (/home/user/.cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 44s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 2 tests
+test passes::loop_unroll::tests::tiny_readonly_reduction_unroll_preserves_ssa_and_load_width ... ok
+test passes::loop_unroll::tests::tiny_readonly_reduction_profitability_refusals ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 4739 filtered out; finished in 0.00s
+

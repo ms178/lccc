@@ -1,0 +1,70 @@
+{
+  "collected_at": "2026-10-25T01:04:14Z",
+  "records": [
+    {
+      "number": 47250,
+      "url": "https://github.com/llvm/llvm-project/issues/47250",
+      "updated_at": "2026-07-16T15:09:52Z",
+      "reported_comments": 5,
+      "accessible_comments": 5,
+      "sha256": "1b143f74d01267ebfa097b96a73ef7fe11032f35c7a993a264c982714d743ea7"
+    },
+    {
+      "number": 76810,
+      "url": "https://github.com/llvm/llvm-project/issues/76810",
+      "updated_at": "2024-01-03T14:46:37Z",
+      "reported_comments": 0,
+      "accessible_comments": 0,
+      "sha256": "94c288beb04cbd3789081189bbe961bc1b6dc1ccf6bcded51e8f572908b3736f"
+    },
+    {
+      "number": 83772,
+      "url": "https://github.com/llvm/llvm-project/issues/83772",
+      "updated_at": "2024-03-04T17:17:35Z",
+      "reported_comments": 7,
+      "accessible_comments": 7,
+      "sha256": "805dd67ed8995c00a96a506ebae4aea900894f54b2760fcf18646c1b03c27859"
+    },
+    {
+      "number": 115751,
+      "url": "https://github.com/llvm/llvm-project/issues/115751",
+      "updated_at": "2025-01-15T15:34:10Z",
+      "reported_comments": 1,
+      "accessible_comments": 1,
+      "sha256": "2efa9bbc9df9e20758eba60d11b2b5a353d8933dba7b1ba5a53a30277135a933"
+    },
+    {
+      "number": 131444,
+      "url": "https://github.com/llvm/llvm-project/issues/131444",
+      "updated_at": "2025-04-29T15:50:54Z",
+      "reported_comments": 9,
+      "accessible_comments": 9,
+      "sha256": "7feb9fe4298e4c0aea159c000be3d01b60686d3729fa6d858bec54f933a02396"
+    },
+    {
+      "number": 210673,
+      "url": "https://github.com/llvm/llvm-project/issues/210673",
+      "updated_at": "2026-08-03T09:05:24Z",
+      "reported_comments": 2,
+      "accessible_comments": 2,
+      "sha256": "af200f0987be8cd1dfb162b752370f8b5520c2d284a370c2c1c10adf4f17ccd2"
+    },
+    {
+      "number": 213877,
+      "url": "https://github.com/llvm/llvm-project/issues/213877",
+      "updated_at": "2026-08-08T17:51:24Z",
+      "reported_comments": 0,
+      "accessible_comments": 0,
+      "sha256": "c64c5dfe2a9f2be2cfdcaa9f519691d7b54c0affb8fac8de694a7f37fbd384cf"
+    },
+    {
+      "number": 231124,
+      "url": "https://github.com/llvm/llvm-project/issues/231124",
+      "updated_at": "2026-10-12T19:15:16Z",
+      "reported_comments": 1,
+      "accessible_comments": 1,
+      "sha256": "07f729329b6346422191571b8a00cb033ebe56661b37015a252643440273c3ab"
+    }
+  ],
+  "method": "GitHub REST issue body and all accessible paginated conversation comments. SHA256 covers sorted-key, indented UTF-8 JSON {issue, comments} plus newline; ignored raw archives are not executable input."
+}

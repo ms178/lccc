@@ -1,0 +1,2050 @@
+//! Shared inline assembly framework.
+//!
+//! All four backends use the same 4-phase inline assembly processing:
+//! 1. Classify constraints and assign registers (specific first, then scratch)
+//! 2. Load input values into registers, pre-load read-write outputs
+//! 3. Substitute operand references in template and emit
+//! 4. Store output registers back to stack slots
+//!
+//! Each backend implements `InlineAsmEmitter` to provide arch-specific register
+//! classification, loading, and storage. The shared `emit_inline_asm_common`
+//! orchestrates the phases.
+
+use super::state::CodegenState;
+pub use crate::common::asm_constraints::constraint_is_immediate_only;
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::reexports::{BlockId, Operand, Value};
+use std::borrow::Cow;
+
+/// Operand classification for inline asm. Each backend classifies its constraints
+/// into these categories so the shared framework can orchestrate register
+/// assignment, tied operand resolution, and GCC numbering.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AsmOperandKind {
+    /// General-purpose register (e.g., x86 "r", ARM "r", RISC-V "r").
+    GpReg,
+    /// Floating-point register (RISC-V "f").
+    FpReg,
+    /// Memory operand (all arches "m").
+    Memory,
+    /// Specific named register (x86 "a"→"rax", RISC-V "a0", etc.).
+    Specific(String),
+    /// Tied to another operand by index (e.g., "0", "1").
+    Tied(usize),
+    /// Immediate value (RISC-V "I", "i", "n").
+    Immediate,
+    /// Address for atomic ops (RISC-V "A").
+    Address,
+    /// Zero-or-register (RISC-V "rJ", "J").
+    ZeroOrReg,
+    /// Condition code output (GCC =@cc<cond>, e.g. =@cce, =@ccne).
+    /// The string is the condition suffix (e.g. "e", "ne", "s", "ns").
+    ConditionCode(String),
+    /// x87 FPU stack top register st(0), selected by "t" constraint.
+    X87St0,
+    /// x87 FPU stack second register st(1), selected by "u" constraint.
+    X87St1,
+    /// GP register with accessible high-byte form (x86 "Q" constraint).
+    /// On x86-64, only rax/rbx/rcx/rdx have %ah/%bh/%ch/%dh forms.
+    /// Used when the asm template uses the %h modifier to access the
+    /// second byte (bits 8-15) of the register.
+    QReg,
+}
+
+/// The register width an `asm` template prints an operand through.
+///
+/// Almost every operand is printed in its natural width, and then any register
+/// of its class will do. Two x86 modifiers ask for a *narrower* view of the
+/// register file, and the set of registers that can answer is target-dependent:
+///
+/// * `%b<n>` prints the low byte (`al`, `bl`, `cl`, `dl`, `sil`, `dil`, `r8b`,
+///   ...). Every x86-64 register has one, because the `sil`/`dil`/`bpl`/`spl`
+///   and `r8b`-`r15b` encodings are REX-only. On IA-32 those encodings do not
+///   exist: only `al`, `bl`, `cl`, `dl` are byte-addressable, and the other
+///   three allocatable registers (`esi`, `edi`, `ebp`) have no 8-bit form at
+///   all. Printing `%esi` for `%b3` is not a worse register choice, it is a
+///   syntax error in the assembler -- and the operand's byte value is not
+///   addressable at any other name either.
+/// * `%h<n>` prints the *high* byte (`ah`, `bh`, `ch`, `dh`), which exists only
+///   for the four legacy accumulator-family registers on both x86 targets.
+///
+/// The AArch64 and RISC-V modifiers are size suffixes on the same register
+/// (`%w0`/`%x0`), so both targets treat every view as [`RegView::Full`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegView {
+    /// Natural width: any register of the operand's class.
+    Full,
+    /// Low byte, i.e. `%b<n>`.
+    Byte,
+    /// High byte, i.e. `%h<n>`: the four legacy `a`/`b`/`c`/`d` registers only.
+    HighByte,
+}
+
+/// Which operands the template prints through a byte view, and which of those
+/// need the *high* byte.
+///
+/// Computed once per `asm` statement from the expanded template, before any
+/// register is assigned. The scan is deliberately total and conservative: a
+/// reference it fails to recognise leaves the operand at [`RegView::Full`],
+/// which is exactly what the back ends did before this existed, and an extra
+/// restriction (a false positive) only costs a register choice.
+///
+/// Why the allocation decision needs this at all: the constraint string says
+/// nothing about `%b`/`%h`, so `assign_scratch_reg` used to hand a byte-printed
+/// operand any free register -- including, on i686, `esi`/`edi`, which have no
+/// byte view. The template is the only place that fact is written down.
+pub(crate) fn operand_reg_views(template: &str, operands: &[AsmOperand]) -> Vec<RegView> {
+    let mut views = vec![RegView::Full; operands.len()];
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        // `%%` is a literal percent sign, not an operand reference.
+        if i < bytes.len() && bytes[i] == b'%' {
+            i += 1;
+            continue;
+        }
+        let view = match bytes.get(i).copied() {
+            Some(b'b') => RegView::Byte,
+            Some(b'h') => RegView::HighByte,
+            _ => {
+                // Any other modifier or a bare operand index: the view is the
+                // natural one. Skipping a single byte is safe -- a modifier is
+                // exactly one character, and an operand index is not a `%`.
+                i += 1;
+                continue;
+            }
+        };
+        i += 1;
+        let (index, next) = parse_operand_ref(template, i, operands);
+        if let Some(slot) = index.and_then(|index| views.get_mut(index)) {
+            // A high-byte use dominates a low-byte use of the same operand:
+            // `%h3` is the strictest requirement the template can state.
+            if *slot != RegView::HighByte {
+                *slot = view;
+            }
+        }
+        i = next;
+    }
+    views
+}
+
+/// Parse the operand reference that follows a `%`-modifier: `0`, `10`, or
+/// `[name]` (optionally followed by another modifier, which the caller does not
+/// care about). Returns the operand index and the position after the reference.
+fn parse_operand_ref(
+    template: &str,
+    start: usize,
+    operands: &[AsmOperand],
+) -> (Option<usize>, usize) {
+    let bytes = template.as_bytes();
+    let mut i = start;
+    if bytes.get(i) == Some(&b'[') {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != b']' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            // Unterminated `[`: the substitution pass diagnoses it; nothing to
+            // attribute here.
+            return (None, j);
+        }
+        let name = &template[i + 1..j];
+        let index = operands
+            .iter()
+            .position(|op| op.name.as_deref() == Some(name));
+        return (index, j + 1);
+    }
+    let begin = i;
+    let mut value: usize = 0;
+    while let Some(digit) = bytes.get(i).and_then(|b| (*b as char).to_digit(10)) {
+        // Saturate instead of wrapping: a template this long is nonsense, and
+        // an out-of-range index simply attributes no view.
+        value = value.saturating_mul(10).saturating_add(digit as usize);
+        i += 1;
+    }
+    ((i > begin).then_some(value), i)
+}
+
+/// Per-operand state tracked by the shared inline asm framework.
+/// Backends populate arch-specific fields (mem_addr, mem_offset, imm_value)
+/// during constraint classification.
+#[derive(Debug, Clone)]
+pub struct AsmOperand {
+    pub kind: AsmOperandKind,
+    pub reg: String,
+    /// High register for 64-bit register pairs on i686. Empty when not a pair.
+    /// On i686, 64-bit values in "r" constraints require two 32-bit GP registers:
+    /// `reg` holds the low 32 bits, `reg_hi` holds the high 32 bits.
+    pub reg_hi: String,
+    pub name: Option<String>,
+    /// x86: memory address string like "offset(%rbp)".
+    pub mem_addr: String,
+    /// RISC-V/ARM: stack offset for memory/address operands.
+    pub mem_offset: i64,
+    /// Immediate value for "I"/"i" constraints.
+    pub imm_value: Option<i64>,
+    /// Symbol name for "i" constraint operands that reference global/function addresses.
+    /// Used by %P and %a modifiers to emit raw symbol names in inline asm templates.
+    pub imm_symbol: Option<String>,
+    /// IR type of this operand, used for correctly-sized loads/stores.
+    pub operand_type: IrType,
+    /// Original constraint string, used for fallback decisions.
+    pub constraint: String,
+    /// Segment prefix for memory operands (e.g., "%gs:" or "%fs:").
+    /// Set from AddressSpace for __seg_gs/__seg_fs pointer dereferences.
+    pub seg_prefix: String,
+}
+
+impl AsmOperand {
+    pub fn new(kind: AsmOperandKind, name: Option<String>) -> Self {
+        Self {
+            kind,
+            reg: String::new(),
+            reg_hi: String::new(),
+            name,
+            mem_addr: String::new(),
+            mem_offset: 0,
+            imm_value: None,
+            imm_symbol: None,
+            operand_type: IrType::I64,
+            constraint: String::new(),
+            seg_prefix: String::new(),
+        }
+    }
+
+    /// Copy register assignment and operand metadata from another operand.
+    /// Used for tied operands and `+` read-write propagation.
+    pub fn copy_metadata_from(&mut self, source: &AsmOperand) {
+        self.kind = source.kind.clone();
+        self.reg = source.reg.clone();
+        self.reg_hi = source.reg_hi.clone();
+        self.mem_addr = source.mem_addr.clone();
+        self.mem_offset = source.mem_offset;
+        self.imm_value = source.imm_value;
+        self.imm_symbol = source.imm_symbol.clone();
+        self.seg_prefix = source.seg_prefix.clone();
+    }
+}
+
+/// Trait that backends implement to provide architecture-specific inline asm behavior.
+/// The shared `emit_inline_asm_common` function calls these methods to handle the
+/// architecture-dependent parts of inline assembly processing.
+pub trait InlineAsmEmitter {
+    /// Mutable access to the codegen state (for emitting instructions).
+    fn asm_state(&mut self) -> &mut CodegenState;
+
+    /// Classify a constraint string into an AsmOperandKind, and optionally
+    /// return the specific register name for Specific constraints.
+    fn classify_constraint(&self, constraint: &str) -> AsmOperandKind;
+
+    /// Set up arch-specific operand metadata after classification.
+    /// Called once per operand. For memory/address operands, set mem_addr or mem_offset.
+    /// For immediate operands, set imm_value.
+    fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, is_output: bool);
+
+    /// Assign the next available scratch register for the given operand kind.
+    /// `excluded` contains register names that are already claimed by specific-register
+    /// constraints (e.g., "rcx" from "c" constraint) and must not be reused.
+    fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String;
+
+    /// Assign a scratch register for an operand that the template prints
+    /// through `view` and whose IR type is `operand_type`.
+    ///
+    /// The default forwards to [`Self::assign_scratch_reg`], ignoring both extra
+    /// arguments: AArch64 and RISC-V have a uniform general register file and
+    /// no byte views, so the natural-width answer is always right there. The
+    /// x86 back ends override it, because IA-32 cannot print `%esi`/`%edi` as a
+    /// byte and only four registers have a high byte.
+    ///
+    /// `operand_type` matters independently of the template: i686 prints an
+    /// `I8`/`U8` operand in its byte form by default (see
+    /// `i686_default_modifier_for_type`), so a `char` operand needs a byte view
+    /// even when the template says nothing about it.
+    fn assign_scratch_reg_for_view(
+        &mut self,
+        kind: &AsmOperandKind,
+        _operand_type: IrType,
+        _view: RegView,
+        excluded: &[String],
+    ) -> String {
+        self.assign_scratch_reg(kind, excluded)
+    }
+
+    /// Whether the register named `home` -- which already holds an input
+    /// operand's value -- can be used for that operand directly, given the view
+    /// the template prints it through and the operand's IR type.
+    ///
+    /// Reusing a fresh home avoids a copy, so it is worth checking rather than
+    /// refusing outright; but a home that cannot be printed the way the
+    /// template asks is not a saving, it is invalid assembly. When this returns
+    /// false the shared code copies the value into a scratch register that
+    /// `assign_scratch_reg_for_view` chose.
+    fn home_reg_usable_for_view(&self, _home: &str, _view: RegView, _operand_type: IrType) -> bool {
+        true
+    }
+
+    /// The asm name of the register that currently HOLDS `value`, when this
+    /// backend models register homes.
+    ///
+    /// Phase 1f materialises a memory operand's address BEFORE phase 2 loads
+    /// the operands' values into their registers, so a scratch register chosen
+    /// for that staging can overwrite a value the asm body is about to read.
+    /// The busy set only knows the registers an operand has already CLAIMED; a
+    /// register-homed input — a parameter, or a value forwarded from the
+    /// surrounding code — is loaded into its home later, in phase 2, and is
+    /// therefore invisible to it.
+    ///
+    /// One name per value, deliberately: the caller feeds each answer through
+    /// `push_busy_reg`, which already dedupes and registers the 32-bit alias,
+    /// so a `Vec<String>` per operand and a second dedupe pass would be pure
+    /// overhead on the hottest part of asm emission.
+    ///
+    /// A backend whose register file is not home-modelled answers `None`; see
+    /// the x86-64 and i686 implementations.
+    fn home_reg_name(&self, value: u32) -> Option<String> {
+        let _ = value;
+        None
+    }
+
+    /// Load an input value into its assigned register. Called during Phase 2.
+    /// `operands` includes fixed-register operands whose values a temporary
+    /// used by input materialization must preserve.
+    fn load_input_to_reg(
+        &mut self,
+        op: &AsmOperand,
+        val: &Operand,
+        constraint: &str,
+        operands: &[AsmOperand],
+    );
+
+    /// Pre-load a read-write ("+") output's current value into its register.
+    fn preload_readwrite_output(&mut self, op: &AsmOperand, ptr: &Value);
+
+    /// Substitute operand references in a single template line and return the result.
+    fn substitute_template_line(
+        &self,
+        line: &str,
+        operands: &[AsmOperand],
+        gcc_to_internal: &[usize],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+    ) -> String;
+
+    /// Store an output register value back to its stack slot after the asm executes.
+    /// `all_output_regs` contains the register names of ALL output operands, used to
+    /// avoid clobbering other output registers when picking scratch registers.
+    fn store_output_from_reg(
+        &mut self,
+        op: &AsmOperand,
+        ptr: &Value,
+        constraint: &str,
+        all_output_regs: &[&str],
+    );
+
+    /// Whether GCC's `%v` mnemonic prefix expands to `v` (the TU may use
+    /// VEX encodings) or to nothing.  Only the x86-64 backend with AVX
+    /// answers `true`.
+    fn asm_vex_prefix_enabled(&self) -> bool {
+        false
+    }
+
+    /// Whether a condition-code output can be written directly to its byte
+    /// stack home, avoiding a temporary GPR for setcc.
+    fn can_store_condition_code_output_direct(&self, _ptr: &Value, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Last-resort scratch register when all non-excluded candidates are
+    /// exhausted and the constraint has no usable memory alternative.
+    fn fallback_scratch_reg(&mut self, _kind: &AsmOperandKind) -> String {
+        String::new()
+    }
+
+    /// Resolve memory operand addresses that require indirection (non-alloca pointers).
+    /// Returns `Some(reg)` when a scratch register was allocated to hold the address,
+    /// so subsequent memory operands in the same inline asm add it to `busy_regs`.
+    fn resolve_memory_operand(
+        &mut self,
+        _op: &mut AsmOperand,
+        _val: &Operand,
+        _excluded: &[String],
+    ) -> Option<String> {
+        None
+    }
+
+    /// Set up a memory operand for a register-to-memory fallback (e.g., "g" constraint
+    /// on i686 when all GP registers are exhausted). Unlike `setup_operand_metadata` for
+    /// Memory kind (which expects the value to be an address/pointer for "m" constraints),
+    /// this sets up a direct memory reference to the value's stack slot. For non-alloca
+    /// values, the slot holds the value directly at `offset(frame_pointer)`.
+    /// Constants are promoted to immediates instead.
+    fn setup_memory_fallback(&self, _op: &mut AsmOperand, _val: &Operand) {
+        // Default: no-op. Only i686 needs this because it's the only backend that
+        // can exhaust all GP registers. x86-64/ARM/RISC-V have enough registers.
+    }
+
+    /// Returns true if the given type requires a register pair for GP register constraints.
+    /// On i686, 64-bit types (I64/U64) need two 32-bit registers to represent a single value.
+    /// Defaults to false (most architectures have 64-bit GP registers).
+    fn needs_register_pair(&self, _ty: IrType) -> bool {
+        false
+    }
+
+    /// Reset scratch register allocation state (called at start of each inline asm).
+    fn reset_scratch_state(&mut self);
+
+    /// Check whether a constant value fits the immediate constraint range for a given
+    /// constraint string. Backends can override this to provide architecture-specific
+    /// immediate ranges. The default implementation uses x86 semantics.
+    ///
+    /// For example, on RISC-V the 'K' constraint means a 5-bit unsigned CSR immediate
+    /// (0-31), while on x86 it means 0-255. Without this override, the shared framework
+    /// would incorrectly promote values like 128 to immediates on RISC-V.
+    fn constant_fits_immediate(&self, constraint: &str, value: i64) -> bool {
+        constant_fits_immediate_constraint(constraint, value)
+    }
+}
+
+/// Check whether a constraint string contains an immediate alternative character.
+/// Used by both IR lowering (to decide whether to try constant evaluation) and
+/// the shared inline asm framework (to promote GpReg operands to Immediate when
+/// the input is a compile-time constant).
+///
+/// This covers the architecture-neutral immediate constraint letters ('I', 'i', 'n')
+/// and the RISC-V 'K' constraint (5-bit unsigned CSR immediate, used in "rK" for
+/// csrw/csrs/csrc instructions). Without recognizing 'K' here, the IR lowering
+/// won't attempt constant evaluation for "rK" constraints, causing values like 0
+/// to be materialized through stack spills instead of as bare immediates.
+/// Other architecture-specific immediate letters (e.g., x86 'N', 'e') are handled
+/// separately by each backend's `classify_constraint`.
+pub fn constraint_has_immediate_alt(constraint: &str) -> bool {
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+    // Named tied operands ("[name]") don't have immediates
+    if stripped.starts_with('[') && stripped.ends_with(']') {
+        return false;
+    }
+    stripped.chars().any(|c| matches!(c, 'I' | 'i' | 'n' | 'K'))
+}
+
+/// Check whether a constant value fits the immediate constraint range for a given
+/// multi-alternative constraint string. For example, x86 "Ir" with value 602 should
+/// NOT be promoted to immediate (602 > 31), but "Ir" with value 5 should (5 <= 31).
+///
+/// x86 immediate constraint ranges (from GCC docs):
+///   'i' - any integer constant (always fits)
+///   'n' - any integer constant (always fits, same as 'i' for our purposes)
+///   'I' - 0..31 (for shift counts / bit positions)
+///   'N' - 0..255 (unsigned byte)
+///   'e' - -(2^31)..((2^31)-1) (signed 32-bit)
+///   'K' - 0..0xFF (same as N for our purposes)
+///   'M' - 0..3 (for lea scale)
+///   'L' - 0xFF, 0xFFFF (mask constants)
+///   'J' - 0..0xFFFFFFFF (unsigned 32-bit)
+///   'O' - 0..127 (unsigned 7-bit)
+///
+/// If the constraint contains 'i' or 'n', any constant fits. Otherwise, the value
+/// must fit the range of at least one uppercase immediate letter present.
+pub fn constant_fits_immediate_constraint(constraint: &str, value: i64) -> bool {
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+    // If constraint has 'i' or 'n', any constant value is accepted
+    if stripped.contains('i') || stripped.contains('n') {
+        return true;
+    }
+    // Check each uppercase immediate letter to see if value fits its range
+    for ch in stripped.chars() {
+        let fits = match ch {
+            'I' => (0..=31).contains(&value),
+            'N' | 'K' => (0..=255).contains(&value),
+            'e' | 'E' => (-(1i64 << 31)..=((1i64 << 31) - 1)).contains(&value),
+            'M' => (0..=3).contains(&value),
+            'J' => (0..=0xFFFF_FFFF).contains(&value),
+            'L' => value == 0xFF || value == 0xFFFF,
+            'O' => (0..=127).contains(&value),
+            'G' | 'H' => false, // floating-point immediate constraints, not integer
+            _ => continue,      // not an immediate constraint letter
+        };
+        if fits {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check whether a constraint string contains a memory alternative character.
+/// Handles both single-character ("m") and multi-character constraints ("rm", "mq").
+/// Also recognizes "Q" which is an AArch64-specific memory constraint meaning
+/// "a memory address with a single base register" (used for atomic ops like ldaxr/stlxr).
+pub fn constraint_has_memory_alt(constraint: &str) -> bool {
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+    // Named tied operands ("[name]") are not memory constraints
+    if stripped.starts_with('[') && stripped.ends_with(']') {
+        return false;
+    }
+    // 'g' means "general operand" (register, memory, or immediate) — includes memory
+    stripped.chars().any(|c| c == 'm' || c == 'Q' || c == 'g')
+}
+
+/// Check whether a constraint is memory-only (has memory alternative but no register
+/// alternative). For constraints like "rm", "qm", "g" that allow both register and
+/// memory, returns false — the backend will prefer registers, so the IR lowering
+/// should provide a value (not an address). Only pure "m"/"o"/"V"/"Q" constraints need
+/// the address for memory operand formatting.
+/// Note: "Q" is AArch64-specific meaning "single base register memory address" and is
+/// always memory-only (no register alternative), used for atomic ops like ldaxr/stlxr.
+/// The `is_arm` flag controls whether 'Q' is treated as a memory constraint:
+/// - On AArch64: 'Q' = memory-only (single base register addressing)
+/// - On x86/x86-64: 'Q' = legacy byte register (rax/rbx/rcx/rdx with %h form)
+/// - On RISC-V: 'Q' is not a standard constraint
+pub fn constraint_is_memory_only(constraint: &str, is_arm: bool) -> bool {
+    let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+    // Named tied operands ("[name]") are never memory-only
+    if stripped.starts_with('[') && stripped.ends_with(']') {
+        return false;
+    }
+    // 'Q' is memory-only ONLY on AArch64; on x86 it's a register constraint.
+    let has_mem = stripped
+        .chars()
+        .any(|c| matches!(c, 'm' | 'o' | 'V' | 'p') || (c == 'Q' && is_arm));
+    if !has_mem {
+        return false;
+    }
+    // Check for any register alternative (GP, FP, or specific register)
+    let has_reg = stripped.chars().any(|c| {
+        matches!(
+            c,
+            'r' | 'q' | 'R' | 'l' |           // GP register
+        'g' |                              // general (reg + mem + imm)
+        'x' | 'v' | 'Y' |                 // FP register
+        'a' | 'b' | 'c' | 'd' | 'S' | 'D' // specific register
+        )
+    });
+    // Also check for tied operand (digits) — those get a register
+    let has_tied = stripped.chars().any(|c| c.is_ascii_digit());
+    !has_reg && !has_tied
+}
+
+/// Check whether a constraint requires an address (lvalue) rather than a value (rvalue).
+/// This covers both memory-only constraints (m, o, V, Q) and address constraints.
+///
+/// The `is_riscv` flag controls whether "A" is treated as an address constraint:
+/// - On RISC-V, "A" means "address operand for AMO/LR/SC instructions" — the inline
+///   asm template receives the address in a register, formatted as "(reg)".
+/// - On x86, "A" means the accumulator register (rax/eax:edx), NOT an address.
+///
+/// This is used by the IR lowering to decide whether to call lower_lvalue() (getting
+/// the address) or lower_expr() (loading the value) for inline asm input operands.
+pub fn constraint_needs_address(constraint: &str, is_riscv: bool, is_arm: bool) -> bool {
+    if constraint_is_memory_only(constraint, is_arm) {
+        return true;
+    }
+    // RISC-V "A" constraint: address for AMO/LR/SC instructions
+    if is_riscv {
+        let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+        if stripped == "A" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Normalize an inline-asm clobber or explicit register name to its bare register token.
+///
+/// GCC-style inline asm commonly accepts any of these spellings in clobber lists:
+/// - `"rcx"`
+/// - `"%rcx"`
+/// - `"~{rcx}"`
+/// - `"{rcx}"`
+///
+/// Internally, scratch allocation and callee-saved scanning operate on bare
+/// register names (`rcx`, `r12`, `ebx`, ...). If `%`/`{}` wrappers are left in
+/// place, the allocator can accidentally assign a supposedly-clobbered register
+/// to an output or input operand. FFmpeg's CABAC inline asm uses `%rcx` clobbers
+/// through `"%" FF_REG_c`, so this normalization is correctness-critical.
+#[inline]
+pub fn normalize_inline_asm_reg_name(name: &str) -> &str {
+    let trimmed = name.trim();
+    let no_percent = trimmed.trim_start_matches('%');
+    if let Some(inner) = no_percent
+        .strip_prefix("~{")
+        .and_then(|s| s.strip_suffix('}'))
+    {
+        inner
+    } else if let Some(inner) = no_percent
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+    {
+        inner
+    } else {
+        no_percent
+    }
+}
+
+/// Expand GCC dialect alternatives in an inline assembly template string.
+///
+/// GCC inline assembly supports dialect alternatives: `{att|intel}` where the
+/// first alternative is AT&T syntax and the second is Intel syntax. Since our
+/// compiler always emits AT&T syntax, we select the first alternative from each
+/// `{...|...}` group.
+///
+/// Examples:
+///   `pushf{l|d}`           -> `pushfl`
+///   `mov{l}\t{%0, %1|%1, %0}` -> `movl\t%0, %1`
+///   `pop{l}\t%0`           -> `popl\t%0`
+///   `no_braces`            -> `no_braces`    (unchanged)
+///
+/// This handles the syntax used in GCC's `<cpuid.h>` for i686 CPUID detection.
+pub fn expand_dialect_alternatives(template: &str) -> Cow<'_, str> {
+    // Fast path: if there are no braces, return as-is
+    if !template.contains('{') {
+        return Cow::Borrowed(template);
+    }
+
+    let mut result = String::with_capacity(template.len());
+    let chars: Vec<char> = template.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            // GCC escape sequence %{ -> literal '{'
+            result.push('{');
+            i += 2;
+        } else if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == '}' {
+            // GCC escape sequence %} -> literal '}'
+            result.push('}');
+            i += 2;
+        } else if chars[i] == '{' {
+            // Could be a dialect alternatives group {att|intel} or literal braces
+            // used in ARM NEON instructions like ld1 {v0.4s}, [x0].
+            // Scan ahead to find matching '}' and check for '|'.
+            let brace_start = i;
+            i += 1; // skip '{'
+            let start = i;
+            let mut depth = 1;
+            let mut pipe_pos = None;
+            // Find the matching '}' and the '|' separator
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '{' {
+                    depth += 1;
+                } else if chars[i] == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                } else if chars[i] == '|' && depth == 1 && pipe_pos.is_none() {
+                    pipe_pos = Some(i);
+                }
+                i += 1;
+            }
+            if let Some(p) = pipe_pos {
+                // This IS a dialect alternatives group: {alt1|alt2}
+                // Extract the first alternative (before '|')
+                let alt: String = chars[start..p].iter().collect();
+                result.push_str(&alt);
+            } else {
+                // No pipe found: these are literal braces (e.g., ARM NEON {v0.4s}).
+                // Preserve the braces and their content as-is.
+                let content: String = chars[brace_start..i].iter().collect();
+                result.push_str(&content);
+                if i < chars.len() && chars[i] == '}' {
+                    result.push('}');
+                }
+            }
+            if i < chars.len() && chars[i] == '}' {
+                i += 1; // skip '}'
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    Cow::Owned(result)
+}
+
+/// Shared inline assembly emission logic. All four backends call this from their
+/// `emit_inline_asm` implementation, providing an `InlineAsmEmitter` to handle
+/// arch-specific details.
+pub fn emit_inline_asm_common(
+    emitter: &mut dyn InlineAsmEmitter,
+    template: &str,
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+    clobbers: &[String],
+    operand_types: &[IrType],
+    goto_labels: &[(String, BlockId)],
+    input_symbols: &[Option<String>],
+    markers: Option<(&'static str, &'static str)>,
+) {
+    emit_inline_asm_common_impl(
+        emitter,
+        template,
+        outputs,
+        inputs,
+        clobbers,
+        operand_types,
+        goto_labels,
+        input_symbols,
+        markers,
+        &[],
+    );
+}
+
+/// Whether a constraint writes its operand back (`=`, `=r`, `+r`, `=&m`, ...).
+///
+/// `+` implies both a read and a write, so it is an output for every purpose
+/// that only asks "is this operand stored after the template?".
+fn constraint_writes_operand(constraint: &str) -> bool {
+    constraint.contains('=') || constraint.contains('+')
+}
+
+/// True when an inline asm template assembles to no instructions at all.
+///
+/// Only whitespace and statement separators count as empty. A comment, a label
+/// or a directive keeps the template non-empty, so every conservative answer
+/// elsewhere stays in force for anything that is not provably inert.
+pub fn inline_asm_template_has_no_instructions(template: &str) -> bool {
+    template.chars().all(|c| c.is_whitespace() || c == ';')
+}
+
+/// True when an inline asm can neither destroy nor stage a register: no goto
+/// labels, a template that assembles to nothing after dialect expansion, and
+/// every operand constraint memory-only (`m`/`o`/`V`, modifiers aside) or
+/// immediate-only.
+///
+/// This is the single register-effect contract between liveness
+/// (`instruction_is_call_point`) and the emitter: whenever it holds, the
+/// emitter returns before staging anything, so liveness may keep values in
+/// caller-saved registers across the statement. A register operand is staged
+/// even under an empty template -- `asm("" : "+d"(y))` loads `y` into %rdx and
+/// `asm("" : "=r"(x) : "0"(x))` (OPTIMIZER_HIDE_VAR) must deliver the tied
+/// value -- so any other constraint, a register variable (`{rdx}`), a tie or a
+/// mixed class like `rm`, keeps the statement a call point. The list is a
+/// whitelist on purpose: a constraint this function does not recognise is
+/// treated as a register.
+pub fn inline_asm_is_register_inert<'a>(
+    template: &str,
+    constraints: impl IntoIterator<Item = &'a str>,
+    has_goto_labels: bool,
+) -> bool {
+    fn memory_only(constraint: &str) -> bool {
+        let class = constraint.trim_start_matches(['=', '+', '&', '%']);
+        !class.is_empty() && class.chars().all(|c| matches!(c, 'm' | 'o' | 'V'))
+    }
+    !has_goto_labels
+        && inline_asm_template_has_no_instructions(&expand_dialect_alternatives(template))
+        && constraints
+            .into_iter()
+            .all(|c| memory_only(c) || constraint_is_immediate_only(c))
+}
+
+pub fn emit_inline_asm_common_impl(
+    emitter: &mut dyn InlineAsmEmitter,
+    template: &str,
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+    clobbers: &[String],
+    operand_types: &[IrType],
+    goto_labels: &[(String, BlockId)],
+    input_symbols: &[Option<String>],
+    markers: Option<(&'static str, &'static str)>,
+    seg_overrides: &[AddressSpace],
+) {
+    // The dialect expansion decides whether any instruction exists at all.
+    let dialect_expanded = expand_dialect_alternatives(template);
+    let template_is_empty = inline_asm_template_has_no_instructions(&dialect_expanded);
+
+    emitter.reset_scratch_state();
+
+    // An asm-goto branch bypasses the normal post-template output stores.
+    // Give each possible target an out-of-line edge block when any output
+    // still needs materializing. Branch-only condition outputs have a proven
+    // empty store, so they keep the original direct target (and avoid an
+    // unnecessary trampoline jump). Asms without outputs also retain their
+    // direct labels, preserving static-branch/jump-table shapes.
+    let has_materialized_outputs = outputs.iter().any(|(constraint, ptr, _)| {
+        (constraint.contains('=') || constraint.contains('+'))
+            && !emitter
+                .asm_state()
+                .asm_cc_branch_output_ptrs
+                .contains(&ptr.0)
+    });
+    let mut emitted_goto_labels = goto_labels.to_vec();
+    let mut asm_goto_trampolines = Vec::new();
+    if has_materialized_outputs && !goto_labels.is_empty() {
+        emitted_goto_labels.clear();
+        for (name, target) in goto_labels {
+            let label = emitter.asm_state().fresh_synthetic_block_id();
+            emitted_goto_labels.push((name.clone(), label));
+            asm_goto_trampolines.push((label, *target));
+        }
+    }
+
+    // Phase 1: Classify all operands and assign registers
+    let (mut operands, input_tied_to) = classify_all_operands(emitter, outputs, inputs);
+    // Pre-populate operand types early so assign_scratch_registers can use them
+    // for register pair decisions on i686 (64-bit types need two 32-bit registers).
+    for (i, ty) in operand_types.iter().enumerate() {
+        if i < operands.len() {
+            operands[i].operand_type = *ty;
+        }
+    }
+    resolve_symbols_and_immediates(&mut operands, outputs, input_symbols);
+    let specific_regs = collect_excluded_registers(&operands, clobbers);
+    // Which operands the template prints through a byte view. Computed from the
+    // dialect-expanded text, before any register is assigned, because `%b`/`%h`
+    // are the only place that requirement is written down -- the constraint
+    // string does not carry it.
+    let views = operand_reg_views(&dialect_expanded, &operands);
+    assign_scratch_registers(
+        emitter,
+        &mut operands,
+        &input_tied_to,
+        &specific_regs,
+        outputs,
+        inputs,
+        &views,
+    );
+    // An empty template assembles to nothing, so it stages nothing either: no
+    // operand address to resolve into a scratch register, no input to load, no
+    // output to write back. That only holds when no operand names a REGISTER —
+    // `asm("" : "=r"(x) : "0"(x))` (the kernel's OPTIMIZER_HIDE_VAR) still has
+    // to deliver the tied value into the output register, because the source
+    // relies on the output being a fresh location holding that value. Memory
+    // and immediate operands name no register at all, so for those the whole
+    // staging path is dead work: it reserved a scratch per memory operand and,
+    // when the busy set left none free, spilled the address to a frame slot and
+    // reloaded it after the block — a store/load pair in the loop body (see
+    // `tests/regression/check_asm_barrier_no_spill.sh`).
+    //
+    // Liveness relies on this return: `inline_asm_is_register_inert` is the
+    // condition under which it stops treating the statement as a call point,
+    // so the emitter must stage nothing whenever that predicate holds (the
+    // second disjunct makes the implication structural, not a property of
+    // each target's constraint classifier).
+    if template_is_empty
+        && goto_labels.is_empty()
+        && (operands
+            .iter()
+            .all(|op| matches!(op.kind, AsmOperandKind::Memory | AsmOperandKind::Immediate))
+            || inline_asm_is_register_inert(
+                template,
+                outputs
+                    .iter()
+                    .map(|(c, ..)| c.as_str())
+                    .chain(inputs.iter().map(|(c, ..)| c.as_str())),
+                false,
+            ))
+    {
+        return;
+    }
+    resolve_tied_and_types(&mut operands, &input_tied_to, outputs, operand_types);
+    let (_, gcc_to_internal) = finalize_operands_and_build_gcc_map(
+        emitter,
+        &mut operands,
+        outputs,
+        inputs,
+        &specific_regs,
+        seg_overrides,
+    );
+
+    // Phase 2: Load input values into their assigned registers
+    load_inputs(emitter, &operands, outputs, inputs);
+
+    // Phase 3: Substitute operand references in template and emit
+    // First, expand GCC dialect alternatives {att|intel} -> att
+    let expanded = expand_dialect_alternatives(template);
+    let lines: Vec<&str> = expanded.split('\n').collect();
+    let body_nonempty = !lines.iter().all(|l| l.trim().is_empty());
+    if let Some((open, _)) = markers {
+        if body_nonempty {
+            emitter.asm_state().emit_fmt(format_args!("{}", open));
+        }
+    }
+    for line in &lines {
+        let line = line.trim().trim_start_matches('\t').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let resolved = emitter.substitute_template_line(
+            line,
+            &operands,
+            &gcc_to_internal,
+            operand_types,
+            &emitted_goto_labels,
+        );
+        // GCC mnemonic-prefix modifiers (glibc math uses `%vstmxcsr`,
+        // `%vldmxcsr`, `%vdivss %1, %d0` and `%xbegin`):
+        //   `%v` prints `v` when the TU has AVX and nothing otherwise (i386
+        //        `print_operand` case 'v': "print VEX prefix if TARGET_AVX"),
+        //        so one template yields `vdivss …` or `divss …`;
+        //   `%x` prints nothing on x86 (it is the "print operand in
+        //        V4SFmode" hint; a bare `%x` before a mnemonic is a no-op).
+        // GAS rejects both spellings in the final .s ("junk after
+        // expression").  `%x` is kept when it starts a register (%xmm0..);
+        // no register name starts with `%v`.  The `%d` duplicate modifier
+        // follows the same AVX switch (see x86_common::emit_operand_common).
+        let stripped = if resolved.starts_with("%v") {
+            if emitter.asm_vex_prefix_enabled() {
+                resolved.replacen("%v", "v", 1)
+            } else {
+                resolved.replacen("%v", "", 1)
+            }
+        } else if resolved.starts_with("%x")
+            && !resolved.starts_with("%xmm")
+            && !resolved.starts_with("%ymm")
+        {
+            resolved.replacen("%x", "", 1)
+        } else {
+            resolved
+        };
+        // setcc instructions require an 8-bit destination register. GCC
+        // substitutes the low-8 name for "=r" outputs (glibc's x87 compare
+        // idioms: `fnstsw %ax; ...; sete %0` with "=r"); GAS 2.47 rejects a
+        // 64-bit name (or, worse, EVEX-encodes it as APX `setzue`).
+        let final_line = if is_setcc_line(&stripped) {
+            to_8bit_setcc_dest(&stripped)
+        } else {
+            stripped
+        };
+        emitter
+            .asm_state()
+            .emit_fmt(format_args!("    {}", final_line));
+    }
+    if let Some((_, close)) = markers {
+        if body_nonempty {
+            emitter.asm_state().emit_fmt(format_args!("{}", close));
+        }
+    }
+
+    // Phase 4: Store output register values back to their stack slots
+    let all_output_regs: Vec<&str> = outputs
+        .iter()
+        .enumerate()
+        .filter(|(_, (c, _, _))| c.contains('=') || c.contains('+'))
+        .map(|(i, _)| operands[i].reg.as_str())
+        .collect();
+    for (i, (constraint, ptr, _)) in outputs.iter().enumerate() {
+        if constraint.contains('=') || constraint.contains('+') {
+            emitter.store_output_from_reg(&operands[i], ptr, constraint, &all_output_regs);
+        }
+    }
+    if !asm_goto_trampolines.is_empty() {
+        let trampoline_outputs: Vec<_> = outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, (constraint, _, _))| constraint_writes_operand(constraint))
+            .map(|(i, (constraint, ptr, _))| (operands[i].clone(), *ptr, constraint.clone()))
+            .collect();
+        let pending = &mut emitter.asm_state().pending_asm_goto_trampolines;
+        pending.extend(asm_goto_trampolines.into_iter().map(|(label, target)| {
+            crate::backend::state::PendingAsmGotoTrampoline {
+                label,
+                target,
+                outputs: trampoline_outputs.clone(),
+            }
+        }));
+    }
+}
+
+/// Phase 1a: Classify all output and input operands, returning the operand
+/// vector and the input-tied-to mapping.
+fn classify_all_operands(
+    emitter: &mut dyn InlineAsmEmitter,
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+) -> (Vec<AsmOperand>, Vec<Option<usize>>) {
+    let total_operands = outputs.len() + inputs.len();
+    let mut operands: Vec<AsmOperand> = Vec::with_capacity(total_operands);
+
+    // Classify outputs
+    for (constraint, ptr, name) in outputs {
+        let kind = emitter.classify_constraint(constraint);
+        let mut op = AsmOperand::new(kind, name.clone());
+        op.constraint = constraint.clone();
+        if let AsmOperandKind::Specific(ref reg) = op.kind {
+            op.reg = reg.clone();
+        }
+        let val = Operand::Value(*ptr);
+        emitter.setup_operand_metadata(&mut op, &val, true);
+        operands.push(op);
+    }
+
+    // Track which inputs are tied (to avoid assigning scratch regs)
+    let mut input_tied_to: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+
+    // Classify inputs
+    for (constraint, val, name) in inputs {
+        // Handle named matching constraints: `[name]` ties this input to the
+        // output declared with that name (GCC's matching-constraint syntax).
+        // The shared grammar also accepts the measured suffix/repeated forms
+        // (`[sum]r`, `[sum][sum]`, `[sum]r[sum]`); treating only the exact
+        // `[name]` spelling as a tie let the suffix letters fall through the
+        // target classifier and allocate an unrelated register.
+        //
+        // A named tie is Tied(idx) even when the output's own constraint is
+        // something other than a plain register: the input inherits whatever
+        // the output was allocated, which is exactly GCC's meaning.
+        let named_tie = crate::common::asm_constraints::named_matching_names(constraint)
+            .ok()
+            .flatten()
+            .and_then(|names| {
+                names.iter().find_map(|tied_name| {
+                    outputs
+                        .iter()
+                        .position(|(_, _, oname)| oname.as_deref() == Some(*tied_name))
+                })
+            });
+        let kind = match named_tie {
+            Some(idx) => AsmOperandKind::Tied(idx),
+            // Unreferable or malformed name: keep a register kind so the back
+            // end still produces *some* well-formed instruction; the parser
+            // has already reported GCC's error, so no code is emitted.
+            None => emitter.classify_constraint(constraint),
+        };
+        let mut op = AsmOperand::new(kind.clone(), name.clone());
+        op.constraint = constraint.clone();
+        if let AsmOperandKind::Specific(ref reg) = op.kind {
+            op.reg = reg.clone();
+        }
+        if let AsmOperandKind::Tied(idx) = &kind {
+            input_tied_to.push(Some(*idx));
+        } else {
+            input_tied_to.push(None);
+        }
+        emitter.setup_operand_metadata(&mut op, val, false);
+
+        // For multi-alternative constraints (e.g., "Ir", "ri", "In") that were classified
+        // as GpReg but have a constant input value, promote to Immediate so the value
+        // is emitted as $value instead of loaded into a register. Only do this when
+        // the constraint actually contains an immediate alternative character AND the
+        // constant value fits the range of that immediate constraint.
+        if matches!(op.kind, AsmOperandKind::GpReg | AsmOperandKind::QReg) {
+            if let Operand::Const(c) = val {
+                if let Some(v) = c.to_i64() {
+                    if emitter.constant_fits_immediate(constraint, v) {
+                        op.imm_value = Some(v);
+                        op.kind = AsmOperandKind::Immediate;
+                    }
+                }
+            }
+        }
+
+        // For pure immediate constraints ("i", "n", etc.) that were classified directly
+        // as Immediate by classify_constraint, populate imm_value from the constant
+        // operand. Without this, the imm_value stays None and gets replaced with 0
+        // in resolve_symbols_and_immediates, causing incorrect assembly output
+        // (e.g., `bic x9, x10, 0` instead of `bic x9, x10, 36028797018963968`).
+        if matches!(op.kind, AsmOperandKind::Immediate) && op.imm_value.is_none() {
+            if let Operand::Const(c) = val {
+                if let Some(v) = c.to_i64() {
+                    op.imm_value = Some(v);
+                }
+            }
+        }
+
+        // For pure immediate-only constraints ("i", "n", etc.) that are still GpReg/QReg
+        // because the operand is a Value (not a Const), retain the historical
+        // placeholder for internal template paths. It is NOT a valid emitted
+        // value: an address-taken always_inline body is a real callable
+        // definition, not disposable DCE input. The driver therefore rejects
+        // every surviving unresolved immediate before this backend is entered.
+        // Without the placeholder, targets would load the value into a
+        // register and substitute its name into data directives.
+        if matches!(op.kind, AsmOperandKind::GpReg | AsmOperandKind::QReg)
+            && matches!(val, Operand::Value(_))
+            && constraint_is_immediate_only(constraint)
+        {
+            op.imm_value = Some(0);
+            op.kind = AsmOperandKind::Immediate;
+        }
+
+        operands.push(op);
+    }
+
+    (operands, input_tied_to)
+}
+
+/// Phase 1b: Resolve input symbol names and handle unresolved immediates.
+fn resolve_symbols_and_immediates(
+    operands: &mut [AsmOperand],
+    outputs: &[(String, Value, Option<String>)],
+    input_symbols: &[Option<String>],
+) {
+    let num_outputs = outputs.len();
+
+    // Populate symbol names for input operands from input_symbols.
+    for (i, sym) in input_symbols.iter().enumerate() {
+        let op_idx = num_outputs + i;
+        if op_idx < operands.len() {
+            if let Some(s) = sym {
+                operands[op_idx].imm_symbol = Some(s.clone());
+                // Promote to Immediate so the symbol is emitted directly
+                if matches!(
+                    operands[op_idx].kind,
+                    AsmOperandKind::GpReg | AsmOperandKind::QReg
+                ) {
+                    operands[op_idx].kind = AsmOperandKind::Immediate;
+                }
+            }
+        }
+    }
+
+    // For "+" read-write constraints, copy imm_symbol from synthetic inputs to outputs
+    {
+        let mut plus_idx = 0;
+        for (i, (constraint, _, _)) in outputs.iter().enumerate() {
+            if constraint.contains('+') {
+                let plus_input_idx = num_outputs + plus_idx;
+                if plus_input_idx < operands.len() {
+                    if let Some(ref sym) = operands[plus_input_idx].imm_symbol.clone() {
+                        operands[i].imm_symbol = Some(sym.clone());
+                    }
+                }
+                plus_idx += 1;
+            }
+        }
+    }
+
+    // For Immediate operands that have neither an imm_value nor an imm_symbol,
+    // resolve to either a placeholder $0 or fall back to GpReg.
+    for op in operands.iter_mut() {
+        if matches!(op.kind, AsmOperandKind::Immediate)
+            && op.imm_value.is_none()
+            && op.imm_symbol.is_none()
+        {
+            if constraint_is_immediate_only(&op.constraint) {
+                op.imm_value = Some(0);
+            } else {
+                op.kind = AsmOperandKind::GpReg;
+            }
+        }
+    }
+}
+
+fn x86_32bit_alias_of_64bit(canonical_64: &str) -> Option<&'static str> {
+    match canonical_64 {
+        "rax" => Some("eax"),
+        "rbx" => Some("ebx"),
+        "rcx" => Some("ecx"),
+        "rdx" => Some("edx"),
+        "rsi" => Some("esi"),
+        "rdi" => Some("edi"),
+        _ => None,
+    }
+}
+
+/// Phase 1c: Collect registers excluded from scratch allocation (specific-register
+/// constraints and clobber registers).
+fn collect_excluded_registers(operands: &[AsmOperand], clobbers: &[String]) -> Vec<String> {
+    let mut specific_regs: Vec<String> = Vec::new();
+    for op in operands {
+        if matches!(op.kind, AsmOperandKind::Specific(_)) {
+            for r in [&op.reg, &op.reg_hi] {
+                if !r.is_empty() && !specific_regs.iter().any(|s| s == r) {
+                    specific_regs.push(r.clone());
+                }
+                if let Some(canonical) = x86_normalize_reg_to_64bit(r) {
+                    if !specific_regs.iter().any(|s| s == canonical.as_ref()) {
+                        specific_regs.push(canonical.clone().into_owned());
+                    }
+                    if let Some(alias32) = x86_32bit_alias_of_64bit(&canonical) {
+                        if !specific_regs.iter().any(|s| s == alias32) {
+                            specific_regs.push(alias32.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for clobber in clobbers {
+        let clobber = normalize_inline_asm_reg_name(clobber);
+        if clobber == "cc" || clobber == "memory" {
+            continue;
+        }
+        if !specific_regs.iter().any(|r| r == clobber) {
+            specific_regs.push(clobber.to_string());
+        }
+        // ARM64: wN and xN are the same physical register
+        if let Some(suffix) = clobber.strip_prefix('w') {
+            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                specific_regs.push(format!("x{}", suffix));
+            }
+        } else if let Some(suffix) = clobber.strip_prefix('x') {
+            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                specific_regs.push(format!("w{}", suffix));
+            }
+        } else if let Some(suffix) = clobber.strip_prefix('r') {
+            // GCC treats r0-r30 as aliases for x0-x30 on AArch64.
+            if suffix.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(n) = suffix.parse::<u32>() {
+                    if n <= 30 {
+                        specific_regs.push(format!("x{}", n));
+                        specific_regs.push(format!("w{}", n));
+                    }
+                }
+            }
+        }
+        // ARM64: v/d/s/q registers are all views of the same physical FP/SIMD register.
+        // Add all aliases so scratch allocation avoids conflicts.
+        let fp_suffix = clobber
+            .strip_prefix('v')
+            .or_else(|| clobber.strip_prefix('d'))
+            .or_else(|| clobber.strip_prefix('s'))
+            .or_else(|| clobber.strip_prefix('q'));
+        if let Some(suffix) = fp_suffix {
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
+                for prefix in &["v", "d", "s", "q"] {
+                    let alias = format!("{}{}", prefix, suffix);
+                    if !specific_regs.contains(&alias) {
+                        specific_regs.push(alias);
+                    }
+                }
+            }
+        }
+        // x86-64 / i686: normalize sub-register names to 64-bit and 32-bit canonical forms
+        if let Some(canonical) = x86_normalize_reg_to_64bit(clobber) {
+            if let Some(alias32) = x86_32bit_alias_of_64bit(&canonical) {
+                if !specific_regs.iter().any(|r| r == alias32) {
+                    specific_regs.push(alias32.to_string());
+                }
+            }
+            let canonical = canonical.into_owned();
+            if canonical != clobber && !specific_regs.iter().any(|r| r == &canonical) {
+                specific_regs.push(canonical);
+            }
+        }
+    }
+
+    specific_regs
+}
+
+/// Phase 1d: Assign scratch registers to operands that need them, with
+/// memory fallback when registers are exhausted.
+fn assign_scratch_registers(
+    emitter: &mut dyn InlineAsmEmitter,
+    operands: &mut [AsmOperand],
+    input_tied_to: &[Option<usize>],
+    specific_regs: &[String],
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+    views: &[RegView],
+) {
+    let total_operands = outputs.len() + inputs.len();
+
+    // Count synthetic "+" inputs. These are the first `num_plus` entries in the
+    // inputs array, one per output that has a "+" constraint. They will be
+    // overwritten by finalize_operands_and_build_gcc_map with the output's
+    // register, so we must NOT allocate scratch registers for them (doing so
+    // would waste the limited register pool).
+    let num_plus = outputs.iter().filter(|(c, _, _)| c.contains('+')).count();
+
+    // First pass: assign registers to output operands only.
+    // Build a dynamic exclusion list that grows as registers are assigned,
+    // so the wraparound fallback never reuses an already-assigned register.
+    let mut output_excluded: Vec<String> = specific_regs.to_vec();
+    for i in 0..outputs.len() {
+        assign_one_scratch(
+            emitter,
+            operands,
+            input_tied_to,
+            &output_excluded,
+            outputs,
+            inputs,
+            views,
+            i,
+            num_plus,
+        );
+        // Track the just-assigned register so it won't be reused by the
+        // next output operand when the scratch pool wraps around.
+        if !operands[i].reg.is_empty() {
+            let reg = &operands[i].reg;
+            if !output_excluded.contains(reg) {
+                output_excluded.push(reg.clone());
+            }
+            if !operands[i].reg_hi.is_empty() {
+                let reg_hi = &operands[i].reg_hi;
+                if !output_excluded.contains(reg_hi) {
+                    output_excluded.push(reg_hi.clone());
+                }
+            }
+        }
+    }
+
+    // Collect registers assigned to early-clobber ("&") and read-write ("+")
+    // outputs. Early-clobber means the output is written before all inputs are
+    // consumed. Read-write ("+") means the register is pre-loaded with an input
+    // value before the asm executes. In both cases, input operands must NOT
+    // share a register with the output, or the input loading phase would
+    // overwrite the pre-loaded value.
+    let mut input_excluded: Vec<String> = specific_regs.to_vec();
+    for i in 0..outputs.len() {
+        if (outputs[i].0.contains('&') || outputs[i].0.contains('+')) && !operands[i].reg.is_empty()
+        {
+            let reg = &operands[i].reg;
+            // Normalize to 64-bit canonical name for x86 (e.g., "ecx" -> "rcx")
+            let canonical = x86_normalize_reg_to_64bit(reg)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|| reg.clone());
+            if !input_excluded.contains(&canonical) {
+                input_excluded.push(canonical);
+            }
+            // Also exclude the register name as-is in case it's already canonical
+            // or a non-x86 target
+            if !input_excluded.contains(reg) {
+                input_excluded.push(reg.clone());
+            }
+            // Exclude high register of a register pair if present
+            if !operands[i].reg_hi.is_empty() {
+                let reg_hi = &operands[i].reg_hi;
+                if !input_excluded.contains(reg_hi) {
+                    input_excluded.push(reg_hi.clone());
+                }
+            }
+        }
+    }
+
+    // Second pass: assign registers to non-synthetic input operands using the
+    // extended exclusion list that includes early-clobber output registers.
+    // Also track assigned registers to avoid reuse when the pool wraps around.
+    for i in outputs.len()..total_operands {
+        assign_one_scratch(
+            emitter,
+            operands,
+            input_tied_to,
+            &input_excluded,
+            outputs,
+            inputs,
+            views,
+            i,
+            num_plus,
+        );
+        if !operands[i].reg.is_empty() {
+            let reg = &operands[i].reg;
+            if !input_excluded.contains(reg) {
+                input_excluded.push(reg.clone());
+            }
+            if !operands[i].reg_hi.is_empty() {
+                let reg_hi = &operands[i].reg_hi;
+                if !input_excluded.contains(reg_hi) {
+                    input_excluded.push(reg_hi.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Helper: assign a scratch register to a single operand at index `i`.
+fn assign_one_scratch(
+    emitter: &mut dyn InlineAsmEmitter,
+    operands: &mut [AsmOperand],
+    input_tied_to: &[Option<usize>],
+    excluded: &[String],
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+    views: &[RegView],
+    i: usize,
+    num_plus: usize,
+) {
+    if !operands[i].reg.is_empty() {
+        return;
+    }
+    if i < outputs.len() && matches!(operands[i].kind, AsmOperandKind::ConditionCode(_)) {
+        let ptr = &outputs[i].1;
+        let branch_only = emitter
+            .asm_state()
+            .asm_cc_branch_output_ptrs
+            .contains(&ptr.0);
+        if branch_only
+            || emitter.can_store_condition_code_output_direct(ptr, operands[i].operand_type)
+        {
+            // Branch-only outputs have no observable store. Other byte flag
+            // outputs can use setcc directly on their stack home. Neither case
+            // needs a temporary GPR, leaving the pool available to operands.
+            return;
+        }
+    }
+    match &operands[i].kind {
+        AsmOperandKind::Memory | AsmOperandKind::Immediate => {}
+        AsmOperandKind::Tied(_) => {}
+        AsmOperandKind::X87St0 => {
+            operands[i].reg = "st(0)".to_string();
+        }
+        AsmOperandKind::X87St1 => {
+            operands[i].reg = "st(1)".to_string();
+        }
+        kind => {
+            if i >= outputs.len() {
+                let input_idx = i - outputs.len();
+                if input_tied_to[input_idx].is_some() {
+                    return;
+                }
+                // Skip synthetic "+" inputs: they are the first `num_plus` entries
+                // in the inputs array and will get their registers from the
+                // corresponding output in finalize_operands_and_build_gcc_map.
+                if input_idx < num_plus {
+                    return;
+                }
+                if let Operand::Value(value) = &inputs[input_idx].1 {
+                    if let Some(home) = emitter.home_reg_name(value.0) {
+                        let compatible = match kind {
+                            AsmOperandKind::GpReg => {
+                                !home.starts_with("xmm") && !home.starts_with("st(")
+                            }
+                            AsmOperandKind::FpReg => home.starts_with("xmm"),
+                            AsmOperandKind::QReg => {
+                                matches!(home.as_str(), "rax" | "rcx" | "rdx" | "rbx")
+                            }
+                            _ => false,
+                        };
+                        let home_canonical = x86_normalize_reg_to_64bit(&home);
+                        let conflicts = excluded.iter().any(|reg| {
+                            reg == &home
+                                || match (
+                                    home_canonical.as_deref(),
+                                    x86_normalize_reg_to_64bit(reg).as_deref(),
+                                ) {
+                                    (Some(a), Some(b)) => a == b,
+                                    _ => false,
+                                }
+                        });
+                        if compatible
+                            && !conflicts
+                            && emitter.home_reg_usable_for_view(
+                                &home,
+                                views[i],
+                                operands[i].operand_type,
+                            )
+                        {
+                            // An already-fresh home is a valid register input.
+                            // Reuse it rather than copying the value to a
+                            // second scratch register.
+                            operands[i].reg = home;
+                            return;
+                        }
+                    }
+                }
+            }
+            let kind_clone = kind.clone();
+            let reg = emitter.assign_scratch_reg_for_view(
+                &kind_clone,
+                operands[i].operand_type,
+                views[i],
+                excluded,
+            );
+            if reg.is_empty() && constraint_has_memory_alt(&operands[i].constraint) {
+                if i < outputs.len() {
+                    let val = Operand::Value(outputs[i].1);
+                    emitter.setup_memory_fallback(&mut operands[i], &val);
+                } else {
+                    let input_idx = i - outputs.len();
+                    let val = inputs[input_idx].1;
+                    emitter.setup_memory_fallback(&mut operands[i], &val);
+                }
+                if !operands[i].mem_addr.is_empty() || operands[i].mem_offset != 0 {
+                    operands[i].kind = AsmOperandKind::Memory;
+                } else {
+                    operands[i].reg = emitter.fallback_scratch_reg(&kind_clone);
+                }
+            } else {
+                let assigned = if reg.is_empty() {
+                    emitter.fallback_scratch_reg(&kind_clone)
+                } else {
+                    reg
+                };
+                operands[i].reg = assigned;
+                // For 64-bit register pairs on 32-bit architectures (i686),
+                // allocate a second GP register for the high 32 bits.
+                if matches!(kind_clone, AsmOperandKind::GpReg)
+                    && emitter.needs_register_pair(operands[i].operand_type)
+                {
+                    let mut pair_excluded = excluded.to_vec();
+                    if !operands[i].reg.is_empty() && !pair_excluded.contains(&operands[i].reg) {
+                        pair_excluded.push(operands[i].reg.clone());
+                    }
+                    let mut reg_hi = emitter.assign_scratch_reg(&kind_clone, &pair_excluded);
+                    if reg_hi.is_empty() {
+                        reg_hi = emitter.fallback_scratch_reg(&kind_clone);
+                    }
+                    operands[i].reg_hi = reg_hi;
+                }
+            }
+        }
+    }
+}
+
+/// Phase 1e: Resolve tied operands and populate operand types.
+fn resolve_tied_and_types(
+    operands: &mut [AsmOperand],
+    input_tied_to: &[Option<usize>],
+    outputs: &[(String, Value, Option<String>)],
+    operand_types: &[IrType],
+) {
+    let total_operands = operands.len();
+    for i in 0..total_operands {
+        let tied_target = if let AsmOperandKind::Tied(tied_to) = operands[i].kind {
+            Some(tied_to)
+        } else if i >= outputs.len() {
+            let input_idx = i - outputs.len();
+            if operands[i].reg.is_empty() {
+                input_tied_to[input_idx]
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(target) = tied_target {
+            if target < operands.len() {
+                let source = operands[target].clone();
+                operands[i].copy_metadata_from(&source);
+            }
+        }
+    }
+
+    // Populate operand types
+    for (i, ty) in operand_types.iter().enumerate() {
+        if i < operands.len() {
+            operands[i].operand_type = *ty;
+        }
+    }
+}
+
+/// Phase 1f: Resolve memory operands, handle "+" read-write constraints,
+/// build GCC operand numbering, and apply segment prefixes.
+fn finalize_operands_and_build_gcc_map(
+    emitter: &mut dyn InlineAsmEmitter,
+    operands: &mut [AsmOperand],
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+    specific_regs: &[String],
+    seg_overrides: &[AddressSpace],
+) -> (usize, Vec<usize>) {
+    let total_operands = outputs.len() + inputs.len();
+
+    fn push_busy_reg(busy: &mut Vec<String>, reg: &str) {
+        if reg.is_empty() {
+            return;
+        }
+        if !busy.iter().any(|b| b == reg) {
+            busy.push(reg.to_string());
+        }
+        if let Some(canonical) = x86_normalize_reg_to_64bit(reg) {
+            if let Some(alias32) = x86_32bit_alias_of_64bit(&canonical) {
+                if !busy.iter().any(|b| b == alias32) {
+                    busy.push(alias32.to_string());
+                }
+            }
+            if !busy.iter().any(|b| b == canonical.as_ref()) {
+                busy.push(canonical.into_owned());
+            }
+        }
+    }
+
+    // Exclude every register already claimed by specific constraints, clobbers,
+    // or operand scratch allocations (including `reg_hi` register pairs), and
+    // dynamically append each scratch register allocated for `"m"` address staging
+    // so multiple memory operands never overwrite one another's base registers.
+    let mut busy_regs: Vec<String> = Vec::new();
+    for r in specific_regs {
+        push_busy_reg(&mut busy_regs, r);
+    }
+    for op in operands.iter() {
+        push_busy_reg(&mut busy_regs, &op.reg);
+        push_busy_reg(&mut busy_regs, &op.reg_hi);
+    }
+    // The operand registers are not the whole answer: an input whose value is
+    // REGISTER-HOMED (no explicit constraint, a parameter, or a value forwarded
+    // from the surrounding code) is loaded into that home by phase 2, so it is
+    // not in `operands[].reg` yet.  Phase 1f materialises the memory-operand
+    // ADDRESSES before phase 2 loads the inputs, so without the homes below the
+    // address staging can land on top of a live input and destroy it before the
+    // asm body runs.
+    for (_, val, _) in inputs {
+        if let Operand::Value(v) = val {
+            if let Some(reg) = emitter.home_reg_name(v.0) {
+                push_busy_reg(&mut busy_regs, &reg);
+            }
+        }
+    }
+    for (_, ptr, _) in outputs {
+        if let Some(reg) = emitter.home_reg_name(ptr.0) {
+            push_busy_reg(&mut busy_regs, &reg);
+        }
+    }
+
+    // Resolve memory operand addresses for outputs
+    for (i, (_, ptr, _)) in outputs.iter().enumerate() {
+        if matches!(operands[i].kind, AsmOperandKind::Memory) {
+            let val = Operand::Value(*ptr);
+            if let Some(tmp_reg) =
+                emitter.resolve_memory_operand(&mut operands[i], &val, &busy_regs)
+            {
+                push_busy_reg(&mut busy_regs, &tmp_reg);
+            }
+            debug_assert!(
+                !operands[i].mem_addr.is_empty() || operands[i].mem_offset != 0,
+                "inline asm output memory operand {i} left unresolved"
+            );
+        }
+    }
+
+    // Handle "+" read-write constraints: synthetic inputs share the output's register.
+    let num_plus = outputs.iter().filter(|(c, _, _)| c.contains('+')).count();
+    let mut plus_idx = 0;
+    for (i, (constraint, _, _)) in outputs.iter().enumerate() {
+        if constraint.contains('+') {
+            let plus_input_idx = outputs.len() + plus_idx;
+            if plus_input_idx < total_operands {
+                let source = operands[i].clone();
+                operands[plus_input_idx].copy_metadata_from(&source);
+                operands[plus_input_idx].kind = source.kind;
+                operands[plus_input_idx].operand_type = source.operand_type;
+            }
+            plus_idx += 1;
+        }
+    }
+
+    // Build GCC operand number -> internal index mapping.
+    let num_gcc_operands = outputs.len() + inputs.len();
+    let mut gcc_to_internal: Vec<usize> = Vec::with_capacity(num_gcc_operands);
+    gcc_to_internal.extend(0..outputs.len());
+    gcc_to_internal.extend((num_plus..inputs.len()).map(|i| outputs.len() + i));
+    for i in 0..num_plus {
+        gcc_to_internal.push(outputs.len() + i);
+    }
+
+    // Resolve memory operand addresses for non-synthetic input operands
+    for (i, (_, val, _)) in inputs.iter().enumerate() {
+        if i < num_plus {
+            continue;
+        }
+        let op_idx = outputs.len() + i;
+        if matches!(operands[op_idx].kind, AsmOperandKind::Memory) {
+            if let Some(tmp_reg) =
+                emitter.resolve_memory_operand(&mut operands[op_idx], val, &busy_regs)
+            {
+                push_busy_reg(&mut busy_regs, &tmp_reg);
+            }
+            debug_assert!(
+                !operands[op_idx].mem_addr.is_empty() || operands[op_idx].mem_offset != 0,
+                "inline asm input memory operand {op_idx} left unresolved"
+            );
+        }
+    }
+
+    // Apply segment prefixes to memory operands (for __seg_gs/__seg_fs)
+    if !seg_overrides.is_empty() {
+        for (i, op) in operands.iter_mut().enumerate() {
+            if i < seg_overrides.len() {
+                match seg_overrides[i] {
+                    AddressSpace::SegGs => op.seg_prefix = "%gs:".to_string(),
+                    AddressSpace::SegFs => op.seg_prefix = "%fs:".to_string(),
+                    AddressSpace::Default => {}
+                }
+            }
+        }
+    }
+
+    (num_plus, gcc_to_internal)
+}
+
+/// Phase 2: Load input values into their assigned registers, handling
+/// x87 FPU stack ordering (st(1) before st(0) due to LIFO semantics).
+fn load_inputs(
+    emitter: &mut dyn InlineAsmEmitter,
+    operands: &[AsmOperand],
+    outputs: &[(String, Value, Option<String>)],
+    inputs: &[(String, Operand, Option<String>)],
+) {
+    // First pass: load non-x87 inputs
+    for (i, (constraint, val, _)) in inputs.iter().enumerate() {
+        let op_idx = outputs.len() + i;
+        match &operands[op_idx].kind {
+            AsmOperandKind::Memory | AsmOperandKind::Immediate => continue,
+            AsmOperandKind::X87St0 | AsmOperandKind::X87St1 => continue,
+            _ => {}
+        }
+        if operands[op_idx].reg.is_empty() {
+            continue;
+        }
+        emitter.load_input_to_reg(&operands[op_idx], val, constraint, operands);
+    }
+
+    // x87 FPU stack inputs must be loaded in reverse stack order: st(1) first, then st(0),
+    // because each fld pushes onto the stack (LIFO).
+    let mut x87_inputs: Vec<(usize, usize)> = Vec::new();
+    for (i, (_, _, _)) in inputs.iter().enumerate() {
+        let op_idx = outputs.len() + i;
+        match &operands[op_idx].kind {
+            AsmOperandKind::X87St0 => x87_inputs.push((i, 0)),
+            AsmOperandKind::X87St1 => x87_inputs.push((i, 1)),
+            _ => {}
+        }
+    }
+    let mut x87_rw_outputs: Vec<(usize, usize)> = Vec::new();
+    for (i, (constraint, _, _)) in outputs.iter().enumerate() {
+        if constraint.contains('+') {
+            match &operands[i].kind {
+                AsmOperandKind::X87St0 => x87_rw_outputs.push((i, 0)),
+                AsmOperandKind::X87St1 => x87_rw_outputs.push((i, 1)),
+                _ => {}
+            }
+        }
+    }
+    // Sort by stack position descending (st(1) loaded first, then st(0))
+    x87_inputs.sort_by(|a, b| b.1.cmp(&a.1));
+    x87_rw_outputs.sort_by(|a, b| b.1.cmp(&a.1));
+    // Load x87 read-write outputs first (preload), then regular x87 inputs
+    for (out_idx, _) in &x87_rw_outputs {
+        emitter.preload_readwrite_output(&operands[*out_idx], &outputs[*out_idx].1);
+    }
+    for (inp_idx, _) in &x87_inputs {
+        let op_idx = outputs.len() + inp_idx;
+        emitter.load_input_to_reg(
+            &operands[op_idx],
+            &inputs[*inp_idx].1,
+            &inputs[*inp_idx].0,
+            operands,
+        );
+    }
+}
+
+/// Substitute `%l[name]` and `%lN` goto label references in an already-substituted line.
+/// In GCC asm goto, `%l[name]` resolves to the assembly label for the C goto label `name`,
+/// and `%lN` resolves to the label at index N (relative to the total number of
+/// output+input operands, so label 0 is at GCC operand index = num_operands).
+///
+/// This is called as a post-processing step after regular operand substitution,
+/// to handle any remaining `%l[...]` or `%l<digit>` patterns that weren't consumed.
+pub fn substitute_goto_labels(
+    line: &str,
+    goto_labels: &[(String, BlockId)],
+    num_operands: usize,
+) -> String {
+    if goto_labels.is_empty() {
+        return line.to_string();
+    }
+    let mut result = String::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' && i + 1 < chars.len() && chars[i + 1] == 'l' {
+            // Check for %l[name] or %l<digit>
+            if i + 2 < chars.len() && chars[i + 2] == '[' {
+                // %l[name] - named goto label reference
+                let mut j = i + 3;
+                while j < chars.len() && chars[j] != ']' {
+                    j += 1;
+                }
+                let name: String = chars[i + 3..j].iter().collect();
+                if j < chars.len() {
+                    j += 1;
+                } // skip ]
+                // Look up the label name
+                if let Some((_, block_id)) = goto_labels.iter().find(|(n, _)| n == &name) {
+                    result.push_str(&block_id.to_string());
+                    i = j;
+                    continue;
+                }
+                // Not found - emit as-is
+                result.push(chars[i]);
+                i += 1;
+            } else if i + 2 < chars.len() && chars[i + 2].is_ascii_digit() {
+                // %l<digit> - positional goto label reference
+                // In GCC, %l0 refers to the first goto label (GCC numbers labels after operands)
+                let mut j = i + 2;
+                let mut num = 0usize;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    num = num * 10 + (chars[j] as usize - '0' as usize);
+                    j += 1;
+                }
+                // GCC numbers goto labels after all output+input operands.
+                // %l<N> where N >= num_operands refers to label (N - num_operands).
+                // If N < num_operands, this is not a valid label reference.
+                let label_idx = num.wrapping_sub(num_operands);
+                if label_idx < goto_labels.len() {
+                    result.push_str(&goto_labels[label_idx].1.to_string());
+                    i = j;
+                    continue;
+                }
+                // Not found - emit as-is
+                result.push(chars[i]);
+                i += 1;
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Normalize an x86 register name to its 64-bit canonical form.
+///
+/// x86 registers have multiple aliases for the same physical register
+/// (e.g., al/ax/eax/rax all refer to RAX). Inline asm clobbers may use
+/// any of these forms, but the scratch register allocator uses 64-bit names.
+/// Returns `Some(canonical)` if the name is a recognized x86 register,
+/// `None` otherwise (non-x86 clobbers, "cc", "memory", etc.).
+fn x86_normalize_reg_to_64bit(name: &str) -> Option<Cow<'static, str>> {
+    // Map of all sub-register names to their 64-bit parent.
+    // Legacy 8-bit: al/ah/bl/bh/cl/ch/dl/dh
+    // Legacy 8-bit (REX): sil/dil/spl/bpl
+    // 16-bit: ax/bx/cx/dx/si/di/sp/bp
+    // 32-bit: eax/ebx/ecx/edx/esi/edi/esp/ebp
+    // 64-bit: rax/rbx/rcx/rdx/rsi/rdi/rsp/rbp (already canonical)
+    // Extended: r8-r15, r8d-r15d, r8w-r15w, r8b-r15b
+    match name {
+        // RAX family
+        "al" | "ah" | "ax" | "eax" | "rax" => Some(Cow::Borrowed("rax")),
+        // RBX family
+        "bl" | "bh" | "bx" | "ebx" | "rbx" => Some(Cow::Borrowed("rbx")),
+        // RCX family
+        "cl" | "ch" | "cx" | "ecx" | "rcx" => Some(Cow::Borrowed("rcx")),
+        // RDX family
+        "dl" | "dh" | "dx" | "edx" | "rdx" => Some(Cow::Borrowed("rdx")),
+        // RSI family
+        "sil" | "si" | "esi" | "rsi" => Some(Cow::Borrowed("rsi")),
+        // RDI family
+        "dil" | "di" | "edi" | "rdi" => Some(Cow::Borrowed("rdi")),
+        // RSP family
+        "spl" | "sp" | "esp" | "rsp" => Some(Cow::Borrowed("rsp")),
+        // RBP family
+        "bpl" | "bp" | "ebp" | "rbp" => Some(Cow::Borrowed("rbp")),
+        _ => {
+            // Extended registers: r8-r15 and their sub-register forms
+            // r8d/r8w/r8b -> r8, r9d/r9w/r9b -> r9, etc.
+            let s = name.strip_prefix('r')?;
+            // Must start with a digit after 'r'
+            if !s.starts_with(|c: char| c.is_ascii_digit()) {
+                return None;
+            }
+            // Extract the number part
+            let num_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            let num_str = &s[..num_end];
+            let num: u32 = num_str.parse().ok()?;
+            if (8..=15).contains(&num) {
+                Some(Cow::Owned(format!("r{}", num)))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// True if the (already-substituted) inline-asm line is a setcc instruction.
+fn is_setcc_line(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("sete ")
+        || t.starts_with("setne ")
+        || t.starts_with("setl ")
+        || t.starts_with("setle ")
+        || t.starts_with("setg ")
+        || t.starts_with("setge ")
+        || t.starts_with("seta ")
+        || t.starts_with("setae ")
+        || t.starts_with("setb ")
+        || t.starts_with("setbe ")
+        || t.starts_with("sets ")
+        || t.starts_with("setns ")
+        || t.starts_with("seto ")
+        || t.starts_with("setno ")
+        || t.starts_with("setp ")
+        || t.starts_with("setnp ")
+}
+
+/// Rewrite a setcc line's destination register to its 8-bit name
+/// (rax→al, rcx→cl, ..., r8→r8b, ...), matching GCC's output for "=r"
+/// constraints. setcc has exactly one register operand.
+fn to_8bit_setcc_dest(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(pos) = rest.find('%') {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let name_len = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(after.len());
+        let reg = &after[..name_len];
+        let low8 = match reg {
+            "rax" | "eax" | "ax" | "al" => "al",
+            "rcx" | "ecx" | "cx" | "cl" => "cl",
+            "rdx" | "edx" | "dx" | "dl" => "dl",
+            "rbx" | "ebx" | "bx" | "bl" => "bl",
+            "rsi" | "esi" | "si" | "sil" => "sil",
+            "rdi" | "edi" | "di" | "dil" => "dil",
+            "rbp" | "ebp" | "bp" | "bpl" => "bpl",
+            "rsp" | "esp" | "sp" | "spl" => "spl",
+            "r8" | "r8d" | "r8w" | "r8b" => "r8b",
+            "r9" | "r9d" | "r9w" | "r9b" => "r9b",
+            "r10" | "r10d" | "r10w" | "r10b" => "r10b",
+            "r11" | "r11d" | "r11w" | "r11b" => "r11b",
+            "r12" | "r12d" | "r12w" | "r12b" => "r12b",
+            "r13" | "r13d" | "r13w" | "r13b" => "r13b",
+            "r14" | "r14d" | "r14w" | "r14b" => "r14b",
+            "r15" | "r15d" | "r15w" | "r15b" => "r15b",
+            _ => reg,
+        };
+        out.push('%');
+        out.push_str(low8);
+        rest = &after[name_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_asm_templates_are_recognised() {
+        // The barrier forms: no template, no instruction.
+        assert!(inline_asm_template_has_no_instructions(""));
+        assert!(inline_asm_template_has_no_instructions("\n\t"));
+        assert!(inline_asm_template_has_no_instructions(" \t ; \n "));
+        // Anything the assembler would see keeps the conservative path.
+        assert!(!inline_asm_template_has_no_instructions("nop"));
+        assert!(!inline_asm_template_has_no_instructions("\n\tnop\n\t"));
+        assert!(!inline_asm_template_has_no_instructions("# comment"));
+        assert!(!inline_asm_template_has_no_instructions("1:"));
+        assert!(!inline_asm_template_has_no_instructions(".p2align 4"));
+    }
+
+    #[test]
+    fn normalize_inline_asm_reg_name_strips_gcc_adornments() {
+        assert_eq!(normalize_inline_asm_reg_name("rcx"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name("%rcx"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name("~{rcx}"), "rcx");
+        assert_eq!(normalize_inline_asm_reg_name(" {r12} "), "r12");
+    }
+
+    #[test]
+    fn collect_excluded_registers_treats_percent_prefixed_clobbers_as_real_regs() {
+        let regs = collect_excluded_registers(&[], &["%rcx".to_string(), "memory".to_string()]);
+        assert!(regs.iter().any(|r| r == "rcx"));
+        assert!(!regs.iter().any(|r| r == "%rcx"));
+    }
+
+    #[test]
+    fn resolve_tied_and_types_copies_the_named_outputs_register_home() {
+        let mut output = AsmOperand::new(AsmOperandKind::Specific("rcx".to_string()), None);
+        output.reg = "rcx".to_string();
+        output.operand_type = IrType::I64;
+        let mut input = AsmOperand::new(AsmOperandKind::Tied(0), None);
+        input.constraint = "[sum]".to_string();
+        let mut operands = vec![output, input];
+        let outputs = vec![("=r".to_string(), Value(0), Some("sum".to_string()))];
+        resolve_tied_and_types(
+            &mut operands,
+            &[Some(0)],
+            &outputs,
+            &[IrType::I64, IrType::I64],
+        );
+        assert!(matches!(operands[1].kind, AsmOperandKind::Specific(_)));
+        assert_eq!(operands[1].reg, "rcx");
+        assert_eq!(operands[1].operand_type, IrType::I64);
+        assert_eq!(operands[1].constraint, "[sum]");
+    }
+
+    /// Build the operand list `operand_reg_views` needs: `names` holds one
+    /// entry per operand, where the empty string means "unnamed".
+    fn views_for(template: &str, names: &[&str]) -> Vec<RegView> {
+        let operands: Vec<AsmOperand> = names
+            .iter()
+            .map(|name| {
+                let name = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+                AsmOperand::new(AsmOperandKind::GpReg, name)
+            })
+            .collect();
+        operand_reg_views(template, &operands)
+    }
+
+    #[test]
+    fn reg_views_flag_the_byte_and_high_byte_modifiers() {
+        let mv = views_for("movb %b0, %h1", &["", ""]);
+        assert_eq!(mv, vec![RegView::Byte, RegView::HighByte]);
+        // Unmodified, other-width and non-register modifiers impose nothing:
+        // `%w`/`%k`/`%q` are same-register width names, `%c`/`%P`/`%a`/`%n`
+        // print constants, and a bare `%0` is the natural width.
+        assert_eq!(
+            views_for("%0 %w1 %k2 %q3 %c4 %P5 %a6 %n7 %l8", &[""; 9]),
+            vec![RegView::Full; 9]
+        );
+    }
+
+    #[test]
+    fn reg_views_ignore_literal_percent_signs() {
+        // `%%al` is the text "al", not an operand reference to operand 0.
+        assert_eq!(views_for("andb $1, %%al", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("movb %b0, %%b1", &[""]), vec![RegView::Byte]);
+    }
+
+    #[test]
+    fn reg_views_resolve_named_and_multi_digit_references() {
+        assert_eq!(
+            views_for("mov %b[byte_in], %0", &["", "byte_in"]),
+            vec![RegView::Full, RegView::Byte]
+        );
+        // Operand 10 is printed by `%b10`; the digits are one index, not
+        // operand 1 followed by a stray "0".
+        assert_eq!(views_for("%b10", &[""; 11])[10], RegView::Byte);
+        assert_eq!(views_for("%h0", &[""]), vec![RegView::HighByte]);
+    }
+
+    #[test]
+    fn reg_views_take_the_strictest_use_of_an_operand() {
+        // `%h` needs one of four legacy registers; `%b` is satisfied by all of
+        // them, so a template that uses both must ask for the high byte.
+        assert_eq!(views_for("%b0 %h0", &[""]), vec![RegView::HighByte]);
+        assert_eq!(views_for("%h0 %b0", &[""]), vec![RegView::HighByte]);
+    }
+
+    #[test]
+    fn reg_views_are_total_on_malformed_and_out_of_range_input() {
+        // No panic and no invented restriction: the substitution pass is what
+        // diagnoses these templates.
+        assert_eq!(views_for("%b7", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%b[unterminated", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%b[unknown]", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%b", &[""]), vec![RegView::Full]);
+        let saturated = views_for("%b99999999999999999999999", &[""]);
+        assert_eq!(saturated, vec![RegView::Full]);
+    }
+
+    #[test]
+    fn copy_metadata_from_preserves_tied_operand_class_and_immediates() {
+        let source = AsmOperand {
+            kind: AsmOperandKind::Immediate,
+            reg: "rcx".to_string(),
+            reg_hi: String::new(),
+            name: None,
+            mem_addr: String::new(),
+            mem_offset: 0,
+            imm_value: Some(7),
+            imm_symbol: Some("sym".to_string()),
+            operand_type: IrType::I64,
+            constraint: "i".to_string(),
+            seg_prefix: "%gs:".to_string(),
+        };
+        let mut dest = AsmOperand::new(AsmOperandKind::Tied(0), None);
+        dest.copy_metadata_from(&source);
+        assert!(matches!(dest.kind, AsmOperandKind::Immediate));
+        assert_eq!(dest.reg, "rcx");
+        assert_eq!(dest.imm_value, Some(7));
+        assert_eq!(dest.imm_symbol.as_deref(), Some("sym"));
+        assert_eq!(dest.seg_prefix, "%gs:");
+    }
+}

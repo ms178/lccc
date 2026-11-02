@@ -1,0 +1,1031 @@
+;;; imm-memory-reloc-0-0
+.text
+vpshufd $3, anchor(%rip), %zmm1
+
+;;; imm-memory-reloc-0-1
+.text
+vpshufd $3, anchor+17(%rip), %zmm1
+
+;;; imm-memory-reloc-0-2
+.text
+vpshufd $3, anchor-17(%rip), %zmm1
+
+;;; imm-memory-reloc-0-3
+.text
+vpshufd $3, anchor@GOTPCREL(%rip), %zmm1
+
+;;; imm-memory-reloc-0-4
+.text
+vpshufd $3, anchor@GOTPCREL+17(%rip), %zmm1
+
+;;; imm-memory-reloc-0-5
+.text
+vpshufd $3, anchor+17, %zmm1
+
+;;; imm-memory-reloc-1-0
+.text
+vrndscaleps $3, anchor(%rip), %zmm1
+
+;;; imm-memory-reloc-1-1
+.text
+vrndscaleps $3, anchor+17(%rip), %zmm1
+
+;;; imm-memory-reloc-1-2
+.text
+vrndscaleps $3, anchor-17(%rip), %zmm1
+
+;;; imm-memory-reloc-1-3
+.text
+vrndscaleps $3, anchor@GOTPCREL(%rip), %zmm1
+
+;;; imm-memory-reloc-1-4
+.text
+vrndscaleps $3, anchor@GOTPCREL+17(%rip), %zmm1
+
+;;; imm-memory-reloc-1-5
+.text
+vrndscaleps $3, anchor+17, %zmm1
+
+;;; imm-memory-reloc-2-0
+.text
+vpslld $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-2-1
+.text
+vpslld $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-2-2
+.text
+vpslld $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-2-3
+.text
+vpslld $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-2-4
+.text
+vpslld $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-2-5
+.text
+vpslld $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-3-0
+.text
+vpslld $3, anchor(%rip), %ymm1
+
+;;; imm-memory-reloc-3-1
+.text
+vpslld $3, anchor+17(%rip), %ymm1
+
+;;; imm-memory-reloc-3-2
+.text
+vpslld $3, anchor-17(%rip), %ymm1
+
+;;; imm-memory-reloc-3-3
+.text
+vpslld $3, anchor@GOTPCREL(%rip), %ymm1
+
+;;; imm-memory-reloc-3-4
+.text
+vpslld $3, anchor@GOTPCREL+17(%rip), %ymm1
+
+;;; imm-memory-reloc-3-5
+.text
+vpslld $3, anchor+17, %ymm1
+
+;;; imm-memory-reloc-4-0
+.text
+vpslld $3, anchor(%rip), %zmm1
+
+;;; imm-memory-reloc-4-1
+.text
+vpslld $3, anchor+17(%rip), %zmm1
+
+;;; imm-memory-reloc-4-2
+.text
+vpslld $3, anchor-17(%rip), %zmm1
+
+;;; imm-memory-reloc-4-3
+.text
+vpslld $3, anchor@GOTPCREL(%rip), %zmm1
+
+;;; imm-memory-reloc-4-4
+.text
+vpslld $3, anchor@GOTPCREL+17(%rip), %zmm1
+
+;;; imm-memory-reloc-4-5
+.text
+vpslld $3, anchor+17, %zmm1
+
+;;; imm-memory-reloc-5-0
+.text
+vshufps $3, anchor(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-5-1
+.text
+vshufps $3, anchor+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-5-2
+.text
+vshufps $3, anchor-17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-5-3
+.text
+vshufps $3, anchor@GOTPCREL(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-5-4
+.text
+vshufps $3, anchor@GOTPCREL+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-5-5
+.text
+vshufps $3, anchor+17, %zmm1, %zmm2
+
+;;; imm-memory-reloc-6-0
+.text
+vcmpps $3, anchor(%rip), %zmm1, %k2
+
+;;; imm-memory-reloc-6-1
+.text
+vcmpps $3, anchor+17(%rip), %zmm1, %k2
+
+;;; imm-memory-reloc-6-2
+.text
+vcmpps $3, anchor-17(%rip), %zmm1, %k2
+
+;;; imm-memory-reloc-6-3
+.text
+vcmpps $3, anchor@GOTPCREL(%rip), %zmm1, %k2
+
+;;; imm-memory-reloc-6-4
+.text
+vcmpps $3, anchor@GOTPCREL+17(%rip), %zmm1, %k2
+
+;;; imm-memory-reloc-6-5
+.text
+vcmpps $3, anchor+17, %zmm1, %k2
+
+;;; imm-memory-reloc-7-0
+.text
+vextracti32x4 $3, %zmm1, anchor(%rip)
+
+;;; imm-memory-reloc-7-1
+.text
+vextracti32x4 $3, %zmm1, anchor+17(%rip)
+
+;;; imm-memory-reloc-7-2
+.text
+vextracti32x4 $3, %zmm1, anchor-17(%rip)
+
+;;; imm-memory-reloc-7-3
+.text
+vextracti32x4 $3, %zmm1, anchor@GOTPCREL(%rip)
+
+;;; imm-memory-reloc-7-4
+.text
+vextracti32x4 $3, %zmm1, anchor@GOTPCREL+17(%rip)
+
+;;; imm-memory-reloc-7-5
+.text
+vextracti32x4 $3, %zmm1, anchor+17
+
+;;; imm-memory-reloc-8-0
+.text
+vprold $3, anchor(%rip), %zmm1
+
+;;; imm-memory-reloc-8-1
+.text
+vprold $3, anchor+17(%rip), %zmm1
+
+;;; imm-memory-reloc-8-2
+.text
+vprold $3, anchor-17(%rip), %zmm1
+
+;;; imm-memory-reloc-8-3
+.text
+vprold $3, anchor@GOTPCREL(%rip), %zmm1
+
+;;; imm-memory-reloc-8-4
+.text
+vprold $3, anchor@GOTPCREL+17(%rip), %zmm1
+
+;;; imm-memory-reloc-8-5
+.text
+vprold $3, anchor+17, %zmm1
+
+;;; imm-memory-reloc-9-0
+.text
+vmpsadbw $3, anchor(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-9-1
+.text
+vmpsadbw $3, anchor+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-9-2
+.text
+vmpsadbw $3, anchor-17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-9-3
+.text
+vmpsadbw $3, anchor@GOTPCREL(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-9-4
+.text
+vmpsadbw $3, anchor@GOTPCREL+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-9-5
+.text
+vmpsadbw $3, anchor+17, %zmm1, %zmm2
+
+;;; imm-memory-reloc-10-0
+.text
+vfpclassps $3, anchor(%rip){1to16}, %k2
+
+;;; imm-memory-reloc-10-1
+.text
+vfpclassps $3, anchor+17(%rip){1to16}, %k2
+
+;;; imm-memory-reloc-10-2
+.text
+vfpclassps $3, anchor-17(%rip){1to16}, %k2
+
+;;; imm-memory-reloc-10-3
+.text
+vfpclassps $3, anchor@GOTPCREL(%rip){1to16}, %k2
+
+;;; imm-memory-reloc-10-4
+.text
+vfpclassps $3, anchor@GOTPCREL+17(%rip){1to16}, %k2
+
+;;; imm-memory-reloc-10-5
+.text
+vfpclassps $3, anchor+17{1to16}, %k2
+
+;;; imm-memory-reloc-11-0
+.text
+vfpclassss $3, anchor(%rip), %k2
+
+;;; imm-memory-reloc-11-1
+.text
+vfpclassss $3, anchor+17(%rip), %k2
+
+;;; imm-memory-reloc-11-2
+.text
+vfpclassss $3, anchor-17(%rip), %k2
+
+;;; imm-memory-reloc-11-3
+.text
+vfpclassss $3, anchor@GOTPCREL(%rip), %k2
+
+;;; imm-memory-reloc-11-4
+.text
+vfpclassss $3, anchor@GOTPCREL+17(%rip), %k2
+
+;;; imm-memory-reloc-11-5
+.text
+vfpclassss $3, anchor+17, %k2
+
+;;; imm-memory-reloc-12-0
+.text
+vcvtps2ph $3, %zmm1, anchor(%rip)
+
+;;; imm-memory-reloc-12-1
+.text
+vcvtps2ph $3, %zmm1, anchor+17(%rip)
+
+;;; imm-memory-reloc-12-2
+.text
+vcvtps2ph $3, %zmm1, anchor-17(%rip)
+
+;;; imm-memory-reloc-12-3
+.text
+vcvtps2ph $3, %zmm1, anchor@GOTPCREL(%rip)
+
+;;; imm-memory-reloc-12-4
+.text
+vcvtps2ph $3, %zmm1, anchor@GOTPCREL+17(%rip)
+
+;;; imm-memory-reloc-12-5
+.text
+vcvtps2ph $3, %zmm1, anchor+17
+
+;;; imm-memory-reloc-13-0
+.text
+vpternlogd $3, anchor(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-13-1
+.text
+vpternlogd $3, anchor+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-13-2
+.text
+vpternlogd $3, anchor-17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-13-3
+.text
+vpternlogd $3, anchor@GOTPCREL(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-13-4
+.text
+vpternlogd $3, anchor@GOTPCREL+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-13-5
+.text
+vpternlogd $3, anchor+17, %zmm1, %zmm2
+
+;;; imm-memory-reloc-14-0
+.text
+vinsertf32x4 $3, anchor(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-14-1
+.text
+vinsertf32x4 $3, anchor+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-14-2
+.text
+vinsertf32x4 $3, anchor-17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-14-3
+.text
+vinsertf32x4 $3, anchor@GOTPCREL(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-14-4
+.text
+vinsertf32x4 $3, anchor@GOTPCREL+17(%rip), %zmm1, %zmm2
+
+;;; imm-memory-reloc-14-5
+.text
+vinsertf32x4 $3, anchor+17, %zmm1, %zmm2
+
+;;; imm-memory-reloc-15-0
+.text
+palignr $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-15-1
+.text
+palignr $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-15-2
+.text
+palignr $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-15-3
+.text
+palignr $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-15-4
+.text
+palignr $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-15-5
+.text
+palignr $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-16-0
+.text
+pshufw $3, anchor(%rip), %mm1
+
+;;; imm-memory-reloc-16-1
+.text
+pshufw $3, anchor+17(%rip), %mm1
+
+;;; imm-memory-reloc-16-2
+.text
+pshufw $3, anchor-17(%rip), %mm1
+
+;;; imm-memory-reloc-16-3
+.text
+pshufw $3, anchor@GOTPCREL(%rip), %mm1
+
+;;; imm-memory-reloc-16-4
+.text
+pshufw $3, anchor@GOTPCREL+17(%rip), %mm1
+
+;;; imm-memory-reloc-16-5
+.text
+pshufw $3, anchor+17, %mm1
+
+;;; imm-memory-reloc-17-0
+.text
+pshufd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-17-1
+.text
+pshufd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-17-2
+.text
+pshufd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-17-3
+.text
+pshufd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-17-4
+.text
+pshufd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-17-5
+.text
+pshufd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-18-0
+.text
+pshuflw $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-18-1
+.text
+pshuflw $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-18-2
+.text
+pshuflw $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-18-3
+.text
+pshuflw $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-18-4
+.text
+pshuflw $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-18-5
+.text
+pshuflw $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-19-0
+.text
+pshufhw $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-19-1
+.text
+pshufhw $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-19-2
+.text
+pshufhw $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-19-3
+.text
+pshufhw $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-19-4
+.text
+pshufhw $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-19-5
+.text
+pshufhw $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-20-0
+.text
+sha1rnds4 $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-20-1
+.text
+sha1rnds4 $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-20-2
+.text
+sha1rnds4 $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-20-3
+.text
+sha1rnds4 $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-20-4
+.text
+sha1rnds4 $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-20-5
+.text
+sha1rnds4 $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-21-0
+.text
+aeskeygenassist $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-21-1
+.text
+aeskeygenassist $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-21-2
+.text
+aeskeygenassist $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-21-3
+.text
+aeskeygenassist $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-21-4
+.text
+aeskeygenassist $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-21-5
+.text
+aeskeygenassist $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-22-0
+.text
+pclmulqdq $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-22-1
+.text
+pclmulqdq $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-22-2
+.text
+pclmulqdq $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-22-3
+.text
+pclmulqdq $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-22-4
+.text
+pclmulqdq $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-22-5
+.text
+pclmulqdq $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-23-0
+.text
+shufps $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-23-1
+.text
+shufps $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-23-2
+.text
+shufps $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-23-3
+.text
+shufps $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-23-4
+.text
+shufps $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-23-5
+.text
+shufps $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-24-0
+.text
+shufpd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-24-1
+.text
+shufpd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-24-2
+.text
+shufpd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-24-3
+.text
+shufpd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-24-4
+.text
+shufpd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-24-5
+.text
+shufpd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-25-0
+.text
+roundsd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-25-1
+.text
+roundsd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-25-2
+.text
+roundsd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-25-3
+.text
+roundsd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-25-4
+.text
+roundsd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-25-5
+.text
+roundsd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-26-0
+.text
+roundss $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-26-1
+.text
+roundss $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-26-2
+.text
+roundss $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-26-3
+.text
+roundss $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-26-4
+.text
+roundss $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-26-5
+.text
+roundss $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-27-0
+.text
+roundpd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-27-1
+.text
+roundpd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-27-2
+.text
+roundpd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-27-3
+.text
+roundpd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-27-4
+.text
+roundpd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-27-5
+.text
+roundpd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-28-0
+.text
+roundps $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-28-1
+.text
+roundps $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-28-2
+.text
+roundps $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-28-3
+.text
+roundps $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-28-4
+.text
+roundps $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-28-5
+.text
+roundps $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-29-0
+.text
+pblendw $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-29-1
+.text
+pblendw $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-29-2
+.text
+pblendw $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-29-3
+.text
+pblendw $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-29-4
+.text
+pblendw $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-29-5
+.text
+pblendw $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-30-0
+.text
+blendpd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-30-1
+.text
+blendpd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-30-2
+.text
+blendpd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-30-3
+.text
+blendpd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-30-4
+.text
+blendpd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-30-5
+.text
+blendpd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-31-0
+.text
+blendps $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-31-1
+.text
+blendps $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-31-2
+.text
+blendps $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-31-3
+.text
+blendps $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-31-4
+.text
+blendps $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-31-5
+.text
+blendps $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-32-0
+.text
+dpps $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-32-1
+.text
+dpps $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-32-2
+.text
+dpps $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-32-3
+.text
+dpps $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-32-4
+.text
+dpps $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-32-5
+.text
+dpps $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-33-0
+.text
+dppd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-33-1
+.text
+dppd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-33-2
+.text
+dppd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-33-3
+.text
+dppd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-33-4
+.text
+dppd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-33-5
+.text
+dppd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-34-0
+.text
+insertps $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-34-1
+.text
+insertps $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-34-2
+.text
+insertps $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-34-3
+.text
+insertps $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-34-4
+.text
+insertps $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-34-5
+.text
+insertps $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-35-0
+.text
+mpsadbw $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-35-1
+.text
+mpsadbw $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-35-2
+.text
+mpsadbw $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-35-3
+.text
+mpsadbw $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-35-4
+.text
+mpsadbw $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-35-5
+.text
+mpsadbw $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-36-0
+.text
+gf2p8affineqb $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-36-1
+.text
+gf2p8affineqb $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-36-2
+.text
+gf2p8affineqb $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-36-3
+.text
+gf2p8affineqb $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-36-4
+.text
+gf2p8affineqb $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-36-5
+.text
+gf2p8affineqb $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-37-0
+.text
+gf2p8affineinvqb $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-37-1
+.text
+gf2p8affineinvqb $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-37-2
+.text
+gf2p8affineinvqb $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-37-3
+.text
+gf2p8affineinvqb $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-37-4
+.text
+gf2p8affineinvqb $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-37-5
+.text
+gf2p8affineinvqb $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-38-0
+.text
+cmpsd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-38-1
+.text
+cmpsd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-38-2
+.text
+cmpsd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-38-3
+.text
+cmpsd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-38-4
+.text
+cmpsd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-38-5
+.text
+cmpsd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-39-0
+.text
+cmpss $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-39-1
+.text
+cmpss $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-39-2
+.text
+cmpss $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-39-3
+.text
+cmpss $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-39-4
+.text
+cmpss $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-39-5
+.text
+cmpss $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-40-0
+.text
+cmppd $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-40-1
+.text
+cmppd $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-40-2
+.text
+cmppd $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-40-3
+.text
+cmppd $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-40-4
+.text
+cmppd $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-40-5
+.text
+cmppd $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-41-0
+.text
+cmpps $3, anchor(%rip), %xmm1
+
+;;; imm-memory-reloc-41-1
+.text
+cmpps $3, anchor+17(%rip), %xmm1
+
+;;; imm-memory-reloc-41-2
+.text
+cmpps $3, anchor-17(%rip), %xmm1
+
+;;; imm-memory-reloc-41-3
+.text
+cmpps $3, anchor@GOTPCREL(%rip), %xmm1
+
+;;; imm-memory-reloc-41-4
+.text
+cmpps $3, anchor@GOTPCREL+17(%rip), %xmm1
+
+;;; imm-memory-reloc-41-5
+.text
+cmpps $3, anchor+17, %xmm1
+
+;;; imm-memory-reloc-42-0
+.text
+palignr $3, anchor(%rip), %mm1
+
+;;; imm-memory-reloc-42-1
+.text
+palignr $3, anchor+17(%rip), %mm1
+
+;;; imm-memory-reloc-42-2
+.text
+palignr $3, anchor-17(%rip), %mm1
+
+;;; imm-memory-reloc-42-3
+.text
+palignr $3, anchor@GOTPCREL(%rip), %mm1
+
+;;; imm-memory-reloc-42-4
+.text
+palignr $3, anchor@GOTPCREL+17(%rip), %mm1
+
+;;; imm-memory-reloc-42-5
+.text
+palignr $3, anchor+17, %mm1

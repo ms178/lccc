@@ -1,0 +1,6 @@
+lccc: /home/user/lccc/target/fastbuild/lccc
+corpus: 1 tests, jobs=1, timeout=90s each
+
+
+== 1 passed, 0 failed, 0 skipped-compare, 0 skipped-run, 1 total, 1s
+json: /home/user/artifacts/sse1/ssa-profile.json

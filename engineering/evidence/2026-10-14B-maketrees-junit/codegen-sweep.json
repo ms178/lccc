@@ -1,0 +1,22 @@
+{
+  "base": "/home/user/.cache/a14/lccc-before",
+  "new": "/home/user/lccc/target/fastbuild/lccc",
+  "roots": [
+    "tests/benchmark/programs"
+  ],
+  "levels": [
+    "-O0",
+    "-O1",
+    "-O2",
+    "-O3",
+    "-Os",
+    "-Oz"
+  ],
+  "files": 58,
+  "counts": {
+    "identical": 348
+  },
+  "different_files": [],
+  "compile_fail_files": [],
+  "no_output_files": []
+}

@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| histogram | 1690633 | 3223573 | 1.90673 | 1165/1168 | 10068/10078 | 6756/6777 | 3170/3239 | 216/222 |
+geomean simulated Ir mine/ref = 1.9067254690994437 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/histogram/manifest.json

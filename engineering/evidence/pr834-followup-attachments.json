@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "scope": "Exact external delivery attachments. The in-repository program proof is separately bound by pr834-corpus.json. These files are not assumed to exist in an ordinary Git clone.",
+  "candidate_source_commit": "b52a114434d446db5979bccf8d759aae619b6f2e",
+  "baseline_source_commit": "f07f4c514460e4116a574773cd84b69d185bf65e",
+  "files": [
+    {
+      "delivery_path": "artifacts/pr834-followup/compiler-profiles.tar.xz",
+      "bytes": 43317676,
+      "sha256": "0d25b128ce2b08f2ad7aa871b5e2fc1ef54de2810c7f735eccc3e5fab66d108d"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/compiler-profiles.tar.xz.inventory.json.gz",
+      "bytes": 16148,
+      "sha256": "43736846d336e8d888e2dace9dee4d116e758da9ed4ecb69b68886cf646e7b16"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/quiet-cost.tar.xz",
+      "bytes": 1178464,
+      "sha256": "cad2ce9018bcfa97f4aca97644f802bd1347f9645e1c756812a437d0b2f10527"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/quiet-cost.tar.xz.inventory.json.gz",
+      "bytes": 494105,
+      "sha256": "69b33b190c2cc16485bede936d591de53d852a5e740ff518ecf69ee0d1bb3575"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/interleaved-cost.tar.xz",
+      "bytes": 191416,
+      "sha256": "4f84352687474f91b77e64e1da6dd6a5409a552b7b586dd550aab233b052500f"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/interleaved-cost.tar.xz.inventory.json.gz",
+      "bytes": 66221,
+      "sha256": "8c34adcd5fc7e481d750bd15d8122ee6c20e1a6898ba5f6e3f1f66ee11f63721"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/historical-f1-cost.tar.xz",
+      "bytes": 1098168,
+      "sha256": "7dd4b3e5bb86c44542deea2a74fa9f3e45c326e3ac6c88f4c5e09049764690c4"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/historical-f1-cost.tar.xz.inventory.json.gz",
+      "bytes": 198861,
+      "sha256": "701934e452a349fe4cf6bc21341dc907efbc5f8d8b765dd3f0feda407a8ee62f"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/stress-profiles.tar.xz",
+      "bytes": 107840,
+      "sha256": "72ec2629557b8edca5a9519aef4eefd35dce0a5b71a27339f068f9fddc6310a9"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/stress-profiles.json",
+      "bytes": 360,
+      "sha256": "9e4cd2af0d82aabacdb1d0883a1fd6e8826e9434553160e1438dfbd0c0a3c961"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/frozen-compiler-deltas.tar.xz",
+      "bytes": 3598096,
+      "sha256": "00c871512f1a8c3240201517e8cad0d23591ebb1b024ca9c3c1b3328cc248eec"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/historical-f1-compiler.bsdiff",
+      "bytes": 1777652,
+      "sha256": "6174e99cd3ce8db101942763070f33594098e81e278e105f6d35f3fe29b39acf"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/historical-f1-compiler.json",
+      "bytes": 425,
+      "sha256": "3fdc78488ae8c028c3b330011441c80f526f4eb7cdca907691ed9d064859581d"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/restore-frozen-compilers.py",
+      "bytes": 3481,
+      "sha256": "dc643d088f9576ffb3cbe7b6311c47555c0ab3e6cdfbeb384dada53e5892840c"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/measure-cost-and-corpus.py",
+      "bytes": 5914,
+      "sha256": "0993ae6419cf5306c769c6157dd082cdd2cbd94160222faba6cf7dc6d8fdfa9a"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/measure-cost-and-corpus-v2.py",
+      "bytes": 8567,
+      "sha256": "77415a2679e675b9efacdbd33c5e312b9335ec69d4ff3ee7dc852494e846cfb2"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/measure-quiet-compiler-cost.py",
+      "bytes": 6320,
+      "sha256": "278a9e31864a01b8b721a025cdeb5b6cbbe457b045483aa8e7b2daa412adeb9e"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/measure-interleaved-diagnostic.py",
+      "bytes": 6546,
+      "sha256": "ff96acf2bdaeae2ea6363060fb5c3644fca2fc60bb9838ef0431199168d4cb67"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/F2-stress-fixture-before-fix.patch",
+      "bytes": 3296,
+      "sha256": "23e62ede68382def0943d30f462964a3fdf8e02d9d1101ba55a5f0bd4e722616"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/stress/native-pairs.json",
+      "bytes": 374,
+      "sha256": "5f170ee96c338617592257a8c0adbf6fe489e439402f38d25d8b4c2166f2d2b4"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/stress/callgrind-summary.json",
+      "bytes": 882,
+      "sha256": "64734be8805d9e1b0d2f24f7c25bbb7023403960ff3020290d4f9f763aed7b29"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/hardware.json",
+      "bytes": 317,
+      "sha256": "90b66f8153bca5c2e88d1e3b41e81214c445ea15d5a04a88662f60ec61133512"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/env-before-provider-pin.sh",
+      "bytes": 272,
+      "sha256": "7c4da67ecbe2763d3c1313a2d2d5ffbdc82c89ea0e871c5eae6e3b67ebf54b1d"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/env.sh",
+      "bytes": 409,
+      "sha256": "d2d7dcbe90f240b6f5bb52259ee735e25073aa816283f2b9d5da1f450768b443"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/gcc-provider-pin.log",
+      "bytes": 202,
+      "sha256": "af7bcd7ec6ad075684c38cad1518cead8f7bcc6f1ea824051de09e49d461508d"
+    },
+    {
+      "delivery_path": "artifacts/legacy-evidence-lossless.tar.xz",
+      "bytes": 30510692,
+      "sha256": "a3c2196b8a749e3641f3c2805fefb75a8dec9654567c0a5b626398c4c7264cba"
+    },
+    {
+      "delivery_path": "artifacts/legacy-evidence-lossless.json",
+      "bytes": 419521,
+      "sha256": "06a199051895ccd8e65deff6b956632a12569b99b2e4061cc8fc557f86827942"
+    },
+    {
+      "delivery_path": "artifacts/restore-legacy-evidence.py",
+      "bytes": 2692,
+      "sha256": "dc140e39851a13ac43a73abcba0566eeda302b3d50ee82fceccac353fae80af9"
+    },
+    {
+      "delivery_path": "artifacts/history-gzip-1.13",
+      "bytes": 102200,
+      "sha256": "748e292cdaae29c1dbd3b6407086a27d5062331deb48d2da613d3912347cea5b"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/multilib-provisioning.json",
+      "bytes": 1148,
+      "sha256": "fb7705fc40cabc7af9c19b57f3fc2178d291a7ec9067396a2edf19fc8ee61a7b"
+    },
+    {
+      "delivery_path": "artifacts/pr834-followup/provision-gcc16-i386.sh",
+      "bytes": 1076,
+      "sha256": "15b2a682ddb731bdd5462bf8438c4f49f62b50033dfab7cffa241ee297bb6258"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+corpus: 82 files, 190 functions (-O2)
+OLD=/tmp/lccc-main
+NEW=/tmp/lccc-final
+----------------------------------------------------------------------------------------------------
+file                             fn                              insns    rrmov   stkref     push      acc   (NEW-OLD; negative = fewer = better)
+csv_field_sum.c                  sum_fields                         -2       -1        0        0        0
+i686_alu_chains.c                k_digits                           -2       -1        0        0        0
+i686_alu_chains.c                k_mul24                            -2       -1        0        0        0
+i686_alu_chains.c                k_mul45                            -2       -1        0        0        0
+i686_alu_chains.c                k_mulm3                            -2       -1        0        0        0
+i686_alu_chains.c                k_mul7                             -1        0        0        0        0
+i686_alu_chains.c                k_udr10                            -1        0        0        0        0
+i686_alu_chains.c                k_urem10                           -1        0        0        0        0
+k30_unroll_shapes.c              sum_mirror                         -1        0        0        0        0
+libm_round_family.c              round_family_pass                  -1        0        0        0        0
+i686_alu_chains.c                k_sdr7                             -1       +1        0        0        0
+----------------------------------------------------------------------------------------------------
+TOTAL                                                     190      -16       -4        0        0        0
+unchanged: 179/190 functions; skipped(old)=[] skipped(new)=[]
+gate: HOT stkref 171->171, insns 5597->5581 => PASS

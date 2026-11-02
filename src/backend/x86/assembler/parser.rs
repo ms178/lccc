@@ -1,0 +1,6195 @@
+//! Parser for AT&T syntax x86-64 assembly as emitted by our codegen.
+//!
+//! Parses assembly text line-by-line into structured `AsmItem` values.
+//! Handles directives, labels, and instructions with AT&T operand ordering
+//! (source, destination).
+
+use crate::backend::asm_expr;
+use crate::backend::asm_preprocess::{self, CommentStyle};
+use crate::backend::elf;
+use std::fmt;
+
+/// A parsed assembly item (one per line, roughly).
+#[derive(Debug, Clone)]
+pub enum AsmItem {
+    /// Switch to a named section: `.section .text`, `.section .rodata`, etc.
+    Section(SectionDirective),
+    /// Global symbol: `.globl name`
+    Global(String),
+    /// Weak symbol: `.weak name`
+    Weak(String),
+    /// Hidden visibility: `.hidden name`
+    Hidden(String),
+    /// Protected visibility: `.protected name`
+    Protected(String),
+    /// Internal visibility: `.internal name`
+    Internal(String),
+    /// Symbol type: `.type name, @function` or `@object` or `@tls_object`
+    SymbolType(String, SymbolKind),
+    /// Symbol size: `.size name, expr`
+    Size(String, SizeExpr),
+    /// Label definition: `name:`
+    Label(String),
+    /// Alignment: `.align N`, `.p2align N[, fill][, max-skip]`.
+    ///
+    /// `align` is the byte alignment (already exponent-expanded for
+    /// `.p2align`; can reach 2^63 for GAS-clamped exponents). `fill`
+    /// overrides the section's default padding: omitted or `0x90` in an
+    /// executable section means optimal multi-byte NOPs (GAS tc-i386
+    /// behavior); any other byte pads verbatim. `max_skip` suppresses the
+    /// padding entirely when more than that many bytes would be needed
+    /// (GAS `.p2align 4,,10` semantics). The section's `sh_addralign` is
+    /// raised regardless — GAS records the alignment even when the
+    /// max-skip test refuses to pad (verified against binutils 2.44/2.47:
+    /// `.byte 1; .p2align 4,,1` yields no padding and addralign 16).
+    Align {
+        align: u64,
+        fill: Option<u8>,
+        max_skip: Option<u64>,
+    },
+    /// lccc-internal tight-loop marker emitted by `passes::loop_align`
+    /// immediately BEFORE the ordinary `.p2align` cascade at a loop
+    /// header that passed the structural tight-loop audit. Resolved by
+    /// the integrated assembler's alignment fixed point: measure the
+    /// exact encoded span from `header` to the first backward branch to
+    /// it and pad to `2^ceil(log2(span))` (clamped to 8..=64 bytes) when
+    /// the span fits in one cache line. NEVER emitted into portable
+    /// `-S` output and unknown to GNU as by design.
+    TightLoopAlign { header: String },
+    /// Emit bytes: `.byte val, val, ...` (can contain label expressions)
+    Byte(Vec<DataValue>),
+    /// Emit 16-bit values: `.short val, ...` (can be symbol references)
+    Short(Vec<DataValue>),
+    /// Emit 32-bit values: `.long val, ...` (can be symbol references)
+    Long(Vec<DataValue>),
+    /// Emit ULEB128-encoded values: `.uleb128 val, ...` (DWARF/.eh_frame)
+    Uleb128(Vec<DataValue>),
+    /// `DW_CFA_advance_loc*` by the distance from label `from` to label `to`
+    /// (one code section), sized to its smallest encoding once the code
+    /// layout is final. Produced only by the CFI lowering
+    /// (`cfi::lower_cfi`); no source directive parses to it.
+    CfaAdvance { from: String, to: String },
+    /// Emit SLEB128-encoded values: `.sleb128 val, ...` (DWARF/.eh_frame)
+    Sleb128(Vec<DataValue>),
+    /// Emit 64-bit values: `.quad val, ...` (can be symbol references)
+    Quad(Vec<DataValue>),
+    /// `.fill repeat, size, value` with a NON-ZERO value, kept symbolic
+    /// until apply: the NOBITS raw-value law (GAS 2.47 rejects
+    /// `.fill 4,1,256` in `.bss` although the element truncates to
+    /// zeros) and the assembly-wide fill budget both need the live
+    /// section — a parse-time `Vec` can see neither.
+    Fill {
+        total: usize,
+        elem: usize,
+        value: u64,
+    },
+    /// Emit zero bytes: `.zero N`.  `usize`, not `u32`: the old `as u32`
+    /// cast silently truncated (`.zero 2^32` → 0 bytes) and turned
+    /// `.zero -1` into a request for 4 GiB-1; negative counts now parse
+    /// to 0 (GAS accepts `.zero -1` as a no-op).
+    Zero(usize),
+    /// Deferred `.skip` with expression: evaluated after all labels are known.
+    /// Used by kernel alternatives framework for label-arithmetic expressions
+    /// like `.skip -(((6651f-6641f)-(662b-661b)) > 0) * ((6651f-6641f)-(662b-661b)), 0x90`.
+    /// Fields: (expression_string, fill_byte)
+    SkipExpr(String, u8),
+    /// NUL-terminated string: `.asciz "str"`
+    Asciz(Vec<u8>),
+    /// String without NUL: `.ascii "str"`
+    Ascii(Vec<u8>),
+    /// Common symbol: `.comm name, size, align`.  `align` is the operand as
+    /// written, 0 when omitted: what it means depends on whether `.local`
+    /// flagged the symbol, which only the writer knows (a local `.bss`
+    /// allocation aligns to 1, a global common to `elf::default_comm_align`).
+    Comm(String, u64, u32),
+    /// `.local a, b, ...`: GAS's sticky per-symbol local flag.  It clears
+    /// external binding (a later `.globl` restores it for a defined symbol)
+    /// and makes a later `.comm` allocate a LOCAL object in `.bss`.
+    Local(Vec<String>),
+    /// `.lcomm name, size`: a `.bss` allocation with GAS's size-derived
+    /// alignment (`lcomm_align`); binding follows `.globl` as for a label.
+    Lcomm(String, u64, u32),
+    /// `.dc.a val, ...`: address-sized values -- 8 bytes on x86-64, 4 on
+    /// i686.  The parser does not know the target; the writer does.
+    Addr(Vec<DataValue>),
+    /// Symbol alias: `.set alias, target`
+    Set(String, String),
+    /// CFI directive. `cfi::lower_cfi` replaces these by location labels and
+    /// `.eh_frame` data before layout; the ELF writers never see one.
+    Cfi(CfiDirective),
+    /// Debug file directive: `.file N "filename"`; retained for DWARF line emission.
+    File(u32, String),
+    /// Debug location: `.loc filenum line column`; retained for DWARF line emission.
+    Loc(u32, u32, u32, crate::backend::elf::DwarfLocOptions),
+    /// x86-64 instruction
+    Instruction(Instruction),
+    /// `.option norelax` (RISC-V, ignored for x86)
+    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
+    // Parsed for RISC-V compatibility in shared parser; ignored on x86
+    OptionDirective(String),
+    /// Push current section and switch to a new one: `.pushsection name,"flags",@type`
+    PushSection(SectionDirective),
+    /// Pop section stack and restore previous section: `.popsection`
+    PopSection,
+    /// Swap current and previous sections: `.previous`
+    Previous,
+    /// `.org` directive: advance to position symbol + offset within the section.
+    /// `.org new-lc, fill` -- symbol (may be empty or "." for the location
+    /// counter), offset, and the fill byte (GAS defaults to 0).
+    Org(String, i64, u8),
+    /// `.incbin "file"[, skip[, count]]` — include binary file contents
+    Incbin {
+        path: String,
+        skip: u64,
+        count: Option<u64>,
+    },
+    /// Symbol version: `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`,
+    /// optionally followed by a visibility argument:
+    /// `.symver name, name2@VERSION, {local|hidden|remove}` (GAS 2.35+).
+    Symver(String, String, Option<SymverFlag>),
+    /// Code mode switch: `.code16`, `.code32`, `.code64`
+    /// The value is the bit width (16, 32, or 64).
+    CodeMode(u8),
+    /// Blank line or comment-only line
+    Empty,
+}
+
+/// Visibility argument of a three-operand `.symver` directive (GAS 2.35+).
+/// Semantics verified against binutils GAS on the plain-name symbol when the
+/// versioned alias is created:
+///   `local`  — the plain name is kept but demoted to STB_LOCAL,
+///   `hidden` — the plain name stays global with STV_HIDDEN visibility,
+///   `remove` — the plain name is removed from the symbol table entirely and
+///              intra-object references rebind to the versioned symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymverFlag {
+    Local,
+    Hidden,
+    Remove,
+}
+
+/// Section directive with optional flags and type.
+#[derive(Debug, Clone)]
+pub struct SectionDirective {
+    pub name: String,
+    pub flags: Option<String>,
+    pub section_type: Option<String>,
+    /// For sections with linked-to or group info (4th arg), e.g.
+    /// `__patchable_function_entries,"awo",@progbits,.LPFE0`
+    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
+    // Parsed for completeness; will be used for SHF_LINK_ORDER sections
+    pub extra: Option<String>,
+    /// COMDAT group name from `.section name,"axG",@progbits,group_name,comdat`
+    /// Set when flags contain 'G' and a 5th argument is "comdat".
+    pub comdat_group: Option<String>,
+}
+
+/// Symbol kind from `.type` directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Function,
+    Object,
+    TlsObject,
+    NoType,
+    /// STT_GNU_IFUNC (10): indirect function resolved at load time by its
+    /// resolver (glibc uses `.type foo, %gnu_indirect_function`).
+    GnuIndirectFunction,
+}
+
+/// Size expression: either a constant or `.-name` (current position minus symbol).
+#[derive(Debug, Clone)]
+pub enum SizeExpr {
+    Constant(u64),
+    CurrentMinusSymbol(String),
+    /// end_label - start_label (resolved by ELF writer after relaxation)
+    SymbolDiff(String, String),
+    /// Symbol reference (e.g., .L__sym_size_*) - resolved through .set aliases
+    SymbolRef(String),
+}
+
+/// A data value that can be a constant, a symbol, or a symbol expression.
+#[derive(Debug, Clone)]
+pub enum DataValue {
+    Integer(i64),
+    Symbol(String),
+    /// symbol + offset (e.g., `.quad GD_struct+128`)
+    SymbolOffset(String, i64),
+    /// symbol - symbol + addend (e.g., `.long .LBB3 - .Ljt_0`, `.short tr_gdt_end - tr_gdt - 1`)
+    SymbolDiff(String, String),
+    /// symbol - symbol with constant addend
+    SymbolDiffAddend(String, String, i64),
+    /// Any other well-formed expression over symbols (`(e - s) >> 1`,
+    /// `(section_table - .) / 8`): no relocation can express it, so it must
+    /// fold to a constant once labels are placed -- it is evaluated after
+    /// layout in GAS's section algebra and refused unless absolute.
+    Expr(String),
+}
+
+/// CFI directives (call frame information), lowered by `cfi::lower_cfi`.
+/// The common forms the codegen emits are pre-parsed; everything else keeps
+/// its source text in `Other` and is decoded by the lowering.
+#[derive(Debug, Clone)]
+pub enum CfiDirective {
+    StartProc,
+    EndProc,
+    /// `i64`, not `i32`: the CFA offset of a frame larger than signed imm32
+    /// is an ordinary positive number above 2^31 (`subq %r11,%rsp` spends the
+    /// immediate form, not the frame). Truncating it here does not fail --
+    /// it produces `DW_CFA_def_cfa_offset_sf` with a negative operand, i.e. an
+    /// unwind table that describes `rsp-2147483632` for a 2 GiB frame. GNU as
+    /// encodes the same directive as `DW_CFA_def_cfa_offset` + ULEB128.
+    DefCfaOffset(i64),
+    DefCfaRegister(String),
+    /// `.cfi_offset` save-slot offsets: i64 for the same reason (a saved
+    /// register above a 2 GiB frame really is past `i32::MAX`).
+    Offset(String, i64),
+    Other(String),
+}
+
+/// GAS encoding selector. `{vex}` and `{vex2}` use the shortest legal
+/// VEX prefix (a 0F38/0F3A opcode still needs C4); `{vex3}` insists on C4
+/// even when the instruction also has a C5 spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VexHint {
+    Vex,
+    Vex2,
+    Vex3,
+}
+
+/// An x86-64 instruction with mnemonic and operands.
+#[derive(Debug, Clone)]
+pub struct Instruction {
+    /// Leading prefixes in source order (e.g., ["lock"], ["xacquire", "lock"]).
+    /// Stacking is real: HLE pairs (`lock xacquire addl ...`) need two bytes.
+    pub prefixes: Vec<String>,
+    /// Instruction mnemonic (e.g., "movq", "addl", "ret")
+    pub mnemonic: String,
+    /// Operands in AT&T order (source first, destination last)
+    pub operands: Vec<Operand>,
+    /// GNU as `{nf}`: APX no-flags (EVEX.NF). Suppresses EFLAGS writes.
+    pub nf: bool,
+    /// GNU as `{evex}`: force the APX EVEX (map-4) encoding of a legacy insn.
+    pub force_evex: bool,
+    /// GNU as `{vex}`/`{vex2}`/`{vex3}`: select a VEX/XOP opcode row,
+    /// rejecting EVEX-only shapes. Vex3 additionally selects the C4 prefix
+    /// even when C5 is legal; Vex2 falls back to C4 when necessary.
+    pub vex_hint: Option<VexHint>,
+    /// GNU as `{rex2}`: force a REX2 prefix even without an EGPR.
+    pub force_rex2: bool,
+    /// GNU as `{dfv=cf,zf,sf,of}`: APX default-flags value for CCMP/CTEST.
+    /// Encoded raw in EVEX P1.vvvv (not inverted). Bits: CF=1 ZF=2 SF=4 OF=8.
+    pub dfv: u8,
+}
+
+/// An instruction operand.
+#[derive(Debug, Clone)]
+pub enum Operand {
+    /// Register: %rax, %eax, %al, %xmm0, %st(0), etc.
+    Register(Register),
+    /// Immediate: $42, $-1, $symbol
+    Immediate(ImmediateValue),
+    /// Memory reference: disp(%base, %index, scale) with optional segment
+    Memory(MemoryOperand),
+    /// Direct label/symbol reference (for jmp/call targets)
+    Label(String),
+    /// Indirect jump/call target: *%reg or *addr
+    Indirect(Box<Operand>),
+}
+
+/// Register reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Register {
+    pub name: String,
+    /// EVEX opmask applied to this operand: `%zmm0{%k1}`.
+    pub mask: Option<String>,
+    /// EVEX zeroing semantics on the destination: `%zmm0{%k1}{z}`.
+    pub zeroing: bool,
+    /// Erroneous `{1toN}` on a register (`%zmm1{1to16}`); broadcast is
+    /// memory-only, so the encoder rejects it (`unsupported broadcast`).
+    /// Stored (not parsed away) so the diagnostic names the mnemonic.
+    pub broadcast: Option<u8>,
+}
+
+impl Register {
+    /// Build a register from its bare name (no `%` sigil).
+    ///
+    /// The name is trimmed and any leftover `%` is stripped. GNU as tolerates
+    /// whitespace between the sigil and the register name, and the kernel
+    /// relies on it: `__ASM_REGPFX` splices `(% rip)` and `(% rsp)` into
+    /// `arch/x86/include/asm/asm.h`'s `_ASM_RIP()`. Callers used to strip only
+    /// the `%`, leaving a name of `" rip"` that matched no register and
+    /// silently defaulted to `%rax` in the encoder -- turning
+    /// `movl x86_pred_cmd(%rip), %eax` into `mov 0x0(%rax), %eax`, a wrong-code
+    /// bug with no diagnostic. Normalizing at the single construction point
+    /// covers every parse path at once.
+    pub fn new(name: &str) -> Self {
+        let n = name.trim();
+        let n = n.strip_prefix('%').map(str::trim_start).unwrap_or(n);
+        // GNU as register names are case-insensitive (`push %FS` == `push
+        // %fs`, `mov %RAX, %rbx` == `mov %rax, %rbx` — GAS 2.47 accepts
+        // and encodes both identically). Normalizing here covers every
+        // encoder table (all of which key on lowercase names) and every
+        // parse path at once.
+        Register {
+            name: n.to_ascii_lowercase().to_string(),
+            mask: None,
+            zeroing: false,
+            broadcast: None,
+        }
+    }
+}
+
+impl fmt::Display for Register {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "%{}", self.name)
+    }
+}
+
+/// Immediate value.
+#[derive(Debug, Clone)]
+pub enum ImmediateValue {
+    Integer(i64),
+    Symbol(String),
+    /// Symbol with integer offset, e.g., init_top_pgt - 0xffffffff80000000
+    SymbolPlusOffset(String, i64),
+    /// Symbol with @modifier, e.g., symbol@GOTPCREL
+    // Constructed by parser; handled by encoder for GOT/TLS relocations.
+    // The expectation is scoped to the shipped build, mirroring
+    // `Displacement::SymbolMod` below: any unit test that drives the
+    // full `encode()` dispatch makes the encoder's `SymbolMod` match
+    // arms reachable, which keeps the variant live under `cfg(test)` —
+    // leaving the expectation asserted there would fail `-D warnings`
+    // on the `lib test` target.
+    #[cfg_attr(all(not(feature = "gcc_assembler"), not(test)), expect(dead_code))]
+    SymbolMod(String, String),
+    /// Symbol difference: sym_a - sym_b (e.g., $_DYNAMIC-1b)
+    SymbolDiff(String, String),
+}
+
+/// Memory operand: optional_segment:disp(%base, %index, scale)
+#[derive(Debug, Clone)]
+pub struct MemoryOperand {
+    pub segment: Option<String>,
+    pub displacement: Displacement,
+    pub base: Option<Register>,
+    pub index: Option<Register>,
+    pub scale: Option<u8>,
+    /// EVEX opmask applied to this operand: `16(%rsp){%k1}`.
+    pub mask: Option<String>,
+    /// EVEX zeroing semantics on the destination.
+    pub zeroing: bool,
+    /// EVEX embedded broadcast: `(%rdi){1to16}`. The integer is N in `{1toN}`.
+    pub broadcast: Option<u8>,
+}
+
+/// Memory displacement.
+#[derive(Debug, Clone)]
+pub enum Displacement {
+    None,
+    Integer(i64),
+    Symbol(String),
+    /// Symbol with an addend offset: symbol+offset or symbol-offset (e.g., GD_struct+128(%rip))
+    // Constructed by elf.rs numeric label resolver; consumed by encoder.
+    //
+    // The expectation is scoped to the shipped build: the i686 addressing
+    // encoder's unit tests construct this variant, so leaving it asserted
+    // under `cfg(test)` would make the expectation unfulfilled and fail
+    // `-D warnings` on the `lib test` target.
+    #[cfg_attr(all(not(feature = "gcc_assembler"), not(test)), expect(dead_code))]
+    SymbolAddend(String, i64),
+    /// Symbol with relocation modifier: symbol@GOT, symbol@GOTPCREL, symbol@TPOFF, etc.
+    SymbolMod(String, String),
+    /// Symbol with relocation modifier **and** a constant addend:
+    /// `symbol@TPOFF+8`, `symbol@GOTTPOFF-4`.
+    ///
+    /// GNU as folds the addend into the relocation's addend field; treating
+    /// this shape as a plain `symbol+offset` would keep the modifier text in
+    /// the symbol name and degrade the access to an absolute `R_X86_64_32S`
+    /// relocation — a silently wrong address for every TLS/GOT form, which is
+    /// why the shape is a distinct variant instead of a normalization.
+    SymbolModAddend(String, String, i64),
+    /// Symbol plus integer offset: symbol+N or symbol-N
+    SymbolPlusOffset(String, i64),
+    /// Symbol difference: `rva(gdt)(%ebp)` in the compressed-boot head_64.S
+    /// expands to `((gdt) - startup_32)(%ebp)` — a label difference as a
+    /// displacement. Same-section pairs fold to a constant after layout.
+    SymbolDiff(String, String),
+    /// Symbol difference with a constant addend on the minuend:
+    /// `rva(pgtable + 0)` -> `((pgtable + 0) - startup_32)`.
+    SymbolDiffAddend(String, String, i64),
+}
+
+/// Comment style for x86 AT&T GAS: `#` only.
+const COMMENT_STYLE: CommentStyle = CommentStyle::Hash;
+
+/// Expand .rept/.endr blocks by repeating contained lines.
+/// Note: .irp/.endr blocks are handled separately by expand_gas_macros, so we must
+/// track .irp depth to avoid swallowing .endr lines that belong to .irp blocks.
+fn expand_rept_blocks(lines: &[&str]) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    let mut irp_depth = 0; // Track .irp nesting to avoid consuming their .endr
+    // Repetition-only growth totals (see asm_preprocess::check_expansion_growth).
+    let mut grown_lines: u64 = 0;
+    let mut grown_bytes: u64 = 0;
+    while i < lines.len() {
+        let trimmed = strip_comment(lines[i]).trim().to_string();
+        if let Some(count_str) = directive_arg(&trimmed, ".rept") {
+            if irp_depth > 0 {
+                // Inside .irp block - pass through as-is
+                result.push(lines[i].to_string());
+                i += 1;
+                continue;
+            }
+            // GAS casts the count to `size_t` (read.c `s_rept`): negative
+            // wraps and is then rejected by the budget below with GAS's
+            // wording (measured `.rept -1` -> "excessive count
+            // 18446744073709551615 for REPT - ignored"); `as usize` on the
+            // i64 expression performs the same wrap on this target.
+            let count = parse_integer_expr(count_str)
+                .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?
+                as u64;
+            let mut depth = 1;
+            let mut body = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                let inner = strip_comment(lines[i]).trim().to_string();
+                if directive_arg(&inner, ".rept").is_some() {
+                    depth += 1;
+                } else if inner == ".endr" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                body.push(lines[i]);
+                i += 1;
+            }
+            if depth != 0 {
+                return Err(".rept without matching .endr".to_string());
+            }
+            // Bound the raw block before recursing — same position in the
+            // flow as GAS's `do_repeat` check (pre-expansion, raw body).
+            asm_preprocess::check_rept_budget(count, &body)?;
+            let expanded_body = expand_rept_blocks(&body)?;
+            let (add_lines, add_bytes) = asm_preprocess::expansion_size(&expanded_body);
+            grown_lines = grown_lines.saturating_add(count.saturating_mul(add_lines));
+            grown_bytes = grown_bytes.saturating_add(count.saturating_mul(add_bytes));
+            asm_preprocess::check_expansion_growth(".rept", grown_lines, grown_bytes)?;
+            for _ in 0..count {
+                result.extend(expanded_body.iter().cloned());
+            }
+        } else if directive_arg(&trimmed, ".irp").is_some()
+            || directive_arg(&trimmed, ".irpc").is_some()
+        {
+            // .irpc must be tracked exactly like .irp here: this pre-pass
+            // only expands .rept, and treating .irpc's .endr as a stray
+            // DELETED it, so the later .irpc expansion ran off the end of
+            // the block (efi-mixed.S page-table unroll emitted a stray
+            // `ret` per iteration).
+            irp_depth += 1;
+            result.push(lines[i].to_string());
+        } else if trimmed == ".endr" {
+            if irp_depth > 0 {
+                irp_depth -= 1;
+                result.push(lines[i].to_string());
+            }
+            // else: stray .endr without .rept or .irp - skip
+        } else {
+            result.push(lines[i].to_string());
+        }
+        i += 1;
+    }
+    Ok(result)
+}
+
+/// Parse assembly text into a list of AsmItems.
+pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
+    let mut items = Vec::new();
+
+    // Strip C-style /* */ comments (used in hand-written assembly like musl)
+    let text = asm_preprocess::strip_c_comments(text);
+    // Pre-split on ';' (GAS statement separator) so that .rept/.irp directives
+    // embedded in semicolon-separated lines (e.g., from C preprocessor macro
+    // expansion like PMDS) are properly detected by expand_rept_blocks.
+    let raw_lines: Vec<&str> = text.lines().collect();
+    let mut lines: Vec<String> = Vec::new();
+    for line in &raw_lines {
+        let parts = asm_preprocess::split_on_semicolons(line);
+        if parts.len() > 1 {
+            for part in parts {
+                let part = crate::backend::asm_expr::trim_asm_line(part);
+                if !part.is_empty() {
+                    lines.push(part.to_string());
+                }
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+    let expanded = expand_rept_blocks(&line_refs)?;
+    let expanded = expand_gas_macros(&expanded)?;
+
+    for (line_num, line) in expanded.iter().enumerate() {
+        let line_num = line_num + 1; // 1-based
+
+        // Strip comments (# to end of line, but not inside strings)
+        let stripped = strip_comment(line);
+        let trimmed = crate::backend::asm_expr::trim_asm_line(stripped);
+
+        if trimmed.is_empty() {
+            items.push(AsmItem::Empty);
+            continue;
+        }
+
+        // Handle ';' as instruction separator (GAS syntax)
+        // Split the line on ';' and parse each part independently.
+        let parts: Vec<&str> = asm_preprocess::split_on_semicolons(trimmed);
+        for part in parts {
+            let part = crate::backend::asm_expr::trim_asm_line(part);
+            if part.is_empty() {
+                continue;
+            }
+            match parse_line_items(part) {
+                Ok(line_items) => items.extend(line_items),
+                Err(e) => {
+                    // Decorator diagnostics (`\0raw:`) are GAS-bare: GNU as
+                    // reports them without location or source echo.
+                    if let Some(raw) = e.strip_prefix("\0raw:") {
+                        return Err(raw.to_string());
+                    }
+                    return Err(format!("line {}: {}: '{}'", line_num, e, part));
+                }
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+/// Strip trailing comment from a line using x86 comment style (`#`).
+fn strip_comment(line: &str) -> &str {
+    asm_preprocess::strip_comment(line, &COMMENT_STYLE)
+}
+
+/// Match a GAS directive and return its argument, whitespace-insensitively.
+///
+/// GAS accepts any ASCII whitespace between a directive and its argument
+/// (`.ifb %1`, `.ifb\t%1`, `.ifb  %1` are all identical). The historical
+/// pattern at every call site was `starts_with(".X ") ||
+/// starts_with(".X\t")` — an enumeration that (a) forgot the tab variant
+/// in three matchers during a refactor and silently broke `.ifb\t%1`
+/// macro conditionals, and (b) could not accept a `.X` followed by any
+/// other whitespace. This helper closes the class once: it matches
+/// `line` exactly equal to the directive (bare form, `Some("")`) or the
+/// directive followed by any single ASCII whitespace character, returning
+/// the trimmed argument. Directives are always dot-prefixed and matched
+/// case-sensitively, like GAS.
+/// The operands of `.set` or its GAS synonym `.equ`.  Every textual pass
+/// that recognises `.set` must use this: `.equ` reaching only the final
+/// parser skipped the register-alias and constant passes.
+fn set_directive_arg(line: &str) -> Option<&str> {
+    directive_arg(line, ".set").or_else(|| directive_arg(line, ".equ"))
+}
+
+fn directive_arg<'a>(line: &'a str, directive: &str) -> Option<&'a str> {
+    if let Some(rest) = line.strip_prefix(directive) {
+        match rest.chars().next() {
+            None => return Some(""),
+            Some(c) if c.is_ascii_whitespace() => return Some(rest.trim_start()),
+            // `.ifbfoo` is a different directive, not `.ifb` with an
+            // argument; a prefix match would silently mis-dispatch it.
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// Parse a single non-empty assembly line into one or more AsmItems.
+///
+/// A line may contain a label followed by an instruction on the same line
+/// (e.g., `1: stmxcsr -8(%rsp)`), which produces two items.
+fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
+    let mut items = Vec::new();
+
+    // Check for label (may be followed by instruction on same line)
+    let rest = if let Some((label, rest)) = try_parse_label(line) {
+        items.push(AsmItem::Label(label));
+        rest
+    } else {
+        crate::backend::asm_expr::trim_asm_line(line)
+    };
+
+    // If there's nothing after the label, we're done
+    if rest.is_empty() {
+        return Ok(items);
+    }
+
+    // Handle multiple labels on same line (e.g. "771: 999: .pushsection ...")
+    let mut rest = rest;
+    while let Some((label, remaining)) = try_parse_label(rest) {
+        items.push(AsmItem::Label(label));
+        rest = remaining;
+    }
+
+    // If there's nothing after the labels, we're done
+    if rest.is_empty() {
+        return Ok(items);
+    }
+
+    // GAS location-counter assignment is positioning, NOT a symbol named ".".
+    // Linux kexec spells each fixed-width exception vector as
+    // `. = base + (index * stride)`. Lower it to the same .org machinery
+    // (including relaxation markers) with zero fill. Comparison operators
+    // (`==`, `!=`, `<=`, `>=`) are not assignments and fail closed.
+    if let Some(eq_pos) = rest.find('=') {
+        let before = rest[..eq_pos].trim();
+        let expr = rest[eq_pos + 1..].trim();
+        if before == "." {
+            if expr.starts_with('=')
+                || (eq_pos > 0 && matches!(rest.as_bytes()[eq_pos - 1], b'!' | b'<' | b'>' | b'='))
+            {
+                return Err("unsupported location-counter assignment".into());
+            }
+            let (sym, addend) = parse_org_target(expr, "location-counter assignment")?;
+            items.push(AsmItem::Org(sym, addend, 0));
+            return Ok(items);
+        }
+        // Ordinary GAS symbol assignment is equivalent to `.set`.
+        if !before.is_empty()
+            && !before.contains(' ')
+            && !before.contains('\t')
+            && !before.starts_with('$')
+            && !before.starts_with('%')
+            && (before.as_bytes()[0].is_ascii_alphabetic() || before.starts_with('_'))
+        {
+            items.push(AsmItem::Set(before.to_string(), expr.to_string()));
+            return Ok(items);
+        }
+    }
+
+    // Parse the remaining content as a directive or instruction
+    if rest.starts_with('.') {
+        items.push(parse_directive(rest)?);
+    } else if is_prefixed_instruction(rest) {
+        items.push(parse_prefixed_instruction(rest)?);
+    } else {
+        items.push(parse_instruction(rest, Vec::new())?);
+    }
+
+    Ok(items)
+}
+
+/// Try to parse a label definition. Returns the label name and any remaining
+/// content after the label (which may be an instruction or directive on the same line).
+///
+/// For example:
+///   "foo:"           -> Some(("foo", ""))
+///   "1:  stmxcsr -8(%rsp)"  -> Some(("1", "stmxcsr -8(%rsp)"))
+///   ".Lfoo: ret"     -> Some((".Lfoo", "ret"))
+///   "mov %rax, %rbx" -> None (no label)
+/// GAS's symbol grammar for the label position:
+/// `[A-Za-z_.$@][A-Za-z0-9_.$@]*`, plus numeric local labels (`1:`).
+fn is_gas_symbol(candidate: &str) -> bool {
+    let mut bytes = candidate.bytes();
+    match bytes.next() {
+        Some(c) if c.is_ascii_alphabetic() || matches!(c, b'_' | b'.' | b'$' | b'@') => {}
+        Some(c) if c.is_ascii_digit() => {
+            return bytes.all(|c| c.is_ascii_digit());
+        }
+        // Extended identifiers: C99 UCNs and UTF-8 identifier characters reach
+        // the assembler as raw UTF-8 bytes (`café`), exactly as GCC emits them,
+        // so any non-ASCII byte is a symbol character.
+        Some(c) if c >= 0x80 => {}
+        _ => return false,
+    }
+    bytes.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$' | b'@') || c >= 0x80)
+}
+
+fn try_parse_label(line: &str) -> Option<(String, &str)> {
+    let trimmed = line.trim();
+    if let Some(colon_pos) = trimmed.find(':') {
+        let candidate = trimmed[..colon_pos].trim();
+        // Verify it's a valid label (no spaces, starts with letter/dot/digit).
+        //
+        // `$` is a legal symbol character to GAS and to this compiler's own
+        // lexer (`-fdollars-in-identifiers`, on by default), so
+        // `int $x = 1;` emits `.globl $x` / `$x:` and must round-trip. The old
+        // unconditional `$` rejection turned that into
+        // `unhandled instruction: $x: []` — a compiler failure on a program
+        // GCC accepts. `%` stays excluded: a `%`-first candidate is a register.
+        if !candidate.is_empty()
+            && !candidate.contains(' ')
+            && !candidate.contains('\t')
+            && !candidate.contains(',')
+            && !candidate.starts_with('%')
+            && is_gas_symbol(candidate)
+        {
+            let rest = trimmed[colon_pos + 1..].trim();
+            return Some((candidate.to_string(), rest));
+        }
+    }
+    None
+}
+
+/// Parse a directive line (starts with '.').
+fn parse_directive(line: &str) -> Result<AsmItem, String> {
+    let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
+    let directive = parts[0];
+    let args = parts
+        .get(1)
+        .map(|s| crate::backend::asm_expr::trim_asm_line(s))
+        .unwrap_or("");
+
+    match directive {
+        ".section" => parse_section_directive(args),
+        ".text" => Ok(AsmItem::Section(SectionDirective {
+            name: ".text".to_string(),
+            flags: None,
+            section_type: None,
+            extra: None,
+            comdat_group: None,
+        })),
+        ".data" => Ok(AsmItem::Section(SectionDirective {
+            name: ".data".to_string(),
+            flags: None,
+            section_type: None,
+            extra: None,
+            comdat_group: None,
+        })),
+        ".bss" => Ok(AsmItem::Section(SectionDirective {
+            name: ".bss".to_string(),
+            flags: None,
+            section_type: None,
+            extra: None,
+            comdat_group: None,
+        })),
+        ".rodata" => Ok(AsmItem::Section(SectionDirective {
+            name: ".rodata".to_string(),
+            flags: None,
+            section_type: None,
+            extra: None,
+            comdat_group: None,
+        })),
+        ".globl" | ".global" => Ok(AsmItem::Global(args.trim().to_string())),
+        ".weak" => Ok(AsmItem::Weak(args.trim().to_string())),
+        ".hidden" => Ok(AsmItem::Hidden(args.trim().to_string())),
+        ".protected" => Ok(AsmItem::Protected(args.trim().to_string())),
+        ".internal" => Ok(AsmItem::Internal(args.trim().to_string())),
+        ".type" => parse_type_directive(args),
+        ".size" => parse_size_directive(args),
+        ".lccc_tight_loop" => {
+            // Exactly one argument: the local header label immediately
+            // following the marker in the text stream. This is a
+            // lccc-private directive, never hand-written or seen by GNU
+            // as, so malformed spellings are errors rather than silent
+            // no-ops (a typo would otherwise just lose the alignment).
+            let header = args.trim();
+            let well_formed = header.starts_with('.')
+                && header.len() > 1
+                && header[1..]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+                && header.split_whitespace().count() == 1;
+            if !well_formed {
+                return Err(format!("bad .lccc_tight_loop argument: {args}"));
+            }
+            Ok(AsmItem::TightLoopAlign {
+                header: header.to_string(),
+            })
+        }
+        ".align" | ".p2align" | ".balign" => {
+            // GAS grammar (read.c, verified against binutils 2.47):
+            //   `.p2align EXP [, fill [, max-skip]]` — exponent form; an
+            //   out-of-range exponent (negative or > 63) clamps to 63 with a
+            //   warning and the directive is ACCEPTED.
+            //   `.align`/`.balign COUNT [, fill [, max-skip]]` — byte-count
+            //   form on x86 GAS; a negative or non-power-of-two count is an
+            //   ERROR ("alignment not a power of 2"), and a count above 2^63
+            //   clamps like the exponent form.
+            // An empty middle field (`.p2align 4,,10`) selects the default
+            // fill. The fill is silently truncated to a byte (`.p2align 4,300`
+            // pads with 0x2c).
+            let mut fields = args.split(',');
+            let align_field = fields.next().unwrap_or("").trim();
+            // Bare byte-form directives (`.balign` / `.align` with no operand)
+            // are accepted by GAS as align-1 no-ops.  `.p2align` with no
+            // operand still requires an expression (GAS: "expected
+            // expression"), so it keeps the parse error below.
+            if align_field.is_empty() && directive != ".p2align" {
+                return Ok(AsmItem::Align {
+                    align: 1,
+                    fill: None,
+                    max_skip: None,
+                });
+            }
+            let align_val: i64 =
+                parse_integer_expr(align_field).map_err(|_| format!("bad alignment: {args}"))?;
+            let align: u64 = if directive == ".p2align" {
+                let exp: u32 = if !(0..=63).contains(&align_val) {
+                    // GAS clamps rather than rejecting.
+                    63
+                } else {
+                    align_val as u32
+                };
+                1u64 << exp
+            } else {
+                if align_val < 0 {
+                    return Err(format!("alignment not a power of 2: {args}"));
+                }
+                let count = align_val as u64;
+                if !count.is_power_of_two() {
+                    // Zero is GAS-legal (no alignment requested).
+                    if count == 0 {
+                        1
+                    } else {
+                        return Err(format!("alignment not a power of 2: {args}"));
+                    }
+                } else {
+                    count
+                }
+            };
+            let parse_field = |raw: Option<&str>, what: &str| -> Result<Option<i64>, String> {
+                match raw {
+                    None => Ok(None),
+                    Some(f) => {
+                        let f = f.trim();
+                        if f.is_empty() {
+                            Ok(None) // `.p2align 4,,10`: default fill
+                        } else {
+                            parse_integer_expr(f)
+                                .map(Some)
+                                .map_err(|_| format!("bad {what}: {args}"))
+                        }
+                    }
+                }
+            };
+            let mut fill_val = parse_field(fields.next(), "alignment fill")?;
+            let skip_val = parse_field(fields.next(), "alignment max-skip")?;
+            if fields.next().is_some_and(|f| !f.trim().is_empty()) {
+                return Err(format!("too many alignment arguments: {args}"));
+            }
+            if let Some(f) = fill_val {
+                // GAS silently truncates the fill to a byte.
+                fill_val = Some(f & 0xff);
+            }
+            let max_skip = match skip_val {
+                None => None,
+                // GAS: a max-skip of 0 or negative means NO skip threshold —
+                // the full pad is always emitted (measured on binutils 2.47:
+                // `.p2align 4,,0` and `.p2align 16,,-1` both pad at @1).  The
+                // old `s < 0 → Err` rejected `,,-1` and `s == 0 → Some(0)`
+                // made the writer skip exactly where GAS pads.
+                Some(s) if s <= 0 => None,
+                Some(s) => Some(s as u64),
+            };
+            Ok(AsmItem::Align {
+                align,
+                fill: fill_val.map(|f| f as u8),
+                max_skip,
+            })
+        }
+        ".org" => {
+            // `.org new-lc, fill` -- the fill byte is optional and defaults to
+            // zero, which is what the ELF writer emits.  It has to be split off
+            // before the expression is parsed, or the whole `8, 0x90` string is
+            // handed to the integer parser and rejected.
+            let (args, fill) = match args.split_once(',') {
+                Some((lc, f)) => (
+                    lc.trim(),
+                    parse_integer_expr(f.trim())
+                        .map_err(|_| format!("bad .org fill: {}", f.trim()))?
+                        as u8,
+                ),
+                None => (args, 0u8),
+            };
+            if args.is_empty() {
+                return Err("missing .org expression".to_string());
+            }
+            let (sym, offset) = parse_org_target(args, ".org")?;
+            Ok(AsmItem::Org(sym, offset, fill))
+        }
+        ".byte" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Byte(vals))
+        }
+        ".short" | ".value" | ".2byte" | ".word" | ".hword" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Short(vals))
+        }
+        ".long" | ".4byte" | ".int" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Long(vals))
+        }
+        ".uleb128" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Uleb128(vals))
+        }
+        ".sleb128" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Sleb128(vals))
+        }
+        ".quad" | ".8byte" => {
+            let vals = parse_data_values(args)?;
+            Ok(AsmItem::Quad(vals))
+        }
+        ".dc" | ".dc.b" | ".dc.w" | ".dc.l" | ".dc.a" | ".dc.s" | ".dc.d" => {
+            parse_dc_directive(directive, args)
+        }
+        // `.octa` — 16-byte (128-bit) constants, emitted little-endian.
+        // Previously this directive fell through to the "ignore unknown
+        // directive" arm, silently emitting NOTHING: the kernel's
+        // `.Lbswap_mask`-style `.octa` constant pools lost whole entries
+        // (shifting everything after them) with no diagnostic, and AES-CTR
+        // assembled with a zeroed byte-swap mask.
+        ".octa" => {
+            let mut data: Vec<DataValue> = Vec::new();
+            for part in args.split(',') {
+                let t = strip_outer_parens(part.trim());
+                if t.is_empty() {
+                    continue;
+                }
+                // 128-bit literals first (they can exceed u64); fall back to
+                // the ordinary 64-bit expression parser for smaller values.
+                let wide =
+                    parse_u128_literal(t).or_else(|| parse_integer_expr(t).ok().map(|v| v as u128));
+                match wide {
+                    Some(v) => {
+                        // AsmItem::Byte is a byte-per-DataValue stream
+                        // (the .float/.double path uses the same shape).
+                        data.extend(
+                            v.to_le_bytes()
+                                .iter()
+                                .map(|b| DataValue::Integer(*b as i64)),
+                        );
+                    }
+                    None => {
+                        return Err(format!(".octa: unsupported value: {t}"));
+                    }
+                }
+            }
+            Ok(AsmItem::Byte(data))
+        }
+        // Floating-point data. These were previously UNRECOGNIZED and fell
+        // through to the "ignore unknown directive" arm, silently emitting
+        // NOTHING — every `.float`/`.double` constant pool assembled from
+        // hand-written or third-party asm was dropped, shifting all following
+        // data. Emit the IEEE-754 bit patterns, matching GAS.
+        ".float" | ".single" => {
+            let vals = parse_float_values(args, false)?;
+            Ok(AsmItem::Byte(vals))
+        }
+        ".double" => {
+            let vals = parse_float_values(args, true)?;
+            Ok(AsmItem::Byte(vals))
+        }
+        // `.space` is an exact synonym of `.skip` in GAS (both take an optional
+        // fill byte).  It was missing from this list, and because unrecognized
+        // directives are silently ignored, `.space 8` emitted NOTHING -- every
+        // following byte in the section landed at the wrong offset.
+        ".zero" | ".skip" | ".space" => {
+            let (expr_str, fill) = split_skip_args(args);
+            if let Ok(val) = parse_integer_expr(expr_str) {
+                if fill == 0 {
+                    // GAS: a negative count emits nothing (`.zero -1`
+                    // accepted as a no-op); keep the full positive range
+                    // (usize, no 32-bit truncation) — the writer's
+                    // directive-fill cap rejects runaway materializations.
+                    Ok(AsmItem::Zero(if val <= 0 { 0 } else { val as usize }))
+                } else {
+                    Ok(AsmItem::SkipExpr(expr_str.to_string(), fill))
+                }
+            } else {
+                // Expression contains labels or complex arithmetic - defer to ELF writer
+                Ok(AsmItem::SkipExpr(expr_str.to_string(), fill))
+            }
+        }
+        ".fill" => {
+            // .fill repeat, size, value
+            // Emits repeat copies of value, each size bytes wide (LE, max 8).
+            let parts: Vec<&str> = args.splitn(3, ',').collect();
+            let repeat_str = parts[0].trim();
+            match parse_integer_expr(repeat_str) {
+                Ok(repeat) => {
+                    let size: i64 = if parts.len() > 1 {
+                        parse_integer_expr(parts[1].trim())
+                            .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
+                    } else {
+                        1
+                    };
+                    let value = if parts.len() > 2 {
+                        parse_integer_expr(parts[2].trim())
+                            .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))?
+                            as u64
+                    } else {
+                        0
+                    };
+                    // GAS (read.c): non-positive repeat/size emit nothing —
+                    // `.fill -1` is accepted as a no-op — and a wrapping
+                    // repeat*size also emits zero bytes.  The old code
+                    // cast-then-multiply: `.fill -1,1,0xff` overflowed to
+                    // 4 GiB-1 and looped until OOM.
+                    if repeat <= 0 || size <= 0 {
+                        return Ok(AsmItem::Zero(0));
+                    }
+                    let repeat = repeat as u64;
+                    let size = size as u64;
+                    // A wrapping repeat*size is GAS's "out of memory" case,
+                    // measured as emitting ZERO bytes (`.fill 2^62,4`):
+                    // checked arithmetic → 0, never a silent wrap.
+                    let Some(total_bytes) = repeat.checked_mul(size.min(8)) else {
+                        return Ok(AsmItem::Zero(0));
+                    };
+                    // No byte cap here: nothing is materialised at parse time (zero
+                    // runs become `Zero`, patterns a `Fill` descriptor), and the
+                    // writer decides against the live section -- the PROGBITS
+                    // ceiling and budget apply there, while a NOBITS run is a
+                    // size (GAS 2.47: `.fill 1073741824,1,0` in `.bss` is a
+                    // 1 GiB section). A parse-time cap refused exactly the
+                    // NOBITS case the writer was built to accept.
+                    let total_bytes = usize::try_from(total_bytes).map_err(|_| {
+                        format!(".fill: {total_bytes} bytes exceed the addressable size")
+                    })?;
+                    if value == 0 {
+                        Ok(AsmItem::Zero(total_bytes))
+                    } else {
+                        // No parse-time Vec — see the `Fill` variant's doc.
+                        Ok(AsmItem::Fill {
+                            total: total_bytes,
+                            elem: size.min(8) as usize,
+                            value,
+                        })
+                    }
+                }
+                Err(_) => {
+                    // Repeat expression contains labels/symbols - defer to ELF writer.
+                    // Parse size and value as constants (these are always simple integers).
+                    let size = if parts.len() > 1 {
+                        parse_integer_expr(parts[1].trim())
+                            .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
+                            as u64
+                    } else {
+                        1
+                    };
+                    let value = if parts.len() > 2 {
+                        parse_integer_expr(parts[2].trim())
+                            .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))?
+                            as u8
+                    } else {
+                        0
+                    };
+                    if size == 1 {
+                        // size=1: equivalent to .skip repeat, value
+                        Ok(AsmItem::SkipExpr(repeat_str.to_string(), value))
+                    } else if value == 0 {
+                        // value=0: equivalent to .skip (repeat * size), 0
+                        // Wrap expression: (repeat_expr) * size
+                        let expr = format!("({}) * {}", repeat_str, size);
+                        Ok(AsmItem::SkipExpr(expr, 0))
+                    } else {
+                        Err(format!(
+                            "bad .fill repeat: {}: deferred .fill with size > 1 and non-zero value not supported",
+                            repeat_str
+                        ))
+                    }
+                }
+            }
+        }
+        ".asciz" | ".string" => {
+            let s = elf::parse_string_literal(args)?;
+            let mut bytes = s;
+            bytes.push(0); // NUL terminator
+            Ok(AsmItem::Asciz(bytes))
+        }
+        ".ascii" => {
+            let s = elf::parse_string_literal(args)?;
+            Ok(AsmItem::Ascii(s))
+        }
+        ".comm" => parse_comm_directive(args),
+        ".lcomm" => parse_lcomm_directive(args),
+        ".local" => Ok(AsmItem::Local(parse_symbol_list(args, ".local")?)),
+        ".base64" => Ok(AsmItem::Ascii(elf::parse_base64_args(args)?)),
+        ".set" | ".equ" => parse_set_directive(args),
+        ".symver" => parse_symver_directive(args),
+        // `.cfi_startproc simple` (no CIE initial instructions) keeps its
+        // text so the lowering sees the operand.
+        ".cfi_startproc" if args.trim().is_empty() => Ok(AsmItem::Cfi(CfiDirective::StartProc)),
+        ".cfi_endproc" if args.trim().is_empty() => Ok(AsmItem::Cfi(CfiDirective::EndProc)),
+        ".cfi_def_cfa_offset" => {
+            // Accept full constant expressions (e.g. "8*2", "N*8+N").
+            let val =
+                parse_integer_expr(args.trim()).map_err(|_| format!("bad cfi offset: {}", args))?;
+            Ok(AsmItem::Cfi(CfiDirective::DefCfaOffset(val)))
+        }
+        ".cfi_def_cfa_register" => {
+            let reg = args.trim().trim_start_matches('%').to_string();
+            Ok(AsmItem::Cfi(CfiDirective::DefCfaRegister(reg)))
+        }
+        ".cfi_offset" => {
+            // .cfi_offset %rbp, -16  (offset may be a constant expression)
+            let parts: Vec<&str> = args.splitn(2, ',').collect();
+            if parts.len() != 2 {
+                return Ok(AsmItem::Cfi(CfiDirective::Other(line.to_string())));
+            }
+            let reg = parts[0].trim().trim_start_matches('%').to_string();
+            let off = parse_integer_expr(parts[1].trim())
+                .map_err(|_| format!("bad cfi offset value: {}", args))?;
+            Ok(AsmItem::Cfi(CfiDirective::Offset(reg, off)))
+        }
+        ".file" => Ok(match crate::backend::elf::parse_file_directive(args)? {
+            Some((number, filename)) => AsmItem::File(number, filename),
+            None => AsmItem::Empty,
+        }),
+        ".loc" => {
+            let (file, line, column, options) = crate::backend::elf::parse_loc_directive(args)?;
+            Ok(AsmItem::Loc(file, line, column, options))
+        }
+        ".pushsection" => {
+            // .pushsection name,"flags",@type - same syntax as .section
+            parse_section_directive(args).map(|item| {
+                if let AsmItem::Section(dir) = item {
+                    AsmItem::PushSection(dir)
+                } else {
+                    AsmItem::Empty
+                }
+            })
+        }
+        ".popsection" => Ok(AsmItem::PopSection),
+        ".previous" => Ok(AsmItem::Previous),
+        // 16 = plain .code16 (call/jmp/ret default to 16-bit operands),
+        // 17 = .code16gcc (GCC -m16 convention: unsuffixed call/ret
+        // take 32-bit operands; everything else keeps 16-bit defaults).
+        // Conflating the two mis-sized the C call/ret ABI against hand
+        // asm using calll/retl (arch/x86/boot) and corrupted the stack:
+        // every return popped 2 bytes off a 4-byte slot and the boot died
+        // at the first function return (ret landed at 0x10000).
+        ".code16gcc" => Ok(AsmItem::CodeMode(17)),
+        ".code16" => Ok(AsmItem::CodeMode(16)),
+        ".code32" => Ok(AsmItem::CodeMode(32)),
+        ".code64" => Ok(AsmItem::CodeMode(64)),
+        ".option" => Ok(AsmItem::OptionDirective(args.to_string())),
+        ".incbin" => {
+            let parts: Vec<&str> = args.splitn(3, ',').collect();
+            let path = elf::parse_string_literal(parts[0].trim())
+                .map_err(|e| format!(".incbin path: {}", e))?;
+            let path = String::from_utf8(path)
+                .map_err(|_| ".incbin: invalid UTF-8 in path".to_string())?;
+            let skip = if parts.len() > 1 {
+                parts[1].trim().parse::<u64>().unwrap_or(0)
+            } else {
+                0
+            };
+            let count = if parts.len() > 2 {
+                Some(parts[2].trim().parse::<u64>().unwrap_or(0))
+            } else {
+                None
+            };
+            Ok(AsmItem::Incbin { path, skip, count })
+        }
+        d if d.starts_with(".cfi_") => {
+            // Any other .cfi_* directive (restore, adjust_cfa_offset, def_cfa,
+            // register, undefined, escape, personality, lsda, sections,
+            // signal_frame, remember/restore_state, val_offset, ...): keep the
+            // text; `cfi::lower_cfi` decodes and validates it.
+            Ok(AsmItem::Cfi(CfiDirective::Other(line.to_string())))
+        }
+        _ => parse_unlisted_directive(line, directive, args),
+    }
+}
+
+/// Every directive `parse_directive` has no arm for: a short list accepted
+/// with no effect on the object, and an error for everything else.
+///
+/// Directives accepted with no effect, each with the reason ignoring it is
+/// exact:
+///  * `.extern`: GAS documents it as accepted and ignored (undefined
+///    symbols are external anyway).
+///  * `.ident`: provenance text GAS puts in `.comment`; it changes no
+///    code, data, symbol or relocation.
+///  * `.addrsig`, `.addrsig_sym`: LLVM's address-significance table.
+///    Without `.llvm_addrsig` lld treats every symbol as
+///    address-significant, the conservative reading for --icf=safe.
+///  * `.prefalign`: LLVM's preferred function alignment, a hint by
+///    definition; the required minimum is a separate `.p2align`.
+///  * `.att_syntax` / `.att_syntax prefix`: the syntax already in use.
+///
+/// Anything else fails closed.  Dropping a directive silently is how
+/// `.octa`, `.float`, `.space`, `.equ`, `.local`, `.lcomm` and `.base64`
+/// each assembled to wrong bytes or symbols with no diagnostic; GAS reports
+/// the same condition as an error.
+fn parse_unlisted_directive(line: &str, directive: &str, args: &str) -> Result<AsmItem, String> {
+    match directive {
+        ".extern" | ".ident" | ".addrsig" | ".addrsig_sym" | ".prefalign" => Ok(AsmItem::Empty),
+        ".att_syntax" if matches!(args.trim(), "" | "prefix") => Ok(AsmItem::Empty),
+        ".intel_syntax" | ".att_syntax" => Err(format!(
+            "unsupported pseudo-op `{line}': lccc's x86 assembler accepts AT&T syntax \
+             with %-prefixed registers only"
+        )),
+        _ => Err(format!(
+            "unknown pseudo-op: `{directive}' (not supported by lccc's x86 assembler)"
+        )),
+    }
+}
+
+/// Parse `.section name,"flags",@type` directive.
+fn parse_section_directive(args: &str) -> Result<AsmItem, String> {
+    // Split by comma, but handle quoted strings
+    let parts = split_section_args(args);
+
+    let name = parts
+        .first()
+        .map(|s| s.trim().trim_matches('"').to_string())
+        .unwrap_or_else(|| ".text".to_string());
+
+    let flags = parts.get(1).map(|s| s.trim().trim_matches('"').to_string());
+    let section_type = parts.get(2).map(|s| s.trim().to_string());
+    let extra = parts.get(3).map(|s| s.trim().to_string());
+
+    // If the flags contain 'G' (SHF_GROUP), the 4th arg is the group signature
+    // name and the 5th arg should be "comdat".
+    let comdat_group = if let Some(ref f) = flags {
+        if f.contains('G') {
+            if let Some(ref group_name) = extra {
+                let fifth = parts.get(4).map(|s| s.trim().to_string());
+                if fifth.as_deref() == Some("comdat") || fifth.is_none() {
+                    // Accept both explicit "comdat" and implicit (GNU as default)
+                    Some(group_name.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(AsmItem::Section(SectionDirective {
+        name,
+        flags,
+        section_type,
+        extra,
+        comdat_group,
+    }))
+}
+
+/// Split section directive args, respecting quoted strings.
+fn split_section_args(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for c in s.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            current.push(c);
+        } else if c == ',' && !in_quotes {
+            parts.push(current.clone());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// Parse `.type name, @function` or `@object` or `@tls_object`.
+/// Also handles Linux kernel format: `.type name STT_FUNC`.
+fn parse_type_directive(args: &str) -> Result<AsmItem, String> {
+    let (name, kind_str) = if let Some(comma_pos) = args.find(',') {
+        // Standard GAS format: .type name, @function
+        (args[..comma_pos].trim(), args[comma_pos + 1..].trim())
+    } else {
+        // Linux kernel format: .type name STT_FUNC (space-separated, no comma)
+        let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
+        if parts.len() != 2 {
+            return Err(format!("bad .type directive: {}", args));
+        }
+        (parts[0].trim(), parts[1].trim())
+    };
+    let name = name.to_string();
+    let kind = match kind_str {
+        "@function" | "%function" | "STT_FUNC" => SymbolKind::Function,
+        "@object" | "%object" | "STT_OBJECT" => SymbolKind::Object,
+        "@tls_object" | "%tls_object" | "STT_TLS" => SymbolKind::TlsObject,
+        "@notype" | "%notype" | "STT_NOTYPE" => SymbolKind::NoType,
+        "@gnu_indirect_function"
+        | "%gnu_indirect_function"
+        | "STT_GNU_IFUNC"
+        | "@gnu_indirect_function,"
+        | "%gnu_indirect_function," => SymbolKind::GnuIndirectFunction,
+        _ => return Err(format!("unknown symbol type: {}", kind_str)),
+    };
+    Ok(AsmItem::SymbolType(name, kind))
+}
+
+/// GAS's `.dc[.size]` family (default size: word).  `.dc.x` (x87 extended)
+/// is not listed and so is refused by `parse_unlisted_directive`: its
+/// decimal-to-64-bit-mantissa rounding is not implemented, and an f64 round
+/// trip would emit wrong low mantissa bits for literals such as 0.1.
+fn parse_dc_directive(directive: &str, args: &str) -> Result<AsmItem, String> {
+    Ok(match directive {
+        ".dc.b" => AsmItem::Byte(parse_data_values(args)?),
+        ".dc" | ".dc.w" => AsmItem::Short(parse_data_values(args)?),
+        ".dc.l" => AsmItem::Long(parse_data_values(args)?),
+        ".dc.a" => AsmItem::Addr(parse_data_values(args)?),
+        ".dc.s" => AsmItem::Byte(parse_float_values(args, false)?),
+        ".dc.d" => AsmItem::Byte(parse_float_values(args, true)?),
+        other => return Err(format!("internal error: `{other}' is not a .dc directive")),
+    })
+}
+
+/// Parse `.size name, expr`.
+fn parse_size_directive(args: &str) -> Result<AsmItem, String> {
+    let parts: Vec<&str> = args.splitn(2, ',').collect();
+    if parts.len() != 2 {
+        return Err(format!("bad .size directive: {}", args));
+    }
+    let name = parts[0].trim().to_string();
+    let expr_str = parts[1].trim();
+
+    // Match ". - sym" or ".-sym" (current position minus symbol)
+    let normalized = expr_str.replace(' ', "");
+    if let Some(rest) = normalized.strip_prefix(".-") {
+        let sym = rest.trim().to_string();
+        Ok(AsmItem::Size(name, SizeExpr::CurrentMinusSymbol(sym)))
+    } else if let Ok(val) = parse_integer_expr(expr_str) {
+        Ok(AsmItem::Size(name, SizeExpr::Constant(val as u64)))
+    } else if expr_str.starts_with('.')
+        || expr_str
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+    {
+        // Symbol reference (e.g., .L__sym_size_*) - resolve through .set aliases
+        // Treat as a symbol that will be resolved during ELF writing
+        Ok(AsmItem::Size(
+            name,
+            SizeExpr::SymbolRef(expr_str.to_string()),
+        ))
+    } else {
+        Err(format!("bad size expr: {}", expr_str))
+    }
+}
+
+/// Parse `.comm name, size[, align]` (shared operand grammar).
+fn parse_comm_directive(args: &str) -> Result<AsmItem, String> {
+    Ok(match elf::parse_comm_args(".comm", args, true)? {
+        Some((name, size, align)) => AsmItem::Comm(
+            name,
+            size,
+            u32::try_from(align).map_err(|_| format!(".comm: alignment {align} out of range"))?,
+        ),
+        None => AsmItem::Empty,
+    })
+}
+
+/// Parse `.lcomm name, size`; the alignment follows from the size.
+fn parse_lcomm_directive(args: &str) -> Result<AsmItem, String> {
+    Ok(match elf::parse_comm_args(".lcomm", args, false)? {
+        Some((name, size, _)) => AsmItem::Lcomm(name, size, elf::lcomm_align(size) as u32),
+        None => AsmItem::Empty,
+    })
+}
+
+/// Comma-separated symbol names (`.local a, b`).  An empty name is an error
+/// rather than a symbol called "" -- the old `.weak a, b` handling created
+/// one symbol literally named "a, b".
+fn parse_symbol_list(args: &str, directive: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = args.split(',').map(|n| n.trim().to_string()).collect();
+    if names.iter().any(String::is_empty) {
+        return Err(format!(
+            "{directive}: expected a comma-separated symbol list: `{args}'"
+        ));
+    }
+    Ok(names)
+}
+
+/// Parse the representable, same-section target of `.org` / `. =`.
+///
+/// The ELF writer already knows how to resolve an absolute offset, a named
+/// label, a numeric local label (`2b`/`2f`) or `.` plus a constant addend, and
+/// how to re-check that target after jump relaxation. This parser is the single
+/// front door for both spellings so they cannot drift apart. Unsupported
+/// symbolic arithmetic (products, differences of two labels, cross-section
+/// expressions) fails closed instead of silently becoming a symbol named after
+/// the whole expression.
+fn parse_org_target(expr: &str, directive: &str) -> Result<(String, i64), String> {
+    let expr = expr.trim();
+    if expr.is_empty() {
+        return Err(format!("missing {directive} expression"));
+    }
+
+    // Balance check with checked arithmetic: a pathological input must produce
+    // a diagnostic, never an overflow or a native stack issue.
+    let mut depth: i32 = 0;
+    for b in expr.bytes() {
+        match b {
+            b'(' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| format!("{directive}: expression nesting too deep"))?;
+            }
+            b')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("{directive}: unbalanced expression"))?;
+                if depth < 0 {
+                    return Err(format!("{directive}: unbalanced expression"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(format!("{directive}: unbalanced expression"));
+    }
+
+    // Strip only parentheses that wrap the *entire* expression. `(a)+(b)` is
+    // not the same as `((a)+(b))`; the first '(' must match the last ')'.
+    let mut expr = expr;
+    while expr.starts_with('(') && expr.ends_with(')') {
+        let bytes = expr.as_bytes();
+        let mut level: i32 = 0;
+        let mut wraps = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => {
+                    level = level
+                        .checked_add(1)
+                        .ok_or_else(|| format!("{directive}: expression nesting too deep"))?;
+                }
+                b')' => {
+                    level = level
+                        .checked_sub(1)
+                        .ok_or_else(|| format!("{directive}: unbalanced expression"))?;
+                    if level == 0 {
+                        wraps = i == bytes.len() - 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !wraps {
+            break;
+        }
+        expr = expr[1..expr.len() - 1].trim();
+    }
+
+    if let Ok(value) = parse_integer_expr(expr) {
+        if value < 0 {
+            return Err(format!("{directive}: cannot move backwards"));
+        }
+        return Ok((String::new(), value));
+    }
+
+    // Leading symbol token: GAS identifier, '.' or a numeric local label.
+    let bytes = expr.as_bytes();
+    let mut end = 0usize;
+    while end < bytes.len() {
+        let c = bytes[end];
+        if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$') {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    let sym = &expr[..end];
+    let numeric_local = sym.len() >= 2
+        && sym.as_bytes()[..sym.len() - 1]
+            .iter()
+            .all(u8::is_ascii_digit)
+        && matches!(sym.as_bytes().last(), Some(b'b' | b'f'));
+    if !is_valid_gas_identifier(sym) && sym != "." && !numeric_local {
+        return Err(format!("unsupported {directive} expression: {expr}"));
+    }
+
+    let tail = expr[end..].trim_start();
+    let addend = if tail.is_empty() {
+        0
+    } else if let Some(rest) = tail.strip_prefix('+') {
+        parse_integer_expr(rest.trim())
+            .map_err(|_| format!("unsupported {directive} expression: {expr}"))?
+    } else if let Some(rest) = tail.strip_prefix('-') {
+        // Negate the parsed addend instead of allocating a `-(...)` string
+        // and re-parsing it.  `checked_neg` keeps `i64::MIN` fail-closed.
+        parse_integer_expr(rest.trim())
+            .map_err(|_| format!("unsupported {directive} expression: {expr}"))?
+            .checked_neg()
+            .ok_or_else(|| format!("unsupported {directive} expression: {expr}"))?
+    } else {
+        return Err(format!("unsupported {directive} expression: {expr}"));
+    };
+    Ok((sym.to_string(), addend))
+}
+
+/// Parse `.set alias, target`.
+fn parse_set_directive(args: &str) -> Result<AsmItem, String> {
+    let parts: Vec<&str> = args.splitn(2, ',').collect();
+    if parts.len() != 2 {
+        return Err(format!("bad .set directive: {}", args));
+    }
+    Ok(AsmItem::Set(
+        parts[0].trim().to_string(),
+        parts[1].trim().to_string(),
+    ))
+}
+
+/// Parse `.symver name, name2@@VERSION` or `.symver name, name2@VERSION`,
+/// with an optional third visibility argument `local`, `hidden` or `remove`
+/// (GAS 2.35+; glibc's compat_symbol machinery generates the plain two-arg
+/// form, the Linux kernel and newer glibc use `remove`).
+///
+/// An unrecognized third argument is a hard error, exactly like GAS
+/// ("junk at end of line"): silently folding it into the version string
+/// previously produced garbage symbol names like `foo@VERS_1, remove`.
+fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
+    let parts: Vec<&str> = args.split(',').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return Err(format!("bad .symver directive: {}", args));
+    }
+    let name = parts[0].trim();
+    let ver = parts[1].trim();
+    if name.is_empty() || ver.is_empty() {
+        return Err(format!("bad .symver directive: {}", args));
+    }
+    let flag = match parts.get(2).map(|s| s.trim()) {
+        None => None,
+        Some("local") => Some(SymverFlag::Local),
+        Some("hidden") => Some(SymverFlag::Hidden),
+        Some("remove") => Some(SymverFlag::Remove),
+        Some(other) => {
+            return Err(format!(
+                ".symver: invalid visibility argument '{}' (expected local, hidden or remove): {}",
+                other, args
+            ));
+        }
+    };
+    Ok(AsmItem::Symver(name.to_string(), ver.to_string(), flag))
+}
+
+/// Does this line start with an instruction prefix followed by a mnemonic?
+///
+/// The separator is matched as "any whitespace", not a literal space:
+/// hand-written kernel assembly overwhelmingly uses TABS (`rep\tstosl` in
+/// arch/x86/boot/startup/efi-mixed.S). Matching only `"rep "` left the whole
+/// line as a single mnemonic `rep` with `stosl` parsed as a label operand.
+/// Words the assembler treats as leading instruction prefixes (HLE hints
+/// `xacquire`/`xrelease` included: they only ever appear prefix-stacked).
+/// `addr16`/`addr32`/`data16`/`data32` are the GAS spellings of the
+/// address-/operand-size overrides as standalone words. `rex`/`rex.x`
+/// force explicit legacy REX bits; `rex64` also sets W (64-bit mode only).
+const INSN_PREFIXES: [&str; 22] = [
+    "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs", "gs",
+    "xacquire", "xrelease", "addr16", "addr32", "data16", "data32", "rex", "rex.x", "rex64",
+];
+
+fn is_prefixed_instruction(rest: &str) -> bool {
+    // Segment-override names are legal instruction prefixes in their own right:
+    // the kernel writes `ds wrmsr` (arch/x86/include/asm/msr.h) to reserve a
+    // byte that ALTERNATIVE can later patch into a different encoding.
+    // Case-insensitive: GAS accepts `REP MOVSQ` and `LOCK ADDQ` (glibc .S
+    // files use uppercase; `REP MOVSQ` used to fall through to the bare
+    // `rep` arm, emit a lone 0xF3 and SILENTLY DROP the instruction).
+    match rest.split_once(|c: char| c.is_whitespace()) {
+        Some((head, tail)) => {
+            !tail.trim().is_empty() && INSN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(head))
+        }
+        None => false,
+    }
+}
+
+/// Parse a prefixed instruction like "lock cmpxchgq ..." or "rep movsb".
+/// Prefixes stack: collect every leading prefix word (`lock xacquire addl`
+/// yields ["lock", "xacquire"]) so the encoder can emit the full prefix run.
+/// Duplicate detection lives in the encoder (it compares prefix BYTES:
+// `rep repe movsb` is two spellings of one byte).
+fn parse_prefixed_instruction(line: &str) -> Result<AsmItem, String> {
+    let mut rest = line.trim();
+    let mut prefixes: Vec<String> = Vec::new();
+    while let Some((head, tail)) = rest.split_once(|c: char| c.is_whitespace()) {
+        // Case-insensitive match (GAS: `REP MOVSQ`); store the canonical
+        // lowercase spelling so the encoder's byte mapping stays exact.
+        if !tail.trim().is_empty() && INSN_PREFIXES.iter().any(|p| p.eq_ignore_ascii_case(head)) {
+            prefixes.push(head.to_ascii_lowercase());
+            rest = tail.trim();
+        } else {
+            break;
+        }
+    }
+    parse_instruction(rest, prefixes)
+}
+
+/// Parse an instruction line.
+fn parse_instruction(line: &str, prefixes: Vec<String>) -> Result<AsmItem, String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(AsmItem::Empty);
+    }
+
+    // Split mnemonic from operands
+    let (nf, force_evex, vex_hint, force_rex2, rest) = parse_encoding_hints(trimmed);
+    let (mnemonic, operand_str) = split_mnemonic_operands(rest);
+    let (dfv, operand_str) = parse_dfv_hint(operand_str)?;
+
+    if mnemonic.is_empty() {
+        return Err(format!("empty mnemonic in: {}", line));
+    }
+
+    let operands = if operand_str.is_empty() {
+        Vec::new()
+    } else {
+        parse_operands(operand_str)?
+    };
+
+    Ok(AsmItem::Instruction(Instruction {
+        prefixes,
+        mnemonic: mnemonic.to_string(),
+        operands,
+        nf,
+        force_evex,
+        vex_hint,
+        force_rex2,
+        dfv,
+    }))
+}
+
+/// Strip stacked GNU as encoding-prefix hints (`{nf}`, `{evex}`, `{rex2}`,
+/// `{vex}`/`{vex2}`/`{vex3}`). The VEX selectors forbid the EVEX row;
+/// `{vex3}` also controls the prefix length when C5 would be legal.
+/// Selectors are last-wins, while incompatible APX modifiers are validated
+/// by the encoder (GAS accepts them syntactically, but rejects the instruction).
+fn parse_encoding_hints(line: &str) -> (bool, bool, Option<VexHint>, bool, &str) {
+    let mut nf = false;
+    let mut force_evex = false;
+    let mut vex_hint = None;
+    let mut force_rex2 = false;
+    let mut s = line.trim_start();
+    loop {
+        if !s.starts_with('{') {
+            break;
+        }
+        let Some(close) = s.find('}') else {
+            break;
+        };
+        match &s[1..close] {
+            "nf" => nf = true,
+            // GAS 2.47: `{vex} {evex} vpdpbusd` selects EVEX, while
+            // `{evex} {vex} vpdpbusd` selects VEX.
+            "evex" => {
+                force_evex = true;
+                vex_hint = None;
+            }
+            "rex2" => force_rex2 = true,
+            "vex" | "vex2" | "vex3" => {
+                vex_hint = Some(match &s[1..close] {
+                    "vex2" => VexHint::Vex2,
+                    "vex3" => VexHint::Vex3,
+                    _ => VexHint::Vex,
+                });
+                force_evex = false;
+            }
+            _ => break,
+        }
+        s = s[close + 1..].trim_start();
+    }
+    (nf, force_evex, vex_hint, force_rex2, s)
+}
+
+/// GNU as `{dfv=cf,zf,sf,of}` sits *after* the mnemonic (never as a leading
+/// hint). Empty `{dfv=}` is legal and means all four flags default to 0.
+fn parse_dfv_hint(s: &str) -> Result<(u8, &str), String> {
+    let s = s.trim_start();
+    if !s.starts_with("{dfv") {
+        return Ok((0, s));
+    }
+    let Some(close) = s.find('}') else {
+        return Err("unterminated {dfv=} hint".to_string());
+    };
+    let inner = &s[1..close];
+    let mut dfv = 0u8;
+    if inner == "dfv" || inner == "dfv=" {
+        // empty bitmap
+    } else if let Some(rest) = inner.strip_prefix("dfv=") {
+        for part in rest.split(',') {
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            match p {
+                "cf" => dfv |= 0x1,
+                "zf" => dfv |= 0x2,
+                "sf" => dfv |= 0x4,
+                "of" => dfv |= 0x8,
+                other => return Err(format!("unknown dfv flag: {other}")),
+            }
+        }
+    } else {
+        return Err(format!("bad dfv hint: {{{inner}}}"));
+    }
+    Ok((dfv, s[close + 1..].trim_start()))
+}
+
+/// Split a line into mnemonic and operand string.
+fn split_mnemonic_operands(line: &str) -> (&str, &str) {
+    let trimmed = line.trim_start();
+    let trimmed = if (trimmed.starts_with("%v") || trimmed.starts_with("%x"))
+        && trimmed.len() > 2
+        && trimmed.as_bytes()[2].is_ascii_alphabetic()
+    {
+        // Keep the v: "%vstmxcsr" -> "vstmxcsr" (GNU as selects the VEX
+        // encoding for the %v hint; LCCC's v* encoders match).
+        &trimmed[1..]
+    } else {
+        trimmed
+    };
+    if let Some(pos) = trimmed.find(|c: char| c.is_whitespace()) {
+        let mnemonic = &trimmed[..pos];
+        let rest = trimmed[pos..].trim();
+        (mnemonic, rest)
+    } else {
+        (trimmed, "")
+    }
+}
+
+/// Parse comma-separated operands.
+fn parse_operands(s: &str) -> Result<Vec<Operand>, String> {
+    let parts = split_operands(s);
+    let mut operands = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let op = parse_operand(part.trim())?;
+        // Standalone `{...}` validation (GAS 2.47): `{sae}`/`{r*-sae}`
+        // normalize (spacing is tolerated); anything else is `Missing
+        // '}'`, `Junk after '}'`, or `invalid char '{' beginning operand
+        // N` (N is 1-based), echoing the offending text.
+        if let Operand::Label(t) = &op {
+            if t.starts_with('{') {
+                let norm = check_standalone_braces(t, i + 1)?;
+                operands.push(Operand::Label(norm));
+                continue;
+            }
+        }
+        operands.push(op);
+    }
+    // Per-INSTRUCTION duplicate-decorator detection (GAS 2.47: the mask,
+    // `{z}` and `{1toN}` slots are per-instruction, so `{%k1}` on two
+    // different operands is `duplicated `{%k1}'` — byte-probed). The
+    // echo is the SECOND token plus its whitespace-stripped remainder
+    // (`%zmm2{%k1}{z}` echoes `` `{%k1}{z}' ``). Runs before the
+    // encoder's placement checks, exactly like GAS's parse phase.
+    let mut seen_mask = false;
+    let mut seen_z = false;
+    let mut seen_bcst = false;
+    for part in &parts {
+        for (inner, tok, tail) in scan_decorator_tokens(part) {
+            let echo = format!("{tok}{tail}");
+            // `{%kN}` / `{kN}` (optional sigil, case-insensitive per the
+            // suffix parser).
+            let mask_num = inner
+                .trim_start_matches('%')
+                .strip_prefix('k')
+                .or_else(|| inner.trim_start_matches('%').strip_prefix('K'));
+            let kind =
+                if mask_num.is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7")) {
+                    0
+                } else if inner == "z" {
+                    1
+                } else if inner
+                    .strip_prefix("1to")
+                    .is_some_and(|n| matches!(n, "2" | "4" | "8" | "16" | "32"))
+                {
+                    2
+                } else {
+                    continue; // sae-family/unknown: handled by the parsers
+                };
+            let dup = match kind {
+                0 => &mut seen_mask,
+                1 => &mut seen_z,
+                _ => &mut seen_bcst,
+            };
+            if *dup {
+                return Err(format!("\0raw:duplicated `{echo}'"));
+            }
+            *dup = true;
+        }
+    }
+    Ok(operands)
+}
+
+/// Extract the raw `{...}` decorator tokens of one operand string with
+/// their whitespace-stripped remainders (for the duplicate echo). Only
+/// syntactically complete tokens are returned; malformed braces stay
+/// with the per-operand parsers.
+fn scan_decorator_tokens(part: &str) -> Vec<(&str, String, String)> {
+    let mut out = Vec::new();
+    let bytes = part.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(close) = part[i..].find('}') {
+                let inner = &part[i + 1..i + close];
+                let tok = format!("{{{inner}}}");
+                // The remainder runs to the end of the suffix chain;
+                // strip ALL whitespace the way GAS's echo does.
+                let tail: String = part[i + close + 1..]
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                out.push((inner, tok, tail));
+                i += close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Normalize or reject a standalone `{...}` operand (see `parse_operands`).
+/// Returns the canonical label text (`{sae}` / `{r*-sae}`).
+fn check_standalone_braces(t: &str, idx: usize) -> Result<String, String> {
+    let raw = t.trim();
+    let Some(close) = raw.find('}') else {
+        return Err(format!("\0raw:Missing '}}': '{raw}'"));
+    };
+    let inner = raw[1..close].trim();
+    let rest = &raw[close + 1..];
+    let is_sae = matches!(inner, "sae" | "rn-sae" | "rd-sae" | "ru-sae" | "rz-sae");
+    if is_sae {
+        if rest.trim().is_empty() {
+            return Ok(format!("{{{inner}}}"));
+        }
+        // `{sae}` followed by junk: echo the token plus the
+        // whitespace-stripped remainder, exactly as GAS does.
+        let tail: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
+        return Err(format!("\0raw:Junk after '}}': '{{{inner}}}{tail}'"));
+    }
+    let stripped: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    Err(format!(
+        "\0raw:invalid char '{{' beginning operand {idx} `{stripped}'"
+    ))
+}
+
+/// Split operand string by commas, respecting parentheses.
+fn split_operands(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut paren_depth = 0;
+
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            // GAS character literal: 'x or 'x' — the next char is data, even
+            // a comma or paren (`movb $',', %bl` in relocate_kernel_64.S
+            // print_reg). Copy the literal through without interpreting it.
+            current.push('\'');
+            if i + 1 < chars.len() {
+                if chars[i + 1] == '\\' && i + 2 < chars.len() {
+                    current.push('\\');
+                    current.push(chars[i + 2]);
+                    i += 2;
+                } else {
+                    current.push(chars[i + 1]);
+                    i += 1;
+                }
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    current.push('\'');
+                    i += 1;
+                }
+            }
+        } else if c == '(' {
+            paren_depth += 1;
+            current.push(c);
+        } else if c == ')' {
+            paren_depth -= 1;
+            current.push(c);
+        } else if c == ',' && paren_depth == 0 {
+            parts.push(current.clone());
+            current.clear();
+        } else {
+            current.push(c);
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// Parse a single operand.
+fn parse_operand(s: &str) -> Result<Operand, String> {
+    let s = s.trim();
+
+    // Indirect: *%reg or *addr
+    if let Some(rest) = s.strip_prefix('*') {
+        let inner = parse_operand(rest)?;
+        return Ok(Operand::Indirect(Box::new(inner)));
+    }
+
+    // Register: %rax, %st(0), etc.
+    if s.starts_with('%') {
+        return parse_register_operand(s);
+    }
+
+    // `$` is both GAS's immediate prefix and a legal symbol character, so
+    // `$x(%rip)` (a memory reference to the symbol `$x`, which this compiler's
+    // lexer accepts under `-fdollars-in-identifiers`) is a memory operand, not
+    // an immediate: an immediate expression cannot be followed by a base
+    // register. GAS itself needs `($x)(%rip)` there; accepting the bare form
+    // keeps the compiler's own output assembleable.
+    if let Some(rest) = s.strip_prefix('$') {
+        // Only `$SYMBOL(...)` is a memory reference; `$(expr)` is GCC's
+        // parenthesised immediate (`movq $(l1-xtrnA), %rax`) and must stay one.
+        if !rest.starts_with('(') {
+            if let Some(paren) = rest.find('(') {
+                let sym = &rest[..paren];
+                if !sym.is_empty()
+                    && sym.bytes().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$' | b'@')
+                    })
+                {
+                    return parse_memory_operand(s);
+                }
+            }
+        }
+        return parse_immediate_operand(rest);
+    }
+
+    // Memory or label reference
+    // Could be: offset(%base), symbol(%rip), (%base,%idx,scale), or just a label
+    if s.contains('(') || s.contains(':') {
+        return parse_memory_operand(s);
+    }
+
+    // Check if this is a bare numeric address like `42` (used in `movl 42, %eax`).
+    // In AT&T syntax, a bare number without `$` prefix is an absolute memory address.
+    // Only treat it as a memory operand if it parses as a pure integer and doesn't
+    // look like a numeric label reference (e.g., `1f`, `1b`).
+    // A GAS numeric local label is a run of DECIMAL DIGITS followed by a single
+    // `f` or `b` and nothing else (`1f`, `42b`).  Rejecting every operand that
+    // merely ends in those letters also threw away legitimate hex constants:
+    // `mov 0x7fffffff, %eax` was treated as a label reference and silently
+    // assembled with a zero displacement.  Test the whole shape instead.
+    let is_numeric_label = {
+        let stem = &s[..s.len().saturating_sub(1)];
+        matches!(s.bytes().last(), Some(b'f') | Some(b'b'))
+            && !stem.is_empty()
+            && stem.bytes().all(|c| c.is_ascii_digit())
+    };
+    // A trailing `{...}` chain on an absolute/label operand (`64{1to16}`,
+    // `foo{%k1}`) is stripped and validated first; the remainder then
+    // parses as an absolute integer or label as usual.
+    let suf = if s.contains('{') && !s.starts_with('{') {
+        Some(parse_evex_mask_suffix(s)?)
+    } else {
+        None
+    };
+    let s = suf.as_ref().map(|suf| suf.rest.as_str()).unwrap_or(s);
+    // GAS lexer quirks for degenerate operands (byte-probed 2.47):
+    // a TRAILING binary operator with no right-hand side still assembles —
+    // `push 1 +` and `push 1 -`/`1 /` keep the left value, `push 1 *`
+    // becomes 0 — while a LEADING `+`/`-` is an ordinary unary sign
+    // (`push + 1` = 1, `push - 1` = -1). LCCC used to turn both shapes
+    // into a symbol reference and silently assemble address 0.
+    let s = {
+        let t = s.trim_end();
+        if t.ends_with('+') || t.ends_with('-') || t.ends_with('/') {
+            t[..t.len() - 1].trim_end()
+        } else if t.ends_with('*') {
+            "0"
+        } else {
+            t
+        }
+    };
+    if s.bytes()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == b'-' || c == b'+')
+        && !is_numeric_label
+    {
+        if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(s) {
+            let (mask, zeroing, broadcast) = suf
+                .as_ref()
+                .map(|suf| (suf.mask.clone(), suf.zeroing, suf.broadcast))
+                .unwrap_or((None, false, None));
+            return Ok(Operand::Memory(MemoryOperand {
+                segment: None,
+                displacement: Displacement::Integer(val),
+                base: None,
+                index: None,
+                scale: None,
+                mask,
+                zeroing,
+                broadcast,
+            }));
+        }
+    }
+
+    // Standalone EVEX decorator: `{sae}` / `{r*-sae}` as their own AT&T
+    // operand (`vaddps {rn-sae}, %zmm1, %zmm2, %zmm3`). Validation needs
+    // the 1-based operand index (`invalid char '{' beginning operand N`
+    // echoes it), which only `parse_operands` knows, so the raw text is
+    // returned here and normalized/checked there.
+    if s.starts_with('{') {
+        return Ok(Operand::Label(s.to_string()));
+    }
+
+    // A label carrying suffixes (`foo{1to16}`, `foo{%k1}`) is a decorated
+    // memory reference, like a bare label in the encoder's normalizer.
+    if let Some(suf) = &suf {
+        return Ok(Operand::Memory(MemoryOperand {
+            segment: None,
+            displacement: Displacement::Symbol(s.trim().to_string()),
+            base: None,
+            index: None,
+            scale: None,
+            mask: suf.mask.clone(),
+            zeroing: suf.zeroing,
+            broadcast: suf.broadcast,
+        }));
+    }
+
+    // Plain label reference (for jmp/call targets)
+    // Could be: .LBB42, funcname, funcname@PLT, 1f, 1b
+    Ok(Operand::Label(s.to_string()))
+}
+
+/// Parsed `{%kN}` / `{z}` / `{1toN}` suffixes. A suffixed `{sae}` /
+/// `{r*-sae}` never parses (GAS 2.47 rejects it with `unknown vector
+/// operation` on every operand kind — byte-probed); standalone `{sae}`
+/// operands are labels, handled by `check_standalone_braces`.
+struct EvexSuffix {
+    rest: String,
+    mask: Option<String>,
+    zeroing: bool,
+    broadcast: Option<u8>,
+}
+
+/// True for a `{%kN}` write-mask number (1-7). The `k` matches
+/// case-insensitively (register names are; `{%K1}` encodes) but the
+/// token is returned as written (dup echoes preserve case). `{%k0}`
+/// is a dedicated error handled by the caller.
+fn evex_mask_num(inner: &str) -> Option<&str> {
+    let n = inner
+        .strip_prefix('k')
+        .or_else(|| inner.strip_prefix('K'))?;
+    if matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7") {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+/// Split EVEX suffixes: `%zmm0{%k1}{z}` / `(%rdi){1to16}`.
+/// Accepts both `{%k1}` and `{k1}` (GNU as tolerates the bare form),
+/// case-insensitively (`{%K2}` parses; the written case is preserved
+/// for echoes and `reg_num`'s `K0`-`K7` arms). Decorator *values* are
+/// validated here with GNU as diagnostics; placement (mask-on-
+/// destination, broadcast support) is the encoder's job — it needs the
+/// mnemonic and the emitted prefix. A suffixed `{sae}`/`{r*-sae}` is
+/// rejected on EVERY operand kind (`unknown vector operation`,
+/// byte-probed; the standalone spelling is the only legal one).
+/// Per-operand duplicates fire here; cross-operand duplicates in
+/// `parse_operands`.
+fn parse_evex_mask_suffix(s: &str) -> Result<EvexSuffix, String> {
+    let mut name = s.to_string();
+    let mut mask: Option<String> = None;
+    let mut zeroing = false;
+    let mut broadcast = None;
+    let mut bcast_seen = false;
+    loop {
+        if let Some(pos) = name.find('{') {
+            let close = name[pos..].find('}');
+            let Some(close) = close else { break };
+            let inner = name[pos + 1..pos + close].trim().to_string();
+            let before = name[..pos].to_string();
+            let after = name[pos + close + 1..].to_string();
+            name = before + &after;
+            // Echo with braces, as GAS does, plus the stripped remainder.
+            let tok = format!("{{{inner}}}");
+            let tail: String = after.chars().filter(|c| !c.is_whitespace()).collect();
+            let echo = format!("{tok}{tail}");
+            if inner == "z" {
+                if zeroing {
+                    return Err(format!("\0raw:duplicated `{echo}'"));
+                }
+                zeroing = true;
+            } else if matches!(
+                inner.as_str(),
+                "sae" | "rn-sae" | "rd-sae" | "ru-sae" | "rz-sae"
+            ) {
+                return Err(format!("\0raw:unknown vector operation: `{echo}'"));
+            } else if let Some(rest) = inner.strip_prefix("1to") {
+                if !matches!(rest, "2" | "4" | "8" | "16" | "32") {
+                    return Err(format!("\0raw:Unsupported broadcast: `{echo}'"));
+                }
+                if bcast_seen {
+                    return Err(format!("\0raw:duplicated `{echo}'"));
+                }
+                bcast_seen = true;
+                broadcast = Some(rest.parse::<u8>().unwrap_or(0));
+            } else if let Some(pct) = inner.strip_prefix('%') {
+                let pct = pct.trim();
+                if pct.eq_ignore_ascii_case("k0") {
+                    return Err("\0raw:`%k0' can't be used for write mask".to_string());
+                }
+                if evex_mask_num(pct).is_none() {
+                    return Err(format!("\0raw:unknown vector operation: `{echo}'"));
+                }
+                if mask.is_some() {
+                    return Err(format!("\0raw:duplicated `{echo}'"));
+                }
+                // Preserve the written case (`{%K2}` echoes back
+                // upper-case in `duplicated `{%K2}'`); consumers read
+                // only the digit (see `reg_num`'s `K0`-`K7` arms).
+                mask = Some(pct.to_string());
+            } else if let Some(k) = evex_mask_num(&inner) {
+                if mask.is_some() {
+                    return Err(format!("\0raw:duplicated `{echo}'"));
+                }
+                mask = Some(k.to_string());
+            } else {
+                // Bare `{k0}`, `{}` and anything else that is not a
+                // known decorator: `unknown vector operation`.
+                return Err(format!("\0raw:unknown vector operation: `{echo}'"));
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(EvexSuffix {
+        rest: name,
+        mask,
+        zeroing,
+        broadcast,
+    })
+}
+
+/// Parse a register operand like %rax, %st(0).
+fn parse_register_operand(s: &str) -> Result<Operand, String> {
+    // GNU as tolerates whitespace between '%' and the register name
+    // (glibc emits `mov % r13, ...` from `% " R13_LP "` macro splicing).
+    let suf = parse_evex_mask_suffix(s)?;
+    let s = suf.rest.as_str();
+    let name = s[1..].trim_start(); // strip % and any following spaces
+
+    // Handle %st(N)
+    if name.starts_with("st(") && name.ends_with(')') {
+        return Ok(Operand::Register(Register::new(name)));
+    }
+
+    // Handle segment:memory patterns like %fs:0
+    if let Some(colon_pos) = name.find(':') {
+        let seg = &name[..colon_pos];
+        let rest = &s[1 + colon_pos + 1..]; // after the colon
+        if is_segment_name(seg) {
+            let mut mem = parse_memory_inner(rest)?;
+            mem.segment = Some(seg.to_string());
+            mem.mask = suf.mask;
+            mem.zeroing = suf.zeroing;
+            mem.broadcast = suf.broadcast;
+            return Ok(Operand::Memory(mem));
+        }
+    }
+
+    let mut reg = Register::new(name);
+    reg.mask = suf.mask;
+    reg.zeroing = suf.zeroing;
+    reg.broadcast = suf.broadcast;
+    Ok(Operand::Register(reg))
+}
+
+/// Parse an immediate operand (after the '$').
+fn parse_immediate_operand(s: &str) -> Result<Operand, String> {
+    let s = s.trim();
+
+    // Strip outer parentheses used for grouping, e.g. $(init_top_pgt - 0xffffffff80000000)
+    // In AT&T syntax, $(...) wraps the expression inside parens for grouping.
+    if s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        // Verify balanced parens
+        let mut depth = 0i32;
+        let mut balanced = true;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        balanced = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if balanced && depth == 0 {
+            return parse_immediate_operand(inner);
+        }
+    }
+
+    // Try integer
+    if let Ok(val) = parse_integer_expr(s) {
+        return Ok(Operand::Immediate(ImmediateValue::Integer(val)));
+    }
+
+    // Symbol with modifier: symbol@GOTPCREL, sym@VER@GOTPCREL, etc.
+    if let Some((sym, modifier)) = split_sym_modifier(s) {
+        return Ok(Operand::Immediate(ImmediateValue::SymbolMod(sym, modifier)));
+    }
+
+    // `sym@SIZE` / `sym@SIZE ± expr` (GAS 2.47): the SIZE of the section
+    // containing sym, as an immediate. The trailing arithmetic rides as a
+    // plain addend on the `name@SIZE` pseudo-symbol; the writer folds the
+    // pair to a constant when the section is local (GAS: `movl
+    // $.data@SIZE + 4, %eax` with an empty .data = b8 04 00 00 00).
+    if let Some(at) = s.rfind('@') {
+        let tail = &s[at + 1..];
+        let split = tail
+            .find(|c: char| c == '+' || c == '-' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let (mod_part, rest) = (&tail[..split], &tail[split..]);
+        if mod_part.eq_ignore_ascii_case("SIZE") {
+            let base = s[..at].trim();
+            if !base.is_empty() {
+                if rest.trim().is_empty() {
+                    return Ok(Operand::Immediate(ImmediateValue::SymbolMod(
+                        base.to_string(),
+                        "SIZE".to_string(),
+                    )));
+                }
+                if let Ok(v) = parse_integer_expr(rest.trim()) {
+                    return Ok(Operand::Immediate(ImmediateValue::SymbolPlusOffset(
+                        format!("{base}@SIZE"),
+                        v,
+                    )));
+                }
+            }
+        }
+    }
+
+    // Check for symbol difference: SYM-LABEL (e.g., $_DYNAMIC-1b, $4f-1b)
+    // Scan for '-' after position 0 where both sides look like labels.
+    if let Some(diff) = parse_immediate_label_diff(s) {
+        return Ok(Operand::Immediate(diff));
+    }
+
+    // Check for symbol+/-offset expression (e.g., init_top_pgt - 0xffffffff80000000)
+    if let Some(sym_offset) = try_parse_immediate_symbol_offset(s) {
+        return Ok(Operand::Immediate(sym_offset));
+    }
+
+    // Plain symbol
+    Ok(Operand::Immediate(ImmediateValue::Symbol(s.to_string())))
+}
+
+/// Known relocation modifiers (GNU as). `sym@VER@GOTPCREL` must split at the
+/// LAST '@' (the modifier), keeping `sym@VER` as the versioned symbol name;
+/// a bare `sym@VER` (suffix not in this list) stays a plain symbol.
+pub(crate) fn is_known_reloc_modifier(m: &str) -> bool {
+    matches!(
+        m.to_ascii_uppercase().as_str(),
+        "GOT"
+            | "GOTPCREL"
+            | "GOTPCRELX"
+            | "GOTOFF"
+            | "GOTTPOFF"
+            | "GOTNTPOFF"
+            | "PLT"
+            | "TPOFF"
+            | "TPREL"
+            | "NTPOFF"
+            | "INDNTPOFF"
+            | "TLSGD"
+            | "TLSLD"
+            | "TLSLDM"
+            | "DTPMOD"
+            | "DTPOFF"
+            | "TLSDESC"
+            | "TLSCALL"
+            | "PLTOFF"
+            | "SECREL"
+            | "SIZE"
+            | "CALL"
+            | "PAGEOFF"
+            | "PAGE"
+            | "GOTPLT"
+    )
+}
+
+/// Split `sym@mod` at the LAST '@' when the suffix is a known relocation
+/// modifier; otherwise return the whole string as a plain symbol.
+fn split_sym_modifier(s: &str) -> Option<(String, String)> {
+    let mut last = None;
+    for (i, c) in s.char_indices() {
+        if c == '@' {
+            last = Some(i);
+        }
+    }
+    let i = last?;
+    let modifier = &s[i + 1..];
+    if modifier.is_empty() || !is_known_reloc_modifier(modifier) {
+        return None;
+    }
+    Some((s[..i].to_string(), modifier.to_string()))
+}
+
+/// Split `sym@MOD` with a trailing constant addend (`sym@TPOFF+8`,
+/// `sym@GOTTPOFF-4`) into `(symbol, modifier, addend)`.
+///
+/// The split happens at the LAST `@` (so a versioned `sym@VER@MOD+N` keeps its
+/// version in the symbol, exactly like [`split_sym_modifier`]) and the addend
+/// is the signed integer after the first `+`/`-` inside the modifier tail.
+/// Returns `None` unless the tail before the sign is a known relocation
+/// modifier and the remainder parses as an integer — every other spelling is
+/// left to the plain-symbol / symbol-difference paths below.
+fn split_sym_modifier_addend(s: &str) -> Option<(String, String, i64)> {
+    let at = s.rfind('@')?;
+    let sym = &s[..at];
+    let tail = &s[at + 1..];
+    if sym.is_empty() || tail.is_empty() {
+        return None;
+    }
+    // Position 0 is skipped: a leading sign is part of the addend, not a
+    // separator (the modifier itself never starts with '+'/'-').
+    let cut = tail
+        .char_indices()
+        .skip(1)
+        .find(|(_, c)| *c == '+' || *c == '-')?
+        .0;
+    let modifier = tail[..cut].to_string();
+    if !is_known_reloc_modifier(&modifier) {
+        return None;
+    }
+    let addend = crate::backend::asm_expr::parse_integer_expr(&tail[cut..]).ok()?;
+    Some((sym.to_string(), modifier, addend))
+}
+
+/// Try to parse a symbol difference expression in an immediate value.
+/// E.g., "_DYNAMIC-1b" -> SymbolDiff("_DYNAMIC", "1b"), "4f-1b" -> SymbolDiff("4f", "1b")
+fn parse_immediate_label_diff(s: &str) -> Option<ImmediateValue> {
+    // Scan for '-' after position 0. We skip position 0 since a leading '-'
+    // is a negation, not a difference.
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '-' {
+            // Trim both sides: `$identity_mapped - 0b` (relocate_kernel_64.S)
+            // carries spaces around the minus; without trimming the strings
+            // failed is_label_like and the WHOLE expression fell through to a
+            // plain symbol named "identity_mapped - 0b", which the linker
+            // reported as an undefined reference. Also strip grouping parens:
+            // head_64.S's rva() macro expands `$ rva(1b)` to `$((1b) -
+            // startup_32)` — the inner label arrives as `(1b)`.
+            let lhs = strip_sym_parens(s[..i].trim());
+            let rhs = strip_sym_parens(s[i + 1..].trim());
+            if !lhs.is_empty() && !rhs.is_empty() && is_label_like(lhs) && is_label_like(rhs) {
+                return Some(ImmediateValue::SymbolDiff(lhs.to_string(), rhs.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Parse a memory operand like `offset(%base, %index, scale)` or `symbol(%rip)`.
+fn parse_memory_operand(s: &str) -> Result<Operand, String> {
+    // Check for segment prefix: %fs:..., %gs:...
+    if s.starts_with('%') {
+        if let Some(colon_pos) = s.find(':') {
+            let seg = s[1..colon_pos].trim_start();
+            if is_segment_name(seg) {
+                let rest = &s[colon_pos + 1..];
+                let mut mem = parse_memory_inner(rest)?;
+                mem.segment = Some(seg.to_string());
+                return Ok(Operand::Memory(mem));
+            }
+        }
+    }
+
+    let mem = parse_memory_inner(s)?;
+    Ok(Operand::Memory(mem))
+}
+
+/// Parse memory operand inner part: `offset(%base, %index, scale)`.
+fn parse_memory_inner(s: &str) -> Result<MemoryOperand, String> {
+    let s = s.trim();
+
+    // EVEX mask/zeroing suffix on a memory operand: `(%rax){%k1}`.
+    if s.contains('{') {
+        let suf = parse_evex_mask_suffix(s)?;
+        let mut mem = parse_memory_inner(&suf.rest)?;
+        mem.mask = suf.mask;
+        mem.zeroing = suf.zeroing;
+        mem.broadcast = suf.broadcast;
+        return Ok(mem);
+    }
+
+    // Find the register-enclosing parentheses: the LAST balanced (...) group.
+    // This handles nested parens in the displacement like ((6*8) + 8*16)(%rsp).
+    // We scan backwards from the end to find the matching '(' for the final ')'.
+    if let Some(paren_end) = s.rfind(')') {
+        // Anything after the closing paren is garbage: `8(%esp)+4` must be
+        // rejected like GAS ("junk `(%esp)+4` after expression"), not
+        // silently truncated to `8(%esp)`. The truncation previously
+        // mis-assembled stores when a codegen path emitted `{}+k` on a
+        // base+disp slot string.
+        let trailing = s[paren_end + 1..].trim();
+        if !trailing.is_empty() {
+            return Err(format!(
+                "junk `{trailing}` after expression in memory operand: `{s}`"
+            ));
+        }
+        let mut depth = 0i32;
+        let mut paren_start = None;
+        for (i, c) in s[..=paren_end].char_indices().rev() {
+            match c {
+                ')' => depth += 1,
+                '(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        paren_start = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let paren_start =
+            paren_start.ok_or_else(|| format!("unmatched paren in memory operand: {}", s))?;
+        let disp_str = s[..paren_start].trim();
+        let inner = &s[paren_start + 1..paren_end];
+
+        // If there's no displacement before the parens AND the inner content doesn't
+        // look like register references (i.e., first part doesn't start with %),
+        // then this is a parenthesized displacement expression like (pcpu_hot + 16),
+        // not a register reference like (%rsp). Treat the whole thing as displacement.
+        if disp_str.is_empty() && !inner.is_empty() {
+            let first_part = inner.split(',').next().unwrap_or("").trim();
+            if !first_part.starts_with('%') && !first_part.is_empty() {
+                // This is a parenthesized expression used as displacement
+                let displacement = parse_displacement(inner)?;
+                return Ok(MemoryOperand {
+                    segment: None,
+                    displacement,
+                    base: None,
+                    index: None,
+                    scale: None,
+                    mask: None,
+                    zeroing: false,
+                    broadcast: None,
+                });
+            }
+        }
+
+        let displacement = parse_displacement(disp_str)?;
+
+        // Parse base, index, scale from inside parens
+        let parts: Vec<&str> = inner.split(',').map(|p| p.trim()).collect();
+
+        // An x86-64 memory operand carries AT MOST base, index and scale.
+        // A fourth field means the operand has two index registers (or is
+        // otherwise malformed) and has NO encoding -- the ModRM/SIB pair has
+        // exactly one of each slot.  Reject it loudly.  This used to take
+        // parts[0..3] and silently IGNORE the rest, so
+        // `0(,%r11,4, %r10, 1)` assembled as `0(,%r11,4)`, dropping the
+        // `+ %r10` addend.  That turned a peephole emitting an invalid
+        // operand into a WRONG-CODE MISCOMPILE instead of a compile error:
+        // `q*4 + r == n` compiled to `q*4 == n` at -O1 and the program still
+        // assembled, ran and printed plausible numbers.  GAS errors on the
+        // same input ('expecting ) after scale factor'), so erroring here
+        // also matches the reference assembler's behaviour.
+        if parts.len() > 3 {
+            return Err(format!(
+                "memory operand has {} comma-separated fields inside the \
+                 parentheses, but at most base,index,scale are encodable: ({})",
+                parts.len(),
+                inner
+            ));
+        }
+
+        // Segment override may appear inside the parens, e.g. the TLS
+        // initial-exec access `g_tls@TPOFF(%fs:0)` (or `%gs:...`). The first
+        // part `%fs:0` must set the segment and leave the base empty — the
+        // address is seg:disp32 with no base/index. Previously this parsed
+        // "fs:0" as a base register name, which the encoder defaulted to %rax
+        // and silently dropped the segment prefix (miscompiled TLS reads).
+        let mut seg_override: Option<String> = None;
+        let base = if !parts.is_empty() && !parts[0].is_empty() {
+            let p0 = parts[0];
+            if let Some(colon) = p0.find(':') {
+                if p0.starts_with('%') {
+                    let seg = &p0[1..colon];
+                    if is_segment_name(seg) {
+                        seg_override = Some(seg.to_string());
+                        let seg_val = p0[colon + 1..].trim();
+                        if !seg_val.is_empty() && seg_val != "0" && seg_val.starts_with('%') {
+                            // `%fs:%reg` form: keep the register as base.
+                            Some(Register::new(seg_val.trim_start_matches('%')))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(Register::new(p0.trim_start_matches('%')))
+                    }
+                } else {
+                    Some(Register::new(p0.trim_start_matches('%')))
+                }
+            } else {
+                Some(Register::new(p0.trim_start_matches('%')))
+            }
+        } else {
+            None
+        };
+
+        let index = if parts.len() > 1 && !parts[1].is_empty() {
+            Some(Register::new(parts[1].trim_start_matches('%')))
+        } else {
+            None
+        };
+
+        let scale = if parts.len() > 2 && !parts[2].is_empty() {
+            Some(
+                parts[2]
+                    .parse::<u8>()
+                    .map_err(|_| format!("bad scale: {}", parts[2]))?,
+            )
+        } else {
+            None
+        };
+
+        Ok(MemoryOperand {
+            segment: seg_override,
+            displacement,
+            base,
+            index,
+            scale,
+            mask: None,
+            zeroing: false,
+            broadcast: None,
+        })
+    } else {
+        // No parens - could be just a displacement/symbol
+        let displacement = parse_displacement(s)?;
+        Ok(MemoryOperand {
+            segment: None,
+            displacement,
+            base: None,
+            index: None,
+            scale: None,
+            mask: None,
+            zeroing: false,
+            broadcast: None,
+        })
+    }
+}
+
+/// Parse a displacement: integer, symbol, symbol+offset, or symbol@modifier.
+fn parse_displacement(s: &str) -> Result<Displacement, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(Displacement::None);
+    }
+
+    // GAS's bracket displacement: `[expr](%base)` — a constant (or
+    // constant-foldable expression) inside square brackets IS the
+    // displacement (GAS 2.47 byte-probed: `mov [-1](%eax),%eax` =
+    // 67 8b 40 ff, `mov [~1](%eax),%eax` = 67 8b 40 fe, `mov [!1](%eax),
+    // %eax` = 67 8b 00 — `!` is logical not, `~` bitwise). Evaluate the
+    // bracket contents with the shared expression evaluator; the old code
+    // silently turned the whole bracket into displacement 0.
+    if s.starts_with('[') && s.ends_with(']') {
+        let inner = &s[1..s.len() - 1];
+        match crate::backend::asm_expr::parse_integer_expr(inner) {
+            Ok(v) => return Ok(Displacement::Integer(v)),
+            Err(e) => return Err(format!("bad displacement expression `{inner}': {e}")),
+        }
+    }
+
+    // Strip outer parentheses used for grouping expressions like (pcpu_hot + 16).
+    // In AT&T syntax, parenthesized displacement expressions like %gs:(pcpu_hot + 16)(%rip)
+    // produce a displacement string of "(pcpu_hot + 16)" that we need to unwrap.
+    // Only strip if the entire string is wrapped in balanced parens.
+    if s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        // Verify the parens are balanced (not e.g. "(a)+(b)")
+        let mut depth = 0i32;
+        let mut balanced = true;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        balanced = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if balanced && depth == 0 {
+            return parse_displacement(inner);
+        }
+    }
+
+    // Try integer
+    if let Ok(val) = parse_integer_expr(s) {
+        return Ok(Displacement::Integer(val));
+    }
+
+    // Symbol with modifier: symbol@GOTPCREL, sym@VER@GOTPCREL, etc.
+    if let Some((sym, modifier)) = split_sym_modifier(s) {
+        return Ok(Displacement::SymbolMod(sym, modifier));
+    }
+
+    // Symbol with modifier AND addend: `sym@TPOFF+8`, `sym@GOTTPOFF-4`.
+    // Must be tried before the plain `symbol+offset` split: that split would
+    // name the symbol `sym@TPOFF` and emit a plain absolute relocation.
+    if let Some((sym, modifier, addend)) = split_sym_modifier_addend(s) {
+        return Ok(Displacement::SymbolModAddend(sym, modifier, addend));
+    }
+
+    // Check for symbol+offset or symbol-offset (e.g., `.Lstr0+1`, `foo-4`)
+    // Find the last '+' or '-' that's not at position 0 (to avoid splitting
+    // negative numbers or labels starting with '.')
+    if let Some(offset_disp) = try_parse_symbol_plus_offset(s) {
+        return Ok(offset_disp);
+    }
+
+    // Symbol difference: `(gdt) - startup_32` (head_64.S rva() macro as a
+    // displacement). Either side may be paren-wrapped or a numeric label,
+    // and the LHS may carry a constant addend: `rva(pgtable + 0)` expands
+    // to `((pgtable + 0) - startup_32)`. Scan minus positions left to
+    // right; at each, try to interpret LHS as `sym [+ const-chain]`.
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '-' {
+            let lhs_raw = strip_sym_parens(s[..i].trim());
+            let rhs = strip_sym_parens(s[i + 1..].trim());
+            if lhs_raw.is_empty() || rhs.is_empty() || !is_label_like(rhs) {
+                continue;
+            }
+            if is_label_like(lhs_raw) {
+                return Ok(Displacement::SymbolDiff(
+                    lhs_raw.to_string(),
+                    rhs.to_string(),
+                ));
+            }
+            // LHS with folded constant tail: `pgtable + 0`, `sym + (1<<4) - 8`.
+            if let Some(DataValue::SymbolOffset(sym, add)) = parse_symbol_expr_chain(lhs_raw) {
+                return Ok(Displacement::SymbolDiffAddend(sym, rhs.to_string(), add));
+            }
+        }
+    }
+
+    // Plain symbol
+    Ok(Displacement::Symbol(s.to_string()))
+}
+
+/// Split a relocation target spelled `symbol+constant` / `symbol-constant`.
+///
+/// Bare operands are deliberately parsed as `Operand::Label` because the
+/// parser cannot know whether `foo+4` is a branch target or an absolute memory
+/// operand.  Every such path ultimately records a relocation, so the encoder's
+/// relocation choke point uses this helper to recover the addend.  Keeping the
+/// grammar here prevents the label and memory-displacement paths from drifting
+/// (the latter already calls `try_parse_symbol_plus_offset` directly).
+pub(crate) fn split_relocation_symbol_addend(s: &str) -> Option<(&str, i64)> {
+    match try_parse_symbol_plus_offset(s)? {
+        Displacement::SymbolPlusOffset(ref symbol, addend) => {
+            // `try_parse_symbol_plus_offset` trims the symbol. Return the
+            // corresponding slice of the caller's string so relocation
+            // recording does not need to allocate just to normalise a name.
+            let start = s.find(symbol.as_str())?;
+            Some((&s[start..start + symbol.len()], addend))
+        }
+        _ => None,
+    }
+}
+
+/// Separate a source constant from a relocation symbol without allocating.
+/// Keep an overflowing expression intact for the normal undefined-symbol
+/// diagnostic rather than silently wrapping it to a different address.
+pub(crate) fn normalize_relocation_symbol_addend(symbol: &str, addend: i64) -> (&str, i64) {
+    split_relocation_symbol_addend(symbol)
+        .and_then(|(base, extra)| addend.checked_add(extra).map(|sum| (base, sum)))
+        .unwrap_or((symbol, addend))
+}
+
+/// Try to parse a `symbol+offset` or `symbol-offset` expression.
+/// Returns None if the string doesn't match this pattern.
+fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
+    // Scan for '+' or '-' that separates the symbol from the offset.
+    // Skip the first character to avoid splitting on leading sign/dot.
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            let left = s[..i].trim();
+            let right_with_sign = s[i..].trim(); // includes the + or -
+            if left.is_empty() {
+                continue;
+            }
+
+            let is_valid_sym = |s: &str| -> bool {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+            };
+
+            // Case 1: symbol+offset (e.g. "maxmin_avx+32")
+            if let Ok(offset) = parse_integer_expr(right_with_sign) {
+                if is_valid_sym(left) {
+                    return Some(Displacement::SymbolPlusOffset(left.to_string(), offset));
+                }
+            }
+
+            // Case 2: offset+symbol (e.g. "32+maxmin_avx") - only for '+'
+            if c == '+' {
+                if let Ok(offset) = parse_integer_expr(left) {
+                    let sym = right_with_sign[1..].trim(); // skip the '+'
+                    if is_valid_sym(sym) {
+                        return Some(Displacement::SymbolPlusOffset(sym.to_string(), offset));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Try to parse a `symbol+offset` or `symbol-offset` expression as an immediate value.
+/// This handles cases like `init_top_pgt - 0xffffffff80000000` where the expression
+/// mixes a symbol with a large integer constant.
+fn try_parse_immediate_symbol_offset(s: &str) -> Option<ImmediateValue> {
+    // A parenthesized symbol `(name)` is the same symbol — GAS grouping.
+    // The kernel emits `$(srso_safe_ret)+5` via __HANDLE_INTR_SAFERET;
+    // rejecting the parens made the whole expression a literal symbol
+    // name and the vmlinux link failed on `(srso_safe_ret)+5`.
+    fn strip_parens(s: &str) -> &str {
+        if s.len() >= 2 && s.starts_with('(') && s.ends_with(')') {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        }
+    }
+    let is_valid_sym = |s: &str| -> bool {
+        let s = strip_parens(s);
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+    };
+
+    // Scan for '+' or '-' that separates the symbol from the offset.
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            let left = s[..i].trim();
+            let right_with_sign = s[i..].trim();
+            if left.is_empty() {
+                continue;
+            }
+
+            // Case 1: symbol+/-offset (e.g. "init_top_pgt - 0xffffffff80000000")
+            if let Ok(offset) = parse_integer_expr(right_with_sign) {
+                if is_valid_sym(left) {
+                    return Some(ImmediateValue::SymbolPlusOffset(
+                        strip_parens(left).to_string(),
+                        offset,
+                    ));
+                }
+            }
+
+            // Case 2: offset+symbol (e.g. "32+init_top_pgt") - only for '+'
+            if c == '+' {
+                if let Ok(offset) = parse_integer_expr(left) {
+                    let sym = right_with_sign[1..].trim();
+                    if is_valid_sym(sym) {
+                        return Some(ImmediateValue::SymbolPlusOffset(
+                            strip_parens(sym).to_string(),
+                            offset,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Split `.skip expr, fill` arguments, respecting parentheses.
+/// Returns the expression string and the fill byte (default 0).
+fn split_skip_args(args: &str) -> (&str, u8) {
+    let mut depth = 0i32;
+    let mut last_comma = None;
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => last_comma = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(pos) = last_comma {
+        let expr = &args[..pos];
+        let fill_str = args[pos + 1..].trim();
+        let fill = if let Ok(v) = parse_integer_expr(fill_str) {
+            v as u8
+        } else {
+            0u8
+        };
+        (expr, fill)
+    } else {
+        (args, 0u8)
+    }
+}
+
+/// Parse a label diff without spaces, e.g., `663b-661b`.
+/// Returns a SymbolDiff DataValue if both sides look like labels.
+fn parse_label_diff(s: &str) -> Option<DataValue> {
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '-' {
+            let lhs = &s[..i];
+            let rhs = &s[i + 1..];
+            if !lhs.is_empty() && !rhs.is_empty() && is_label_like(lhs) && is_label_like(rhs) {
+                return Some(DataValue::SymbolDiff(lhs.to_string(), rhs.to_string()));
+            }
+            // `label-N-.` (kernel vDSO sigreturn: `.long .LSTART_sigreturn-1-.`,
+            // the DWARF CFA "initial location minus one" idiom): LHS label,
+            // integer addend, then a PC-relative subtraction. Parse as
+            // SymbolDiffAddend(label, ".", -N).
+            if !lhs.is_empty() && is_label_like(lhs) && rhs.ends_with("-.") {
+                let mid = &rhs[..rhs.len() - 2];
+                if let Ok(n) = parse_integer_expr(mid) {
+                    return Some(DataValue::SymbolDiffAddend(
+                        lhs.to_string(),
+                        ".".to_string(),
+                        -n,
+                    ));
+                }
+            }
+            // `a-b+N` / `a-b-N` without spaces (same file:
+            // `.long .LEND_sigreturn-.LSTART_sigreturn+1`). The plain
+            // SymbolDiff arm above already rejected rhs because of the
+            // trailing addend; split it off and fold into the diff.
+            if !lhs.is_empty() && is_label_like(lhs) {
+                for (j, cj) in rhs.char_indices().skip(1) {
+                    if cj == '+' || cj == '-' {
+                        let rhs_sym = &rhs[..j];
+                        let addend_str = &rhs[j..];
+                        if is_label_like(rhs_sym) {
+                            if let Ok(n) = parse_integer_expr(addend_str) {
+                                return Some(DataValue::SymbolDiffAddend(
+                                    lhs.to_string(),
+                                    rhs_sym.to_string(),
+                                    n,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The six x86 segment registers usable as an address override.
+///
+/// Only `%fs`/`%gs` have a nonzero base in 64-bit mode, but `%cs`/`%ds`/
+/// `%es`/`%ss` overrides are still legal encodings that appear in real code
+/// (multi-byte NOP padding uses a `%cs` prefix; boot code uses the others).
+/// Recognizing only fs/gs made the parser reject them outright.
+fn is_segment_name(s: &str) -> bool {
+    matches!(s, "cs" | "ds" | "es" | "fs" | "gs" | "ss")
+}
+
+/// Check if a string looks like a label (alphanumeric, underscore, dot).
+///
+/// A bare numeric literal is never label-like.  Hex constants are spelled
+/// with alphabetic digits (`0xffffffff80000000`), so they satisfy the charset
+/// test below and would be mistaken for a symbol by the symbol-difference
+/// probe: the kernel's `init_top_pgt - __START_KERNEL_map` must be parsed as
+/// SymbolPlusOffset so it receives an absolute R_X86_64_32S relocation, not a
+/// PC-relative R_X86_64_PC32 relocation.
+///
+/// The literal test is a single allocation-free byte scan rather than a call
+/// into the shared evaluator.  `is_label_like` runs for every candidate
+/// symbol on every operand of every assembly line, and `parse_integer_expr`
+/// allocates an error `String` on *each* miss — twice, in fact, because
+/// `parse_single_integer` fails first and `tokenize_expr` then fails on the
+/// identifier's leading character.  That turned the hottest predicate in the
+/// assembler into two heap allocations per symbol.
+///
+/// The scan is the evaluator's OWN grammar, not a copy of it: both call
+/// `asm_expr::bare_integer_literal`, so there is no second recognizer to drift
+/// and no allocation on either side.  Skipping the rest of the evaluator is
+/// exactly equivalent here, not an approximation: a string that survives the
+/// charset test below contains no operator, parenthesis, sign, quote or
+/// whitespace, so the evaluator can only accept it through its single-literal
+/// path (its tokenizer fallback values numbers through the same function) —
+/// and that path necessarily begins with an ASCII digit.  Identifiers, the
+/// overwhelming majority of call sites, never enter the scan at all.
+/// `is_label_like_agrees_with_the_library_parsers_exhaustively` pins the
+/// equivalence against an independent restatement built on `str::parse`.
+pub(crate) fn is_label_like(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    if first.is_ascii_digit() && asm_expr::bare_integer_literal(bytes).is_some() {
+        return false;
+    }
+    if !(first.is_ascii_alphabetic() || first == b'_' || first == b'.' || first.is_ascii_digit()) {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+}
+
+/// Strip balanced outer parentheses from an expression.
+/// E.g. "((1b) - .)" -> "(1b) - ." -> "1b - ." (recursive).
+fn strip_outer_parens(s: &str) -> &str {
+    let s = crate::backend::asm_expr::trim_data_arg(s);
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return s;
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut depth = 0i32;
+    for ch in inner.bytes() {
+        match ch {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return s;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 {
+        strip_outer_parens(inner)
+    } else {
+        s
+    }
+}
+
+/// Strip outer parentheses from a symbol name. E.g. "(1b)" -> "1b".
+fn strip_sym_parens(s: &str) -> &str {
+    let s = s.trim();
+    if s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        let mut depth = 0i32;
+        for ch in inner.bytes() {
+            match ch {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return s;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            strip_sym_parens(inner)
+        } else {
+            s
+        }
+    } else {
+        s
+    }
+}
+
+/// Parse data values (integers or symbol references).
+/// Parse a comma-separated list of floating-point literals into their
+/// little-endian IEEE-754 byte representation.
+///
+/// `double` selects binary64; otherwise binary32. GAS accepts the usual C
+/// spellings (`1.0`, `-0.0`, `3.14159`, `1e30`) plus its own `0f`/`0d`/`0e`
+/// prefixes, so we accept the same set.
+fn parse_float_values(s: &str, double: bool) -> Result<Vec<DataValue>, String> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let t = t
+            .strip_prefix("0f")
+            .or_else(|| t.strip_prefix("0F"))
+            .or_else(|| t.strip_prefix("0d"))
+            .or_else(|| t.strip_prefix("0D"))
+            .or_else(|| t.strip_prefix("0e"))
+            .or_else(|| t.strip_prefix("0E"))
+            .unwrap_or(t);
+        let v: f64 = t
+            .parse::<f64>()
+            .map_err(|_| format!("bad floating-point literal: {}", t))?;
+        if double {
+            for b in v.to_bits().to_le_bytes() {
+                out.push(DataValue::Integer(b as i64));
+            }
+        } else {
+            for b in (v as f32).to_bits().to_le_bytes() {
+                out.push(DataValue::Integer(b as i64));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a standalone 128-bit integer literal (decimal, 0x hex, 0b binary,
+/// 0o/leading-0 octal), with an optional leading `-` (two's complement).
+/// Returns None for anything that is not a pure literal.
+fn parse_u128_literal(s: &str) -> Option<u128> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest.trim()),
+        None => (false, s),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (radix, digits) =
+        if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            (16, h)
+        } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+            (2, b)
+        } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+            (8, o)
+        } else if body.len() > 1
+            && body.starts_with('0')
+            && body[1..].bytes().all(|c| c.is_ascii_digit())
+        {
+            (8, &body[1..])
+        } else {
+            (10, body)
+        };
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let v = u128::from_str_radix(digits, radix).ok()?;
+    Some(if neg { v.wrapping_neg() } else { v })
+}
+
+/// One data operand by its value in GAS's section algebra, names kept as
+/// terms: a constant, `sym + k`, `a - b + k` (the relocatable shapes), or
+/// any other well-formed expression over symbols, which has to fold to a
+/// constant after layout ([`DataValue::Expr`]). `None` for text outside the
+/// expression grammar.
+fn classify_data_expr(s: &str) -> Option<DataValue> {
+    use crate::backend::asm_expr::{SectionExpr, eval_section_expr};
+    match eval_section_expr::<String>(s, |n| Ok(SectionExpr::term(n.to_string(), 1))) {
+        Ok(v) => {
+            let c = v.constant;
+            Some(match v.terms() {
+                [] => DataValue::Integer(c),
+                [(a, 1)] if c == 0 => DataValue::Symbol(a.clone()),
+                [(a, 1)] => DataValue::SymbolOffset(a.clone(), c),
+                [(a, 1), (b, -1)] | [(b, -1), (a, 1)] if c == 0 => {
+                    DataValue::SymbolDiff(a.clone(), b.clone())
+                }
+                [(a, 1), (b, -1)] | [(b, -1), (a, 1)] => {
+                    DataValue::SymbolDiffAddend(a.clone(), b.clone(), c)
+                }
+                _ => DataValue::Expr(s.to_string()),
+            })
+        }
+        // Well-formed, but an operator needs values only layout provides.
+        Err(_) => eval_section_expr::<()>(s, |_| Ok(SectionExpr::absolute(1)))
+            .ok()
+            .map(|_| DataValue::Expr(s.to_string())),
+    }
+}
+
+fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
+    let mut vals = Vec::new();
+    for part in crate::backend::asm_expr::split_comma_args(s) {
+        let trimmed = strip_outer_parens(crate::backend::asm_expr::trim_data_arg(part));
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // PURE constant expressions first: `.quad ((0x1000000) + (0x200000
+        // - 1)) & ~(0x200000 - 1)` (header.S pref_address/LOAD_PHYSICAL_ADDR).
+        // The " - " diff split below would break the expression at its first
+        // minus and emit a relocation against the literal left-half string.
+        // parse_integer_expr fails on any symbol reference, so this probe
+        // can never swallow a legitimate symbol diff.
+        if let Ok(val) = parse_integer_expr(trimmed) {
+            vals.push(DataValue::Integer(val));
+            continue;
+        }
+
+        // Every operand in the expression grammar is classified by its value
+        // in GAS's section algebra, the one model `.set` uses too: the
+        // textual splitting below tore operands apart at the wrong operator
+        // (`(e - s) >> 1` became the pair `(e` / `s) >> 1`).
+        if let Some(val) = classify_data_expr(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
+        // Operands outside the expression grammar -- relocation operators
+        // (`sym@GOTOFF`, `f@PLT - .`), quoted names -- take the textual path.
+        // General `symbol +/- const-expr [+/- const-expr ...]` chain, e.g. the
+        // kernel's `level1_fixmap_pgt + (2 << 12) - 8 + 16`. The " - " split
+        // below would break at the FIRST minus and treat everything left of
+        // it (including arithmetic) as a symbol name, emitting a relocation
+        // against a nonexistent symbol. Fold the whole constant tail first.
+        if let Some(val) = parse_symbol_expr_chain(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
+        // Check for symbol difference: .LBB3 - .Ljt_0, or with addend: tr_gdt_end - tr_gdt - 1
+        if let Some(minus_pos) = trimmed.find(" - ") {
+            let lhs_raw = strip_sym_parens(trimmed[..minus_pos].trim()).to_string();
+            let rhs_full = trimmed[minus_pos + 3..].trim();
+            // The LEFT side may carry a constant addend:
+            //   .word .Ljmp + 1 - trampoline_32bit_src
+            // (arch/x86/boot/startup/la57toggle.S computes the offset of the
+            // immediate field inside a far jump this way). Splitting only on
+            // the first " - " left `lhs` as the literal string ".Ljmp + 1",
+            // which is not a symbol. Peel the addend off and fold it in.
+            // The LHS may be a whole constant CHAIN: kernel jump-label keys
+            // expand to `.quad __tracepoint_read_msr+8 + 0 + 2 - .` (%c0
+            // prints "sym+8" and the JUMP_TABLE_ENTRY macro appends
+            // ` + 0 + 2`). Peeling only ONE ` + N` term left the literal
+            // string "__tracepoint_read_msr+8 + 0" as the symbol name and the
+            // link failed with "undefined reference to `sym+8 + 0 + 2'".
+            // Fold the full chain first; fall back to the single-term peel.
+            let (lhs, lhs_addend) =
+                if let Some(DataValue::SymbolOffset(sym, a)) = parse_symbol_expr_chain(&lhs_raw) {
+                    (sym, a)
+                } else {
+                    match lhs_raw.rfind(" + ") {
+                        Some(p) => {
+                            let sym = strip_sym_parens(lhs_raw[..p].trim());
+                            match (
+                                is_label_like(sym),
+                                parse_integer_expr(lhs_raw[p + 3..].trim()),
+                            ) {
+                                (true, Ok(a)) => (sym.to_string(), a),
+                                _ => (lhs_raw.clone(), 0),
+                            }
+                        }
+                        None => (lhs_raw.clone(), 0),
+                    }
+                };
+            // Parenthesized RHS: probe with parse_sym_addend FIRST. It strips
+            // balanced parens and correctly handles forms like `(. + 4)` (the
+            // Linux kernel's static_call trampoline: `.long func - (. + 4)`).
+            // The rfind-based probes below cannot: rfind(" + ") finds the `+`
+            // INSIDE the parens and mis-splits `(. + 4)` into `(." / "4`,
+            // both of which fail is_label_like, and the fall-through then
+            // silently emits a bogus SymbolDiff against the literal string
+            // ". + 4" — resolved as ZERO with no diagnostic (reproduced:
+            // `.long target_fn - (. + 4)` came out 00000000; GAS emits
+            // R_X86_64_PC32 target_fn-4). With the paren stripped,
+            // parse_sym_addend yields (".", 4) and the writer emits the
+            // correct PC-relative diff.
+            //
+            // The guard to `starts_with('(')` is load-bearing: WITHOUT it, a
+            // non-parenthesized `a - b + N` would be read as `a - (b + N)`
+            // and the trailing addend flipped in sign (broke
+            // kernel_altinstr_layout's `.long 760b - 770b + 5`). Un-paren
+            // `sym ± N` tails stay on the rfind path below, which folds them
+            // with the correct sign.
+            if rhs_full.starts_with('(') {
+                if let Some((rhs_sym, rhs_add)) = parse_sym_addend(rhs_full) {
+                    // Reject BARE numbers: is_label_like accepts a leading
+                    // digit (numeric labels like `770b`), but a digit-only
+                    // string is a constant expression, not a label —
+                    // `a - (1 + 2)` must not become a diff against "1".
+                    let is_real_label =
+                        is_label_like(&rhs_sym) && !rhs_sym.bytes().all(|c| c.is_ascii_digit());
+                    if is_real_label {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            rhs_sym,
+                            lhs_addend - rhs_add,
+                        ));
+                        continue;
+                    }
+                }
+            }
+            // Check if rhs has an addend: "sym - N" or "sym + N"
+            if let Some(rhs_minus) = rhs_full.rfind(" - ") {
+                let rhs_sym = strip_sym_parens(rhs_full[..rhs_minus].trim());
+                let rhs_add = rhs_full[rhs_minus + 3..].trim();
+                if is_label_like(rhs_sym) {
+                    if let Ok(addend) = parse_integer_expr(rhs_add) {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            rhs_sym.to_string(),
+                            lhs_addend - addend,
+                        ));
+                        continue;
+                    }
+                }
+            }
+            if let Some(rhs_plus) = rhs_full.rfind(" + ") {
+                let rhs_sym = strip_sym_parens(rhs_full[..rhs_plus].trim());
+                let rhs_add = rhs_full[rhs_plus + 3..].trim();
+                if is_label_like(rhs_sym) {
+                    if let Ok(addend) = parse_integer_expr(rhs_add) {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            rhs_sym.to_string(),
+                            lhs_addend + addend,
+                        ));
+                        continue;
+                    }
+                }
+            }
+            // `1b - 8 - .` (the kernel's runtime-const entries in
+            // arch/x86/include/asm/runtime-const.h): the RHS is a
+            // CONSTANT-minus-dot chain. The probes above only understand
+            // `sym ± N` shapes; the digit-only "8" is not a real label and
+            // parse_integer_expr(".") fails, so the fall-through below
+            // dropped the constant entirely — the retained relocation lost
+            // its `- 8`, runtime_const_fixup patched the movabs immediate
+            // EIGHT BYTES LATE, and the overwritten code took a #UD on
+            // boot (kernel 6.18.50: d_lookup → "invalid opcode", init
+            // killed, exitcode 0x0b). Fold the chain:
+            //   lhs - N - .  =>  (lhs - N) vs .
+            //   lhs - (. - N) =>  (lhs + N) vs .
+            if let Some(m) = rhs_full.rfind(" - ") {
+                let rl = rhs_full[..m].trim();
+                let rr = rhs_full[m + 3..].trim();
+                if rr == "." {
+                    if let Ok(n) = parse_integer_expr(rl) {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            ".".to_string(),
+                            lhs_addend - n,
+                        ));
+                        continue;
+                    }
+                }
+                if rl == "." {
+                    if let Ok(n) = parse_integer_expr(rr) {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            ".".to_string(),
+                            lhs_addend + n,
+                        ));
+                        continue;
+                    }
+                }
+            }
+            if lhs_addend != 0 {
+                vals.push(DataValue::SymbolDiffAddend(
+                    lhs,
+                    strip_sym_parens(rhs_full).to_string(),
+                    lhs_addend,
+                ));
+            } else {
+                vals.push(DataValue::SymbolDiff(
+                    lhs,
+                    strip_sym_parens(rhs_full).to_string(),
+                ));
+            }
+            continue;
+        }
+
+        // Try integer
+        if let Ok(val) = parse_integer_expr(trimmed) {
+            vals.push(DataValue::Integer(val));
+            continue;
+        }
+
+        // Check for label diff without spaces (e.g., 663b-661b)
+        if let Some(val) = parse_label_diff(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
+        // Check for symbol+offset or symbol-offset (e.g., GD_struct+128, arr+33)
+        if let Some(val) = parse_symbol_offset(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
+        // GNU as symbol-difference forms without spaces or with parentheses
+        // (glibc .eh_frame emits `(.LSTART_restore_rt-1)-.`,
+        //  `.LEND_restore_rt-(.LSTART_restore_rt-1)`, `.LENDCIE_-.LSTARTCIE_`).
+        if let Some(val) = try_parse_sym_diff(trimmed) {
+            vals.push(val);
+            continue;
+        }
+
+        // Reject anything that cannot be a symbol name outright rather than
+        // emitting a bogus relocation for it.
+        if !is_label_like(trimmed) {
+            return Err(format!("unsupported data expression: {}", trimmed));
+        }
+
+        // Symbol reference
+        vals.push(DataValue::Symbol(trimmed.to_string()));
+    }
+    Ok(vals)
+}
+
+/// Split `sym`, `sym+N`, `sym-N`, `(sym±N)` into (symbol, addend) where the
+/// value equals `symbol + addend`. Returns None for non-label strings.
+fn parse_sym_addend(s: &str) -> Option<(String, i64)> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(t);
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    for (i, c) in t.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            let sym = t[..i].trim();
+            if !is_label_like(sym) {
+                continue;
+            }
+            let num_raw: String = t[i..].chars().filter(|c| !c.is_whitespace()).collect();
+            let v: i64 = if let Some(r) = num_raw.strip_prefix('+') {
+                r.parse().ok()?
+            } else if let Some(r) = num_raw.strip_prefix('-') {
+                -r.parse::<i64>().ok()?
+            } else {
+                continue;
+            };
+            return Some((sym.to_string(), v));
+        }
+    }
+    if is_label_like(t) {
+        Some((t.to_string(), 0))
+    } else {
+        None
+    }
+}
+
+/// Parse GNU-as symbol-difference expressions that lack spaces around the
+/// operator or use parentheses: `(a-1)-.`, `a-(b-1)`, `(a+2)-b`, `a-b`.
+/// Returns DataValue::SymbolDiffAddend(a, b, add) meaning `a - b + add`.
+fn try_parse_sym_diff(s: &str) -> Option<DataValue> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..bytes.len() {
+        let c = bytes[i] as char;
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+        } else if c == '-' && depth == 0 && i > 0 {
+            let lhs = &s[..i];
+            let rhs = &s[i + 1..];
+            let (a, add_a) = parse_sym_addend(lhs)?;
+            if rhs.trim() == "." {
+                // (a ± N) - .  ==  a - . ± N   (PC-relative, GNU as encodes as
+                // a PC32 reloc with the addend folded in)
+                return Some(DataValue::SymbolDiffAddend(a, ".".to_string(), add_a));
+            }
+            if let Some((b, add_b)) = parse_sym_addend(rhs) {
+                // a + add_a - (b + add_b) = a - b + (add_a - add_b)
+                return Some(DataValue::SymbolDiffAddend(a, b, add_a - add_b));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Parse symbol+offset or symbol-offset expressions (e.g., GD_struct+128).
+/// Also handles offset+symbol (e.g., 0x9b000000 + pa_real_mode_base).
+/// Returns a DataValue::SymbolOffset if the string matches this pattern.
+/// Parse `SYMBOL op expr op expr ...` where every `expr` after the symbol is
+/// a compile-time integer expression and ops are +/-. Returns the folded
+/// SymbolOffset. Bails (None) if the tail references any other symbol - a
+/// symbol difference must be handled by the dedicated paths.
+fn parse_symbol_expr_chain(s: &str) -> Option<DataValue> {
+    let t = s.trim();
+    // Find the leading symbol: longest prefix that is label-like.
+    let mut sym_end = 0;
+    for (i, c) in t.char_indices() {
+        if i == 0 {
+            if !(c.is_ascii_alphabetic() || c == '_' || c == '.') {
+                return None;
+            }
+        } else if !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$') {
+            break;
+        }
+        sym_end = i + c.len_utf8();
+    }
+    if sym_end == 0 {
+        return None;
+    }
+    let sym = &t[..sym_end];
+    if !is_label_like(sym) {
+        return None;
+    }
+    let tail = t[sym_end..].trim();
+    if tail.is_empty() {
+        return None; // plain symbol: let the standard path handle it
+    }
+    // Tail must start with + or - and consist purely of constant arithmetic.
+    if !(tail.starts_with('+') || tail.starts_with('-')) {
+        return None;
+    }
+    // The whole tail must evaluate as one integer expression: "+ (2<<12) - 8 + 16".
+    match parse_integer_expr(tail) {
+        Ok(v) => Some(DataValue::SymbolOffset(sym.to_string(), v)),
+        Err(_) => None,
+    }
+}
+
+fn parse_symbol_offset(s: &str) -> Option<DataValue> {
+    // Look for + or - that separates symbol from offset
+    // Don't match the leading character (could be .-prefixed label)
+    for (i, c) in s.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            let left = s[..i].trim();
+            let right_with_sign = &s[i..]; // includes the sign
+
+            // Case 1: symbol+offset or symbol-offset (e.g., "GD_struct+128")
+            if let Ok(offset) = parse_integer_expr(right_with_sign) {
+                if !left.is_empty() && !left.contains(' ') {
+                    return Some(DataValue::SymbolOffset(left.to_string(), offset));
+                }
+            }
+
+            // Case 2: offset+symbol (e.g., "0x9b000000 + pa_real_mode_base") - only for '+'
+            if c == '+' {
+                if let Ok(offset) = parse_integer_expr(left) {
+                    let sym = right_with_sign[1..].trim(); // skip the '+'
+                    if !sym.is_empty() && !sym.contains(' ') && is_label_like(sym) {
+                        return Some(DataValue::SymbolOffset(sym.to_string(), offset));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse an integer expression (delegates to the shared expression evaluator).
+fn parse_integer_expr(s: &str) -> Result<i64, String> {
+    asm_expr::parse_integer_expr(s)
+}
+
+/// GAS macro definition
+#[derive(Clone, Debug)]
+struct GasMacro {
+    /// As written in `.macro`, for diagnostics.
+    name: String,
+    params: Vec<asm_preprocess::MacroParam>,
+    body: Vec<String>,
+}
+
+/// GAS `\@` pseudo-variable: the total number of macro expansions performed
+/// so far. Every expansion gets a distinct value — that is what makes
+/// `.Lhere_\@:` a unique label per invocation. Leaving `\@` unsubstituted
+/// collapsed every use onto ONE label: the kernel's ANNOTATE macro then
+/// pointed all `.discard.annotate_insn` entries at the same address instead
+/// of at the instruction each one annotates, and objtool rejected the object
+/// ("intra_function_call not a direct call").
+///
+/// The counter is process-global (AtomicU64), not per-expansion-pass: GAS
+/// draws nested and recursive expansions from one sequence, and a file-local
+/// counter would recycle values when expand_gas_macros_with_state recurses.
+/// Distinctness is the only contract — the concrete numbers may differ from
+/// GAS's, which no correct assembly can observe.
+static MACRO_INVOCATION_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// GAS 2.47's macro-nesting wall, re-measured on the pinned oracle: a
+/// 101-frame chain of distinct macros (`m0 -> m1 -> ... -> m100`)
+/// assembles, the 102nd frame fatals with `macros nested too deeply`,
+/// and direct/mutual recursion hits the same wall with the same
+/// message.  Without a frame counter of our own, a self-referential
+/// macro (`m` whose body invokes `m`) overflows the native stack and
+/// aborts — and a crash is never a verdict.
+const MAX_MACRO_FRAMES: u32 = 101;
+
+/// Deterministic expansion law threaded through
+/// `expand_gas_macros_with_state`.
+///
+/// * `depth` — live macro frames; `> `[`MAX_MACRO_FRAMES`]` fails with
+///   GAS's exact `macros nested too deeply` wording (measured above).
+/// * `grown_lines` / `grown_bytes` — everything `.irp`, `.irpc` and
+///   macro invocation materialize *before* any parse can run.  An
+///   `items x body` product is quadratic in a linear input, so the
+/// * `totals` — [`asm_preprocess::ExpansionTotals`]: the 4194304-line /
+///   256 MiB-of-text ceilings of [`asm_preprocess::check_expansion_growth`]
+///   (each line counted as `len + 1`, exactly [`asm_preprocess::expansion_size`]),
+///   charged incrementally and checked *before* the next block is appended.
+///   The same deterministic-stand-in law as
+///   `MAX_DIRECTIVE_FILL`, whose GAS-side verdict degrades into
+///   machine memory state at these sizes (FOLLOWUP deviation
+///   register).  One budget spans the whole recursive expansion, so
+///   nested constructs can never reset the totals.
+struct ExpansionBudget {
+    totals: asm_preprocess::ExpansionTotals,
+    depth: u32,
+}
+
+impl ExpansionBudget {
+    fn new() -> Self {
+        Self {
+            totals: asm_preprocess::ExpansionTotals::default(),
+            depth: 0,
+        }
+    }
+
+    /// Charge `lines` freshly materialized lines (with their text) and fail
+    /// closed the moment either ceiling is crossed.  Delegation, not a second
+    /// implementation: the arm and riscv front ends charge the same shared
+    /// totals, so the three expanders cannot grow three different ceilings --
+    /// which is what they had until `.macro` joined the party.
+    fn charge(&mut self, lines: &[String], kind: &str) -> Result<(), String> {
+        self.totals.charge(kind, lines)
+    }
+}
+
+/// Expand GAS macro directives: .macro/.endm, .purgem, .irp/.endr, .ifc/.endif, .if/.endif, .set
+///
+/// This runs as a text-level expansion pass before instruction parsing.
+/// It handles the Linux kernel's extable_type_reg pattern and similar constructs.
+fn expand_gas_macros(lines: &[String]) -> Result<Vec<String>, String> {
+    let mut macros = crate::common::fx_hash::FxHashMap::default();
+    let mut symbols = crate::common::fx_hash::FxHashMap::default();
+    let mut labels = crate::common::fx_hash::FxHashSet::default();
+    let expanded = expand_gas_macros_with_state(
+        lines,
+        &mut macros,
+        &mut symbols,
+        &mut labels,
+        &mut ExpansionBudget::new(),
+    )?;
+    Ok(substitute_register_aliases(expanded))
+}
+
+/// Substitute `.set alias, %reg` register aliases into instruction operands.
+///
+/// GAS allows a symbol to alias a REGISTER (`.set state0, %xmm1`) and then
+/// uses the bare symbol as an operand (`movdqa copy0,state0`). The kernel
+/// vDSO ChaCha implementation (arch/x86/entry/vdso/vgetrandom-chacha.S) is
+/// written entirely in this style. Numeric .set symbols are handled by the
+/// integer-expression path; register aliases must instead be textually
+/// substituted before operand parsing, with word-boundary matching so an
+/// alias `i` never fires inside an identifier or directive. Aliases take
+/// effect only on lines AFTER their definition (GAS semantics); the .set
+/// line itself is dropped since the alias has no ELF-symbol meaning.
+fn substitute_register_aliases(lines: Vec<String>) -> Vec<String> {
+    use crate::common::fx_hash::FxHashMap;
+    let mut reg_aliases: FxHashMap<String, String> = FxHashMap::default();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        // Comments must go BEFORE alias parsing: the kernel writes
+        // `CTX\t= %rdi\t# 1st arg` (sha256-avx2-asm.S), and keeping the
+        // comment glued the target into "%rdi\t# 1st arg" — a register name
+        // that matches nothing, so the alias silently never resolved.
+        let trimmed = strip_comment(&line).trim();
+        // Both alias spellings define register aliases:
+        //   .set NAME, TARGET      (vgetrandom-chacha.S)
+        //   NAME = TARGET          (sha256-avx2-asm.S: `X0 = %ymm4`, and
+        //                           rotate_Xs rotates them via `X_ = X0`)
+        // TARGET may be a %register or ANOTHER alias (transitive; kernel
+        // crc-pclmul builds CONSTS -> V7 -> %xmm7, sha256-avx2's rotate_Xs
+        // permutes X0..X3 through X_). GAS evaluates eagerly: the alias
+        // snapshots the target's CURRENT value, so later redefinition of
+        // the target must not rewrite history — exactly what resolving
+        // through the map at definition time gives us.
+        let alias_def: Option<(&str, &str)> = if let Some(rest) = set_directive_arg(trimmed) {
+            rest.find(',')
+                .map(|comma| (rest[..comma].trim(), rest[comma + 1..].trim()))
+        } else if let Some(eq) = trimmed.find('=') {
+            // Plain `NAME = TARGET` (not ==, and NAME must be a bare
+            // identifier — labels and expressions are not alias defs).
+            let name = trimmed[..eq].trim();
+            let target = trimmed[eq + 1..].trim();
+            let name_is_ident = !name.is_empty()
+                && !target.starts_with('=')
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+            if name_is_ident {
+                Some((name, target))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((name, target)) = alias_def {
+            let name_ok = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+            if name_ok {
+                if target.starts_with('%') {
+                    reg_aliases.insert(name.to_string(), target.to_string());
+                    continue; // drop the alias-definition line
+                }
+                if let Some(resolved) = reg_aliases.get(target) {
+                    let resolved = resolved.clone();
+                    reg_aliases.insert(name.to_string(), resolved);
+                    continue; // drop the alias-definition line
+                }
+            }
+        }
+        if reg_aliases.is_empty() || trimmed.starts_with('.') || trimmed.ends_with(':') {
+            out.push(line);
+            continue;
+        }
+        // Replace whole-word occurrences of any alias in the operand text.
+        let bytes = line.as_bytes();
+        let mut replaced = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c.is_ascii_alphabetic() || c == b'_' || c == b'.' {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+                {
+                    i += 1;
+                }
+                let word = &line[start..i];
+                // Never substitute the mnemonic (first word): an alias named
+                // like an instruction must not clobber it. Operands start
+                // after the first whitespace.
+                let is_mnemonic_pos = replaced.trim().is_empty();
+                if !is_mnemonic_pos {
+                    if let Some(reg) = reg_aliases.get(word) {
+                        replaced.push_str(reg);
+                        continue;
+                    }
+                }
+                replaced.push_str(word);
+            } else if c == b'%' {
+                // Skip register names wholesale so an alias equal to a
+                // register suffix cannot fire inside one.
+                let start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                replaced.push_str(&line[start..i]);
+            } else {
+                replaced.push(c as char);
+                i += 1;
+            }
+        }
+        out.push(replaced);
+    }
+    out
+}
+
+fn expand_gas_macros_with_state(
+    lines: &[String],
+    macros: &mut crate::common::fx_hash::FxHashMap<String, GasMacro>,
+    symbols: &mut crate::common::fx_hash::FxHashMap<String, i64>,
+    labels: &mut crate::common::fx_hash::FxHashSet<String>,
+    budget: &mut ExpansionBudget,
+) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = strip_comment(&lines[i]).trim().to_string();
+
+        // Label definitions are recorded SEQUENTIALLY (GAS semantics: a
+        // label only counts as "defined" for a later .ifdef — forward
+        // references do not; verified against GAS 2.47). `name:` may carry
+        // trailing content on the same line; numeric-only local labels
+        // (1:, 2:) are not symbol-table names for .ifdef purposes.
+        if let Some(colon) = trimmed.find(':') {
+            let name = trimmed[..colon].trim();
+            if !name.is_empty()
+                && name
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'.')
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$')
+            {
+                labels.insert(name.to_string());
+            }
+        }
+
+        // .macro name param1:req param2:req ...
+        if let Some(rest) = directive_arg(&trimmed, ".macro") {
+            let (name, params) = asm_preprocess::parse_macro_header(rest);
+            if name.is_empty() {
+                return Err(".macro: missing name".to_string());
+            }
+            let name = name.to_string();
+            let mut body = Vec::new();
+            let mut depth = 1;
+            i += 1;
+            while i < lines.len() {
+                let inner = strip_comment(&lines[i]).trim().to_string();
+                if directive_arg(&inner, ".macro").is_some() {
+                    depth += 1;
+                } else if inner == ".endm" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                body.push(lines[i].clone());
+                i += 1;
+            }
+            if depth != 0 {
+                return Err(".macro without matching .endm".to_string());
+            }
+            macros.insert(name.clone(), GasMacro { name, params, body });
+            i += 1;
+            continue;
+        }
+
+        // .purgem name
+        if let Some(name) = directive_arg(&trimmed, ".purgem") {
+            macros.remove(name);
+            i += 1;
+            continue;
+        }
+
+        // .set symbol, expr (with symbol resolution)
+        if let Some(rest) = set_directive_arg(&trimmed) {
+            if let Some(comma_pos) = rest.find(',') {
+                let sym_name = rest[..comma_pos].trim().to_string();
+                let expr_str = rest[comma_pos + 1..].trim();
+                // Try to evaluate expression with current symbol values
+                let resolved = resolve_set_expr(expr_str, symbols);
+                if let Ok(val) = parse_integer_expr(&resolved) {
+                    symbols.insert(sym_name.clone(), val);
+                    // For local symbols (.L*), don't emit the .set - we handle them internally
+                    if sym_name.starts_with(".L") {
+                        i += 1;
+                        continue;
+                    }
+                }
+                // Emit the .set directive for non-local or unresolvable symbols
+                let resolved_line = format!(".set {}, {}", sym_name, resolved);
+                result.push(resolved_line);
+            } else {
+                result.push(lines[i].clone());
+            }
+            i += 1;
+            continue;
+        }
+
+        // GAS-style symbol = expr assignment (equivalent to .set symbol, expr)
+        // Used by kernel code like: i = 0 / i = i + 1 inside .rept blocks
+        if let Some(eq_pos) = trimmed.find('=') {
+            // Make sure it's not ==, !=, <=, >= (comparison operators)
+            let not_comparison = (eq_pos + 1 >= trimmed.len()
+                || trimmed.as_bytes()[eq_pos + 1] != b'=')
+                && (eq_pos == 0
+                    || (trimmed.as_bytes()[eq_pos - 1] != b'!'
+                        && trimmed.as_bytes()[eq_pos - 1] != b'<'
+                        && trimmed.as_bytes()[eq_pos - 1] != b'>'));
+            if not_comparison {
+                let before = trimmed[..eq_pos].trim();
+                // Check if before looks like a symbol name: starts with letter or _, no spaces
+                if !before.is_empty()
+                    && !before.contains(' ')
+                    && !before.contains('\t')
+                    && !before.contains(':')
+                    && !before.starts_with('$')
+                    && !before.starts_with('%')
+                    && !before.starts_with('.')
+                    && (before.as_bytes()[0].is_ascii_alphabetic() || before.as_bytes()[0] == b'_')
+                {
+                    let expr_str = trimmed[eq_pos + 1..].trim();
+                    let resolved = resolve_set_expr(expr_str, symbols);
+                    if let Ok(val) = parse_integer_expr(&resolved) {
+                        symbols.insert(before.to_string(), val);
+                        // Emit as .set so the parser can also handle it
+                        let resolved_line = format!(".set {}, {}", before, resolved);
+                        result.push(resolved_line);
+                        i += 1;
+                        continue;
+                    }
+                    // `NAME = %reg` — the `=` spelling of a REGISTER alias
+                    // (kernel sha256-avx2-asm.S: `NUM_BLKS = %rdx`). Not a
+                    // numeric symbol; normalize to `.set NAME, %reg` so the
+                    // register-alias substitution pass picks it up exactly
+                    // like the .set spelling. Without this the line passed
+                    // through verbatim and every use of the alias died in
+                    // the encoder ("unsupported shlq operands").
+                    if expr_str.starts_with('%') {
+                        result.push(format!(".set {}, {}", before, expr_str));
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // .irpc var, string  /  .endr -- GAS character iteration: the body
+        // expands once per CHARACTER of the string. efi-mixed.S uses
+        // `.irpc l, 0123` to unroll four page-table-entry stores with
+        // `\l * 8(%eax)` displacements; without this the raw `\l` leaked
+        // into the object as a relocation symbol named "\l * 8".
+        if let Some(rest) = directive_arg(&trimmed, ".irpc") {
+            let comma = rest
+                .find(',')
+                .ok_or(".irpc: missing comma after variable")?;
+            let var = rest[..comma].trim().to_string();
+            let chars_str = rest[comma + 1..].trim();
+            // GAS allows the string to be quoted; strip one layer.
+            let chars_str = chars_str
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(chars_str);
+            let mut body = Vec::new();
+            let mut depth = 1;
+            i += 1;
+            while i < lines.len() {
+                let inner = strip_comment(&lines[i]).trim().to_string();
+                if directive_arg(&inner, ".irp").is_some()
+                    || directive_arg(&inner, ".irpc").is_some()
+                    || directive_arg(&inner, ".rept").is_some()
+                {
+                    depth += 1;
+                } else if inner == ".endr" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                body.push(lines[i].clone());
+                i += 1;
+            }
+            let mut all_expanded = Vec::new();
+            let mut block: Vec<String> = Vec::with_capacity(body.len());
+            for ch in chars_str.chars() {
+                let item = ch.to_string();
+                for bline in &body {
+                    let mut expanded =
+                        asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), &item);
+                    expanded = expanded.replace("\\()", "");
+                    block.push(expanded);
+                }
+                // Charge every character-block as it is materialized: an
+                // `.irpc` amplifies `len(string) x body` from linear input,
+                // and the ceiling must fire before the next block allocates.
+                budget.charge(&block, ".irpc")?;
+                all_expanded.append(&mut block);
+            }
+            let processed =
+                expand_gas_macros_with_state(&all_expanded, macros, symbols, labels, budget)?;
+            result.extend(processed);
+            i += 1;
+            continue;
+        }
+
+        // .irp var, item1, item2, ...  /  .endr
+        if let Some(rest) = directive_arg(&trimmed, ".irp") {
+            let (var, items) = parse_irp_header(rest)?;
+            let mut body = Vec::new();
+            let mut depth = 1;
+            i += 1;
+            while i < lines.len() {
+                let inner = strip_comment(&lines[i]).trim().to_string();
+                if directive_arg(&inner, ".irp").is_some()
+                    || directive_arg(&inner, ".rept").is_some()
+                {
+                    depth += 1;
+                } else if inner == ".endr" {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                body.push(lines[i].clone());
+                i += 1;
+            }
+            // Expand: for each item, substitute \var with the item, then recursively process
+            let mut all_expanded = Vec::new();
+            let mut block: Vec<String> = Vec::with_capacity(body.len());
+            for item in &items {
+                for bline in &body {
+                    let mut expanded =
+                        asm_preprocess::replace_macro_param(bline, &format!("\\{}", var), item);
+                    // Strip GAS macro argument delimiters: \() resolves to empty string
+                    expanded = expanded.replace("\\()", "");
+                    block.push(expanded);
+                }
+                // Same incremental charge as `.irpc`: the `items x body`
+                // product is quadratic in a linear input, so the shared
+                // ceilings must be tested between blocks, not after the
+                // whole (potentially unbounded) materialization.
+                budget.charge(&block, ".irp")?;
+                all_expanded.append(&mut block);
+            }
+            let processed =
+                expand_gas_macros_with_state(&all_expanded, macros, symbols, labels, budget)?;
+            result.extend(processed);
+            i += 1;
+            continue;
+        }
+
+        // ─── Conditional-assembly family (GAS 2.47 parity) ───
+        //
+        // One branch-collection mechanism over the full head family:
+        // `.if`, `.ifdef`, `.ifndef`, `.ifnotdef`, `.ifeq`, `.ifne`,
+        // `.iflt`, `.ifle`, `.ifgt`, `.ifge`, `.ifb`, `.ifnb`, `.ifc`,
+        // `.ifnc`, `.ifeqs`, `.ifnes`. Every head reduces to a boolean
+        // (with GAS-verbatim diagnostics on malformed arguments) and the
+        // `.elseif`/`.else`/`.endif` collection below is shared, so a new
+        // family member cannot drift from the nesting rules — the three
+        // pre-family copy-pasted collectors had exactly that drift risk.
+        let head = eval_conditional_head(&trimmed, symbols, labels);
+        match head {
+            Some(Ok(cond)) => {
+                let branches = collect_conditional_branches(lines, &mut i, cond, symbols)?;
+                let empty: Vec<String> = Vec::new();
+                let chosen_lines: &Vec<String> = branches
+                    .iter()
+                    .find(|(bcond, _)| *bcond)
+                    .map(|(_, blines)| blines)
+                    .unwrap_or(&empty);
+                let expanded =
+                    expand_gas_macros_with_state(chosen_lines, macros, symbols, labels, budget)?;
+                result.extend(expanded);
+                i += 1;
+                continue;
+            }
+            Some(Err(msg)) => return Err(msg),
+            None => {}
+        }
+
+        // .error "message" - assembler error directive
+        if let Some(rest) = directive_arg(&trimmed, ".error") {
+            return Err(format!("assembler error: {}", rest));
+        }
+
+        // Stray conditional terminators are a hard error, exactly like GAS
+        // (`".else" without matching ".if"`): a conditional-family line that
+        // reaches this point has no open .if block. Before this check, a
+        // malformed conditional head (anything the arms above did not
+        // recognize) fell through and the assembler SILENTLY emitted every
+        // branch — a wrong-code failure mode with no diagnostic. The kernel's
+        // macro-heavy asm must never mis-assemble silently.
+        if trimmed == ".else" {
+            return Err("\".else\" without matching \".if\"".to_string());
+        }
+        if trimmed == ".endif" {
+            return Err("\".endif\" without \".if\"".to_string());
+        }
+        if directive_arg(&trimmed, ".elseif").is_some() {
+            return Err("\".elseif\" without matching \".if\"".to_string());
+        }
+
+        // Check if line is a macro invocation.
+        // First, split on semicolons to handle "macrocall args; other_stuff" patterns.
+        // GAS treats ';' as a statement separator, so a macro invocation may be
+        // followed by other statements on the same line.
+        let semi_parts = crate::backend::asm_preprocess::split_on_semicolons(&trimmed);
+        let first_part = semi_parts[0].trim();
+        let first_word = first_part.split_whitespace().next().unwrap_or("");
+        // Strip label prefixes if present (e.g., "label: macroname args").
+        // MULTIPLE labels can pile up before the invocation: the kernel's
+        // ALTERNATIVE_2 body puts `740: 740: \oldinstr` on one line (each
+        // nested alternative contributes its own numeric label), and
+        // stripping only ONE left `740: RETPOLINE rax` unrecognized — the
+        // encoder then saw a bogus `retpoline` instruction.
+        let mut label_prefix_end = 0usize;
+        {
+            let bytes = first_part.as_bytes();
+            let mut pos = 0usize;
+            loop {
+                // Skip whitespace.
+                while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+                    pos += 1;
+                }
+                let tok_start = pos;
+                while pos < bytes.len() && bytes[pos] != b' ' && bytes[pos] != b'\t' {
+                    pos += 1;
+                }
+                if pos > tok_start
+                    && bytes[pos - 1] == b':'
+                    && first_part[tok_start..pos - 1]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                    && !first_part[tok_start..pos - 1].is_empty()
+                {
+                    label_prefix_end = pos;
+                } else {
+                    break;
+                }
+            }
+        }
+        let after_labels = first_part[label_prefix_end..].trim();
+        let macro_name_candidate = if label_prefix_end > 0 {
+            after_labels.split_whitespace().next().unwrap_or("")
+        } else {
+            first_word
+        };
+        // Also check for C-preprocessor-style invocations: MACRO_NAME(args)
+        // In GAS, "MACRO_NAME(arg)" is treated as macro invocation with "(arg)" as arg text
+        let macro_name = if macros.contains_key(macro_name_candidate) {
+            macro_name_candidate
+        } else if let Some(paren_pos) = macro_name_candidate.find('(') {
+            let candidate = &macro_name_candidate[..paren_pos];
+            if macros.contains_key(candidate) {
+                candidate
+            } else {
+                macro_name_candidate
+            }
+        } else {
+            macro_name_candidate
+        };
+
+        // A directive is NEVER a macro invocation: GAS resolves `.type`,
+        // `.size`, ... as directives even when a macro of the same bare name
+        // exists. Without the guard, a macro whose name collides with a
+        // directive word (the kernel defines macros around `type`) could
+        // capture the directive line and rewrite it into garbage.
+        if macros.contains_key(macro_name) && !macro_name.starts_with('.') {
+            // Frame entry: GAS 2.47 fatals the 102nd nested frame with
+            // `macros nested too deeply` (chain of 101 distinct macros
+            // assembles; direct and mutual recursion land on the same
+            // wall).  Checked before any body materialization, so a
+            // self-referential macro fails deterministically instead of
+            // overflowing the native stack.
+            budget.depth += 1;
+            if budget.depth > MAX_MACRO_FRAMES {
+                return Err("macros nested too deeply".to_string());
+            }
+            let mac = macros[macro_name].clone();
+            let args_str = if label_prefix_end > 0 {
+                // Emit every stacked label first, each on its own line
+                // (they are separate statements in GAS).
+                for lab in first_part[..label_prefix_end].split_whitespace() {
+                    result.push(lab.to_string());
+                }
+                after_labels[macro_name.len()..].trim()
+            } else {
+                first_part[macro_name.len()..].trim()
+            };
+            let fields = asm_preprocess::split_macro_arg_fields(
+                args_str,
+                asm_preprocess::MacroArgLexing::X86,
+            );
+            let values = asm_preprocess::bind_macro_args(&mac.name, &mac.params, &fields)?;
+            let args: Vec<(String, String)> = mac
+                .params
+                .iter()
+                .map(|p| p.name.clone())
+                .zip(values)
+                .collect();
+            // Sort parameters by name length (longest first) to avoid partial
+            // substitution: e.g., \orig must not match before \orig_len.
+            let mut sorted_args: Vec<(String, String)> = args.clone();
+            sorted_args.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            // Substitute parameters in body
+            // One `\@` value per invocation, fetched before body substitution
+            // so every line of this expansion sees the same number.
+            let invocation = MACRO_INVOCATION_COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_string();
+            let mut expanded_body: Vec<String> = mac
+                .body
+                .iter()
+                .map(|line| {
+                    let mut l = line.clone();
+                    for (pname, pval) in &sorted_args {
+                        l = asm_preprocess::replace_macro_param(&l, &format!("\\{}", pname), pval);
+                    }
+                    if l.contains("\\@") {
+                        l = l.replace("\\@", &invocation);
+                    }
+                    // Strip GAS macro argument delimiters: \() resolves to empty string.
+                    // Used to separate parameter names from adjacent text,
+                    // e.g., \op\()_safe_regs -> rdmsr_safe_regs
+                    l = l.replace("\\()", "");
+                    l
+                })
+                .collect();
+            // Substituting a parameter can splice several statements into ONE
+            // body line (a quoted ALTERNATIVE argument such as
+            // "nop;ANNOTATE type=7; call 772f"). Break those apart before the
+            // recursive pass so a macro invocation that ended up after a `;`
+            // is still recognised as the first word of a statement.
+            let mut split_body: Vec<String> = Vec::with_capacity(expanded_body.len());
+            for line in expanded_body {
+                if line.contains(';') {
+                    for part in crate::backend::asm_preprocess::split_on_semicolons(&line) {
+                        let p = part.trim();
+                        if !p.is_empty() {
+                            split_body.push(p.to_string());
+                        }
+                    }
+                } else {
+                    split_body.push(line);
+                }
+            }
+            expanded_body = split_body;
+            // Charge the substituted body as materialized text (one
+            // invocation's contribution; nested constructs charge again
+            // through their own sites on the shared budget).
+            budget.charge(&expanded_body, ".macro")?;
+            // Recursively expand the body (handles nested .irp, .set, .if, etc.)
+            expanded_body =
+                expand_gas_macros_with_state(&expanded_body, macros, symbols, labels, budget)?;
+            result.extend(expanded_body);
+            // The frame ends with its body: sibling statements after the
+            // `;` on the same line are NOT inside the invocation (a
+            // thousand sequential top-level calls must not accumulate
+            // depth — measured: GAS assembles any number of them).
+            budget.depth -= 1;
+            // Emit remaining semicolon-separated parts as separate lines.
+            //
+            // They must be re-expanded, not pushed raw: a macro invocation can
+            // follow another statement on the same line, and after a macro
+            // argument is substituted the resulting text frequently contains
+            // one. The kernel's FILL_RETURN_BUFFER passes
+            //     "nop;ANNOTATE type=7; call 772f; ..."
+            // as a quoted ALTERNATIVE_2 argument, so `ANNOTATE` only ever
+            // appears after a `;` once the outer macro has expanded. Pushing it
+            // verbatim left it to the instruction encoder, which reported
+            // "unhandled instruction: annotate [Label(\"type=7\")]".
+            let rest_parts: Vec<String> = semi_parts[1..]
+                .iter()
+                .map(|sp| sp.trim().to_string())
+                .filter(|sp| !sp.is_empty())
+                .collect();
+            if !rest_parts.is_empty() {
+                let expanded_rest =
+                    expand_gas_macros_with_state(&rest_parts, macros, symbols, labels, budget)?;
+                result.extend(expanded_rest);
+            }
+            i += 1;
+            continue;
+        }
+
+        // For regular lines, resolve any .set symbol references
+        if !symbols.is_empty() {
+            let resolved = resolve_set_expr(&lines[i], symbols);
+            result.push(resolved);
+        } else {
+            result.push(lines[i].clone());
+        }
+        i += 1;
+    }
+
+    Ok(result)
+}
+
+/// Parse .irp header: "var, item1, item2, ..."
+fn parse_irp_header(rest: &str) -> Result<(String, Vec<String>), String> {
+    // Format: var,item1,item2,... or var item1,item2,...
+    let rest = rest.trim();
+    // First find the variable name (before the first comma)
+    let comma_pos = rest.find(',').ok_or(".irp: missing comma after variable")?;
+    let var = rest[..comma_pos].trim().to_string();
+    let items_str = rest[comma_pos + 1..].trim();
+    let items: Vec<String> = items_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    Ok((var, items))
+}
+
+/// Evaluate .ifb/.ifnb blank-argument test.  GAS treats an omitted
+/// argument, empty string, or macro argument that expands to nothing as blank.
+fn eval_ifb(rest: &str) -> bool {
+    let t = rest.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
+        return t.len() <= 2;
+    }
+    false
+}
+
+/// Evaluate .ifc string comparison: "str1, str2" => true if equal
+fn eval_ifc(rest: &str) -> bool {
+    if let Some(comma_pos) = rest.find(',') {
+        let s1 = rest[..comma_pos].trim();
+        let s2 = rest[comma_pos + 1..].trim();
+        s1 == s2
+    } else {
+        false
+    }
+}
+
+/// Resolve symbols in a .set expression string.
+/// Uses whole-word matching to avoid replacing substrings inside identifiers,
+/// register names, or instruction mnemonics (e.g., replacing `i` inside `rip`).
+fn resolve_set_expr(
+    expr: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+) -> String {
+    // NEVER substitute inside the directive mnemonic.
+    //
+    // Substitution is whole-word and `.` counts as a word boundary, so a
+    // symbol named `type` rewrote the directive `.type` into `.3`. The kernel
+    // hits this hard: arch/x86/include/asm/unwind_hints.h does `.set type, 3`
+    // inside UNWIND_HINT, and every later `.type foo STT_FUNC` produced by
+    // SYM_FUNC_END silently became `.3 foo STT_FUNC`. All 26 affected function
+    // symbols stayed STT_NOTYPE and objtool rejected the object with
+    // "unexpected relocation symbol type in .rela.discard...: 0".
+    //
+    // This function is called in two DIFFERENT contexts and the guard is
+    // only correct in one of them:
+    //  * whole LINES (the regular-line pass): the first token may be a
+    //    directive mnemonic and must be protected;
+    //  * bare EXPRESSIONS (the .set value, `sym = expr`): there is no
+    //    mnemonic, and an expression naturally starts with '.' whenever it
+    //    references a `.L` local symbol.
+    // The first version applied the guard unconditionally AND recursed into
+    // itself for the operand text, so `.Lfound+1` — no whitespace — was
+    // consumed whole as a "mnemonic" and never substituted:
+    // `.set .Lfound, .Lfound+1` silently kept 0 and the kernel's
+    // extable_type_reg register scan (.irp + .ifc counting into .Lfound)
+    // died with "extable_type_reg: bad register argument" on every uaccess
+    // object. Distinguish the contexts: a leading '.' token is a directive
+    // only if it is FOLLOWED BY MORE TEXT (directives never end the line
+    // they start — they have operands or none, but a bare `.Lsym+1`
+    // expression is not a directive); `.Lfound` / `.Lfound+1` contain
+    // expression characters (+,-,digits after the identifier) or ARE the
+    // whole text, which no directive mnemonic is.
+    let lead = expr.len() - expr.trim_start().len();
+    let body = &expr[lead..];
+    if body.starts_with('.') {
+        let end = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
+        let (first_tok, rest) = body.split_at(end);
+        // Directive mnemonics are pure `.` + identifier tokens (`.type`,
+        // `.long`, `.size`, `.text`, ...). Two things are NOT mnemonics:
+        //  * tokens containing expression operators (`.Lfound+1` — the whole
+        //    .set value arrives here as one token with no whitespace);
+        //  * `.L`-prefixed tokens — GAS's local-symbol namespace, which no
+        //    directive name inhabits (`.Lfound` alone is an expression).
+        // Operand-less directives (`.text` with empty rest) ARE mnemonics
+        // and stay protected: a user symbol named `text` must not turn
+        // `.text` into `.3`.
+        let is_mnemonic = first_tok[1..].bytes().all(is_ident_char) && !first_tok.starts_with(".L");
+        if is_mnemonic {
+            return format!(
+                "{}{}{}",
+                &expr[..lead],
+                first_tok,
+                substitute_set_symbols(rest, symbols)
+            );
+        }
+    }
+    substitute_set_symbols(expr, symbols)
+}
+
+/// Plain whole-word .set-symbol substitution, no directive-mnemonic logic.
+fn substitute_set_symbols(
+    text: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+) -> String {
+    let mut result = text.to_string();
+    // Sort by length (longest first) to avoid partial replacements
+    let mut sym_list: Vec<_> = symbols.iter().collect();
+    sym_list.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    for (name, val) in sym_list {
+        result = replace_whole_word(&result, name, &val.to_string());
+    }
+    result
+}
+
+/// Replace all whole-word occurrences of `word` with `replacement`.
+/// A word boundary is any position where the adjacent character is not
+/// alphanumeric or underscore (i.e., not an identifier character).
+fn replace_whole_word(text: &str, word: &str, replacement: &str) -> String {
+    if word.is_empty() || text.is_empty() || text.len() < word.len() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let word_bytes = word.as_bytes();
+    let mut result = String::with_capacity(text.len());
+    let mut i = 0;
+    while i + word_bytes.len() <= bytes.len() {
+        if &bytes[i..i + word_bytes.len()] == word_bytes {
+            // Check left boundary: either start of string or non-identifier char
+            let left_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            // Check right boundary: either end of string or non-identifier char
+            let right_ok =
+                i + word_bytes.len() >= bytes.len() || !is_ident_char(bytes[i + word_bytes.len()]);
+            if left_ok && right_ok {
+                result.push_str(replacement);
+                i += word_bytes.len();
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    // Append any remaining characters
+    while i < bytes.len() {
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    result
+}
+
+/// Check if a byte is an identifier character (alphanumeric or underscore).
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Check if a line starts a new conditional assembly block (.if, .ifc, .ifdef, .ifndef).
+fn is_if_start(trimmed: &str) -> bool {
+    conditional_head_arg(trimmed).is_some()
+}
+
+/// Match a conditional-assembly head directive and return its argument.
+///
+/// The full GAS 2.47 family, whitespace-insensitively (`.ifb\t%1` matched
+/// here too — a nested conditional whose tab form was dropped mis-nested
+/// the whole `.if/.endif` stack). Order matters: the longer spellings are
+/// matched before the prefix-colliding shorter ones (`.ifeqs` before
+/// `.ifeq`, `.ifdef` before `.if`), though `directive_arg`'s
+/// whitespace-after-directive requirement already keeps `.if` from
+/// swallowing the longer names. `.if(` — a paren directly after the
+/// directive, no whitespace — is legal GAS tokenization and kept as an
+/// explicit fallback form.
+fn conditional_head_arg(trimmed: &str) -> Option<&str> {
+    for dir in [
+        ".ifdef",
+        ".ifndef",
+        ".ifnotdef",
+        ".ifeqs",
+        ".ifnes",
+        ".ifeq",
+        ".ifne",
+        ".iflt",
+        ".ifle",
+        ".ifgt",
+        ".ifge",
+        ".ifc",
+        ".ifnc",
+        ".ifb",
+        ".ifnb",
+    ] {
+        if let Some(rest) = directive_arg(trimmed, dir) {
+            return Some(rest);
+        }
+    }
+    directive_arg(trimmed, ".if")
+        .or_else(|| trimmed.starts_with(".if(").then(|| &trimmed[".if".len()..]))
+}
+
+/// Evaluate the head of a conditional-assembly block.
+///
+/// * `None` — `trimmed` does not open a conditional block.
+/// * `Some(Ok(cond))` — head with evaluated condition.
+/// * `Some(Err(msg))` — it IS a conditional head, but the argument is
+///   malformed. The message reproduces GAS 2.47 verbatim (`invalid
+///   identifier for ".ifdef"`, `missing string`, `.ifeqs syntax error`,
+///   `non-constant expression in ".if" statement`), so the differential
+///   suites can pin diagnostics byte-for-byte.
+///
+/// GAS rejects undefined symbols in conditional heads ("non-constant
+/// expression") rather than silently reading them as 0 — a head over an
+/// unknown name is a bug in the assembly, and silently taking the false
+/// branch once hid every branch the enclosing macro expected to run.
+fn eval_conditional_head(
+    trimmed: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+    labels: &crate::common::fx_hash::FxHashSet<String>,
+) -> Option<Result<bool, String>> {
+    let rest = conditional_head_arg(trimmed)?;
+    let head_dir = trimmed.split(|c: char| c.is_ascii_whitespace()).next()?; // directive token itself
+
+    // `.ifdef symbol` / `.ifndef symbol` / `.ifnotdef symbol`: the argument
+    // must be a valid GAS identifier; the condition is set-membership in
+    // the `.set`/assignment namespace (labels are parsed later, so a
+    // forward reference is "not defined" exactly as GAS's sequential
+    // parser sees it).
+    if head_dir == ".ifdef" || head_dir == ".ifndef" || head_dir == ".ifnotdef" {
+        let bad = format!("invalid identifier for \"{head_dir}\"");
+        let sym = rest.trim();
+        if !is_valid_gas_identifier(sym) {
+            return Some(Err(bad));
+        }
+        // GAS sequential semantics: a label counts as defined only if it
+        // has already been seen on this walk (forward refs are undefined).
+        let defined = symbols.contains_key(sym) || labels.contains(sym);
+        return Some(Ok(match head_dir {
+            ".ifdef" => defined,
+            _ => !defined,
+        }));
+    }
+
+    // `.ifeqs "a", "b"` / `.ifnes "a", "b"`: strict string comparison. GAS
+    // demands quoted strings on both sides of a comma (missing comma →
+    // `<directive> syntax error`, unquoted operand → `missing string`).
+    if head_dir == ".ifeqs" || head_dir == ".ifnes" {
+        let negate = head_dir == ".ifnes";
+        let (a, b) = match parse_ifeqs_strings(rest, head_dir) {
+            Ok(pair) => pair,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(if negate { a != b } else { a == b }));
+    }
+
+    // Numeric comparison family: `.ifeq`/`.ifne`/`.iflt`/`.ifle`/
+    // `.ifgt`/`.ifge` are `.if (expr CMP 0)` in GAS. All share the
+    // non-constant-expression gate; note GAS names ".if" in that
+    // diagnostic even for `.ifeq` (one shared evaluator), while `.elseif`
+    // names itself.
+    if let Some(cmp) = numeric_family(head_dir) {
+        return Some(eval_numeric_head(rest, symbols, cmp));
+    }
+
+    // `.ifb`/`.ifnb`: argument blankness (after macro substitution, which
+    // already happened upstream).
+    if head_dir == ".ifb" {
+        return Some(Ok(eval_ifb(rest)));
+    }
+    if head_dir == ".ifnb" {
+        return Some(Ok(!eval_ifb(rest)));
+    }
+
+    // `.ifc`/`.ifnc`: case-sensitive string equality (unquoted operands,
+    // comma-separated).
+    if head_dir == ".ifc" {
+        return Some(Ok(eval_ifc(rest)));
+    }
+    if head_dir == ".ifnc" {
+        return Some(Ok(!eval_ifc(rest)));
+    }
+
+    // `.if expr` / `.if(expr)` — the plain expression head.
+    Some(eval_if_expr_strict(rest, symbols, ".if"))
+}
+
+/// The numeric comparison family, as a compare-with-zero code:
+/// 0=`==`, 1=`!=`, 2=`<`, 3=`<=`, 4=`>`, 5=`>=`.
+fn numeric_family(head_dir: &str) -> Option<u8> {
+    match head_dir {
+        ".ifeq" => Some(0),
+        ".ifne" => Some(1),
+        ".iflt" => Some(2),
+        ".ifle" => Some(3),
+        ".ifgt" => Some(4),
+        ".ifge" => Some(5),
+        _ => None,
+    }
+}
+
+/// Evaluate a `.ifeq`-family head: strictly resolve the expression to an
+/// assembly-time constant and compare it against zero.
+fn eval_numeric_head(
+    rest: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+    cmp: u8,
+) -> Result<bool, String> {
+    let resolved = resolve_set_expr(rest, symbols);
+    reject_non_constant(&resolved, ".if")?;
+    let value = asm_expr::parse_integer_expr(&resolved)
+        .map_err(|_| "non-constant expression in \".if\" statement".to_string())?;
+    Ok(match cmp {
+        0 => value == 0,
+        1 => value != 0,
+        2 => value < 0,
+        3 => value <= 0,
+        4 => value > 0,
+        5 => value >= 0,
+        _ => unreachable!("numeric_family only yields 0..=5"),
+    })
+}
+
+/// Parse `.ifeqs`/`.ifnes` arguments: two quoted strings separated by a
+/// comma. Diagnostics reproduce GAS 2.47: a missing comma is
+/// `<directive> syntax error`; an unquoted operand is `missing string`.
+fn parse_ifeqs_strings(rest: &str, directive: &str) -> Result<(String, String), String> {
+    let comma = rest
+        .find(',')
+        .ok_or_else(|| format!("{directive} syntax error"))?;
+    let unquote = |s: &str| -> Result<String, String> {
+        let t = s.trim();
+        if !(t.starts_with('"') && t.ends_with('"') && t.len() >= 2) {
+            return Err("missing string".to_string());
+        }
+        Ok(t[1..t.len() - 1].to_string())
+    };
+    Ok((unquote(&rest[..comma])?, unquote(&rest[comma + 1..])?))
+}
+
+/// Is `s` a valid GAS identifier for `.ifdef` and friends? GAS's
+/// `invalid identifier for ".ifdef"` covers the empty argument, numbers,
+/// register spellings and every other non-`[A-Za-z_.$][A-Za-z0-9_.$]*`
+/// token.
+fn is_valid_gas_identifier(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    match bytes.first() {
+        Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c == b'.' || *c == b'$' => {}
+        _ => return false,
+    }
+    bytes[1..]
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$'))
+}
+
+/// Evaluate a `.if` expression for the x86 assembler.
+///
+/// Resolves `.set` symbols and x86 register names (%rsp, %rbp, etc.) before
+/// evaluating the expression. Supports `==`, `!=`, `>=`, `<=`, `>`, `<`
+/// comparison operators and full arithmetic.
+fn eval_if_expr(expr: &str, symbols: &crate::common::fx_hash::FxHashMap<String, i64>) -> bool {
+    let resolved = resolve_set_expr(expr, symbols);
+    asm_preprocess::eval_if_condition_with_resolver(&resolved, |s| {
+        asm_preprocess::resolve_x86_registers(s)
+    })
+}
+
+/// Strictly evaluate a `.if`-family expression, rejecting the inputs GAS
+/// rejects: after `.set` substitution, any remaining bare identifier that
+/// is neither a register spelling nor a number makes the expression
+/// non-constant. The existing [`eval_if_expr`] tolerates those (they
+/// silently read as 0 / MIN / MAX inside the boolean evaluator), which is
+/// the right behavior for the permissive internal uses but a silent
+/// mis-branching hazard for user-facing conditional heads.
+fn eval_if_expr_strict(
+    expr: &str,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+    directive: &str,
+) -> Result<bool, String> {
+    let resolved = resolve_set_expr(expr, symbols);
+    reject_non_constant(&resolved, directive)?;
+    Ok(eval_if_expr(expr, symbols))
+}
+
+/// Reject expressions containing identifiers that cannot be assembly-time
+/// constants. Scans the `.set`-resolved text for identifier-shaped runs
+/// and requires each to be a register spelling (which the boolean
+/// evaluator resolves per-operand). Numbers — decimal, hex (`0x…`),
+/// octal, binary, and char/character-style quoted tokens — never qualify.
+fn reject_non_constant(expr: &str, directive: &str) -> Result<(), String> {
+    let bytes = expr.as_bytes();
+    let mut k = 0;
+    while k < bytes.len() {
+        let c = bytes[k];
+        if c == b'"' || c == b'\'' {
+            // Quoted string/char literal: no identifiers inside count.
+            k += 1;
+            while k < bytes.len() && bytes[k] != c {
+                k += 1;
+            }
+            k += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            // Number token (incl. 0x1F / 0b1010 / 0777 / trailing h/f
+            // hex spellings): swallow the whole alphanumeric run.
+            while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                k += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c == b'%' {
+            let start = k;
+            // `%` is a register PREFIX, not an identifier body character: it
+            // must be consumed before the name run or the run is empty. That
+            // exactly inverted the register exemption below — every `%reg`
+            // scanned as the empty identifier, which is neither `%`-prefixed
+            // nor a resolvable spelling, so `reject_non_constant` rejected
+            // every register comparison in a `.if` and the kernel's
+            // UNWIND_HINT_REGS dispatch (`.if \base == %rsp` …) could not be
+            // assembled at all (`entry_64.S` died with "non-constant
+            // expression in \".if\" statement").
+            if c == b'%' {
+                k += 1;
+            }
+            while k < bytes.len()
+                && (bytes[k].is_ascii_alphanumeric() || matches!(bytes[k], b'_' | b'$' | b'@'))
+            {
+                k += 1;
+            }
+            let ident = &expr[start..k];
+            // Register spellings (with or without %) are resolved by the
+            // boolean evaluator; GAS's register names are not assembly-time
+            // constants either, but the long-standing resolver contract
+            // here maps them to numbers and kernel code relies on it.
+            if ident.starts_with('%') || asm_preprocess::resolve_x86_registers(ident) != ident {
+                continue;
+            }
+            return Err(format!(
+                "non-constant expression in \"{directive}\" statement"
+            ));
+        }
+        // `.L`-style local symbols and any other leading-`.` token are
+        // identifiers too (GAS rejects an undefined `.Lsym` in `.if` the
+        // same way); a directive-shaped token inside an expression is
+        // equally non-constant.
+        if c == b'.' {
+            return Err(format!(
+                "non-constant expression in \"{directive}\" statement"
+            ));
+        }
+        k += 1;
+    }
+    Ok(())
+}
+
+/// Collect the branches of a conditional block whose head sits at
+/// `lines[*i]`.
+///
+/// One mechanism for the whole family: a chain of `(condition, lines)`
+/// pairs ending with an optional `.else`, nested `.if*`/`.endif` tracked
+/// by depth. `.elseif` is evaluated LAZILY, exactly like GAS: once a
+/// branch has matched, the remaining `.elseif` conditions are skipped
+/// without being evaluated — an undefined symbol inside a dead `.elseif`
+/// is not an error, while the same token in a live one is. `*i` is left
+/// ON the `.endif`; the caller advances past it. Diagnostics reproduce
+/// GAS 2.47: `duplicate ".else"` and `end of file inside conditional`.
+fn collect_conditional_branches(
+    lines: &[String],
+    i: &mut usize,
+    head_cond: bool,
+    symbols: &crate::common::fx_hash::FxHashMap<String, i64>,
+) -> Result<Vec<(bool, Vec<String>)>, String> {
+    let mut branches: Vec<(bool, Vec<String>)> = vec![(head_cond, Vec::new())];
+    let mut any_true = head_cond;
+    let mut saw_else = false;
+    let mut current_idx = 0;
+    let mut depth = 1;
+    *i += 1;
+    while *i < lines.len() {
+        let inner = strip_comment(&lines[*i]).trim().to_string();
+        if is_if_start(&inner) {
+            depth += 1;
+            branches[current_idx].1.push(lines[*i].clone());
+        } else if inner == ".endif" {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+            branches[current_idx].1.push(lines[*i].clone());
+        } else if depth == 1 && directive_arg(&inner, ".elseif").is_some() {
+            let elseif_rest = directive_arg(&inner, ".elseif").unwrap_or("");
+            let elseif_cond = if any_true {
+                // Dead branch: GAS never evaluates it.
+                false
+            } else {
+                eval_if_expr_strict(elseif_rest, symbols, ".elseif")?
+            };
+            any_true |= elseif_cond;
+            branches.push((elseif_cond, Vec::new()));
+            current_idx += 1;
+        } else if inner == ".else" && depth == 1 {
+            if saw_else {
+                return Err("duplicate \".else\"".to_string());
+            }
+            saw_else = true;
+            // .else is the fallback: taken only when nothing matched.
+            branches.push((!any_true, Vec::new()));
+            any_true = true;
+            current_idx += 1;
+        } else {
+            branches[current_idx].1.push(lines[*i].clone());
+        }
+        *i += 1;
+    }
+    if depth != 0 {
+        return Err("end of file inside conditional".to_string());
+    }
+    Ok(branches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ExpansionBudget` must stay a *delegation*, not a second accounting.
+    ///
+    /// The end-to-end `.rept`/`.irp` ceiling tests in this module would also
+    /// pass if x86 kept a private copy of the limits -- which is the drift the
+    /// shared type exists to prevent, and the drift a future edit can
+    /// reintroduce.  So the boundary is pinned directly.  It is also cheap by
+    /// design: the two counters *are* the state that decides, so a budget can be
+    /// pre-loaded one line below a ceiling instead of materialising four million
+    /// `String`s (~200 MB) to assert arithmetic that needs one.
+    #[test]
+    fn x86_expansion_budget_delegates_to_the_shared_totals() {
+        use crate::backend::asm_preprocess::{
+            ExpansionTotals, MAX_EXPANSION_LINES, MAX_EXPANSION_TEXT,
+        };
+        let one = vec![String::from("x")]; // 1 line, len+1 = 2 bytes
+
+        // Both ceilings are `>` comparisons, so the last permitted charge and
+        // the first refused one are both worth pinning: a `>=` slip here would
+        // refuse 4 Mi expanded lines that assemble today.
+        let at_ceiling = MAX_EXPANSION_LINES as u64 - 1;
+        let mut shared = ExpansionTotals {
+            lines: at_ceiling,
+            bytes: 0,
+        };
+        let mut mine = ExpansionBudget {
+            totals: ExpansionTotals {
+                lines: at_ceiling,
+                bytes: 0,
+            },
+            depth: 7, // the frame counter is x86's own; the ceilings are not
+        };
+        let last_ok_s = shared.charge(".macro", &one);
+        let last_ok_m = mine.charge(&one, ".macro");
+        assert!(
+            last_ok_s.is_ok() && last_ok_m.is_ok(),
+            "the ceiling must permit exactly MAX_EXPANSION_LINES: {last_ok_s:?} / {last_ok_m:?}"
+        );
+        assert_eq!(
+            (mine.totals.lines, mine.totals.bytes),
+            (shared.lines, shared.bytes),
+            "the delegated charge kept a second, diverging tally"
+        );
+        assert_eq!((mine.totals.lines, mine.totals.bytes), (at_ceiling + 1, 2));
+        assert_eq!(mine.depth, 7, "charge must not touch the frame counter");
+
+        // One line more, and both sides refuse with the same words.
+        let s = shared.charge(".macro", &one);
+        let m = mine.charge(&one, ".macro");
+        assert!(
+            s.is_err() && m.is_err(),
+            "the line ceiling did not fire past its boundary"
+        );
+        assert_eq!(
+            s.err().unwrap(),
+            m.err().unwrap(),
+            "x86 grew its own wording: a reader of the error is told a different rule"
+        );
+
+        // Text ceiling, walked the same way.  The byte check runs first inside
+        // `check_expansion_growth`, so a line count far below its ceiling must
+        // still yield the *byte* diagnostic: if the two limits were merged into
+        // one condition on the x86 side, this is what would catch it.
+        let at_text = MAX_EXPANSION_TEXT as u64 - 2;
+        let mut shared = ExpansionTotals {
+            lines: 0,
+            bytes: at_text,
+        };
+        let mut mine = ExpansionBudget {
+            totals: ExpansionTotals {
+                lines: 0,
+                bytes: at_text,
+            },
+            depth: 0,
+        };
+        assert!(shared.charge(".rept", &one).is_ok());
+        assert!(mine.charge(&one, ".rept").is_ok());
+        let s = shared.charge(".rept", &one);
+        let m = mine.charge(&one, ".rept");
+        assert!(
+            s.as_ref().err().unwrap().contains("byte limit")
+                && m.as_ref().err().unwrap().contains("byte limit"),
+            "shared={s:?} x86={m:?}"
+        );
+        assert_eq!(s.err(), m.err());
+        assert_eq!(
+            mine.totals.lines, 2,
+            "lines must still be counted under a byte refusal, or a later verdict              would be made from an under-charged tally"
+        );
+
+        // A fresh budget is empty: the ceiling is per expansion run, so the
+        // struct must not be sharing a static tally across invocations.
+        let mut fresh = ExpansionBudget::new();
+        assert_eq!(
+            (fresh.totals.lines, fresh.totals.bytes, fresh.depth),
+            (0, 0, 0)
+        );
+        fresh.charge(&one, ".macro").expect("trivial charge");
+        assert_eq!((fresh.totals.lines, fresh.totals.bytes), (1, 2));
+    }
+
+    #[test]
+    fn gas247_rept_budget_law_x86() {
+        let ok = |src: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            expand_rept_blocks(&lines)
+        };
+        let out = ok(".rept 2\n.byte 0\n.endr").unwrap();
+        assert_eq!(out, vec![".byte 0".to_string(), ".byte 0".to_string()]);
+        assert!(ok(".rept 0\n.byte 0\n.endr").unwrap().is_empty());
+        // GAS size_t cast on a negative count, GAS wording (PR768 M2:
+        // this path used to wrap to u64::MAX and exhaust memory).
+        let err = ok(".rept -1\n.byte 0\n.endr").unwrap_err();
+        assert!(
+            err.contains("excessive count 18446744073709551615 for REPT - ignored"),
+            "got: {err}"
+        );
+        let err = ok(".rept 1099511627776\n.byte 0\n.endr").unwrap_err();
+        assert!(
+            err.contains("excessive count 1099511627776 for REPT - ignored"),
+            "got: {err}"
+        );
+        // Growth line ceiling fires for counts inside the GAS budget.
+        let err = ok(".rept 5000000\n.byte 0\n.endr").unwrap_err();
+        assert!(err.contains("line limit"), "got: {err}");
+    }
+
+    /// GAS 2.47's macro-nesting wall on the pinned oracle: a 101-frame
+    /// chain of distinct macros assembles, the 102nd frame fatals with
+    /// `macros nested too deeply`, and direct/mutual recursion land on
+    /// the same wall.  Every one of these used to die as a native stack
+    /// overflow (SIGABRT) — a crash is never a verdict.
+    #[test]
+    fn gas247_macro_nesting_wall_x86() {
+        let run = |src: &str| {
+            let lines: Vec<String> = src.lines().map(str::to_string).collect();
+            expand_gas_macros(&lines)
+        };
+        let err = run(".macro m\n m\n.endm\n m\n").unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+        let err = run(".macro a\n b\n.endm\n.macro b\n a\n.endm\n a\n").unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+        let chain = |n: usize| {
+            let mut s = String::from(".data\n");
+            for i in 0..n {
+                let nxt = if i + 1 < n {
+                    format!("m{}", i + 1)
+                } else {
+                    ".byte 7".into()
+                };
+                s.push_str(&format!(".macro m{i}\n{nxt}\n.endm\n"));
+            }
+            s.push_str("m0\n");
+            s
+        };
+        run(&chain(101)).expect("101 frames assemble on GAS 2.47");
+        let err = run(&chain(102)).unwrap_err();
+        assert!(err.contains("macros nested too deeply"), "got: {err}");
+        // Sequential top-level invocations release their frame: any
+        // number assembles (GAS parity; depth must not accumulate).
+        let mut seq = String::from(".macro n\n.byte 7\n.endm\n");
+        for _ in 0..500 {
+            seq.push_str("n\n");
+        }
+        run(&seq).expect("sequential invocations never nest");
+    }
+
+    /// `.irp`/`.irpc` amplify `items x body` out of a linear input, and
+    /// the x86 expander materialized every line before anything could
+    /// object — a 41 KiB input ran until the harness killed it.  The
+    /// shared expansion ceilings must fire (deterministic Err, same
+    /// stand-in law as MAX_DIRECTIVE_FILL) while ordinary expansions
+    /// stay byte-exact.
+    #[test]
+    fn gas247_irp_expansion_ceiling_x86() {
+        let run = |src: &str| {
+            let lines: Vec<String> = src.lines().map(str::to_string).collect();
+            expand_gas_macros(&lines)
+        };
+        // Small expansion: three items x one body line, exact output.
+        let out = run(".data\n.irp v,1,2,3\n.byte \\v\n.endr\n").unwrap();
+        assert_eq!(
+            out,
+            vec![
+                ".data".to_string(),
+                ".byte 1".to_string(),
+                ".byte 2".to_string(),
+                ".byte 3".to_string()
+            ]
+        );
+        // 11000 items x 400 body lines = 4.4M lines > 4194304: the
+        // charge fires between blocks, before the full product exists.
+        let mut big = String::from(".irp v,0");
+        big.push_str(",0".repeat(10999).as_str());
+        big.push('\n');
+        for _ in 0..400 {
+            big.push_str(".byte 0\n");
+        }
+        big.push_str(".endr\n");
+        let err = run(&big).unwrap_err();
+        assert!(err.contains("line limit"), "got: {err}");
+    }
+
+    /// `sym@MOD+N` must keep the relocation modifier AND carry N as an
+    /// addend.  Parsing it as a plain `symbol+offset` names the symbol
+    /// `sym@MOD` and degrades the access to an absolute `R_X86_64_32S`
+    /// relocation — a silently wrong TLS/GOT address, not a loud error.
+    #[test]
+    fn test_symbol_modifier_with_addend_keeps_the_relocation() {
+        for (text, sym, modifier, addend) in [
+            ("a@TPOFF+8", "a", "TPOFF", 8),
+            ("a@tpoff+8", "a", "tpoff", 8),
+            ("a@TPOFF-8", "a", "TPOFF", -8),
+            ("g_tls@GOTTPOFF+16", "g_tls", "GOTTPOFF", 16),
+            ("g@GOTPCREL+4", "g", "GOTPCREL", 4),
+            ("v@VER@TPOFF+24", "v@VER", "TPOFF", 24),
+        ] {
+            let disp = parse_displacement(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            match disp {
+                Displacement::SymbolModAddend(s, m, a) => {
+                    assert_eq!(s, sym, "{text}: symbol");
+                    assert_eq!(m, modifier, "{text}: modifier");
+                    assert_eq!(a, addend, "{text}: addend");
+                }
+                other => panic!("{text}: parsed as {other:?}, expected SymbolModAddend"),
+            }
+        }
+        // The bare form stays a plain SymbolMod (no addend variant invented).
+        assert!(matches!(
+            parse_displacement("a@TPOFF"),
+            Ok(Displacement::SymbolMod(_, _))
+        ));
+        // A NON-relocation suffix is not a modifier: the string stays one
+        // opaque symbol name (GAS behaviour for a versioned/unknown `@tail`),
+        // so no addend is split off and no relocation is invented.
+        assert!(matches!(
+            parse_displacement("my@label+8"),
+            Ok(Displacement::Symbol(_))
+        ));
+    }
+
+    /// The same shape in a full memory operand: `%fs:a@TPOFF+8` is the
+    /// Local-Exec TLS form this parser has to support for direct accesses.
+    #[test]
+    fn test_segment_symbol_modifier_addend_memory_operand() {
+        let op = parse_memory_operand("%fs:a@TPOFF+8").expect("parse %fs:a@TPOFF+8");
+        match op {
+            Operand::Memory(mem) => {
+                assert_eq!(mem.segment.as_deref(), Some("fs"));
+                match mem.displacement {
+                    Displacement::SymbolModAddend(s, m, a) => {
+                        assert_eq!((s.as_str(), m.as_str(), a), ("a", "TPOFF", 8));
+                    }
+                    other => panic!("displacement parsed as {other:?}"),
+                }
+            }
+            other => panic!("operand parsed as {other:?}"),
+        }
+    }
+
+    /// `disp(base)+k` must be rejected like GAS ("junk after expression"),
+    /// never silently truncated to `disp(base)`: the truncation previously
+    /// mis-assembled `movl %edx, 128(%esp)+8` as a store to `128(%esp)`.
+    #[test]
+    fn test_memory_operand_trailing_junk_is_rejected() {
+        for bad in [
+            "128(%esp)+8",
+            "8(%esp)+4",
+            "sym(%eax)+4",
+            "8(%ebx,%ecx,4)+2",
+        ] {
+            assert!(parse_memory_operand(bad).is_err(), "must reject: {bad}");
+        }
+
+        // The legal forms still parse, with the offset INSIDE the
+        // displacement: `sym+4(%esp)` is a symbol-addend displacement.
+        let mem = match parse_memory_operand("8(%esp)").expect("plain disp+base") {
+            Operand::Memory(m) => m,
+            other => panic!("expected memory operand, got {other:?}"),
+        };
+        assert!(matches!(mem.displacement, Displacement::Integer(8)));
+        assert_eq!(mem.base, Some(Register::new("esp")));
+        // `sym+4(%esp)` keeps the symbol-addend expression in the
+        // displacement slot; the exact Displacement variant is the
+        // resolver's business, so only require a successful parse.
+        assert!(parse_memory_operand("sym+4(%esp)").is_ok());
+    }
+
+    /// Bare label operands stay context-neutral until instruction dispatch,
+    /// but their relocation addends must use the exact same grammar as a
+    /// parenthesized memory displacement.
+    #[test]
+    fn test_split_relocation_symbol_addend() {
+        assert_eq!(split_relocation_symbol_addend("ext+9"), Some(("ext", 9)));
+        assert_eq!(
+            split_relocation_symbol_addend(" ext - 7 "),
+            Some(("ext", -7))
+        );
+        assert_eq!(split_relocation_symbol_addend("4+ext"), Some(("ext", 4)));
+        assert_eq!(
+            split_relocation_symbol_addend(".Ltarget+1"),
+            Some((".Ltarget", 1))
+        );
+        assert_eq!(split_relocation_symbol_addend("plain"), None);
+        assert_eq!(split_relocation_symbol_addend("sym-other"), None);
+    }
+
+    /// GAS `\@` must be substituted with a DISTINCT value per macro
+    /// expansion (kernel ANNOTATE emits `.Lhere_\@:` once per use; a shared
+    /// value collapses every annotation onto one label).
+    #[test]
+    fn test_macro_at_counter_distinct_per_invocation() {
+        let lines: Vec<String> = vec![
+            ".macro ANN".into(),
+            ".Lhere_\\@:".into(),
+            ".long .Lhere_\\@ - .".into(),
+            ".endm".into(),
+            "ANN".into(),
+            "ANN".into(),
+            "ANN".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let labels: Vec<&String> = out
+            .iter()
+            .filter(|l| l.trim_end().ends_with(':') && l.contains(".Lhere_"))
+            .collect();
+        assert_eq!(
+            labels.len(),
+            3,
+            "three expansions, three label defs: {:?}",
+            out
+        );
+        // All three labels must be pairwise distinct.
+        assert_ne!(labels[0], labels[1]);
+        assert_ne!(labels[1], labels[2]);
+        assert_ne!(labels[0], labels[2]);
+        // No `\@` may survive expansion.
+        assert!(
+            out.iter().all(|l| !l.contains("\\@")),
+            "unsubstituted \\@: {:?}",
+            out
+        );
+        // Each reference must use ITS invocation's label.
+        for (def, reference) in labels
+            .iter()
+            .zip(out.iter().filter(|l| l.contains(".long .Lhere_")))
+        {
+            let def_name = def.trim().trim_end_matches(':');
+            assert!(
+                reference.contains(def_name),
+                "reference {:?} does not match definition {:?}",
+                reference,
+                def
+            );
+        }
+    }
+
+    /// .macro parameter defaults containing parens/spaces/commas must
+    /// survive as ONE value (kernel FILL_RETURN_BUFFER's
+    /// `ftr2=(((1 << 0) << 16) | (( 3*32+21)))`), and `:req` qualifiers
+    /// must not become part of the parameter name.
+    #[test]
+    fn test_macro_paren_default_and_req_qualifier() {
+        let lines: Vec<String> = vec![
+            ".macro FRB reg:req nr:req ftr2=(((1 << 0) << 16) | (( 3*32+21)))".into(),
+            "mov $\\nr, \\reg".into(),
+            ".long \\ftr2".into(),
+            ".endm".into(),
+            "FRB %rax, 32".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("mov $32, %rax"),
+            ":req parameter did not bind: {:?}",
+            out
+        );
+        assert!(
+            joined.contains(".long (((1 << 0) << 16) | (( 3*32+21)))"),
+            "parenthesized default was shredded: {:?}",
+            out
+        );
+    }
+
+    /// A directive is never a macro invocation: a macro named `type` must
+    /// not capture `.type` lines (kernel objtool.h defines such macros; a
+    /// capture rewrote `.type f STT_FUNC` into garbage and left the symbol
+    /// STT_NOTYPE).
+    #[test]
+    fn test_directive_not_captured_by_same_name_macro() {
+        let lines: Vec<String> = vec![
+            ".macro type arg".into(),
+            ".long \\arg".into(),
+            ".endm".into(),
+            ".type myfn, @function".into(),
+            "type 7".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(
+            joined.contains(".type myfn, @function"),
+            ".type directive was rewritten: {:?}",
+            out
+        );
+        assert!(
+            joined.contains(".long 7"),
+            "bare `type` invocation must still expand: {:?}",
+            out
+        );
+    }
+
+    /// `.set alias, %reg` register aliases substitute into operands with
+    /// word-boundary matching, including transitive chains
+    /// (crc-pclmul-template.S: CONSTS -> V7 -> %xmm7). Resolution is
+    /// eager: redefining the middle link later must not change earlier
+    /// snapshots.
+    #[test]
+    fn test_set_register_alias_transitive_and_eager() {
+        let lines: Vec<String> = vec![
+            ".set V7, %xmm7".into(),
+            ".set CONSTS, V7".into(),
+            "movdqa -32(%rcx), CONSTS".into(),
+            ".set V7, %xmm2".into(),
+            "movdqa (%rdx), V7".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(
+            joined.contains("movdqa -32(%rcx), %xmm7"),
+            "transitive alias failed: {:?}",
+            out
+        );
+        assert!(
+            joined.contains("movdqa (%rdx), %xmm2"),
+            "redefinition not honored for later uses: {:?}",
+            out
+        );
+        assert!(!joined.contains("CONSTS"), "alias leaked: {:?}", out);
+    }
+
+    /// `.set` numeric symbols must never rewrite a DIRECTIVE mnemonic:
+    /// after `.set type, 3`, the directive `.type` must stay `.type`
+    /// (unwind_hints.h does exactly this and 26 kernel symbols went
+    /// STT_NOTYPE when `.type` became `.3`).
+    #[test]
+    fn test_set_symbol_does_not_rewrite_directives() {
+        let lines: Vec<String> = vec![
+            ".set type, 3".into(),
+            ".long type".into(),
+            ".type f, @function".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        let joined = out.join("\n");
+        assert!(
+            joined.contains(".long 3"),
+            ".set value not applied: {:?}",
+            out
+        );
+        assert!(
+            joined.contains(".type f, @function"),
+            ".type directive corrupted: {:?}",
+            out
+        );
+    }
+
+    /// The directive-mnemonic guard must NOT swallow `.L` local symbols:
+    /// the .set VALUE expression arrives as a bare token (`.Lfound+1`, no
+    /// whitespace), and treating it as a "mnemonic" skipped substitution
+    /// entirely. `.set .Lfound, .Lfound+1` then silently kept the old
+    /// value, and the kernel's extable_type_reg register scan
+    /// (.irp + .ifc incrementing .Lfound) failed on EVERY uaccess object
+    /// with "extable_type_reg: bad register argument".
+    #[test]
+    fn test_set_local_symbol_increment_and_ifc_counting() {
+        // Direct increment.
+        let lines: Vec<String> = vec![
+            ".set .Lfound, 0".into(),
+            ".set .Lfound, .Lfound+1".into(),
+            ".long .Lfound".into(),
+        ];
+        let out = expand_gas_macros(&lines).unwrap();
+        assert!(
+            out.join("\n").contains(".long 1"),
+            ".Lfound increment lost: {:?}",
+            out
+        );
+
+        // The full kernel shape: .irp register scan with .ifc counting.
+        let lines2: Vec<String> = vec![
+            ".macro tm reg:req".into(),
+            ".set .Lfound, 0".into(),
+            ".irp rs,rax,rcx,rdi".into(),
+            ".ifc \\reg, %\\rs".into(),
+            ".set .Lfound, .Lfound+1".into(),
+            ".endif".into(),
+            ".endr".into(),
+            ".if (.Lfound != 1)".into(),
+            ".error \"bad reg\"".into(),
+            ".endif".into(),
+            ".endm".into(),
+            "tm reg=%rdi".into(),
+        ];
+        let out2 = expand_gas_macros(&lines2);
+        assert!(out2.is_ok(), "extable_type_reg shape failed: {:?}", out2);
+    }
+
+    /// Session-85 (Agent-Z audit, hunk #7): the static_call trampoline shape
+    /// `.long func - (. + 4)` must parse to SymbolDiffAddend(func, ".", -4).
+    /// Before the fix the naive ` - ` split grabbed the parenthesized RHS,
+    /// the rfind probes failed on `(."`, and the fall-through emitted a bogus
+    /// SymbolDiff against the literal string ". + 4" — resolved as a SILENT
+    /// ZERO with no relocation (GAS: R_X86_64_PC32 func-4).
+    #[test]
+    fn test_static_call_parenthesized_dot_addend() {
+        let vals = parse_data_values("target_fn - (. + 4)").unwrap();
+        assert_eq!(vals.len(), 1, "expected a single data value: {:?}", vals);
+        match &vals[0] {
+            DataValue::SymbolDiffAddend(a, b, add) => {
+                assert_eq!(a, "target_fn");
+                assert_eq!(b, ".");
+                assert_eq!(*add, -4);
+            }
+            other => panic!("func - (. + 4) misparsed: {:?}", other),
+        }
+        // The LHS may carry its own addend (JUMP_TABLE_ENTRY chains):
+        // `sym+8 - (. + 4)` == sym - . + 4.
+        let vals2 = parse_data_values("sym+8 - (. + 4)").unwrap();
+        match &vals2[0] {
+            DataValue::SymbolDiffAddend(a, b, add) => {
+                assert_eq!(a, "sym");
+                assert_eq!(b, ".");
+                assert_eq!(*add, 4);
+            }
+            other => panic!("sym+8 - (. + 4) misparsed: {:?}", other),
+        }
+    }
+
+    /// The paren-RHS probe must NOT steal unparenthesized trailing addends:
+    /// `760b - 770b + 5` is `(760b - 770b) + 5`, NOT `760b - (770b + 5)`.
+    /// Kernel alt_instr layout (kernel_altinstr_layout regression) depends on
+    /// the sign staying positive.
+    #[test]
+    fn test_diff_trailing_addend_sign_preserved() {
+        let vals = parse_data_values("760b - 770b + 5").unwrap();
+        match &vals[0] {
+            DataValue::SymbolDiffAddend(a, b, add) => {
+                assert_eq!(a, "760b");
+                assert_eq!(b, "770b");
+                assert_eq!(*add, 5);
+            }
+            other => panic!("760b - 770b + 5 misparsed: {:?}", other),
+        }
+    }
+
+    /// Spaceless label arithmetic in data directives (vdso32 sigreturn.S):
+    /// `label-N-.` and `a-b+N` must parse as symbol diffs with addends,
+    /// not fall through to "unsupported data expression".
+    #[test]
+    fn test_spaceless_label_diff_addend_forms() {
+        match parse_label_diff(".LSTART_sigreturn-1-.") {
+            Some(DataValue::SymbolDiffAddend(a, b, n)) => {
+                assert_eq!(a, ".LSTART_sigreturn");
+                assert_eq!(b, ".");
+                assert_eq!(n, -1);
+            }
+            other => panic!("label-N-. misparsed: {:?}", other),
+        }
+        match parse_label_diff(".LEND_sigreturn-.LSTART_sigreturn+1") {
+            Some(DataValue::SymbolDiffAddend(a, b, n)) => {
+                assert_eq!(a, ".LEND_sigreturn");
+                assert_eq!(b, ".LSTART_sigreturn");
+                assert_eq!(n, 1);
+            }
+            other => panic!("a-b+N misparsed: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hex_constant_is_not_symbol_difference_rhs() {
+        let operand = parse_immediate_operand("init_top_pgt - 0xffffffff80000000")
+            .expect("immediate expression should parse");
+        match operand {
+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, addend)) => {
+                assert_eq!(sym, "init_top_pgt");
+                assert_eq!(addend, 0x8000_0000);
+            }
+            other => panic!("hex constant was misparsed as a symbol difference: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_is_label_like_numeric_literal_boundaries() {
+        // Literals: rejected as labels, in every radix the evaluator accepts
+        // and with the C integer suffixes it strips.
+        for literal in [
+            "0",
+            "1",
+            "42",
+            "0644",
+            "00",
+            "0x1f",
+            "0X1F",
+            "0b1010",
+            "0xffffffff80000000",
+            "0xffffffffffffffff",
+            "9223372036854775807",
+            "18446744073709551615",
+            "0777777777777777777777",
+            "0x10u",
+            "12ul",
+            "0xffULL",
+            "0000000000000000000000005",
+        ] {
+            assert!(
+                !is_label_like(literal),
+                "{literal} is a numeric literal and must not be label-like"
+            );
+        }
+
+        // Charset-valid non-literals: still label-like.  GAS local-label
+        // references (`1f`/`2b`) and overflowing constants are the cases that
+        // a coarser "starts with a digit" rejection would break.
+        for symbol in [
+            "1f",
+            "1b",
+            "2f",
+            "09",                      // octal selection, then '9' is not an octal digit
+            "0x1g",                    // not a hex digit
+            "0x",                      // empty mantissa
+            "0b",                      // empty mantissa
+            "0abc",                    // leading zero but not octal digits
+            "1.5",                     // no floating point in integer expressions
+            "0xfffffffffffffffff",     // 17 hex digits: overflows u64
+            "18446744073709551616",    // u64::MAX + 1
+            "777777777777777777778",   // 21 digits, above the decimal width
+            "07777777777777777777777", // 22 significant octal digits
+            // 21 DECIMAL digits, so above u64::MAX: only the leading-zero
+            // spelling `0777777777777777777777` selects octal and fits i64.
+            "777777777777777777777",
+            "init_top_pgt",
+            "__START_KERNEL_map",
+            ".Lfoo",
+            "_bar9",
+        ] {
+            assert!(
+                is_label_like(symbol),
+                "{symbol} is not a numeric literal and must stay label-like"
+            );
+        }
+
+        // Anything outside the label charset is never label-like, whether or
+        // not the evaluator could parse it.
+        for rejected in ["", "-5", "1+2", "(8)", " 5", "5 ", "1 << 5", "'A'"] {
+            assert!(
+                !is_label_like(rejected),
+                "{rejected:?} is outside the label charset"
+            );
+        }
+    }
+
+    /// The allocation-free literal recognizer must agree with the shared
+    /// evaluator on every input `is_label_like` can actually reach.  Exhaustive
+    /// over a charset that covers each decision the recognizer makes: radix
+    /// prefixes (case-insensitive), valid and invalid digits per radix, the
+    /// octal-vs-decimal selection on a leading zero, suffix stripping, and the
+    /// charset-only separators.
+    #[test]
+    fn test_bare_integer_literal_matches_shared_evaluator() {
+        const ALPHABET: &[u8] = b"01789xXbBfeulz._";
+        const MAX_LEN: usize = 4;
+        let mut buf = [0u8; MAX_LEN];
+        let mut checked = 0usize;
+        for len in 1..=MAX_LEN {
+            let radix = ALPHABET.len();
+            for n in 0..radix.pow(len as u32) {
+                let mut v = n;
+                for slot in buf[..len].iter_mut() {
+                    *slot = ALPHABET[v % radix];
+                    v /= radix;
+                }
+                let candidate = std::str::from_utf8(&buf[..len]).unwrap();
+                assert_eq!(
+                    asm_expr::bare_integer_literal(candidate.as_bytes()).is_some(),
+                    parse_integer_expr(candidate).is_ok(),
+                    "literal recognizer disagrees with the shared evaluator on {candidate:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 60_000, "corpus too small: {checked}");
+    }
+
+    /// Width boundaries, as a readable table: the widest value each radix
+    /// accepts and the first one it rejects.  The exhaustive equivalence corpus
+    /// below covers these too, but a table a human can read is what tells the
+    /// next person which boundary a change moved.
+    #[test]
+    fn test_width_boundaries_through_the_shared_grammar() {
+        let cases: &[(&str, bool)] = &[
+            ("0xffffffffffffffff", true),    // 16 hex digits = u64::MAX
+            ("0x10000000000000000", false),  // 17 hex digits
+            ("0x0000000000000000001", true), // leading zeros do not count
+            (
+                "0b111111111111111111111111111111111111111111111111111111111111111",
+                true,
+            ), // 63 bits
+            (
+                "0b1000000000000000000000000000000000000000000000000000000000000000",
+                false,
+            ), // 64 bits
+            ("0777777777777777777777", true), // i64::MAX in octal
+            ("01000000000000000000000", false), // 2^63 in octal
+            ("18446744073709551615", true),  // u64::MAX in decimal
+            ("18446744073709551616", false), // u64::MAX + 1
+            ("9223372036854775807", true),   // i64::MAX, via the u64 retry
+        ];
+        for (candidate, expected) in cases {
+            let recognized = asm_expr::bare_integer_literal(candidate.as_bytes()).is_some();
+            assert_eq!(recognized, *expected, "width boundary {candidate:?}");
+            assert_eq!(
+                recognized,
+                parse_integer_expr(candidate).is_ok(),
+                "evaluator parity on {candidate:?}"
+            );
+            // And the predicate that consumes it: a literal is never a label.
+            assert_eq!(
+                is_label_like(candidate),
+                !*expected,
+                "is_label_like on width boundary {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_simple() {
+        let asm = r#"
+.section .text
+.globl main
+.type main, @function
+main:
+.cfi_startproc
+    pushq %rbp
+    movq %rsp, %rbp
+    xorl %eax, %eax
+    popq %rbp
+    ret
+.cfi_endproc
+.size main, .-main
+"#;
+        let items = parse_asm(asm).unwrap();
+        // Should parse without errors
+        let labels: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, AsmItem::Label(_)))
+            .collect();
+        assert_eq!(labels.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_memory_operand() {
+        let mem = parse_memory_inner("-8(%rbp)").unwrap();
+        assert!(matches!(mem.displacement, Displacement::Integer(-8)));
+        assert_eq!(mem.base.as_ref().unwrap().name, "rbp");
+    }
+
+    #[test]
+    fn test_parse_rip_relative() {
+        let mem = parse_memory_inner("x(%rip)").unwrap();
+        assert!(matches!(mem.displacement, Displacement::Symbol(ref s) if s == "x"));
+        assert_eq!(mem.base.as_ref().unwrap().name, "rip");
+    }
+
+    #[test]
+    fn test_parse_integer() {
+        assert_eq!(parse_integer_expr("42").unwrap(), 42);
+        assert_eq!(parse_integer_expr("-1").unwrap(), -1);
+        assert_eq!(parse_integer_expr("0xff").unwrap(), 255);
+        assert_eq!(parse_integer_expr("0").unwrap(), 0);
+    }
+
+    /// The lccc-private tight-loop marker carries exactly one local label.
+    /// It must survive the parser verbatim (the ELF writer resolves it);
+    /// malformed forms are rejected rather than silently dropped.
+    #[test]
+    fn test_parse_tight_loop_marker() {
+        let items = parse_asm("\t.lccc_tight_loop\t.LBB3\n").unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, AsmItem::TightLoopAlign { header } if header == ".LBB3")),
+            "marker missing: {items:?}"
+        );
+        // Exactly one token, and it must be a well-formed local label.
+        assert!(parse_asm("\t.lccc_tight_loop\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop .LBB3 .LBB4\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop 16\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop .LBB3,\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop LBB3\n").is_err());
+        assert!(parse_asm("\t.lccc_tight_loop .LBB3\nnop\n").is_ok());
+    }
+    // ------------------------------------------------------------------
+    // Memory operand arity.  A SIB byte has exactly one base slot and one
+    // index slot; a fourth field has no encoding and MUST be rejected
+    // rather than ignored.  Silently dropping it turned a peephole that
+    // emitted `0(,%r11,4, %r10, 1)` into a wrong-code miscompile: the
+    // assembler produced `0(,%r11,4)`, so `q*4 + r == n` compiled to
+    // `q*4 == n` and the program still assembled, ran, and printed
+    // plausible numbers.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn memory_operand_rejects_a_fourth_field() {
+        let err = parse_memory_inner("0(,%r11,4, %r10, 1)")
+            .expect_err("two index registers must not be accepted");
+        assert!(
+            err.contains("comma-separated fields"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn memory_operand_rejects_two_index_registers_via_the_full_operand() {
+        // The exact text the fold used to emit, through the real entry point.
+        assert!(parse_memory_operand("0(,%r11,4, %r10, 1)").is_err());
+    }
+
+    #[test]
+    fn memory_operand_accepts_the_canonical_three_field_forms() {
+        // base, index, scale
+        assert!(parse_memory_inner("8(%rcx,%rbp,8)").is_ok());
+        // base, index (implicit scale 1)
+        assert!(parse_memory_inner("(%rcx,%rbp)").is_ok());
+        // index only
+        assert!(parse_memory_inner("0(,%r11,4)").is_ok());
+        // base only
+        assert!(parse_memory_inner("16(%rax)").is_ok());
+        // The composed form the fixed peephole emits: both addends survive.
+        let m = parse_memory_inner("(%r10, %r11, 4)").expect("composed form must parse");
+        assert!(m.index.is_some(), "scale-4 index must survive");
+        assert_eq!(m.scale, Some(4));
+        assert!(m.base.is_some(), "base must survive");
+    }
+
+    /// GNU as 2.47 operand semantics for the alignment directives:
+    /// max-skip <= 0 means UNLIMITED (the full pad is emitted), bare
+    /// byte-form directives default to align 1, exponents clamp to 63,
+    /// and the fill is truncated to its low byte.
+    #[test]
+    fn gas247_align_operand_semantics() {
+        for (src, want) in [
+            (".p2align 4,,0", None),
+            (".p2align 4,,-1", None),
+            (".p2align 4,,5", Some(5u64)),
+            (".p2align 4", None),
+            (".p2align 4,,", None),
+        ] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { max_skip, .. } => assert_eq!(
+                    max_skip, want,
+                    "{src}: max_skip must be {want:?} (GAS: <=0 is unlimited)"
+                ),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Bare byte-form directives are align-1 no-ops (GAS-accepted).
+        for src in [".balign", ".align"] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { align, .. } => assert_eq!(align, 1, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Bare `.p2align` still requires its exponent expression.
+        assert!(
+            parse_directive(".p2align").is_err(),
+            "bare .p2align is a GAS error"
+        );
+        // Exponent clamp family reaches the writer as 1<<63.
+        for src in [".p2align 63", ".p2align 64", ".p2align -1"] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Align { align, .. } => assert_eq!(align, 1u64 << 63, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // Fill truncation pin: -129 keeps only the low byte (0x7f).
+        match parse_directive(".p2align 4,-129").expect("fill parse") {
+            AsmItem::Align { fill, .. } => assert_eq!(fill, Some(0x7f)),
+            other => panic!("parsed as {other:?}"),
+        }
+        // Non-power-of-two byte counts are errors (GAS: "alignment not a power of 2").
+        assert!(parse_directive(".balign 3").is_err(), ".balign 3");
+        assert!(parse_directive(".balign -16").is_err(), ".balign -16");
+    }
+
+    /// `.zero` / `.fill` operand law: negatives emit nothing, the full
+    /// positive range survives (the old `as u32` truncated 2^32+4 to 4
+    /// bytes), overflowing repeat*size collapses to 0 bytes, and
+    /// over-limit requests are refused at parse time.
+    #[test]
+    fn gas247_zero_fill_operand_semantics() {
+        match parse_directive(".zero -1").expect(".zero -1 is a no-op") {
+            AsmItem::Zero(n) => assert_eq!(n, 0, ".zero -1 must emit nothing"),
+            other => panic!("parsed as {other:?}"),
+        }
+        match parse_directive(".zero 4294967300").expect(".zero 2^32+4") {
+            AsmItem::Zero(n) => assert_eq!(
+                n, 4294967300,
+                "the 32-bit truncation must be gone (old code produced 4)"
+            ),
+            other => panic!("parsed as {other:?}"),
+        }
+        for (src, want) in [
+            (".fill -1,1,5", 0usize),
+            (".fill 2,0,7", 0),
+            (".fill 1,9", 8),
+            (".fill 4611686018427387904,4", 0),
+        ] {
+            match parse_directive(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                AsmItem::Zero(n) => assert_eq!(n, want, "{src}"),
+                other => panic!("{src}: parsed as {other:?}"),
+            }
+        }
+        // No parse-time byte cap: nothing is materialised here, and the
+        // writer decides against the live section (PROGBITS refuses past
+        // the ceiling, NOBITS holds a size -- see
+        // `sparse_nobits_holds_zero_content_as_a_size`).
+        match parse_directive(".fill 268435457,1,1").expect(".fill past the ceiling parses") {
+            AsmItem::Fill { total, elem, value } => {
+                assert_eq!((total, elem, value), (268435457, 1, 1))
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+        // Out-of-i64-range literals take their two's-complement pattern
+        // (GAS 2.47: every count in 2^63..2^64-1 is negative -> zero bytes;
+        // 2^64 is an expression error).
+        match parse_directive(".fill 18446744073709551615,1,5") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0, "u64max repeat is -1"),
+            other => panic!(".fill u64max: {other:?}"),
+        }
+        match parse_directive(".zero 18446744073709551615") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0),
+            other => panic!(".zero u64max: {other:?}"),
+        }
+        match parse_directive(".zero 9223372036854775808") {
+            Ok(AsmItem::Zero(n)) => assert_eq!(n, 0),
+            other => panic!(".zero 2^63: {other:?}"),
+        }
+        // NOTE: `.fill` DEFERS an unvalued repeat to the writer (by design,
+        // for label-valued repeats), so the >u64::MAX rejection for
+        // `18446744073709551616` is asserted at assemble level in
+        // `gas247_fill_ceiling_refuses_before_alloc`.
+    }
+
+    #[test]
+    fn org_target_absolute_and_symbolic_forms() {
+        use super::parse_org_target;
+        assert_eq!(parse_org_target("8", ".org").unwrap(), (String::new(), 8));
+        assert_eq!(
+            parse_org_target("(2 * 4)", ".org").unwrap(),
+            (String::new(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base", ".org").unwrap(),
+            ("base".into(), 0)
+        );
+        assert_eq!(
+            parse_org_target("base + 8", ".org").unwrap(),
+            ("base".into(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base + (2 * 6)", ".org").unwrap(),
+            ("base".into(), 12)
+        );
+        assert_eq!(
+            parse_org_target("(base + 8)", ".org").unwrap(),
+            ("base".into(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base + 4 + 4", ".org").unwrap(),
+            ("base".into(), 8)
+        );
+        assert_eq!(
+            parse_org_target("base - 4", ".org").unwrap(),
+            ("base".into(), -4)
+        );
+        // Negation is arithmetic on the parsed addend, not a re-parse of a
+        // freshly allocated `-(...)` string: double negatives and the
+        // i64::MIN boundary must behave exactly as the expression parser.
+        assert_eq!(
+            parse_org_target("base - -4", ".org").unwrap(),
+            ("base".into(), 4)
+        );
+        assert_eq!(
+            parse_org_target("base - (2 * 3)", ".org").unwrap(),
+            ("base".into(), -6)
+        );
+        assert!(parse_org_target("base - -9223372036854775808", ".org").is_err());
+        assert_eq!(
+            parse_org_target("2b + 8", ".org").unwrap(),
+            ("2b".into(), 8)
+        );
+        assert_eq!(parse_org_target(". + 4", ".org").unwrap(), (".".into(), 4));
+        assert!(parse_org_target("-1", ".org").is_err());
+        assert!(parse_org_target("", ".org").is_err());
+        assert!(parse_org_target("(1 + 2", ".org").is_err());
+        assert!(parse_org_target("base * 2", ".org").is_err());
+        assert!(parse_org_target("base + other", ".org").is_err());
+    }
+
+    #[test]
+    fn dot_assignment_lowers_to_org_with_zero_fill() {
+        let items = parse_line_items(". = base + (2 * 6)").unwrap();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            AsmItem::Org(sym, off, fill) => {
+                assert_eq!(sym, "base");
+                assert_eq!(*off, 12);
+                assert_eq!(*fill, 0);
+            }
+            other => panic!("expected Org, got {other:?}"),
+        }
+        let items = parse_line_items("label: . = 8").unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], AsmItem::Label(_)));
+        assert!(matches!(items[1], AsmItem::Org(_, 8, 0)));
+    }
+
+    #[test]
+    fn dot_assignment_rejects_comparisons_and_malformed_input() {
+        for src in [
+            ". == 8",
+            ". = =8",
+            ". != 8",
+            ". <= 8",
+            ". >= 8",
+            ". = (1 + 2",
+        ] {
+            assert!(parse_line_items(src).is_err(), "accepted {src:?}");
+        }
+    }
+
+    #[test]
+    fn org_directive_shares_the_target_parser() {
+        match parse_directive(".org base + 8, 0x77").unwrap() {
+            AsmItem::Org(sym, off, fill) => {
+                assert_eq!(sym, "base");
+                assert_eq!(off, 8);
+                assert_eq!(fill, 0x77);
+            }
+            other => panic!("expected Org, got {other:?}"),
+        }
+        match parse_directive(".org . + 4").unwrap() {
+            AsmItem::Org(sym, off, fill) => {
+                assert_eq!(sym, ".");
+                assert_eq!(off, 4);
+                assert_eq!(fill, 0);
+            }
+            other => panic!("expected Org, got {other:?}"),
+        }
+        assert!(parse_directive(".org").is_err());
+        assert!(parse_directive(".org base * 2").is_err());
+    }
+}
+
+// ── tests: the integer grammar has exactly one implementation ────────────────
+
+#[cfg(test)]
+mod integer_grammar_equivalence_tests {
+    use super::is_label_like;
+    use crate::backend::asm_expr::{bare_integer_literal, parse_integer_expr};
+
+    /// `is_label_like` as it was defined BEFORE the literal test became a byte
+    /// scan: ask the full evaluator, then apply the charset test.  Slow and
+    /// obvious on purpose — it is the oracle, and it exercises the evaluator's
+    /// tokenizer fallback, char literals and sign handling as well.
+    fn original_is_label_like(s: &str) -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        if parse_integer_expr(s).is_ok() {
+            return false;
+        }
+        let first = s.as_bytes()[0];
+        if !(first.is_ascii_alphabetic()
+            || first == b'_'
+            || first == b'.'
+            || first.is_ascii_digit())
+        {
+            return false;
+        }
+        s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+    }
+
+    /// The evaluator's numeric branches as they were before the grammar was
+    /// shared, restated on the STANDARD LIBRARY's parsers: `from_str_radix` for
+    /// the prefixed radices, `parse` for decimal with its i64-then-u64 retry,
+    /// suffix stripping first and the sign handled by wrapping negation.  std is
+    /// the independent implementation here — nothing in this function calls the
+    /// code under test.
+    fn library_single_integer(s: &str) -> Option<i64> {
+        let bytes = s.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
+            end -= 1;
+        }
+        let s = &s[..end];
+        if s.is_empty() {
+            return None;
+        }
+        let (negative, s) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s),
+        };
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            let uval = u64::from_str_radix(hex, 16).ok()?;
+            return Some(if negative {
+                (uval as i64).wrapping_neg()
+            } else {
+                uval as i64
+            });
+        }
+        if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+            let val = i64::from_str_radix(bin, 2).ok()?;
+            return Some(if negative { val.wrapping_neg() } else { val });
+        }
+        if s.starts_with('0') && s.len() > 1 && s.chars().all(|c| c.is_ascii_digit()) {
+            let val = i64::from_str_radix(s, 8).ok()?;
+            return Some(if negative { val.wrapping_neg() } else { val });
+        }
+        if let Ok(val) = s.parse::<i64>() {
+            return Some(if negative { -val } else { val });
+        }
+        let uval = s.parse::<u64>().ok()?;
+        Some(if negative {
+            (uval as i64).wrapping_neg()
+        } else {
+            uval as i64
+        })
+    }
+
+    /// The same question through the shared recognizer, structured exactly as
+    /// `parse_single_integer` structures it: sign first, then the grammar.
+    fn shared_single_integer(s: &str) -> Option<i64> {
+        let bytes = s.as_bytes();
+        let (body, negative) = match bytes.first() {
+            Some(b'-') => (&bytes[1..], true),
+            _ => (bytes, false),
+        };
+        let value = bare_integer_literal(body)?;
+        Some(if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        })
+    }
+
+    /// Every string up to `max_len` over `alphabet`, shortest first.
+    fn exhaustive(alphabet: &[u8], max_len: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut frontier: Vec<String> = vec![String::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::with_capacity(frontier.len() * alphabet.len());
+            for prefix in &frontier {
+                for &b in alphabet {
+                    let mut s = prefix.clone();
+                    s.push(b as char);
+                    next.push(s);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    /// The bytes that decide the grammar: decimal digits incl. the two that are
+    /// invalid octal, both radix prefixes in both cases, every suffix letter,
+    /// the sign, the dot that the charset allows and the tokenizer does not,
+    /// hex letters that are not suffix letters, and the identifier underscore.
+    const ALPHABET: &[u8] = b"0189xXbBuUlLzZ+-.aAfF_";
+    /// A subset, for one more byte of length at a tolerable case count.
+    const ALPHABET_SMALL: &[u8] = b"0189xXuL+-.a";
+    /// The alphabet the recognizer's own decisions need at full length four:
+    /// both radix prefixes in both cases, every valid and invalid digit per
+    /// radix, the octal-vs-decimal selection on a leading zero, every suffix
+    /// letter, and the two charset-only separators.  16^4 = 65536 cases.
+    const ALPHABET_GRAMMAR: &[u8] = b"01789xXbBfeulz._";
+
+    fn boundary_literals() -> Vec<String> {
+        let mut out = Vec::new();
+        // Width boundaries of all four radices, as decimal/hex/octal/binary
+        // digit strings: bound-1, bound, bound+1.
+        let bounds: [(&str, [u128; 3]); 4] = [
+            (
+                "dec",
+                [u64::MAX as u128 - 1, u64::MAX as u128, u64::MAX as u128 + 1],
+            ),
+            (
+                "hex",
+                [u64::MAX as u128 - 1, u64::MAX as u128, u64::MAX as u128 + 1],
+            ),
+            (
+                "oct",
+                [i64::MAX as u128 - 1, i64::MAX as u128, i64::MAX as u128 + 1],
+            ),
+            (
+                "bin",
+                [i64::MAX as u128 - 1, i64::MAX as u128, i64::MAX as u128 + 1],
+            ),
+        ];
+        let suffixes = [
+            "", "u", "U", "l", "L", "z", "Z", "ul", "UL", "ull", "ULL", "llu", "zzzz",
+        ];
+        let signs = ["", "+", "-"];
+        for (radix, values) in bounds {
+            for value in values {
+                // i64::MAX + 1 as a signed decimal is out of i64 range but in
+                // u64 range: both spellings matter, so emit each value in every
+                // radix that can represent it.
+                let spellings: Vec<String> = match radix {
+                    "dec" => vec![format!("{value}")],
+                    "hex" => vec![format!("0x{value:x}"), format!("0X{value:X}")],
+                    "oct" => vec![format!("0{value:o}")],
+                    "bin" => vec![format!("0b{value:b}")],
+                    _ => unreachable!(),
+                };
+                for spelling in spellings {
+                    for suffix in suffixes {
+                        for sign in signs {
+                            // A sign in front of a radix prefix is not a
+                            // literal (the prefix match happens on the string
+                            // as given), but it IS a valid thing to feed the
+                            // predicate, so the corpus keeps it.
+                            out.push(format!("{sign}{spelling}{suffix}"));
+                        }
+                    }
+                }
+            }
+        }
+        // Shapes from real assembly: the kernel's symbol arithmetic, GAS local
+        // labels, and the glibc constant-expression suffix idiom.
+        out.extend([
+            "0xffffffff80000000".to_string(),
+            "0xffffffffffffffff".to_string(),
+            "9223372036854775807".to_string(),
+            "18446744073709551615".to_string(),
+            "0777777777777777777777".to_string(),
+            "0b111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            "__START_KERNEL_map".to_string(),
+            "init_top_pgt".to_string(),
+            ".LBB12".to_string(),
+            ".Ltmp0".to_string(),
+            "1U".to_string(),
+            "0x1fU".to_string(),
+            "09".to_string(),
+            "08".to_string(),
+            "00".to_string(),
+            "0".to_string(),
+            "+42".to_string(),
+            "-42".to_string(),
+            "+0x1f".to_string(),
+            "-0x1f".to_string(),
+            "1.2".to_string(),
+            "1_000".to_string(),
+            "1e5".to_string(),
+            "'A'".to_string(),
+            "'\\n'".to_string(),
+            "1<<4".to_string(),
+            "(1+2)".to_string(),
+        ]);
+        out
+    }
+
+    fn corpus() -> Vec<String> {
+        let mut out = exhaustive(ALPHABET, 3);
+        out.extend(exhaustive(ALPHABET_SMALL, 4));
+        out.extend(exhaustive(ALPHABET_GRAMMAR, 4));
+        out.extend(boundary_literals());
+        out
+    }
+
+    #[test]
+    fn shared_grammar_matches_the_library_parsers_exhaustively() {
+        // Accept/reject AND value, over the whole corpus.  `bare_integer_literal`
+        // is one allocation-free pass with hand-rolled digit arithmetic and
+        // hand-rolled width bounds; the library is neither.  Agreement is what
+        // makes sharing the grammar safe instead of merely tidy.
+        let mut literals = 0usize;
+        for text in corpus() {
+            // A repeated sign is the ONE documented divergence, and it is a
+            // divergence of the private single-integer path only: the public
+            // evaluator recovers the same value through its tokenizer, which
+            // `the_public_evaluator_is_unchanged_by_the_shared_grammar` pins.
+            let bytes = text.as_bytes();
+            let repeated_sign = bytes
+                .windows(2)
+                .any(|w| matches!(w[0], b'+' | b'-') && matches!(w[1], b'+' | b'-'));
+            if repeated_sign {
+                continue;
+            }
+            let shared = shared_single_integer(&text);
+            let library = library_single_integer(&text);
+            assert_eq!(
+                shared, library,
+                "the shared grammar and the library parsers disagree on {text:?}"
+            );
+            literals += usize::from(shared.is_some());
+        }
+        // What that counter is really for: a differential test over inputs that
+        // all reject proves nothing.  So assert the shapes that decide the
+        // grammar by VALUE -- the widest literal each radix accepts and the
+        // first it rejects -- instead of trusting a count that could stay high
+        // while the boundaries fell out of the corpus.  (3327 of the ~90k
+        // strings are literals; the floor below only catches a corpus that
+        // stopped generating them at all.)
+        let bin63 = "0b111111111111111111111111111111111111111111111111111111111111111";
+        let bin64 = "0b1000000000000000000000000000000000000000000000000000000000000000";
+        for (widest, first_rejected) in [
+            ("18446744073709551615", "18446744073709551616"), // u64::MAX, decimal
+            ("0xffffffffffffffff", "0x10000000000000000"),    // u64::MAX, hex
+            ("0777777777777777777777", "01000000000000000000000"), // i64::MAX, octal
+            (bin63, bin64),                                   // i64::MAX, binary
+        ] {
+            assert!(
+                shared_single_integer(widest).is_some(),
+                "the corpus lost the widest {widest:?}"
+            );
+            assert!(
+                shared_single_integer(first_rejected).is_none(),
+                "the corpus lost the first rejected {first_rejected:?}"
+            );
+        }
+        assert!(
+            literals > 3_000,
+            "corpus accepted only {literals} literals; it is no longer generating them"
+        );
+    }
+
+    #[test]
+    fn is_label_like_matches_the_original_definition_exhaustively() {
+        // The predicate's ANSWER must not have moved when its literal test
+        // became a byte scan: the original definition asked the full evaluator.
+        let mut labels = 0usize;
+        for text in corpus() {
+            let fast = is_label_like(&text);
+            let slow = original_is_label_like(&text);
+            assert_eq!(
+                fast, slow,
+                "is_label_like disagrees with the evaluator-based definition on {text:?}"
+            );
+            labels += usize::from(fast);
+        }
+        assert!(
+            labels > 5_000,
+            "corpus produced only {labels} label-like texts; identifiers are not being exercised"
+        );
+        // And the two answers the predicate exists to tell apart, on the shapes
+        // that motivated the byte scan: the kernel's symbol arithmetic must stay
+        // a symbol, and its absolute addresses must stay literals.
+        assert!(is_label_like("__START_KERNEL_map"));
+        assert!(is_label_like("init_top_pgt"));
+        assert!(!is_label_like("0xffffffff80000000"));
+        assert!(!is_label_like("0x1f"));
+    }
+
+    #[test]
+    fn the_public_evaluator_is_unchanged_by_the_shared_grammar() {
+        // The repeated-sign shapes the recognizer now declines, with the values
+        // the OLD single-integer path produced.  `parse_integer_expr` must still
+        // produce them -- through the tokenizer's unary handling -- because that
+        // function is the public contract and assembly files are written against
+        // it, not against a private helper.
+        for (text, want) in [
+            ("--42", 42i64),
+            ("+-42", -42),
+            ("-+42", -42),
+            ("++42", 42),
+            ("---42", -42),
+            ("- -42", 42),
+            ("--0x1f", 31),
+            ("-1u", -1),
+            // A '+' in front of a radix prefix is not a bare literal (the prefix
+            // match never fires behind a sign), but it IS a valid expression:
+            // the tokenizer reads `+` applied to `0x1f`.  Both implementations
+            // answer 31 -- the original through `str::parse` declining and the
+            // tokenizer taking over, this one the same way.
+            ("+0x1f", 31),
+            ("+0b101", 5),
+        ] {
+            assert_eq!(
+                parse_integer_expr(text).ok(),
+                Some(want),
+                "{text:?}: the evaluator's answer moved when the grammar was shared"
+            );
+        }
+    }
+
+    #[test]
+    fn the_evaluator_and_the_recognizer_agree_on_bare_literals() {
+        // End to end through the public evaluator: for a bare numeric token the
+        // value it returns is the value the recognizer produced, sign included.
+        for text in [
+            "0",
+            "42",
+            "-42",
+            "+42",
+            "0x1f",
+            "0X1F",
+            "0b1010",
+            "0644",
+            "0777777777777777777777",
+            "9223372036854775807",
+            "18446744073709551615",
+            "0xffffffffffffffff",
+            "1U",
+            "0x1full",
+            "-0x1f",
+            "+42",
+        ] {
+            let evaluated = parse_integer_expr(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            let recognized = shared_single_integer(text).expect(text);
+            assert_eq!(evaluated, recognized, "{text:?}");
+        }
+        // And the rejects stay rejects, with the message naming the radix that
+        // was actually attempted (the four messages are observable in assembler
+        // diagnostics, so they are part of the contract).
+        for (text, want) in [
+            ("09", "bad octal: 09"),
+            ("0x", "bad hex: 0x"),
+            // The tokenizer's binary branch stops at the first non-binary
+            // digit, so the token it fails on is `0b`, not `0b2`.
+            ("0b2", "bad binary: 0b"),
+            ("0x10000000000000000", "bad hex: 0x10000000000000000"),
+            ("18446744073709551616", "bad integer: 18446744073709551616"),
+            ("abc", "bad integer: abc"),
+            ("0z9", "bad integer: 0z9"),
+        ] {
+            // `parse_integer_expr` falls back to its tokenizer, which reports a
+            // different error for some of these; the message contract belongs to
+            // `parse_single_integer`, so ask it through a shape that cannot be
+            // tokenized any other way.
+            let err = parse_integer_expr(text).expect_err(text);
+            assert!(
+                err.contains(want) || err.contains("unexpected") || err.contains("expression"),
+                "{text:?}: got {err:?}, want it to mention {want:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod relocation_symbol_normalization_tests {
+    use super::normalize_relocation_symbol_addend;
+
+    #[test]
+    fn source_addends_are_checked_and_symbol_differences_are_not_split() {
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor+17", -4),
+            ("anchor", 13)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor-17", -4),
+            ("anchor", -21)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor-other", -4),
+            ("anchor-other", -4)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor+1", i64::MAX),
+            ("anchor+1", i64::MAX)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor-1", i64::MIN),
+            ("anchor-1", i64::MIN)
+        );
+    }
+}

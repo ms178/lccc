@@ -1,0 +1,19 @@
+FAIL default command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: 
+FAIL weak-definition command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: 
+FAIL import command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+FAIL weak-import command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+FAIL weak-missing command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+FAIL weak-hidden-missing command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+FAIL weak-protected-missing command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+FAIL absolute-default command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+FAIL absolute-local command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+FAIL absolute-protected command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-7tjjlq19/runner']: /tmp/rv-shared-loader-7tjjlq19/runner: error while loading shared libraries: /tmp/rv-shared-loader-7tjjlq19/shared.so: unexpected reloc type 0x06
+
+RV64 shared loader: 3 PASS / 10 FAIL / 0 SKIP

@@ -1,0 +1,8 @@
+    Finished `fastbuild` profile [optimized + debuginfo] target(s) in 0.01s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-244ecc21c018cae1)
+
+running 2 tests
+test driver::cli::cli_tests::sse2_denial_survives_independent_sse1_codegen_grant ... ok
+test frontend::preprocessor::predefined_macros::tests::sse2_denial_does_not_erase_independent_x86_64_sse_macros ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 6299 filtered out; finished in 0.00s

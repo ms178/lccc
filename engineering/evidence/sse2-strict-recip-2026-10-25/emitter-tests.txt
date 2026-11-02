@@ -1,0 +1,9 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized + debuginfo] target(s) in 1m 19s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-244ecc21c018cae1)
+
+running 2 tests
+test backend::x86::codegen::intrinsics::strict_recip_sse2_tests::sse2_reciprocal_scalar_denominators_use_only_reserved_scratch ... ok
+test backend::x86::codegen::intrinsics::strict_recip_sse2_tests::sse2_reciprocal_home_aliases_keep_both_denominator_halves_before_the_sum ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 6349 filtered out; finished in 0.00s

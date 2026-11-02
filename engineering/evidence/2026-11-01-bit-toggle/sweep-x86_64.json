@@ -1,0 +1,41 @@
+{
+ "level": "-O2",
+ "files": 3079,
+ "shorter": [
+  [
+   "tests/benchmark/programs/glibc_memcmp.c",
+   156,
+   158
+  ],
+  [
+   "tests/benchmark/programs/linux_find_bit.c",
+   122,
+   123
+  ],
+  [
+   "tests/regression/simd_avx2_defer_chain.c",
+   164,
+   178
+  ],
+  [
+   "engineering/evidence/2026-11-01-bit-selection/bit-selection-exec.c",
+   176,
+   181
+  ],
+  [
+   "engineering/evidence/2026-11-01-bit-selection/bit-selection.c",
+   173,
+   205
+  ],
+  [
+   "engineering/evidence/2026-11-01-bit-toggle/bit-toggle.c",
+   46,
+   60
+  ]
+ ],
+ "same": 2298,
+ "longer": [],
+ "both_reject": 775,
+ "verdict": [],
+ "net_delta": -68
+}

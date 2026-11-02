@@ -1,0 +1,97 @@
+{
+  "label": "A/B",
+  "arm_a": {
+    "binary": "target/nbody-before",
+    "sha256": "c21e4e0a0d3f9202cc8bea1c18f465922500a6c3815aa40839d8826be469605e",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8"
+    }
+  },
+  "arm_b": {
+    "binary": "target/nbody-after",
+    "sha256": "d848d095c25c228259dcca55968507e221f7f7f071cb85a0dcf28eabece6afe4",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "before",
+    "n": 15,
+    "min_ms": 225.517,
+    "median_ms": 282.531,
+    "mean_ms": 278.503,
+    "stdev_ms": 27.817,
+    "samples_ms": [
+      240.392,
+      266.904,
+      261.073,
+      282.531,
+      288.231,
+      283.911,
+      348.367,
+      278.89,
+      247.137,
+      295.873,
+      292.653,
+      225.517,
+      281.005,
+      293.349,
+      291.71
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "after",
+    "n": 15,
+    "min_ms": 181.418,
+    "median_ms": 213.74,
+    "mean_ms": 210.087,
+    "stdev_ms": 13.69,
+    "samples_ms": [
+      203.197,
+      202.643,
+      199.589,
+      198.812,
+      222.085,
+      219.711,
+      223.175,
+      228.298,
+      193.328,
+      200.966,
+      215.316,
+      181.418,
+      213.74,
+      217.858,
+      231.171
+    ]
+  },
+  "paired_diffs_ms": [
+    37.195,
+    64.261,
+    61.484,
+    83.719,
+    66.146,
+    64.199,
+    125.191,
+    50.592,
+    53.809,
+    94.906,
+    77.337,
+    44.099,
+    67.264,
+    75.491,
+    60.539
+  ],
+  "median_ratio_b_over_a": 0.75652,
+  "min_ratio_b_over_a": 0.80445,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "before SLOWER by 24.35% (median)"
+}

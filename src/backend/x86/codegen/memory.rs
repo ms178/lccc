@@ -1,0 +1,5446 @@
+//! X86Codegen: memory operations (load, store, memcpy, GEP, stack).
+
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::{SlotAddr, StackSlot};
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
+
+/// Printable immediate for a direct `movX $imm, <mem>` store that stages
+/// nothing through %rax.
+///
+/// x86 stores take an immediate field of the STORE's width: `movb`/`movw`/
+/// `movl` encode raw {8,16,32}-bit values (the same raw-field width contract
+/// the MachInst emitter applies on its narrow fast path), so for every store
+/// width <= 4 bytes ANY constant is directly encodable once truncated to the
+/// destination width — including unsigned 32-bit constants like 3041712678
+/// whose value sits above `i32::MAX` (the historical gate here rejected
+/// them, forcing the `movabsq $imm,%rax; movl %eax,addr` relay that PR #364's
+/// direct path only removed for the MachInst side). A 64-bit store cannot
+/// take a full imm64 to memory, so it still needs the sign-extended imm32
+/// form or the accumulator relay.
+pub(super) fn direct_store_imm(imm: i64, ty: IrType) -> Option<i64> {
+    if ty.is_float() || matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+        return None;
+    }
+    if ty.size() >= 8 {
+        // 64-bit destinations: only `movq $imm32` (sign-extended) is legal.
+        return (imm >= i32::MIN as i64 && imm <= i32::MAX as i64).then_some(imm);
+    }
+    // Narrow destinations: keep the historical signed spelling when the
+    // value fits an imm32 (small negatives print like GCC's `movl $-1`),
+    // otherwise print the value truncated to the destination's raw field.
+    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+        Some(imm)
+    } else {
+        let mask: i64 = match ty.size() {
+            1 => 0xff,
+            2 => 0xffff,
+            _ => 0xffff_ffff,
+        };
+        Some(imm & mask)
+    }
+}
+
+/// Largest constant `memmove` size the overlap-safe buffered expansion
+/// covers.  Two scratch vectors (or, under `-mno-sse`, the two scalar scratch
+/// registers) buffer the whole copy, which is what makes it direction-free.
+/// Must stay <= `generation::INLINE_MEMMOVE_MAX`, the bound the call lowering
+/// asks for.
+pub(super) const MEMMOVE_BUFFERED_MAX: usize = 32;
+
+/// Source classification for the `%rdi`/`%rsi` parallel-copy staging of
+/// memcpy/memmove addresses (see `X86Codegen::stage_copy_operands`).
+#[derive(Clone, Copy, Debug)]
+enum CopyAddrSource {
+    /// Home GPR of the value (may itself be `%rdi`/`%rsi`).
+    Gpr(PhysReg),
+    /// XMM home: `movq %xmmN, %target`.
+    Xmm(PhysReg),
+    /// Slot whose ADDRESS is the operand (allocas, direct 16/32-byte payload
+    /// slots); over-alignment is applied by `emit_alloca_addr_to`.
+    SlotAddress(StackSlot, u32),
+    /// Slot holding the pointer value: `movq off(%rbp), %target`.
+    SlotLoad(StackSlot),
+    /// Constants and anything else: `operand_to_reg` (never reads rdi/rsi
+    /// unless the value is register-homed, which the cases above catch).
+    Generic,
+}
+
+impl X86Codegen {
+    /// S11: soundness gate for raw SIB-index use of `reg_assignments`.
+    ///
+    /// `build_indexed_gep_map` peels widening casts, `add(iv, const)` and
+    /// power-of-two scale chains off a GEP offset, so the value feeding the
+    /// SIB index can be NARROWER than 64 bits (e.g. an I32 call result reached
+    /// by peeling the `Cast`+`Add` off `(i64)idx + 1` in `k[baz()+1]`).
+    /// Narrow values have no defined 64-bit home form: `store_rax_to` /
+    /// `store_eax_to` deliberately keep the whole accumulator (`movq`), and
+    /// after a Call returning I32 the upper half of %rax is undefined
+    /// (System V names only %eax as the return register). A SIB index reads
+    /// the home register directly — no reload, no `movslq` — so the peel
+    /// turns `p[idx]` into `mem(%base, %idx_home, scale)` with garbage in the
+    /// upper half (pr110115: `16(%rsp,%r9,8)` with %r9 = 0x00000000FFFFFFFF
+    /// instead of the required sign extension 0xFFFFFFFFFFFFFFFF ⇒ wild
+    /// store ⇒ SIGSEGV).
+    ///
+    /// Values that appear in a 64-bit IR position are already covered: they
+    /// land in `needs_sext_values`, whose def-side policy emits the
+    /// extending move after the 32-bit op, so their homes carry the correct
+    /// 64-bit form and this helper is a no-op for them (it re-extends the
+    /// same low bits). The peeled index never reaches such a position, which
+    /// is exactly the hole this closes.
+    ///
+    /// The extension happens IN PLACE on the home register, immediately
+    /// before the SIB operand is consumed:
+    ///   I8/I16/I32 → movsbq/movswq/movslq from the narrow sub-register
+    ///   U8/U16/U32 → movzbq/movzwq/movl (zero-extension by definition)
+    /// In-place extension is always sound for a narrow value:
+    ///   * the SIB now reads exactly the 64-bit form the type promises;
+    ///   * later 32-bit reloads (`movl %rNd`) still read the low 32 bits;
+    ///   * later sext-aware reloads re-extend from the low bits, unchanged;
+    ///   * the home only gains DEFINED upper bits — every form above
+    ///     preserves the low bits bit-exactly and MOV never touches flags
+    ///     (safe even with a fused-Cmp handshake pending).
+    ///
+    /// Returns false (caller refuses the fold) when the index has no register
+    /// home, is XMM-homed, or its IR type is not statically narrow: extending
+    /// a genuine 64-bit value in place would truncate it, and an unknown type
+    /// must not be gambled on. Refusals fall back to the `leaq` path, which
+    /// reloads the index through the sext-aware operand machinery.
+    ///
+    /// INVARIANT — every symbol+index SIB in this file goes through here
+    /// first. The four sites are `indexed_sym_operand`, `emit_load_indexed_impl`
+    /// (and its store dual), the register-offset pair
+    /// `emit_load_indexed_sym_reg_base_impl` / `emit_store_indexed_sym_reg_base_impl`,
+    /// and `emit_leaq_sym_index_impl`. That last one is the newest and was the
+    /// one that skipped the call, which is how the same GEP came to lower two
+    /// different ways depending on which fold won; `tests/regression/
+    /// check_symbol_index_widths.sh` states the resulting value law end to end
+    /// and the unit tests below pin each arm. A new SIB site that needs a
+    /// symbol base must call this too, or it reinvents the defect.
+    fn ensure_sib_index_form(&mut self, index: &Value) -> bool {
+        // Freshness-gated (see home_fresh): a stale home must not feed a
+        // SIB index; refusing the fold falls back to the reload path.
+        let Some(reg) = self.fresh_home_of(index.0) else {
+            return false;
+        };
+        if is_xmm_reg(reg) {
+            return false;
+        }
+        let Some(&ty) = self.value_types.get(&index.0) else {
+            return false;
+        };
+        match ty {
+            IrType::I64 | IrType::U64 | IrType::Ptr => true,
+            IrType::U32 | IrType::U16 | IrType::U8
+                if self.zext_loaded_values.contains(&index.0) =>
+            {
+                true
+            }
+            IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8 => {
+                let r64 = phys_reg_name(reg);
+                let instr = match ty {
+                    IrType::I32 if self.bitop_nonneg_values.contains(&index.0) => format!(
+                        "    movl %{}, %{}",
+                        phys_reg_name_32(reg),
+                        phys_reg_name_32(reg)
+                    ),
+                    IrType::I32 => format!("    movslq %{}, %{}", phys_reg_name_32(reg), r64),
+                    IrType::U32 => format!(
+                        "    movl %{}, %{}",
+                        phys_reg_name_32(reg),
+                        phys_reg_name_32(reg)
+                    ),
+                    IrType::I16 => format!(
+                        "    movswq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::I16),
+                        r64
+                    ),
+                    IrType::U16 => format!(
+                        "    movzwq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::U16),
+                        r64
+                    ),
+                    IrType::I8 => format!(
+                        "    movsbq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::I8),
+                        r64
+                    ),
+                    IrType::U8 => format!(
+                        "    movzbq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::U8),
+                        r64
+                    ),
+                    _ => unreachable!("narrow-type match is exhaustive above"),
+                };
+                self.state.emit_fmt(format_args!("{}", instr));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Try to emit a store using x86-64 SIB indexed addressing mode.
+    /// Returns true if successful, false to fall back to normal codegen.
+    ///
+    /// First tries IVSR pattern detection (Phase 9b), then falls back to
+    /// Phase 9 pattern (GEP with Mul/Shl offset).
+    fn try_emit_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9b: Try IVSR pointer pattern first (most common in loops)
+        if self.try_emit_ivsr_indexed_store(val, ptr, ty) {
+            return true;
+        }
+
+        // Phase 9: Try non-IVSR pattern (explicit multiply/shift)
+        self.try_emit_phase9_indexed_store(val, ptr, ty)
+    }
+
+    /// Try to emit indexed addressing for IVSR-transformed loop pointer stores.
+    fn try_emit_ivsr_indexed_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is an IVSR pointer phi
+        let ivsr_info = match self.ivsr_pointers.get(&ptr.0) {
+            Some(info) => info.clone(),
+            None => return false,
+        };
+
+        // Find the loop counter associated with this pointer
+        let counter_val = match self.pointer_to_counter.get(&ptr.0) {
+            Some(&counter_id) => Value(counter_id),
+            None => return false,
+        };
+
+        // Check if both base and counter are in registers
+        let base_reg = match self.fresh_home_of(ivsr_info.base_ptr.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.fresh_home_of(counter_val.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Verify stride is a valid SIB scale
+        if !Self::is_valid_sib_scale(ivsr_info.stride) {
+            return false;
+        }
+
+        // Base and index must be different registers.
+        if base_reg == index_reg {
+            return false;
+        }
+
+        // Check if loading the store value would clobber base or index register
+        if let Operand::Value(v) = val {
+            if let Some(val_reg) = self.fresh_home_of(v.0) {
+                let val_name = phys_reg_name(val_reg);
+                if val_name == base_reg || val_name == index_reg {
+                    return false;
+                }
+            }
+        }
+
+        // Load the value to be stored into the accumulator/xmm register.
+        // FP constants load directly from the rodata constant pool into xmm0.
+        let fp_const = matches!(
+            val,
+            Operand::Const(IrConst::F64(_) | IrConst::F32(_) | IrConst::D64(_) | IrConst::D32(_))
+        ) && matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32);
+        if fp_const {
+            self.emit_fp_operand_to_xmm(val, ty, "xmm0");
+        } else {
+            self.operand_to_rax(val);
+        }
+
+        // Determine store instruction and source register based on type
+        let (store_instr, src_reg) = match ty {
+            IrType::F64 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movq %rax, %xmm0");
+                }
+                ("movsd", "%xmm0")
+            }
+            IrType::F32 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movd %eax, %xmm0");
+                }
+                ("movss", "%xmm0")
+            }
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movw", "%ax"),
+            IrType::I8 | IrType::U8 => ("movb", "%al"),
+            _ => return false,
+        };
+
+        // Emit indexed store: movX %src, (%base,%index,scale)
+        if ivsr_info.init_offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} {}, (%{},%{},{})",
+                store_instr, src_reg, base_reg, index_reg, ivsr_info.stride
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}, {}(%{},%{},{})",
+                store_instr, src_reg, ivsr_info.init_offset, base_reg, index_reg, ivsr_info.stride
+            ));
+        }
+
+        true
+    }
+
+    /// Phase 9 indexed addressing: detect GEP with multiply/shift offset for stores.
+    /// Detects patterns like: `store val, (base + index*scale)` where:
+    /// - base is in a register
+    /// - index is in a register
+    /// - scale is 1, 2, 4, or 8
+    ///
+    /// Emits: `mov %src, (%base_reg,%index_reg,scale)`
+    // Phase 9 is DISABLED: the body below the early `return false` is kept as
+    // executable documentation of the SIB-addressing decomposition we intend to
+    // restore.  It still type-checks, so the decomposition cannot silently rot
+    // while the pass is off -- and because the dead body keeps referencing the
+    // parameters, no `#[allow(unused_variables)]` is needed here.  That matters:
+    // the lint is enabled crate-wide (see `src/lib.rs`) precisely because a
+    // silently dead safety binding is how PR #681's volatile miscompile hid, and
+    // a function-wide allow would mask a genuinely dead binding added to the
+    // live prologue above the `return false`.
+    fn try_emit_phase9_indexed_store(&mut self, _val: &Operand, _ptr: &Value, _ty: IrType) -> bool {
+        // Phase 9 decomposes a variable-offset GEP into SIB addressing:
+        //   Store _val, (GEP base, Mul(idx, scale))  →  movl %eax, (%base, %idx, scale)
+        // However, variable-offset GEPs are always emitted as `leaq` instructions
+        // (they are NOT in gep_fold_map, which only handles constant offsets).
+        // By the time the Store is emitted, the GEP's source registers (base, idx)
+        // may have been clobbered by the leaq destination or intervening instructions.
+        // The GEP result is already computed in a register/slot, so use it directly.
+        return false;
+
+        // Check if _ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(_ptr.0) {
+            Some(inst) => inst,
+            None => return false,
+        };
+
+        let (gep_base, gep_offset) = match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => (base, offset),
+            _ => return false,
+        };
+
+        // Check if offset is a Value (not a constant - those are handled by existing GEP folding)
+        let offset_val = match gep_offset {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if offset is defined by a multiply or shift (i*scale pattern)
+        let (index_val, scale) = match self.get_defining_instruction(offset_val.0) {
+            Some(Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(idx),
+                rhs: Operand::Const(c),
+                ..
+            }) => {
+                // Pattern: index * const
+                let scale_val = match c.to_i64() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if !Self::is_valid_sib_scale(scale_val) {
+                    return false;
+                }
+                (idx, scale_val)
+            }
+            Some(Instruction::BinOp {
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(idx),
+                rhs: Operand::Const(c),
+                ..
+            }) => {
+                // Pattern: index << shift_amount (equivalent to index * 2^shift)
+                let shift = match c.to_i64() {
+                    Some(v) if v >= 0 && v <= 3 => v, // shift of 0-3 gives scale of 1,2,4,8
+                    _ => return false,
+                };
+                let scale_val = 1i64 << shift;
+                (idx, scale_val)
+            }
+            _ => return false,
+        };
+
+        // Check if base and index both have register assignments
+        let base_reg = match self.fresh_home_of(gep_base.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.fresh_home_of(index_val.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Base and index must be different registers for SIB addressing.
+        // If the register allocator assigned both the same register (e.g.,
+        // because one value's live range ended and the register was reused),
+        // the SIB computation would be wrong (base + base*scale instead of
+        // base + index*scale).
+        if base_reg == index_reg {
+            return false;
+        }
+
+        // Check if loading the store value would clobber the base or index
+        // register. This happens when the store value's register overlaps with
+        // the base/index, or when operand_to_rax needs to use the register for
+        // intermediate computations. If so, fall back to non-indexed store.
+        if let Operand::Value(v) = _val {
+            if let Some(val_reg) = self.fresh_home_of(v.0) {
+                let val_name = phys_reg_name(val_reg);
+                if val_name == base_reg || val_name == index_reg {
+                    return false; // Register conflict, fall back
+                }
+            }
+        }
+
+        // Load the value to be stored into the accumulator/xmm register.
+        // FP constants load directly from the rodata constant pool into xmm0.
+        let fp_const = matches!(_val, Operand::Const(IrConst::F64(_) | IrConst::F32(_)))
+            && matches!(_ty, IrType::F64 | IrType::F32);
+        if fp_const {
+            self.emit_fp_operand_to_xmm(_val, _ty, "xmm0");
+        } else {
+            self.operand_to_rax(_val);
+        }
+
+        // Determine store instruction and source register based on type
+        let (store_instr, src_reg) = match _ty {
+            IrType::F64 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movq %rax, %xmm0");
+                }
+                ("movsd", "%xmm0")
+            }
+            IrType::F32 => {
+                if !fp_const {
+                    // Convert from rax to xmm0
+                    self.state.emit("    movd %eax, %xmm0");
+                }
+                ("movss", "%xmm0")
+            }
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movw", "%ax"),
+            IrType::I8 | IrType::U8 => ("movb", "%al"),
+            _ => return false, // Unsupported type for indexed addressing
+        };
+
+        // Emit indexed store: movX %src, (%base,%index,scale)
+        self.state.emit_fmt(format_args!(
+            "    {} {}, (%{},%{},{})",
+            store_instr, src_reg, base_reg, index_reg, scale
+        ));
+
+        true
+    }
+
+    /// Try to emit a load using x86-64 SIB indexed addressing mode.
+    /// Returns true if successful, false to fall back to normal codegen.
+    ///
+    /// First tries IVSR pattern detection (Phase 9b), then falls back to
+    /// Phase 9 pattern (GEP with Mul/Shl offset).
+    fn try_emit_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Phase 9b: Try IVSR pointer pattern first (most common in loops)
+        if self.try_emit_ivsr_indexed_load(dest, ptr, ty) {
+            return true;
+        }
+
+        // Phase 9: Try non-IVSR pattern (explicit multiply/shift)
+        self.try_emit_phase9_indexed_load(dest, ptr, ty)
+    }
+
+    /// Try to emit indexed addressing for IVSR-transformed loop pointers.
+    /// Detects pattern: %ptr = Phi(%init, %next) where %next = GEP(%ptr, stride)
+    /// and emits: movX (%base,%counter,scale), %dest
+    fn try_emit_ivsr_indexed_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) -> bool {
+        // Check if ptr is an IVSR pointer phi
+        let ivsr_info = match self.ivsr_pointers.get(&ptr.0) {
+            Some(info) => info.clone(),
+            None => return false,
+        };
+
+        // Find the loop counter associated with this pointer
+        let counter_val = match self.pointer_to_counter.get(&ptr.0) {
+            Some(&counter_id) => Value(counter_id),
+            None => return false,
+        };
+
+        // Check if both base and counter are in registers
+        let base_reg = match self.fresh_home_of(ivsr_info.base_ptr.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.fresh_home_of(counter_val.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Verify stride is a valid SIB scale
+        if !Self::is_valid_sib_scale(ivsr_info.stride) {
+            return false;
+        }
+
+        // Determine load instruction and destination register based on type
+        let (load_instr, dest_reg) = match ty {
+            IrType::F64 => ("movsd", "%xmm0"),
+            IrType::F32 => ("movss", "%xmm0"),
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movzwl", "%eax"),
+            IrType::I8 | IrType::U8 => ("movzbl", "%eax"),
+            _ => return false,
+        };
+
+        // Emit indexed load: movX (%base,%index,scale), %dest
+        // Handle optional displacement for non-zero init_offset
+        if ivsr_info.init_offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} (%{},%{},{}), {}",
+                load_instr, base_reg, index_reg, ivsr_info.stride, dest_reg
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}(%{},%{},{}), {}",
+                load_instr, ivsr_info.init_offset, base_reg, index_reg, ivsr_info.stride, dest_reg
+            ));
+        }
+
+        // Update register cache - for FP types, value is in xmm0, for integers in rax
+        match ty {
+            IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32 => {
+                // For floating point, the value is in xmm0, not rax
+                // We need to move it to rax for the common code path
+                if matches!(ty, IrType::F64 | IrType::D64) {
+                    self.state.emit("    movq %xmm0, %rax");
+                } else {
+                    self.state.emit("    movd %xmm0, %eax");
+                }
+                self.state.park_acc(dest.0, false);
+            }
+            _ => {
+                // Integer types are already in rax
+                self.state.park_acc(dest.0, false);
+            }
+        }
+
+        true
+    }
+
+    /// Phase 9 indexed addressing: detect GEP with multiply/shift offset.
+    /// Detects patterns like: `load (base + index*scale)` where:
+    /// - base is in a register
+    /// - index is in a register
+    /// - scale is 1, 2, 4, or 8
+    ///
+    /// Emits: `mov (%base_reg,%index_reg,scale), %dest`
+    // Phase 9 is DISABLED: the body below the early `return false` is kept as
+    // executable documentation of the SIB-addressing decomposition we intend to
+    // restore.  It still type-checks, so the decomposition cannot silently rot
+    // while the pass is off -- and because the dead body keeps referencing the
+    // parameters, no `#[allow(unused_variables)]` is needed here.  That matters:
+    // the lint is enabled crate-wide (see `src/lib.rs`) precisely because a
+    // silently dead safety binding is how PR #681's volatile miscompile hid, and
+    // a function-wide allow would mask a genuinely dead binding added to the
+    // live prologue above the `return false`.
+    fn try_emit_phase9_indexed_load(&mut self, _dest: &Value, _ptr: &Value, _ty: IrType) -> bool {
+        // Disabled: same issue as try_emit_phase9_indexed_store — variable-offset
+        // GEPs are already emitted, so base/index registers may be stale.
+        return false;
+
+        // Check if _ptr is defined by a GEP instruction
+        let gep_inst = match self.get_defining_instruction(_ptr.0) {
+            Some(inst) => inst,
+            None => return false,
+        };
+
+        let (gep_base, gep_offset) = match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => (base, offset),
+            _ => return false,
+        };
+
+        // Check if offset is a Value (not a constant - those are handled by existing GEP folding)
+        let offset_val = match gep_offset {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if offset is defined by a multiply or shift (i*scale pattern)
+        let (index_val, scale) = match self.get_defining_instruction(offset_val.0) {
+            Some(Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(idx),
+                rhs: Operand::Const(c),
+                ..
+            }) => {
+                // Pattern: index * const
+                let scale_val = match c.to_i64() {
+                    Some(v) => v,
+                    None => return false,
+                };
+                if !Self::is_valid_sib_scale(scale_val) {
+                    return false;
+                }
+                (idx, scale_val)
+            }
+            Some(Instruction::BinOp {
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(idx),
+                rhs: Operand::Const(c),
+                ..
+            }) => {
+                // Pattern: index << shift_amount (equivalent to index * 2^shift)
+                let shift = match c.to_i64() {
+                    Some(v) if v >= 0 && v <= 3 => v, // shift of 0-3 gives scale of 1,2,4,8
+                    _ => return false,
+                };
+                let scale_val = 1i64 << shift;
+                (idx, scale_val)
+            }
+            _ => return false,
+        };
+
+        // Check if base and index both have register assignments
+        let base_reg = match self.fresh_home_of(gep_base.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        let index_reg = match self.fresh_home_of(index_val.0) {
+            Some(reg) => phys_reg_name(reg),
+            None => return false,
+        };
+
+        // Determine load instruction and destination register based on type
+        let (load_instr, dest_reg) = match _ty {
+            IrType::F64 => ("movsd", "%xmm0"),
+            IrType::F32 => ("movss", "%xmm0"),
+            IrType::I64 | IrType::U64 => ("movq", "%rax"),
+            IrType::I32 | IrType::U32 => ("movl", "%eax"),
+            IrType::I16 | IrType::U16 => ("movzwl", "%eax"),
+            IrType::I8 | IrType::U8 => ("movzbl", "%eax"),
+            _ => return false, // Unsupported type for indexed addressing
+        };
+
+        // Emit indexed load: movX (%base,%index,scale), %_dest
+        self.state.emit_fmt(format_args!(
+            "    {} (%{},%{},{}), {}",
+            load_instr, base_reg, index_reg, scale, dest_reg
+        ));
+
+        // Update register cache - for FP types, value is in xmm0, for integers in rax
+        match _ty {
+            IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32 => {
+                // For floating point, the value is in xmm0, not rax
+                // We need to move it to rax for the common code path
+                if matches!(_ty, IrType::F64 | IrType::D64) {
+                    self.state.emit("    movq %xmm0, %rax");
+                } else {
+                    self.state.emit("    movd %xmm0, %eax");
+                }
+                self.state.park_acc(_dest.0, false);
+            }
+            _ => {
+                // Integer types are already in rax
+                self.state.park_acc(_dest.0, false);
+            }
+        }
+
+        true
+    }
+
+    // ---- Store/Load overrides ----
+
+    pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
+        // PF-TLS-1: a store into a Local-Exec `__thread` slot folds into one
+        // instruction with the TPOFF relocation in the memory operand.
+        if self.try_emit_tls_direct_store_impl(val, ptr, 0, ty) {
+            return;
+        }
+        // Over-aligned-param homing-store elision: `store %p, %a` where %a is
+        // an over-aligned param alloca. The prologue capture already wrote the
+        // incoming value to the alloca's EFFECTIVE aligned address, so this
+        // store is a redundant rewrite (and, pre-elision, the destructive
+        // garbage-copy source: it re-loaded %p from a slot the capture never
+        // wrote). Elide: zero instructions instead of load+store.
+        if let Operand::Value(v) = val {
+            if self.state.param_homing_stores.contains(&(v.0, ptr.0)) {
+                return;
+            }
+        }
+        if ty == IrType::F128 {
+            if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = val {
+                let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+                let lo = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+                let hi_bytes: [u8; 8] = [x87[8], x87[9], 0, 0, 0, 0, 0, 0];
+                let hi = u64::from_le_bytes(hi_bytes);
+                if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                    self.emit_f128_store_raw_bytes(&addr, ptr.0, 0, lo, hi);
+                }
+                return;
+            }
+            if let Operand::Const(IrConst::I128(c)) = val {
+                // _Float128 constant as a 16-byte bit pattern (huge_valf128 etc.).
+                let bytes = (*c as u128).to_le_bytes();
+                let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                    self.emit_f128_store_raw_bytes(&addr, ptr.0, 0, lo, hi);
+                }
+                return;
+            }
+            if let Operand::Value(v) = val {
+                if self.state.f128_direct_slots.contains(&v.0) {
+                    if let Some(src_slot) = self.state.get_slot(v.0) {
+                        if let Some(dest_addr) = self.state.resolve_slot_addr(ptr.0) {
+                            self.state.out.emit_instr_rbp("    fldt", src_slot.0);
+                            self.emit_f128_fstpt(&dest_addr, ptr.0, 0);
+                            return;
+                        }
+                    }
+                }
+            }
+            self.operand_to_rax(val);
+            if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                self.emit_f128_store_f64_via_x87(&addr, ptr.0, 0);
+            }
+            return;
+        }
+
+        // Try indexed addressing mode first (Phase 9 optimization)
+        if self.try_emit_indexed_store(val, ptr, ty) {
+            // Indexed addressing succeeded - we're done!
+            return;
+        }
+
+        // Scalar FP store: keep the value in the SSE domain instead of
+        // round-tripping through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            // Decimal carriers: D64 moves like a 64-bit double, D32 like a
+            // 32-bit float — bit-exact SSE moves, never a value conversion.
+            let store_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "    movsd"
+            } else {
+                "    movss"
+            };
+            let addr = self.state.resolve_slot_addr(ptr.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.out.emit_instr_reg_rbp(store_instr, src, slot.0);
+                    return;
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            let src = self.fp_store_value_xmm(val, ty);
+                            self.state.emit_fmt(format_args!(
+                                "{} %{}, (%{})",
+                                store_instr, src, reg_name
+                            ));
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state
+                        .emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state
+                        .emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                Some(SlotAddr::Reg(reg)) => {
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state.emit_fmt(format_args!(
+                        "{} %{}, (%{})",
+                        store_instr,
+                        src,
+                        phys_reg_name(reg)
+                    ));
+                    return;
+                }
+                None => {} // fall through to default
+            }
+        }
+
+        // Constant-immediate store optimization: when storing a small constant,
+        // emit `movX $IMM, ADDR` directly instead of loading the constant into
+        // %rax and then storing through the accumulator. This saves 1-3 instructions
+        // (eliminates xorl/movq for zero, or movq $IMM for other constants, plus
+        // the emit_save_acc movq %rax, %rdx for indirect stores).
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Const(c) = val {
+                if let Some(imm) = c.to_i64() {
+                    // Direct `movX $imm, ADDR` is legal whenever the value
+                    // fits the store's immediate field — for narrow stores
+                    // that is EVERY constant (see `direct_store_imm`), which
+                    // removes the `movabsq $imm,%rax; movX %eax,ADDR` relay
+                    // for unsigned 32-bit constants above i32::MAX too.
+                    if let Some(imm_print) = direct_store_imm(imm, ty) {
+                        if self.try_emit_const_store(imm_print, ptr, ty) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register-direct fast path: bypass the accumulator when both val
+        // and ptr have register assignments. Saves 2-3 instructions per store.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Value(v) = val {
+                let v_reg = self.reg_assignments.get(&v.0).copied();
+                let p_reg = self.reg_assignments.get(&ptr.0).copied();
+
+                // Both val and ptr in GPR registers: emit 1 instruction
+                if let (Some(vr), Some(pr)) = (v_reg, p_reg) {
+                    if !is_xmm_reg(vr) && !is_xmm_reg(pr) && !self.state.is_alloca(ptr.0) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let v_name = typed_phys_reg_name(vr, ty);
+                        let p_name = phys_reg_name(pr);
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, (%{})",
+                            store_instr, v_name, p_name
+                        ));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+
+                // Val in register, ptr on stack: 2 instructions (skip emit_save_acc)
+                if let Some(vr) = v_reg {
+                    if !is_xmm_reg(vr) && !self.state.is_alloca(ptr.0) {
+                        if let Some(crate::backend::state::SlotAddr::Indirect(slot)) =
+                            self.state.resolve_slot_addr(ptr.0)
+                        {
+                            self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                            let store_instr = Self::mov_store_for_type(ty);
+                            let v_name = typed_phys_reg_name(vr, ty);
+                            self.state
+                                .emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, v_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // register-direct F64/F32 store. When the value lives in an
+        // XMM-allocated register, store it straight to memory (movsd/movss
+        // %xmmN, (%ptr)) instead of the GPR round-trip (movq %xmmN,%rax;
+        // movq %rax,(%ptr)) the default path pays on every store.
+        if ty == IrType::F64 || ty == IrType::F32 {
+            if let Operand::Value(v) = val {
+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
+                    if is_xmm_reg(v_reg) {
+                        let v_name = phys_reg_name(v_reg);
+                        let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                        // ptr in a GPR-allocated register
+                        if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
+                            if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                                let p_name = phys_reg_name(p_reg);
+                                self.state.emit_fmt(format_args!(
+                                    "    {} %{}, (%{})",
+                                    mov, v_name, p_name
+                                ));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                        // ptr is an alloca with a direct slot
+                        if self.state.is_alloca(ptr.0)
+                            && self.state.alloca_over_align(ptr.0).is_none()
+                        {
+                            if let Some(slot) = self.state.get_slot(ptr.0) {
+                                let sr = self.slot_ref(slot.0);
+                                self.state
+                                    .emit_fmt(format_args!("    {} %{}, {}", mov, v_name, sr));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                        // general pointer: materialize to %rax and store
+                        self.operand_to_reg(&Operand::Value(*ptr), "rax");
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, (%rax)", mov, v_name));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fall back to default store logic
+        crate::backend::traits::emit_store_default(self, val, ptr, ty);
+    }
+
+    /// Try to emit a constant-immediate store: `movX $IMM, ADDR`.
+    /// Bypasses the accumulator entirely, saving 1-3 instructions.
+    /// `imm` is the print value already validated by [`direct_store_imm`]:
+    /// its low `store width` bits are exactly the bytes the store writes.
+    fn try_emit_const_store(&mut self, imm: i64, ptr: &Value, ty: IrType) -> bool {
+        let store_instr = Self::mov_store_for_type(ty);
+        let addr = self.state.resolve_slot_addr(ptr.0);
+
+        match addr {
+            Some(SlotAddr::Direct(slot)) => {
+                // Store constant directly to stack slot: movX $IMM, N(%rsp/%rbp)
+                let out = &mut self.state.out;
+                out.write_str("    ");
+                out.write_str(store_instr);
+                out.write_str(" $");
+                out.write_i64(imm);
+                out.write_str(", ");
+                if out.use_rsp_addressing {
+                    out.write_i64(out.rsp_frame_size + slot.0);
+                    out.write_str("(%rsp)");
+                } else {
+                    out.write_i64(slot.0);
+                    out.write_str("(%rbp)");
+                }
+                out.newline();
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                true
+            }
+            Some(SlotAddr::Indirect(slot)) => {
+                // Pointer is in a stack slot — load pointer to %rcx, then store immediate
+                self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm));
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                true
+            }
+            Some(SlotAddr::Reg(reg)) => {
+                // Pointer lives in a physical GPR (register-homed GEP result,
+                // RA-26 caller home, ...): store the immediate directly through
+                // it. Without this arm the store fell back to
+                // `movq $IMM, %rax; movX %eax, (%reg)`, one instruction and an
+                // accumulator clobber longer per store (IS-24).
+                if !is_xmm_reg(reg) {
+                    let reg_name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, (%{})",
+                        store_instr, imm, reg_name
+                    ));
+                    self.state.reg_cache.invalidate_all();
+                    self.flush_pending_vec_store_impl();
+                    self.state.invalidate_vec_peephole();
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(SlotAddr::OverAligned(slot, id)) => {
+                // Over-aligned alloca: materialize its address into %rcx first,
+                // then store the immediate through it — same shape the scalar
+                // FP store path above uses.
+                self.emit_alloca_aligned_addr_impl(slot, id);
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm));
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                true
+            }
+            _ => false, // no slot — fall back to default
+        }
+    }
+
+    pub(super) fn emit_load_impl(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
+        // PF-TLS-1: a load out of a Local-Exec `__thread` slot folds into one
+        // instruction with the TPOFF relocation in the memory operand.
+        if self.try_emit_tls_direct_load_impl(dest, ptr, 0, ty) {
+            return;
+        }
+        // W2 fold handshake: only a redirecting path below may re-arm the
+        // cast-skip; anything else leaves it None so the adjacent cast emits.
+        self.fold_skip_cast = None;
+        let fold_target = self.load_cast_fold.get(&dest.0).copied();
+        if ty == IrType::F128 {
+            if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                self.emit_f128_fldt(&addr, ptr.0, 0);
+                self.emit_f128_load_finish(dest);
+                self.state.track_f128_load(dest.0, ptr.0, 0);
+            }
+            return;
+        }
+
+        // Try indexed addressing mode first (Phase 9 optimization)
+        if self.try_emit_indexed_load(dest, ptr, ty) {
+            // Indexed addressing succeeded - we're done!
+            // The accumulator already holds dest's value (cache updated in try_emit_indexed_load)
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Scalar FP load: keep the value in the SSE domain — load directly
+        // into an XMM register (the destination's own XMM register when it
+        // has one) instead of round-tripping through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let load_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "    movsd"
+            } else {
+                "    movss"
+            };
+            let dest_xmm_reg = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|&r| is_xmm_reg(r));
+            let dest_xmm = dest_xmm_reg.map(phys_reg_name);
+            let target = dest_xmm.unwrap_or("xmm0");
+            let addr = self.state.resolve_slot_addr(ptr.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg(load_instr, slot.0, target);
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&ptr.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            self.state.emit_fmt(format_args!(
+                                "{} (%{}), %{}",
+                                load_instr, reg_name, target
+                            ));
+                            if dest_xmm.is_none() {
+                                self.store_xmm_to(dest, "xmm0", ty);
+                            }
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                    self.state
+                        .emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.state
+                        .emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                Some(SlotAddr::Reg(reg)) => self.state.emit_fmt(format_args!(
+                    "{} (%{}), %{}",
+                    load_instr,
+                    phys_reg_name(reg),
+                    target
+                )),
+                None => {
+                    // No address resolution — fall back to the default path.
+                    crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+                    return;
+                }
+            }
+            if dest_xmm.is_none() {
+                self.store_xmm_to(dest, "xmm0", ty);
+            } else {
+                // Definition-writes-home accounting: the FP load wrote the
+                // dest's XMM home directly.
+                self.note_inplace_compute(dest_xmm_reg.expect("dest_xmm is Some here"), dest.0);
+            }
+            return;
+        }
+
+        // Register-direct load: when ptr has a register, load directly.
+        // If dest ALSO has a register, load directly to dest (bypassing rax entirely).
+        // Otherwise, load to rax and store via accumulator.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
+                if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                    // W2 fold: the load REPLACES the consumer cast, so the
+                    // extension must come from the TYPE (movslq for I32 -
+                    // the admission's width table only folds sign-extending
+                    // I32 casts), not from the needs-sext convention: a
+                    // widening cast no longer marks its source (the cast
+                    // extends itself), so the convention would pick movl
+                    // and zero-extend a sign-extending fold.
+                    let load_instr = if fold_target.is_some() {
+                        Self::mov_load_for_type(ty)
+                    } else {
+                        self.mov_load_for_value(ty, dest.0)
+                    };
+                    let p_name = phys_reg_name(p_reg);
+                    let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                    let use_16bit_dest = load_instr == "movw";
+                    let use_8bit_dest = load_instr == "movb";
+
+                    // W2 Load->Cast fold target takes precedence: load straight
+                    // into the consumer Cast dest's register.
+                    let fold_reg = fold_target.map(|(r, _)| r);
+                    let d_reg_opt = fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
+                    if let Some(d_reg) = d_reg_opt {
+                        if !is_xmm_reg(d_reg) {
+                            let d_name = if use_32bit_dest {
+                                phys_reg_name_32(d_reg)
+                            } else if use_16bit_dest || use_8bit_dest {
+                                typed_phys_reg_name(d_reg, ty)
+                            } else {
+                                phys_reg_name(d_reg)
+                            };
+                            self.state.emit_fmt(format_args!(
+                                "    {} (%{}), %{}",
+                                load_instr, p_name, d_name
+                            ));
+                            if fold_reg.is_some() {
+                                self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                            }
+                            // Definition-writes-home accounting: the direct
+                            // load wrote the destination home register with
+                            // the loaded value. For the W2 fold the written
+                            // value is the CONSUMER CAST's dest (its emission
+                            // is skipped); for the plain path it is the load's
+                            // own dest. Missing this note was the PR #487
+                            // class: loads are the most common def of a homed
+                            // value.
+                            if let Some((fr, fold_dest)) = fold_target {
+                                self.note_inplace_compute(fr, fold_dest);
+                            } else {
+                                self.note_inplace_compute(d_reg, dest.0);
+                            }
+                            return;
+                        }
+                    }
+
+                    // Dest is on stack — load to rax as before (no fold target).
+                    let dest_reg = if use_32bit_dest {
+                        "%eax"
+                    } else if use_16bit_dest {
+                        "%ax"
+                    } else if use_8bit_dest {
+                        "%al"
+                    } else {
+                        "%rax"
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    {} (%{}), {}",
+                        load_instr, p_name, dest_reg
+                    ));
+                    self.state.park_acc(dest.0, false);
+                    self.store_rax_to(dest);
+                    return;
+                }
+            }
+        }
+
+        // Accumulator-address load: a preceding GEP/Add often leaves the
+        // pointer in %rax and records it in the accumulator cache.  The legacy
+        // fallback immediately reloaded that same pointer into %rcx before the
+        // dereference, producing `lea/add -> mov %rax,%rcx -> load (%rcx)` in
+        // hot scalar loops.  x86 evaluates a memory address before writing the
+        // load destination, so `movX (%rax),%eax/%rax` is equivalent and avoids
+        // the relay.  This path is restricted to a verified cache hit and
+        // scalar integer/pointer loads; float and wide paths retain their
+        // dedicated ABI handling below.
+        if !ty.is_float()
+            && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128)
+            && !self.state.is_alloca(ptr.0)
+            && self.state.acc_has_verified(ptr.0, false)
+        {
+            // Same type-vs-convention distinction as the register-pointer
+            // path above: a firing W2 fold supplies the cast's extension.
+            let load_instr = if fold_target.is_some() {
+                Self::mov_load_for_type(ty)
+            } else {
+                self.mov_load_for_value(ty, dest.0)
+            };
+            let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+            let use_16bit_dest = load_instr == "movw";
+            let use_8bit_dest = load_instr == "movb";
+            // W2 Load->Cast fold target takes precedence over dest's own home.
+            let fold_reg = fold_target.map(|(r, _)| r);
+            let d_reg_opt = fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
+            if let Some(d_reg) = d_reg_opt {
+                if !is_xmm_reg(d_reg) {
+                    let d_name = if use_32bit_dest {
+                        phys_reg_name_32(d_reg)
+                    } else if use_16bit_dest || use_8bit_dest {
+                        typed_phys_reg_name(d_reg, ty)
+                    } else {
+                        phys_reg_name(d_reg)
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {} (%rax), %{}", load_instr, d_name));
+                    if fold_reg.is_some() {
+                        self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                    }
+                    return;
+                }
+            }
+            let dest_reg = if use_32bit_dest {
+                "%eax"
+            } else if use_16bit_dest {
+                "%ax"
+            } else if use_8bit_dest {
+                "%al"
+            } else {
+                "%rax"
+            };
+            self.state
+                .emit_fmt(format_args!("    {} (%rax), {}", load_instr, dest_reg));
+            self.state.park_acc(dest.0, false);
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Register-direct load from alloca: when ptr is a stack-allocated local
+        // variable and dest has a register, load directly to the register.
+        // This bypasses the accumulator, saving one movq instruction.
+        // SOUNDNESS: over-aligned allocas reserve size+(align-1) bytes and the
+        // data lives at a RUNTIME-aligned address, not the slot base. A direct
+        // slot load reads up to align-1 bytes before the object (zlib-ng
+        // symptom: lanes[0] of an aligned(32) array loaded from the wrong
+        // offset, corrupting the AVX2 adler32 horizontal sum). Fall through to
+        // the default path, which materializes the aligned address.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            // W2 Load->Cast fold target takes precedence over dest's own home.
+            let fold_reg = fold_target.map(|(r, _)| r);
+            let d_reg_opt = fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
+            if let Some(d_reg) = d_reg_opt {
+                if !is_xmm_reg(d_reg)
+                    && self.state.is_alloca(ptr.0)
+                    && self.state.alloca_over_align(ptr.0).is_none()
+                {
+                    if let Some(slot) = self.state.get_slot(ptr.0) {
+                        let load_instr = Self::mov_load_for_type(ty);
+                        // Match the destination width to the selected opcode.
+                        // movzbl/movzwl and movl write a 32-bit register; the
+                        // sign-extending forms and movq write a 64-bit register.
+                        let d_name = if matches!(load_instr, "movl" | "movzbl" | "movzwl") {
+                            phys_reg_name_32(d_reg)
+                        } else {
+                            phys_reg_name(d_reg)
+                        };
+                        let sr = self.slot_ref(slot.0);
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, d_name));
+                        self.state.reg_cache.invalidate_acc();
+                        if fold_reg.is_some() {
+                            self.fold_skip_cast = fold_target.map(|(_, c)| c);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        // register-direct F64/F32 load. When the destination is
+        // XMM-allocated, load straight into it (movsd/movss (%ptr), %xmmN)
+        // instead of the GPR round-trip (movq (%ptr),%rax; movq %rax,%xmmN).
+        // Over-aligned allocas fall through (their data lives at a runtime-
+        // aligned address, not the slot base).
+        if ty == IrType::F64 || ty == IrType::F32 {
+            if let Some(d_reg) = self.reg_assignments.get(&dest.0).copied() {
+                if is_xmm_reg(d_reg) {
+                    let d_name = phys_reg_name(d_reg);
+                    let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                    // 1. Pointer already in a GPR-allocated register.
+                    if let Some(p_reg) = self.reg_assignments.get(&ptr.0).copied() {
+                        if !is_xmm_reg(p_reg) && !self.state.is_alloca(ptr.0) {
+                            let p_name = phys_reg_name(p_reg);
+                            self.state
+                                .emit_fmt(format_args!("    {} (%{}), %{}", mov, p_name, d_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                    // 2. Alloca with a direct slot (data IS at the slot).
+                    if self.state.is_alloca(ptr.0) && self.state.alloca_over_align(ptr.0).is_none()
+                    {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            let sr = self.slot_ref(slot.0);
+                            self.state
+                                .emit_fmt(format_args!("    {} {}, %{}", mov, sr, d_name));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                    // 3. General pointer (GEP into a global, IVSR phi, computed
+                    //    address): materialize into %rax (or reuse it when the
+                    //    accumulator cache already holds the pointer) and load
+                    //    directly into the XMM home. This is the nbody inner-
+                    //    loop case: the old path did movq (%ptr),%rax +
+                    //    movq %rax,%xmmN.
+                    self.operand_to_reg(&Operand::Value(*ptr), "rax");
+                    self.state
+                        .emit_fmt(format_args!("    {} (%rax), %{}", mov, d_name));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+
+        // Fall back to default load logic
+        crate::backend::traits::emit_load_default(self, dest, ptr, ty);
+    }
+
+    pub(super) fn emit_store_with_const_offset_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) {
+        // Invariant (see `can_const_addr_fold` in generation.rs): a folded
+        // default-space store always carries an i32 displacement. A wider one
+        // would be truncated by the encoder, so refuse it loudly here instead.
+        assert!(
+            i32::try_from(offset).is_ok(),
+            "folded store displacement {offset} exceeds i32; the fold decider must refuse it"
+        );
+        // PF-TLS-1: `tls_array[CONST] = v` folds into
+        // `movX %v, %fs:sym@TPOFF+N`.
+        if self.try_emit_tls_direct_store_impl(val, base, offset, ty) {
+            return;
+        }
+        if ty == IrType::F128 {
+            if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = val {
+                let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+                let lo = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+                let hi_bytes: [u8; 8] = [x87[8], x87[9], 0, 0, 0, 0, 0, 0];
+                let hi = u64::from_le_bytes(hi_bytes);
+                if let Some(addr) = self.state.resolve_slot_addr(base.0) {
+                    self.emit_f128_store_raw_bytes(&addr, base.0, offset, lo, hi);
+                }
+                return;
+            }
+            if let Operand::Value(v) = val {
+                if self.state.f128_direct_slots.contains(&v.0) {
+                    if let Some(src_slot) = self.state.get_slot(v.0) {
+                        if let Some(addr) = self.state.resolve_slot_addr(base.0) {
+                            self.state.out.emit_instr_rbp("    fldt", src_slot.0);
+                            self.emit_f128_fstpt(&addr, base.0, offset);
+                            return;
+                        }
+                    }
+                }
+            }
+            self.operand_to_rax(val);
+            if let Some(addr) = self.state.resolve_slot_addr(base.0) {
+                self.emit_f128_store_f64_via_x87(&addr, base.0, offset);
+            }
+            return;
+        }
+        // Scalar FP store: keep the value in the SSE domain instead of
+        // round-tripping through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let store_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "    movsd"
+            } else {
+                "    movss"
+            };
+            let addr = self.state.resolve_slot_addr(base.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp(store_instr, src, folded_slot.0);
+                    return;
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            let src = self.fp_store_value_xmm(val, ty);
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!(
+                                    "{} %{}, {}(%{})",
+                                    store_instr, src, offset, reg_name
+                                ));
+                            } else {
+                                self.state.emit_fmt(format_args!(
+                                    "{} %{}, (%{})",
+                                    store_instr, src, reg_name
+                                ));
+                            }
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg_impl(offset);
+                    }
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state
+                        .emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                    let src = self.fp_store_value_xmm(val, ty);
+                    self.state
+                        .emit_fmt(format_args!("{} %{}, (%rcx)", store_instr, src));
+                    return;
+                }
+                Some(SlotAddr::Reg(reg)) => {
+                    let src = self.fp_store_value_xmm(val, ty);
+                    let r = phys_reg_name(reg);
+                    if offset != 0 {
+                        self.state
+                            .emit_fmt(format_args!("{} %{}, {}(%{})", store_instr, src, offset, r));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("{} %{}, (%{})", store_instr, src, r));
+                    }
+                    return;
+                }
+                None => {} // fall through to default
+            }
+        }
+
+        // Non-F128: try constant-immediate store optimization first.
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+            if let Operand::Const(c) = val {
+                if let Some(imm) = c.to_i64() {
+                    // The folded-offset destination accepts the same raw-field
+                    // immediates as a base-register store (see
+                    // `direct_store_imm`): fold `$imm`, offset AND the store
+                    // width into one memory operand. Unsigned 32-bit constants
+                    // above i32::MAX previously took the
+                    // `movabsq $imm,%rax; movl %eax, off(%reg)` relay here.
+                    if let Some(imm_print) = direct_store_imm(imm, ty) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        match addr {
+                            Some(SlotAddr::Direct(slot)) => {
+                                let folded_slot = StackSlot(slot.0 + offset);
+                                let out = &mut self.state.out;
+                                out.write_str("    ");
+                                out.write_str(store_instr);
+                                out.write_str(" $");
+                                out.write_i64(imm_print);
+                                out.write_str(", ");
+                                if out.use_rsp_addressing {
+                                    out.write_i64(out.rsp_frame_size + folded_slot.0);
+                                    out.write_str("(%rsp)");
+                                } else {
+                                    out.write_i64(folded_slot.0);
+                                    out.write_str("(%rbp)");
+                                }
+                                out.newline();
+                                self.state.reg_cache.invalidate_all();
+                                self.flush_pending_vec_store_impl();
+                                self.state.invalidate_vec_peephole();
+                                return;
+                            }
+                            Some(SlotAddr::Indirect(slot)) => {
+                                if std::env::var_os("LCCC_DBG_STORE").is_some() {
+                                    eprintln!(
+                                        "[DBGSTORE] base={} get_slot={:?} reg_assign={:?} offset={}",
+                                        base.0,
+                                        self.state.get_slot(base.0),
+                                        self.reg_assignments.get(&base.0),
+                                        offset
+                                    );
+                                }
+                                if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                                    let reg_name = phys_reg_name(reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} ${}, {}(%{})",
+                                            store_instr, imm_print, offset, reg_name
+                                        ));
+                                    } else {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} ${}, (%{})",
+                                            store_instr, imm_print, reg_name
+                                        ));
+                                    }
+                                } else {
+                                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                                    if offset != 0 {
+                                        self.emit_add_offset_to_addr_reg_impl(offset);
+                                    }
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} ${}, (%rcx)",
+                                        store_instr, imm_print
+                                    ));
+                                }
+                                self.state.reg_cache.invalidate_all();
+                                self.flush_pending_vec_store_impl();
+                                self.state.invalidate_vec_peephole();
+                                return;
+                            }
+                            Some(SlotAddr::Reg(reg)) => {
+                                // Base pointer is register-homed (RA-26 param
+                                // home / register GEP): fold offset + immediate
+                                // into one addressing form (IS-24). Without this
+                                // arm the store materialized the constant via
+                                // `movq $IMM, %rax` first.
+                                if !is_xmm_reg(reg) {
+                                    let reg_name = phys_reg_name(reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} ${}, {}(%{})",
+                                            store_instr, imm_print, offset, reg_name
+                                        ));
+                                    } else {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} ${}, (%{})",
+                                            store_instr, imm_print, reg_name
+                                        ));
+                                    }
+                                    self.state.reg_cache.invalidate_all();
+                                    self.flush_pending_vec_store_impl();
+                                    self.state.invalidate_vec_peephole();
+                                    return;
+                                }
+                            }
+                            Some(SlotAddr::OverAligned(slot, id)) => {
+                                // Over-aligned alloca base: materialize the
+                                // aligned address, add the field offset, store
+                                // the immediate through it.
+                                self.emit_alloca_aligned_addr_impl(slot, id);
+                                if offset != 0 {
+                                    self.emit_add_offset_to_addr_reg_impl(offset);
+                                }
+                                self.state.emit_fmt(format_args!(
+                                    "    {} ${}, (%rcx)",
+                                    store_instr, imm_print
+                                ));
+                                self.state.reg_cache.invalidate_all();
+                                self.flush_pending_vec_store_impl();
+                                self.state.invalidate_vec_peephole();
+                                return;
+                            }
+                            _ => {} // fall through to default path
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register-direct store: when val has a register, store directly to memory
+        // without loading to %rax first. Handles Direct (alloca) and Indirect (ptr) cases.
+        // FP variant — an XMM-allocated F64/F32 value stores straight to the
+        // folded-offset address (movsd/movss %xmmN, off(%base)) instead of the
+        // GPR round-trip (movq %xmmN,%rax; movq %rax,off(%base)).  This fires
+        // for both a GPR base register and a stack-local (alloca) destination;
+        // before, the alloca case fell through to the accumulator round-trip,
+        // which is the dominant cost of FP struct-field stores (struct_copy:
+        // every `p.x = ...` paid movq %xmmN,%rax; movq %rax,slot).
+        if ty == IrType::F64 || ty == IrType::F32 {
+            if let Operand::Value(v) = val {
+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
+                    if is_xmm_reg(v_reg) {
+                        let mov = if ty == IrType::F64 { "movsd" } else { "movss" };
+                        let v_name = phys_reg_name(v_reg);
+                        if self.state.is_alloca(base.0) {
+                            // Direct into the stack slot (aligned double/float).
+                            if let Some(addr) = self.state.resolve_slot_addr(base.0) {
+                                if let SlotAddr::Direct(slot) = addr {
+                                    let folded_slot = StackSlot(slot.0 + offset);
+                                    let sr = self.slot_ref(folded_slot.0);
+                                    self.state
+                                        .emit_fmt(format_args!("    {} %{}, {}", mov, v_name, sr));
+                                    self.state.reg_cache.invalidate_acc();
+                                    return;
+                                }
+                            }
+                        } else if let Some(b_reg) = self.reg_assignments.get(&base.0).copied() {
+                            if !is_xmm_reg(b_reg) {
+                                let b_name = phys_reg_name(b_reg);
+                                if offset != 0 {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} %{}, {}(%{})",
+                                        mov, v_name, offset, b_name
+                                    ));
+                                } else {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} %{}, (%{})",
+                                        mov, v_name, b_name
+                                    ));
+                                }
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if let Operand::Value(v) = val {
+                if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {
+                    if !is_xmm_reg(v_reg) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        let v_name = typed_phys_reg_name(v_reg, ty);
+                        let addr = self.state.resolve_slot_addr(base.0);
+                        match addr {
+                            Some(SlotAddr::Direct(slot)) => {
+                                let folded_slot = StackSlot(slot.0 + offset);
+                                let sr = self.slot_ref(folded_slot.0);
+                                self.state.emit_fmt(format_args!(
+                                    "    {} %{}, {}",
+                                    store_instr, v_name, sr
+                                ));
+                                return;
+                            }
+                            Some(SlotAddr::Indirect(_slot)) => {
+                                if let Some(&b_reg) = self.reg_assignments.get(&base.0) {
+                                    let b_name = phys_reg_name(b_reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} %{}, {}(%{})",
+                                            store_instr, v_name, offset, b_name
+                                        ));
+                                    } else {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} %{}, (%{})",
+                                            store_instr, v_name, b_name
+                                        ));
+                                    }
+                                    return;
+                                }
+                                // base not in register — fall through to load base to %rcx
+                            }
+                            _ => {} // fall through
+                        }
+                    }
+                }
+            }
+        }
+
+        // Default GEP fold logic.
+        let addr = self.state.resolve_slot_addr(base.0);
+        if let Some(addr) = addr {
+            let store_instr = Self::mov_store_for_type(ty);
+            match addr {
+                SlotAddr::OverAligned(slot, id) => {
+                    // For over-aligned, load ptr first to rcx, then load value to rax
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                    // rcx now holds the target address
+                    self.operand_to_rax(val);
+                    let store_reg = Self::reg_for_type("rax", ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, store_reg));
+                }
+                SlotAddr::Direct(slot) => {
+                    self.operand_to_rax(val);
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    self.emit_typed_store_to_slot_impl(store_instr, ty, folded_slot);
+                }
+                SlotAddr::Indirect(slot) => {
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        self.operand_to_rax(val);
+                        let reg_name = phys_reg_name(reg);
+                        let store_reg = Self::reg_for_type("rax", ty);
+                        if offset != 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    {} %{}, {}(%{})",
+                                store_instr, store_reg, offset, reg_name
+                            ));
+                        } else {
+                            self.state.emit_fmt(format_args!(
+                                "    {} %{}, (%{})",
+                                store_instr, store_reg, reg_name
+                            ));
+                        }
+                    } else {
+                        // Load pointer to %rcx FIRST, then load value to %rax.
+                        // This avoids emit_save_acc which can be clobbered by
+                        // operand_to_rax if the value uses %r11/%rdx as scratch.
+                        self.emit_load_ptr_from_slot_impl(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg_impl(offset);
+                        }
+                        // Now load value — %rcx is safe (not clobbered by operand_to_rax)
+                        self.operand_to_rax(val);
+                        let store_reg = Self::reg_for_type("rax", ty);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, (%rcx)", store_instr, store_reg));
+                    }
+                }
+                SlotAddr::Reg(reg) => {
+                    self.operand_to_rax(val);
+                    let r = phys_reg_name(reg);
+                    let src = Self::reg_for_type("rax", ty);
+                    if offset != 0 {
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, {}(%{})",
+                            store_instr, src, offset, r
+                        ));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, (%{})", store_instr, src, r));
+                    }
+                }
+            }
+        } else if let Some(&b_reg) = self.reg_assignments.get(&base.0) {
+            // Register-resident base with no slot home (fold accepted through
+            // const_offset_fold_reg_base_ok).  The old code staged the value
+            // into %rax and emitted NO store.  operand_to_rax only touches
+            // %rax plus the %r11/%rdx staging scratches — the base was
+            // verified to sit outside that set by the fold predicate.
+            if !is_xmm_reg(b_reg) {
+                self.operand_to_rax(val);
+                let b_name = phys_reg_name(b_reg);
+                let store_instr = Self::mov_store_for_type(ty);
+                let store_reg = Self::reg_for_type("rax", ty);
+                if offset != 0 {
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, {}(%{})",
+                        store_instr, store_reg, offset, b_name
+                    ));
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, (%{})",
+                        store_instr, store_reg, b_name
+                    ));
+                }
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+            }
+        } else {
+            // No addr resolution — fall back
+            self.operand_to_rax(val);
+        }
+    }
+
+    pub(super) fn emit_load_with_const_offset_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) {
+        // Same invariant as the store twin: the fold decider admits only i32
+        // displacements, so a wider one here is a caller bug, not an input.
+        assert!(
+            i32::try_from(offset).is_ok(),
+            "folded load displacement {offset} exceeds i32; the fold decider must refuse it"
+        );
+        // PF-TLS-1: `v = tls_array[CONST]` folds into
+        // `movX %fs:sym@TPOFF+N, %dst`.
+        if self.try_emit_tls_direct_load_impl(dest, base, offset, ty) {
+            return;
+        }
+        if ty == IrType::F128 {
+            if let Some(addr) = self.state.resolve_slot_addr(base.0) {
+                self.emit_f128_fldt(&addr, base.0, offset);
+                self.emit_f128_load_finish(dest);
+            }
+            return;
+        }
+        // Scalar FP load: keep the value in the SSE domain — load directly
+        // into an XMM register (the destination's own XMM register when it
+        // has one) instead of round-tripping through %rax. Covers Direct,
+        // Indirect (register-held or slot-held base) and OverAligned bases,
+        // so FP-struct field loads in loops never pay the GPR shuttle.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let load_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "    movsd"
+            } else {
+                "    movss"
+            };
+            let dest_xmm_reg = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|&r| is_xmm_reg(r));
+            let dest_xmm = dest_xmm_reg.map(phys_reg_name);
+            let target = dest_xmm.unwrap_or("xmm0");
+            let addr = self.state.resolve_slot_addr(base.0);
+            match addr {
+                Some(SlotAddr::Direct(slot)) => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg(load_instr, folded_slot.0, target);
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!(
+                                    "{} {}(%{}), %{}",
+                                    load_instr, offset, reg_name, target
+                                ));
+                            } else {
+                                self.state.emit_fmt(format_args!(
+                                    "{} (%{}), %{}",
+                                    load_instr, reg_name, target
+                                ));
+                            }
+                            if dest_xmm.is_none() {
+                                self.store_xmm_to(dest, "xmm0", ty);
+                            } else {
+                                // Definition-writes-home accounting: the FP
+                                // field load wrote the dest's XMM home.
+                                self.note_inplace_compute(
+                                    dest_xmm_reg.expect("dest_xmm is Some here"),
+                                    dest.0,
+                                );
+                            }
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                    self.emit_load_ptr_from_slot_impl(slot, base.0);
+                    if offset != 0 {
+                        self.emit_add_offset_to_addr_reg_impl(offset);
+                    }
+                    self.state
+                        .emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                    self.state
+                        .emit_fmt(format_args!("{} (%rcx), %{}", load_instr, target));
+                }
+                Some(SlotAddr::Reg(reg)) => {
+                    let r = phys_reg_name(reg);
+                    if offset != 0 {
+                        self.state.emit_fmt(format_args!(
+                            "{} {}(%{}), %{}",
+                            load_instr, offset, r, target
+                        ));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("{} (%{}), %{}", load_instr, r, target));
+                    }
+                }
+                None => {
+                    // Register-resident base with no slot home (fold accepted
+                    // through const_offset_fold_reg_base_ok).  Dropping the
+                    // load here silently read garbage; load through the base.
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        if !is_xmm_reg(reg) {
+                            let reg_name = phys_reg_name(reg);
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!(
+                                    "{} {}(%{}), %{}",
+                                    load_instr, offset, reg_name, target
+                                ));
+                            } else {
+                                self.state.emit_fmt(format_args!(
+                                    "{} (%{}), %{}",
+                                    load_instr, reg_name, target
+                                ));
+                            }
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+            }
+            if dest_xmm.is_none() {
+                self.store_xmm_to(dest, "xmm0", ty);
+            } else {
+                // Definition-writes-home accounting: the FP field load wrote
+                // the dest's XMM home directly.
+                self.note_inplace_compute(dest_xmm_reg.expect("dest_xmm is Some here"), dest.0);
+            }
+            // Conservative: a stale acc entry for a value that aliases the
+            // loaded memory must not survive this load.
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        // W2 Load->Cast fold (const-offset variant): a load whose single
+        // consumer is the adjacent widening Cast loads straight into the
+        // CAST's register; the cast emission then skips (fold_skip_cast
+        // handshake). `mov_load_for_type` already picks the extending opcode
+        // that matches every width_ok pair (movzbl/movzwl/movl zero-extend;
+        // movslq/movsbq/movswq sign-extend), so redirecting is value-exact.
+        let fold_target = self.load_cast_fold.get(&dest.0).copied();
+        let addr = self.state.resolve_slot_addr(base.0);
+        if let Some(addr) = addr {
+            let load_instr = Self::mov_load_for_type(ty);
+            match addr {
+                SlotAddr::OverAligned(slot, id) => {
+                    self.emit_alloca_aligned_addr_impl(slot, id);
+                    self.emit_add_offset_to_addr_reg_impl(offset);
+                    self.emit_typed_load_indirect_impl(load_instr);
+                }
+                SlotAddr::Direct(slot) => {
+                    let folded_slot = StackSlot(slot.0 + offset);
+                    self.emit_typed_load_from_slot_impl(load_instr, folded_slot);
+                }
+                SlotAddr::Indirect(slot) => {
+                    if let Some(&reg) = self.reg_assignments.get(&base.0) {
+                        let reg_name = phys_reg_name(reg);
+
+                        // Register-direct: if dest also has a register, load directly to it.
+                        // The W2 fold target takes precedence over dest's own home.
+                        if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+                            if let Some(d_reg) = fold_target
+                                .map(|(r, _)| r)
+                                .or_else(|| self.reg_assignments.get(&dest.0).copied())
+                            {
+                                if !is_xmm_reg(d_reg) {
+                                    // movslq/movsbq/movswq need 64-bit dest.
+                                    // movl/movzbl/movzwl use 32-bit dest (implicit
+                                    // zero-extend). Keyed on the OPCODE, not the
+                                    // IR type: a U8 load is `movzbl` → 32-bit dest
+                                    // (`%r11d`), and emitting `%r11` is rejected by
+                                    // GNU as (GAS oracle: "incorrect register %r11
+                                    // used with l suffix").
+                                    let load_instr = Self::mov_load_for_type(ty);
+                                    let use_32bit_dest =
+                                        matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                                    let d_name = if use_32bit_dest {
+                                        phys_reg_name_32(d_reg)
+                                    } else {
+                                        phys_reg_name(d_reg)
+                                    };
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} {}(%{}), %{}",
+                                            load_instr, offset, reg_name, d_name
+                                        ));
+                                    } else {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} (%{}), %{}",
+                                            load_instr, reg_name, d_name
+                                        ));
+                                    }
+                                    if let Some((fr, fold_dest)) = fold_target {
+                                        self.fold_skip_cast = Some(fold_dest);
+                                        self.note_inplace_compute(fr, fold_dest);
+                                    } else {
+                                        if use_32bit_dest && matches!(ty, IrType::U8 | IrType::U16)
+                                        {
+                                            self.zext_loaded_values.insert(dest.0);
+                                        }
+                                        self.note_inplace_compute(d_reg, dest.0);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+
+                        let dest_reg = Self::load_dest_reg(ty);
+                        if offset != 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}(%{}), {}",
+                                load_instr, offset, reg_name, dest_reg
+                            ));
+                        } else {
+                            self.state.emit_fmt(format_args!(
+                                "    {} (%{}), {}",
+                                load_instr, reg_name, dest_reg
+                            ));
+                        }
+                    } else {
+                        self.emit_load_ptr_from_slot_impl(slot, base.0);
+                        if offset != 0 {
+                            self.emit_add_offset_to_addr_reg_impl(offset);
+                        }
+                        self.emit_typed_load_indirect_impl(load_instr);
+                    }
+                }
+                SlotAddr::Reg(reg) => {
+                    let r = phys_reg_name(reg);
+                    if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+                        if let Some(dr) = fold_target
+                            .map(|(reg, _)| reg)
+                            .or_else(|| self.reg_assignments.get(&dest.0).copied())
+                        {
+                            if !is_xmm_reg(dr) {
+                                let u = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                                let d = if u {
+                                    phys_reg_name_32(dr)
+                                } else if load_instr == "movb" || load_instr == "movw" {
+                                    typed_phys_reg_name(dr, ty)
+                                } else {
+                                    phys_reg_name(dr)
+                                };
+                                if offset != 0 {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} {}(%{}), %{}",
+                                        load_instr, offset, r, d
+                                    ));
+                                } else {
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} (%{}), %{}",
+                                        load_instr, r, d
+                                    ));
+                                }
+                                if let Some((fr, fold_dest)) = fold_target {
+                                    self.fold_skip_cast = Some(fold_dest);
+                                    self.note_inplace_compute(fr, fold_dest);
+                                } else {
+                                    if u && matches!(ty, IrType::U8 | IrType::U16) {
+                                        self.zext_loaded_values.insert(dest.0);
+                                    }
+                                    self.note_inplace_compute(dr, dest.0);
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    let d = Self::load_dest_reg(ty);
+                    if offset != 0 {
+                        self.state
+                            .emit_fmt(format_args!("    {} {}(%{}), {}", load_instr, offset, r, d));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} (%{}), {}", load_instr, r, d));
+                    }
+                }
+            }
+            self.store_rax_to(dest);
+        } else if let Some(&reg) = self.reg_assignments.get(&base.0) {
+            // Register-resident base with no slot home (fold accepted through
+            // const_offset_fold_reg_base_ok): load through the base register.
+            // Previously this shape fell out with no instruction emitted.
+            if !is_xmm_reg(reg) {
+                let load_instr = Self::mov_load_for_type(ty);
+                let reg_name = phys_reg_name(reg);
+                if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
+                    if let Some(d_reg) = fold_target
+                        .map(|(r, _)| r)
+                        .or_else(|| self.reg_assignments.get(&dest.0).copied())
+                    {
+                        if !is_xmm_reg(d_reg) {
+                            let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                            let use_16bit_dest = load_instr == "movw";
+                            let use_8bit_dest = load_instr == "movb";
+                            let d_name = if use_32bit_dest {
+                                phys_reg_name_32(d_reg)
+                            } else if use_16bit_dest || use_8bit_dest {
+                                typed_phys_reg_name(d_reg, ty)
+                            } else {
+                                phys_reg_name(d_reg)
+                            };
+                            if offset != 0 {
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}(%{}), %{}",
+                                    load_instr, offset, reg_name, d_name
+                                ));
+                            } else {
+                                self.state.emit_fmt(format_args!(
+                                    "    {} (%{}), %{}",
+                                    load_instr, reg_name, d_name
+                                ));
+                            }
+                            if let Some((fr, fold_dest)) = fold_target {
+                                self.fold_skip_cast = Some(fold_dest);
+                                self.note_inplace_compute(fr, fold_dest);
+                            } else {
+                                if use_32bit_dest && matches!(ty, IrType::U8 | IrType::U16) {
+                                    self.zext_loaded_values.insert(dest.0);
+                                }
+                                self.note_inplace_compute(d_reg, dest.0);
+                            }
+                            return;
+                        }
+                    }
+                }
+                let dest_reg = Self::load_dest_reg(ty);
+                if offset != 0 {
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}(%{}), {}",
+                        load_instr, offset, reg_name, dest_reg
+                    ));
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    {} (%{}), {}",
+                        load_instr, reg_name, dest_reg
+                    ));
+                }
+                self.store_rax_to(dest);
+            }
+        }
+    }
+
+    // ---- SIB indexed addressing (session 28): mem(,%idx,scale) ----
+    //
+    // Mirrors the session-27 i686 emitters on the 64-bit backend: a
+    // variable-offset GEP `base + idx<<shift` becomes one SIB memory operand
+    // instead of shift+add+lea+access.  Soundness contract: the prologue
+    // wires collect_folded_gep_links_all (base AND index) into register
+    // allocation, so both address registers survive to the access.  %rax is
+    // not allocatable on x86-64, so rax staging can never collide with the
+    // base/index registers.
+
+    fn sib_mem64(base_reg: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        let d = if disp == 0 {
+            String::new()
+        } else {
+            format!("{}", disp)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", d, base_reg, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", d, base_reg, index_reg, 1u32 << shift)
+        }
+    }
+
+    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        // AT&T `sym+disp(, %idx, scale)`. Concatenating the raw number
+        // (`foo` + `4` → `foo4`) invents a different symbol. Negative
+        // displacements already carry the minus sign.
+        let head = if disp == 0 {
+            sym.to_string()
+        } else if disp > 0 {
+            format!("{}+{}", sym, disp)
+        } else {
+            format!("{}{}", sym, disp)
+        };
+        if shift == 0 {
+            format!("{}(, %{})", head, index_reg)
+        } else {
+            format!("{}(, %{}, {})", head, index_reg, 1u32 << shift)
+        }
+    }
+
+    /// `sym+disp(%off, %idx, scale)`: the symbol stays the displacement, the
+    /// offset register takes the SIB base slot and the scaled index the SIB
+    /// index slot. Both registers are read at the access; the decision side
+    /// (`can_indexed_addr_fold`'s register-offset arm) has already refused
+    /// this form under PIC (a symbol needs its own staging register, and the
+    /// SIB has no third slot) and excluded the register-offset `Add` from
+    /// ever materialising.
+    fn sib_mem64_sym_base(
+        sym: &str,
+        base_reg: &str,
+        index_reg: &str,
+        shift: u8,
+        disp: i64,
+    ) -> String {
+        let head = if disp == 0 {
+            sym.to_string()
+        } else if disp > 0 {
+            format!("{}+{}", sym, disp)
+        } else {
+            format!("{}{}", sym, disp)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", head, base_reg, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", head, base_reg, index_reg, 1u32 << shift)
+        }
+    }
+
+    /// Load half of the register-offset symbol fold; see
+    /// [`sib_mem64_sym_base`] and `ArchCodegen::supports_indexed_sym_reg_base`.
+    /// Non-PIC only (the deciding arm refuses PIC): under PIC the symbol would
+    /// need a staging register and the fold would cost the same LEA it saves.
+    pub(super) fn emit_load_indexed_sym_reg_base_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        off: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        // Same basename rule as emit_load_indexed_sym_impl: the GOT verdict
+        // is computed on the base symbol, exactly like `rip_rel_blocked` does
+        // on the deciding side.
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
+            return false;
+        }
+        if self.state.pic_mode {
+            return false;
+        }
+        // The off register takes the SIB BASE slot: it needs the same
+        // 64-bit-form guarantee the index gets.  Narrow offset types are
+        // extended in place by `ensure_sib_index_form` exactly as a SIB
+        // index is, so this is a freshness check plus that extension.
+        let Some(off_reg) = self.fresh_home_of(off.0) else {
+            return false;
+        };
+        if is_xmm_reg(off_reg) || !self.ensure_sib_index_form(off) {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) || !self.ensure_sib_index_form(index) {
+            return false;
+        }
+        let off_name = phys_reg_name(off_reg);
+        let index_name = phys_reg_name(x);
+        // A SIB cannot encode %rsp in the index slot (index=100 means "no
+        // index"); %rsp is not allocatable, so this guards a contract break,
+        // not a live case.  %rsp IS encodable in the base slot (mod=10 keeps
+        // the disp32 we always carry), so only the index slot is checked.
+        if index_name == "rsp" {
+            return false;
+        }
+        let mem = Self::sib_mem64_sym_base(sym, off_name, index_name, shift, disp);
+        self.emit_load_indexed_common(dest, index, shift, ty, mem)
+    }
+
+    /// Store dual of [`Self::emit_load_indexed_sym_reg_base_impl`].
+    pub(super) fn emit_store_indexed_sym_reg_base_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        off: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
+            return false;
+        }
+        if self.state.pic_mode {
+            return false;
+        }
+        let Some(off_reg) = self.fresh_home_of(off.0) else {
+            return false;
+        };
+        if is_xmm_reg(off_reg) || !self.ensure_sib_index_form(off) {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) || !self.ensure_sib_index_form(index) {
+            return false;
+        }
+        let off_name = phys_reg_name(off_reg);
+        let index_name = phys_reg_name(x);
+        if index_name == "rsp" {
+            return false;
+        }
+        let mem = Self::sib_mem64_sym_base(sym, off_name, index_name, shift, disp);
+        self.emit_store_indexed_common(val, index, shift, ty, mem)
+    }
+
+    fn emit_load_indexed_common(
+        &mut self,
+        dest: &Value,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+        mem: String,
+    ) -> bool {
+        if shift > 3 {
+            return false;
+        }
+        // FP loads stay in the SSE domain. Decimal carriers move here too:
+        // D64 is a bit-exact 64-bit move (movsd), D32 a bit-exact 32-bit one
+        // (movss) — the same law the non-indexed FP fast paths above have
+        // grouped as F64|F32|D64|D32 since 1fdb401a. These two arms are the
+        // indexed emitters' half of the fold contract (`can_indexed_addr_fold`
+        // ↔ `ArchCodegen::indexed_fold_ok` ↔ these arms must agree exactly):
+        // a type the deciding side guarantees but an arm refuses rematerialises
+        // the folded GEP at the access site after the dead-producer walk
+        // already skipped its offset chain — the never-written-home read the
+        // trait's soundness contract exists to forbid.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "movsd"
+            } else {
+                "movss"
+            };
+            let dest_xmm_reg = self
+                .reg_assignments
+                .get(&dest.0)
+                .copied()
+                .filter(|&r| is_xmm_reg(r));
+            let dest_xmm = dest_xmm_reg.map(phys_reg_name);
+            let target = dest_xmm.unwrap_or("xmm0");
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}", instr, mem, target));
+            if dest_xmm.is_none() {
+                self.store_xmm_to(dest, "xmm0", ty);
+            } else {
+                // Definition-writes-home accounting: the indexed FP load
+                // wrote the dest's XMM home directly.
+                self.note_inplace_compute(dest_xmm_reg.expect("dest_xmm is Some here"), dest.0);
+            }
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // I64/U64 included: on x86-64 they are everyday scalar loads.  The
+        // dead-producer skip in generation.rs assumes every consumer of a
+        // foldable indexed GEP IS folded — a type the emitter rejects would
+        // fall back to rematerialisation and read the skipped offset chain.
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        // IS-15: honor the function-wide sext analysis for I32 loads. The
+        // static table always answers `movslq` for I32, but when this value
+        // has no 64-bit consumer (not in `needs_sext_values`) a plain `movl`
+        // is correct and saves the implicit REX byte; downstream consumers
+        // only read the low 32 bits. This mirrors what the non-indexed load
+        // path (`mov_load_for_value`) already does.
+        let load_instr = if ty == IrType::I32 {
+            self.mov_load_for_value(ty, dest.0)
+        } else {
+            load_instr
+        };
+        let _ = index; // liveness handled by the RA link wiring
+        if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+            if !is_xmm_reg(d_reg) {
+                let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                let use_16bit_dest = load_instr == "movw";
+                let use_8bit_dest = load_instr == "movb";
+                let d_name = if use_32bit_dest {
+                    phys_reg_name_32(d_reg)
+                } else if use_16bit_dest || use_8bit_dest {
+                    typed_phys_reg_name(d_reg, ty)
+                } else {
+                    phys_reg_name(d_reg)
+                };
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %{}", load_instr, mem, d_name));
+                if use_32bit_dest {
+                    self.zext_loaded_values.insert(dest.0);
+                }
+                self.note_inplace_compute(d_reg, dest.0);
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
+        let acc_reg = if matches!(load_instr, "movl" | "movzbl" | "movzwl") {
+            "%eax"
+        } else if load_instr == "movw" {
+            "%ax"
+        } else if load_instr == "movb" {
+            "%al"
+        } else {
+            "%rax"
+        };
+        self.state
+            .emit_fmt(format_args!("    {} {}, {}", load_instr, mem, acc_reg));
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+        true
+    }
+
+    fn emit_store_indexed_common(
+        &mut self,
+        val: &Operand,
+        index: &Value,
+        shift: u8,
+        ty: IrType,
+        mem: String,
+    ) -> bool {
+        if shift > 3 {
+            return false;
+        }
+        // FP stores straight from the XMM home. Decimal carriers store here
+        // too: D64 via movsd, D32 via movss — bit-exact moves, never a value
+        // conversion (same law as the load arm above and the non-indexed
+        // store fast path). Both halves of the fold contract must accept the
+        // same type set or a guaranteed fold rematerialises over a dead
+        // offset chain (see the load arm's contract note).
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let instr = if matches!(ty, IrType::F64 | IrType::D64) {
+                "movsd"
+            } else {
+                "movss"
+            };
+            let src = self.fp_store_value_xmm(val, ty);
+            self.state
+                .emit_fmt(format_args!("    {} %{}, {}", instr, src, mem));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // I64/U64 included (see emit_load_indexed_common).
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        let store_instr = Self::mov_store_for_type(ty);
+        let _ = index; // liveness handled by the RA link wiring
+        // Immediate-direct: one instruction, no rax staging.
+        if let Operand::Const(c) = val {
+            if let Some(imm) = c.to_i64() {
+                if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                    let imm_out = match ty {
+                        IrType::I8 | IrType::U8 => imm & 0xff,
+                        IrType::I16 | IrType::U16 => imm & 0xffff,
+                        _ => imm,
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, {}", store_instr, imm_out, mem));
+                    return true;
+                }
+            }
+        }
+        self.operand_to_rax(val);
+        let src = Self::reg_for_type("rax", ty);
+        self.state
+            .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, mem));
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        true
+    }
+
+    /// SIB memory operand anchored at the frame register with an alloca slot
+    /// offset: `slot+disp(%rbp/%rsp,%idx,scale)`. Mirrors `slot_ref`'s
+    /// rsp-frame-size adjustment for `use_rsp_addressing` functions. When
+    /// the final displacement is zero on an rbp frame, "0" is kept: a bare
+    /// `(%rbp,%idx,s)` with no displacement is ambiguous in the encoder.
+    fn sib_mem64_frame(&self, slot_off: i64, index_reg: &str, shift: u8, disp: i64) -> String {
+        // NOTE: no leading '%' — the format literals below supply it
+        // (`%{}`), matching phys_reg_name's no-prefix convention.
+        let frame = if self.state.out.use_rsp_addressing {
+            "rsp"
+        } else {
+            "rbp"
+        };
+        let off = if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size + slot_off
+        } else {
+            slot_off
+        } + disp;
+        // On an rbp frame the displacement is always materialised: a bare
+        // `(%rbp,%idx,s)` with mod=00 would relocate the base to RIP. On an
+        // rsp frame SIB base=rsp is unambiguous, so 0 can be omitted.
+        let d = if off == 0 && frame == "rsp" {
+            String::new()
+        } else {
+            format!("{}", off)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", d, frame, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", d, frame, index_reg, 1u32 << shift)
+        }
+    }
+
+    /// Alloca-base arm for indexed addressing: the base is a frame slot
+    /// (Direct), the SIB anchors at %rbp/%rsp. Returns None when the base is
+    /// not a plain Direct alloca slot (register-held, Indirect, OverAligned).
+    fn frame_sib_for_alloca_base(
+        &self,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+    ) -> Option<String> {
+        let idx_reg = self.reg_assignments.get(&index.0).copied()?;
+        if is_xmm_reg(idx_reg) {
+            return None;
+        }
+        match self.state.resolve_slot_addr(base.0) {
+            Some(SlotAddr::Direct(slot)) => {
+                Some(self.sib_mem64_frame(slot.0 as i64, phys_reg_name(idx_reg), shift, disp))
+            }
+            _ => None,
+        }
+    }
+
+    /// Memory operand of an indexed access `[base + (index << shift) + disp]`
+    /// through a register base or a frame slot. `seg` is the segment prefix
+    /// (`"%gs:"`/`"%fs:"`) or empty for a generic access. `None` when no legal
+    /// form exists, which the caller reports as a refusal.
+    fn indexed_access_operand(
+        &mut self,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        seg: &str,
+    ) -> Option<String> {
+        let Some(&b) = self.reg_assignments.get(&base.0) else {
+            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            if !self.ensure_sib_index_form(index) {
+                return None;
+            }
+            return self
+                .frame_sib_for_alloca_base(base, index, shift, disp)
+                .map(|mem| format!("{seg}{mem}"));
+        };
+        if is_xmm_reg(b)
+            || self
+                .reg_assignments
+                .get(&index.0)
+                .copied()
+                .is_none_or(is_xmm_reg)
+        {
+            return None;
+        }
+        if !self.ensure_sib_index_form(index) {
+            return None;
+        }
+        Some(format!(
+            "{seg}{}",
+            Self::sib_mem64(
+                phys_reg_name(b),
+                phys_reg_name(self.reg_assignments[&index.0]),
+                shift,
+                disp,
+            )
+        ))
+    }
+
+    pub(super) fn emit_load_indexed_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        let Some(mem) = self.indexed_access_operand(base, index, shift, disp, "") else {
+            return false;
+        };
+        self.emit_load_indexed_common(dest, index, shift, ty, mem)
+    }
+
+    pub(super) fn emit_store_indexed_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        let Some(mem) = self.indexed_access_operand(base, index, shift, disp, "") else {
+            return false;
+        };
+        self.emit_store_indexed_common(val, index, shift, ty, mem)
+    }
+
+    /// Memory operand of an indexed access through a global symbol base
+    /// `sym(,%idx,scale)`; PIC materialises the symbol in the reserved %rcx.
+    /// `seg` is the segment prefix or empty. `None` when refused.
+    fn indexed_sym_operand(
+        &mut self,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        seg: &str,
+    ) -> Option<String> {
+        // `sym` may carry a composed constant displacement ("gh+2"). The GOT
+        // verdict must be computed on the base symbol, exactly like
+        // `rip_rel_blocked` does on the deciding side (`can_indexed_addr_fold`).
+        // Passing the composed string made `needs_got_for_addr` miss
+        // `local_symbols` under -fPIC, so the emitter refused a fold the
+        // allocator had already committed to: the skipped GEP was then
+        // rematerialised at the access site, clobbering %rax while it held the
+        // acc-resident store value (speedtest1 HashFinal ICE).
+        // C symbol names cannot contain '+'; '-' only occurs in the map's
+        // displacement suffix.
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
+            return None;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return None;
+        };
+        if is_xmm_reg(x) {
+            return None;
+        }
+        if !self.ensure_sib_index_form(index) {
+            return None;
+        }
+        let index_name = phys_reg_name(x);
+        let mem = if self.state.pic_mode {
+            // x86 has no RIP-relative SIB form. Rebuild the legal direct
+            // executable/local symbol in reserved %rcx, then consume the
+            // scaled index in one memory operand. This avoids separately
+            // materializing the shift, add, and derived pointer.
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
+            Self::sib_mem64("rcx", index_name, shift, disp)
+        } else {
+            Self::sib_mem64_sym(sym, index_name, shift, disp)
+        };
+        Some(format!("{seg}{mem}"))
+    }
+
+    pub(super) fn emit_load_indexed_sym_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        let Some(mem) = self.indexed_sym_operand(sym, index, shift, disp, "") else {
+            return false;
+        };
+        self.emit_load_indexed_common(dest, index, shift, ty, mem)
+    }
+
+    pub(super) fn emit_store_indexed_sym_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+        ty: IrType,
+    ) -> bool {
+        let Some(mem) = self.indexed_sym_operand(sym, index, shift, disp, "") else {
+            return false;
+        };
+        self.emit_store_indexed_common(val, index, shift, ty, mem)
+    }
+
+    // Segment-qualified indexed folds. Each takes the same operand
+    // builder as its generic twin with the `%gs:`/`%fs:` prefix, so the
+    // refusal set is identical and the dead-producer contract holds.
+
+    pub(super) fn emit_seg_load_indexed_impl(
+        &mut self,
+        dest: &Value,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) =
+            self.indexed_access_operand(&info.base, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_load_indexed_common(dest, &info.index, info.shift, ty, mem)
+    }
+
+    pub(super) fn emit_seg_store_indexed_impl(
+        &mut self,
+        val: &Operand,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) =
+            self.indexed_access_operand(&info.base, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_store_indexed_common(val, &info.index, info.shift, ty, mem)
+    }
+
+    pub(super) fn emit_seg_load_indexed_sym_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) = self.indexed_sym_operand(sym, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_load_indexed_common(dest, &info.index, info.shift, ty, mem)
+    }
+
+    pub(super) fn emit_seg_store_indexed_sym_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        info: &crate::backend::generation::IndexedGepInfo,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let Some(prefix) = seg_operand_prefix(seg) else {
+            return false;
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        let Some(mem) = self.indexed_sym_operand(sym, &info.index, info.shift, info.disp, prefix)
+        else {
+            return false;
+        };
+        self.emit_store_indexed_common(val, &info.index, info.shift, ty, mem)
+    }
+
+    pub(super) fn emit_typed_store_to_slot_impl(
+        &mut self,
+        instr: &'static str,
+        ty: IrType,
+        slot: StackSlot,
+    ) {
+        // The instruction suffix is authoritative here.  `reg_for_type`
+        // describes the IR value, but a narrow copy must use the matching
+        // architectural subregister; `%rax` with `movb`/`movw` is rejected by
+        // GAS and, worse, used to hide this bug behind a late assembler error.
+        let reg = match instr {
+            "movb" => "al",
+            "movw" => "ax",
+            "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "eax",
+            _ => Self::reg_for_type("rax", ty),
+        };
+        let out = &mut self.state.out;
+        out.write_str("    ");
+        out.write_str(instr);
+        out.write_str(" %");
+        out.write_str(reg);
+        out.write_str(", ");
+        if out.use_rsp_addressing {
+            out.write_i64(out.rsp_frame_size + slot.0);
+            out.write_str("(%rsp)");
+        } else {
+            out.write_i64(slot.0);
+            out.write_str("(%rbp)");
+        }
+        out.newline();
+    }
+
+    pub(super) fn emit_typed_load_from_slot_impl(&mut self, instr: &'static str, slot: StackSlot) {
+        // Select the architectural destination width of the move. `movb` and
+        // `movw` appear in narrow temporary copy paths; spelling `%rax` there
+        // is invalid assembly. Extending loads and movl write eax, while
+        // full-width/sign-to-64 loads write rax.
+        let dest_reg = match instr {
+            "movb" => "%al",
+            "movw" => "%ax",
+            "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "%eax",
+            _ => "%rax",
+        };
+        let out = &mut self.state.out;
+        out.write_str("    ");
+        out.write_str(instr);
+        out.write_str(" ");
+        if out.use_rsp_addressing {
+            out.write_i64(out.rsp_frame_size + slot.0);
+            out.write_str("(%rsp), ");
+        } else {
+            out.write_i64(slot.0);
+            out.write_str("(%rbp), ");
+        }
+        out.write_str(dest_reg);
+        out.newline();
+    }
+
+    pub(super) fn emit_save_acc_impl(&mut self) {
+        // Save %rax to a scratch register before loading a pointer to %rcx.
+        // Use %r11 when %rdx is allocated to a value (rdx is in the caller-saved pool).
+        if self.reg_assignments.values().any(|r| r.0 == 16) {
+            self.state.emit("    movq %rax, %r11");
+        } else {
+            self.state.emit("    movq %rax, %rdx");
+        }
+    }
+
+    pub(super) fn emit_load_ptr_from_slot_impl(&mut self, slot: StackSlot, val_id: u32) {
+        self.state.reg_cache.invalidate_sec(); // clobbers %rcx
+        if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = phys_reg_name(reg);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", reg_name, "rcx");
+        } else {
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+        }
+    }
+
+    pub(super) fn emit_typed_store_indirect_impl(&mut self, instr: &'static str, ty: IrType) {
+        // Store from the accumulator (%rax) to the address in %rcx.
+        // The value was loaded to %rax AFTER the pointer was loaded to %rcx,
+        // so %rax holds the correct value.
+        let store_reg = Self::reg_for_type("rax", ty);
+        self.state
+            .emit_fmt(format_args!("    {} %{}, (%rcx)", instr, store_reg));
+    }
+
+    pub(super) fn emit_typed_load_indirect_impl(&mut self, instr: &'static str) {
+        // movl/movzbl/movzwl write a 32-bit register (implicit zero-extend);
+        // %rax for movzbl/movzwl is rejected by GAS (GAS-oracle).
+        let dest_reg = if matches!(instr, "movl" | "movzbl" | "movzwl") {
+            "%eax"
+        } else {
+            "%rax"
+        };
+        self.state
+            .emit_fmt(format_args!("    {} (%rcx), {}", instr, dest_reg));
+    }
+
+    pub(super) fn emit_add_offset_to_addr_reg_impl(&mut self, offset: i64) {
+        self.state.out.emit_instr_imm_reg("    addq", offset, "rcx");
+    }
+
+    /// Compute the address of an alloca into `reg`, handling over-aligned allocas.
+    pub(super) fn emit_alloca_addr_to(&mut self, reg: &str, val_id: u32, offset: i64) {
+        if let Some(align) = self.state.alloca_over_align(val_id) {
+            self.state.out.emit_instr_rbp_reg("    leaq", offset, reg);
+            self.state
+                .out
+                .emit_instr_imm_reg("    addq", (align - 1) as i64, reg);
+            self.state
+                .out
+                .emit_instr_imm_reg("    andq", -(align as i64), reg);
+        } else {
+            self.state.out.emit_instr_rbp_reg("    leaq", offset, reg);
+        }
+    }
+
+    pub(super) fn emit_slot_addr_to_secondary_impl(
+        &mut self,
+        slot: StackSlot,
+        is_alloca: bool,
+        val_id: u32,
+    ) {
+        self.state.reg_cache.invalidate_sec(); // clobbers %rcx
+        if is_alloca {
+            self.emit_alloca_addr_to("rcx", val_id, slot.0);
+        } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = phys_reg_name(reg);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", reg_name, "rcx");
+        } else {
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+        }
+    }
+
+    pub(super) fn emit_add_secondary_to_acc_impl(&mut self) {
+        self.state.emit("    addq %rcx, %rax");
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    pub(super) fn emit_gep_direct_const_impl(&mut self, slot: StackSlot, offset: i64) {
+        let folded = slot.0 + offset;
+        self.state.out.emit_instr_rbp_reg("    leaq", folded, "rax");
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    pub(super) fn emit_gep_indirect_const_impl(
+        &mut self,
+        slot: StackSlot,
+        offset: i64,
+        val_id: u32,
+    ) {
+        if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = phys_reg_name(reg);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", reg_name, "rax");
+        } else {
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+        }
+        if offset != 0 {
+            self.state
+                .out
+                .emit_instr_mem_reg("    leaq", offset, "rax", "rax");
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Emit leaq (%base, %index), %dest for GEP with both operands in registers.
+    /// If dest is also register-allocated, emits directly to the dest register.
+    /// Otherwise, emits to %rax and stores via store_rax_to.
+    pub(super) fn emit_leaq_base_index_impl(
+        &mut self,
+        base_reg: super::super::super::regalloc::PhysReg,
+        index_reg: super::super::super::regalloc::PhysReg,
+        dest: &Value,
+        dest_phys: Option<super::super::super::regalloc::PhysReg>,
+    ) {
+        use super::emit::phys_reg_name;
+        let base_name = phys_reg_name(base_reg);
+        let index_name = phys_reg_name(index_reg);
+
+        if let Some(dp) = dest_phys {
+            let dest_name = phys_reg_name(dp);
+            self.state.emit_fmt(format_args!(
+                "    leaq (%{}, %{}), %{}",
+                base_name, index_name, dest_name
+            ));
+            self.state.reg_cache.invalidate_acc();
+            // Definition-writes-home accounting: the LEA wrote the GEP's
+            // result into the dest's home.
+            self.note_inplace_compute(dp, dest.0);
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    leaq (%{}, %{}), %rax",
+                base_name, index_name
+            ));
+            // store_rax_to establishes the acc-cache handoff (it marks dest
+            // as the accumulator content, including the immediately-consumed
+            // no-home case).  Invalidating AFTER it strands the value: the
+            // consumer then finds no cache entry, no register, no slot and
+            // fabricates a value (sqlite -O2 sqlite3KeyInfoAlloc: the
+            // `p->aSortFlags = &p->aColl[N+X]` store read a fabricated 0).
+            self.store_rax_to(dest);
+        }
+    }
+
+    /// Emit `leaq sym(, %index, scale), %dest` for a GEP with a symbol
+    /// (GlobalAddr) base and a register-resident index. Mirrors
+    /// `emit_load_indexed_sym_impl` but emits `leaq` (address compute)
+    /// instead of `movq` (load), and records the dest's home via the
+    /// acc-cache handoff (store_rax_to) so the consumer does not hit the
+    /// operand_to_rax "no register home" ICE.
+    pub(super) fn emit_leaq_sym_index_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+    ) -> bool {
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
+            return false;
+        }
+        if shift > 3 {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) {
+            return false;
+        }
+        // SOUNDNESS — the sibling law. Every other symbol+index fold in this
+        // file (`indexed_sym_operand`, `emit_load_indexed_impl`, and the
+        // register-offset pair `emit_load_indexed_sym_reg_base_impl` /
+        // `emit_store_indexed_sym_reg_base_impl`) normalises the index through
+        // `ensure_sib_index_form` before it reaches a SIB. A SIB consumes the
+        // FULL 64-bit register, so a narrow index — the I32 byte offset from
+        // `int *p; p + i`, a U16 element index, a packed-bit lane — whose home
+        // is canonical only in its low half would address with garbage above
+        // bit 31, and a STALE home would address with an already-clobbered
+        // value. This arm did neither: the same GEP shape therefore lowered
+        // correctly through the load arm and incorrectly through the LEA arm,
+        // which is the symptom class the function's own `value_types` lookup
+        // exists to prevent. Refusing falls back to `emit_gep`, whose
+        // register-offset path reloads the index through the sext-aware
+        // operand machinery.
+        if !self.ensure_sib_index_form(index) {
+            return false;
+        }
+        let index_name = phys_reg_name(x);
+        let mem = if self.state.pic_mode {
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
+            Self::sib_mem64("rcx", index_name, shift, disp)
+        } else {
+            Self::sib_mem64_sym(sym, index_name, shift, disp)
+        };
+        if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    leaq {}, %{}", mem, d_name));
+                self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the symbol-index LEA
+                // wrote the GEP's dest into its home.
+                self.note_inplace_compute(d_reg, dest.0);
+                return true;
+            }
+        }
+        self.state.emit_fmt(format_args!("    leaq {}, %rax", mem));
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+        true
+    }
+
+    pub(super) fn emit_gep_add_const_to_acc_impl(&mut self, offset: i64) {
+        if offset != 0 {
+            self.state.out.emit_instr_imm_reg("    addq", offset, "rax");
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    pub(super) fn emit_add_imm_to_acc_impl(&mut self, imm: i64) {
+        self.state.out.emit_instr_imm_reg("    addq", imm, "rax");
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    pub(super) fn emit_round_up_acc_to_16_impl(&mut self) {
+        self.state.emit("    addq $15, %rax");
+        self.state.emit("    andq $-16, %rax");
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    pub(super) fn emit_sub_sp_by_acc_impl(&mut self) {
+        if self.state.stack_clash_protection {
+            let loop_lbl = self.state.fresh_label("dalloca_probe");
+            let rem_lbl = self.state.fresh_label("dalloca_rem");
+            let done_lbl = self.state.fresh_label("dalloca_done");
+            self.state.out.emit_named_label(&loop_lbl);
+            self.state.out.emit_instr_imm_reg("    cmpq", 4096, "rax");
+            self.state.out.emit_jcc_label("    jb", &rem_lbl);
+            self.state.out.emit_instr_imm_reg("    subq", 4096, "rsp");
+            self.state.emit("    orl $0, (%rsp)");
+            self.state.out.emit_instr_imm_reg("    subq", 4096, "rax");
+            self.state.out.emit_jmp_label(&loop_lbl);
+            self.state.out.emit_named_label(&rem_lbl);
+            self.state.emit("    testq %rax, %rax");
+            self.state.out.emit_jcc_label("    jz", &done_lbl);
+            self.state.emit("    subq %rax, %rsp");
+            self.state.emit("    orl $0, (%rsp)");
+            self.state.out.emit_named_label(&done_lbl);
+        } else {
+            self.state.emit("    subq %rax, %rsp");
+        }
+    }
+
+    pub(super) fn emit_mov_sp_to_acc_impl(&mut self) {
+        self.state.emit("    movq %rsp, %rax");
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    pub(super) fn emit_mov_acc_to_sp_impl(&mut self) {
+        self.state.emit("    movq %rax, %rsp");
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    pub(super) fn emit_align_acc_impl(&mut self, align: usize) {
+        self.state
+            .out
+            .emit_instr_imm_reg("    addq", (align - 1) as i64, "rax");
+        self.state
+            .out
+            .emit_instr_imm_reg("    andq", -(align as i64), "rax");
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    pub(super) fn emit_memcpy_load_dest_addr_impl(
+        &mut self,
+        slot: StackSlot,
+        is_alloca: bool,
+        val_id: u32,
+    ) {
+        if is_alloca {
+            self.emit_alloca_addr_to("rdi", val_id, slot.0);
+        } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = phys_reg_name(reg);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", reg_name, "rdi");
+        } else {
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rdi");
+        }
+    }
+
+    pub(super) fn emit_memcpy_load_src_addr_impl(
+        &mut self,
+        slot: StackSlot,
+        is_alloca: bool,
+        val_id: u32,
+    ) {
+        if is_alloca {
+            self.emit_alloca_addr_to("rsi", val_id, slot.0);
+        } else if let Some(&reg) = self.reg_assignments.get(&val_id) {
+            let reg_name = phys_reg_name(reg);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", reg_name, "rsi");
+        } else {
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rsi");
+        }
+    }
+
+    pub(super) fn emit_alloca_aligned_addr_impl(&mut self, slot: StackSlot, val_id: u32) {
+        let align = self
+            .state
+            .alloca_over_align(val_id)
+            .expect("alloca must have over-alignment for aligned addr emission");
+        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rcx");
+        self.state
+            .out
+            .emit_instr_imm_reg("    addq", (align - 1) as i64, "rcx");
+        self.state
+            .out
+            .emit_instr_imm_reg("    andq", -(align as i64), "rcx");
+    }
+
+    pub(super) fn emit_alloca_aligned_addr_to_acc_impl(&mut self, slot: StackSlot, val_id: u32) {
+        let align = self
+            .state
+            .alloca_over_align(val_id)
+            .expect("alloca must have over-alignment for aligned addr emission");
+        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+        self.state
+            .out
+            .emit_instr_imm_reg("    addq", (align - 1) as i64, "rax");
+        self.state
+            .out
+            .emit_instr_imm_reg("    andq", -(align as i64), "rax");
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    pub(super) fn emit_acc_to_secondary_impl(&mut self) {
+        self.state.emit("    movq %rax, %rcx");
+        // S22 SEC contract: this hook overwrites %rcx — on x86-64 it is
+        // reached only through the OverAligned arm of the default emit_gep
+        // (traits.rs): emit_reg_to_secondary, emit_leaq_base_index,
+        // emit_gep_add_const_to_acc and emit_memcpy are all overridden here
+        // without the accumulator round-trip, and the float-binop default
+        // that also calls it is dead (every backend overrides it). Any
+        // parked SEC residency is stale from here on: invalidate per the
+        // conservative emit_reg_to_secondary precedent. (A precise park of
+        // the GEP base would be sound but is deliberately NOT done: the
+        // hook carries no value id, the base is an overaligned alloca (too
+        // rare to measure a hit-rate effect), and a traits-level park would
+        // activate riscv's dormant SEC consumer whose writers were never
+        // audited. Soundness here, performance elsewhere.)
+        self.state.reg_cache.invalidate_sec();
+    }
+
+    pub(super) fn emit_memcpy_store_dest_from_acc_impl(&mut self) {
+        self.state.emit("    movq %rcx, %rdi");
+    }
+
+    pub(super) fn emit_memcpy_store_src_from_acc_impl(&mut self) {
+        self.state.emit("    movq %rcx, %rsi");
+    }
+
+    /// Inline a fixed-size `memcpy(dest, src, size)` call (from
+    /// `__builtin_memcpy` with a constant size). `dest`/`src` are generic
+    /// pointer operands; load them into rdi/rsi and run the fixed-size copy.
+    /// This turns the bundled SIMD headers' `__builtin_memcpy(&x, &y, 16)`
+    /// software fallbacks into a single movdqu pair instead of a libc call.
+    /// Where a copy-address operand currently lives. Only `Gpr` sources can
+    /// alias the staging targets (`%rdi`/`%rsi`); every other kind is
+    /// materialised from `%rbp`/`%rsp`/an XMM register/an immediate and can
+    /// be emitted in any order.
+    fn copy_addr_source(&self, op: &Operand) -> CopyAddrSource {
+        let v = match op {
+            Operand::Value(v) => *v,
+            Operand::Const(_) => return CopyAddrSource::Generic,
+        };
+        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+            return if is_xmm_reg(reg) {
+                CopyAddrSource::Xmm(reg)
+            } else {
+                CopyAddrSource::Gpr(reg)
+            };
+        }
+        match self.state.resolve_slot_addr(v.0) {
+            Some(SlotAddr::Reg(reg)) if is_xmm_reg(reg) => CopyAddrSource::Xmm(reg),
+            Some(SlotAddr::Reg(reg)) => CopyAddrSource::Gpr(reg),
+            // Allocas (plain or over-aligned) and 16/32-byte payload values
+            // (i128/F128/Vec*) live DIRECTLY in their slot: the address IS
+            // the operand. `emit_alloca_addr_to` applies the over-alignment
+            // fix-up when the value has one and a plain `leaq` otherwise.
+            Some(SlotAddr::Direct(slot)) | Some(SlotAddr::OverAligned(slot, _)) => {
+                CopyAddrSource::SlotAddress(slot, v.0)
+            }
+            Some(SlotAddr::Indirect(slot)) => CopyAddrSource::SlotLoad(slot),
+            None => CopyAddrSource::Generic,
+        }
+    }
+
+    /// Materialise one copy-address operand into `target` (`"rdi"`/`"rsi"`).
+    fn emit_copy_addr_to(&mut self, op: &Operand, src: &CopyAddrSource, target: &'static str) {
+        match *src {
+            CopyAddrSource::Gpr(reg) => {
+                let name = phys_reg_name(reg);
+                if name != target {
+                    self.state.out.emit_instr_reg_reg("    movq", name, target);
+                }
+            }
+            CopyAddrSource::Xmm(reg) => {
+                self.state.emit_fmt(format_args!(
+                    "    movq %{}, %{}",
+                    phys_reg_name(reg),
+                    target
+                ));
+            }
+            CopyAddrSource::SlotAddress(slot, val_id) => {
+                self.emit_alloca_addr_to(target, val_id, slot.0);
+            }
+            CopyAddrSource::SlotLoad(slot) => {
+                self.state
+                    .out
+                    .emit_instr_rbp_reg("    movq", slot.0, target);
+            }
+            CopyAddrSource::Generic => self.operand_to_reg(op, target),
+        }
+    }
+
+    /// Stage `dest → %rdi`, `src → %rsi` as a **parallel copy**.
+    ///
+    /// The two targets are also possible *sources*: with parameters kept in
+    /// their ABI registers across inline expansions
+    /// (`regalloc::x86_param_caller_homes_safe`) and with the allocator free
+    /// to home any pointer in `%rdi`/`%rsi`, `memcpy(d, s)` may see `s` in
+    /// `%rdi`, `d` in `%rsi`, or both. Sequential staging through a scratch
+    /// register destroyed the not-yet-read operand (`mc2`: `%rsi` was
+    /// overwritten with `%rdi` before it was read, so source and destination
+    /// collapsed onto the same address and the copy became a no-op).
+    ///
+    /// Resolution is the classic two-node parallel-move schedule:
+    ///   * neither target is the other operand's source → any order;
+    ///   * exactly one target is the other operand's source → write the
+    ///     *other* target first (its source is untouched);
+    ///   * both cross → one `xchgq`.
+    /// Non-register sources (slot loads, `leaq` of allocas, constants) never
+    /// read `%rdi`/`%rsi`, so they impose no ordering constraint.
+    pub(super) fn stage_copy_operands(&mut self, dest: &Operand, src: &Operand) {
+        const RDI: PhysReg = PhysReg(14);
+        const RSI: PhysReg = PhysReg(15);
+        let d_src = self.copy_addr_source(dest);
+        let s_src = self.copy_addr_source(src);
+        let src_in_rdi = matches!(s_src, CopyAddrSource::Gpr(r) if r == RDI);
+        let dest_in_rsi = matches!(d_src, CopyAddrSource::Gpr(r) if r == RSI);
+        if src_in_rdi && dest_in_rsi {
+            self.state.emit("    xchgq %rdi, %rsi");
+        } else if src_in_rdi {
+            // `%rdi` must be read before it is written: stage src first.
+            self.emit_copy_addr_to(src, &s_src, "rsi");
+            self.emit_copy_addr_to(dest, &d_src, "rdi");
+        } else {
+            self.emit_copy_addr_to(dest, &d_src, "rdi");
+            self.emit_copy_addr_to(src, &s_src, "rsi");
+        }
+        // %rdi/%rsi are not tracked by the acc/sec cache, but a value that
+        // *was* cached there through an operand load (Generic path) is now
+        // stale relative to the register file.
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// IR `Memcpy { dest, src, size }` (x86 override of the generic trait
+    /// default, which staged both addresses through `%rcx` sequentially).
+    pub(super) fn emit_memcpy_ir_impl(&mut self, dest: &Value, src: &Value, size: usize) {
+        self.stage_copy_operands(&Operand::Value(*dest), &Operand::Value(*src));
+        self.emit_memcpy_impl_impl(size);
+    }
+
+    /// Materialise the call result (= dest) from the copy kept in %rdx.
+    /// %rdx is untouched by both expansions, is never a home of a value live
+    /// across a call point, and every parameter is dead after the expansion
+    /// whenever the allocator left parameters in caller-saved registers.
+    fn store_inline_libc_result(&mut self, result: Option<&Value>) {
+        if let Some(r) = result {
+            self.state.emit("    movq %rdx, %rax");
+            crate::backend::traits::ArchCodegen::emit_store_result(self, r);
+        }
+    }
+
+    pub(super) fn emit_inline_memcpy_call_impl(
+        &mut self,
+        dest: &Operand,
+        src: &Operand,
+        size: usize,
+        result: Option<&Value>,
+    ) {
+        self.stage_copy_operands(dest, src);
+        if result.is_some() {
+            self.state.emit("    movq %rdi, %rdx");
+        }
+        self.emit_memcpy_impl_impl(size);
+        self.store_inline_libc_result(result);
+    }
+
+    pub(super) fn emit_inline_memmove_call_impl(
+        &mut self,
+        dest: &Operand,
+        src: &Operand,
+        size: usize,
+        result: Option<&Value>,
+    ) {
+        // Source slot may still be a deferred vector result.
+        self.flush_pending_vec_store_impl();
+        self.stage_copy_operands(dest, src);
+        if result.is_some() {
+            // %rdx survives both expansions (see store_inline_libc_result).
+            self.state.emit("    movq %rdi, %rdx");
+        }
+        // Small constant sizes take the branch-free expansion below: it is
+        // overlap-safe by construction (every chunk is loaded into a scratch
+        // register before the first store), which is what memmove needs and
+        // what a forward `movdqu` sequence does NOT provide.
+        if size <= MEMMOVE_BUFFERED_MAX && !(self.no_sse && size > 16) {
+            self.emit_memmove_buffered_impl(size);
+            self.store_inline_libc_result(result);
+            return;
+        }
+        // Larger sizes (or -mno-sse above 16 bytes, where no xmm register may
+        // be touched at all): rep-movsb fallback, which needs no scratch
+        // registers.  `inline_memcpy_len` asks for it only for the -mno-sse
+        // 17..32-byte window today.
+        //
+        // `rep movsb` always walks upward, so the backwards case must first
+        // move BOTH pointers to the end of their ranges; the previous form
+        // reloaded only the count and copied the wrong bytes (it never ran,
+        // because nothing expanded memmove at all).
+        let lbl = self.state.next_label_id();
+        let done = format!(".Lmmv_done_{}", lbl);
+        let bwd = format!(".Lmmv_bwd_{}", lbl);
+        self.state
+            .out
+            .emit_instr_imm_reg("    movq", size as i64, "rcx");
+        self.state.emit("    cmpq %rsi, %rdi");
+        self.state.emit_fmt(format_args!("    je {}", done)); // same address: nothing to copy
+        self.state.emit_fmt(format_args!("    ja {}", bwd)); // dst > src: backward
+        self.state.emit("    rep movsb");
+        self.state.emit_fmt(format_args!("    jmp {}", done));
+        self.state.emit_fmt(format_args!("{}:", bwd));
+        // DF=1 makes rep movsb walk downward, starting at the byte each
+        // pointer references: point both at the LAST byte of their range.
+        self.state.emit("    leaq -1(%rsi,%rcx), %rsi");
+        self.state.emit("    leaq -1(%rdi,%rcx), %rdi");
+        self.state.emit("    std");
+        self.state.emit("    rep movsb");
+        self.state.emit("    cld");
+        self.state.emit_fmt(format_args!("{}:", done));
+        self.state.reg_cache.invalidate_all();
+        self.store_inline_libc_result(result);
+    }
+
+    /// Overlap-safe expansion of a small constant-size `memmove`.
+    ///
+    /// The classic forward copy is only correct when the ranges are disjoint
+    /// or dest < src; the classic backward copy needs DF toggling (a
+    /// serialising `std`/`cld` pair) plus a direction branch.  For a size
+    /// that fits in two scratch registers the whole copy can be *buffered*
+    /// instead: load every chunk into a register, then store them.  No
+    /// branch, no flag traffic, and correct for any overlap because no store
+    /// is visible to a later load.
+    ///
+    /// Scratch discipline: %rax and %rcx (scalar) or %xmm0 and %xmm1
+    /// (vector) — exactly the set `inline_memcpy_len`'s contract publishes to
+    /// the allocator, the frame scan and the MachInst gate.
+    ///
+    /// Chunking never rounds up: a 5-byte move composes from overlapping
+    /// in-bounds pieces (`movl 0` + `movl 1`), never from a wider load that
+    /// could read past the end of the object.
+    fn emit_memmove_buffered_impl(&mut self, size: usize) {
+        debug_assert!(size <= MEMMOVE_BUFFERED_MAX);
+        if size == 0 {
+            return;
+        }
+        // VEX-128 whenever AVX2 is enabled: `vmovdqu %xmm` zeroes the upper
+        // half of the register, so this can never trigger a legacy-SSE
+        // transition in a function that also used 256-bit ops.
+        let mv = if self.avx2_enabled && !self.no_sse {
+            "vmovdqu"
+        } else {
+            "movdqu"
+        };
+        // (width, offset) per piece; loads are all emitted before any store.
+        // At most two pieces ever, because only %rax/%rcx (or %xmm0/%xmm1)
+        // may be touched; the caller sends -mno-sse sizes above 16 bytes to
+        // the rep-movsb fallback for exactly that reason.
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        if self.no_sse {
+            // No xmm/ymm may be touched (kernel boot runs with CR4.OSFXSR=0).
+            match size {
+                1 => pieces.push((1, 0)),
+                2 => pieces.push((2, 0)),
+                3 => {
+                    pieces.push((2, 0));
+                    pieces.push((1, 2));
+                }
+                4 => pieces.push((4, 0)),
+                5..=7 => {
+                    pieces.push((4, 0));
+                    pieces.push((4, size - 4));
+                }
+                8 => pieces.push((8, 0)),
+                _ => {
+                    pieces.push((8, 0));
+                    pieces.push((8, size - 8));
+                }
+            }
+        } else if size <= 16 {
+            if size == 16 {
+                pieces.push((16, 0));
+            } else {
+                // A 16-byte load would read past the end of a smaller object;
+                // combine exact-width scalar pieces instead.  They are all in
+                // bounds and overlap only each other.
+                match size {
+                    1 => pieces.push((1, 0)),
+                    2 => pieces.push((2, 0)),
+                    3 => {
+                        pieces.push((2, 0));
+                        pieces.push((1, 2));
+                    }
+                    4 => pieces.push((4, 0)),
+                    5..=7 => {
+                        pieces.push((4, 0));
+                        pieces.push((4, size - 4));
+                    }
+                    _ => {
+                        pieces.push((8, 0));
+                        pieces.push((8, size - 8));
+                    }
+                }
+            }
+        } else {
+            pieces.push((16, 0));
+            pieces.push((16, size - 16));
+        }
+        let gpr = |slot: usize, width: usize| -> String {
+            let base = if slot == 0 { "a" } else { "c" };
+            match width {
+                8 => format!("%r{}x", base),
+                4 => format!("%e{}x", base),
+                2 => format!("%{}x", base),
+                _ => format!("%{}l", base),
+            }
+        };
+        for (i, (width, off)) in pieces.iter().enumerate() {
+            if *width == 16 {
+                self.state
+                    .emit_fmt(format_args!("    {} {}(%rsi), %xmm{}", mv, off, i));
+            } else {
+                self.state.emit_fmt(format_args!(
+                    "    mov{} {}(%rsi), {}",
+                    match width {
+                        8 => "q",
+                        4 => "l",
+                        2 => "w",
+                        _ => "b",
+                    },
+                    off,
+                    gpr(i, *width)
+                ));
+            }
+        }
+        for (i, (width, off)) in pieces.iter().enumerate() {
+            if *width == 16 {
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm{}, {}(%rdi)", mv, i, off));
+            } else {
+                self.state.emit_fmt(format_args!(
+                    "    mov{} {}, {}(%rdi)",
+                    match width {
+                        8 => "q",
+                        4 => "l",
+                        2 => "w",
+                        _ => "b",
+                    },
+                    gpr(i, *width),
+                    off
+                ));
+            }
+        }
+        self.state.invalidate_vec_peephole();
+        self.state.reg_cache.invalidate_all();
+    }
+
+    // ------------------------------------------------------------------
+    // Fixed-size memset expansion.
+    //
+    // Every constant-size `memset` used to be a `call memset@PLT`: 10
+    // instructions with a callee-saved spill for `memset(p, 0, 15)` where
+    // Clang emits two overlapping `movq $0` stores and GCC a 8/4/2/1 ladder.
+    // The lowering below is driven by the CPU tuning row
+    // (`X86Tune::memset_strategy`, docs/CPU_MODEL_AUDIT.md §4):
+    //
+    // * size < 16             two overlapping scalar stores of the largest
+    //                         power-of-two width ≤ size (Clang's shape; one
+    //                         store fewer than GCC's ladder for 3/5/6/7/9..15).
+    // * ≤ 8 vector stores     straight-line `movups`/`vmovdqu` (Clang
+    //                         `MaxStoresPerMemset`); the last store overlaps
+    //                         the previous one instead of a narrower ladder.
+    // * ≥ rep_stosb_threshold `rep stosb` on ERMS rows (glibc
+    //   (2048 B)              `__x86_rep_stosb_threshold`; glibc's own memset
+    //                         takes this path at the same size).
+    // * otherwise             counted loop, two vector stores per iteration,
+    //                         vector remainder with one overlapping store.
+    // * above ¼ L3 (ERMS) /   `LibCall` — not expanded (`inline_memset_len`
+    //   8 KiB (no ERMS)       answers None), glibc's non-temporal path wins.
+    // * `-mno-sse`            scalar 8-byte stores ≤ 64 B, `rep stosb` above
+    //                         (kernel boot code, no libc, CR4.OSFXSR=0).
+    //
+    // The vector width follows the `-march` contract exactly like the block
+    // copy path (`block_copy_vector_bytes`): 32-byte YMM only when AVX2 is
+    // enabled and the row does not split 256-bit unaligned accesses; VEX-128
+    // encodings whenever AVX2 is enabled so no legacy-SSE instruction is
+    // issued while an upper YMM half may be dirty.
+    // ------------------------------------------------------------------
+
+    /// Store `width` ∈ {1,2,4,8} bytes of the fill pattern at `off(%rdi)`.
+    /// `rax_pat` tracks whether %rax already holds the 64-bit broadcast of
+    /// the fill byte (constant fills materialise it lazily, at most once).
+    fn emit_memset_scalar_store(
+        &mut self,
+        off: i64,
+        width: usize,
+        const_byte: Option<u8>,
+        rax_pat: &mut bool,
+    ) {
+        let mem = if off == 0 {
+            "(%rdi)".to_string()
+        } else {
+            format!("{}(%rdi)", off)
+        };
+        match (width, const_byte) {
+            (8, Some(b)) => {
+                let pat = (b as u64).wrapping_mul(0x0101_0101_0101_0101);
+                let sx = pat as i64;
+                if i32::try_from(sx).is_ok() {
+                    // 0x00 / 0xFF: sign-extended imm32 form (`movq $0` / `movq $-1`).
+                    self.state
+                        .emit_fmt(format_args!("    movq ${}, {}", sx, mem));
+                } else {
+                    if !*rax_pat {
+                        self.state
+                            .emit_fmt(format_args!("    movabsq $0x{:x}, %rax", pat));
+                        *rax_pat = true;
+                    }
+                    self.state.emit_fmt(format_args!("    movq %rax, {}", mem));
+                }
+            }
+            (8, None) => self.state.emit_fmt(format_args!("    movq %rax, {}", mem)),
+            (4, Some(b)) => self.state.emit_fmt(format_args!(
+                "    movl $0x{:x}, {}",
+                (b as u32).wrapping_mul(0x0101_0101),
+                mem
+            )),
+            (4, None) => self.state.emit_fmt(format_args!("    movl %eax, {}", mem)),
+            (2, Some(b)) => self.state.emit_fmt(format_args!(
+                "    movw $0x{:x}, {}",
+                (b as u16).wrapping_mul(0x0101),
+                mem
+            )),
+            (2, None) => self.state.emit_fmt(format_args!("    movw %ax, {}", mem)),
+            (_, Some(b)) => self
+                .state
+                .emit_fmt(format_args!("    movb $0x{:x}, {}", b, mem)),
+            (_, None) => self.state.emit_fmt(format_args!("    movb %al, {}", mem)),
+        }
+    }
+
+    /// Fill `[base, base+len)` (len < 16) with at most two overlapping
+    /// scalar stores: width w = largest power of two ≤ len at `base`, and a
+    /// second w-byte store ending exactly at `base+len` when len > w.
+    fn emit_memset_scalar_tail(
+        &mut self,
+        base: i64,
+        len: usize,
+        const_byte: Option<u8>,
+        rax_pat: &mut bool,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let w = if len >= 8 {
+            8
+        } else if len >= 4 {
+            4
+        } else if len >= 2 {
+            2
+        } else {
+            1
+        };
+        self.emit_memset_scalar_store(base, w, const_byte, rax_pat);
+        if len > w {
+            self.emit_memset_scalar_store(base + (len - w) as i64, w, const_byte, rax_pat);
+        }
+    }
+
+    /// Fill `[base, base+len)` (len ≥ 16) with straight-line vector stores:
+    /// w = 32 when `use_ymm` and len ≥ 32, else 16; stores at base, base+w,
+    /// …; the final store overlaps so that no narrower ladder is needed.
+    fn emit_memset_vec_region(&mut self, base: i64, len: usize, use_ymm: bool, vex: bool) {
+        debug_assert!(len >= 16);
+        let (w, mv, reg) = if use_ymm && len >= 32 {
+            (32usize, "vmovdqu", "%ymm0")
+        } else if vex {
+            (16usize, "vmovdqu", "%xmm0")
+        } else {
+            (16usize, "movups", "%xmm0")
+        };
+        let store = |this: &mut Self, off: i64| {
+            if off == 0 {
+                this.state
+                    .emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
+            } else {
+                this.state
+                    .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, off));
+            }
+        };
+        let mut off = 0usize;
+        while off + w <= len {
+            store(self, base + off as i64);
+            off += w;
+        }
+        if off < len {
+            store(self, base + (len - w) as i64);
+        }
+    }
+
+    /// Materialise the fill pattern in %xmm0 (and %ymm0 when `use_ymm`).
+    /// Zero and all-ones use the dependency-breaking idioms; other constant
+    /// bytes broadcast a 32-bit immediate; a runtime byte broadcasts the
+    /// byte staged in %ecx (raw under AVX2, 32-bit pattern under SSE2).
+    fn emit_memset_vec_pattern(&mut self, const_byte: Option<u8>, use_ymm: bool, vex: bool) {
+        match const_byte {
+            Some(0) => {
+                if vex {
+                    // VEX-128 zeroing idiom zeroes the full %ymm0.
+                    self.state.emit("    vpxor %xmm0, %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    pxor %xmm0, %xmm0");
+                }
+            }
+            Some(0xFF) => {
+                if use_ymm {
+                    self.state.emit("    vpcmpeqd %ymm0, %ymm0, %ymm0");
+                } else if vex {
+                    self.state.emit("    vpcmpeqd %xmm0, %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    pcmpeqd %xmm0, %xmm0");
+                }
+            }
+            Some(b) => {
+                self.state.emit_fmt(format_args!(
+                    "    movl $0x{:x}, %eax",
+                    (b as u32).wrapping_mul(0x0101_0101)
+                ));
+                if use_ymm {
+                    self.state.emit("    vmovd %eax, %xmm0");
+                    self.state.emit("    vpbroadcastd %xmm0, %ymm0");
+                } else if vex {
+                    self.state.emit("    vmovd %eax, %xmm0");
+                    self.state.emit("    vpbroadcastd %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    movd %eax, %xmm0");
+                    self.state.emit("    pshufd $0, %xmm0, %xmm0");
+                }
+            }
+            None => {
+                // Runtime byte.  AVX2: %ecx holds the raw value; broadcast
+                // its low byte lane directly (GCC/Clang/ICX shape, 2
+                // instructions).  SSE2: %ecx holds the 32-bit pattern
+                // (imull $0x01010101 in the caller); `pshufd $0` replicates it.
+                if use_ymm {
+                    self.state.emit("    vmovd %ecx, %xmm0");
+                    self.state.emit("    vpbroadcastb %xmm0, %ymm0");
+                } else if vex {
+                    self.state.emit("    vmovd %ecx, %xmm0");
+                    self.state.emit("    vpbroadcastb %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    movd %ecx, %xmm0");
+                    self.state.emit("    pshufd $0, %xmm0, %xmm0");
+                }
+            }
+        }
+    }
+
+    /// `rep stosb`: %al = fill byte, %rcx = count, %rdi = dest (DF = 0 per
+    /// the SysV ABI at every call boundary).
+    fn emit_memset_rep_stosb(&mut self, size: usize, const_byte: Option<u8>) {
+        match const_byte {
+            Some(0) => self.state.emit("    xorl %eax, %eax"),
+            Some(b) => self.state.emit_fmt(format_args!("    movl ${}, %eax", b)),
+            None => {} // %rax already holds the broadcast; %al is the byte.
+        }
+        self.state
+            .out
+            .emit_instr_imm_reg("    movq", size as i64, "rcx");
+        self.state.emit("    rep stosb");
+    }
+
+    /// Inline `memset(dest, value, size)`; see the section comment above.
+    pub(super) fn emit_inline_memset_call_impl(
+        &mut self,
+        dest: &Operand,
+        value: &Operand,
+        size: usize,
+        result: Option<&Value>,
+    ) {
+        use crate::backend::x86::cpu_model::CopyStrategy;
+        // %xmm0 is clobbered: the vector last-store peephole and the
+        // deferred-store cache must not reuse a stale value (same soundness
+        // rule as emit_memcpy_impl_impl).
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+
+        let const_byte: Option<u8> = match value {
+            Operand::Const(c) => c.to_i64().map(|v| v as u8),
+            Operand::Value(_) => None,
+        };
+        // Stage the fill value before the destination: a runtime byte homed
+        // in %rdi must be read before %rdi is overwritten, and no allocation
+        // is ever homed in %rax, so the destination load cannot disturb it.
+        let mut rax_pat = false;
+        let vb = self.tune.block_copy_vector_bytes(self.avx2_enabled);
+        let strategy = self.tune.memset_strategy(size, vb);
+        // Which expansion consumes a runtime fill byte, decided up front so
+        // the byte is staged where that expansion reads it (see below).
+        let rep = size > 0
+            && (self.no_sse && size > 64
+                || !self.no_sse
+                    && size >= 16
+                    && strategy == CopyStrategy::RepMovsb
+                    && std::env::var_os("CCC_NO_REP_MOVSB").is_none());
+        let vector = !self.no_sse && size >= 16 && !rep;
+        // Vector expansions broadcast from a GPR that is dead afterwards;
+        // %rcx is used (not %rax) so the staging copy is never kept alive by
+        // the peephole's conservative "return value live at ret" rule in a
+        // void function, and the loop counter re-uses it only after the
+        // broadcast.  Scalar tails and `rep stosb` read %rax/%al.
+        let fill_gpr = if vector { "rcx" } else { "rax" };
+        if const_byte.is_none() {
+            self.operand_to_reg(value, fill_gpr);
+        }
+        self.operand_to_reg(dest, "rdi");
+        if result.is_some() {
+            self.state.emit("    movq %rdi, %rdx");
+        }
+        if size == 0 {
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        // Runtime fill byte: broadcast only as wide as the chosen expansion
+        // actually consumes (FOLLOWUP_CPU_MODEL #2).
+        //   * `rep stosb` reads %al only — no broadcast at all.
+        //   * Vector paths under AVX2 broadcast the byte lane directly
+        //     (`vmovd` + `vpbroadcastb`, 2 µops, p5-free on GLC/RPC); the
+        //     GPR multiply chain (movzbl + movabs + 3-cycle imul) is gone.
+        //   * Scalar tails and the SSE2 baseline widen through the integer
+        //     multiplier: a 32-bit `imull $0x01010101` (imm32, one
+        //     instruction) is enough for a `movl` tail or a `pshufd`
+        //     broadcast; only an 8-byte `movq %rax` store needs the 64-bit
+        //     `movabsq` + `imulq` form.
+        // `rax_pat` records that %rax holds the *64-bit* pattern; the
+        // scalar-store helper relies on it only for 8-byte stores.
+        if const_byte.is_none() {
+            let vex = vb == 32;
+            if rep {
+                // %al already is the fill byte.
+            } else if vector && vex {
+                // Consumed by emit_memset_vec_pattern (vpbroadcastb from %ecx).
+            } else if vector {
+                // 32-bit pattern in %ecx for the SSE2 pshufd broadcast.
+                self.state.emit("    movzbl %cl, %ecx");
+                self.state.emit("    imull $0x1010101, %ecx, %ecx");
+            } else if size < 8 {
+                // 32-bit pattern: movl/movw/movb tails.
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    imull $0x1010101, %eax, %eax");
+            } else {
+                // 64-bit pattern: (uint8)c * 0x0101010101010101.
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    movabsq $0x101010101010101, %rcx");
+                self.state.emit("    imulq %rcx, %rax");
+                rax_pat = true;
+            }
+        }
+
+        if self.no_sse {
+            // No vector instruction may be emitted (CR4.OSFXSR may be 0).
+            if size > 64 {
+                self.emit_memset_rep_stosb(size, const_byte);
+            } else {
+                let mut off = 0usize;
+                while off + 8 <= size {
+                    self.emit_memset_scalar_store(off as i64, 8, const_byte, &mut rax_pat);
+                    off += 8;
+                }
+                if off < size {
+                    if size >= 8 {
+                        self.emit_memset_scalar_store(
+                            (size - 8) as i64,
+                            8,
+                            const_byte,
+                            &mut rax_pat,
+                        );
+                    } else {
+                        self.emit_memset_scalar_tail(0, size, const_byte, &mut rax_pat);
+                    }
+                }
+            }
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        if size < 16 {
+            self.emit_memset_scalar_tail(0, size, const_byte, &mut rax_pat);
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        if strategy == CopyStrategy::RepMovsb && std::env::var_os("CCC_NO_REP_MOVSB").is_none() {
+            self.emit_memset_rep_stosb(size, const_byte);
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        let vex = vb == 32;
+        let use_ymm = vex && size >= 32;
+        self.emit_memset_vec_pattern(const_byte, use_ymm, vex);
+
+        if strategy == CopyStrategy::InlineUnrolled {
+            self.emit_memset_vec_region(0, size, use_ymm, vex);
+        } else {
+            // Counted loop: two vector stores (2 × vb bytes) per iteration,
+            // then the remainder relative to the advanced %rdi.  A remainder
+            // shorter than 16 bytes is covered by one 16-byte store that
+            // overlaps the already-filled prefix (negative displacement).
+            let chunk = 2 * vb;
+            let full_chunks = size / chunk;
+            let remainder = size % chunk;
+            debug_assert!(full_chunks > 0);
+            let (mv, reg) = if use_ymm {
+                ("vmovdqu", "%ymm0")
+            } else if vex {
+                ("vmovdqu", "%xmm0")
+            } else {
+                ("movups", "%xmm0")
+            };
+            self.state
+                .out
+                .emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
+            let loop_label = format!(".Lmset_loop_{}", self.state.next_label_id());
+            self.state.emit_fmt(format_args!("{}:", loop_label));
+            self.state
+                .emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, vb));
+            self.state
+                .emit_fmt(format_args!("    addq ${}, %rdi", chunk));
+            self.state.emit("    decq %rcx");
+            self.state.emit_fmt(format_args!("    jne {}", loop_label));
+            if remainder >= 16 {
+                self.emit_memset_vec_region(0, remainder, use_ymm, vex);
+            } else if remainder > 0 {
+                let mv16 = if vex { "vmovdqu" } else { "movups" };
+                self.state.emit_fmt(format_args!(
+                    "    {} %xmm0, -{}(%rdi)",
+                    mv16,
+                    16 - remainder
+                ));
+            }
+        }
+        if use_ymm {
+            // Arm the epilogue vzeroupper (upper %ymm0 half is dirty).
+            self.state.dirty_upper_ymm = true;
+        }
+        self.store_inline_libc_result(result);
+        self.state.reg_cache.invalidate_all();
+    }
+
+    pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {
+        // SOUNDNESS (v9 / BUG-004): 16/32-byte copies go through %xmm0/%ymm0/%ymm1.
+        // The vector last-store peephole and deferred-store cache assume those
+        // registers still hold the last SIMD intrinsic result. Clobbering them
+        // here without invalidation made inlined fold_state_1
+        //   *xmm_crc3 = _mm_xor_si128(x_low, x_high)
+        // reuse a stale %xmm0 (the just-copied *crc3 = 0) instead of reloading
+        // x_high from its slot. zlib-ng CRC32 then failed iff (n % 64) ∈ [16,31].
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+
+        // A complete 64-byte assignment is the profitable boundary for YMM:
+        // four memory instructions replace eight XMM instructions, and an
+        // explicit vzeroupper prevents any later legacy-SSE transition. Smaller
+        // 32/48-byte copies stay XMM (the vzeroupper cost erases their one- or
+        // two-instruction saving in hot struct loops).
+        if size == 64
+            && self.avx2_enabled
+            && !self.no_sse
+            && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none()
+        {
+            if self.avx512_enabled && self.wide_simd_copies {
+                // Exact 64-byte copy. A single full-width store also avoids
+                // the two-YMM-store -> ZMM-load forwarding penalty when an
+                // EVEX intrinsic immediately consumes this aggregate.
+                self.state.emit("    vmovdqu64 (%rsi), %zmm0");
+                self.state.emit("    vmovdqu64 %zmm0, (%rdi)");
+            } else {
+                self.state.emit("    vmovdqu (%rsi), %ymm0");
+                self.state.emit("    vmovdqu %ymm0, (%rdi)");
+                self.state.emit("    vmovdqu 32(%rsi), %ymm1");
+                self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
+            }
+            self.state.emit("    vzeroupper");
+            // This copy cleans only its own YMM writes. `dirty_upper_ymm` is
+            // tracked in emission order, not per path, so it must keep any
+            // dirt an earlier-emitted block left on a path that bypasses it.
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        if size <= 64 {
+            let mut offset = 0usize;
+            let mut remaining = size;
+            // AVX->SSE TRANSITION: do not use 256-bit ymm for small inline
+            // copies.
+            //
+            // A 32-byte chunk as one `vmovdqu %ymm0` saves exactly ONE
+            // instruction over two 16-byte moves. But it leaves the upper half
+            // of ymm0 dirty, and every legacy-SSE instruction executed
+            // afterwards -- including ordinary scalar FP such as movsd/mulsd/
+            // addsd, which this backend emits everywhere -- pays a CPU state
+            // transition of roughly 70 cycles on Intel. A struct-copying loop
+            // alternates between the two domains on every iteration and pays it
+            // twice per iteration.
+            //
+            // Measured on tests/benchmark/programs/struct_copy.c (48-byte
+            // Particle, three copies per iteration, 2,000,000 iterations),
+            // -O2, same host, median of 7 runs:
+            //
+            //   ymm chunk + legacy SSE tail   5287 ms   (the shipped behaviour)
+            //   ymm chunk + VEX tail          2516 ms   (removes one of two)
+            //   no ymm, 16-byte moves          113 ms   <- 46x faster
+            //   gcc -O2                         21 ms
+            //
+            // One saved instruction is not worth two state transitions, so
+            // small copies stay in the 128-bit domain. The 16-byte arm below
+            // keeps the VEX/legacy choice consistent for the same reason,
+            // which matters if this constant is ever turned back on.
+            //
+            // This does NOT affect the large-copy path (size > 64), which uses
+            // its own loop further down.
+            const USE_YMM_FOR_SMALL_MEMCPY: bool = false;
+            let mut used_ymm = false;
+            while remaining > 0 {
+                if USE_YMM_FOR_SMALL_MEMCPY && remaining >= 32 {
+                    // Use AVX2 256-bit vmovdqu for 32-byte chunks (1 instruction
+                    // instead of 2x movdqu). ymm scratch: ymm0 = xmm0's extension.
+                    if offset == 0 {
+                        self.state.emit("    vmovdqu (%rsi), %ymm0");
+                        self.state.emit("    vmovdqu %ymm0, (%rdi)");
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
+                        self.state
+                            .emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
+                    }
+                    offset += 32;
+                    remaining -= 32;
+                    used_ymm = true;
+                } else if remaining >= 16 && !self.no_sse {
+                    // GCC's -mno-sse contract forbids ALL xmm/ymm usage (the
+                    // kernel decompressor and early boot run with CR4.OSFXSR=0,
+                    // where any SSE instruction faults -- reproduced: 16-byte
+                    // gate_desc copy in load_stage2_idt crashed the Cachymod
+                    // 6.18.46 QEMU boot). With SSE disabled the 16 bytes fall
+                    // through to two movq, matching GCC.
+                    //
+                    // AVX->SSE TRANSITION PENALTY. A 48-byte struct copies as
+                    // one 32-byte ymm chunk plus a 16-byte tail. Emitting the
+                    // tail as legacy SSE (`movdqu %xmm0`) while the upper half
+                    // of ymm0 is still dirty from the vmovdqu above costs a
+                    // full state transition on Intel -- measured on
+                    // tests/benchmark/programs/struct_copy.c (3 such copies per
+                    // iteration, 2M iterations): 5287 ms versus GCC's 21 ms.
+                    //
+                    // The fix is NOT to insert vzeroupper (that has its own
+                    // cost and would run per copy); it is to keep the tail in
+                    // the VEX domain. `vmovdqu %xmm0` zeroes the upper bits by
+                    // definition, so no transition ever occurs. Same length,
+                    // same semantics.
+                    //
+                    // Legacy SSE is still used when no ymm was touched (a plain
+                    // 16..31 byte copy), so targets without AVX are unaffected.
+                    let (ld, st) = if used_ymm {
+                        ("    vmovdqu", "    vmovdqu")
+                    } else {
+                        ("    movdqu", "    movdqu")
+                    };
+                    if offset == 0 {
+                        self.state.emit_fmt(format_args!("{} (%rsi), %xmm0", ld));
+                        self.state.emit_fmt(format_args!("{} %xmm0, (%rdi)", st));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("{} {}(%rsi), %xmm0", ld, offset));
+                        self.state
+                            .emit_fmt(format_args!("{} %xmm0, {}(%rdi)", st, offset));
+                    }
+                    offset += 16;
+                    remaining -= 16;
+                } else if remaining >= 8 {
+                    if offset == 0 {
+                        self.state.emit("    movq (%rsi), %rax");
+                        self.state.emit("    movq %rax, (%rdi)");
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movq {}(%rsi), %rax", offset));
+                        self.state
+                            .emit_fmt(format_args!("    movq %rax, {}(%rdi)", offset));
+                    }
+                    offset += 8;
+                    remaining -= 8;
+                } else if remaining >= 4 {
+                    if offset == 0 {
+                        self.state.emit("    movl (%rsi), %eax");
+                        self.state.emit("    movl %eax, (%rdi)");
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movl {}(%rsi), %eax", offset));
+                        self.state
+                            .emit_fmt(format_args!("    movl %eax, {}(%rdi)", offset));
+                    }
+                    offset += 4;
+                    remaining -= 4;
+                } else if remaining >= 2 {
+                    if offset == 0 {
+                        self.state.emit("    movw (%rsi), %ax");
+                        self.state.emit("    movw %ax, (%rdi)");
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movw {}(%rsi), %ax", offset));
+                        self.state
+                            .emit_fmt(format_args!("    movw %ax, {}(%rdi)", offset));
+                    }
+                    offset += 2;
+                    remaining -= 2;
+                } else {
+                    if offset == 0 {
+                        self.state.emit("    movb (%rsi), %al");
+                        self.state.emit("    movb %al, (%rdi)");
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movb {}(%rsi), %al", offset));
+                        self.state
+                            .emit_fmt(format_args!("    movb %al, {}(%rdi)", offset));
+                    }
+                    offset += 1;
+                    remaining -= 1;
+                }
+            }
+        } else {
+            // Under -mno-sse no vector instruction may be emitted at all
+            // (kernel boot runs with CR4.OSFXSR=0): use rep movsb.
+            if self.no_sse {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movq", size as i64, "rcx");
+                self.state.emit("    rep movsb");
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+            // Copies > 64 bytes follow the CPU tuning model
+            // (`X86Tune::memcpy_strategy`, docs/CPU_MODEL_AUDIT.md §4):
+            //
+            // * `rep movsb` at or above glibc's `__x86_rep_movsb_threshold`
+            //   on ERMS/FSRM parts (2112 B with FSRM, 8192 B with 32-byte
+            //   vectors on the older ERMS cores).  Three instructions, no
+            //   call, no loop, byte-granular so no alignment prologue; it is
+            //   the exact path glibc's own memmove-vec-unaligned-erms takes
+            //   for the same size on the same hardware.
+            // * otherwise a counted vector loop whose width follows the
+            //   instruction-set contract: 32-byte `vmovdqu %ymm` ONLY when
+            //   AVX2 is enabled by `-march` (and the part does not split
+            //   256-bit unaligned loads, SNB/IVB), 16-byte SSE2 `movdqu`
+            //   otherwise.  The previous lowering emitted `%ymm` here
+            //   unconditionally, which SIGILLs on any pre-AVX host at plain
+            //   `-march=x86-64` (regression: tests/regression/
+            //   cpu_model_memcpy_raptorlake.c).
+            use crate::backend::x86::cpu_model::CopyStrategy;
+            let vb = self.tune.block_copy_vector_bytes(self.avx2_enabled);
+            let strategy = self.tune.memcpy_strategy(size, vb);
+            if strategy == CopyStrategy::RepMovsb && std::env::var_os("CCC_NO_REP_MOVSB").is_none()
+            {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movq", size as i64, "rcx");
+                self.state.emit("    rep movsb");
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+            let use_ymm = vb == 32;
+            let (mv, r0, r1) = if use_ymm {
+                ("vmovdqu", "%ymm0", "%ymm1")
+            } else {
+                ("movdqu", "%xmm0", "%xmm1")
+            };
+            // Up to eight vector stores (Clang `MaxStoresPerMemcpy`, GCC
+            // `move_by_pieces`) are cheaper straight-line than as a 2–4
+            // iteration counted loop: no %rcx/pointer increments, no taken
+            // branches, and every load/store pair is independent so the
+            // OoO core streams them.  Alternate the two scratch registers so
+            // consecutive pairs never serialise on one register.
+            let unrolled = strategy == CopyStrategy::InlineUnrolled;
+            let chunk = if unrolled { vb } else { 2 * vb };
+            let full_chunks = size / chunk;
+            let remainder = size % chunk;
+
+            if unrolled {
+                for i in 0..full_chunks {
+                    let reg = if i % 2 == 0 { r0 } else { r1 };
+                    let off = i * vb;
+                    self.state
+                        .emit_fmt(format_args!("    {} {}(%rsi), {}", mv, off, reg));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, off));
+                }
+                if use_ymm && full_chunks > 0 {
+                    self.state.dirty_upper_ymm = true;
+                }
+            } else if full_chunks > 0 {
+                // Counted loop: two vector moves (2 × vb bytes) per iteration.
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
+                let loop_label = format!(".Lmcpy_loop_{}", self.state.next_label_id());
+                self.state.emit_fmt(format_args!("{}:", loop_label));
+                self.state
+                    .emit_fmt(format_args!("    {} (%rsi), {}", mv, r0));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, (%rdi)", mv, r0));
+                self.state
+                    .emit_fmt(format_args!("    {} {}(%rsi), {}", mv, vb, r1));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, r1, vb));
+                self.state
+                    .emit_fmt(format_args!("    addq ${}, %rsi", chunk));
+                self.state
+                    .emit_fmt(format_args!("    addq ${}, %rdi", chunk));
+                self.state.emit("    decq %rcx");
+                self.state.emit_fmt(format_args!("    jne {}", loop_label));
+                if use_ymm {
+                    // The upper YMM halves are dirty: arm the epilogue
+                    // vzeroupper so later legacy-SSE code (scalar FP in this
+                    // backend) does not pay the AVX/SSE transition.
+                    self.state.dirty_upper_ymm = true;
+                }
+            }
+
+            // Remainder ladder.  After the counted loop %rsi/%rdi already
+            // point past the copied prefix (offset 0); after the straight-line
+            // form they do not, so the ladder continues at the prefix length.
+            let mut offset = if unrolled {
+                full_chunks * chunk
+            } else {
+                0usize
+            };
+            let mut remaining = remainder;
+            while remaining > 0 {
+                if remaining >= 32 && use_ymm {
+                    self.state
+                        .emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
+                    self.state
+                        .emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
+                    self.state.dirty_upper_ymm = true;
+                    offset += 32;
+                    remaining -= 32;
+                } else if remaining >= 16 && !self.no_sse {
+                    // Stay in the VEX domain once a YMM register is dirty
+                    // (see the small-copy path above for the measurement).
+                    let mv16 = if use_ymm { "vmovdqu" } else { "movdqu" };
+                    self.state
+                        .emit_fmt(format_args!("    {} {}(%rsi), %xmm0", mv16, offset));
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, {}(%rdi)", mv16, offset));
+                    offset += 16;
+                    remaining -= 16;
+                } else if remaining >= 8 {
+                    self.state
+                        .emit_fmt(format_args!("    movq {}(%rsi), %rax", offset));
+                    self.state
+                        .emit_fmt(format_args!("    movq %rax, {}(%rdi)", offset));
+                    offset += 8;
+                    remaining -= 8;
+                } else if remaining >= 4 {
+                    self.state
+                        .emit_fmt(format_args!("    movl {}(%rsi), %eax", offset));
+                    self.state
+                        .emit_fmt(format_args!("    movl %eax, {}(%rdi)", offset));
+                    offset += 4;
+                    remaining -= 4;
+                } else if remaining >= 2 {
+                    self.state
+                        .emit_fmt(format_args!("    movw {}(%rsi), %ax", offset));
+                    self.state
+                        .emit_fmt(format_args!("    movw %ax, {}(%rdi)", offset));
+                    offset += 2;
+                    remaining -= 2;
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movb {}(%rsi), %al", offset));
+                    self.state
+                        .emit_fmt(format_args!("    movb %al, {}(%rdi)", offset));
+                    offset += 1;
+                    remaining -= 1;
+                }
+            }
+        }
+    }
+
+    // ---- Segment-prefixed memory ops ----
+
+    pub(super) fn emit_seg_load_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Value,
+        ty: IrType,
+        seg: AddressSpace,
+    ) {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        self.operand_to_rax(&Operand::Value(*ptr));
+        self.state.emit("    movq %rax, %rcx");
+        // Scalar FP: load straight into the destination's XMM home rather than
+        // moving the bit pattern through %rax.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            self.emit_seg_load_xmm(dest, ty, seg_prefix, "", Some("rcx"));
+            return;
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        let dest_reg = Self::load_dest_reg(ty);
+        self.state.emit_fmt(format_args!(
+            "    {} {}(%rcx), {}",
+            load_instr, seg_prefix, dest_reg
+        ));
+        self.store_rax_to(dest);
+    }
+
+    /// Finish a segment-prefixed scalar FP load in the SSE domain:
+    /// `movsd %gs:8(%rdi), %xmm0` / `movss %gs:16, %xmm3`.
+    ///
+    /// `disp` is the displacement text (`""`, `"8"`, `"sym"`) and `base` the
+    /// addressing register without its `%` (`None` for a direct segment
+    /// address).  Landing the value in the destination's own XMM home is what
+    /// keeps an FP per-CPU access one instruction: the GPR path loads the bit
+    /// pattern into %rax and then shuttles it across domains
+    /// (`movq %gs:8(%rdi), %rax; movq %rax, %xmm0`), and the default-space
+    /// twin (`emit_load_with_const_offset_impl`) already made this choice for
+    /// everything except segment operands.  Measured: `double f(struct F
+    /// __seg_gs *p){ return p->d; }` — lccc 3 instructions, GCC 1
+    /// (`movsd %gs:8(%rdi), %xmm0`).
+    fn emit_seg_load_xmm(
+        &mut self,
+        dest: &Value,
+        ty: IrType,
+        seg_prefix: &str,
+        disp: &str,
+        base: Option<&str>,
+    ) {
+        let load_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+            "movsd"
+        } else {
+            "movss"
+        };
+        let dest_xmm_reg = self
+            .reg_assignments
+            .get(&dest.0)
+            .copied()
+            .filter(|&r| is_xmm_reg(r));
+        let target = dest_xmm_reg.map(phys_reg_name).unwrap_or("xmm0");
+        match base {
+            Some(reg) => self.state.emit_fmt(format_args!(
+                "    {} {}{}(%{}), %{}",
+                load_instr, seg_prefix, disp, reg, target
+            )),
+            None => self.state.emit_fmt(format_args!(
+                "    {} {}{}, %{}",
+                load_instr, seg_prefix, disp, target
+            )),
+        }
+        if dest_xmm_reg.is_none() {
+            self.store_xmm_to(dest, "xmm0", ty);
+        } else {
+            // Definition-writes-home accounting: the load wrote the dest's
+            // XMM home, exactly like the default-space FP branch.
+            self.note_inplace_compute(
+                dest_xmm_reg.expect("dest_xmm_reg is Some in this arm"),
+                dest.0,
+            );
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Segment-overridden load at a constant displacement from a base that is
+    /// already live in a GPR: `movq %gs:8(%rax), %rax`. GCC and Clang fold
+    /// this displacement; the generic [`Self::emit_seg_load_impl`] instead
+    /// materialises `base + offset` into %rcx first, so every per-CPU
+    /// `base->field` access in the kernel cost `leaq 8(%rax), %rcx` plus a
+    /// second live GPR. Measured on `struct S __seg_gs *` (work/repros/
+    /// seg_fold.c): lccc 2 instructions vs GCC/Clang 1 for `getp()->b`.
+    ///
+    /// Returns false whenever the shape is not expressible here (base not in a
+    /// register, 128-bit type, oversized displacement, default address space),
+    /// in which case the caller keeps the existing base-materialisation path.
+    pub(super) fn emit_seg_load_with_const_offset_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        // Same legality predicate as the default-space fast path
+        // (`is_foldable_mem_ty`): 128-bit values have no single
+        // memory-operand load.
+        if crate::backend::generation::is_wide_int_type(ty) || ty == IrType::F128 {
+            return false;
+        }
+        // x86 displacements are sign-extended 32-bit.
+        if i32::try_from(offset).is_err() {
+            return false;
+        }
+        let Some(&base_reg) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if is_xmm_reg(base_reg) {
+            return false;
+        }
+        let base_name = phys_reg_name(base_reg);
+        // Scalar FP stays in the SSE domain, like the default-space twin:
+        // `movsd %gs:8(%rax), %xmm0` instead of a GPR round trip.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            let disp = if offset == 0 {
+                String::new()
+            } else {
+                offset.to_string()
+            };
+            self.emit_seg_load_xmm(dest, ty, seg_prefix, &disp, Some(base_name));
+            return true;
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        // 64-bit loads go straight into the value's GPR home when it has one,
+        // exactly like the const-ADDRESS twin (`emit_seg_load_const_addr`).
+        // The `%rax` round trip costs one instruction per access and shows up on
+        // the kernel's hottest shape, the per-CPU field read: `p = p->next`
+        // emitted `movq %gs:24(%r8), %rax; movq %rax, %r8` (2 insns) where gcc
+        // and clang emit `movq %gs:24(%rdi), %rdi` (1).  Measured on the
+        // pointer-base per-CPU walk (tests/benchmark/programs/percpu_ptr_walk.c,
+        // 4 segment loads per iteration): inner loop 9 -> 8 instructions and
+        // byte-identical output.  `invalidate_acc` is the same accumulator
+        // bookkeeping the const-address twin applies: the value now lives in
+        // its home and nothing may claim it in %rax.
+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                if !is_xmm_reg(reg) {
+                    let dest_name = phys_reg_name(reg);
+                    if offset == 0 {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}(%{}), %{}",
+                            load_instr, seg_prefix, base_name, dest_name
+                        ));
+                    } else {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}{}(%{}), %{}",
+                            load_instr, seg_prefix, offset, base_name, dest_name
+                        ));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    return true;
+                }
+            }
+        }
+        let dest_reg = Self::load_dest_reg(ty);
+        if offset == 0 {
+            self.state.emit_fmt(format_args!(
+                "    {} {}(%{}), {}",
+                load_instr, seg_prefix, base_name, dest_reg
+            ));
+        } else {
+            self.state.emit_fmt(format_args!(
+                "    {} {}{}(%{}), {}",
+                load_instr, seg_prefix, offset, base_name, dest_reg
+            ));
+        }
+        self.store_rax_to(dest);
+        true
+    }
+
+    /// Segment-prefixed store to `offset(base)` with the displacement folded into
+    /// the operand. The base must have a general-register home other than `rax`,
+    /// so the value can be staged in `%rax` without touching the base, and no
+    /// `push`/`pop` is needed (the generic segment store uses both to survive
+    /// any operand-home assignment). A constant that fits the immediate is stored
+    /// directly. Returns false, emitting nothing, when the form does not apply.
+    pub(super) fn emit_seg_store_with_const_offset_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !crate::backend::generation::seg_indexed_fold_ty(ty) {
+            return false;
+        }
+        // x86 displacements are sign-extended 32-bit, the same width the
+        // load twin and the fold decider require.
+        if i32::try_from(offset).is_err() {
+            return false;
+        }
+        let Some(base_reg) = self.seg_base_home(base) else {
+            return false;
+        };
+        let store_instr = Self::mov_store_for_type(ty);
+        if let Some(imm) = seg_store_immediate(val, ty) {
+            self.state.emit_fmt(format_args!(
+                "    {} ${}, {}{}(%{})",
+                store_instr, imm, seg_prefix, offset, base_reg
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Value source: its own register home when it has one, else rax.
+        let src = match val {
+            Operand::Value(v) => match self.reg_assignments.get(&v.0) {
+                Some(&r) if !is_xmm_reg(r) && phys_reg_name(r) != "rax" => {
+                    typed_phys_reg_name(r, ty)
+                }
+                _ => {
+                    self.operand_to_rax(val);
+                    Self::reg_for_type("rax", ty)
+                }
+            },
+            Operand::Const(_) => {
+                self.operand_to_rax(val);
+                Self::reg_for_type("rax", ty)
+            }
+        };
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}{}(%{})",
+            store_instr, src, seg_prefix, offset, base_reg
+        ));
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    /// The general-register home of `base` when it can address memory directly
+    /// (never `rax`, which stages values, and never an xmm register).
+    fn seg_base_home(&self, base: &Value) -> Option<&'static str> {
+        let &reg = self.reg_assignments.get(&base.0)?;
+        if is_xmm_reg(reg) {
+            return None;
+        }
+        match phys_reg_name(reg) {
+            "rax" => None,
+            name => Some(name),
+        }
+    }
+
+    pub(super) fn emit_seg_load_symbol_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        ty: IrType,
+        seg: AddressSpace,
+    ) {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        // Scalar FP per-CPU objects (`this_cpu_read(fp_field)`) stay in the SSE
+        // domain: `movsd %gs:sym(%rip), %xmm0`.
+        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
+            self.emit_seg_load_xmm(dest, ty, seg_prefix, sym, Some("rip"));
+            return;
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        let dest_reg = Self::load_dest_reg(ty);
+        self.state.emit_fmt(format_args!(
+            "    {} {}{}(%rip), {}",
+            load_instr, seg_prefix, sym, dest_reg
+        ));
+        self.store_rax_to(dest);
+    }
+
+    /// Direct segment-relative access at constant offset: the GCC/Clang
+    /// form for every glibc TLS macro. `movq %fs:16, %rax` (2 uops, no
+    /// address materialization) replaces movq $16,%r; movq %r,%rcx;
+    /// movq %fs:(%rcx),... The offset is printed signed decimal exactly
+    /// like GAS 2.47 disassembles it.
+    pub(super) fn emit_seg_load_const_addr_impl(
+        &mut self,
+        dest: &Value,
+        addr: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        // 64-bit loads straight into a GPR home skip the rax round-trip.
+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                if !is_xmm_reg(reg) {
+                    self.state.emit_fmt(format_args!(
+                        "    movq {}{}, %{}",
+                        seg_prefix,
+                        addr,
+                        phys_reg_name(reg)
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                    return true;
+                }
+            }
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        let dest_reg = Self::load_dest_reg(ty);
+        self.state.emit_fmt(format_args!(
+            "    {} {}{}, {}",
+            load_instr, seg_prefix, addr, dest_reg
+        ));
+        self.store_rax_to(dest);
+        true
+    }
+
+    pub(super) fn emit_seg_store_const_addr_impl(
+        &mut self,
+        val: &Operand,
+        addr: i64,
+        ty: IrType,
+        seg: AddressSpace,
+    ) -> bool {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => return false,
+        };
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        let store_instr = Self::mov_store_for_type(ty);
+        // Immediate store: mov $imm, %fs:OFF — zero register pressure.
+        if let Operand::Const(c) = val {
+            let is_32 = !matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+            if let Some(imm) = Self::const_as_imm32_typed(&Operand::Const(c.clone()), is_32) {
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, {}{}",
+                    store_instr, imm, seg_prefix, addr
+                ));
+                return true;
+            }
+        }
+        // Register-homed value: store straight from its home.
+        if let Operand::Value(v) = val {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if !is_xmm_reg(reg) {
+                    // typed name: reg_for_type knows only rax..r9, so a value homed in
+                    // rbx/r10..r15 would otherwise be stored from %rax.
+                    let rname = typed_phys_reg_name(reg, ty);
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, {}{}",
+                        store_instr, rname, seg_prefix, addr
+                    ));
+                    return true;
+                }
+            }
+        }
+        self.operand_to_rax(val);
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}{}",
+            store_instr,
+            Self::reg_for_type("rax", ty),
+            seg_prefix,
+            addr
+        ));
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    // ---- Local-Exec TLS direct accesses (`%fs:symbol@TPOFF+N`) ----
+    //
+    // PF-TLS-1. Every TLS access through a materialized address costs the
+    // two-instruction Local-Exec base (`movq %fs:0,%r` + `leaq sym@TPOFF(%r)`)
+    // plus the access itself. GCC and Clang fold the whole thing into ONE
+    // instruction with the segment override and the link-time-constant TPOFF
+    // relocation in the memory operand:
+    //
+    //     lccc:  movq %fs:0, %rax
+    //            leaq a@TPOFF(%rax), %rax      GCC:  movq %rdi, %fs:a@tpoff
+    //            movq %rdi, (%rax)
+    //
+    // The Local-Exec fold is legal exactly when the symbol's model is
+    // Local-Exec (`common::tls`): executable code (`-fPIE`/non-PIC; never
+    // `-fPIC`/`-shared`, where the linker rejects `R_X86_64_TPOFF32` for
+    // `ET_DYN`) and a symbol that binds to this executable's definition, or an
+    // explicit `-ftls-model=`/`tls_model` request, which GCC honours the same
+    // way. Initial-Exec and descriptor accesses fold their GOT/descriptor
+    // offset into a `%fs:(%rax)` operand instead (`try_emit_tls_direct_load_impl`).
+    // Only at optimized levels — `-O0` keeps non-SSA value identities after
+    // phi elimination, so `get_defining_instruction` may name a definition
+    // that does not reach this access (the same restriction the
+    // accumulator-address fast path carries).
+
+    /// Resolve `ptr` (+ `extra`) to a TLS symbol, effective model and addend,
+    /// walking the bounded constant-offset GEP/Copy chain.
+    fn tls_symbol_access(
+        &self,
+        ptr: u32,
+        extra: i64,
+    ) -> Option<(String, i64, crate::ir::reexports::TlsModel)> {
+        // Only a GlobalAddr naming a TLS symbol ends the walk with an answer,
+        // so a TU without one has no answer to find: this runs for every
+        // load and store, and most TUs never declare `_Thread_local`.
+        if self.state.disable_regalloc || self.state.tls_symbols.is_empty() {
+            return None;
+        }
+        let mut cur = ptr;
+        let mut total = extra;
+        // A GEP chain off a TLS symbol is constant-folded by the optimizer,
+        // but `-O1` still leaves short chains; bound the walk so a pathological
+        // IR shape can never make emission quadratic.
+        for _ in 0..8 {
+            let step = {
+                let inst = self.get_defining_instruction(cur)?;
+                match inst {
+                    crate::ir::reexports::Instruction::GlobalAddr { name, .. } => {
+                        if !self.state.tls_symbols.contains(name) {
+                            return None;
+                        }
+                        return Some((name.clone(), total, self.state.tls_model(name)));
+                    }
+                    crate::ir::reexports::Instruction::GetElementPtr { base, offset, .. } => {
+                        match offset {
+                            Operand::Const(c) => match c.to_i64() {
+                                Some(off) => (base.0, off),
+                                None => return None,
+                            },
+                            _ => return None,
+                        }
+                    }
+                    // CSE/hoisting hands the access a Copy of the address
+                    // (global_addr_cse does exactly this for TLS bases). The
+                    // copied value still denotes the same link-time-constant
+                    // address, so the chain is followed.
+                    crate::ir::reexports::Instruction::Copy { src, .. } => match src {
+                        Operand::Value(v) => (v.0, 0),
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            };
+            cur = step.0;
+            total = total.checked_add(step.1)?;
+        }
+        None
+    }
+
+    /// Resolve `ptr` (+ `extra`) to `(symbol, total_offset)` for a legal
+    /// Local-Exec direct access (the model alone decides, see above).
+    pub(super) fn tls_local_exec_access(&self, ptr: u32, extra: i64) -> Option<(String, i64)> {
+        let (name, offset, model) = self.tls_symbol_access(ptr, extra)?;
+        (model == crate::ir::reexports::TlsModel::LocalExec).then_some((name, offset))
+    }
+
+    /// The GAS/objdump spelling of the operand: `%fs:sym@TPOFF` or
+    /// `%fs:sym@TPOFF+N` (the addend rides in the relocation, see the
+    /// assembler's `SymbolModAddend`).
+    fn tls_local_exec_operand(sym: &str, off: i64) -> String {
+        if off == 0 {
+            format!("%fs:{}@TPOFF", sym)
+        } else {
+            format!("%fs:{}@TPOFF{:+}", sym, off)
+        }
+    }
+
+    /// Integer/pointer types: everything the direct form can carry. FP and
+    /// wide (i128/f128) accesses keep their dedicated paths.
+    pub(super) fn tls_direct_type_ok(ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        )
+    }
+
+    fn emit_tls_load_operand(&mut self, dest: &Value, ty: IrType, operand: &str) {
+        // 64-bit loads straight into a GPR home skip the rax round-trip.
+        if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
+            if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+                if !is_xmm_reg(reg) {
+                    let name = phys_reg_name(reg);
+                    self.state
+                        .emit_fmt(format_args!("    movq {}, %{}", operand, name));
+                    // The load wrote the home directly, so the home now holds
+                    // THIS definition — the same accounting the register-direct
+                    // load path performs. Without it the home reads as stale
+                    // and a later use could reload the value from a slot the
+                    // load never wrote.
+                    self.note_inplace_compute(reg, dest.0);
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+        let load_instr = Self::mov_load_for_type(ty);
+        let dest_reg = Self::load_dest_reg(ty);
+        self.state
+            .emit_fmt(format_args!("    {} {}, {}", load_instr, operand, dest_reg));
+        self.store_rax_to(dest);
+    }
+
+    /// Fold a load through either a Local-Exec address or an Initial-Exec GOT
+    /// offset. IE still needs one GOT load, but avoids materialising and adding
+    /// the thread pointer: `mov GOTTPOFF,%rax; mov %fs:(%rax),dest`.
+    pub(super) fn try_emit_tls_direct_load_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if !Self::tls_direct_type_ok(ty) {
+            return false;
+        }
+        if let Some((sym, off, model)) = self.tls_symbol_access(ptr.0, offset) {
+            match model {
+                crate::ir::reexports::TlsModel::InitialExec => {
+                    self.state
+                        .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", sym));
+                }
+                crate::ir::reexports::TlsModel::LocalDynamic
+                | crate::ir::reexports::TlsModel::GlobalDynamic => {
+                    self.emit_tls_dynamic_offset(&sym);
+                }
+                crate::ir::reexports::TlsModel::LocalExec => {}
+            }
+            if model != crate::ir::reexports::TlsModel::LocalExec {
+                let operand = if off == 0 {
+                    "%fs:(%rax)".to_string()
+                } else {
+                    format!("%fs:{off}(%rax)")
+                };
+                if matches!(
+                    model,
+                    crate::ir::reexports::TlsModel::LocalDynamic
+                        | crate::ir::reexports::TlsModel::GlobalDynamic
+                ) {
+                    // End the opaque descriptor-call region before the memory
+                    // operation. This still blocks address folding across the
+                    // call while allowing ordinary load/copy propagation.
+                    self.state.emit("    # LCCC_VOLATILE_END");
+                }
+                self.emit_tls_load_operand(dest, ty, &operand);
+                return true;
+            }
+        }
+        let Some((sym, off)) = self.tls_local_exec_access(ptr.0, offset) else {
+            return false;
+        };
+        let operand = Self::tls_local_exec_operand(&sym, off);
+        self.emit_tls_load_operand(dest, ty, &operand);
+        true
+    }
+
+    /// Emit a store straight into a Local-Exec TLS slot. Returns false when
+    /// the access is not a legal direct form, leaving the caller unchanged.
+    pub(super) fn try_emit_tls_direct_store_impl(
+        &mut self,
+        val: &Operand,
+        ptr: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if !Self::tls_direct_type_ok(ty) {
+            return false;
+        }
+        let (sym, off) = match self.tls_local_exec_access(ptr.0, offset) {
+            Some(v) => v,
+            None => return false,
+        };
+        let operand = Self::tls_local_exec_operand(&sym, off);
+        let store_instr = Self::mov_store_for_type(ty);
+        // Immediate store: `movl $imm, %fs:sym@TPOFF` — zero register pressure.
+        if let Operand::Const(c) = val {
+            let is_32 = !matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+            if let Some(imm) = Self::const_as_imm32_typed(&Operand::Const(c.clone()), is_32) {
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, {}", store_instr, imm, operand));
+                return true;
+            }
+        }
+        // Register-homed value: store straight from its home. The value is
+        // read BEFORE the operand text is assembled, so no scratch register
+        // can clobber it (the segment-store ordering hazard).
+        if let Operand::Value(v) = val {
+            if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                if !is_xmm_reg(reg) {
+                    // The WIDTH follows the mnemonic, and the sized name must
+                    // come from the physical-register helpers: `reg_for_type`
+                    // only knows rax/rcx/rdx/rdi/rsi/r8/r9 and silently
+                    // answers "rax" for r10-r15, which would store the wrong
+                    // register (observed: `movl %rax, %fs:ui@TPOFF` for a
+                    // value homed in %r11).
+                    let rname = match store_instr {
+                        "movl" => phys_reg_name_32(reg),
+                        "movw" | "movb" => typed_phys_reg_name(reg, ty),
+                        _ => phys_reg_name(reg),
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, {}", store_instr, rname, operand));
+                    return true;
+                }
+            }
+        }
+        self.operand_to_rax(val);
+        let rname = Self::reg_for_type("rax", ty);
+        self.state
+            .emit_fmt(format_args!("    {} %{}, {}", store_instr, rname, operand));
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    pub(super) fn emit_seg_store_impl(
+        &mut self,
+        val: &Operand,
+        ptr: &Value,
+        ty: IrType,
+        seg: AddressSpace,
+    ) {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        // Operand-ordering hazard: %rdx/%rcx scratch bounces can CLOBBER the
+        // other operand's register home before it is read. glibc's
+        // __tls_init_tp hit exactly this: THREAD_SETMEM's fs-offset constant
+        // (v = Copy(Const 1296)) was register-allocated to %rdx, the old
+        // sequence moved the stored VALUE into %rdx first, and the store
+        // then went through the value-as-address (*fs:&robust_head = ...)
+        // — startup SIGSEGV for every external binary (LK-24). Saving the
+        // value on the stack makes the sequence correct for EVERY possible
+        // home assignment of val and ptr, including rax/rcx/rdx themselves.
+        self.operand_to_rax(val);
+        self.state.emit("    pushq %rax");
+        // The push moves %rsp by 8 until the pop. A pointer slot addressed
+        // from %rsp (`use_rsp_addressing`) must be computed with that offset,
+        // or it reads the pushed value instead of its own slot. This is the
+        // same adjustment `calls.rs` makes around its pushes.
+        let rsp_adjust = self.state.out.use_rsp_addressing;
+        if rsp_adjust {
+            self.state.out.rsp_frame_size += 8;
+        }
+        self.operand_to_rax(&Operand::Value(*ptr));
+        if rsp_adjust {
+            self.state.out.rsp_frame_size -= 8;
+        }
+        self.state.emit("    movq %rax, %rcx");
+        self.state.emit("    popq %rax");
+        let store_instr = Self::mov_store_for_type(ty);
+        let store_reg = Self::reg_for_type("rax", ty);
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}(%rcx)",
+            store_instr, store_reg, seg_prefix
+        ));
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    pub(super) fn emit_seg_store_symbol_impl(
+        &mut self,
+        val: &Operand,
+        sym: &str,
+        ty: IrType,
+        seg: AddressSpace,
+    ) {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        self.operand_to_rax(val);
+        let store_instr = Self::mov_store_for_type(ty);
+        let store_reg = Self::reg_for_type("rax", ty);
+        self.state.emit_fmt(format_args!(
+            "    {} %{}, {}{}(%rip)",
+            store_instr, store_reg, seg_prefix, sym
+        ));
+    }
+}
+
+/// Assembler segment prefix for a named address space; `None` for generic.
+fn seg_operand_prefix(seg: AddressSpace) -> Option<&'static str> {
+    match seg {
+        AddressSpace::SegGs => Some("%gs:"),
+        AddressSpace::SegFs => Some("%fs:"),
+        AddressSpace::Default => None,
+    }
+}
+
+/// The immediate of a constant store, truncated to the store width and in a
+/// form the assembler accepts. A 64-bit store needs a sign-extendable imm32.
+fn seg_store_immediate(val: &Operand, ty: IrType) -> Option<i64> {
+    let Operand::Const(c) = val else {
+        return None;
+    };
+    let v = c.to_i64()?;
+    match ty {
+        IrType::I64 | IrType::U64 | IrType::Ptr => (i32::MIN as i64..=i32::MAX as i64)
+            .contains(&v)
+            .then_some(v),
+        IrType::I32 | IrType::U32 => Some(v as i32 as i64),
+        IrType::I16 | IrType::U16 => Some(v as i16 as i64),
+        IrType::I8 | IrType::U8 => Some(v as i8 as i64),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod indexed_fold_contract_tests {
+    use super::*;
+    use crate::backend::generation::IndexedGepInfo;
+    use crate::backend::traits::ArchCodegen;
+
+    /// The SIB operand every emitter assertion shares: register base, register
+    /// index, scale 4 — the exact shape `emit_load_indexed_impl` builds for a
+    /// register-resident base and index at shift 2.
+    fn mem4() -> String {
+        X86Codegen::sib_mem64("rbx", "rcx", 2, 0)
+    }
+
+    /// ...and its scale-8 sibling.
+    fn mem8() -> String {
+        X86Codegen::sib_mem64("rbx", "rcx", 3, 0)
+    }
+
+    fn xmm_home(cg: &mut X86Codegen, v: u32) {
+        // PhysReg(20) is an allocatable XMM home (xmm2 — xmm0/xmm1 are
+        // scratch and never assigned as homes).
+        cg.reg_assignments.insert(v, PhysReg(20));
+    }
+
+    fn gep_info(access_tys: Vec<IrType>, feeds_store: bool, shift: u8) -> IndexedGepInfo {
+        IndexedGepInfo {
+            base: Value(1),
+            index: Value(2),
+            shift,
+            disp: 0,
+            orig_offset: Value(3),
+            access_tys,
+            index_ty: IrType::I32,
+            feeds_store,
+        }
+    }
+
+    #[test]
+    fn store_offset_elision_is_x86_64_only() {
+        assert!(X86Codegen::new().guarantees_indexed_store_fold());
+        assert!(!crate::backend::i686::I686Codegen::new().guarantees_indexed_store_fold());
+        assert!(!crate::backend::arm::ArmCodegen::new().guarantees_indexed_store_fold());
+        assert!(!crate::backend::riscv::RiscvCodegen::new().guarantees_indexed_store_fold());
+    }
+
+    #[test]
+    fn guaranteed_store_profiles_emit_for_all_scales_and_staging_classes() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::Ptr,
+            IrType::F32,
+            IrType::F64,
+            IrType::D32,
+            IrType::D64,
+        ] {
+            for shift in 0..=3 {
+                for (base, index) in [
+                    (PhysReg(10), PhysReg(16)),
+                    (PhysReg(16), PhysReg(10)),
+                    (PhysReg(1), PhysReg(3)),
+                ] {
+                    let mut cg = X86Codegen::new();
+                    cg.reg_assignments.insert(1, base);
+                    cg.reg_assignments.insert(2, index);
+                    cg.value_types.insert(2, IrType::I64);
+                    let mut info = gep_info(vec![ty], true, shift);
+                    info.index_ty = IrType::I64;
+                    assert!(cg.indexed_fold_ok(&info));
+                    let val = if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
+                    {
+                        xmm_home(&mut cg, 100);
+                        Operand::Value(Value(100))
+                    } else {
+                        Operand::Const(IrConst::I64(i64::MAX))
+                    };
+                    assert!(
+                        cg.emit_store_indexed_impl(&val, &Value(1), &Value(2), shift, 4, ty),
+                        "accepted profile refused: {ty:?} scale={shift} base={base:?} index={index:?}"
+                    );
+                    assert!(cg.state.out.buf.contains("mov"));
+                }
+            }
+        }
+    }
+
+    // ── the LEA half of the symbol+index fold obeys the same index law ─────
+
+    /// Every symbol+index SIB consumes the index's FULL register, so the LEA
+    /// arm must extend a narrow index in place exactly as the load and store
+    /// arms do. This test would have passed on the load arm and failed here
+    /// before the guard was added: the same GEP lowered two different ways.
+    #[test]
+    fn leaq_sym_index_extends_a_narrow_index_before_the_sib() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(3, PhysReg(4)); // %r14 holds the index
+        cg.reg_assignments.insert(4, PhysReg(1)); // %rbx holds the dest
+        cg.value_types.insert(3, IrType::I32);
+        let folded = cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 2, 0);
+        assert!(folded, "a narrow index is extended");
+        let buf = &cg.state.out.buf;
+        let extended = buf.contains("movslq %r14d, %r14");
+        assert!(extended, "I32 sign-extended: {buf:?}");
+        let sib = buf.contains("leaq scratch(, %r14, 4), %rbx");
+        assert!(sib, "the SIB uses the extended index: {buf:?}");
+    }
+
+    /// A 64-bit index needs no extension, so the fold costs exactly one LEA —
+    /// the guard must not make the common shape pay for the rare one.
+    #[test]
+    fn leaq_sym_index_leaves_a_64_bit_index_alone() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(3, PhysReg(4));
+        cg.reg_assignments.insert(4, PhysReg(1));
+        cg.value_types.insert(3, IrType::I64);
+        let folded = cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 8);
+        assert!(folded, "a 64-bit index needs no extension");
+        let buf = &cg.state.out.buf;
+        let extended = buf.contains("movslq");
+        assert!(!extended, "no extension for I64: {buf:?}");
+        let sib = buf.contains("leaq scratch+8(, %r14), %rbx");
+        assert!(sib, "one LEA with the displacement: {buf:?}");
+    }
+
+    /// The raw `reg_assignments` lookup this arm used bypassed the freshness
+    /// refusal every sibling applies: a clobbered home must make the fold
+    /// refuse, so `emit_gep` reloads the index from its stack home instead of
+    /// addressing through a value the register no longer holds.
+    #[test]
+    fn leaq_sym_index_refuses_a_stale_index_home() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(3, PhysReg(4));
+        cg.reg_assignments.insert(4, PhysReg(1));
+        cg.value_types.insert(3, IrType::I64);
+        cg.home_clobbered.insert(3);
+        let folded = cg.emit_leaq_sym_index_impl(&Value(4), "scratch", &Value(3), 0, 0);
+        assert!(!folded, "a clobbered index home is refused");
+        let quiet = cg.state.out.buf.is_empty();
+        assert!(quiet, "nothing emitted: {:?}", cg.state.out.buf);
+    }
+
+    // ── the emitter half: D32/D64 reach the SSE arms width-exactly ─────────
+
+    #[test]
+    fn d32_indexed_load_and_store_move_like_f32() {
+        // Load: dest homed in an XMM register, value lands there width-exactly.
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 2, IrType::D32, mem4()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movss (%rbx, %rcx, 4), %xmm2"),
+            "D32 indexed load must use the 32-bit scalar move, got: {:?}",
+            cg.state.out.buf
+        );
+        assert!(
+            !cg.state.out.buf.contains("movsd"),
+            "no 64-bit move for D32"
+        );
+
+        // Store: source homed in an XMM register, same width law.
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 101);
+        assert!(cg.emit_store_indexed_common(
+            &Operand::Value(Value(101)),
+            &Value(2),
+            2,
+            IrType::D32,
+            mem4()
+        ));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movss %xmm2, (%rbx, %rcx, 4)"),
+            "D32 indexed store must use movss, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn d64_indexed_load_and_store_move_like_f64() {
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 3, IrType::D64, mem8()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movsd (%rbx, %rcx, 8), %xmm2"),
+            "D64 indexed load must use the 64-bit scalar move, got: {:?}",
+            cg.state.out.buf
+        );
+
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 101);
+        assert!(cg.emit_store_indexed_common(
+            &Operand::Value(Value(101)),
+            &Value(2),
+            3,
+            IrType::D64,
+            mem8()
+        ));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movsd %xmm2, (%rbx, %rcx, 8)"),
+            "D64 indexed store must use movsd, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn f32_f64_indexed_arms_unchanged() {
+        // Guard the widening against accidental drift of the incumbent types.
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 2, IrType::F32, mem4()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movss (%rbx, %rcx, 4), %xmm2")
+        );
+
+        let mut cg = X86Codegen::new();
+        xmm_home(&mut cg, 100);
+        assert!(cg.emit_load_indexed_common(&Value(100), &Value(2), 3, IrType::F64, mem8()));
+        assert!(
+            cg.state
+                .out
+                .buf
+                .contains("    movsd (%rbx, %rcx, 8), %xmm2")
+        );
+    }
+
+    #[test]
+    fn i128_indexed_still_refused() {
+        // The one type family the fold's generic gate and this emitter agree
+        // to refuse: a pair-emulating type has no SIB arm.
+        let mut cg = X86Codegen::new();
+        assert!(!cg.emit_load_indexed_common(&Value(100), &Value(2), 3, IrType::I128, mem8()));
+        assert!(
+            cg.state.out.buf.is_empty(),
+            "a refused fold must emit nothing, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+
+    // ── the deciding half: indexed_fold_ok mirrors the emitter exactly ─────
+
+    #[test]
+    fn override_accepts_every_emitter_accepted_type() {
+        let cg = X86Codegen::new();
+        let accepted = [
+            IrType::F64,
+            IrType::F32,
+            IrType::D64,
+            IrType::D32,
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::Ptr,
+        ];
+        for ty in accepted {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], false, 2)),
+                "{ty:?} load folds must be guaranteed"
+            );
+        }
+    }
+
+    #[test]
+    fn override_refuses_every_emitter_refused_type() {
+        let cg = X86Codegen::new();
+        for ty in [IrType::I128, IrType::U128, IrType::F128, IrType::Void] {
+            assert!(
+                !cg.indexed_fold_ok(&gep_info(vec![IrType::I32, ty], false, 2)),
+                "{ty:?} must be refused before the fold is guaranteed"
+            );
+        }
+    }
+
+    #[test]
+    fn override_mirrors_the_shift_guard() {
+        let cg = X86Codegen::new();
+        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::F32], false, 3)));
+        assert!(!cg.indexed_fold_ok(&gep_info(vec![IrType::F32], false, 4)));
+    }
+
+    #[test]
+    fn store_fed_folds_accept_any_gpr_homed_address_registers() {
+        // F15 regression pin: x86-64 indexed-store staging writes %rax
+        // (integer path) or %xmm0 (FP path) only — audited scratch-free of
+        // every allocatable home — so ANY GPR-homed SIB base/index folds,
+        // including %r11/%rdx. An earlier revision refused those homes and
+        // cost double_reduction/spectral_norm +2/+4 instructions against
+        // the corpus ratchet (the {%rdx, %r11} set was copied from the
+        // const-offset fold, whose staging machinery is different).
+        // Pin the PhysReg numbers this test's vocabulary rests on: a
+        // renumbering must fail loudly here, not silently test the wrong
+        // homes.
+        //
+        // S13 note: S08 accidentally reverted BOTH this pin and the F15
+        // removal (bad rebase, ungated session), resurrecting the bogus
+        // rule and tripping the sqlite_varint/expat golden gates. S13
+        // re-removed the rule and re-flipped this pin; the golden gate plus
+        // check_indexed_fold_scratch_index.sh now triple-pin the fold, so a
+        // third revert fails loudly in three places, not zero.
+        assert_eq!(phys_reg_name(PhysReg(10)), "r11");
+        assert_eq!(phys_reg_name(PhysReg(16)), "rdx");
+        assert_eq!(phys_reg_name(PhysReg(1)), "rbx");
+        assert_eq!(phys_reg_name(PhysReg(3)), "r13");
+        // %r11-homed index (the spectral_norm shape: `208(%rsp,%r11,8)`).
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(2, PhysReg(10)); // index in %r11
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "an %r11-homed index must fold: staging never writes %r11"
+        );
+
+        // %rdx-homed base.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, PhysReg(16)); // base in %rdx
+        cg.reg_assignments.insert(2, PhysReg(1)); // index in %rbx
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "a %rdx-homed base must fold: staging never writes %rdx"
+        );
+
+        // Ordinary callee-saved homes.
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, PhysReg(1)); // base in %rbx
+        cg.reg_assignments.insert(2, PhysReg(3)); // index in %r13
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "non-scratch homes fold"
+        );
+
+        // %r11-homed BASE (the double_reduction shape: `(%r11,%rdi,4)`).
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, PhysReg(10)); // base in %r11
+        assert!(
+            cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)),
+            "an %r11-homed base must fold: staging never writes %r11"
+        );
+
+        // No register home at all: frame-anchored slot or sym form.
+        let cg = X86Codegen::new();
+        assert!(cg.indexed_fold_ok(&gep_info(vec![IrType::I32], true, 2)));
+    }
+
+    #[test]
+    fn store_fed_folds_accept_all_emitter_arms() {
+        // Store-side companion of the load-side accepted[] pin above:
+        // staging narrows nothing on x86-64 (the write-confinement proof
+        // on the override), so every emitter-armed type folds store-fed
+        // too — in particular D64/D32, whose SIB stores the
+        // check_decimal64_indexed_fold.sh gate pins end to end.
+        let cg = X86Codegen::new();
+        for ty in [
+            IrType::F64,
+            IrType::F32,
+            IrType::D64,
+            IrType::D32,
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::Ptr,
+        ] {
+            assert!(
+                cg.indexed_fold_ok(&gep_info(vec![ty], true, 2)),
+                "{ty:?} store-fed folds must be guaranteed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod seg_store_rsp_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{IrConst, Operand, Value};
+
+    /// A segment store whose pointer is in a stack slot, in a function that
+    /// addresses its slots from %rsp. The value is pushed while the pointer is
+    /// loaded, so %rsp is 8 bytes lower there and the slot must be addressed 8
+    /// bytes higher. Before the fix the pointer was read from the pushed value.
+    #[test]
+    fn seg_store_pointer_slot_accounts_for_the_value_push() {
+        let mut cg = X86Codegen::new();
+        cg.state.out.use_rsp_addressing = true;
+        cg.state.out.rsp_frame_size = 48;
+        // rbp-relative slot -40 is rsp-relative 48 - 40 = 8 outside the push.
+        cg.state.value_locations.insert(5, StackSlot(-40));
+        cg.emit_seg_store_impl(
+            &Operand::Const(IrConst::I64(7)),
+            &Value(5),
+            IrType::I64,
+            AddressSpace::SegGs,
+        );
+        let asm = cg.state.out.buf.clone();
+        assert!(
+            asm.contains("    movq 16(%rsp), %rax\n"),
+            "pointer must be reloaded from 16(%rsp) past the pushed value, got: {asm:?}"
+        );
+        assert!(
+            !asm.contains("8(%rsp)"),
+            "the unadjusted offset reads the pushed value, got: {asm:?}"
+        );
+        assert_eq!(
+            cg.state.out.rsp_frame_size, 48,
+            "the push adjustment must be undone after the pointer load"
+        );
+    }
+
+    /// Without rsp-relative addressing there is no %rsp offset to correct.
+    #[test]
+    fn seg_store_pointer_slot_is_rbp_relative_without_rsp_addressing() {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(5, StackSlot(-40));
+        cg.emit_seg_store_impl(
+            &Operand::Const(IrConst::I64(7)),
+            &Value(5),
+            IrType::I64,
+            AddressSpace::SegGs,
+        );
+        assert!(
+            cg.state.out.buf.contains("    movq -40(%rbp), %rax\n"),
+            "rbp-relative reload expected, got: {:?}",
+            cg.state.out.buf
+        );
+    }
+}

@@ -1,0 +1,2397 @@
+//! Expression type resolution and sizing.
+//!
+//! This module contains functions for determining the IR type and size of C expressions.
+//! It includes helpers for binary operations, subscript, function call return types,
+//! `_Generic` selections, `sizeof` computation, and CType-level expression type resolution.
+
+use super::lower::Lowerer;
+use crate::common::fx_hash::FxHashMap;
+use crate::common::qualifiers;
+use crate::common::types::{
+    AddressSpace, CType, IrType, PtrQuals, target_int_ir_type, widened_op_type,
+};
+use crate::frontend::parser::ast::{
+    BinOp, BlockItem, CompoundStmt, Expr, GenericAssociation, Initializer, Stmt, TypeSpecifier,
+    UnaryOp,
+};
+use crate::ir::reexports::{IrConst, Value};
+
+/// Promote small integer types to I32, matching C integer promotion rules.
+/// I8, U8, I16, U16 all promote to I32. All other types are returned unchanged.
+fn promote_integer(ty: IrType) -> IrType {
+    match ty {
+        IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 => IrType::I32,
+        IrType::U32 => IrType::U32,
+        other => other,
+    }
+}
+
+/// Apply C11 6.3.1.1p2 integer promotion for bitfield types.
+/// "If an int can represent all values of the original type (as restricted by the
+/// width, for a bit-field), the value is converted to an int; otherwise, it is
+/// converted to an unsigned int."
+///
+/// This applies regardless of the declared storage type of the bitfield. A
+/// `uint64_t arg_count : 16` bitfield has values 0..65535, which fit in int,
+/// so it promotes to int (I32).
+pub(super) fn bitfield_promoted_type(field_ty: IrType, bf_info: Option<(u32, u32)>) -> IrType {
+    if let Some((_bit_offset, bit_width)) = bf_info {
+        let is_signed = field_ty.is_signed();
+        if is_signed {
+            // Signed bitfield: values range is -(2^(w-1)) to 2^(w-1)-1.
+            // int (32-bit signed) can represent all values if width <= 32.
+            if bit_width <= 32 {
+                IrType::I32
+            } else {
+                field_ty
+            }
+        } else {
+            // Unsigned bitfield: values range is 0 to 2^w - 1.
+            // int (32-bit signed, max 2^31-1) can represent all values if width <= 31.
+            if bit_width <= 31 {
+                IrType::I32
+            } else if bit_width == 32 {
+                // int cannot represent 0..2^32-1, so promote to unsigned int.
+                IrType::U32
+            } else {
+                field_ty
+            }
+        }
+    } else {
+        field_ty
+    }
+}
+
+impl qualifiers::ConstLookup for Lowerer {
+    fn object_const_base(&self, name: &str) -> bool {
+        self.lookup_var_info(name).is_some_and(|v| v.base_const)
+    }
+
+    fn typedef_const_base(&self, name: &str) -> bool {
+        self.types.const_base_typedefs.contains(name)
+    }
+
+    fn typedef_const_pointer_level(&self, name: &str) -> Option<usize> {
+        self.types
+            .typedefs
+            .get(name)
+            .and_then(qualifiers::typedef_const_pointer_level)
+    }
+
+    fn is_pointer(&self, expr: &Expr) -> bool {
+        matches!(
+            self.get_expr_ctype(expr),
+            Some(CType::Pointer(..) | CType::Array(..))
+        )
+    }
+
+    fn expr_const_pointer_level(&self, expr: &Expr) -> Option<usize> {
+        self.get_expr_ctype(expr)
+            .as_ref()
+            .and_then(qualifiers::typedef_const_pointer_level)
+    }
+
+    fn type_const_pointer_level(&self, ts: &TypeSpecifier) -> Option<usize> {
+        qualifiers::typedef_const_pointer_level(&self.type_spec_to_ctype(ts))
+    }
+
+    fn select_generic<'a>(
+        &self,
+        controlling: &Expr,
+        associations: &'a [GenericAssociation],
+    ) -> Option<&'a Expr> {
+        self.resolve_generic_selection_expr(controlling, associations)
+    }
+
+    fn member_const_base(&self, base: &Expr, field: &str, indirect: bool) -> bool {
+        let base_ct = if indirect {
+            match self.get_expr_ctype(base) {
+                Some(CType::Pointer(inner, _) | CType::Array(inner, _)) => Some(*inner),
+                _ => None,
+            }
+        } else {
+            self.get_expr_ctype(base)
+        };
+        let Some(CType::Struct(key) | CType::Union(key)) = base_ct else {
+            return false;
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())
+            .and_then(|layout| layout.field_constness(field, &*layouts))
+            .is_some_and(|(base_const, _, _)| base_const)
+    }
+
+    fn call_const_base(&self, callee: &Expr) -> Option<bool> {
+        match callee {
+            Expr::Identifier(name, _) => self.sema_functions.get(name).map(|f| f.return_base_const),
+            _ => None,
+        }
+    }
+}
+
+impl Lowerer {
+    /// Check if a TypeSpecifier resolves to long double.
+    pub(super) fn is_type_spec_long_double(&self, ts: &TypeSpecifier) -> bool {
+        match ts {
+            TypeSpecifier::LongDouble => true,
+            TypeSpecifier::TypedefName(name) => {
+                if let Some(ctype) = self.types.typedefs.get(name) {
+                    matches!(ctype, CType::LongDouble)
+                } else {
+                    false
+                }
+            }
+            TypeSpecifier::TypeofType(inner, _) => self.is_type_spec_long_double(inner),
+            _ => false,
+        }
+    }
+
+    /// Get the zero constant for a given IR type.
+    pub(super) fn zero_const(&self, ty: IrType) -> IrConst {
+        if ty == IrType::Void {
+            IrConst::Zero
+        } else {
+            IrConst::zero(ty)
+        }
+    }
+
+    /// Return the appropriate IrType for storing packed struct/union data of the given size.
+    /// Small structs (≤8 bytes) passed in registers are packed into the low bytes of a
+    /// 64-bit register. We must store with the correct width to avoid overwriting memory
+    /// adjacent to the struct allocation (e.g. globals placed contiguously).
+    /// Sizes 5-7 use I64 since SysV ABI alignment ensures at least 8 bytes are allocated.
+    pub(super) fn packed_store_type(size: usize) -> IrType {
+        match size {
+            1 => IrType::I8,
+            2 => IrType::I16,
+            3..=4 => IrType::I32,
+            // 0 and 5-8: use I64. Call sites guard size==0 to 8.
+            _ => IrType::I64,
+        }
+    }
+
+    /// Runtime size for expressions that produce a VLA-containing aggregate.
+    /// Fixed-size aggregates still use `struct_value_size` so the backend can
+    /// inline small copies; this is only for GCC's block-scope VLA-struct
+    /// extension where the byte count is an SSA value.
+    pub(super) fn dynamic_struct_value_size(&self, expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Identifier(name, _) => self
+                .func_state
+                .as_ref()
+                .and_then(|fs| fs.locals.get(name))
+                .and_then(|info| if info.is_struct { info.vla_size } else { None }),
+            Expr::StmtExpr(compound, _) => compound
+                .value_expr()
+                .and_then(|v| self.dynamic_struct_value_size(v)),
+            _ => None,
+        }
+    }
+
+    /// Check if an expression refers to a struct/union/vector value (not pointer-to-struct).
+    /// Returns the struct/union/vector size if the expression produces such a value,
+    /// or None if it's not one. Vector types are included because they use the same
+    /// by-value ABI convention as structs (small vectors packed into registers,
+    /// large vectors via sret).
+    pub(super) fn struct_value_size(&self, expr: &Expr) -> Option<usize> {
+        // Native GNU vector results use object-address IR carriers on both modes.
+        if let Expr::FunctionCall(callee, _, _) = expr {
+            if let Expr::Identifier(name, _) = &**callee {
+                if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+                    if result.is_vector() {
+                        return Some(result.size());
+                    }
+                }
+                match name.as_str() {
+                    "__builtin_shuffle" | "__builtin_shufflevector" => {
+                        let bytes = match self.get_expr_ctype(expr) {
+                            Some(ct) if ct.is_vector() => ct.size(),
+                            // Not resolvable: keep the historical packed
+                            // answer rather than inventing a size.
+                            _ => return None,
+                        };
+                        // The lowering packs only results of at most 8 bytes
+                        // on x86-64 (`call_result_is_packed`); everything else,
+                        // every i686 result included, is the object's address.
+                        if bytes > 8 || crate::common::types::target_is_32bit() {
+                            return Some(bytes);
+                        }
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        match expr {
+            Expr::Identifier(name, _) => {
+                if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
+                    if info.is_struct {
+                        return Some(info.alloc_size);
+                    }
+                    // Check if the local is a vector type
+                    if let Some(ref ct) = info.c_type {
+                        if ct.is_vector() {
+                            return Some(info.alloc_size);
+                        }
+                    }
+                    return None; // local found but not struct/vector; don't fall through to globals
+                }
+                if let Some(ginfo) = self.globals.get(name) {
+                    if ginfo.is_struct {
+                        return Some(ginfo.struct_layout.as_ref().map_or(8, |l| l.size));
+                    }
+                    if let Some(ref ct) = ginfo.c_type {
+                        if ct.is_vector() {
+                            return Some(self.ctype_size(ct));
+                        }
+                    }
+                }
+                None
+            }
+            Expr::MemberAccess(base_expr, field_name, _)
+            | Expr::PointerMemberAccess(base_expr, field_name, _) => {
+                let is_ptr = matches!(expr, Expr::PointerMemberAccess(..));
+                let ctype = self.resolve_field_ctype(base_expr, field_name, is_ptr)?;
+                if ctype.is_struct_or_union() || ctype.is_vector() {
+                    Some(self.ctype_size(&ctype))
+                } else {
+                    None
+                }
+            }
+            Expr::ArraySubscript(_, _, _)
+            | Expr::Deref(_, _)
+            | Expr::FunctionCall(_, _, _)
+            | Expr::Conditional(_, _, _, _)
+            | Expr::GnuConditional(_, _, _)
+            | Expr::Assign(_, _, _)
+            | Expr::CompoundAssign(_, _, _, _)
+            | Expr::Comma(_, _, _)
+            | Expr::Cast(_, _, _, _)
+            | Expr::BinaryOp(_, _, _, _)
+            | Expr::UnaryOp(_, _, _) => {
+                let ctype = self.get_expr_ctype(expr)?;
+                if ctype.is_struct_or_union() || ctype.is_vector() {
+                    Some(self.ctype_size(&ctype))
+                } else {
+                    None
+                }
+            }
+            Expr::CompoundLiteral(type_spec, _, _, _) | Expr::BitCast(type_spec, _, _) => {
+                let ctype = self.type_spec_to_ctype(type_spec);
+                if ctype.is_struct_or_union() || ctype.is_vector() {
+                    Some(self.sizeof_type(type_spec))
+                } else {
+                    None
+                }
+            }
+            Expr::StmtExpr(compound, _) => {
+                // Statement expression: recurse into the value expression
+                if let Some(inner_expr) = compound.value_expr() {
+                    if let Some(size) = self.struct_value_size(inner_expr) {
+                        return Some(size);
+                    }
+                    // Fallback: the inner variable may not be lowered yet (it's
+                    // declared inside the statement expression). Scan the compound
+                    // statement's declarations to resolve its type and size.
+                    if let Expr::Identifier(name, _) = inner_expr {
+                        for item in &compound.items {
+                            if let crate::frontend::parser::ast::BlockItem::Declaration(decl) = item
+                            {
+                                for declarator in &decl.declarators {
+                                    if declarator.name == *name {
+                                        let ctype = self
+                                            .build_full_ctype(&decl.type_spec, &declarator.derived);
+                                        if ctype.is_struct_or_union() || ctype.is_vector() {
+                                            return Some(self.ctype_size(&ctype));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the return IrType from a function pointer's CType.
+    /// The function pointer CType can be:
+    ///   - Pointer(Function(ft)): ft.return_type is the actual C return type
+    ///   - Pointer(X): typedef lost the Function node; X is the return type
+    ///   - Function(ft): direct function type
+    fn extract_func_ptr_return_type(ctype: &CType) -> IrType {
+        match ctype {
+            CType::Pointer(inner, _) => match inner.as_ref() {
+                CType::Function(ft) => IrType::from_ctype(&ft.return_type),
+                // For parameter function pointers, CType is just Pointer(ReturnType)
+                // without the Function wrapper
+                other => IrType::from_ctype(other),
+            },
+            CType::Function(ft) => IrType::from_ctype(&ft.return_type),
+            _ => target_int_ir_type(),
+        }
+    }
+
+    /// Resolve the RETURN type of the function designated by `func`, for
+    /// indirect calls (function pointer calls). Strip Deref layers since
+    /// dereferencing function pointers is a no-op in C.
+    ///
+    /// Shared by `get_call_return_struct_size` and
+    /// `get_call_return_struct_align` so the size and alignment queries can
+    /// never disagree about which type they describe.
+    pub(super) fn call_return_ctype(&self, func: &Expr) -> Option<CType> {
+        let func_ctype = match func {
+            Expr::Identifier(name, _) => {
+                // Could be a function pointer variable
+                self.lookup_var_info(name).and_then(|vi| vi.c_type.clone())
+            }
+            Expr::Deref(..) => {
+                let mut expr = func;
+                while let Expr::Deref(inner, _) = expr {
+                    expr = inner;
+                }
+                self.get_expr_ctype(expr)
+            }
+            _ => self.get_expr_ctype(func),
+        };
+        func_ctype.and_then(|ref ct| ct.func_ptr_return_type(false))
+    }
+
+    /// For indirect calls (function pointer calls), determine if the return type is a struct,
+    /// union, or vector and return its size. Returns None if not an aggregate return or if
+    /// the type cannot be determined.
+    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
+        let ret_ct = self.call_return_ctype(func)?;
+        if ret_ct.is_struct_or_union() {
+            // Use resolve_ctype_size to look up struct layouts properly;
+            // CType::size() returns 0 for Struct/Union since they only
+            // store a key, not the actual layout.
+            return Some(self.resolve_ctype_size(&ret_ct));
+        }
+        if ret_ct.is_vector() {
+            if crate::common::types::target_is_32bit()
+                && ret_ct.i686_ext_vector_ret_carrier().is_some()
+            {
+                return None;
+            }
+            return Some(self.resolve_ctype_size(&ret_ct));
+        }
+        None
+    }
+
+    /// Natural alignment of the aggregate returned by an indirect call —
+    /// the companion of `get_call_return_struct_size`. The hidden sret
+    /// buffer for such a call must be aligned to the returned type: a
+    /// callee compiled by GCC materialises the return value with aligned
+    /// SSE stores (movaps) whenever the struct's alignment is 16, and an
+    /// 8-mod-16 buffer faults with #GP at runtime.
+    pub(super) fn get_call_return_struct_align(&self, func: &Expr) -> Option<usize> {
+        let ret_ct = self.call_return_ctype(func)?;
+        if ret_ct.is_struct_or_union() || ret_ct.is_vector() {
+            return Some(self.ctype_align(&ret_ct).max(1));
+        }
+        None
+    }
+
+    /// Check if a builtin name is a polymorphic atomic builtin whose return type
+    /// depends on the pointee type of the first argument. These include all
+    /// __atomic_fetch_*, __atomic_*_fetch, __sync_fetch_and_*, __sync_*_and_fetch,
+    /// __atomic_exchange, __atomic_load, and __sync_val_compare_and_swap.
+    fn is_polymorphic_atomic_builtin(name: &str) -> bool {
+        // Strip size suffix (_1, _2, _4, _8, _16) from __sync_* builtins
+        let name = crate::frontend::sema::builtins::strip_sync_size_suffix(name);
+        // fetch-op family (returns old value)
+        name == "__atomic_fetch_add"
+        || name == "__atomic_fetch_sub"
+        || name == "__atomic_fetch_and"
+        || name == "__atomic_fetch_or"
+        || name == "__atomic_fetch_xor"
+        || name == "__atomic_fetch_nand"
+        || name == "__sync_fetch_and_add"
+        || name == "__sync_fetch_and_sub"
+        || name == "__sync_fetch_and_and"
+        || name == "__sync_fetch_and_or"
+        || name == "__sync_fetch_and_xor"
+        || name == "__sync_fetch_and_nand"
+        // op-fetch family (returns new value)
+        || name == "__atomic_add_fetch"
+        || name == "__atomic_sub_fetch"
+        || name == "__atomic_and_fetch"
+        || name == "__atomic_or_fetch"
+        || name == "__atomic_xor_fetch"
+        || name == "__atomic_nand_fetch"
+        || name == "__sync_add_and_fetch"
+        || name == "__sync_sub_and_fetch"
+        || name == "__sync_and_and_fetch"
+        || name == "__sync_or_and_fetch"
+        || name == "__sync_xor_and_fetch"
+        || name == "__sync_nand_and_fetch"
+        // exchange and load (returns value of the atomic type)
+        || name == "__atomic_exchange_n"
+        || name == "__atomic_load_n"
+        || name == "__sync_lock_test_and_set"
+        || name == "__sync_val_compare_and_swap"
+    }
+
+    /// Return the IR type for known builtins that return float or specific types.
+    /// Returns None for builtins without special return type handling.
+    pub(super) fn builtin_return_type(&self, name: &str) -> Option<IrType> {
+        if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+            return Some(IrType::from_ctype(&result));
+        }
+        if crate::common::avx_widen::AvxWiden::raw_builtin(name).is_some() {
+            return Some(IrType::Ptr);
+        }
+        match name {
+            // x86 vector scalar extractions with 64-bit results (long long /
+            // unsigned long long). Without these the call was typed with the
+            // target int (I32 on i686): every consumer sign-extended the low
+            // dword (cltd) and discarded the high half of the eax:edx pair
+            // (simd_insert_extract pextrq0/pextrq1).
+            "_mm_extract_epi64"
+            | "_mm_cvtsi128_si64"
+            | "_mm_cvtsi128_si64x"
+            | "__builtin_ia32_pextrq128"
+            | "__builtin_ia32_cvtsi128si64"
+            | "__builtin_ia32_cvtsd2si64"
+            | "__builtin_ia32_cvtss2si64" => Some(IrType::I64),
+            // BMI2 BZHI returns its operand type (unsigned int / unsigned long long).
+            "__builtin_ia32_bzhi_si" => Some(IrType::U32),
+            "__builtin_ia32_bzhi_di" => Some(IrType::U64),
+            // Float-returning builtins
+            "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
+            "__builtin_inff" | "__builtin_huge_valf" => Some(IrType::F32),
+            "__builtin_infl" | "__builtin_huge_vall" => Some(IrType::F128),
+            // _Float128 constants are binary128 bit patterns in the U128
+            // carrier (F128 is the x87 long double type).
+            "__builtin_inff128"
+            | "__builtin_huge_valf128"
+            | "__builtin_nanf128"
+            | "__builtin_nansf128"
+            | "__builtin_infq"
+            | "__builtin_huge_valq"
+            | "__builtin_nanq"
+            | "__builtin_nansq" => Some(IrType::U128),
+            "__builtin_nan" | "__builtin_nans" => Some(IrType::F64),
+            "__builtin_nanf" | "__builtin_nansf" => Some(IrType::F32),
+            "__builtin_nanl" | "__builtin_nansl" => Some(IrType::F128),
+            "__builtin_fma"
+            | "__builtin_trunc"
+            | "__builtin_rint"
+            | "__builtin_nearbyint"
+            | "__builtin_roundeven"
+            | "__builtin_fabs"
+            | "__builtin_sqrt"
+            | "__builtin_sin"
+            | "__builtin_cos"
+            | "__builtin_log"
+            | "__builtin_log2"
+            | "__builtin_exp"
+            | "__builtin_pow"
+            | "__builtin_floor"
+            | "__builtin_ceil"
+            | "__builtin_round"
+            | "__builtin_fmin"
+            | "__builtin_fmax"
+            | "__builtin_copysign"
+            | "__builtin_nextafter" => Some(IrType::F64),
+            "__builtin_fmaf"
+            | "__builtin_truncf"
+            | "__builtin_rintf"
+            | "__builtin_nearbyintf"
+            | "__builtin_roundevenf"
+            | "__builtin_fabsf"
+            | "__builtin_sqrtf"
+            | "__builtin_sinf"
+            | "__builtin_cosf"
+            | "__builtin_logf"
+            | "__builtin_expf"
+            | "__builtin_powf"
+            | "__builtin_floorf"
+            | "__builtin_ceilf"
+            | "__builtin_roundf"
+            | "__builtin_copysignf"
+            | "__builtin_nextafterf"
+            // The float twins of `fmax`/`fmin`/`log2`. Their absence here was
+            // a silent miscompile, not a missing symbol: the libc-alias
+            // lowering asks THIS table for the call's result type, so an
+            // unlisted name fell through to I64 and the caller converted the
+            // callee's %xmm0 return with `cvtsi2ssq` -- `__builtin_fmaxf(1.5f,
+            // 2.5f)` evaluated to 1.08842e+09 (the raw low word reinterpreted as
+            // an integer) where GCC 16.2 answers 2.5.  This table and
+            // `builtins.rs`'s alias map are two halves of one contract, which is
+            // exactly why `tests/regression/check_builtin_float_aliases.py`
+            // derives the class from GCC and checks the RESULT rather than the
+            // tables: drift in either half fails there.
+            | "__builtin_fmaxf"
+            | "__builtin_fminf"
+            | "__builtin_log2f" => Some(IrType::F32),
+            "__builtin_fabsl" | "__builtin_sqrtl" | "__builtin_nextafterl" => Some(IrType::F128),
+            // __builtin_* variants: the LibcAlias lowering asks for the
+            // BUILTIN name (e.g. "__builtin_copysignl"), not the libc name.
+            // Without these, the call was typed I64 -> the caller cast the
+            // x87 result via fildq (bit-pattern corruption) or lost it.
+            "__builtin_copysignl"
+            | "__builtin_truncl"
+            | "__builtin_floorl"
+            | "__builtin_ceill"
+            | "__builtin_rintl"
+            | "__builtin_nearbyintl"
+            | "__builtin_roundl"
+            | "__builtin_fmodl"
+            | "__builtin_remainderl"
+            | "__builtin_powl"
+            | "__builtin_sinl"
+            | "__builtin_cosl"
+            | "__builtin_tanl"
+            | "__builtin_asinl"
+            | "__builtin_acosl"
+            | "__builtin_atanl"
+            | "__builtin_atan2l"
+            | "__builtin_sinhl"
+            | "__builtin_coshl"
+            | "__builtin_tanhl"
+            | "__builtin_asinhl"
+            | "__builtin_acoshl"
+            | "__builtin_atanhl"
+            | "__builtin_exp2l"
+            | "__builtin_expm1l"
+            | "__builtin_log1pl"
+            | "__builtin_log10l"
+            | "__builtin_log2l"
+            | "__builtin_fmaxl"
+            | "__builtin_fminl"
+            | "__builtin_fdiml"
+            | "__builtin_fmal"
+            | "__builtin_hypotl"
+            | "__builtin_cbrtl"
+            | "__builtin_frexpl"
+            | "__builtin_ldexpl"
+            | "__builtin_scalbnl"
+            | "__builtin_scalblnl"
+            | "__builtin_modfl"
+            | "__builtin_erfl"
+            | "__builtin_erfcl"
+            | "__builtin_tgammal"
+            | "__builtin_lgammal"
+            | "__builtin_j0l"
+            | "__builtin_j1l"
+            | "__builtin_jnl"
+            | "__builtin_y0l"
+            | "__builtin_y1l"
+            | "__builtin_ynl" => Some(IrType::F128),
+            // plain libm names used by simplify's binary/unary intrinsic folds
+            // (copysignl/fabsl -> LDCopysign/LDFabs); wrong default typing
+            // (I64) made the return cast the x87 result via fildq.
+            "copysignl" | "fabsl" | "truncl" | "floorl" | "ceill" | "rintl" | "nearbyintl"
+            | "sqrtl" => Some(IrType::F128),
+            // _Float128-specific builtins: results are 16-byte binary128 BIT
+            // PATTERNS (U128). Returning F128 here makes the caller cast
+            // F128->U128 via __fixunstfti, corrupting the value.
+            "__builtin_copysignf128"
+            | "__builtin_fabsf128"
+            | "__builtin_copysignq"
+            | "__builtin_fabsq" => Some(IrType::U128),
+            "__builtin_inff16"
+            | "__builtin_huge_valf16"
+            | "__builtin_nanf16"
+            | "__builtin_nansf16"
+            | "__builtin_nansf16b"
+            | "__builtin_fabsf16"
+            | "__builtin_copysignf16"
+            | "__builtin_ceilf16"
+            | "__builtin_floorf16"
+            | "__builtin_truncf16"
+            | "__builtin_roundf16"
+            | "__builtin_roundevenf16"
+            | "__builtin_rintf16"
+            | "__builtin_nearbyintf16"
+            | "__builtin_sqrtf16"
+            | "__builtin_fmaf16"
+            | "__builtin_fminf16"
+            | "__builtin_fmaxf16"
+            | "__builtin_nextafterf16" => Some(IrType::U16),
+            // Integer-returning classification builtins
+            "__builtin_fpclassify"
+            | "__builtin_isnan"
+            | "__builtin_isnanf"
+            | "__builtin_isnanl"
+            | "__builtin_isinf"
+            | "__builtin_isinff"
+            | "__builtin_isinfl"
+            | "__builtin_isfinite"
+            | "__builtin_isfinitef"
+            | "__builtin_isfinitel"
+            | "__builtin_isnormal"
+            | "__builtin_isnormalf"
+            | "__builtin_isnormall"
+            | "__builtin_signbit"
+            | "__builtin_signbitf"
+            | "__builtin_signbitl"
+            | "__builtin_isinf_sign"
+            | "__builtin_isgreater"
+            | "__builtin_isgreaterequal"
+            | "__builtin_isless"
+            | "__builtin_islessequal"
+            | "__builtin_islessgreater"
+            | "__builtin_isunordered" => Some(IrType::I32),
+            // Bit manipulation builtins return int
+            "__builtin_clz"
+            | "__builtin_clzl"
+            | "__builtin_clzll"
+            | "__builtin_ctz"
+            | "__builtin_ctzl"
+            | "__builtin_ctzll"
+            | "__builtin_clrsb"
+            | "__builtin_clrsbl"
+            | "__builtin_clrsbll"
+            | "__builtin_popcount"
+            | "__builtin_popcountl"
+            | "__builtin_popcountll"
+            | "__builtin_parity"
+            | "__builtin_parityl"
+            | "__builtin_parityll"
+            | "__builtin_ffs"
+            | "__builtin_ffsl"
+            | "__builtin_ffsll" => Some(IrType::I32),
+            // Memory/string comparison builtins return int
+            "__builtin_memcmp" | "__builtin_strcmp" | "__builtin_strncmp" => Some(IrType::I32),
+            // Pointer-returning string/memory builtins (kernel fortify-string.h).
+            "__builtin_memchr" | "__builtin_strpbrk" | "__builtin_strncat"
+            | "__builtin_stpncpy" => Some(IrType::Ptr),
+            "__builtin_strspn" | "__builtin_strcspn" => Some(IrType::U64),
+            // Raw GCC 128-bit vector builtins return the vector BY VALUE;
+            // lccc's value representation for 16-byte vectors is I128.
+            // Without this the result defaulted to I64 and the RETURN path
+            // sign-extended half the vector away (cqto), zeroing lanes 2-3
+            // and corrupting lane 1 (kernel NAP governor v4sf clamp).
+            "__builtin_ia32_maxps"
+            | "__builtin_ia32_minps"
+            | "__builtin_ia32_shufps"
+            | "__builtin_ia32_vextractf128_ps256"
+                if self.target == crate::backend::Target::I686 =>
+            {
+                Some(IrType::Ptr)
+            }
+            "__builtin_ia32_maxps"
+            | "__builtin_ia32_minps"
+            | "__builtin_ia32_shufps"
+            | "__builtin_ia32_vextractf128_ps256" => Some(IrType::I128),
+            // 256-bit raw builtins return v8sf, which lccc represents as a
+            // POINTER to the 32-byte result slot everywhere (sret convention).
+            "__builtin_ia32_maxps256"
+            | "__builtin_ia32_minps256"
+            | "__builtin_ia32_andps256"
+            | "__builtin_ia32_cmpps256" => Some(IrType::Ptr),
+            // I/O builtins return int
+            "__builtin_printf" | "__builtin_fprintf" | "__builtin_sprintf"
+            | "__builtin_snprintf" | "__builtin_puts" | "__builtin_putchar" => Some(IrType::I32),
+            // Byte-swap builtins return the same-width unsigned type
+            "__builtin_bswap16" => Some(IrType::U16),
+            "__builtin_bswap32" => Some(IrType::U32),
+            "__builtin_bswap64" => Some(IrType::U64),
+            // abs returns int
+            "__builtin_abs" => Some(IrType::I32),
+            // Complex number component extraction builtins
+            "creal" | "__builtin_creal" | "cimag" | "__builtin_cimag" => Some(IrType::F64),
+            "crealf" | "__builtin_crealf" | "cimagf" | "__builtin_cimagf" => Some(IrType::F32),
+            "creall" | "__builtin_creall" | "cimagl" | "__builtin_cimagl" => Some(IrType::F128),
+            // Complex absolute value
+            "cabs" | "__builtin_cabs" => Some(IrType::F64),
+            "cabsf" | "__builtin_cabsf" => Some(IrType::F32),
+            "cabsl" | "__builtin_cabsl" => Some(IrType::F128),
+            // Complex argument
+            "carg" | "__builtin_carg" => Some(IrType::F64),
+            "cargf" | "__builtin_cargf" => Some(IrType::F32),
+            // CPU feature detection builtins return int
+            "__builtin_cpu_init" => Some(IrType::I32),
+            "__builtin_cpu_supports" => Some(IrType::I32),
+            "__builtin_cpu_is" => Some(IrType::I32),
+            // Fortification builtins: return type matches the underlying libc function
+            // Memory/string functions return pointer (dest)
+            "__builtin___memcpy_chk"
+            | "__builtin___memmove_chk"
+            | "__builtin___memset_chk"
+            | "__builtin___strcpy_chk"
+            | "__builtin___strncpy_chk"
+            | "__builtin___strcat_chk"
+            | "__builtin___strncat_chk"
+            | "__builtin___mempcpy_chk"
+            | "__builtin___stpcpy_chk"
+            | "__builtin___stpncpy_chk" => Some(IrType::Ptr),
+            // printf/fprintf/sprintf/snprintf return int
+            "__builtin___sprintf_chk"
+            | "__builtin___snprintf_chk"
+            | "__builtin___vsprintf_chk"
+            | "__builtin___vsnprintf_chk"
+            | "__builtin___printf_chk"
+            | "__builtin___fprintf_chk"
+            | "__builtin___vprintf_chk"
+            | "__builtin___vfprintf_chk"
+            | "__builtin_va_arg_pack"
+            | "__builtin_va_arg_pack_len" => Some(IrType::I32),
+            "__builtin_thread_pointer" => Some(IrType::Ptr),
+            _ => None,
+        }
+    }
+
+    /// Get the IR type for a binary operation expression.
+    fn get_binop_type(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> IrType {
+        match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::LogicalAnd
+            | BinOp::LogicalOr => crate::common::types::target_int_ir_type(),
+            BinOp::Shl | BinOp::Shr => {
+                // GNU vector shifts are element-wise when either operand is
+                // a vector.  A scalar lhs is splatted to the rhs vector type;
+                // the scalar-C "promoted lhs" rule applies only otherwise.
+                if self.get_expr_ctype(rhs).is_some_and(|ct| ct.is_vector()) {
+                    return self.get_expr_type(rhs);
+                }
+                let lty = self.get_expr_type(lhs);
+                promote_integer(lty)
+            }
+            _ => {
+                // Pointer subtraction (ptr - ptr) yields ptrdiff_t, which is
+                // target_int_ir_type() (I32 on i686, I64 on x86-64).
+                // Without this check, the generic wider_type logic would
+                // propagate the operand types (e.g. U64 from pointer+offset
+                // arithmetic), producing incorrect from_ty in Cast instructions.
+                if *op == BinOp::Sub {
+                    let lty = self.get_expr_type(lhs);
+                    let rty = self.get_expr_type(rhs);
+                    if lty == IrType::Ptr && rty == IrType::Ptr {
+                        return crate::common::types::target_int_ir_type();
+                    }
+                    // Also handle array types decaying to pointers
+                    let lct = self.expr_ctype(lhs);
+                    let rct = self.expr_ctype(rhs);
+                    let is_ptr_or_fn =
+                        |ct: &CType| ct.is_pointer_like() || matches!(ct, CType::Function(_));
+                    if is_ptr_or_fn(&lct) && is_ptr_or_fn(&rct) {
+                        return crate::common::types::target_int_ir_type();
+                    }
+                }
+
+                // Iterate left-skewed chains to avoid O(2^n) recursion
+                let rty = self.get_expr_type(rhs);
+                let mut result = rty;
+                let mut cur: &Expr = lhs;
+                // Check complex for the rhs first
+                if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                    && rty == IrType::Ptr
+                {
+                    let rct = self.expr_ctype(rhs);
+                    if rct.is_complex() {
+                        return IrType::Ptr;
+                    }
+                }
+                loop {
+                    match cur {
+                        Expr::BinaryOp(op2, inner_lhs, inner_rhs, _)
+                            if !op2.is_comparison()
+                                && !matches!(
+                                    op2,
+                                    BinOp::LogicalAnd | BinOp::LogicalOr | BinOp::Shl | BinOp::Shr
+                                ) =>
+                        {
+                            let r_ty = self.get_expr_type(inner_rhs.as_ref());
+                            // Check complex for inner rhs
+                            if matches!(op2, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                                && r_ty == IrType::Ptr
+                            {
+                                let rct = self.expr_ctype(inner_rhs.as_ref());
+                                if rct.is_complex() {
+                                    return IrType::Ptr;
+                                }
+                            }
+                            result = Self::wider_type(result, r_ty);
+                            cur = inner_lhs.as_ref();
+                        }
+                        _ => {
+                            let l_ty = self.get_expr_type(cur);
+                            // Check complex for leftmost leaf
+                            if l_ty == IrType::Ptr {
+                                let lct = self.expr_ctype(cur);
+                                if lct.is_complex() {
+                                    return IrType::Ptr;
+                                }
+                            }
+                            result = Self::wider_type(result, l_ty);
+                            break;
+                        }
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    /// IR type of the VALUE the lowered expression actually produces (its
+    /// defining instruction's result type). Arithmetic BinOps compute in the
+    /// C-semantic common type (see lower_arithmetic_binop), while
+    /// get_expr_type reports the widened storage type (I64 for int-op-literal
+    /// on LP64). Casts, assignments and returns must describe the ACTUAL bits
+    /// in the register: using the widened type as from_ty skips the sign
+    /// extension that int->u64 conversions require ((unsigned long long)(i-3)
+    /// zero-extended instead of sign-extending). Mirrors the exact type
+    /// computation of lower_arithmetic_binop.
+    pub(super) fn value_ir_type(&self, expr: &Expr) -> IrType {
+        // Comparisons and logical operators materialise a C `int` boolean:
+        // the Cmp/select that defines the value is I32-wide (setcc + movzbl,
+        // spilled to a 4-byte slot). get_expr_type reports the widened
+        // storage type (target_int_ir_type() == I64 on LP64), which is a
+        // width lie for the ACTUAL value: when the boolean is an operand of a
+        // 64-bit operation (`p1 < (p1 == 2)`), lower_expr_with_type saw
+        // I64 -> I64, emitted no Cast, and the backend's memory-operand form
+        // read 8 bytes from the 4-byte slot — the high half was whatever
+        // lived in the neighbouring slot (stress lab intexpr seed 5 case 30,
+        // wrong at -O0 only because -O1+ keeps the setcc result in a register
+        // whose upper 32 bits movzbl happened to clear). Reporting I32 here
+        // makes the consumer insert the explicit zero-extension. (`&&`/`||`
+        // are NOT included: lower_short_circuit merges its result at the
+        // target int storage width, which get_expr_type already reports.)
+        if let Expr::BinaryOp(op, _, _, _) = expr {
+            if op.is_comparison() {
+                return IrType::I32;
+            }
+        }
+        if matches!(expr, Expr::UnaryOp(UnaryOp::LogicalNot, _, _)) {
+            return IrType::I32;
+        }
+        // Pointer-valued expressions always materialise a full target pointer.
+        // Prefer the semantic CType before the storage-oriented fallback:
+        // member expressions in very large TUs can have a conservative I32
+        // layout fallback even while lower_expr emits `Load ty: Ptr`.
+        if self
+            .get_expr_ctype(expr)
+            .is_some_and(|ctype| matches!(ctype, CType::Pointer(..) | CType::Array(..)))
+        {
+            return IrType::Ptr;
+        }
+        if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
+            if !op.is_comparison() && !matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
+                // C23 decimal FP: decimal operands carry the result in the
+                // decimal carrier (the integer common_type logic below would
+                // misreport it as I32 and emit a bogus int->D64 cast).
+                let ldec = self.expr_ctype(lhs);
+                let rdec = self.expr_ctype(rhs);
+                if ldec.is_decimal() || rdec.is_decimal() {
+                    let ct = CType::usual_arithmetic_conversion(&ldec, &rdec);
+                    if ct.is_decimal() {
+                        return IrType::from_ctype(&ct);
+                    }
+                }
+                let lhs_ty = self.infer_expr_type(lhs);
+                let rhs_ty = self.infer_expr_type(rhs);
+                let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+                let ot = if is_shift {
+                    let promoted_lhs = Self::integer_promote(lhs_ty);
+                    widened_op_type(promoted_lhs)
+                } else {
+                    let ct = Self::common_type(lhs_ty, rhs_ty);
+                    widened_op_type(ct)
+                };
+                if ot.is_integer() && ot.size() <= 8 {
+                    return ot;
+                }
+            }
+        }
+        self.get_expr_type(expr)
+    }
+
+    /// Return the wider/common type between two types, preferring float > int.
+    fn wider_type(a: IrType, b: IrType) -> IrType {
+        if a == IrType::F128 || b == IrType::F128 {
+            IrType::F128
+        } else if a == IrType::F64 || b == IrType::F64 {
+            IrType::F64
+        } else if a == IrType::F32 || b == IrType::F32 {
+            IrType::F32
+        } else {
+            Self::common_type(a, b)
+        }
+    }
+
+    /// Get the IR type for an array subscript expression.
+    fn get_subscript_type(&self, base: &Expr, index: &Expr) -> IrType {
+        if let Some(base_ctype) = self.get_expr_ctype(base) {
+            match base_ctype {
+                CType::Array(elem, _) => return IrType::from_ctype(&elem),
+                CType::Pointer(pointee, _) => return IrType::from_ctype(&pointee),
+                CType::Vector(elem, _) | CType::ExtVector(elem, _) => {
+                    return IrType::from_ctype(&elem);
+                }
+                _ => {}
+            }
+        }
+        if let Some(idx_ctype) = self.get_expr_ctype(index) {
+            match idx_ctype {
+                CType::Array(elem, _) => return IrType::from_ctype(&elem),
+                CType::Pointer(pointee, _) => return IrType::from_ctype(&pointee),
+                CType::Vector(elem, _) | CType::ExtVector(elem, _) => {
+                    return IrType::from_ctype(&elem);
+                }
+                _ => {}
+            }
+        }
+        // Reconstruct the full subscript expr for get_array_root_name
+        // We use base/index directly to look up root names
+        let root_name = self.get_array_root_name_from_subscript(base, index);
+        if let Some(name) = root_name {
+            if let Some(vi) = self.lookup_var_info(&name) {
+                if vi.is_array {
+                    // For globals with multi-dim strides, use stride-based type
+                    if !vi.array_dim_strides.is_empty() {
+                        return self
+                            .ir_type_for_elem_size(*vi.array_dim_strides.last().unwrap_or(&8));
+                    }
+                    return vi.ty;
+                }
+            }
+        }
+        for operand in [base, index] {
+            if let Expr::Identifier(name, _) = operand {
+                if let Some(vi) = self.lookup_var_info(name) {
+                    if let Some(pt) = vi.pointee_type {
+                        return pt;
+                    }
+                    if vi.is_array {
+                        return vi.ty;
+                    }
+                }
+            }
+        }
+        match base {
+            Expr::MemberAccess(base_expr, field_name, _)
+            | Expr::PointerMemberAccess(base_expr, field_name, _) => {
+                let is_ptr = matches!(base, Expr::PointerMemberAccess(..));
+                if let Some(ctype) = self.resolve_field_ctype(base_expr, field_name, is_ptr) {
+                    if let CType::Array(elem_ty, _) = &ctype {
+                        return IrType::from_ctype(elem_ty);
+                    }
+                    if let CType::Pointer(pointee, _) = &ctype {
+                        return IrType::from_ctype(pointee);
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(pt) = self.get_pointee_type_of_expr(base) {
+            return pt;
+        }
+        if let Some(pt) = self.get_pointee_type_of_expr(index) {
+            return pt;
+        }
+        target_int_ir_type()
+    }
+
+    /// Helper to get array root name from subscript base/index without needing the full
+    /// ArraySubscript expression node.
+    fn get_array_root_name_from_subscript(&self, base: &Expr, index: &Expr) -> Option<String> {
+        // Try base first (normal case: arr[i])
+        if let Some(name) = self.get_array_root_name(base) {
+            return Some(name);
+        }
+        // Try index (reverse subscript: i[arr])
+        self.get_array_root_name(index)
+    }
+
+    /// Get the IR type for a function call's return value.
+    /// Strips Deref layers since dereferencing function pointers is a no-op in C.
+    pub(super) fn get_call_return_type(&self, func: &Expr) -> IrType {
+        // Strip all Deref layers to get the underlying expression
+        let mut stripped = func;
+        while let Expr::Deref(inner, _) = stripped {
+            stripped = inner;
+        }
+        if let Expr::Identifier(name, _) = stripped {
+            // A function-pointer VARIABLE decides its own return type: its
+            // declared signature, else its `c_type` (below).  It must never
+            // pick up a same-named function's signature, builtin, or sema
+            // entry — a parameter named e.g. `round` is not `double
+            // round(double)`.
+            if self.is_func_ptr_variable(name) {
+                if let Some(sig) = self.fptr_variable_sig(name) {
+                    return sig.return_type;
+                }
+            } else {
+                // Nested-function scoping: the signature of the entity being
+                // called, not of the same-named file-scope symbol.
+                let sig_key = self.callee_signature_key(name.as_str());
+                if let Some(ret_ty) = self
+                    .func_meta
+                    .sigs
+                    .get(sig_key.as_str())
+                    .map(|s| s.return_type)
+                {
+                    return ret_ty;
+                }
+                if let Some(ret_ty) = self.builtin_return_type(&sig_key) {
+                    return ret_ty;
+                }
+                // Fall back to sema's function signatures for IrType derivation
+                if let Some(func_info) = self.sema_functions.get(sig_key.as_str()) {
+                    return IrType::from_ctype(&func_info.return_type);
+                }
+            }
+        }
+        if let Some(ctype) = self.get_expr_ctype(stripped) {
+            return Self::extract_func_ptr_return_type(&ctype);
+        }
+        if let Some(ctype) = self.get_expr_ctype(func) {
+            return Self::extract_func_ptr_return_type(&ctype);
+        }
+        target_int_ir_type()
+    }
+
+    /// Resolve a _Generic selection to the matched association's expression.
+    /// Returns the matched expression (or the default), or None if no match.
+    /// Both resolve_generic_selection_ctype and resolve_generic_selection_type
+    /// delegate to this to avoid duplicating the matching logic.
+    pub(super) fn resolve_generic_selection_expr<'a>(
+        &self,
+        controlling: &Expr,
+        associations: &'a [GenericAssociation],
+    ) -> Option<&'a Expr> {
+        // C23 6.5.1.1p2: an expression operand undergoes lvalue conversion
+        // (array and function decay included); a type operand (C2y) none.
+        // Its type is computed fresh, not from the ExprId cache, which can
+        // hold a type computed before the operand's declarations were seen.
+        let controlling_ctype = match controlling {
+            Expr::TypeOperand(ts, ..) => Some(self.type_spec_to_ctype(ts)),
+            _ => self
+                .get_expr_ctype_lowerer(controlling)
+                .or_else(|| self.lookup_sema_expr_type(controlling))
+                .map(|ct| ct.decayed_value_ctype()),
+        };
+        let (ctrl_is_const, compare_const) =
+            qualifiers::controlling_const(controlling, associations, self);
+        let controlling_ir_type = self.get_expr_type(controlling);
+        let mut default_expr: Option<&Expr> = None;
+        for assoc in associations {
+            let Some(type_spec) = &assoc.type_spec else {
+                default_expr = Some(&assoc.expr);
+                continue;
+            };
+            let matches = match &controlling_ctype {
+                Some(ctrl_ct) => {
+                    ctrl_ct.generic_association_matches(&self.type_spec_to_ctype(type_spec))
+                }
+                None => self.type_spec_to_ir(type_spec) == controlling_ir_type,
+            };
+            if matches
+                && (!compare_const
+                    || qualifiers::association_const_base(assoc, self) == ctrl_is_const)
+            {
+                return Some(&assoc.expr);
+            }
+        }
+        default_expr
+    }
+
+    /// Resolve the CType of a _Generic selection expression.
+    pub(super) fn resolve_generic_selection_ctype(
+        &self,
+        controlling: &Expr,
+        associations: &[GenericAssociation],
+    ) -> Option<CType> {
+        let matched = self.resolve_generic_selection_expr(controlling, associations)?;
+        self.get_expr_ctype(matched)
+    }
+
+    /// Resolve the IrType of a _Generic selection expression.
+    pub(super) fn resolve_generic_selection_type(
+        &self,
+        controlling: &Expr,
+        associations: &[GenericAssociation],
+    ) -> IrType {
+        if let Some(matched) = self.resolve_generic_selection_expr(controlling, associations) {
+            self.get_expr_type(matched)
+        } else {
+            target_int_ir_type()
+        }
+    }
+
+    /// Resolve __builtin_choose_expr(const_expr, expr1, expr2) to the selected branch.
+    /// Returns a reference to args[1] if the condition is nonzero, or args[2] otherwise.
+    pub(super) fn resolve_builtin_choose_expr<'a>(&self, args: &'a [Expr]) -> &'a Expr {
+        // Sema has proven the condition an integer constant expression
+        // (`sema/ice.rs`), so it folds here; any constant width selects by
+        // its value.
+        let is_nonzero = self
+            .eval_required_constant(&args[0])
+            .is_none_or(|c| c.is_nonzero());
+        if is_nonzero { &args[1] } else { &args[2] }
+    }
+
+    /// `__builtin_classify_type(arg)` ([`CType::gcc_type_class`]); a
+    /// function designator decays to a pointer, unless a local object hides
+    /// the function's name.
+    pub(super) fn classify_type_of(&self, arg: Option<&Expr>) -> i64 {
+        let Some(arg) = arg else {
+            return 0;
+        };
+        if let Expr::Identifier(name, _) = arg {
+            let local = self
+                .func_state
+                .as_ref()
+                .is_some_and(|fs| fs.locals.contains_key(name.as_str()));
+            if !local && self.known_functions.contains(name.as_str()) {
+                return 5;
+            }
+        }
+        self.expr_ctype(arg).gcc_type_class()
+    }
+
+    /// The operand `__builtin_choose_expr(c, a, b)` designates, when `expr`
+    /// is one: the selected arm, which keeps its value category (GCC: the
+    /// result is an lvalue iff the chosen operand is), so stores, member
+    /// stores and `&` go through it instead of a materialized call result.
+    pub(super) fn choose_expr_selected<'a>(&self, expr: &'a Expr) -> Option<&'a Expr> {
+        match expr {
+            Expr::FunctionCall(callee, args, _)
+                if args.len() >= 3
+                    && matches!(&**callee, Expr::Identifier(n, _) if n == "__builtin_choose_expr") =>
+            {
+                Some(self.resolve_builtin_choose_expr(args))
+            }
+            _ => None,
+        }
+    }
+
+    // expr_is_const_qualified is defined in expr.rs as pub(super)
+    /// Get the IR type for an expression (best-effort, based on locals/globals info).
+    pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
+        use crate::common::types::target_is_32bit;
+        let is_32bit = target_is_32bit();
+        // CType is authoritative for pointer width. The case-by-case IR
+        // fallback below is intentionally best-effort and may return I32 for
+        // an unresolved member/subscript in a very large translation unit;
+        // allowing that fallback to type pointer-valued phis/copies narrows
+        // their spill stores and leaves stale upper pointer bits.
+        if self
+            .get_expr_ctype(expr)
+            .is_some_and(|ctype| matches!(ctype, CType::Pointer(..) | CType::Array(..)))
+        {
+            return IrType::Ptr;
+        }
+        match expr {
+            Expr::IntLiteral(val, _) => {
+                // Storage-level type query: LP64 reports I64 (ILP32: I32 when
+                // the value fits). Conversion boundaries (casts, assignments,
+                // inits, returns) must use value_ir_type(), which reports the
+                // ACTUAL producer type so int->u64 conversions sign-extend.
+                if is_32bit {
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        IrType::I32
+                    } else {
+                        IrType::I64
+                    }
+                } else {
+                    IrType::I64
+                }
+            }
+            // C character constants have type int (not the char type).
+            Expr::CharLiteral(_, _) => {
+                if is_32bit {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
+            }
+            Expr::UIntLiteral(val, _) => {
+                // C `unsigned int` is 32-bit on both ILP32 and LP64.
+                // Values that fit in U32 have type U32; larger ones promote to U64.
+                if *val <= u32::MAX as u64 {
+                    IrType::U32
+                } else {
+                    IrType::U64
+                }
+            }
+            Expr::LongLiteral(val, _) => {
+                if is_32bit {
+                    // On ILP32, long is 32-bit. Values outside i32 range promote to long long (64-bit).
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        IrType::I32
+                    } else {
+                        IrType::I64
+                    }
+                } else {
+                    IrType::I64
+                }
+            }
+            Expr::ULongLiteral(val, _) => {
+                if is_32bit {
+                    if *val <= u32::MAX as u64 {
+                        IrType::U32
+                    } else {
+                        IrType::U64
+                    }
+                } else {
+                    IrType::U64
+                }
+            }
+            // long long is always 64-bit, regardless of target
+            Expr::LongLongLiteral(_, _) => IrType::I64,
+            Expr::ULongLongLiteral(_, _) => IrType::U64,
+            Expr::FloatLiteral(_, _) => IrType::F64,
+            Expr::FloatLiteralF32(_, _) => IrType::F32,
+            Expr::FloatLiteralLongDouble(_, _, _) => IrType::F128,
+            Expr::FloatLiteralF128(_, _, _) => IrType::U128,
+            Expr::FloatLiteralHalf(_, _, _) => IrType::U16,
+            Expr::FloatLiteralDecimal(width, _, _) => match width {
+                32 => IrType::D32,
+                64 => IrType::D64,
+                _ => IrType::U128,
+            },
+            Expr::ImaginaryLiteral(_, _)
+            | Expr::ImaginaryLiteralF32(_, _)
+            | Expr::ImaginaryLiteralLongDouble(_, _, _) => IrType::Ptr,
+            Expr::StringLiteral(_, _)
+            | Expr::WideStringLiteral(_, _)
+            | Expr::Char16StringLiteral(_, _) => IrType::Ptr,
+            Expr::Cast(target_type, _, _, _) => self.type_spec_to_ir(target_type),
+            Expr::UnaryOp(UnaryOp::RealPart, inner, _)
+            | Expr::UnaryOp(UnaryOp::ImagPart, inner, _) => {
+                let inner_ct = self.expr_ctype(inner);
+                if inner_ct.is_complex() {
+                    return Self::complex_component_ir_type(&inner_ct);
+                }
+                self.get_expr_type(inner)
+            }
+            Expr::UnaryOp(UnaryOp::Neg, inner, _)
+            | Expr::UnaryOp(UnaryOp::Plus, inner, _)
+            | Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
+                let inner_ty = self.get_expr_type(inner);
+                // Only check for complex types if the inner type is Ptr (which complex uses)
+                if inner_ty == IrType::Ptr {
+                    let inner_ct = self.expr_ctype(inner);
+                    if inner_ct.is_complex() {
+                        return IrType::Ptr;
+                    }
+                }
+                if inner_ty.is_float() {
+                    return inner_ty;
+                }
+                promote_integer(inner_ty)
+            }
+            Expr::UnaryOp(UnaryOp::PreInc, inner, _) | Expr::UnaryOp(UnaryOp::PreDec, inner, _) => {
+                self.get_expr_type(inner)
+            }
+            Expr::UnaryOp(UnaryOp::LogicalNot, _, _) => {
+                // Logical NOT produces C int (I32 on ILP32, I64 on LP64)
+                crate::common::types::target_int_ir_type()
+            }
+            Expr::BinaryOp(op, lhs, rhs, _) => self.get_binop_type(op, lhs, rhs),
+            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => self.get_expr_type(lhs),
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                // The conditional's result is a value of its C common type —
+                // not a storage type — so type the arms by C semantics. Using
+                // raw storage types here makes an int conditional with a
+                // constant arm (born I64) report I64 and forces a spurious
+                // widen/narrow cast pair around the (now natural-width) merge.
+                Self::common_type(
+                    self.ternary_arm_type(then_expr),
+                    self.ternary_arm_type(else_expr),
+                )
+            }
+            Expr::GnuConditional(cond, else_expr, _) => Self::common_type(
+                self.ternary_arm_type(cond),
+                self.ternary_arm_type(else_expr),
+            ),
+            Expr::Comma(_, rhs, _) => self.get_expr_type(rhs),
+            Expr::PostfixOp(_, inner, _) => self.get_expr_type(inner),
+            Expr::AddressOf(_, _) => IrType::Ptr,
+            Expr::Sizeof(_, _) | Expr::Countof(_, _) => {
+                if is_32bit {
+                    IrType::U32
+                } else {
+                    IrType::U64
+                }
+            }
+            Expr::GenericSelection(controlling, associations, _) => {
+                self.resolve_generic_selection_type(controlling, associations)
+            }
+            Expr::FunctionCall(func, args, _) => {
+                if let Expr::Identifier(name, _) = func.as_ref() {
+                    if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+                        return IrType::from_ctype(&result);
+                    }
+                    if name == "__builtin_choose_expr" && args.len() >= 3 {
+                        return self.get_expr_type(self.resolve_builtin_choose_expr(args));
+                    }
+                    if Self::is_polymorphic_atomic_builtin(name) {
+                        if let Some(pointee_ty) =
+                            args.first().and_then(|a| self.get_pointee_type_of_expr(a))
+                        {
+                            return pointee_ty;
+                        }
+                    }
+                    if let Some(ct) = self.get_c2y_builtin_ctype(name, args) {
+                        return IrType::from_ctype(&ct);
+                    }
+                }
+                self.get_call_return_type(func)
+            }
+            Expr::VaArg(_, type_spec, _) => self.resolve_va_arg_type(type_spec),
+            // ConvertVector lowers to the result ALLOCA pointer (vector
+            // expression convention).
+            Expr::ConvertVector(_, _, _) => IrType::Ptr,
+            Expr::Identifier(name, _) => {
+                if crate::frontend::parser::ast::is_function_name_builtin(name) {
+                    return IrType::Ptr;
+                }
+                if let Some((_, ty)) = self.identifier_enumerator(expr, name) {
+                    return IrType::from_ctype(&ty);
+                }
+                if let Some(vi) = self.lookup_var_info(name) {
+                    if vi.is_array {
+                        return IrType::Ptr;
+                    }
+                    return vi.ty;
+                }
+                target_int_ir_type()
+            }
+            Expr::ArraySubscript(base, index, _) => self.get_subscript_type(base, index),
+            Expr::Deref(inner, _) => {
+                if let Some(inner_ctype) = self.get_expr_ctype(inner) {
+                    match inner_ctype {
+                        CType::Pointer(pointee, _) => return IrType::from_ctype(&pointee),
+                        CType::Array(elem, _) => return IrType::from_ctype(&elem),
+                        _ => {}
+                    }
+                }
+                if let Some(pt) = self.get_pointee_type_of_expr(inner) {
+                    return pt;
+                }
+                target_int_ir_type()
+            }
+            Expr::MemberAccess(base_expr, field_name, _) => {
+                let (_, field_ty, bf_info) = self.resolve_member_access_full(base_expr, field_name);
+                bitfield_promoted_type(field_ty, bf_info)
+            }
+            Expr::PointerMemberAccess(base_expr, field_name, _) => {
+                let (_, field_ty, bf_info) =
+                    self.resolve_pointer_member_access_full(base_expr, field_name);
+                bitfield_promoted_type(field_ty, bf_info)
+            }
+            Expr::StmtExpr(compound, _) => {
+                // Statement expression: type is the type of the last expression statement.
+                // Try CType-based resolution first (includes sema annotations), which
+                // correctly handles anonymous struct member access inside stmt exprs
+                // where the inner variable hasn't been lowered yet.
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    return IrType::from_ctype(&ctype);
+                }
+                return compound
+                    .value_expr()
+                    .map_or(IrType::Void, |value| self.get_expr_type(value));
+            }
+            Expr::CompoundLiteral(type_name, _, _, _) | Expr::BitCast(type_name, _, _) => {
+                self.type_spec_to_ir(type_name)
+            }
+            _ => target_int_ir_type(),
+        }
+    }
+
+    /// Get the CType of a binary operation expression.
+    fn get_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
+        match op {
+            // A GNU vector comparison is a vector of signed lanes (so
+            // `__typeof__(a == b)` declares a vector, as in GCC); a scalar
+            // comparison and the logical operators produce `int`.
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let vector = [lhs, rhs]
+                    .into_iter()
+                    .filter_map(|e| self.get_expr_ctype(e))
+                    .find(CType::is_vector);
+                return match vector {
+                    Some(v) => v.vector_comparison_result(),
+                    None => Some(CType::Int),
+                };
+            }
+            BinOp::LogicalAnd | BinOp::LogicalOr => return Some(CType::Int),
+            _ => {}
+        }
+
+        // GNU vector shifts produce the vector type even when its operand is
+        // on the right (`scalar << vector`); scalar shifts keep promoted-lhs.
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            if let Some(rct) = self.get_expr_ctype(rhs) {
+                if rct.is_vector() {
+                    return Some(rct);
+                }
+            }
+            if let Some(lct) = self.get_expr_ctype(lhs) {
+                return Some(Self::integer_promote_ctype(&lct));
+            }
+            return Some(CType::Int);
+        }
+
+        // Pointer arithmetic for Add and Sub (including function designators)
+        let is_ptr_or_fn = |ct: &CType| ct.is_pointer_like() || matches!(ct, CType::Function(_));
+        if matches!(op, BinOp::Add | BinOp::Sub) {
+            if let Some(lct) = self.get_expr_ctype(lhs) {
+                match &lct {
+                    CType::Pointer(_, _) => {
+                        if *op == BinOp::Sub
+                            && self.get_expr_ctype(rhs).as_ref().is_some_and(is_ptr_or_fn)
+                        {
+                            return Some(CType::Long);
+                        }
+                        return Some(lct);
+                    }
+                    CType::Array(elem, _) => {
+                        if *op == BinOp::Sub
+                            && self.get_expr_ctype(rhs).as_ref().is_some_and(is_ptr_or_fn)
+                        {
+                            return Some(CType::Long);
+                        }
+                        // The decayed array keeps the space of its object:
+                        // `*(arr + i)` on a __seg_gs array reads %gs.
+                        let space = self.get_addr_space_of_struct_expr(lhs);
+                        return Some(CType::Pointer(elem.clone(), PtrQuals::of(space)));
+                    }
+                    CType::Function(_) => {
+                        if *op == BinOp::Sub
+                            && self.get_expr_ctype(rhs).as_ref().is_some_and(is_ptr_or_fn)
+                        {
+                            return Some(CType::Long);
+                        }
+                        return Some(CType::Pointer(Box::new(lct), PtrQuals::GENERIC));
+                    }
+                    _ => {}
+                }
+            }
+            if *op == BinOp::Add {
+                // int + ptr case
+                if let Some(rct) = self.get_expr_ctype(rhs) {
+                    match rct {
+                        CType::Pointer(_, _) => return Some(rct),
+                        CType::Array(elem, _) => {
+                            let space = self.get_addr_space_of_struct_expr(rhs);
+                            return Some(CType::Pointer(elem, PtrQuals::of(space)));
+                        }
+                        CType::Function(_) => {
+                            return Some(CType::Pointer(Box::new(rct), PtrQuals::GENERIC));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // For arithmetic (Add, Sub, Mul, Div, Mod) and bitwise (BitAnd, BitOr, BitXor)
+        // operators on non-pointer types, apply C usual arithmetic conversions.
+        let lct = self.get_expr_ctype(lhs);
+        let rct = self.get_expr_ctype(rhs);
+
+        // Per GCC vector extensions, if either operand is a vector type, the result
+        // is a vector type. The scalar operand is broadcast to all vector lanes.
+        if let Some(ref l) = lct {
+            if l.is_vector() {
+                return Some(l.clone());
+            }
+        }
+        if let Some(ref r) = rct {
+            if r.is_vector() {
+                return Some(r.clone());
+            }
+        }
+
+        match (lct, rct) {
+            (Some(l), Some(r)) => Some(CType::usual_arithmetic_conversion(&l, &r)),
+            (Some(l), None) => Some(Self::integer_promote_ctype(&l)),
+            (None, Some(r)) => Some(Self::integer_promote_ctype(&r)),
+            (None, None) => None,
+        }
+    }
+
+    /// Apply C integer promotion rules to a CType.
+    /// Types smaller than int are promoted to int.
+    /// Delegates to CType::integer_promoted().
+    fn integer_promote_ctype(ct: &CType) -> CType {
+        ct.integer_promoted()
+    }
+
+    /// Resolve a potentially stale (forward-declared) struct/union CType by looking
+    /// up the latest complete definition from the ctype_cache.
+    /// If the struct has no fields but has a name, the cache may have the full definition.
+    pub(super) fn resolve_forward_declared_ctype(&self, ctype: CType) -> CType {
+        match &ctype {
+            CType::Struct(key) | CType::Union(key) => {
+                // Check if the layout for this key is a forward-declaration stub (size 0, no fields)
+                let is_incomplete = self
+                    .types
+                    .borrow_struct_layouts()
+                    .get(&**key)
+                    .map(|l| l.fields.is_empty())
+                    .unwrap_or(true);
+                if is_incomplete {
+                    // Try the ctype_cache for a complete version
+                    if let Some(cached) = self.types.ctype_cache.borrow().get(&**key) {
+                        match cached {
+                            CType::Struct(cached_key) | CType::Union(cached_key) => {
+                                let cached_complete = self
+                                    .types
+                                    .borrow_struct_layouts()
+                                    .get(&**cached_key)
+                                    .map(|l| !l.fields.is_empty())
+                                    .unwrap_or(false);
+                                if cached_complete {
+                                    return cached.clone();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ctype
+            }
+            _ => ctype,
+        }
+    }
+
+    /// Get the CType of a struct/union field.
+    /// Recursively searches anonymous struct/union members to find the field,
+    /// matching the behavior of StructLayout::field_offset().
+    fn get_field_ctype(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer_access: bool,
+    ) -> Option<CType> {
+        if let Some((vec_ct, _)) =
+            self.vector_member_lanes(base_expr, field_name, is_pointer_access)
+        {
+            return vec_ct.ext_vector_swizzle_ctype(field_name);
+        }
+        let raw_base_ctype = self.get_expr_ctype(base_expr);
+        let base_ctype = if is_pointer_access {
+            // For p->field, get CType of p, then dereference
+            // Arrays decay to pointers, so arr->field is valid when arr is an array
+            match raw_base_ctype? {
+                CType::Pointer(inner, _) => *inner,
+                CType::Array(inner, _) => *inner,
+                _ => return None,
+            }
+        } else {
+            raw_base_ctype?
+        };
+        // Resolve forward-declared (incomplete) struct/union types that may have
+        // been cached before the full definition was available.
+        let base_ctype = self.resolve_forward_declared_ctype(base_ctype);
+        // Look up field in the struct/union type, recursing into anonymous members
+        match &base_ctype {
+            CType::Struct(key) | CType::Union(key) => {
+                if let Some(layout) = self.types.borrow_struct_layouts().get(&**key) {
+                    // Use field_offset which recursively searches anonymous
+                    // struct/union members, returning the correct field type
+                    if let Some((_offset, ctype)) =
+                        layout.field_offset(field_name, &*self.types.borrow_struct_layouts())
+                    {
+                        return Some(ctype);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Look up the CType of an expression from sema's pre-computed annotation map.
+    /// Returns None if sema did not annotate this expression (e.g., because the
+    /// type depends on lowering-specific state like alloca info).
+    fn lookup_sema_expr_type(&self, expr: &Expr) -> Option<CType> {
+        self.sema_expr_types.get(&expr.id()).cloned()
+    }
+
+    /// The type of the `?:` `expr` with arms `then_expr`/`else_expr` (C11
+    /// 6.5.15p3-p6).
+    ///
+    /// Whether a `void *` arm is a null pointer constant picks between that
+    /// arm's type and the other's, and takes the integer-constant-expression
+    /// rules -- enumerators, `(void *)(N - N)`, qualified-pointee typedefs --
+    /// that sema implements exactly (`ExprTypeChecker::is_null_pointer_constant`)
+    /// and the syntactic `const_arith` test approximates. Sema typed this very
+    /// conditional with them, so its annotation decides; it is trusted only
+    /// when it equals one of the two possible outcomes, so an annotation of
+    /// another node at a reused address can never inject a type. The
+    /// syntactic test stays the fallback for expressions sema never typed.
+    fn conditional_expr_ctype(
+        &self,
+        expr: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> Option<CType> {
+        self.reconcile_conditional_ctype(
+            expr,
+            self.get_expr_ctype(then_expr),
+            self.get_expr_ctype(else_expr),
+            then_expr,
+            else_expr,
+        )
+    }
+
+    /// Get the full CType of an expression by recursion.
+    /// Returns None if the type cannot be determined from CType tracking.
+    ///
+    /// Resolution order:
+    /// 1. Lowerer-specific inference (uses locals, globals, func_meta, etc.)
+    /// 2. Sema annotation fallback (pre-computed ExprTypeMap from sema pass)
+    ///
+    /// The lowerer-specific path is checked first because it has access to
+    /// lowering state (variable allocas, global metadata) that may produce
+    /// more precise types than sema's symbol-table-only inference.
+    pub(super) fn get_expr_ctype(&self, expr: &Expr) -> Option<CType> {
+        // For identifiers and dereferences of identifiers, always consult
+        // the lowerer's local/global state directly rather than the
+        // ExprId-keyed cache.  The allocator can reuse heap addresses across
+        // different expression nodes within the same function (e.g., a
+        // macro-expanded `_old` identifier may be allocated at the address
+        // previously used by `n`), and since ExprId is currently
+        // address-based, this could cause stale hits.  The lowerer's
+        // lookup_var_info is O(1) and always reflects the current scope, so
+        // bypassing the cache for identifiers is both correct and cheap.
+        //
+        // The Deref/Cast bypass is essential for typeof() inside offsetof()
+        // macros: `offsetof(typeof(*a), field)` and
+        // `offsetof(typeof(*b), field)` may allocate the Deref and Cast
+        // nodes at the same heap address, causing the cache to return the
+        // wrong struct type for the second call.  Similarly,
+        // typeof(*(type *)0) patterns (e.g., LIST_ELEM macro) reuse
+        // Deref(Cast(...)) addresses.  Cast is also bypassed since
+        // type_spec_to_ctype is cheap and always correct.
+        //
+        // A CompoundLiteral carries its own type_specifier, so
+        // type_spec_to_ctype answers exactly and in constant time; going
+        // through the address-keyed cache is both pointless and WRONG: two
+        // literals in one translation unit can share an address, and the cache
+        // then reports the other literal's type.  That is how
+        // `(int[2][3]){ ... }` once answered for `(char[4]){ "ab" }` and the
+        // character member it designated stayed zero.
+        let bypass_cache = matches!(
+            expr,
+            Expr::Identifier(..) | Expr::Deref(..) | Expr::Cast(..) | Expr::CompoundLiteral(..)
+        );
+        if bypass_cache {
+            let result = self.get_expr_ctype_lowerer(expr);
+            if result.is_some() {
+                return result;
+            }
+            // Fall back to sema annotation (keyed by ExprId from the sema
+            // pass — its keys are stable because they were computed before
+            // any AST node deallocation).
+            return self.lookup_sema_expr_type(expr);
+        }
+
+        let key = expr.id();
+        let disc = std::mem::discriminant(expr);
+
+        // Check memoization cache first.
+        // Validate discriminant to detect address reuse (ABA): expressions inside
+        // TypeSpecifier trees (typeof, _Generic) can share addresses with different
+        // Expr variants in the main AST after the TypeSpecifier is dropped.
+        // TODO: Once ExprId uses counter-based IDs instead of pointer addresses,
+        // the discriminant check can be removed entirely.
+        if let Some((cached_disc, cached_val)) = self.expr_ctype_cache.borrow().get(&key) {
+            if *cached_disc == disc {
+                return cached_val.clone();
+            }
+            // Discriminant mismatch — address was reused by a different Expr variant.
+            // Fall through to recompute.
+        }
+
+        // Try lowerer-specific inference first
+        let result = self.get_expr_ctype_lowerer(expr);
+        let result = if result.is_some() {
+            result
+        } else {
+            // Fall back to sema's pre-computed type annotation
+            self.lookup_sema_expr_type(expr)
+        };
+
+        // Only cache successful results.  A None result may become Some
+        // after more variables come into scope during lowering (e.g. when
+        // struct_value_size pre-scans a statement expression before its
+        // locals have been lowered).  Caching None would poison later
+        // resolve_typeof calls that need the now-in-scope variable.
+        if result.is_some() {
+            self.expr_ctype_cache
+                .borrow_mut()
+                .insert(key, (disc, result.clone()));
+        }
+        result
+    }
+
+    /// Lowerer-specific CType inference using lowering state (locals, globals, func_meta).
+    /// This is the original get_expr_ctype logic, now separated so the public
+    /// get_expr_ctype can add a sema fallback after it.
+    fn get_expr_ctype_lowerer(&self, expr: &Expr) -> Option<CType> {
+        match expr {
+            Expr::Identifier(name, _) => {
+                if let Some((_, ty)) = self.identifier_enumerator(expr, name) {
+                    return Some(ty);
+                }
+                if let Some(vi) = self.lookup_var_info(name) {
+                    return vi.c_type.clone();
+                }
+                // Fall back to sema's function signatures for function-typed identifiers
+                // (e.g., taking address of a function: &func_name)
+                if let Some(func_info) = self.sema_functions.get(name.as_str()) {
+                    let callable_type = func_info.prototype.clone().unwrap_or_else(|| {
+                        crate::common::types::FunctionType {
+                            return_type: func_info.return_type.clone(),
+                            params: Vec::new(),
+                            variadic: func_info.variadic,
+                            has_prototype: false,
+                        }
+                    });
+                    return Some(CType::Function(Box::new(callable_type)));
+                }
+                None
+            }
+            Expr::Deref(inner, _) => {
+                // Dereferencing peels off one Pointer/Array layer
+                if let Some(inner_ct) = self.get_expr_ctype(inner) {
+                    match inner_ct {
+                        CType::Pointer(pointee, _) => return Some(*pointee),
+                        CType::Array(elem, _) => return Some(*elem),
+                        _ => {}
+                    }
+                }
+                None
+            }
+            Expr::AddressOf(inner, _) => {
+                // Address-of wraps in Pointer. Named address spaces (`__seg_gs`
+                // / `__seg_fs`) qualify the object, so `&gs_var` is
+                // `T __seg_gs *`, not a generic pointer.
+                if let Some(inner_ct) = self.get_expr_ctype(inner) {
+                    let space = self.get_addr_space_of_struct_expr(inner);
+                    return Some(CType::Pointer(Box::new(inner_ct), PtrQuals::of(space)));
+                }
+                None
+            }
+            Expr::ArraySubscript(base, index, _) => {
+                // Subscript peels off one Array/Pointer/Vector layer
+                if let Some(base_ct) = self.get_expr_ctype(base) {
+                    match base_ct {
+                        CType::Array(elem, _) => return Some(*elem),
+                        CType::Pointer(pointee, _) => return Some(*pointee),
+                        CType::Vector(elem, _) | CType::ExtVector(elem, _) => return Some(*elem),
+                        _ => {}
+                    }
+                }
+                // Reverse subscript: index[base]
+                if let Some(idx_ct) = self.get_expr_ctype(index) {
+                    match idx_ct {
+                        CType::Array(elem, _) => return Some(*elem),
+                        CType::Pointer(pointee, _) => return Some(*pointee),
+                        CType::Vector(elem, _) | CType::ExtVector(elem, _) => return Some(*elem),
+                        _ => {}
+                    }
+                }
+                None
+            }
+            Expr::Cast(type_spec, _, _, _) => Some(self.type_spec_to_ctype(type_spec)),
+            Expr::MemberAccess(base_expr, field_name, _) => {
+                self.get_field_ctype(base_expr, field_name, false)
+            }
+            Expr::PointerMemberAccess(base_expr, field_name, _) => {
+                self.get_field_ctype(base_expr, field_name, true)
+            }
+            Expr::UnaryOp(UnaryOp::Plus, inner, _)
+            | Expr::UnaryOp(UnaryOp::Neg, inner, _)
+            | Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
+                // C11 6.5.3.3: integer promotions apply to the operand of
+                // unary +, -, and ~.  The result type is the promoted type.
+                let ct = self.get_expr_ctype(inner);
+                ct.map(|c| {
+                    if c.is_integer() {
+                        Self::integer_promote_ctype(&c)
+                    } else {
+                        c
+                    }
+                })
+            }
+            Expr::UnaryOp(UnaryOp::PreInc, inner, _) | Expr::UnaryOp(UnaryOp::PreDec, inner, _) => {
+                // PreInc/PreDec return the operand's own type (no promotion).
+                self.get_expr_ctype(inner)
+            }
+            Expr::PostfixOp(_, inner, _) => self.get_expr_ctype(inner),
+            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
+                self.get_expr_ctype(lhs)
+            }
+            // The arms' lvalue conversion (`1 ? arr : (int *)0` is an
+            // `int *`) happens inside the shared composite rule.
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                self.conditional_expr_ctype(expr, then_expr, else_expr)
+            }
+            Expr::GnuConditional(cond, else_expr, _) => {
+                self.conditional_expr_ctype(expr, cond, else_expr)
+            }
+            // The comma operator yields the right operand's *value*
+            // (C11 6.5.17p3), so the result undergoes lvalue conversion:
+            // `(0, arr)` has type `int *`, not `int[4]`.
+            Expr::Comma(_, last, _) => self.get_expr_ctype(last).map(|ct| ct.decayed_value_ctype()),
+            Expr::StringLiteral(_, _) => {
+                // String literals have type char[] which decays to char*
+                Some(CType::Pointer(
+                    Box::new(CType::plain_char()),
+                    PtrQuals::of(AddressSpace::Default),
+                ))
+            }
+            Expr::BinaryOp(op, lhs, rhs, _) => self.get_binop_ctype(op, lhs, rhs),
+            // Literal types for _Generic support
+            // On ILP32, values that overflow the 32-bit type promote to long long
+            Expr::IntLiteral(val, _) => {
+                if crate::common::types::target_is_32bit()
+                    && (*val < i32::MIN as i64 || *val > i32::MAX as i64)
+                {
+                    Some(CType::LongLong)
+                } else {
+                    Some(CType::Int)
+                }
+            }
+            Expr::UIntLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() && *val > u32::MAX as u64 {
+                    Some(CType::ULongLong)
+                } else {
+                    Some(CType::UInt)
+                }
+            }
+            Expr::LongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit()
+                    && (*val < i32::MIN as i64 || *val > i32::MAX as i64)
+                {
+                    Some(CType::LongLong)
+                } else {
+                    Some(CType::Long)
+                }
+            }
+            Expr::ULongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() && *val > u32::MAX as u64 {
+                    Some(CType::ULongLong)
+                } else {
+                    Some(CType::ULong)
+                }
+            }
+            // long long is always 64-bit regardless of target
+            Expr::LongLongLiteral(_, _) => Some(CType::LongLong),
+            Expr::ULongLongLiteral(_, _) => Some(CType::ULongLong),
+            Expr::CharLiteral(_, _) => Some(CType::Int), // char literals have type int in C
+            Expr::FloatLiteral(_, _) => Some(CType::Double),
+            Expr::FloatLiteralF32(_, _) => Some(CType::Float),
+            Expr::FloatLiteralLongDouble(_, _, _) => Some(CType::LongDouble),
+            Expr::FloatLiteralF128(_, _, _) => Some(CType::Float128),
+            Expr::FloatLiteralHalf(is_bf16, _, _) => Some(if *is_bf16 {
+                CType::BFloat16
+            } else {
+                CType::Float16
+            }),
+            Expr::FloatLiteralDecimal(width, _, _) => match width {
+                32 => Some(CType::Decimal32),
+                64 => Some(CType::Decimal64),
+                _ => Some(CType::Decimal128),
+            },
+            // Wide string literal L"..." has type wchar_t* (which is int* on all targets)
+            Expr::WideStringLiteral(_, _) => {
+                Some(CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC))
+            }
+            // char16_t string literal u"..." has type char16_t* (which is unsigned short*)
+            Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(
+                Box::new(CType::UShort),
+                PtrQuals::of(AddressSpace::Default),
+            )),
+            Expr::FunctionCall(func, args, _) => {
+                if let Expr::Identifier(name, _) = func.as_ref() {
+                    if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+                        return Some(result);
+                    }
+                    if name == "__builtin_choose_expr" && args.len() >= 3 {
+                        return self.get_expr_ctype(self.resolve_builtin_choose_expr(args));
+                    }
+                    // Sema's cache does not cover `typeof` operands, which
+                    // reach here: without this, `typeof(__builtin_shuffle(a, m))`
+                    // fell back to `int` with only a warning.
+                    if matches!(
+                        name.as_str(),
+                        "__builtin_shuffle" | "__builtin_shufflevector"
+                    ) {
+                        if let Some(result) = args.first().and_then(|first| {
+                            let first = self.get_expr_ctype(first)?;
+                            CType::shuffle_builtin_result(name, &first, args.len())
+                        }) {
+                            return Some(result);
+                        }
+                    }
+                    if Self::is_polymorphic_atomic_builtin(name) {
+                        if let Some(first_arg) = args.first() {
+                            if let Some(CType::Pointer(inner, _)) = self.get_expr_ctype(first_arg) {
+                                return Some(*inner);
+                            }
+                        }
+                    }
+                    if let Some(ct) = self.get_c2y_builtin_ctype(name, args) {
+                        return Some(ct);
+                    }
+                    // Same rule as the IrType path above: a call to a visible
+                    // nested function is typed by the nested entity's record.
+                    let sig_key = self.callee_signature_key(name.as_str());
+                    // First check lowerer's own func_meta (has ABI-adjusted return_ctype)
+                    if let Some(ctype) = self
+                        .func_meta
+                        .sigs
+                        .get(sig_key.as_str())
+                        .and_then(|s| s.return_ctype.as_ref())
+                    {
+                        return Some(ctype.clone());
+                    }
+                    // Fall back to sema's authoritative function signatures
+                    if let Some(func_info) = self.sema_functions.get(sig_key.as_str()) {
+                        return Some(func_info.return_type.clone());
+                    }
+                    // An undeclared builtin is typed by sema's builtin table
+                    // (`typeof(__builtin_nan(""))` is double, not the
+                    // implicit-int fallback).
+                    if let Some(ct) =
+                        crate::frontend::sema::type_checker::ExprTypeChecker::builtin_return_ctype(
+                            name,
+                        )
+                    {
+                        return Some(ct);
+                    }
+                }
+                // For indirect calls through function pointer variables,
+                // extract the return type from the pointer's CType.
+                // Strip Deref layers since dereferencing function pointers is a no-op.
+                let mut stripped_func: &Expr = func.as_ref();
+                while let Expr::Deref(inner, _) = stripped_func {
+                    stripped_func = inner;
+                }
+                let func_ctype = match stripped_func {
+                    Expr::Identifier(name, _) => {
+                        if let Some(vi) = self.lookup_var_info(name) {
+                            vi.c_type.clone()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => self.get_expr_ctype(stripped_func),
+                };
+                if let Some(ctype) = func_ctype {
+                    if let Some(ret_ct) = ctype.func_ptr_return_type(false) {
+                        return Some(ret_ct);
+                    }
+                }
+                None
+            }
+            Expr::VaArg(_, type_spec, _)
+            | Expr::ConvertVector(_, type_spec, _)
+            | Expr::BitCast(type_spec, _, _)
+            | Expr::CompoundLiteral(type_spec, _, _, _) => Some(self.type_spec_to_ctype(type_spec)),
+            Expr::GenericSelection(controlling, associations, _) => {
+                self.resolve_generic_selection_ctype(controlling, associations)
+            }
+            Expr::StmtExpr(compound, _) => self.get_stmt_expr_ctype(compound, None),
+            // sizeof and alignof always produce size_t (unsigned long on 64-bit,
+            // unsigned int on 32-bit). This is needed so typeof(sizeof(...)) resolves
+            // correctly in kernel macros.
+            Expr::Sizeof(_, _)
+            | Expr::Countof(_, _)
+            | Expr::Alignof(_, _)
+            | Expr::AlignofExpr(_, _)
+            | Expr::GnuAlignof(_, _)
+            | Expr::GnuAlignofExpr(_, _) => {
+                if crate::common::types::target_is_32bit() {
+                    Some(CType::UInt)
+                } else {
+                    Some(CType::ULong)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve the type of a statement expression's compound body.
+    ///
+    /// Optionally accepts a parent scope from an enclosing statement expression,
+    /// enabling resolution of nested statement expression patterns like the kernel's
+    /// atomic_cmpxchg macro: `typeof(*({ typeof(&obj->member) __ai_ptr = ...; ({ typeof(*__ai_ptr) __ret; ...; __ret; }); }))`
+    fn get_stmt_expr_ctype(
+        &self,
+        compound: &CompoundStmt,
+        parent_scope: Option<&FxHashMap<String, CType>>,
+    ) -> Option<CType> {
+        if let Some(expr) = self.stmt_expr_result_expr(compound) {
+            // Build the compound scope up front so the result expression prefers
+            // local declarations over shadowed outer bindings, even when the
+            // tail expression is not a bare identifier (e.g. `x ?: x` inside
+            // `long x = ({ unsigned x = -8; x ?: x; }) * 480998226;`). Without
+            // this, the local `unsigned x` is shadowed by the outer `long x`
+            // when the multiply's operand type is resolved, and the multiply is
+            // computed in 64-bit instead of wrapping at 32-bit.
+            let scope = self.build_compound_scope(compound, parent_scope);
+
+            // If the last expression is itself a StmtExpr, pass the current scope
+            // down so nested statement expressions can reference outer locals.
+            if let Expr::StmtExpr(inner_compound, _) = expr {
+                if !scope.is_empty() {
+                    if let Some(ctype) = self.get_stmt_expr_ctype(inner_compound, Some(&scope)) {
+                        return Some(ctype);
+                    }
+                }
+            }
+
+            // Resolve against the compound-local scope first so local declarations
+            // shadow any outer bindings of the same name.
+            if !scope.is_empty() {
+                if let Some(ctype) = self.get_expr_ctype_with_scope(expr, &scope) {
+                    return Some(ctype);
+                }
+            }
+            // Try normal resolution (works if vars are in sema scope)
+            if let Some(ctype) = self.get_expr_ctype(expr) {
+                return Some(ctype);
+            }
+        }
+        None
+    }
+
+    /// Extract the value expression of a GNU statement expression by unwrapping
+    /// top-level label wrappers around the final statement.
+    fn stmt_expr_result_expr<'a>(&self, compound: &'a CompoundStmt) -> Option<&'a Expr> {
+        compound.value_expr()
+    }
+
+    /// Build a local scope from declarations in a compound statement.
+    ///
+    /// Scans declarations in order, resolving typeof expressions against earlier
+    /// declarations. This is needed for statement expressions inside typeof where
+    /// the variables haven't been lowered yet (e.g., kernel min/max/clamp macros).
+    ///
+    /// Optionally accepts a parent scope from an enclosing statement expression,
+    /// allowing inner declarations that use typeof() on outer variables to resolve
+    /// correctly (e.g., `typeof(*__ai_ptr)` where `__ai_ptr` is in the outer scope).
+    fn build_compound_scope(
+        &self,
+        compound: &CompoundStmt,
+        parent_scope: Option<&FxHashMap<String, CType>>,
+    ) -> FxHashMap<String, CType> {
+        let mut local_scope: FxHashMap<String, CType> = FxHashMap::default();
+
+        // Seed with parent scope so inner typeof expressions can reference
+        // variables declared in an enclosing statement expression.
+        if let Some(parent) = parent_scope {
+            for (k, v) in parent {
+                local_scope.insert(k.clone(), v.clone());
+            }
+        }
+
+        for item in &compound.items {
+            if let BlockItem::Declaration(decl) = item {
+                for declarator in &decl.declarators {
+                    if declarator.name.is_empty() {
+                        continue;
+                    }
+                    // Handle __auto_type: infer type from initializer expression
+                    // rather than defaulting to int (which loses signedness/size info).
+                    if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
+                        if let Some(Initializer::Expr(ref init_expr)) = declarator.init {
+                            if let Some(ctype) = self
+                                .get_expr_ctype(init_expr)
+                                .or_else(|| self.get_expr_ctype_with_scope(init_expr, &local_scope))
+                            {
+                                let full_ctype = self.build_full_ctype(
+                                    &Self::ctype_to_type_spec(&ctype.decayed_value_ctype()),
+                                    &declarator.derived,
+                                );
+                                local_scope.insert(declarator.name.clone(), full_ctype);
+                            }
+                        }
+                        continue;
+                    }
+                    // Resolve this declaration's type, using the local_scope
+                    // for typeof expressions that reference earlier declarations.
+                    // Use try_resolve to avoid emitting warnings during speculative
+                    // scope building; skip declarations where typeof fails rather
+                    // than using a wrong fallback type.
+                    if let Some(resolved_ts) =
+                        self.try_resolve_typeof_with_scope(&decl.type_spec, &local_scope)
+                    {
+                        let ctype = self.build_full_ctype(&resolved_ts, &declarator.derived);
+                        local_scope.insert(declarator.name.clone(), ctype);
+                    }
+                    // If typeof couldn't be resolved, skip this declaration.
+                    // The caller (get_expr_ctype_with_scope) will retry with
+                    // a broader scope that may include outer compound variables.
+                }
+            }
+        }
+        local_scope
+    }
+
+    /// Try to resolve a TypeSpecifier by replacing Typeof nodes with concrete
+    /// type specs, using both normal expression type resolution and a
+    /// supplementary scope. Returns None on failure instead of falling back to
+    /// Int. Used during speculative scope building (build_compound_scope) where
+    /// callers need to know if resolution failed to avoid propagating wrong types.
+    fn try_resolve_typeof_with_scope(
+        &self,
+        ts: &TypeSpecifier,
+        scope: &FxHashMap<String, CType>,
+    ) -> Option<TypeSpecifier> {
+        match ts {
+            TypeSpecifier::Typeof(expr, _) => {
+                if let Some(ctype) = self.get_expr_ctype(expr) {
+                    return Some(Self::ctype_to_type_spec(&ctype));
+                }
+                if let Some(ctype) = self.get_expr_ctype_with_scope(expr, scope) {
+                    return Some(Self::ctype_to_type_spec(&ctype));
+                }
+                None // caller decides what to do
+            }
+            TypeSpecifier::TypeofType(inner, _) => self.try_resolve_typeof_with_scope(inner, scope),
+            other => Some(other.clone()),
+        }
+    }
+
+    /// Resolve an expression's CType using a supplementary scope for identifiers.
+    /// This handles the common typeof patterns (identifier, deref, address-of, cast)
+    /// where the identifier is declared in the same compound statement.
+    /// More complex expressions (member access, subscript, etc.) are not supported.
+    /// Compose a conditional's two arm types, reconciling the two
+    /// null-pointer-constant readings against sema's own type for the
+    /// whole conditional.
+    ///
+    /// `void *` against `0` has two readings, and sema has already decided
+    /// which one this program has; when it agrees with exactly one of them
+    /// that is the answer. Both type-resolution paths go through here:
+    /// before this was shared, the scope-threaded path skipped the
+    /// reconciliation, so the same conditional could be typed differently
+    /// depending on whether a statement expression happened to be in the
+    /// way.
+    fn reconcile_conditional_ctype(
+        &self,
+        expr: &Expr,
+        then_ct: Option<CType>,
+        else_ct: Option<CType>,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> Option<CType> {
+        use crate::common::const_arith::is_null_pointer_constant;
+        let compose = |then_is_npc: bool, else_is_npc: bool| {
+            CType::conditional_composite_type(
+                then_ct.clone(),
+                else_ct.clone(),
+                then_is_npc,
+                else_is_npc,
+            )
+        };
+        let then_matters = CType::conditional_arm_npc_matters(then_ct.as_ref(), else_ct.as_ref());
+        let else_matters = CType::conditional_arm_npc_matters(else_ct.as_ref(), then_ct.as_ref());
+        if then_matters || else_matters {
+            if let Some(sema) = self.lookup_sema_expr_type(expr) {
+                let npc = compose(then_matters, else_matters);
+                if npc.as_ref() == Some(&sema) {
+                    return npc;
+                }
+                let not_npc = compose(false, false);
+                if not_npc.as_ref() == Some(&sema) {
+                    return not_npc;
+                }
+            }
+        }
+        compose(
+            is_null_pointer_constant(then_expr),
+            is_null_pointer_constant(else_expr),
+        )
+    }
+
+    /// Composite type of a conditional's arms resolved against a
+    /// statement-expression's compound-local scope (a scope binding wins
+    /// over normal resolution, so a local shadows an outer same-named
+    /// binding), then reconciled exactly as the plain path is.
+    fn conditional_ctype_with_scope(
+        &self,
+        expr: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+        scope: &FxHashMap<String, CType>,
+    ) -> Option<CType> {
+        let then_ct = self
+            .get_expr_ctype_with_scope(then_expr, scope)
+            .or_else(|| self.get_expr_ctype(then_expr));
+        let else_ct = self
+            .get_expr_ctype_with_scope(else_expr, scope)
+            .or_else(|| self.get_expr_ctype(else_expr));
+        self.reconcile_conditional_ctype(expr, then_ct, else_ct, then_expr, else_expr)
+    }
+
+    fn get_expr_ctype_with_scope(
+        &self,
+        expr: &Expr,
+        scope: &FxHashMap<String, CType>,
+    ) -> Option<CType> {
+        match expr {
+            Expr::Identifier(name, _) => scope.get(name.as_str()).cloned(),
+            Expr::Deref(inner, _) => {
+                if let Some(inner_ct) = self
+                    .get_expr_ctype(inner)
+                    .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
+                {
+                    match inner_ct {
+                        CType::Pointer(pointee, _) => return Some(*pointee),
+                        CType::Array(elem, _) => return Some(*elem),
+                        _ => {}
+                    }
+                }
+                None
+            }
+            Expr::AddressOf(inner, _) => {
+                if let Some(inner_ct) = self
+                    .get_expr_ctype(inner)
+                    .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
+                {
+                    let space = self.get_addr_space_of_struct_expr(inner);
+                    return Some(CType::Pointer(Box::new(inner_ct), PtrQuals::of(space)));
+                }
+                None
+            }
+            Expr::Cast(type_spec, _, _, _) => {
+                // typeof((type)expr) = type
+                Some(self.type_spec_to_ctype(type_spec))
+            }
+            // Conditional: C11 6.5.15 composite type of the two arms
+            // (usual arithmetic conversions for arithmetic arms), with the
+            // arms resolved against the compound-local scope first (a local
+            // declaration shadows an outer same-named binding).  Taking the
+            // then-arm's type here -- the old behaviour -- mistyped every
+            // min/max-style statement expression whose arms have different
+            // types: `({ unsigned char _a = 225; unsigned long long _b =
+            // 4955; _a > _b ? _a : _b; })` came out `unsigned char`, so the
+            // result was truncated to 91 and enclosing comparisons were
+            // performed on the truncated value (YARPGen seed 20261020: the
+            // outer loop bound collapsed and the loop ran zero times at
+            // -O1).  This now matches get_expr_ctype's conditional_expr_ctype.
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                self.conditional_ctype_with_scope(expr, then_expr, else_expr, scope)
+            }
+            // GNU conditional (`x ?: y` is `x ? x : y`): same composite rule,
+            // with the condition expression doubling as the then-arm.
+            // Resolving against the scope first lets a local `unsigned x`
+            // shadow an outer `long x` when determining the
+            // statement-expression result type.
+            Expr::GnuConditional(cond, else_expr, _) => {
+                self.conditional_ctype_with_scope(expr, cond, else_expr, scope)
+            }
+            // Binary ops: try to infer from operands using scope
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                // Comparison and logical operators produce `int` in C regardless
+                // of the operand types (matches get_expr_ctype_lowerer).
+                if op.is_comparison() || matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
+                    return Some(CType::Int);
+                }
+                let lhs_ct = self
+                    .get_expr_ctype(lhs)
+                    .or_else(|| self.get_expr_ctype_with_scope(lhs, scope));
+                let rhs_ct = self
+                    .get_expr_ctype(rhs)
+                    .or_else(|| self.get_expr_ctype_with_scope(rhs, scope));
+                // Return the wider type (simple heuristic matching usual arithmetic conversions)
+                match (lhs_ct, rhs_ct) {
+                    (Some(l), Some(r)) => {
+                        if l.size() >= r.size() {
+                            Some(l)
+                        } else {
+                            Some(r)
+                        }
+                    }
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
+            // Statement expression with outer scope: build a combined scope
+            // (outer + inner declarations) and resolve the last expression.
+            // This handles nested stmt exprs like the kernel's cmpxchg macro where
+            // the inner compound uses typeof() referencing outer compound variables.
+            Expr::StmtExpr(compound, _) => {
+                if let Some(expr) = compound.value_expr() {
+                    // First try normal resolution
+                    if let Some(ctype) = self.get_expr_ctype(expr) {
+                        return Some(ctype);
+                    }
+                    // Build a combined scope: outer scope + inner declarations
+                    let combined_scope = self.build_compound_scope(compound, Some(scope));
+                    if !combined_scope.is_empty() {
+                        if let Some(ctype) = self.get_expr_ctype_with_scope(expr, &combined_scope) {
+                            return Some(ctype);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn get_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
+        use crate::frontend::sema::{gcc16_builtins, stdbit};
+        if stdbit::is_stdc_bit_builtin(name) {
+            let arg0_ct = args
+                .first()
+                .and_then(|a| self.get_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype());
+            return stdbit::stdc_bit_return_ctype(name, arg0_ct.as_ref());
+        }
+        if gcc16_builtins::is_gcc16_extra_builtin(name) {
+            let arg0_ct = args
+                .first()
+                .and_then(|a| self.get_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype());
+            return gcc16_builtins::gcc16_builtin_return_ctype(name, arg0_ct.as_ref());
+        }
+        match name {
+            "__builtin_counted_by_ref" => {
+                if let Some(arg0) = args.first() {
+                    if let Some((_, cnt_ty, _)) = self.resolve_counted_by_member_expr(arg0) {
+                        let space = match arg0 {
+                            Expr::PointerMemberAccess(base, _, _) => {
+                                match self.get_expr_ctype(base) {
+                                    Some(CType::Pointer(_, quals)) => quals.space,
+                                    _ => AddressSpace::Default,
+                                }
+                            }
+                            _ => AddressSpace::Default,
+                        };
+                        return Some(CType::Pointer(Box::new(cnt_ty), PtrQuals::of(space)));
+                    }
+                }
+                Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC))
+            }
+            "__builtin_assoc_barrier" => args
+                .first()
+                .and_then(|a| self.get_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype()),
+            "__builtin_clear_padding" => Some(CType::Void),
+            "__builtin_object_size" | "__builtin_dynamic_object_size" => {
+                Some(if crate::common::types::target_is_32bit() {
+                    CType::UInt
+                } else {
+                    CType::ULong
+                })
+            }
+            _ => None,
+        }
+    }
+}

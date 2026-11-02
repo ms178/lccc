@@ -1,0 +1,268 @@
+{
+  "compiler": "/home/user/lccc/target/ci-debug/fastbuild/lccc",
+  "results": [
+    {
+      "name": "bb_slp_v8",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 2.5084111539999867,
+      "gcc_time": 0.6593683480000436,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "builtin_cpu_supports_default",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.16343477100008386,
+      "gcc_time": 0.051049222000074224,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "builtin_cpu_supports_raptor",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.09250281100003122,
+      "gcc_time": 0.03360711799996352,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "c23_alignas",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.025256568000258994,
+      "gcc_time": 0.03304829899980177,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "casts_roundtrip",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.14625748299977204,
+      "gcc_time": 0.0,
+      "phases": [
+        "compile:ok",
+        "run:ok"
+      ]
+    },
+    {
+      "name": "cet_macro_mirrors_cf_protection",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.0264971209999203,
+      "gcc_time": 0.03419742000005499,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "code16_realmode_encoding",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.09057442299990726,
+      "gcc_time": 0.04485029199986457,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "cross_pr_redteam",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 1.354277820000334,
+      "gcc_time": 0.21680734599976859,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "cross_pr_redteam2",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.5250844669999424,
+      "gcc_time": 0.10904749700011962,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "cross_target_intrinsic",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.020812403000036284,
+      "gcc_time": 0.036677649000012025,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "edg_c23_compatible_tag_redefinition",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.02672923999989507,
+      "gcc_time": 0.03032804299982672,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "kernel_flags_and_builtins",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.09050404799972966,
+      "gcc_time": 0.05102133099990169,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "machinst_subword_reload_sign",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.4200684789998377,
+      "gcc_time": 0.08918096299976241,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "regress_tentative_incomplete_global_array_size",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.017101949999869248,
+      "gcc_time": 0.029187493000335962,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "retpoline_thunk_inline",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.07646951200013063,
+      "gcc_time": 0.03365334000000075,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "sqrt_vex_scalar",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.03444192500001009,
+      "gcc_time": 0.044310941000276216,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "strict_recip_vex_pack_stress",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.09733447600001455,
+      "gcc_time": 0.05945242799998596,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "typeof_unqual_c23",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.026892452000083722,
+      "gcc_time": 0.02967662199989718,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "va_opt_c2x",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.0167249430000993,
+      "gcc_time": 0.028228966000369837,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "vectorize_strict_computed_recip",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.05647686200018143,
+      "gcc_time": 0.044394869999905495,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "vzeroupper_after_ymm",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.14080245400009517,
+      "gcc_time": 0.35956443700024465,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    },
+    {
+      "name": "spectral_norm",
+      "status": "pass",
+      "detail": "",
+      "lccc_time": 0.3086567670002296,
+      "gcc_time": 0.23263584599999376,
+      "phases": [
+        "compile:ok",
+        "run:ok",
+        "compare:ok"
+      ]
+    }
+  ]
+}

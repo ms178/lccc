@@ -1,0 +1,29 @@
+{
+  "zstd": {
+    "version": "1.5.7",
+    "url": "https://codeload.github.com/facebook/zstd/tar.gz/refs/tags/v1.5.7",
+    "archive_sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3"
+  },
+  "silesia": {
+    "url": "https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip",
+    "sha256": "0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af"
+  },
+  "inputs": {
+    "xml": {
+      "bytes": 5345280,
+      "sha256": "0e82e54e695c1938e4193448022543845b33020c8be6bf3bf3ead2224903e08c"
+    },
+    "mozilla": {
+      "bytes": 51220480,
+      "sha256": "657fc3764b0c75ac9de9623125705831ebbfbe08fed248df73bc2dc66e2a963b"
+    },
+    "dickens": {
+      "bytes": 10192446,
+      "sha256": "b24c37886142e11d0ee687db6ab06f936207aa7f2ea1fd1d9a36763c7a507e6a"
+    },
+    "sao": {
+      "bytes": 7251944,
+      "sha256": "c2d0ea2cc59d4c21b7fe43a71499342a00cbe530a1d5548770e91ecd6214adcc"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "metric": "Checks-API evidence delivery observation; NOT compiler performance",
+  "run": "https://github.com/ms178/lccc/actions/runs/38788687406",
+  "check_api": "https://api.github.com/repos/ms178/lccc/check-runs/116607653877/annotations?per_page=100",
+  "run_conclusion": "cancelled",
+  "measurement_source": "0e557c55689a37e0856c7b59fe992c6da31a923b",
+  "annotation_response_sha256": "326761438d5f70f516458735f86425672b13032ca5ccb6e1fee9ea5e0af14621",
+  "observed_notice_counts": {
+    "combined_publication_step": 10,
+    "native_report_command": 10
+  },
+  "completed_measurements_not_visible_in_the_combined_step": [
+    "semantic witnesses",
+    "O3 correctness",
+    "all four static compiler surveys"
+  ],
+  "publication_step_conclusion": "success",
+  "budget_per_step": 10,
+  "repair": "One unconditional publication step per evidence section, immediately after its measurement; buffer and reject over-budget sections before emitting any prefix.",
+  "regression": {
+    "file": "tests/corpus/test_compiler_evidence_publication.py",
+    "sha256": "0184b00160d191920721d7b5c51dcb97883978c8074bd340d42e677e3a441755",
+    "git_blob": "14015aa3d0cd495de10806155a330cd7a8b86ff5",
+    "coverage": "all 45 native rows/five compiler arms, all 65 semantic failure rows, every static/instrumentation alias, missing/partial sections, source identities, required-case failures, budget overflow, workflow separation and prompt publication"
+  }
+}

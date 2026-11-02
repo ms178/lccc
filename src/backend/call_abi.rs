@@ -1,0 +1,2146 @@
+//! Unified ABI classification for both call-site arguments and callee-side parameters.
+//!
+//! The core classification algorithm (struct layout, register assignment, stack overflow)
+//! is the same for callers and callees — they must agree on where each argument lives.
+//! Previously this logic was duplicated in two separate files with parallel enum
+//! hierarchies (`CallArgClass` and `ParamClass`). This module unifies them:
+//!
+//! - `CallArgClass`: caller-side classification (no stack offsets needed)
+//! - `ParamClass`: callee-side classification (tracks stack offsets for loading params)
+//! - `classify_args_core`: single implementation of the classification algorithm
+//! - `classify_call_args` / `classify_params_full`: thin wrappers over the core
+
+use super::generation::is_i128_type;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrConst, IrFunction, Operand};
+
+/// Keep call-site aggregate copies bounded in generated instruction count.
+/// Below this size the existing small-copy paths remain unchanged; above it
+/// the x86 backends use an exact-size string copy, not millions of pushes /
+/// scalar stores (GCC torture 20050622-1 passes a 72-MiB object by value).
+pub(super) const LARGE_ARG_COPY_THRESHOLD: usize = 2048;
+
+/// Bit image of a scalar 16-byte SSE-carrier constant (`_Float128` or
+/// `_Decimal128`). The I128 variant is already the converted object image,
+/// not an integer to be converted again. Integer zero is also accepted for
+/// binary128, whose lowering uses it as the canonical zero after some implicit
+/// conversions. Decimal128 constants must already carry their I128 BID image:
+/// integer and literal zeros can have different quantum encodings. Other
+/// scalar constants are rejected rather than reinterpreted as carrier bits;
+/// they indicate a missing conversion in lowering.
+pub(crate) fn f128_sse_const_bits(c: IrConst) -> Option<u128> {
+    match c {
+        IrConst::Zero
+        | IrConst::I8(0)
+        | IrConst::I16(0)
+        | IrConst::I32(0)
+        | IrConst::I64(0)
+        | IrConst::I128(0) => Some(0),
+        IrConst::I128(bits) => Some(bits as u128),
+        _ => None,
+    }
+}
+
+/// Return the object image after the lowering invariant has been checked in
+/// one place. Keeping this internal-error path shared avoids architecture-
+/// specific copies of both the conversion policy and its diagnostic.
+pub(crate) fn f128_sse_const_image(c: IrConst) -> u128 {
+    f128_sse_const_bits(c)
+        .unwrap_or_else(|| panic!("internal error: {c:?} is not a 16-byte SSE scalar constant"))
+}
+
+/// Distinguish a scalar 16-byte VALUE from an ext-vector/aggregate ADDRESS.
+/// i686 deliberately reuses the f128 alignment marker for decomposed XMM
+/// vector pieces, so the marker alone is not sufficient for marshalling.
+/// Both scalar `_Float128` and `_Decimal128` have the U128 IR carrier; an
+/// `__int128` argument cannot be misselected because the CType-derived marker
+/// is false for it.
+pub(crate) fn is_scalar_f128_sse_arg(
+    arg_types: &[IrType],
+    struct_arg_is_f128_sse: &[bool],
+    index: usize,
+) -> bool {
+    arg_types.get(index).copied() == Some(IrType::U128)
+        && struct_arg_is_f128_sse.get(index).copied().unwrap_or(false)
+}
+
+/// Scalar SSE-carrier values are always homed in a 16-byte slot. Share the
+/// explicit invariant failure between x86-64 and i686 rather than silently
+/// manufacturing a partial/zero-filled object when malformed IR violates it.
+pub(crate) fn require_f128_sse_value_slot<T>(slot: Option<T>, value: u32) -> T {
+    slot.unwrap_or_else(|| panic!("internal error: 16-byte SSE scalar v{value} has no stack slot"))
+}
+
+// ---------------------------------------------------------------------------
+// CallArgClass — caller-side classification (used by emit_call_*)
+// ---------------------------------------------------------------------------
+
+/// Classification of a function call argument for register/stack assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallArgClass {
+    /// Integer/pointer argument in a GP register. `reg_idx` is the GP register index.
+    IntReg { reg_idx: usize },
+    /// Float argument in an FP register. `reg_idx` is the FP register index.
+    FloatReg { reg_idx: usize },
+    /// 128-bit integer in a GP register pair. `base_reg_idx` is the first register.
+    I128RegPair { base_reg_idx: usize },
+    /// F128 (long double) — handling is arch-specific (x87 on x86, Q-reg on ARM, GP pair on RISC-V).
+    F128Reg { reg_idx: usize },
+    /// _Float128 (binary128) in ONE 16-byte XMM register (SysV psABI).
+    /// The operand is the 16-byte value itself.
+    F128SseReg { reg_idx: usize },
+    /// A `[SSE, SSEUP...]` aggregate in ONE vector register: 16 bytes
+    /// (`struct { v4f v; }`, a struct wrapping `_Float128`, ...) in an
+    /// `%xmm`, 32 bytes (`__m256`, under the AVX ABI level) in a `%ymm`, 64
+    /// bytes (`__m512`, AVX-512) in a `%zmm` — `size` says which. Unlike
+    /// `F128SseReg` the operand is the aggregate's ADDRESS.
+    StructXmmReg { reg_idx: usize, size: usize },
+    /// Small struct (<=16 bytes) passed by value in 1-2 GP registers.
+    StructByValReg { base_reg_idx: usize, size: usize },
+    /// i686 regparm: I64/U64 in a consecutive GP register pair
+    /// (low half in `base_reg_idx`, high half in `base_reg_idx + 1`).
+    I64RegPair { base_reg_idx: usize },
+    /// Small struct (<=16 bytes) where all fields are float/double (SSE class per SysV ABI).
+    /// Passed in 1-2 XMM registers instead of GP registers.
+    /// `lo_fp_idx` is the FP register for the first eightbyte, `hi_fp_idx` for the second (if size > 8).
+    StructSseReg {
+        lo_fp_idx: usize,
+        hi_fp_idx: Option<usize>,
+        size: usize,
+    },
+    /// Small struct where first eightbyte is INTEGER and second is SSE (mixed).
+    StructMixedIntSseReg {
+        int_reg_idx: usize,
+        fp_reg_idx: usize,
+        size: usize,
+    },
+    /// Small struct where first eightbyte is SSE and second is INTEGER (mixed).
+    StructMixedSseIntReg {
+        fp_reg_idx: usize,
+        int_reg_idx: usize,
+        size: usize,
+    },
+    /// Small struct (<=16 bytes) that overflows to the stack.
+    StructByValStack { size: usize },
+    /// Small struct split across the last GP register and the stack.
+    /// RISC-V psABI: first XLEN bytes in `reg_idx`, remaining bytes on the stack.
+    StructSplitRegStack { reg_idx: usize, size: usize },
+    /// Large struct (>16 bytes) passed on the stack (MEMORY class).
+    LargeStructStack { size: usize },
+    /// Argument overflows to the stack (normal 8-byte).
+    Stack,
+    /// F128 argument overflows to the stack (16-byte aligned).
+    F128Stack,
+    /// I128 argument overflows to the stack (16-byte aligned).
+    I128Stack,
+    /// Zero-size struct argument (e.g., `struct { char x[0]; }`).
+    /// Per GCC behavior, zero-size struct arguments consume no register or stack space.
+    ZeroSizeSkip,
+}
+
+impl CallArgClass {
+    /// Returns true if this argument is passed on the stack (any kind).
+    pub fn is_stack(&self) -> bool {
+        matches!(
+            self,
+            CallArgClass::Stack
+                | CallArgClass::F128Stack
+                | CallArgClass::I128Stack
+                | CallArgClass::StructByValStack { .. }
+                | CallArgClass::LargeStructStack { .. }
+                | CallArgClass::StructSplitRegStack { .. }
+        )
+    }
+
+    /// Returns the stack space consumed by this argument (0 if register).
+    pub fn stack_bytes(&self) -> usize {
+        let slot_size = crate::common::types::target_ptr_size(); // 8 for LP64, 4 for ILP32
+        let align_mask = slot_size - 1;
+        match self {
+            CallArgClass::F128Stack => {
+                if slot_size == 4 {
+                    12
+                } else {
+                    16
+                }
+            } // i686: x87 long double = 12 bytes
+            CallArgClass::I128Stack => 16,
+            CallArgClass::StructByValStack { size } | CallArgClass::LargeStructStack { size } => {
+                (*size + align_mask) & !align_mask
+            }
+            CallArgClass::StructSplitRegStack { size, .. } => {
+                // Only the portion beyond the first register goes on the stack.
+                let stack_part = size - slot_size;
+                (stack_part + align_mask) & !align_mask
+            }
+            CallArgClass::Stack => slot_size,
+            _ => 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParamClass — callee-side classification (used by emit_store_params)
+// ---------------------------------------------------------------------------
+
+/// Classification of a function parameter for `emit_store_params`.
+///
+/// Each variant tells the backend exactly where the parameter arrives and what
+/// kind of store logic is needed, without the backend reimplementing the ABI
+/// classification algorithm.
+#[derive(Debug, Clone, Copy)]
+pub enum ParamClass {
+    /// Integer/pointer in GP register at `reg_idx`.
+    IntReg { reg_idx: usize },
+    /// Float/double in FP register at `reg_idx`.
+    FloatReg { reg_idx: usize },
+    /// i128 in aligned GP register pair starting at `base_reg_idx`.
+    I128RegPair { base_reg_idx: usize },
+    /// Small struct (<=16 bytes) by value in 1-2 GP registers.
+    StructByValReg { base_reg_idx: usize, size: usize },
+    /// i686 regparm: I64/U64 parameter in a consecutive GP register pair.
+    I64RegPair { base_reg_idx: usize },
+    /// Small struct where all eightbytes are SSE class -> 1-2 XMM registers.
+    StructSseReg {
+        lo_fp_idx: usize,
+        hi_fp_idx: Option<usize>,
+        size: usize,
+    },
+    /// `size` bytes arrive in ONE vector register (SysV psABI): 16 for a
+    /// `_Float128` or a `[SSE, SSEUP]` aggregate (`%xmm`), 32 / 64 for the
+    /// AVX one-register aggregate shapes (`%ymm` / `%zmm`). All are captured
+    /// the same way -- the bytes are stored to the parameter's home -- so
+    /// one class serves them all.
+    F128SseReg { reg_idx: usize, size: usize },
+    /// The hidden return pointer of a function whose aggregate result the
+    /// psABI returns in ONE `%ymm0` / `%zmm0` (see
+    /// [`hidden_vector_return_bytes`]). It arrives in no register: the
+    /// callee homes it as the address of a private `bytes`-byte frame
+    /// buffer, and the return sequence loads that buffer into the vector
+    /// register.
+    VectorReturnBuffer { bytes: usize },
+    /// Small struct: first eightbyte INTEGER, second SSE.
+    /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
+    StructMixedIntSseReg {
+        int_reg_idx: usize,
+        fp_reg_idx: usize,
+        size: usize,
+    },
+    /// Small struct: first eightbyte SSE, second INTEGER.
+    /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
+    StructMixedSseIntReg {
+        fp_reg_idx: usize,
+        int_reg_idx: usize,
+        size: usize,
+    },
+    /// F128 (long double) in FP register (ARM: Q-reg).
+    F128FpReg { reg_idx: usize },
+    /// F128 in GP register pair (RISC-V).
+    F128GpPair {
+        lo_reg_idx: usize,
+        hi_reg_idx: usize,
+    },
+    /// F128 always on stack (x86: x87 convention).
+    F128AlwaysStack { offset: i64 },
+    /// Regular scalar on the stack.
+    StackScalar { offset: i64 },
+    /// i128 on the stack (16-byte aligned).
+    I128Stack { offset: i64 },
+    /// F128 on the stack (overflow from registers).
+    F128Stack { offset: i64 },
+    /// Small struct that overflowed to the stack.
+    StructStack { offset: i64, size: usize },
+    /// Small struct split across the last GP register and the stack.
+    /// RISC-V psABI: first XLEN bytes in `reg_idx`, remaining bytes at `stack_offset`.
+    StructSplitRegStack {
+        reg_idx: usize,
+        stack_offset: i64,
+        size: usize,
+    },
+    /// Large struct (>16 bytes) passed on the stack.
+    LargeStructStack { offset: i64, size: usize },
+    /// Large struct (>16 bytes) passed by reference in a GP register (AAPCS64).
+    /// The register holds a pointer to the struct data; callee must copy from it.
+    LargeStructByRefReg { reg_idx: usize, size: usize },
+    /// Large struct (>16 bytes) passed by reference on the stack (AAPCS64, overflow case).
+    /// The stack slot holds a pointer to the struct data; callee must copy from it.
+    LargeStructByRefStack { offset: i64, size: usize },
+    /// Zero-size struct parameter (e.g., `struct { char x[0]; }`).
+    /// Per GCC behavior, zero-size struct parameters consume no register or stack space.
+    ZeroSizeSkip,
+}
+
+impl ParamClass {
+    /// Returns true if this parameter is passed on the stack (fully or partially).
+    pub fn is_stack(&self) -> bool {
+        matches!(
+            self,
+            ParamClass::StackScalar { .. }
+                | ParamClass::I128Stack { .. }
+                | ParamClass::F128Stack { .. }
+                | ParamClass::F128AlwaysStack { .. }
+                | ParamClass::StructStack { .. }
+                | ParamClass::LargeStructStack { .. }
+                | ParamClass::LargeStructByRefStack { .. }
+                | ParamClass::StructSplitRegStack { .. }
+        )
+    }
+
+    /// Returns true if this parameter arrives in a GP register (int, i128 pair, struct, or F128 GP pair).
+    pub fn uses_gp_reg(&self) -> bool {
+        matches!(
+            self,
+            ParamClass::IntReg { .. }
+                | ParamClass::I128RegPair { .. }
+                | ParamClass::StructByValReg { .. }
+                | ParamClass::F128GpPair { .. }
+                | ParamClass::LargeStructByRefReg { .. }
+                | ParamClass::StructMixedIntSseReg { .. }
+                | ParamClass::StructMixedSseIntReg { .. }
+                | ParamClass::StructSplitRegStack { .. }
+        )
+    }
+
+    /// Returns the number of stack bytes consumed by this parameter classification.
+    /// Used by variadic function handling to compute how many stack bytes named
+    /// parameters occupy, so va_start can skip past them.
+    pub fn stack_bytes(&self) -> usize {
+        let slot_size = crate::common::types::target_ptr_size(); // 8 for LP64, 4 for ILP32
+        let align_mask = slot_size - 1;
+        match self {
+            ParamClass::StackScalar { .. } => slot_size,
+            ParamClass::I128Stack { .. } => 16,
+            ParamClass::F128Stack { .. } => 16,
+            ParamClass::F128AlwaysStack { .. } => {
+                if slot_size == 4 {
+                    12
+                } else {
+                    16
+                }
+            }
+            ParamClass::StructStack { size, .. } => (*size + align_mask) & !align_mask,
+            ParamClass::StructSplitRegStack { size, .. } => {
+                // Only the portion beyond the first register goes on the stack.
+                let stack_part = size - slot_size;
+                (stack_part + align_mask) & !align_mask
+            }
+            ParamClass::LargeStructStack { size, .. } => (*size + align_mask) & !align_mask,
+            ParamClass::LargeStructByRefStack { .. } => slot_size, // pointer on stack
+            _ => 0, // register-passed params don't consume stack space
+        }
+    }
+
+    /// Returns the number of GP registers consumed by this parameter classification.
+    /// Used by variadic function handling to compute the correct va_start offset.
+    pub fn gp_reg_count(&self) -> usize {
+        match self {
+            ParamClass::IntReg { .. } => 1,
+            ParamClass::LargeStructByRefReg { .. } => 1, // pointer in one GP reg
+            ParamClass::I128RegPair { .. } => 2,
+            ParamClass::StructByValReg { size, .. } => {
+                // 1 reg for <=8 bytes, 2 regs for >8 bytes (up to 16)
+                if *size <= 8 { 1 } else { 2 }
+            }
+            ParamClass::F128GpPair { .. } => 2,
+            ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
+            ParamClass::StructSplitRegStack { .. } => 1, // only 1 GP reg used (the rest on stack)
+            ParamClass::StructSseReg { .. } => 0,        // all SSE, no GP regs
+            _ => 0,                                      // FP regs and stack don't consume GP regs
+        }
+    }
+
+    /// Returns the number of SSE/FP argument registers consumed by this
+    /// parameter classification. Used by variadic `va_start` to compute the
+    /// correct `fp_offset` (the register save area starts AFTER the named
+    /// parameters' SSE registers).
+    ///
+    /// Unlike the older `FloatReg`-only counting, this includes every class
+    /// that occupies an XMM argument register: `_Float128` (F128SseReg), a
+    /// struct whose eightbytes are SSE (StructSseReg, 1-2 registers), and a
+    /// mixed struct's SSE eightbyte (StructMixed*).
+    pub fn fp_reg_count(&self) -> usize {
+        match self {
+            ParamClass::FloatReg { .. } => 1,
+            ParamClass::F128SseReg { .. } => 1,
+            ParamClass::VectorReturnBuffer { .. } => 0,
+            ParamClass::F128FpReg { .. } => 1,
+            ParamClass::StructSseReg { hi_fp_idx, .. } => 1 + usize::from(hi_fp_idx.is_some()),
+            ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// `Some(bytes)` when a call or function with the hidden-pointer return
+/// shape (`is_sret`) actually returns its aggregate in ONE `%ymm0` (32) or
+/// `%zmm0` (64): the x86-64 psABI convention for `__m256` / `__m512` under
+/// the AVX / AVX-512 ABI level.
+///
+/// The IR has no 32/64-byte value type, so the lowering keeps such a return
+/// in the sret shape (caller-allocated buffer, its address as argument 0,
+/// callee copies into it) and tags it with the classifier's SSE + SSEUPs
+/// classes — a pair no other convention produces (a MEMORY-class sret has
+/// no classes; a register-returned aggregate of ≤16 bytes is not sret). The
+/// backend applies the register convention at the boundary: the hidden
+/// pointer consumes no argument register (`CallArgClass::ZeroSizeSkip` /
+/// `ParamClass::VectorReturnBuffer`), the callee's return loads the buffer
+/// into the register, and the caller stores the register through its
+/// buffer after the call. A 16-byte one-`%xmm` return is not this case: it
+/// travels as a 16-byte IR value (`ret_is_f128_sse`).
+pub fn hidden_vector_return_bytes(
+    is_sret: bool,
+    ret_classes: &[crate::common::types::EightbyteClass],
+) -> Option<usize> {
+    if !is_sret {
+        return None;
+    }
+    crate::common::sysv_classify::vector_reg_bytes_of(ret_classes).filter(|b| *b > 16)
+}
+
+// ---------------------------------------------------------------------------
+// ABI configuration and SysV struct classification (unchanged)
+// ---------------------------------------------------------------------------
+
+/// ABI configuration for call argument classification.
+pub struct CallAbiConfig {
+    /// Maximum GP registers for arguments (x86: 6, ARM/RISC-V: 8).
+    pub max_int_regs: usize,
+    /// Maximum FP registers for arguments (all: 8).
+    pub max_float_regs: usize,
+    /// Whether i128 register pairs must be even-aligned (ARM/RISC-V: true, x86: false).
+    pub align_i128_pairs: bool,
+    /// Whether F128 uses FP registers (ARM: true) or always goes to stack/x87 (x86: true = stack).
+    /// On RISC-V, F128 goes in GP register pairs like i128.
+    pub f128_in_fp_regs: bool,
+    /// Whether F128 uses GP register pairs (RISC-V: true).
+    pub f128_in_gp_pairs: bool,
+    /// Whether variadic float args must go in GP registers instead of FP regs (RISC-V: true, x86: false, ARM: false).
+    pub variadic_floats_in_gp: bool,
+    /// Whether large structs (>16 bytes) are passed by reference (pointer in GP reg).
+    /// ARM/RISC-V: true (pointer in GP reg or on stack), x86: false (copy to stack).
+    pub large_struct_by_ref: bool,
+    /// Whether to use SysV per-eightbyte struct classification (x86-64 only).
+    /// When true, struct eightbytes classified as SSE are passed in xmm registers.
+    pub use_sysv_struct_classification: bool,
+    /// Whether to use RISC-V LP64D hardware floating-point struct classification.
+    /// When true, small structs with float/double fields are passed in FP registers
+    /// per the RISC-V psABI.
+    pub use_riscv_float_struct_classification: bool,
+    /// Whether 2-register structs can be split across the last GP register and the stack.
+    /// RISC-V psABI: if a 2×XLEN struct has only 1 GP register left, the first XLEN bytes
+    /// go in that register and the rest go on the stack. ARM AAPCS64 does NOT split.
+    pub allow_struct_split_reg_stack: bool,
+    /// Whether 2-register structs with >XLEN alignment must start at an even register.
+    /// RISC-V psABI: true (2×XLEN-aligned composites require even-aligned register pairs).
+    /// ARM AAPCS64: false (composite types never require even-aligned pairs; only
+    /// fundamental types like __int128 do, which is handled by align_i128_pairs).
+    pub align_struct_pairs: bool,
+    /// Whether sret (struct return) uses a dedicated register (x8 on AArch64) instead of
+    /// consuming a regular GP argument register slot. When true, the classification must
+    /// promote the first stack-overflow GP argument to the freed GP register slot so that
+    /// caller and callee agree on where each argument lives.
+    /// ARM AAPCS64: true (sret pointer in x8), x86/RISC-V: false (sret in x0/a0).
+    pub sret_uses_dedicated_reg: bool,
+    /// GCC i386 `-mregparm=N` semantics (i686 only). Changes the core walk to
+    /// match GCC's function_arg_32 exactly, because the Linux kernel's .S
+    /// files hand-implement this convention when calling C:
+    ///  * variadic functions pass ALL arguments on the stack (regparm is
+    ///    ignored entirely, named and anonymous alike);
+    ///  * I64/U64 consume a consecutive GP register PAIR (low in the lower-
+    ///    numbered register); if the pair does not fit, the argument goes to
+    ///    the stack AND all remaining GP registers are killed;
+    ///  * any integer-eligible argument that overflows kills the remaining
+    ///    GP registers (a later small int cannot grab a free register);
+    ///  * float/double/long-double scalars always go to the stack and do
+    ///    NOT consume or kill GP registers;
+    ///  * small aggregates take ceil(size/4) consecutive registers when they
+    ///    fit, otherwise stack + kill (GCC BLKmode rule).
+    pub gcc_regparm_mode: bool,
+    /// The maximum alignment honored when placing stack (overflow-area)
+    /// arguments, as a byte count.
+    ///
+    /// * x86-64: `usize::MAX` — GCC >= 4.6 honors the FULL natural alignment
+    ///   of MEMORY-class stack arguments (uncapped; callers realign %rsp for
+    ///   the >16 case, see emit_call_stack_args_impl).
+    /// * AArch64/RISC-V: 16 — the psABIs cap stack-argument alignment at
+    ///   2*XLEN (the va_arg / prologue readers cap identically).
+    /// * i686: 4 for ordinary scalars/records — GCC's i386 cdecl does not
+    ///   align those stack arguments beyond the 4-byte slot granularity
+    ///   (PARM_BOUNDARY): not `long long` (align 8),
+    ///   not over-aligned aggregates. GCC 14.2 -m32 oracle: a 3-int prefix
+    ///   places an aligned(32)/24-byte struct at arg offset 12, and the
+    ///   callee reads it via %ebp at that same 4-granular offset — the
+    ///   `aligned` attribute only rounds the TYPE SIZE (24 -> 32). lccc's
+    ///   i686 caller packs 4-granular and its va_arg readers walk 4-granular,
+    ///   so the callee layout (and the va_start overflow offset derived from
+    ///   it) must agree — an 8-byte cap here misreads every over-aligned
+    ///   struct arg whose natural offset is 4 (mod 8). TFmode carriers and
+    ///   memory-passed GNU vectors are explicit exceptions handled by
+    ///   `i386_gnu_vector_stack_align` and the TFmode branch below.
+    pub stack_arg_align_cap: usize,
+    /// XMM registers for 16-byte vector pieces on i386 (Clang's
+    /// convention, LLVM `CC_X86_32_Vector_Common`): the first three pieces of
+    /// a non-variadic call take %xmm0-%xmm2; later pieces, and every piece of
+    /// a variadic call, go to 16-byte-aligned stack slots. 0 elsewhere:
+    /// x86-64 carries `[SSE, SSEUP]` values in its ordinary FP registers.
+    pub vector_xmm_regs: usize,
+    /// Whether a scalar argument tagged `[NoClass]` (no `struct_size`) is a
+    /// Clang-i386 ExtVector lane: stack-passed without consuming or killing
+    /// the regparm/fastcall GP sequence. The tag is an in-band marker the
+    /// i686 lowering attaches to decomposed lanes, so it is only meaningful
+    /// where that lowering runs. Every other target must ignore it: on
+    /// x86-64 a by-reference aggregate (a VLA struct in a variadic call
+    /// carries `struct_size: None` and whatever classes the zero-byte static
+    /// layout produced) is an ordinary pointer in the next GP register, and
+    /// honoring the tag there pushed the pointer to the stack while the
+    /// callee's `va_arg` read `%rsi` (gcc.c-torture 20020412-1.c aborts).
+    pub i386_ext_vector_lanes: bool,
+}
+
+/// Natural stack alignment for an i386 GNU vector MEMORY argument.
+///
+/// The lowering uses `[Memory, NoClass]` as a target-local marker for GNU
+/// `vector_size` aggregates. The second tag distinguishes the marker from an
+/// ordinary SysV `[Memory]` record. It is deliberately gated by the i386
+/// configuration: on x86-64 these bytes are not a vector marker and must
+/// follow that target's own rules. Every memory-passed vector with natural
+/// alignment of at least 16 bytes uses that alignment, including no-SSE v16;
+/// XMM-register pieces never call this helper for stack placement.
+/// Width of an i386 argument that is a native SSE/AVX/AVX-512 vector
+/// (`[SSE, SSEUP...]`, exactly 16/32/64 bytes) and therefore travels in
+/// `%xmm`/`%ymm`/`%zmm{0..vector_xmm_regs}` while registers remain, or
+/// `None`. Such an argument never touches the GP sequence, so it neither
+/// consumes nor breaks the regparm/fastcall registers (GCC's
+/// `function_arg_advance_32` advances only the SSE counters for vector
+/// modes). The single rule for the cdecl/regparm classification and the
+/// fastcall layout (`I686Codegen::fastcall_layout_with_abi`).
+pub(crate) fn i386_vector_reg_bytes(
+    config: &CallAbiConfig,
+    classes: &[crate::common::types::EightbyteClass],
+    struct_size: Option<usize>,
+) -> Option<usize> {
+    if config.vector_xmm_regs == 0 {
+        return None;
+    }
+    let size = crate::common::sysv_classify::vector_reg_bytes_of(classes)?;
+    (struct_size == Some(size)).then_some(size)
+}
+
+pub(crate) fn i386_gnu_vector_stack_align(
+    config: &CallAbiConfig,
+    classes: &[crate::common::types::EightbyteClass],
+    align: usize,
+) -> Option<usize> {
+    (config.i386_ext_vector_lanes
+        && align >= 16
+        && align.is_power_of_two()
+        && (classes
+            == [
+                crate::common::types::EightbyteClass::Memory,
+                crate::common::types::EightbyteClass::NoClass,
+            ]
+            || crate::common::sysv_classify::vector_reg_bytes_of(classes)
+                .is_some_and(|bytes| bytes > 16)))
+    .then_some(align)
+}
+
+impl CallAbiConfig {
+    /// The x86-64 SysV configuration.  The single source of truth shared by
+    /// `X86Codegen::call_abi_config_impl` (prologue/call emission) and the
+    /// stack-layout dead-parameter-alloca predicate
+    /// (`stack_layout::analysis`): both must classify a vector parameter
+    /// identically, or the layout drops a slot the prologue still stores to.
+    pub fn sysv_x86_64() -> CallAbiConfig {
+        CallAbiConfig {
+            max_int_regs: 6,
+            max_float_regs: 8,
+            align_i128_pairs: false,
+            f128_in_fp_regs: false,
+            f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+            large_struct_by_ref: false,
+            use_sysv_struct_classification: true,
+            use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false,
+            align_struct_pairs: false,
+            sret_uses_dedicated_reg: false,
+            gcc_regparm_mode: false,
+            // GCC >= 4.6 honors the full natural alignment of MEMORY-class
+            // stack arguments (SysV AMD64); the >16 case is completed by the
+            // caller's dynamic %rsp realignment (emit_call_stack_args_impl).
+            stack_arg_align_cap: usize::MAX,
+            vector_xmm_regs: 0,
+            i386_ext_vector_lanes: false,
+        }
+    }
+}
+
+/// Result of SysV per-eightbyte struct classification.
+/// Describes how a small struct (<=16 bytes) should be passed in registers.
+#[derive(Debug, Clone, Copy)]
+pub enum SysvStructRegClass {
+    /// All eightbytes are INTEGER class -> GP registers only.
+    AllInt,
+    /// All eightbytes are SSE class -> XMM registers only.
+    AllSse { fp_count: usize },
+    /// First eightbyte INTEGER, second SSE (mixed).
+    IntSse,
+    /// First eightbyte SSE, second INTEGER (mixed).
+    SseInt,
+    /// Not enough registers available -> spill to stack.
+    Stack,
+}
+
+/// Classify a small struct (<=16 bytes) using SysV AMD64 per-eightbyte rules.
+///
+/// Given the eightbyte classes and current register allocation state, determines
+/// whether the struct fits in registers and which class combination to use.
+/// Returns the classification and the number of GP/FP registers consumed.
+pub fn classify_sysv_struct(
+    eb_classes: &[crate::common::types::EightbyteClass],
+    int_idx: usize,
+    float_idx: usize,
+    config: &CallAbiConfig,
+) -> (SysvStructRegClass, usize, usize) {
+    use crate::common::types::EightbyteClass;
+    debug_assert!(
+        !eb_classes
+            .iter()
+            .any(|c| matches!(c, EightbyteClass::SseUp | EightbyteClass::Memory)),
+        "one-xmm and MEMORY aggregates are assigned before the eightbyte walk: {eb_classes:?}"
+    );
+    let n_eightbytes = eb_classes.len();
+    let eb0_is_sse = eb_classes.first() == Some(&EightbyteClass::Sse);
+    let eb1_is_sse = if n_eightbytes > 1 {
+        eb_classes.get(1) == Some(&EightbyteClass::Sse)
+    } else {
+        false
+    };
+
+    let gp_needed = (if !eb0_is_sse { 1 } else { 0 })
+        + (if n_eightbytes > 1 && !eb1_is_sse {
+            1
+        } else {
+            0
+        });
+    let fp_needed =
+        (if eb0_is_sse { 1 } else { 0 }) + (if n_eightbytes > 1 && eb1_is_sse { 1 } else { 0 });
+
+    if int_idx + gp_needed > config.max_int_regs || float_idx + fp_needed > config.max_float_regs {
+        return (SysvStructRegClass::Stack, 0, 0);
+    }
+
+    if n_eightbytes == 1 {
+        if eb0_is_sse {
+            (SysvStructRegClass::AllSse { fp_count: 1 }, 0, 1)
+        } else {
+            (SysvStructRegClass::AllInt, 1, 0)
+        }
+    } else if eb0_is_sse && eb1_is_sse {
+        (SysvStructRegClass::AllSse { fp_count: 2 }, 0, 2)
+    } else if !eb0_is_sse && eb1_is_sse {
+        (SysvStructRegClass::IntSse, 1, 1)
+    } else if eb0_is_sse && !eb1_is_sse {
+        (SysvStructRegClass::SseInt, 1, 1)
+    } else {
+        (SysvStructRegClass::AllInt, 2, 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArgInfo — abstracts per-argument metadata for the unified classification core
+// ---------------------------------------------------------------------------
+
+/// Per-argument metadata needed by the classification algorithm.
+///
+/// Both the caller (`classify_call_args`) and callee (`classify_params_full`) paths
+/// construct one `ArgInfo` per argument/parameter, then pass the slice to the shared
+/// `classify_args_core` function.
+pub(crate) struct ArgInfo<'a> {
+    pub(crate) is_float: bool,
+    pub(crate) is_i128: bool,
+    pub(crate) is_long_double: bool,
+    /// True for _Float128 (IEEE binary128): ONE 16-byte XMM register (SysV psABI).
+    pub(crate) is_f128_sse: bool,
+    /// True for I64/U64 on an ILP32 target (candidate for a regparm GP pair).
+    pub(crate) is_i64_pair: bool,
+    /// If this is a struct/union by value: Some(byte_size). None otherwise.
+    pub(crate) struct_size: Option<usize>,
+    /// Struct alignment in bytes (for RISC-V even-register alignment). None for non-struct.
+    pub(crate) struct_align: Option<usize>,
+    /// SysV per-eightbyte classification (x86-64 only). Empty if not applicable.
+    /// The exact `[NoClass]` value with no `struct_size` is also an internal
+    /// i686 marker for an ExtVector lane that is stack-passed without consuming
+    /// regparm GP registers; it is honored only under
+    /// `CallAbiConfig::i386_ext_vector_lanes`.
+    pub(crate) eightbyte_classes: &'a [crate::common::types::EightbyteClass],
+    /// RISC-V LP64D float struct classification. None if not applicable.
+    pub(crate) riscv_float_class: Option<crate::common::types::RiscvFloatClass>,
+}
+
+// ---------------------------------------------------------------------------
+// Core classification algorithm — single implementation used by both sides
+// ---------------------------------------------------------------------------
+
+/// Internal classification result for one argument, used by the core algorithm.
+/// Represents the ABI decision *without* stack offsets — offsets are layered on
+/// by the callee-side wrapper (`classify_params_full`).
+#[derive(Debug, Clone, Copy)]
+enum CoreArgClass {
+    IntReg {
+        reg_idx: usize,
+    },
+    FloatReg {
+        reg_idx: usize,
+    },
+    I128RegPair {
+        base_reg_idx: usize,
+    },
+    F128FpReg {
+        reg_idx: usize,
+    },
+    F128GpPair {
+        base_reg_idx: usize,
+    },
+    F128Stack,
+    /// _Float128 (binary128) in ONE 16-byte XMM register (SysV psABI).
+    F128SseReg {
+        reg_idx: usize,
+    },
+    /// A `[SSE, SSEUP...]` aggregate in ONE vector register of `size`
+    /// bytes (16 `%xmm`, 32 `%ymm`, 64 `%zmm`).
+    StructXmmReg {
+        reg_idx: usize,
+        size: usize,
+    },
+    StructByValReg {
+        base_reg_idx: usize,
+        size: usize,
+    },
+    I64RegPair {
+        base_reg_idx: usize,
+    },
+    StructSseReg {
+        lo_fp_idx: usize,
+        hi_fp_idx: Option<usize>,
+        size: usize,
+    },
+    StructMixedIntSseReg {
+        int_reg_idx: usize,
+        fp_reg_idx: usize,
+        size: usize,
+    },
+    StructMixedSseIntReg {
+        fp_reg_idx: usize,
+        int_reg_idx: usize,
+        size: usize,
+    },
+    StructByValStack {
+        size: usize,
+    },
+    StructSplitRegStack {
+        reg_idx: usize,
+        size: usize,
+    },
+    LargeStructStack {
+        size: usize,
+    },
+    LargeStructByRefReg {
+        reg_idx: usize,
+        size: usize,
+    },
+    LargeStructByRefStack {
+        size: usize,
+    },
+    Stack,
+    I128Stack,
+    ZeroSizeSkip,
+}
+
+/// Result of the core classification algorithm.
+struct CoreClassification {
+    classes: Vec<CoreArgClass>,
+    /// Final GP register index after classifying all arguments (capped at max_int_regs).
+    int_reg_idx: usize,
+}
+
+/// Core ABI classification algorithm shared by both caller and callee paths.
+///
+/// Walks the argument list and assigns each to a register or stack class based on
+/// the ABI configuration. The `is_variadic` flag gates the `force_gp` behavior for
+/// float args in variadic functions (needed on the caller side; the callee side
+/// encodes this in `config.variadic_floats_in_gp` directly).
+fn classify_args_core(
+    args: &[ArgInfo<'_>],
+    is_variadic: bool,
+    real_variadic: bool,
+    config: &CallAbiConfig,
+) -> CoreClassification {
+    let mut result = Vec::with_capacity(args.len());
+    let mut int_idx = 0usize;
+    let mut float_idx = 0usize;
+    let mut vec_xmm_idx = 0usize;
+    let slot_size = crate::common::types::target_ptr_size();
+
+    for info in args {
+        let force_gp =
+            is_variadic && config.variadic_floats_in_gp && info.is_float && !info.is_long_double;
+
+        // Clang's i386 ExtVector ABI passes each logical lane in a stack slot
+        // even when the surrounding function uses regparm. Unlike ordinary
+        // aggregates, these lanes do not consume/kill the register sequence,
+        // so a following scalar can still use EAX/EDX/ECX. The marker is
+        // target-gated (see `CallAbiConfig::i386_ext_vector_lanes`): a
+        // by-reference aggregate on x86-64 can carry the same bytes.
+        if config.i386_ext_vector_lanes
+            && info.struct_size.is_none()
+            && info.eightbyte_classes == [crate::common::types::EightbyteClass::NoClass]
+        {
+            result.push(if info.is_long_double {
+                CoreArgClass::F128Stack
+            } else if info.is_i128 {
+                CoreArgClass::I128Stack
+            } else {
+                CoreArgClass::Stack
+            });
+            continue;
+        }
+
+        // GCC i386 -mregparm=N walk (see CallAbiConfig::gcc_regparm_mode).
+        // Verified against gcc -m32 -mregparm=3 (GCC 14.2) on: int/int/int,
+        // ll+int, int+ll, int+int+ll, struct{int,int}+int, struct{int,int,int},
+        // struct{float}, struct{float,int}, double+ints, variadics, and sret.
+        // An i386 XMM vector piece (`[SSE, SSEUP]`, 16 bytes). It never
+        // touches the GP sequence, so regparm/fastcall registers stay
+        // available for later arguments.
+        if let Some(size) = i386_vector_reg_bytes(config, info.eightbyte_classes, info.struct_size)
+        {
+            if !real_variadic && vec_xmm_idx < config.vector_xmm_regs {
+                result.push(CoreArgClass::StructXmmReg {
+                    reg_idx: vec_xmm_idx,
+                    size,
+                });
+                vec_xmm_idx += 1;
+            } else {
+                result.push(CoreArgClass::StructByValStack { size });
+            }
+            continue;
+        }
+
+        if config.gcc_regparm_mode {
+            if real_variadic {
+                // GCC: variadic functions ignore regparm completely; every
+                // argument (named and anonymous) is on the stack.
+                result.push(if info.struct_size.is_some() {
+                    let size = info.struct_size.unwrap();
+                    if size == 0 {
+                        CoreArgClass::ZeroSizeSkip
+                    } else {
+                        CoreArgClass::StructByValStack { size }
+                    }
+                } else if info.is_long_double {
+                    CoreArgClass::F128Stack
+                } else {
+                    CoreArgClass::Stack
+                });
+                continue;
+            }
+            if let Some(size) = info.struct_size {
+                if size == 0 {
+                    result.push(CoreArgClass::ZeroSizeSkip);
+                    continue;
+                }
+                // Aggregate: ceil(size/4) consecutive GP regs when it fits
+                // entirely; otherwise stack + kill remaining registers.
+                // (GCC ix86 BLKmode: SSE-class structs like {float} are also
+                // integer-register candidates under regparm — verified:
+                // struct{float,int} arrives in %eax,%edx.)
+                let regs_needed = size.div_ceil(4);
+                if int_idx + regs_needed <= config.max_int_regs {
+                    result.push(CoreArgClass::StructByValReg {
+                        base_reg_idx: int_idx,
+                        size,
+                    });
+                    int_idx += regs_needed;
+                } else {
+                    result.push(CoreArgClass::StructByValStack { size });
+                    int_idx = config.max_int_regs; // kill
+                }
+                continue;
+            }
+            if info.is_long_double {
+                // long double: always memory, does not kill GP regs.
+                result.push(CoreArgClass::F128Stack);
+                continue;
+            }
+            if info.is_float {
+                // float/double scalars: always memory under regparm,
+                // and do NOT kill the remaining GP registers (verified:
+                // p4(double,int,int,int) passes b,c,d in eax,edx,ecx).
+                result.push(CoreArgClass::Stack);
+                continue;
+            }
+            if info.is_i64_pair {
+                // I64/U64: consecutive GP pair, else stack + kill.
+                if int_idx + 2 <= config.max_int_regs {
+                    result.push(CoreArgClass::I64RegPair {
+                        base_reg_idx: int_idx,
+                    });
+                    int_idx += 2;
+                } else {
+                    result.push(CoreArgClass::Stack);
+                    int_idx = config.max_int_regs; // kill
+                }
+                continue;
+            }
+            // Plain integer/pointer.
+            if int_idx < config.max_int_regs {
+                result.push(CoreArgClass::IntReg { reg_idx: int_idx });
+                int_idx += 1;
+            } else {
+                result.push(CoreArgClass::Stack);
+                int_idx = config.max_int_regs; // kill (idempotent here)
+            }
+            continue;
+        }
+
+        if let Some(size) = info.struct_size {
+            // Zero-size structs consume no register or stack space per GCC behavior.
+            if size == 0 {
+                result.push(CoreArgClass::ZeroSizeSkip);
+                continue;
+            }
+
+            // SysV psABI MEMORY class at any size (misaligned fields, X87
+            // members, BLKmode vectors): the whole aggregate is passed on the
+            // stack and consumes no register.
+            if config.use_sysv_struct_classification
+                && info.eightbyte_classes == [crate::common::types::EightbyteClass::Memory]
+            {
+                result.push(if size <= 16 {
+                    CoreArgClass::StructByValStack { size }
+                } else {
+                    CoreArgClass::LargeStructStack { size }
+                });
+                continue;
+            }
+
+            // AAPCS64 (ARM): a _Float128 carrier (scalar or 16-byte
+            // aggregate flagged is_f128_sse by the lowering) goes in a Q
+            // register exactly like long double — the "SSE" naming of the
+            // flag is SysV jargon, the class itself is target-relative.
+            // Overflow takes a 16-byte-aligned stack slot (F128Stack
+            // semantics), not the x86 SysV StructByValStack rollback.
+            if info.is_f128_sse && size == 16 && config.f128_in_fp_regs {
+                if float_idx < config.max_float_regs {
+                    result.push(CoreArgClass::F128FpReg { reg_idx: float_idx });
+                    float_idx += 1;
+                } else {
+                    result.push(CoreArgClass::F128Stack);
+                }
+                continue;
+            }
+
+            // RISC-V (soft-float-pair targets): a _Float128 carrier goes in
+            // an even-aligned GP register pair exactly like long double
+            // (f128_in_gp_pairs); overflow takes the F128Stack slot. The x86
+            // F128SseReg branch below must not fire — RISC-V has no XMM.
+            if info.is_f128_sse && size == 16 && config.f128_in_gp_pairs {
+                if config.align_i128_pairs && int_idx % 2 != 0 {
+                    int_idx += 1;
+                }
+                if int_idx + 1 < config.max_int_regs {
+                    result.push(CoreArgClass::F128GpPair {
+                        base_reg_idx: int_idx,
+                    });
+                    int_idx += 2;
+                } else {
+                    result.push(CoreArgClass::F128Stack);
+                    int_idx = config.max_int_regs;
+                }
+                continue;
+            }
+
+            // x86-64 SysV: _Float128 (IEEE binary128) — ONE 16-byte XMM
+            // register per the psABI (not a two-eightbyte SSE struct).
+            // Overflow (all XMM regs consumed) goes to a 16-byte stack slot.
+            // `[Sse, SseUp]` is the same carrier for any aggregate, and the
+            // AVX shapes SSE + 3×SSEUP / SSE + 7×SSEUP (one `%ymm` /
+            // `%zmm`, 32 / 64 bytes) take the same walk: one SSE argument
+            // register each, the whole object to memory when none is left.
+            // The classifier (`sysv_classify`) only produces the wide
+            // shapes under the TU's AVX ABI level, and a variadic callee
+            // never sees them (`__m256`/`__m512` are MEMORY in a variadic
+            // call, psABI §3.2.3; the lowering classifies those positions
+            // as MEMORY before they reach here).
+            let one_vec_reg =
+                crate::common::sysv_classify::vector_reg_bytes_of(info.eightbyte_classes)
+                    .is_some_and(|bytes| bytes == size);
+            if (info.is_f128_sse && size == 16) || one_vec_reg {
+                if float_idx < config.max_float_regs {
+                    result.push(if info.is_f128_sse {
+                        CoreArgClass::F128SseReg { reg_idx: float_idx }
+                    } else {
+                        CoreArgClass::StructXmmReg {
+                            reg_idx: float_idx,
+                            size,
+                        }
+                    });
+                    float_idx += 1;
+                } else {
+                    result.push(CoreArgClass::StructByValStack { size });
+                    // SysV aggregate assignment is transactional: if the
+                    // complete aggregate does not fit, it goes to memory and
+                    // register allocation rolls back to its pre-aggregate
+                    // state. In particular an SSE overflow must not consume or
+                    // kill an otherwise-free GP register.
+                }
+                continue;
+            }
+
+            let eb_classes = info.eightbyte_classes;
+
+            if size <= 16 && config.use_sysv_struct_classification && !eb_classes.is_empty() {
+                // SysV AMD64 ABI: classify per-eightbyte and assign to GP or SSE registers
+                let (cls, gp_used, fp_used) =
+                    classify_sysv_struct(eb_classes, int_idx, float_idx, config);
+                match cls {
+                    SysvStructRegClass::AllSse { fp_count } => {
+                        let hi = if fp_count > 1 {
+                            Some(float_idx + 1)
+                        } else {
+                            None
+                        };
+                        result.push(CoreArgClass::StructSseReg {
+                            lo_fp_idx: float_idx,
+                            hi_fp_idx: hi,
+                            size,
+                        });
+                    }
+                    SysvStructRegClass::AllInt => {
+                        result.push(CoreArgClass::StructByValReg {
+                            base_reg_idx: int_idx,
+                            size,
+                        });
+                    }
+                    SysvStructRegClass::IntSse => {
+                        result.push(CoreArgClass::StructMixedIntSseReg {
+                            int_reg_idx: int_idx,
+                            fp_reg_idx: float_idx,
+                            size,
+                        });
+                    }
+                    SysvStructRegClass::SseInt => {
+                        result.push(CoreArgClass::StructMixedSseIntReg {
+                            fp_reg_idx: float_idx,
+                            int_reg_idx: int_idx,
+                            size,
+                        });
+                    }
+                    SysvStructRegClass::Stack => {
+                        // SysV AMD64 3.2.3: register assignment for an
+                        // aggregate is all-or-nothing. On overflow the complete
+                        // value is passed on the stack and both register cursors
+                        // remain at their pre-aggregate positions, allowing a
+                        // following scalar to use the still-free register.
+                        result.push(CoreArgClass::StructByValStack { size });
+                    }
+                }
+                int_idx += gp_used;
+                float_idx += fp_used;
+            } else if size <= 16 {
+                // Non-SysV path (ARM, RISC-V)
+                let rv_class = if config.use_riscv_float_struct_classification {
+                    info.riscv_float_class
+                } else {
+                    None
+                };
+                let mut classified = false;
+                if let Some(rv_fc) = rv_class {
+                    use crate::common::types::RiscvFloatClass;
+                    match rv_fc {
+                        RiscvFloatClass::OneFloat { .. } => {
+                            if float_idx < config.max_float_regs {
+                                result.push(CoreArgClass::StructSseReg {
+                                    lo_fp_idx: float_idx,
+                                    hi_fp_idx: None,
+                                    size,
+                                });
+                                float_idx += 1;
+                                classified = true;
+                            }
+                        }
+                        RiscvFloatClass::TwoFloats { .. } => {
+                            if float_idx + 1 < config.max_float_regs {
+                                result.push(CoreArgClass::StructSseReg {
+                                    lo_fp_idx: float_idx,
+                                    hi_fp_idx: Some(float_idx + 1),
+                                    size,
+                                });
+                                float_idx += 2;
+                                classified = true;
+                            }
+                        }
+                        RiscvFloatClass::FloatAndInt { .. } => {
+                            if float_idx < config.max_float_regs && int_idx < config.max_int_regs {
+                                result.push(CoreArgClass::StructMixedSseIntReg {
+                                    fp_reg_idx: float_idx,
+                                    int_reg_idx: int_idx,
+                                    size,
+                                });
+                                float_idx += 1;
+                                int_idx += 1;
+                                classified = true;
+                            }
+                        }
+                        RiscvFloatClass::IntAndFloat { .. } => {
+                            if int_idx < config.max_int_regs && float_idx < config.max_float_regs {
+                                result.push(CoreArgClass::StructMixedIntSseReg {
+                                    int_reg_idx: int_idx,
+                                    fp_reg_idx: float_idx,
+                                    size,
+                                });
+                                int_idx += 1;
+                                float_idx += 1;
+                                classified = true;
+                            }
+                        }
+                    }
+                }
+                if !classified {
+                    let regs_needed = if size <= slot_size {
+                        1
+                    } else {
+                        size.div_ceil(slot_size)
+                    };
+                    // Composites whose natural alignment exceeds XLEN are
+                    // allocated at an even-aligned register (pair) — the
+                    // RISC-V psABI requires it for 2×XLEN-aligned structs,
+                    // and AAPCS64 does the same for ANY 16-byte-aligned
+                    // composite, including single-register struct{int}
+                    // align(16) (GCC oracle: w0/w2/w4/w6 with odd registers
+                    // skipped). The rounding also applies on the va_arg side
+                    // (emit_va_arg_struct rounds __gr_offs the same way), so
+                    // caller and callee agree.
+                    let mut align_applied = false;
+                    if config.align_struct_pairs {
+                        let struct_align = info.struct_align.unwrap_or(slot_size);
+                        if struct_align > slot_size && int_idx % 2 != 0 {
+                            int_idx += 1; // skip to even register
+                            align_applied = true;
+                        }
+                    }
+                    if int_idx + regs_needed <= config.max_int_regs {
+                        result.push(CoreArgClass::StructByValReg {
+                            base_reg_idx: int_idx,
+                            size,
+                        });
+                        int_idx += regs_needed;
+                    } else if !align_applied
+                        && regs_needed == 2
+                        && int_idx < config.max_int_regs
+                        && config.allow_struct_split_reg_stack
+                    {
+                        result.push(CoreArgClass::StructSplitRegStack {
+                            reg_idx: int_idx,
+                            size,
+                        });
+                        int_idx = config.max_int_regs;
+                    } else {
+                        result.push(CoreArgClass::StructByValStack { size });
+                        int_idx = config.max_int_regs;
+                    }
+                }
+            } else if config.large_struct_by_ref {
+                // AAPCS64 / RISC-V: large composites passed by reference.
+                if int_idx < config.max_int_regs {
+                    result.push(CoreArgClass::LargeStructByRefReg {
+                        reg_idx: int_idx,
+                        size,
+                    });
+                    int_idx += 1;
+                } else {
+                    result.push(CoreArgClass::LargeStructByRefStack { size });
+                }
+            } else {
+                result.push(CoreArgClass::LargeStructStack { size });
+            }
+        } else if info.is_i128 {
+            if config.align_i128_pairs && int_idx % 2 != 0 {
+                int_idx += 1;
+            }
+            if int_idx + 1 < config.max_int_regs {
+                result.push(CoreArgClass::I128RegPair {
+                    base_reg_idx: int_idx,
+                });
+                int_idx += 2;
+            } else {
+                result.push(CoreArgClass::I128Stack);
+                // AAPCS64 (C.9/C.11) and the i686 regparm model close the GP
+                // file once a 128-bit integer misses it. The AMD64 psABI
+                // (§3.2.3) instead passes an argument that does not fit in
+                // the remaining registers in memory WITHOUT consuming them:
+                // later INTEGER arguments still take what is left. GCC 16.2
+                // and Clang 23.1.4 read `x` of
+                // `q_after(long, long, long, long, long, __int128 q, long x)`
+                // from %r9; closing the file here read it from the stack, on
+                // both sides of every such call (caller and callee agreed
+                // with each other but not with any other compiler).
+                if !config.use_sysv_struct_classification {
+                    int_idx = config.max_int_regs;
+                }
+            }
+        } else if info.is_long_double {
+            if config.f128_in_fp_regs {
+                if float_idx < config.max_float_regs {
+                    result.push(CoreArgClass::F128FpReg { reg_idx: float_idx });
+                    float_idx += 1;
+                } else {
+                    result.push(CoreArgClass::F128Stack);
+                }
+            } else if config.f128_in_gp_pairs {
+                if config.align_i128_pairs && int_idx % 2 != 0 {
+                    int_idx += 1;
+                }
+                if int_idx + 1 < config.max_int_regs {
+                    result.push(CoreArgClass::F128GpPair {
+                        base_reg_idx: int_idx,
+                    });
+                    int_idx += 2;
+                } else {
+                    result.push(CoreArgClass::F128Stack);
+                    int_idx = config.max_int_regs;
+                }
+            } else {
+                result.push(CoreArgClass::F128Stack);
+            }
+        } else if info.is_float && !force_gp && float_idx < config.max_float_regs {
+            result.push(CoreArgClass::FloatReg { reg_idx: float_idx });
+            float_idx += 1;
+        } else if info.is_float && !force_gp {
+            result.push(CoreArgClass::Stack);
+        } else if int_idx < config.max_int_regs {
+            result.push(CoreArgClass::IntReg { reg_idx: int_idx });
+            int_idx += 1;
+        } else {
+            result.push(CoreArgClass::Stack);
+        }
+    }
+
+    CoreClassification {
+        classes: result,
+        int_reg_idx: int_idx,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Caller-side wrapper: classify_call_args
+// ---------------------------------------------------------------------------
+
+/// Classify all arguments for a function call, returning a `CallArgClass` per argument.
+///
+/// This is the caller-side entry point. It extracts `ArgInfo` from the call-site
+/// arrays and delegates to the shared classification core.
+///
+/// `struct_arg_sizes`: Some(size) for struct/union by-value args, None otherwise.
+/// `struct_arg_aligns`: struct alignment (for RISC-V even-register alignment).
+/// `struct_arg_classes`: per-eightbyte SysV ABI classification (x86-64 only).
+/// `struct_arg_riscv_float_classes`: RISC-V LP64D float field classification.
+pub fn classify_call_args(
+    args: &[Operand],
+    arg_types: &[IrType],
+    struct_arg_sizes: &[Option<usize>],
+    struct_arg_aligns: &[Option<usize>],
+    struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+    struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+    struct_arg_is_f128_sse: &[bool],
+    is_variadic: bool,
+    config: &CallAbiConfig,
+) -> Vec<CallArgClass> {
+    // Build ArgInfo slice from call-site arrays.
+    let arg_infos: Vec<ArgInfo<'_>> = args
+        .iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            let arg_ty = if i < arg_types.len() {
+                Some(arg_types[i])
+            } else {
+                None
+            };
+            let raw_f128_sse = struct_arg_is_f128_sse.get(i).copied().unwrap_or(false);
+            let is_half_fp = arg_ty == Some(IrType::U16) && raw_f128_sse;
+            ArgInfo {
+                is_float: is_half_fp
+                    || if let Some(ty) = arg_ty {
+                        ty.is_float()
+                    } else {
+                        matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
+                    },
+                is_i128: arg_ty.map(is_i128_type).unwrap_or(false),
+                is_long_double: arg_ty.map(|t| t.is_long_double()).unwrap_or(false),
+                struct_size: struct_arg_sizes.get(i).copied().flatten(),
+                struct_align: struct_arg_aligns.get(i).copied().flatten(),
+                eightbyte_classes: struct_arg_classes
+                    .get(i)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                riscv_float_class: struct_arg_riscv_float_classes.get(i).copied().flatten(),
+                is_f128_sse: !is_half_fp && raw_f128_sse,
+                is_i64_pair: arg_ty
+                    .map(|t| matches!(t, IrType::I64 | IrType::U64))
+                    .unwrap_or(false),
+            }
+        })
+        .collect();
+
+    let core = classify_args_core(&arg_infos, is_variadic, is_variadic, config);
+
+    // Convert CoreArgClass -> CallArgClass (drop by-ref variants that only appear
+    // when large_struct_by_ref is true, which maps to IntReg/Stack on the caller side).
+    core.classes
+        .into_iter()
+        .map(|c| match c {
+            CoreArgClass::IntReg { reg_idx } => CallArgClass::IntReg { reg_idx },
+            CoreArgClass::FloatReg { reg_idx } => CallArgClass::FloatReg { reg_idx },
+            CoreArgClass::I128RegPair { base_reg_idx } => {
+                CallArgClass::I128RegPair { base_reg_idx }
+            }
+            CoreArgClass::F128FpReg { reg_idx }
+            | CoreArgClass::F128GpPair {
+                base_reg_idx: reg_idx,
+            } => CallArgClass::F128Reg { reg_idx },
+            CoreArgClass::F128Stack => CallArgClass::F128Stack,
+            CoreArgClass::F128SseReg { reg_idx } => CallArgClass::F128SseReg { reg_idx },
+            CoreArgClass::StructXmmReg { reg_idx, size } => {
+                CallArgClass::StructXmmReg { reg_idx, size }
+            }
+            CoreArgClass::StructByValReg { base_reg_idx, size } => {
+                CallArgClass::StructByValReg { base_reg_idx, size }
+            }
+            CoreArgClass::I64RegPair { base_reg_idx } => CallArgClass::I64RegPair { base_reg_idx },
+            CoreArgClass::StructSseReg {
+                lo_fp_idx,
+                hi_fp_idx,
+                size,
+            } => CallArgClass::StructSseReg {
+                lo_fp_idx,
+                hi_fp_idx,
+                size,
+            },
+            CoreArgClass::StructMixedIntSseReg {
+                int_reg_idx,
+                fp_reg_idx,
+                size,
+            } => CallArgClass::StructMixedIntSseReg {
+                int_reg_idx,
+                fp_reg_idx,
+                size,
+            },
+            CoreArgClass::StructMixedSseIntReg {
+                fp_reg_idx,
+                int_reg_idx,
+                size,
+            } => CallArgClass::StructMixedSseIntReg {
+                fp_reg_idx,
+                int_reg_idx,
+                size,
+            },
+            CoreArgClass::StructByValStack { size } => CallArgClass::StructByValStack { size },
+            CoreArgClass::StructSplitRegStack { reg_idx, size } => {
+                CallArgClass::StructSplitRegStack { reg_idx, size }
+            }
+            CoreArgClass::LargeStructStack { size } => CallArgClass::LargeStructStack { size },
+            // On caller side, large-struct-by-ref uses IntReg (pointer) or Stack (pointer overflow).
+            CoreArgClass::LargeStructByRefReg { reg_idx, .. } => CallArgClass::IntReg { reg_idx },
+            CoreArgClass::LargeStructByRefStack { .. } => CallArgClass::Stack,
+            CoreArgClass::Stack => CallArgClass::Stack,
+            CoreArgClass::I128Stack => CallArgClass::I128Stack,
+            CoreArgClass::ZeroSizeSkip => CallArgClass::ZeroSizeSkip,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Callee-side wrapper: classify_params_full / classify_params
+// ---------------------------------------------------------------------------
+
+/// Result of parameter classification, including the final register allocation state.
+/// The `int_reg_idx` field captures the effective GP register index after all named
+/// params are classified, which is needed by RISC-V va_start to correctly skip
+/// alignment padding gaps (e.g., when an F128 pair couldn't fit and bumped the index).
+pub struct ParamClassification {
+    pub classes: Vec<ParamClass>,
+    /// Final GP register index after classifying all named params.
+    /// Includes alignment bumps for I128/F128 pairs. Capped at max_int_regs.
+    pub int_reg_idx: usize,
+    /// Total stack bytes consumed by all named parameters.
+    /// This is the final stack_offset after classification, accounting for
+    /// type-specific sizes (e.g., F64/I64 take 8 bytes on ILP32).
+    pub total_stack_bytes: usize,
+}
+
+/// Classify all parameters of a function for callee-side store emission.
+///
+/// Uses the same `CallAbiConfig` as `classify_call_args` to ensure caller and callee
+/// agree on parameter locations. Returns one `ParamClass` per parameter plus the final
+/// register allocation state.
+pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamClassification {
+    // A `%ymm0`/`%zmm0`-returned aggregate keeps the hidden-pointer shape in
+    // the IR (parameter 0) but the pointer arrives in no register: classify
+    // the real parameters from index 1 and give parameter 0 its frame
+    // buffer class. (x86-64 only; every other target answers `None`.)
+    if let Some(bytes) = hidden_vector_return_bytes(func.uses_sret, &func.ret_eightbyte_classes) {
+        if !func.params.is_empty() {
+            let mut classification = classify_param_slice(
+                &func.name,
+                &func.params[1..],
+                false,
+                func.is_variadic,
+                config,
+            );
+            classification
+                .classes
+                .insert(0, ParamClass::VectorReturnBuffer { bytes });
+            return classification;
+        }
+    }
+    classify_param_slice(
+        &func.name,
+        &func.params,
+        func.uses_sret,
+        func.is_variadic,
+        config,
+    )
+}
+
+fn param_to_arg_info(param: &crate::ir::module::IrParam) -> ArgInfo<'_> {
+    let is_half_fp = param.ty == IrType::U16 && param.is_f128_sse;
+    ArgInfo {
+        is_float: param.ty.is_float() || is_half_fp,
+        is_i128: is_i128_type(param.ty),
+        is_long_double: param.ty.is_long_double(),
+        struct_size: param.struct_size,
+        struct_align: param.struct_align,
+        eightbyte_classes: &param.struct_eightbyte_classes,
+        riscv_float_class: param.riscv_float_class,
+        is_f128_sse: !is_half_fp && param.is_f128_sse,
+        is_i64_pair: matches!(param.ty, IrType::I64 | IrType::U64),
+    }
+}
+
+/// `classify_params_full` over an explicit parameter list.
+fn classify_param_slice(
+    func_name: &str,
+    params: &[crate::ir::module::IrParam],
+    uses_sret: bool,
+    is_variadic: bool,
+    config: &CallAbiConfig,
+) -> ParamClassification {
+    let arg_infos: Vec<ArgInfo<'_>> = params.iter().map(param_to_arg_info).collect();
+
+    // Pass is_variadic=true here because the callee side encodes variadic behavior
+    // directly in config.variadic_floats_in_gp (set by the caller based on is_variadic).
+    // The force_gp check is: is_variadic && config.variadic_floats_in_gp && is_float.
+    // For non-variadic functions, config.variadic_floats_in_gp is false, so force_gp
+    // is false regardless of the is_variadic flag — making this safe.
+    let mut core = classify_args_core(&arg_infos, true, is_variadic, config);
+
+    // AArch64 ABI: when sret uses a dedicated register (x8), the classification initially
+    // assigns the sret pointer to IntReg(0), consuming one GP register slot. On the caller
+    // side (emit_call in traits.rs), the sret arg is reclassified to ZeroSizeSkip, all
+    // other GP reg indices are shifted down by 1, and the first stack-overflow GP arg is
+    // promoted to the freed register slot (max_int_regs-1, i.e. x7).
+    //
+    // We must apply the same promotion on the callee side so that caller and callee agree
+    // on where each argument lives. The emit_store_gp_params method already handles
+    // the register index shift (sret_shift=1), but it does NOT promote stack args.
+    // Apply the promotion here to match the caller-side logic.
+    if uses_sret && config.sret_uses_dedicated_reg && core.classes.len() > 1 {
+        // Use max_int_regs (not max_int_regs-1) because emit_store_gp_params applies
+        // sret_shift=1, computing actual_idx = reg_idx - 1. So reg_idx=8 maps to x7.
+        let freed_reg = config.max_int_regs;
+        // Promote the first GP stack-overflow arg to the freed register slot.
+        for i in 1..core.classes.len() {
+            match core.classes[i] {
+                CoreArgClass::Stack => {
+                    let is_float = params.get(i).map(|p| p.ty.is_float()).unwrap_or(false);
+                    if !is_float {
+                        core.classes[i] = CoreArgClass::IntReg { reg_idx: freed_reg };
+                        break;
+                    }
+                }
+                CoreArgClass::StructByValStack { size } if size <= 8 => {
+                    core.classes[i] = CoreArgClass::StructByValReg {
+                        base_reg_idx: freed_reg,
+                        size,
+                    };
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Convert CoreArgClass -> ParamClass, assigning stack offsets.
+    let slot_size = crate::common::types::target_ptr_size();
+    let slot_align_mask = (slot_size - 1) as i64;
+    let mut stack_offset: i64 = 0;
+    let mut classes = Vec::with_capacity(core.classes.len());
+
+    for (i, c) in core.classes.iter().enumerate() {
+        let param_ty = params.get(i).map(|p| p.ty);
+        let pc = match *c {
+            CoreArgClass::IntReg { reg_idx } => ParamClass::IntReg { reg_idx },
+            CoreArgClass::FloatReg { reg_idx } => ParamClass::FloatReg { reg_idx },
+            CoreArgClass::I128RegPair { base_reg_idx } => ParamClass::I128RegPair { base_reg_idx },
+            CoreArgClass::StructByValReg { base_reg_idx, size } => {
+                ParamClass::StructByValReg { base_reg_idx, size }
+            }
+            CoreArgClass::I64RegPair { base_reg_idx } => ParamClass::I64RegPair { base_reg_idx },
+            CoreArgClass::StructSseReg {
+                lo_fp_idx,
+                hi_fp_idx,
+                size,
+            } => ParamClass::StructSseReg {
+                lo_fp_idx,
+                hi_fp_idx,
+                size,
+            },
+            CoreArgClass::StructMixedIntSseReg {
+                int_reg_idx,
+                fp_reg_idx,
+                size,
+            } => ParamClass::StructMixedIntSseReg {
+                int_reg_idx,
+                fp_reg_idx,
+                size,
+            },
+            CoreArgClass::StructMixedSseIntReg {
+                fp_reg_idx,
+                int_reg_idx,
+                size,
+            } => ParamClass::StructMixedSseIntReg {
+                fp_reg_idx,
+                int_reg_idx,
+                size,
+            },
+            CoreArgClass::F128FpReg { reg_idx } => ParamClass::F128FpReg { reg_idx },
+            CoreArgClass::F128GpPair { base_reg_idx } => ParamClass::F128GpPair {
+                lo_reg_idx: base_reg_idx,
+                hi_reg_idx: base_reg_idx + 1,
+            },
+            CoreArgClass::F128SseReg { reg_idx } => ParamClass::F128SseReg { reg_idx, size: 16 },
+            CoreArgClass::StructXmmReg { reg_idx, size } => {
+                ParamClass::F128SseReg { reg_idx, size }
+            }
+            CoreArgClass::LargeStructByRefReg { reg_idx, size } => {
+                ParamClass::LargeStructByRefReg { reg_idx, size }
+            }
+            CoreArgClass::ZeroSizeSkip => ParamClass::ZeroSizeSkip,
+
+            // Stack-overflow cases: assign offsets
+            CoreArgClass::F128Stack => {
+                if config.f128_in_fp_regs || config.f128_in_gp_pairs {
+                    // ARM/RISC-V: F128 overflowed from registers
+                    stack_offset = (stack_offset + 15) & !15;
+                    let off = stack_offset;
+                    stack_offset += 16;
+                    ParamClass::F128Stack { offset: off }
+                } else if slot_size == 4 {
+                    // i686: long double is 12 bytes, 4-byte aligned
+                    let off = stack_offset;
+                    stack_offset += 12;
+                    ParamClass::F128AlwaysStack { offset: off }
+                } else {
+                    // x86-64: 16 bytes, 16-byte aligned
+                    stack_offset = (stack_offset + 15) & !15;
+                    let off = stack_offset;
+                    stack_offset += 16;
+                    ParamClass::F128AlwaysStack { offset: off }
+                }
+            }
+            CoreArgClass::I128Stack => {
+                // 16-byte stack alignment for __int128 per the LP64 psABIs
+                // (x86-64 SysV, AAPCS64, RISC-V) — but capped by the target's
+                // stack-arg alignment cap: i686 cdecl packs at 4-byte slot
+                // granularity and its caller/va_arg readers never realign, so
+                // __int128 (an lccc extension on i386) must stay 4-granular
+                // there too. All three i686 paths (caller, named-param
+                // layout, va_arg) then agree.
+                let a = 16.min(config.stack_arg_align_cap) as i64;
+                if a > slot_size as i64 {
+                    stack_offset = (stack_offset + a - 1) & !(a - 1);
+                }
+                let off = stack_offset;
+                stack_offset += 16;
+                ParamClass::I128Stack { offset: off }
+            }
+            CoreArgClass::StructByValStack { size } | CoreArgClass::LargeStructStack { size } => {
+                // A stack argument whose natural alignment exceeds the slot
+                // size is aligned to min(align, stack_arg_align_cap) in the
+                // argument area:
+                //  * AAPCS64 / RISC-V LP64D psABIs cap at 2*XLEN (16) —
+                //    struct { long double } (align 16) is the canonical case;
+                //    the va_arg / prologue readers use the same rule.
+                //  * x86-64 (GCC >= 4.6) honors the FULL natural alignment
+                //    of MEMORY-class stack arguments (uncapped; callers
+                //    realign %rsp for the >16 case).
+                //  * i686 cdecl packs ordinary arguments at the 4-byte slot
+                //    granularity — doubles, 12-byte x87 long double, 8-byte-
+                //    aligned structs, even `aligned(16)` structs (GCC 14.2
+                //    -m32 oracles f1/f3/f7/f8) — with separate exceptions for
+                //    memory-passed GNU vectors (natural 16/32/64-byte alignment)
+                //    and TFmode 16-byte carriers (__float128/_Decimal128, the
+                //    is_f128_sse params) are 16-byte aligned (oracles f2/f6:
+                //    (int,__float128,int) puts q at offset 16; libgcc's
+                //    __addtf3 reads its by-value TF args at entry+20/+36).
+                //    The caller layout (i686 calls.rs stack_arg_align) uses
+                //    the identical rule so both sides agree.
+                let param = params.get(i);
+                let struct_align = param
+                    .and_then(|p| p.struct_align)
+                    .unwrap_or(slot_size as usize);
+                if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
+                    eprintln!(
+                        "[STACK-ALIGN-ARM] fn={} i={} size={} ir_align={:?} slot_size={} cap={} aligning={}",
+                        func_name,
+                        i,
+                        size,
+                        param.and_then(|p| p.struct_align),
+                        slot_size,
+                        config.stack_arg_align_cap,
+                        struct_align > slot_size as usize
+                    );
+                }
+                let tf_carrier_ia32 =
+                    slot_size == 4 && param.is_some_and(|p| p.is_f128_sse) && struct_align >= 16;
+                if tf_carrier_ia32 {
+                    stack_offset = (stack_offset + 15) & !15;
+                } else if let Some(vector_align) = param.and_then(|p| {
+                    i386_gnu_vector_stack_align(config, &p.struct_eightbyte_classes, struct_align)
+                }) {
+                    let a = vector_align as i64;
+                    stack_offset = (stack_offset + a - 1) & !(a - 1);
+                } else if struct_align > slot_size as usize {
+                    // NOTE: the cap is `usize::MAX` when uncapped (x86-64);
+                    // the min/max MUST run in usize — casting the cap to i64
+                    // turns usize::MAX into -1, min() then selects it and the
+                    // clamp collapses every alignment to the slot size
+                    // (observed: a 192-byte union with long double read 8
+                    // bytes early by the callee's param stores — stress abi
+                    // fn3, gcc-interop SIGSEGV).
+                    let a = struct_align
+                        .min(config.stack_arg_align_cap)
+                        .max(slot_size as usize) as i64;
+                    stack_offset = (stack_offset + a - 1) & !(a - 1);
+                }
+                if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
+                    eprintln!(
+                        "[STACK-ALIGN-ARM2] fn={} i={} post_align_offset={}",
+                        func_name, i, stack_offset
+                    );
+                }
+                let off = stack_offset;
+                stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
+                if matches!(*c, CoreArgClass::LargeStructStack { .. }) {
+                    ParamClass::LargeStructStack { offset: off, size }
+                } else {
+                    ParamClass::StructStack { offset: off, size }
+                }
+            }
+            CoreArgClass::StructSplitRegStack { reg_idx, size } => {
+                let off = stack_offset;
+                let stack_part = size - slot_size;
+                stack_offset += (stack_part as i64 + slot_align_mask) & !slot_align_mask;
+                ParamClass::StructSplitRegStack {
+                    reg_idx,
+                    stack_offset: off,
+                    size,
+                }
+            }
+            CoreArgClass::LargeStructByRefStack { size } => {
+                let off = stack_offset;
+                stack_offset += slot_size as i64; // pointer on stack
+                ParamClass::LargeStructByRefStack { offset: off, size }
+            }
+            CoreArgClass::Stack => {
+                let off = stack_offset;
+                let is_float = params
+                    .get(i)
+                    .is_some_and(|p| p.ty.is_float() || (p.ty == IrType::U16 && p.is_f128_sse));
+                if is_float {
+                    // Float that overflowed FP registers
+                    if slot_size == 4 {
+                        // i386: a stack scalar occupies its size rounded up
+                        // to whole words: float/_Decimal32 4, double and the
+                        // _Decimal64 BID container 8 (`is_float` covers the
+                        // decimals; sizing D64 as 4 shifted every later
+                        // parameter).  The caller sizes it identically
+                        // (`I686Codegen::stack_scalar_arg_size`).
+                        stack_offset += param_ty.map_or(4, |t| (t.size() as i64 + 3) & !3);
+                    } else {
+                        stack_offset += 8;
+                    }
+                } else {
+                    // GP register overflow
+                    let param_size = param_ty
+                        .map(|t| t.size() as i64)
+                        .unwrap_or(slot_size as i64);
+                    stack_offset += (param_size + slot_align_mask) & !slot_align_mask;
+                }
+                ParamClass::StackScalar { offset: off }
+            }
+        };
+        classes.push(pc);
+    }
+
+    if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
+        for (i, pc) in classes.iter().enumerate() {
+            eprintln!(
+                "[STACK-ALIGN] fn={} param {} = {:?} ir_align={:?}",
+                func_name,
+                i,
+                pc,
+                params.get(i).and_then(|p| p.struct_align)
+            );
+        }
+        eprintln!(
+            "[STACK-ALIGN] fn={} total_stack_bytes={}",
+            func_name, stack_offset
+        );
+    }
+
+    ParamClassification {
+        classes,
+        int_reg_idx: core.int_reg_idx,
+        total_stack_bytes: stack_offset as usize,
+    }
+}
+
+/// Classify all parameters of a function for callee-side store emission.
+///
+/// Uses the same `CallAbiConfig` as `classify_call_args` to ensure caller and callee
+/// agree on parameter locations. Returns one `ParamClass` per parameter.
+pub fn classify_params(func: &IrFunction, config: &CallAbiConfig) -> Vec<ParamClass> {
+    classify_params_full(func, config).classes
+}
+
+/// Compute the total stack space (in bytes) consumed by named parameters that are
+/// passed on the stack. This is needed for variadic functions: va_start must set its
+/// stack pointer past all named stack-passed args to point at the first variadic arg.
+///
+/// This correctly accounts for alignment padding (e.g., 16-byte alignment for F128/I128).
+pub fn named_params_stack_bytes(param_classes: &[ParamClass]) -> usize {
+    // The ParamClass offsets already embed every alignment decision
+    // (16-byte F128/I128 slots, over-aligned struct padding), so the named
+    // stack area ends at the furthest (offset + size). Deriving the total
+    // from the offsets — instead of re-summing sizes — cannot drift from
+    // the layout the caller and prologue actually use.
+    param_classes
+        .iter()
+        .filter_map(|class| match class {
+            ParamClass::StackScalar { offset } => Some(offset + 8),
+            ParamClass::I128Stack { offset } => Some(offset + 16),
+            ParamClass::F128Stack { offset } => Some(offset + 16),
+            // i686 x87 long double occupies 12 bytes; x86-64 uses 16.
+            ParamClass::F128AlwaysStack { offset } => {
+                let sz = if crate::common::types::target_ptr_size() == 4 {
+                    12
+                } else {
+                    16
+                };
+                Some(offset + sz)
+            }
+            ParamClass::StructStack { offset, size }
+            | ParamClass::LargeStructStack { offset, size } => {
+                Some(offset + (*size as i64 + 7) & !7)
+            }
+            ParamClass::LargeStructByRefStack { offset, .. } => Some(offset + 8),
+            ParamClass::StructSplitRegStack {
+                stack_offset, size, ..
+            } => {
+                let stack_part = (*size as i64 - 8 + 7) & !7;
+                Some(stack_offset + stack_part)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0) as usize
+}
+
+// ---------------------------------------------------------------------------
+// Call-site stack space helpers (used by emit_call)
+// ---------------------------------------------------------------------------
+
+/// Compute the total stack space needed for stack-overflow arguments.
+/// Returns the total bytes needed, 16-byte aligned.
+/// Use this for ARM and RISC-V which pre-allocate stack space with a single SP adjustment.
+pub fn compute_stack_arg_space(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+) -> usize {
+    // ARM/RISC-V pre-allocate the outgoing area with one SP adjustment whose
+    // base is 16-aligned; their psABIs cap stack-argument alignment at 16.
+    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns, 16);
+    let mut total: usize = 0;
+    for (i, cls) in arg_classes.iter().enumerate() {
+        if !cls.is_stack() {
+            continue;
+        }
+        total += padding[i] + cls.stack_bytes();
+    }
+    (total + 15) & !15
+}
+
+/// Compute per-stack-arg alignment padding needed in the forward layout.
+/// Returns a Vec with one entry per `arg_classes` element. Non-stack args get 0.
+/// F128Stack and I128Stack args get padding to align to 16 bytes in the overflow
+/// area; struct args whose alignment exceeds 8 (`struct_arg_aligns`) get padding
+/// to their alignment, capped at `align_cap`. ARM/RISC-V pass 16 (their psABIs
+/// cap stack-argument alignment at 2*XLEN and the va_arg/prologue readers cap
+/// identically); x86-64 passes `usize::MAX` — GCC ≥ 4.6 honors the FULL natural
+/// alignment of MEMORY-class stack arguments, and the >16 case is completed by
+/// the caller's dynamic %rsp realignment (see emit_call_stack_args_impl).
+pub fn compute_stack_arg_padding(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+    align_cap: usize,
+) -> Vec<usize> {
+    let mut padding = vec![0usize; arg_classes.len()];
+    let mut offset: usize = 0;
+    for (i, cls) in arg_classes.iter().enumerate() {
+        if !cls.is_stack() {
+            continue;
+        }
+        let align = match cls {
+            CallArgClass::F128Stack | CallArgClass::I128Stack => Some(16),
+            CallArgClass::StructByValStack { .. }
+            | CallArgClass::LargeStructStack { .. }
+            | CallArgClass::StructSplitRegStack { .. } => {
+                struct_arg_aligns.get(i).copied().flatten()
+            }
+            _ => None,
+        };
+        if let Some(a) = align {
+            if a > 8 {
+                let a = a.min(align_cap);
+                let align_pad = (a - (offset % a)) % a;
+                padding[i] = align_pad;
+                offset += align_pad;
+            }
+        }
+        offset += cls.stack_bytes();
+    }
+    padding
+}
+
+/// The largest alignment requirement among stack-passed arguments (8 for
+/// plain scalars). x86-64 uses this to decide whether the outgoing area
+/// needs dynamic %rsp realignment: static per-arg padding is sufficient
+/// exactly while this stays ≤ 16, because the push sequence's base is only
+/// guaranteed 16-aligned.
+pub fn max_stack_arg_alignment(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+) -> usize {
+    let mut max_align = 8usize;
+    for (i, cls) in arg_classes.iter().enumerate() {
+        if !cls.is_stack() {
+            continue;
+        }
+        let align = match cls {
+            CallArgClass::F128Stack | CallArgClass::I128Stack => 16,
+            CallArgClass::StructByValStack { .. }
+            | CallArgClass::LargeStructStack { .. }
+            | CallArgClass::StructSplitRegStack { .. } => {
+                struct_arg_aligns.get(i).copied().flatten().unwrap_or(8)
+            }
+            _ => 8,
+        };
+        max_align = max_align.max(align);
+    }
+    max_align
+}
+
+/// Compute the raw bytes that will be pushed onto the stack for stack arguments.
+/// Unlike `compute_stack_arg_space`, this does NOT apply final 16-byte alignment,
+/// because x86 uses individual `pushq` instructions and handles alignment separately.
+/// This includes alignment padding for F128/I128 and over-aligned struct args
+/// (see `compute_stack_arg_padding` for the `align_cap` semantics).
+pub fn compute_stack_push_bytes(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+    align_cap: usize,
+) -> usize {
+    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns, align_cap);
+    let mut total: usize = 0;
+    for (i, cls) in arg_classes.iter().enumerate() {
+        if !cls.is_stack() {
+            continue;
+        }
+        total += padding[i] + cls.stack_bytes();
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::EightbyteClass;
+
+    /// The x86-64 SysV configuration (`X86Codegen::call_abi_config_impl`).
+    fn sysv_x86_64() -> CallAbiConfig {
+        CallAbiConfig::sysv_x86_64()
+    }
+
+    /// The i686 `-mregparm=3` configuration (`I686Codegen::call_abi_config_impl`).
+    fn i686_regparm3() -> CallAbiConfig {
+        CallAbiConfig {
+            max_int_regs: 3,
+            max_float_regs: 0,
+            align_i128_pairs: false,
+            f128_in_fp_regs: false,
+            f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+            large_struct_by_ref: false,
+            use_sysv_struct_classification: false,
+            use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false,
+            align_struct_pairs: false,
+            sret_uses_dedicated_reg: false,
+            gcc_regparm_mode: true,
+            stack_arg_align_cap: 4,
+            vector_xmm_regs: 3,
+            i386_ext_vector_lanes: true,
+        }
+    }
+
+    fn scalar(classes: &[EightbyteClass]) -> ArgInfo<'_> {
+        ArgInfo {
+            is_float: false,
+            is_i128: false,
+            is_long_double: false,
+            is_f128_sse: false,
+            is_i64_pair: false,
+            struct_size: None,
+            struct_align: None,
+            eightbyte_classes: classes,
+            riscv_float_class: None,
+        }
+    }
+
+    #[test]
+    fn i386_wide_vectors_share_three_registers_and_keep_gp_arguments_independent() {
+        let config = i686_regparm3();
+        for bytes in [16, 32, 64] {
+            let mut classes = vec![EightbyteClass::SseUp; bytes / 8];
+            classes[0] = EightbyteClass::Sse;
+            let vector = || ArgInfo {
+                struct_size: Some(bytes),
+                struct_align: Some(bytes),
+                ..scalar(&classes)
+            };
+            let args = [
+                scalar(&[]),
+                vector(),
+                vector(),
+                vector(),
+                vector(),
+                scalar(&[]),
+            ];
+            let result = classify_args_core(&args, false, false, &config);
+            assert!(matches!(
+                result.classes[0],
+                CoreArgClass::IntReg { reg_idx: 0 }
+            ));
+            for index in 0..3 {
+                assert!(
+                    matches!(result.classes[index + 1], CoreArgClass::StructXmmReg { reg_idx, size }
+                    if reg_idx == index && size == bytes)
+                );
+            }
+            assert!(
+                matches!(result.classes[4], CoreArgClass::StructByValStack { size } if size == bytes)
+            );
+            assert!(matches!(
+                result.classes[5],
+                CoreArgClass::IntReg { reg_idx: 1 }
+            ));
+            if bytes > 16 {
+                assert_eq!(
+                    i386_gnu_vector_stack_align(&config, &classes, bytes),
+                    Some(bytes)
+                );
+            }
+            let variadic = classify_args_core(&args, true, true, &config);
+            assert!(
+                variadic
+                    .classes
+                    .iter()
+                    .all(|class| !matches!(class, CoreArgClass::StructXmmReg { .. }))
+            );
+        }
+    }
+
+    /// gcc.c-torture/execute/20020412-1.c: `foo(int size, ...)` receives two
+    /// VLA-containing structs. GCC passes them by reference, so each is a
+    /// pointer in the next GP register (%rsi, %rdx) and the callee's
+    /// `va_arg` reads them from the register save area. The lowering hands
+    /// such an argument over with `struct_size: None`; whatever classes the
+    /// zero-byte static layout yielded must not demote it to the stack.
+    #[test]
+    fn x86_64_by_reference_aggregate_takes_the_next_gp_register() {
+        let config = sysv_x86_64();
+        let no_class = [EightbyteClass::NoClass];
+        let args = [scalar(&[]), scalar(&no_class), scalar(&no_class)];
+        let core = classify_args_core(&args, true, true, &config);
+        let regs: Vec<usize> = core
+            .classes
+            .iter()
+            .map(|c| match c {
+                CoreArgClass::IntReg { reg_idx } => *reg_idx,
+                other => panic!("by-reference aggregate left the GP sequence: {other:?}"),
+            })
+            .collect();
+        assert_eq!(regs, [0, 1, 2]);
+        assert_eq!(core.int_reg_idx, 3);
+    }
+
+    /// The marker keeps its i686 meaning: a decomposed ExtVector lane is
+    /// stack-passed and leaves the regparm registers to the next scalar.
+    #[test]
+    fn i686_ext_vector_lane_marker_skips_the_regparm_sequence() {
+        let config = i686_regparm3();
+        let no_class = [EightbyteClass::NoClass];
+        let args = [scalar(&no_class), scalar(&no_class), scalar(&[])];
+        let core = classify_args_core(&args, false, false, &config);
+        assert!(matches!(core.classes[0], CoreArgClass::Stack));
+        assert!(matches!(core.classes[1], CoreArgClass::Stack));
+        assert!(matches!(
+            core.classes[2],
+            CoreArgClass::IntReg { reg_idx: 0 }
+        ));
+    }
+
+    #[test]
+    fn i386_vector_alignment_requires_the_explicit_vector_marker() {
+        let config = i686_regparm3();
+        let vector = [EightbyteClass::Memory, EightbyteClass::NoClass];
+        let ordinary_memory = [EightbyteClass::Memory];
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 16), Some(16));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 32), Some(32));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 64), Some(64));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 8), None);
+        assert_eq!(i386_gnu_vector_stack_align(&config, &[], 32), None);
+        for align in [16, 32, 64] {
+            assert_eq!(
+                i386_gnu_vector_stack_align(&config, &ordinary_memory, align),
+                None
+            );
+        }
+        assert_eq!(
+            i386_gnu_vector_stack_align(&sysv_x86_64(), &vector, 64),
+            None
+        );
+    }
+
+    #[test]
+    fn i386_no_sse_vector_stack_offsets_include_v16_alignment() {
+        let vector = vec![EightbyteClass::Memory, EightbyteClass::NoClass];
+        let param = |size, align, classes: Vec<EightbyteClass>| crate::ir::module::IrParam {
+            ty: IrType::Ptr,
+            noalias: false,
+            struct_size: size,
+            struct_align: align,
+            param_align: None,
+            struct_eightbyte_classes: classes,
+            is_f128_sse: false,
+            riscv_float_class: None,
+        };
+        let params = vec![
+            param(None, None, Vec::new()),
+            param(Some(16), Some(16), vector.clone()),
+            param(Some(32), Some(32), vector),
+        ];
+        let mut config = i686_regparm3();
+        config.max_int_regs = 0; // cdecl no-SSE hidden-sret convention
+        let classified = classify_param_slice("no_sse_vectors", &params, true, false, &config);
+        assert!(matches!(
+            classified.classes[1],
+            ParamClass::StructStack {
+                offset: 16,
+                size: 16
+            }
+        ));
+        assert!(matches!(
+            classified.classes[2],
+            ParamClass::StructStack {
+                offset: 32,
+                size: 32
+            } | ParamClass::LargeStructStack {
+                offset: 32,
+                size: 32
+            }
+        ));
+    }
+
+    #[test]
+
+    fn scalar_f128_overflow_uses_the_value_stack_class_on_x86() {
+        let f128 = || ArgInfo {
+            struct_size: Some(16),
+            struct_align: Some(16),
+            is_f128_sse: true,
+            ..scalar(&[])
+        };
+        let mut args: Vec<ArgInfo<'_>> = (0..8)
+            .map(|_| ArgInfo {
+                is_float: true,
+                ..scalar(&[])
+            })
+            .collect();
+        args.push(f128());
+        let core = classify_args_core(&args, false, false, &sysv_x86_64());
+        assert!(matches!(
+            core.classes[8],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+
+        // i686 has no XMM argument registers and scalar binary128 carries no
+        // aggregate eightbyte classes, so it reaches the same flagged arm.
+        let core = classify_args_core(&[f128()], false, false, &i686_regparm3());
+        assert!(matches!(
+            core.classes[0],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+    }
+
+    #[test]
+    fn scalar_f128_marshalling_rejects_vector_address_markers() {
+        // i686 ext-vector XMM pieces reuse the alignment marker but carry
+        // Ptr operands. Only the genuine U128 scalar with the marker may use
+        // the value-copy path; missing metadata and other carriers fail closed
+        // to the aggregate/ordinary-I128 paths respectively.
+        let types = [IrType::Ptr, IrType::U128, IrType::U128, IrType::I128];
+        let markers = [true, true, false, true];
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 0));
+        assert!(is_scalar_f128_sse_arg(&types, &markers, 1));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 2));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 3));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 4));
+    }
+
+    #[test]
+    fn f128_sse_constants_are_object_images_not_aggregate_addresses() {
+        let nine = 0x4002_2000_0000_0000_0000_0000_0000_0000u128;
+        assert_eq!(f128_sse_const_bits(IrConst::I128(nine as i128)), Some(nine));
+        let negative_zero = 1u128 << 127;
+        assert_eq!(
+            f128_sse_const_bits(IrConst::I128(negative_zero as i128)),
+            Some(negative_zero)
+        );
+        assert_eq!(f128_sse_const_bits(IrConst::I64(0)), Some(0));
+        assert_eq!(f128_sse_const_bits(IrConst::I64(9)), None);
+        assert_eq!(f128_sse_const_bits(IrConst::F64(9.0)), None);
+    }
+}

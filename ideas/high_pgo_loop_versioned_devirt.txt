@@ -1,0 +1,65 @@
+PGO Loop-Versioned Devirtualization (hoist the guard out of the loop)
+=====================================================================
+Priority: HIGH
+
+Motivation
+----------
+The v11 cost-aware devirtualization fix (single-target ≥95% → don't promote)
+eliminated a +28% regression by simply NOT promoting stable single-target
+sites. But there is a better outcome available: instead of *skipping* the
+promotion, **hoist the target check out of the loop** when the function pointer
+is loop-invariant. Then the per-iteration overhead is one compare + one
+well-predicted branch (executed once), not per call.
+
+The idea
+--------
+For an indirect call inside a loop where the loaded function pointer is
+loop-invariant (dominated by a load that does not change in the loop):
+
+```c
+// before
+for (i...) { s += fp(x[i]); }     // indirect every iteration
+
+// after (loop versioning)
+if (fp == hot_target) {
+    for (i...) { s += hot_target(x[i]); }   // direct, guard hoisted
+} else {
+    for (i...) { s += fp(x[i]); }           // fallback
+}
+```
+
+This is the classic LLVM/GCC loop-versioning transform. It retains the accuracy
+win of a direct call on the hot path *and* the branch-prediction win of a
+guard executed once, so it does not regress even a perfectly-predicted single
+target (the v11 concern disappears: the guard is not in the hot loop).
+
+Why it is hard (and why the cost-aware rule is a correct first step)
+-------------------------------------------------------------------
+- Requires proving the function pointer is **loop-invariant** (a value that
+  reaches the indirect call from outside the loop and is not modified inside).
+- Requires loop versioning infrastructure (clone the loop body, add a header
+  dispatch) — LCCC has the IR pieces (phi handling, block cloning from the
+  inliner/loop unroller) but no general loop-versioning pass yet.
+- The cost-aware ≥95% rule is the *safe subset* that is already integrated; this
+  is its generalization.
+
+Plan
+----
+1. Detect a loop-invariant indirect call site (SCEV/dominance-based).
+2. Clone the loop for the hot target (recorded by the value profiler) and the
+   fallback; add the hoisted guard.
+3. Re-run the optimizer on the direct clone (constant propagation, etc.).
+4. Measure vs plain and vs the current cost-aware rule with the PGO A/B harness.
+5. Fall back to the current skip-rule if the clone cost exceeds the gain.
+
+Measurable success
+------------------
+- Single-target hot loops: beat the "neutral" of v11 (guard hoisted once).
+- Multi-valued dispatch: retain the 1.07× win.
+- Both validated with branch-miss counters on the i7-14700KF.
+
+Key files
+- src/pgo/promote.rs (extend the value-profiler site record with loop context)
+- src/passes/loop_versioning.rs (new) or extend loop_unroll.rs cloning helpers
+- reference: LLVM LoopVersioning / LoopPredication; GCC
+  `-ftree-loop-versioning` (alias) and devirtualization.

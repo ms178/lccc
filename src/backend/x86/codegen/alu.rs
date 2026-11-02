@@ -1,0 +1,2621 @@
+//! X86Codegen: integer/float arithmetic, unary ops, binop, copy.
+
+use super::emit::{X86Codegen, phys_reg_name, shift_mnemonic};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrBinOp, IrConst, Operand, Value};
+
+impl X86Codegen {
+    // ---- Unary ----
+
+    pub(super) fn emit_float_neg_impl(&mut self, ty: IrType) {
+        // The value lives in the GPR accumulator as its IEEE-754 bit pattern,
+        // so the sign is a single bit flip — no GPR<->XMM domain crossings and
+        // no movabsq-to-xmm shuttle. F32: bit 31 of %eax (xorl zero-extends).
+        // F64: bit 63 of %rax; xorq has no imm64 form, so the mask is moved
+        // through %rcx (the secondary scratch) first.
+        if ty == IrType::F32 {
+            self.state.emit("    xorl $0x80000000, %eax");
+        } else {
+            self.state.emit("    movabsq $-9223372036854775808, %rcx");
+            self.state.emit("    xorq %rcx, %rax");
+            self.state.reg_cache.invalidate_sec();
+        }
+    }
+
+    pub(super) fn emit_int_neg_impl(&mut self, ty: IrType) {
+        // Width-correct: 32-bit forms zero-extend the upper half (the SysV
+        // i32-home invariant); negq on a zero-extended U32 would produce
+        // 0xFFFFFFFF00000001 instead of 1.
+        match ty {
+            IrType::I8 | IrType::U8 => self.state.emit("    negb %al"),
+            IrType::I16 | IrType::U16 => self.state.emit("    negw %ax"),
+            IrType::I32 | IrType::U32 => self.state.emit("    negl %eax"),
+            _ => self.state.emit("    negq %rax"),
+        }
+    }
+
+    pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
+        match ty {
+            IrType::I8 | IrType::U8 => self.state.emit("    notb %al"),
+            IrType::I16 | IrType::U16 => self.state.emit("    notw %ax"),
+            IrType::I32 | IrType::U32 => self.state.emit("    notl %eax"),
+            _ => self.state.emit("    notq %rax"),
+        }
+    }
+
+    pub(super) fn emit_and_not_impl(
+        &mut self,
+        not_src: &Operand,
+        other: &Operand,
+        dest: &Value,
+        ty: IrType,
+        direct_return: bool,
+    ) {
+        let narrow = matches!(ty, IrType::I32 | IrType::U32);
+        let suffix = if narrow { "l" } else { "q" };
+        // Fresh-home read: the register must hold the operand's value NOW.
+        // Reading unconditionally consumed whatever clobbering write (earlier
+        // staging, an in-place compute, a MachInst window) last left in the
+        // home — the free_area_init_node class, here reachable through every
+        // Not+And consumer once BMI is enabled. `fresh_home_of` applies the
+        // same composed freshness law as every other staging site (mark bits
+        // narrowed by the exact write-state dataflow).
+        let fresh_reg_of = |this: &Self, operand: &Operand| -> Option<String> {
+            let Operand::Value(value) = operand else {
+                return None;
+            };
+            let reg = this.fresh_home_of(value.0)?;
+            if super::emit::is_xmm_reg(reg) || this.state.is_alloca(value.0) {
+                return None;
+            }
+            Some(if narrow {
+                super::emit::phys_reg_name_32(reg).to_string()
+            } else {
+                super::emit::phys_reg_name(reg).to_string()
+            })
+        };
+        // The non-negated source, resolved in preference order:
+        //   1. MEMORY-FORM FOLD (BMI `andn r/m, reg, reg`): no fresh home but
+        //      a sound direct slot image — one instruction instead of
+        //      load-then-andn, no rcx staging dependency (kernel linux_find_bit:
+        //      5 -> 4 insns per scanned word). The image is sound exactly when
+        //      the slot is SSA-stable (written at the definition, never aliased
+        //      while the value is live — the stack-slot contract) and wide
+        //      enough for the instruction width (slot_fits_width: a 4-byte
+        //      small slot must not feed a 64-bit andn — it would read 4 bytes
+        //      of the neighboring slot into the high half).
+        //   2. Fresh home register.
+        //   3. Stage through rcx (last resort).
+        enum OtherSrc {
+            Mem(String),
+            Reg(String),
+        }
+        let other_src: OtherSrc = match other {
+            Operand::Value(v) if fresh_reg_of(self, other).is_none() => {
+                let width_ok = || {
+                    super::emit::slot_fits_width(
+                        &self.state,
+                        v.0,
+                        if narrow {
+                            super::machinst::OpSize::S32
+                        } else {
+                            super::machinst::OpSize::S64
+                        },
+                    )
+                };
+                match self.state.resolve_slot_addr(v.0) {
+                    Some(crate::backend::state::SlotAddr::Direct(slot)) if width_ok() => {
+                        OtherSrc::Mem(self.slot_ref(slot.0))
+                    }
+                    _ => {
+                        self.operand_to_rcx(other);
+                        OtherSrc::Reg(if narrow { "ecx".into() } else { "rcx".into() })
+                    }
+                }
+            }
+            _ => match fresh_reg_of(self, other) {
+                Some(name) => OtherSrc::Reg(name),
+                None => {
+                    self.operand_to_rcx(other);
+                    OtherSrc::Reg(if narrow { "ecx".into() } else { "rcx".into() })
+                }
+            },
+        };
+        let not_name = match fresh_reg_of(self, not_src) {
+            Some(name) => name,
+            None => {
+                if narrow {
+                    self.operand_to_eax(not_src);
+                } else {
+                    self.operand_to_rax(not_src);
+                }
+                if narrow { "eax".into() } else { "rax".into() }
+            }
+        };
+        // The not_src staging cannot invalidate `other_src`: the memory form
+        // is rbp/rsp-addressed, and register homes never alias rax/rcx (they
+        // are not allocatable), so the freshness computed above still holds.
+        match (direct_return, other_src) {
+            (true, OtherSrc::Reg(other_name)) => {
+                self.state.emit_fmt(format_args!(
+                    "    andn{} %{}, %{}, %{}",
+                    suffix,
+                    other_name,
+                    not_name,
+                    if narrow { "eax" } else { "rax" }
+                ));
+                self.state.park_acc(dest.0, false);
+            }
+            (true, OtherSrc::Mem(mem)) => {
+                self.state.emit_fmt(format_args!(
+                    "    andn{} {}, %{}, %{}",
+                    suffix,
+                    mem,
+                    not_name,
+                    if narrow { "eax" } else { "rax" }
+                ));
+                self.state.park_acc(dest.0, false);
+            }
+            (false, OtherSrc::Reg(other_name)) => {
+                if let Some(reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+                    let name = if narrow {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} %{}, %{}, %{}",
+                        suffix, other_name, not_name, name
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} %{}, %{}, %{}",
+                        suffix,
+                        other_name,
+                        not_name,
+                        if narrow { "eax" } else { "rax" }
+                    ));
+                    self.store_rax_to(dest);
+                }
+            }
+            (false, OtherSrc::Mem(mem)) => {
+                if let Some(reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+                    let name = if narrow {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} {}, %{}, %{}",
+                        suffix, mem, not_name, name
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    andn{} {}, %{}, %{}",
+                        suffix,
+                        mem,
+                        not_name,
+                        if narrow { "eax" } else { "rax" }
+                    ));
+                    self.store_rax_to(dest);
+                }
+            }
+        }
+    }
+
+    /// 32-bit leading-zero count of %eax without LZCNT: 31 - BSR(x), with
+    /// the IR's Clz(0) == 32 (a defined result; constant folding agrees).
+    /// This is the accumulator-only fallback. Register-allocated operands
+    /// take `emit_zero_defined_scan_direct`, which preloads 63 into a
+    /// distinct destination so the zero source passes it through, branch
+    /// free. Here the operand and the result share %eax and no scratch is
+    /// free, so the zero case is a branch. The branch-free scratch-less form
+    /// (`movl; lea 1(%rax,%rax); bsrq; neg; add $32`) puts five dependent
+    /// instructions on every input's critical path; the nonzero path here is
+    /// `test; jnz; bsr; xor` with the jump well predicted, so it is kept.
+    fn emit_clz32_rax_baseline(&mut self) {
+        let nz = self.state.fresh_label("clz_nz");
+        let done = self.state.fresh_label("clz_done");
+        self.state.emit("    testl %eax, %eax");
+        self.state.out.emit_jcc_label("    jnz", &nz);
+        self.state.emit("    movl $32, %eax");
+        self.state.out.emit_jmp_label(&done);
+        self.state.out.emit_named_label(&nz);
+        self.state.emit("    bsrl %eax, %eax");
+        self.state.emit("    xorl $31, %eax");
+        self.state.out.emit_named_label(&done);
+    }
+
+    /// 32-bit trailing-zero count of %eax without TZCNT, defined at zero.
+    /// The narrow forms' stop bit, one lane up: with bit 32 set the 64-bit
+    /// scan never sees zero, a zero operand yields 32, and whatever sits in
+    /// bits 33..63 can never be the lowest set bit, so no zero-extension is
+    /// needed. Two instructions, no branch and no scratch register (GCC:
+    /// `xor; mov $32; rep bsf; test; cmove`, which needs a second register
+    /// the accumulator path does not have free).
+    fn emit_ctz32_rax_baseline(&mut self) {
+        self.state.emit("    btsq $32, %rax");
+        self.state.emit("    bsfq %rax, %rax");
+    }
+
+    pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            match ty {
+                IrType::I8 | IrType::U8 => {
+                    // clz8(x) = lzcnt32(zext(x)) - 24.
+                    self.state.emit("    movzbl %al, %eax");
+                    self.state.emit("    lzcntl %eax, %eax");
+                    self.state.emit("    subl $24, %eax");
+                }
+                IrType::I16 | IrType::U16 => {
+                    self.state.emit("    movzwl %ax, %eax");
+                    self.state.emit("    lzcntl %eax, %eax");
+                    self.state.emit("    subl $16, %eax");
+                }
+                IrType::I32 | IrType::U32 => self.state.emit("    lzcntl %eax, %eax"),
+                _ => self.state.emit("    lzcntq %rax, %rax"),
+            }
+            return;
+        }
+        // Baseline x86-64 has no LZCNT: the F3 0F BD encoding decodes as BSR
+        // on CPUs without ABM and silently yields the MSB *index* instead of
+        // the leading-zero *count* (bit-flipped result, no fault). This
+        // corrupted the preboot ZSTD decoder's FSE/Huffman table builds when
+        // an lccc-built kernel booted on QEMU's default qemu64 TCG CPU.
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    movzbl %al, %eax");
+                self.emit_clz32_rax_baseline();
+                self.state.emit("    subl $24, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.emit_clz32_rax_baseline();
+                self.state.emit("    subl $16, %eax");
+            }
+            IrType::I32 | IrType::U32 => self.emit_clz32_rax_baseline(),
+            _ => {
+                let nz = self.state.fresh_label("clz_nz");
+                let done = self.state.fresh_label("clz_done");
+                self.state.emit("    testq %rax, %rax");
+                self.state.out.emit_jcc_label("    jnz", &nz);
+                self.state.emit("    movl $64, %eax");
+                self.state.out.emit_jmp_label(&done);
+                self.state.out.emit_named_label(&nz);
+                self.state.emit("    bsrq %rax, %rax");
+                self.state.emit("    xorq $63, %rax");
+                self.state.out.emit_named_label(&done);
+            }
+        }
+    }
+
+    /// CLZ for a value proven nonzero by the frontend or CVP. Unlike the
+    /// defined-zero IR operation, baseline x86 needs only BSR+XOR.
+    pub(super) fn emit_int_clz_nonzero_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            self.emit_int_clz_impl(ty);
+            return;
+        }
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+                self.state.emit("    subl $24, %eax");
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+                self.state.emit("    subl $16, %eax");
+            }
+            IrType::I32 | IrType::U32 => {
+                self.state.emit("    bsrl %eax, %eax");
+                self.state.emit("    xorl $31, %eax");
+            }
+            _ => {
+                self.state.emit("    bsrq %rax, %rax");
+                self.state.emit("    xorq $63, %rax");
+            }
+        }
+    }
+
+    /// Ctz with the IR's defined-zero semantics: `Ctz(0)` is the operand
+    /// width (`src/ir/ops.rs`). TZCNT is a BMI1 instruction (GCC gates it
+    /// on `-mbmi`, not `-mlzcnt`): on LZCNT-only CPUs (AMD K10, Bobcat,
+    /// Jaguar) F3 0F BC decodes as BSF and leaves Ctz(0) undefined.
+    ///
+    /// Narrow widths OR a stop bit just above the operand (bit 8 or 16):
+    /// the scanned value is then never zero, so a zero operand yields the
+    /// width, the baseline needs no zero branch, and no zero-extension is
+    /// needed -- garbage above the stop bit can never be the lowest set bit.
+    pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
+        let tz32 = if self.bmi1_enabled {
+            "    tzcntl %eax, %eax"
+        } else {
+            "    bsfl %eax, %eax"
+        };
+        match ty {
+            IrType::I8 | IrType::U8 => {
+                self.state.emit("    orl $256, %eax");
+                self.state.emit(tz32);
+            }
+            IrType::I16 | IrType::U16 => {
+                self.state.emit("    orl $65536, %eax");
+                self.state.emit(tz32);
+            }
+            IrType::I32 | IrType::U32 if self.bmi1_enabled => self.state.emit(tz32),
+            IrType::I32 | IrType::U32 => self.emit_ctz32_rax_baseline(),
+            _ if self.bmi1_enabled => self.state.emit("    tzcntq %rax, %rax"),
+            _ => {
+                let nz = self.state.fresh_label("ctz_nz");
+                let done = self.state.fresh_label("ctz_done");
+                self.state.emit("    testq %rax, %rax");
+                self.state.out.emit_jcc_label("    jnz", &nz);
+                self.state.emit("    movl $64, %eax");
+                self.state.out.emit_jmp_label(&done);
+                self.state.out.emit_named_label(&nz);
+                self.state.emit("    bsfq %rax, %rax");
+                self.state.out.emit_named_label(&done);
+            }
+        }
+    }
+
+    /// CTZ for a value proven nonzero by the frontend or CVP. BSF has exactly
+    /// the desired semantics on that domain and needs no test/branch/fallback.
+    /// A narrow operand's lowest set bit lies in its low lane, so bits above
+    /// it never matter and no zero-extension is emitted. TZCNT (BMI1) is
+    /// preferred where available: AMD Zen 1-3 run BSF as 6 macro-ops with
+    /// latency 3, TZCNT as 2 with latency 2; Intel runs both as 1 uop.
+    pub(super) fn emit_int_ctz_nonzero_impl(&mut self, ty: IrType) {
+        let narrow_or_32 = matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        );
+        self.state.emit(match (narrow_or_32, self.bmi1_enabled) {
+            (true, true) => "    tzcntl %eax, %eax",
+            (true, false) => "    bsfl %eax, %eax",
+            (false, true) => "    tzcntq %rax, %rax",
+            (false, false) => "    bsfq %rax, %rax",
+        });
+    }
+
+    pub(super) fn emit_int_bswap_impl(&mut self, ty: IrType) {
+        match ty {
+            // Byte-swap of a single byte is the identity.
+            IrType::I8 | IrType::U8 => {}
+            IrType::I16 | IrType::U16 => self.state.emit("    rolw $8, %ax"),
+            IrType::I32 | IrType::U32 => self.state.emit("    bswapl %eax"),
+            _ => self.state.emit("    bswapq %rax"),
+        }
+    }
+
+    pub(super) fn emit_int_popcount_impl(&mut self, ty: IrType) {
+        let narrow = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
+        if narrow {
+            match ty {
+                IrType::I8 | IrType::U8 => self.state.emit("    movzbl %al, %eax"),
+                _ => self.state.emit("    movzwl %ax, %eax"),
+            }
+        }
+        if self.popcnt_enabled {
+            if narrow {
+                self.state.emit("    popcntl %eax, %eax");
+            } else if matches!(ty, IrType::I32 | IrType::U32) {
+                self.state.emit("    popcntl %eax, %eax");
+            } else {
+                self.state.emit("    popcntq %rax, %rax");
+            }
+            return;
+        }
+        // POPCNT (0F B8) is #UD on pre-Nehalem/Barcelona x86-64 — it is a
+        // v2 feature, not v1. Baseline fallback: the classic O(1) SWAR
+        // Hamming-weight sequence (the same code GCC emits for `__builtin_
+        // popcount` on a baseline target), replacing the previous per-bit
+        // `shr/adc` loop that iterated once per set bit (up to 64 trips —
+        // the largest single benchmark gap on this compiler, ~3.85x on the
+        // bitops kernel).
+        //
+        // The SWAR form is straight-line and data-independent, so it costs
+        // ~1 round trip regardless of input. It needs scratch registers:
+        //  - 32-bit path uses only %eax (in/out) + %ecx.
+        //  - 64-bit path uses %rax (in/out) + %rcx + %rdx (the full-width
+        //    masks 0x55.., 0x33.., 0x0f.. and 0x0101.. do not fit an imm32,
+        //    so they must be loaded with movabsq into a scratch GPR).
+        // %rcx (and %rdx on the 64-bit path) are NOT free here: the
+        // surrounding accumulator-mode code may have staged live values in
+        // them (e.g. a 64-bit multiply constant reused by a later `imulq`).
+        // Preserve them with push/pop pairs; the sequence contains no call,
+        // so the transient 16-byte stack excursion is safe at any alignment.
+        // The peephole `dead_scratch_saves` deletes a pair whose register is
+        // provably dead afterwards, so the cost is paid only when it is live.
+        if narrow || matches!(ty, IrType::I32 | IrType::U32) {
+            self.state.emit("    pushq %rcx");
+            self.state.emit("    movl %eax, %ecx"); // c = x
+            self.state.emit("    shrl $1, %eax");
+            self.state.emit("    andl $0x55555555, %eax"); // (x>>1)&0x55..
+            self.state.emit("    subl %eax, %ecx"); // c = x - pairs
+            self.state.emit("    movl %ecx, %eax");
+            self.state.emit("    shrl $2, %eax");
+            self.state.emit("    andl $0x33333333, %eax");
+            self.state.emit("    andl $0x33333333, %ecx");
+            self.state.emit("    addl %eax, %ecx"); // c = nibble counts
+            self.state.emit("    movl %ecx, %eax");
+            self.state.emit("    shrl $4, %eax");
+            self.state.emit("    addl %ecx, %eax");
+            self.state.emit("    andl $0x0f0f0f0f, %eax"); // byte counts
+            self.state.emit("    imull $0x01010101, %eax, %eax"); // *0x01010101
+            self.state.emit("    shrl $24, %eax"); // top byte = popcount
+            self.state.emit("    popq %rcx");
+        } else {
+            self.state.emit("    pushq %rcx");
+            self.state.emit("    pushq %rdx");
+            self.state.emit("    movq %rax, %rcx"); // c = x
+            self.state.emit("    shrq $1, %rax");
+            self.state.emit("    movabsq $0x5555555555555555, %rdx");
+            self.state.emit("    andq %rdx, %rax"); // (x>>1)&0x55..
+            self.state.emit("    subq %rax, %rcx"); // c = x - pairs
+            self.state.emit("    movq %rcx, %rax");
+            self.state.emit("    shrq $2, %rax");
+            self.state.emit("    movabsq $0x3333333333333333, %rdx");
+            self.state.emit("    andq %rdx, %rax");
+            self.state.emit("    andq %rdx, %rcx");
+            self.state.emit("    addq %rax, %rcx"); // c = nibble counts
+            self.state.emit("    movq %rcx, %rax");
+            self.state.emit("    shrq $4, %rax");
+            self.state.emit("    addq %rcx, %rax");
+            self.state.emit("    movabsq $0x0f0f0f0f0f0f0f0f, %rdx");
+            self.state.emit("    andq %rdx, %rax"); // byte counts
+            self.state.emit("    movabsq $0x0101010101010101, %rdx");
+            self.state.emit("    imulq %rdx, %rax"); // *0x0101..0101
+            self.state.emit("    shrq $56, %rax"); // top byte = popcount
+            self.state.emit("    popq %rdx");
+            self.state.emit("    popq %rcx");
+        }
+    }
+
+    /// Register-direct BMI2 `bzhi`: `bzhi %index, %src, %dest`.  Staging is
+    /// `emit_shift_reg_direct`'s VEX discipline -- the index from its own
+    /// register home or staged in %rcx (staged first when the source must be
+    /// loaded into the index's home), the source from its home or loaded into
+    /// the destination -- because `bzhi`, like `shlx`, reads both sources
+    /// before writing the destination and takes its index in a register.
+    /// The 32-bit form zero-extends into the full register, as the
+    /// accumulator path's `store_eax_to` discipline expects.
+    fn emit_bzhi_reg_direct(
+        &mut self,
+        src: &Operand,
+        index: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        dest_value_id: u32,
+    ) {
+        let gpr_home = |r: Option<PhysReg>| r.filter(|r| !super::emit::is_xmm_reg(*r));
+        let index_home = gpr_home(self.operand_reg(index));
+        let src_home = gpr_home(self.operand_reg(src));
+        let name = |r: PhysReg| {
+            if use_32bit {
+                super::emit::phys_reg_name_32(r).to_string()
+            } else {
+                super::emit::phys_reg_name(r).to_string()
+            }
+        };
+        let index_name = match index_home {
+            Some(r) if src_home.is_some() || r.0 != dest_phys.0 => name(r),
+            _ => {
+                self.operand_to_rcx(index);
+                if use_32bit { "ecx" } else { "rcx" }.to_string()
+            }
+        };
+        let src_name = match src_home {
+            Some(r) => name(r),
+            None => {
+                self.operand_to_callee_reg(src, dest_phys);
+                name(dest_phys)
+            }
+        };
+        let mnem = if use_32bit { "bzhil" } else { "bzhiq" };
+        let dest_name = name(dest_phys);
+        self.state.emit_fmt(format_args!(
+            "    {mnem} %{index_name}, %{src_name}, %{dest_name}"
+        ));
+        self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (see note_inplace_compute): the result
+        // was written into dest_phys.
+        self.note_inplace_compute(dest_phys, dest_value_id);
+    }
+
+    /// `UMulHigh`/`SMulHigh` on the accumulator pair: one-operand
+    /// `mul`/`imul` leaves %rdx:%rax = %rax * %rcx and the high half is the
+    /// result.  %rdx is this point's fixed scratch
+    /// (`regalloc::x86_inst_fixed_scratch`), so the position-aware %rdx
+    /// wave keeps every value live across it out of %rdx.  The operation is
+    /// only ever created at 64 bits (`div_by_const`).
+    fn emit_mul_high_acc(&mut self, op: IrBinOp, use_32bit: bool) {
+        if use_32bit {
+            crate::ir::ops::mul_high_unsupported_here();
+        }
+        self.state.emit(if op == IrBinOp::UMulHigh {
+            "    mulq %rcx"
+        } else {
+            "    imulq %rcx"
+        });
+        self.state.emit("    movq %rdx, %rax");
+    }
+
+    /// Accumulator `Bzhi`: source in %rax/%eax, index in %rcx.  With BMI2
+    /// this is the instruction itself.  Without it (the frontend rejects the
+    /// builtins then, so only hand-built IR gets here) the portable form uses
+    /// no register beyond the two operands: `k = index & 0xFF`; `k >= W`
+    /// keeps the source; otherwise shifting left by `W - k` and back clears
+    /// the high bits, spelled as `(W - 1 - k)` plus `1` so that `k == 0`
+    /// clears all W bits instead of hitting the count mask.  For
+    /// `k <= W - 1`, `(W - 1) ^ k == W - 1 - k`.
+    fn emit_bzhi_acc(&mut self, use_32bit: bool) {
+        if self.bmi2_enabled {
+            self.state.emit(if use_32bit {
+                "    bzhil %ecx, %eax, %eax"
+            } else {
+                "    bzhiq %rcx, %rax, %rax"
+            });
+            return;
+        }
+        let (width, sfx) = if use_32bit { (32, 'l') } else { (64, 'q') };
+        let acc = if use_32bit { "eax" } else { "rax" };
+        let done = self.state.fresh_label("bzhi_keep");
+        self.state.emit("    movzbl %cl, %ecx");
+        self.state.emit_fmt(format_args!("    cmpl ${width}, %ecx"));
+        self.state.out.emit_jcc_label("    jae", &done);
+        self.state
+            .emit_fmt(format_args!("    xorl ${}, %ecx", width - 1));
+        self.state
+            .emit_fmt(format_args!("    shl{sfx} %cl, %{acc}"));
+        self.state.emit_fmt(format_args!("    shl{sfx} $1, %{acc}"));
+        self.state.emit_fmt(format_args!("    shr{sfx} $1, %{acc}"));
+        self.state
+            .emit_fmt(format_args!("    shr{sfx} %cl, %{acc}"));
+        self.state.out.emit_named_label(&done);
+    }
+
+    /// Emit `dest = BT(base, index) & 1` directly to a physical register.
+    /// Returns false only when the result register is BT's fixed count
+    /// register (%rcx) or is not an ordinary GPR; the accumulator fallback
+    /// handles those shapes. SETcc writes an 8-bit GPR directly, and a 32-bit
+    /// result is zero-extended with `movzbl`. For 64-bit results the zero
+    /// extension from 32-bit MOVL is enough.
+    fn emit_bit_test_reg_direct(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+    ) -> bool {
+        let dest64 = super::emit::phys_reg_name(dest_phys);
+        if dest64 == "rcx" {
+            return false;
+        }
+        let dest8 = super::emit::typed_phys_reg_name(dest_phys, IrType::U8);
+        let own_idx_reg = match index {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| !super::emit::is_xmm_reg(*r)),
+            _ => None,
+        };
+        // BT only reads the base and writes CF. When the base already lives in
+        // a GPR, read it in place without copying into dest_phys first; when
+        // the base is a constant or homeless value and the bit index lives in
+        // dest_phys, stage the base in %rax so the index register stays intact.
+        let base_w: &'static str = match base {
+            Operand::Value(v) => {
+                if let Some(&reg) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .filter(|r| !super::emit::is_xmm_reg(**r))
+                {
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    }
+                } else {
+                    self.operand_to_rax(base);
+                    if own_idx_reg == Some(dest_phys) {
+                        if use_32bit { "eax" } else { "rax" }
+                    } else if use_32bit {
+                        let dest32 = super::emit::phys_reg_name_32(dest_phys);
+                        self.state
+                            .emit_fmt(format_args!("    movl %eax, %{dest32}"));
+                        dest32
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movq %rax, %{dest64}"));
+                        dest64
+                    }
+                }
+            }
+            Operand::Const(_) => {
+                if own_idx_reg == Some(dest_phys) {
+                    self.operand_to_rax(base);
+                    if use_32bit { "eax" } else { "rax" }
+                } else {
+                    self.operand_to_reg(base, dest64);
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(dest_phys)
+                    } else {
+                        dest64
+                    }
+                }
+            }
+        };
+        let const_index = match index {
+            Operand::Const(c) => c
+                .to_i64()
+                .filter(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64),
+            _ => None,
+        };
+        if let Some(imm) = const_index {
+            let width = if use_32bit { 32 } else { 64 };
+            let bit = (imm as u32) % width;
+            let bt = if use_32bit { "btl" } else { "btq" };
+            self.state
+                .emit_fmt(format_args!("    {bt} ${bit}, %{base_w}"));
+        } else {
+            let bt = if use_32bit { "btl" } else { "btq" };
+            match own_idx_reg {
+                Some(reg) => {
+                    let idx = if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {bt} %{idx}, %{base_w}"));
+                }
+                None => {
+                    self.operand_to_rcx(index);
+                    let src = if use_32bit { "ecx" } else { "rcx" };
+                    self.state
+                        .emit_fmt(format_args!("    {bt} %{src}, %{base_w}"));
+                }
+            }
+        }
+        self.state.emit_fmt(format_args!("    setc %{dest8}"));
+        // ALWAYS zero-extend: SETcc writes one byte only, and the
+        // destination was staged with the BASE (mask) value. Without the
+        // extension the 64-bit result kept mask bits 8..63 and a later
+        // `testq %dest,%dest` was nonzero for every in-range index
+        // (set_membership two-block form: bytes 59..64 classified as XML
+        // name chars). A 32-bit MOVZX zero-extends the full 64-bit
+        // register on x86-64, so one form covers both widths.
+        let dest32 = super::emit::phys_reg_name_32(dest_phys);
+        self.state
+            .emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
+        true
+    }
+
+    // ---- Binop ----
+
+    /// Store %rdx (division remainder) to a value's location. Mirror of
+    /// `store_rax_to` with the source register changed; the accumulator
+    /// case cannot arise for remainders (pair tails are excluded from
+    /// accumulator chains by the shared RA filter), but a dead remainder
+    /// (use count 0) skips the store entirely.
+    pub(super) fn store_rdx_to(&mut self, dest: &Value, use_32bit: bool) {
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        let use_small = use_32bit && self.state.is_small_slot(dest.0);
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            let reg_name = phys_reg_name(reg);
+            if super::emit::is_xmm_reg(reg) {
+                // Integer value parked in an XMM home (bit-punned float word).
+                self.state
+                    .emit_fmt(format_args!("    movq %rdx, %{}", reg_name));
+            } else {
+                // Always movq for register stores (movl would zero-extend and
+                // corrupt negative I32 remainders flowing into 64-bit uses).
+                self.state
+                    .out
+                    .emit_instr_reg_reg("    movq", "rdx", reg_name);
+            }
+            // Definition-writes-home accounting: the divrem pair head's
+            // dual-store wrote the remainder's dest into its home.
+            self.note_inplace_compute(reg, dest.0);
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            if use_small {
+                self.state.out.emit_instr_reg_rbp("    movl", "edx", slot.0);
+            } else {
+                self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0);
+            }
+        } else if self.state.is_accumulator_location(dest.0) {
+            // Accumulator location means %rax residency — a remainder can
+            // never claim it directly. Route through %rax: the consumer's
+            // operand_to_rax finds it there.
+            if use_32bit {
+                self.state.emit("    movl %edx, %eax");
+            } else {
+                self.state.emit("    movq %rdx, %rax");
+            }
+            self.state.park_acc(dest.0, false);
+        } else {
+            panic!(
+                "x86 codegen: live remainder value {} has no assigned location",
+                dest.0
+            );
+        }
+    }
+
+    /// Emit `%rdx:%rax / %rcx` (64-bit) with `%rax` = quotient, `%rdx` =
+    /// remainder, prefixed by the width bypass when the tuning row asks for it
+    /// ([`crate::backend::x86::cpu_model::X86Tune::bypass_div64`]).
+    ///
+    /// Bypass form (both operands provably < 2^32 at run time → 32-bit
+    /// divide, LLVM `idivq-to-divl`):
+    ///
+    /// ```text
+    ///     movq %rax, %rdx        # %rdx is dead until the divide defines it
+    ///     orq  %rcx, %rdx
+    ///     shrq $32,  %rdx        # ZF = (dividend | divisor) >> 32 == 0
+    ///     jnz  .slow
+    ///     divl %ecx              # %edx == 0 here; quotient/remainder
+    ///     jmp  .done             #   zero-extend into %rax/%rdx
+    /// .slow:
+    ///     xorl %edx,%edx | cqto  # unchanged 64-bit path
+    ///     divq | idivq %rcx
+    /// .done:
+    /// ```
+    ///
+    /// Signed division takes the fast path only for two non-negative
+    /// operands (a negative 64-bit value has bits 63..32 set), where the
+    /// unsigned 32-bit divide is exact; `INT64_MIN / -1` and divide-by-zero
+    /// behave exactly as before (slow path / `#DE` from `divl` with `%ecx == 0`).
+    /// Measured on `[uops.info]`: DIV r64 TP 21 vs DIV r32 TP 6 on SKL.
+    fn emit_div64(&mut self, signed: bool) {
+        let emit_full = |this: &mut Self| {
+            if signed {
+                this.state.emit("    cqto");
+                this.state.emit("    idivq %rcx");
+            } else {
+                this.state.emit("    xorl %edx, %edx");
+                this.state.emit("    divq %rcx");
+            }
+        };
+        if !crate::backend::x86::cpu_model::bypass_div64_enabled_for(
+            &self.tune,
+            crate::backend::x86::cpu_model::div64_bypass_killed(),
+        ) {
+            emit_full(self);
+            return;
+        }
+        let slow = self.state.fresh_label("div64_slow");
+        let done = self.state.fresh_label("div64_done");
+        self.state.emit("    movq %rax, %rdx");
+        self.state.emit("    orq %rcx, %rdx");
+        self.state.emit("    shrq $32, %rdx");
+        self.state.out.emit_jcc_label("    jnz", &slow);
+        self.state.emit("    divl %ecx");
+        self.state.out.emit_jmp_label(&done);
+        self.state.out.emit_named_label(&slow);
+        emit_full(self);
+        self.state.out.emit_named_label(&done);
+    }
+
+    /// Divide for an integer type NARROWER than 32 bits, using the 32-bit form.
+    ///
+    /// A narrow value's canonical home form is its 8/16-bit value extended to
+    /// 32 bits (the backend-wide invariant `value_to_reg_inner` and the
+    /// narrow accumulator staging both maintain), so both operands of a narrow
+    /// divide already fit in `%eax`/`%ecx` and `idivl`/`divl` produces the
+    /// exact quotient and remainder the 64-bit form would -- at `DIV r32`
+    /// latency/throughput instead of `DIV r64` (uops.info SKL: 26/6 vs 42/21
+    /// for signed, 22/6 vs 36/21 for unsigned).  The quotient cannot trap:
+    /// the dividend is bounded by the narrow width, so `INT32_MIN / -1` (the
+    /// one `idiv` input that raises `#DE` independently of the divisor being
+    /// zero) is unreachable.
+    ///
+    /// The 32-bit divide leaves `%rax`/`%rdx` in the narrow type's canonical
+    /// 32-bit form -- a 32-bit write zero-extends the upper half -- which is
+    /// exactly the invariant every narrow consumer already re-extends from.
+    /// No extra canonicalization instruction is therefore emitted, and the
+    /// pre-existing width-consistency of slot reloads keeps it sufficient.
+    /// Divide `%rax` by `%rcx`, selecting the width the operand type needs and
+    /// leaving the quotient in `%rax` (remainder moved there when `op` is a
+    /// `rem`). Extracted from `emit_int_binop_impl` so that function stays
+    /// under the audit-census ceiling; the three arms are the three widths.
+    fn emit_divrem_reg(&mut self, op: IrBinOp, ty: IrType, use_32bit: bool) {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
+        // Narrow integers are 32-bit canonical, so the 32-bit divide is exact
+        // for them (see `emit_div_narrow`). The staging the caller performs
+        // has already put the 64-bit canonical form in %rax/%rcx, whose low
+        // 32 bits ARE the canonical 32-bit operand.
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            self.emit_div_narrow(signed);
+            if is_rem {
+                self.state.emit("    movl %edx, %eax");
+            }
+        } else if use_32bit {
+            self.state.emit(if signed {
+                "    cltd"
+            } else {
+                "    xorl %edx, %edx"
+            });
+            self.state.emit(if signed {
+                "    idivl %ecx"
+            } else {
+                "    divl %ecx"
+            });
+            if is_rem {
+                self.state.emit("    movl %edx, %eax");
+            }
+        } else {
+            self.emit_div64(signed);
+            if is_rem {
+                self.state.emit("    movq %rdx, %rax");
+            }
+        }
+    }
+
+    /// Emit the 32-bit divide that is exact for a NARROW (I8/U8/I16/U16)
+    /// dividend and divisor, both already staged in `%rax`/`%rcx` in 64-bit
+    /// canonical form -- whose low 32 bits ARE the canonical 32-bit operands.
+    ///
+    /// `cqto; idivq` would compute with the upper half of a quantity that has
+    /// none, and it costs 42/21 latency/throughput against 26/6 for the 32-bit
+    /// form (SKL, signed; 36/21 against 22/6 unsigned). It cannot trap: the
+    /// dividend is bounded by the narrow width, so the one `idiv` input that
+    /// raises `#DE` independently of a zero divisor -- `INT32_MIN / -1` -- is
+    /// unreachable. `cltd` / `xorl %edx, %edx` set up `%edx`, and a 32-bit
+    /// write leaves `%rax`/`%rdx` in the narrow canonical form every consumer
+    /// re-extends from, so no canonicalization instruction is added.
+    ///
+    /// The MachInst backend mirrors this: `isel::emit_narrow_dividend` stages
+    /// the dividend and `isel::lower_divrem` widens the whole sequence.
+    fn emit_div_narrow(&mut self, signed: bool) {
+        if signed {
+            self.state.emit("    cltd");
+            self.state.emit("    idivl %ecx");
+        } else {
+            self.state.emit("    xorl %edx, %edx");
+            self.state.emit("    divl %ecx");
+        }
+    }
+
+    /// Emit one divide serving a same-block div/rem pair and store BOTH
+    /// results. Returns false when the home combination is unstoreable
+    /// (deadlock) — the caller falls back to standalone divisions for both
+    /// sides and the tail is marked broken.
+    fn emit_divrem_pair_head(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        partner_dest: u32,
+        _partner_from_eax: bool,
+    ) -> bool {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+        if use_32bit {
+            self.operand_to_eax(lhs);
+        } else {
+            self.operand_to_rax(lhs);
+        }
+        self.operand_to_rcx(rhs);
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            // The 32-bit divide is exact for narrow operands (see
+            // `emit_div_narrow`) and leaves both results in the narrow type's
+            // canonical 32-bit form, which is what the two stores below keep.
+            self.emit_div_narrow(signed);
+        } else if !use_32bit {
+            self.emit_div64(signed);
+        } else if signed {
+            self.state.emit("    cltd");
+            self.state.emit("    idivl %ecx");
+        } else {
+            self.state.emit("    xorl %edx, %edx");
+            self.state.emit("    divl %ecx");
+        }
+        self.state.reg_cache.invalidate_acc();
+
+        // Which value takes which output register:
+        //   div-flavoured dest -> %rax, rem-flavoured dest -> %rdx.
+        let div_dest = if self_is_div {
+            *dest
+        } else {
+            Value(partner_dest)
+        };
+        let rem_dest = if self_is_div {
+            Value(partner_dest)
+        } else {
+            *dest
+        };
+
+        let rem_home = self.dest_reg(&rem_dest);
+        let div_home = self.dest_reg(&div_dest);
+        // Immediately-consumed (accumulator-flow) values have neither a home
+        // nor a slot: their consumer reads %rax directly. The pair tail can
+        // never be one (the accumulator analysis excludes tails), so at most
+        // the HEAD's own dest is slotless.
+        let rem_slotless = rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
+        let div_slotless = div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
+        // store_rdx(rem) writes %rax iff rem is HOMED in %rdx; store_rax(div)
+        // writes %rdx iff the quotient is HOMED in %rdx. REACHABLE since the
+        // position-aware %rdx admission wave (regalloc Phase 2-x64): a div/rem
+        // result born exactly at the clobber point is admitted into %rdx —
+        // the natural output register. The deadlock screening below is
+        // load-bearing, not defensive: the slotless/rdx combinations and the
+        // store-order dependencies must keep refusing to fuse.
+        let rdx_phys = crate::backend::regalloc::PhysReg(16);
+        let rem_in_rdx = rem_home == Some(rdx_phys);
+        let div_in_rdx = div_home == Some(rdx_phys);
+
+        // Deadlock / ordering screening (mirrors the i686 fusion). The
+        // rdx-homed combinations are reachable via the Phase-2x64 wave; the
+        // slotless ones via accumulator-flow values.
+        if (rem_in_rdx && div_in_rdx)
+            || (rem_slotless && div_in_rdx)
+            || (div_slotless && rem_in_rdx)
+        {
+            self.divrem_broken_tails.insert(partner_dest);
+            return false;
+        }
+        let div_dead = self
+            .state
+            .value_use_counts
+            .get(div_dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0;
+        if rem_slotless {
+            // Remainder must reach %rax for its acc-flow consumer. Store the
+            // quotient first (its store cannot touch %rdx), then move the
+            // remainder into %rax.
+            self.store_rax_to(&div_dest);
+            if use_32bit {
+                self.state.emit("    movl %edx, %eax");
+            } else {
+                self.state.emit("    movq %rdx, %rax");
+            }
+            self.state.park_acc(rem_dest.0, false);
+        } else if div_slotless {
+            // Quotient stays in %rax for its acc-flow consumer; store the
+            // remainder first (its store cannot touch %rax).
+            self.store_rdx_to(&rem_dest, use_32bit);
+            self.state.park_acc(div_dest.0, false);
+        } else {
+            // Canonical order: remainder out of %rdx first (its store cannot
+            // touch %rax — see screening), then the quotient store.
+            self.store_rdx_to(&rem_dest, use_32bit);
+            if !div_dead {
+                self.store_rax_to(&div_dest);
+            } else {
+                self.state.reg_cache.invalidate_acc();
+            }
+        }
+        true
+    }
+
+    pub(super) fn emit_int_binop_impl(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        // DE MORGAN SPLIT: an And/Or claimed by the branch split emits
+        // NOTHING at its own position — the CondBranch re-emits both
+        // recorded comparisons with a short-circuit jump between them.
+        // (Only And/Or can be claimed; other BinOps never appear in the
+        // skip set, so no opcode check is needed.)
+        if self.demorgan_skip.contains(&dest.0) {
+            return;
+        }
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+        let is_unsigned = ty.is_unsigned();
+
+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+        // X86_64 target). The TAIL of a pair emits nothing — its result was
+        // stored by the HEAD's dual-store emission further up in this block
+        // (one divq/idivq instead of two: the remainder is free with the
+        // quotient on x86). The HEAD emits one divide and stores its own
+        // result AND the partner's.
+        if matches!(
+            op,
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+        ) {
+            if self.divrem_tail_dests.contains(&dest.0)
+                && !self.divrem_broken_tails.contains(&dest.0)
+            {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] tail-skip dest={}", dest.0);
+                }
+                // Tail: nothing to emit. The accumulator cache makes no
+                // claim about this dest (it was never staged through %rax),
+                // and its home/slot was written at the head.
+                return;
+            }
+            if self.divrem_broken_tails.contains(&dest.0) {
+                // Pair was broken at head-emission time (pathological home
+                // combination): both sides emit standalone divisions.
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] tail-broken dest={} (standalone)", dest.0);
+                }
+            } else if let Some(&(partner_dest, partner_from_eax)) =
+                self.divrem_head_partners.get(&dest.0)
+            {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!(
+                        "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
+                        dest.0, op, partner_dest, partner_from_eax
+                    );
+                }
+                let fused = self.emit_divrem_pair_head(
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                    partner_dest,
+                    partner_from_eax,
+                );
+                if fused {
+                    return;
+                }
+                // Broken pair: fall through to the standalone path; the
+                // partner (tail) was marked broken above.
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] head-broken dest={} (standalone)", dest.0);
+                }
+            }
+        }
+
+        // Register-direct path. An XMM-homed dest (integer value the RA
+        // parked in an XMM register: bit-punned float words) has no GPR
+        // sub-register names — emit_alu_reg_direct would hit
+        // phys_reg_name_32's unreachable!(). The accumulator path below
+        // handles XMM homes on both loads (operand_to_rax) and the final
+        // store (store_rax_to).
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+            let is_simple_alu = matches!(
+                op,
+                IrBinOp::Add
+                    | IrBinOp::Sub
+                    | IrBinOp::And
+                    | IrBinOp::Or
+                    | IrBinOp::Xor
+                    | IrBinOp::Mul
+            );
+            if is_simple_alu {
+                self.emit_alu_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
+                return;
+            }
+            if matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
+                self.emit_shift_reg_direct(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest.0);
+                return;
+            }
+            if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
+                // All integer widths lower natively: `rolb`/`rolw`/`roll`/
+                // `rolq` rotate at the operand width (the hardware count is
+                // `(count & 31) mod width` below 64 bits — measured, and what
+                // GCC relies on for bare `rolw %cl`), and the truncation-
+                // aware `bit_idioms` pattern produces the sub-word forms.
+                if matches!(
+                    ty,
+                    IrType::I8
+                        | IrType::U8
+                        | IrType::I16
+                        | IrType::U16
+                        | IrType::I32
+                        | IrType::U32
+                        | IrType::I64
+                        | IrType::U64
+                        | IrType::Ptr
+                ) {
+                    self.emit_rotate_reg_direct(op, lhs, rhs, dest_phys, ty, dest.0);
+                    return;
+                }
+            }
+            if op == IrBinOp::Bzhi && self.bmi2_enabled && is_bzhi_type(ty) {
+                self.emit_bzhi_reg_direct(lhs, rhs, dest_phys, use_32bit, dest.0);
+                return;
+            }
+            if op == IrBinOp::BitTest
+                && matches!(
+                    ty,
+                    IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
+                )
+            {
+                if self.emit_bit_test_reg_direct(lhs, rhs, dest_phys, use_32bit) {
+                    // Definition-writes-home accounting: BT staged the base
+                    // into dest_phys and SETC materialised the boolean there.
+                    self.note_inplace_compute(dest_phys, dest.0);
+                    return;
+                }
+            }
+            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle) {
+                // BTS/BTR/BTC write the base back, so the register-direct form
+                // only claims the cases where staging the base into
+                // dest_phys cannot destroy the index (see the emitter); every
+                // other shape takes the accumulator path below, which stages
+                // through %rax/%rcx and is correct for all widths.
+                if self.emit_bit_modify_reg_direct(op, lhs, rhs, dest_phys, ty) {
+                    self.note_inplace_compute(dest_phys, dest.0);
+                    return;
+                }
+            }
+        }
+
+        if op == IrBinOp::BitTest {
+            self.emit_bit_test_acc(dest, lhs, rhs, ty, use_32bit);
+            return;
+        }
+
+        if matches!(op, IrBinOp::RotateLeft | IrBinOp::RotateRight) {
+            // Accumulator rotate for every integer width. The constant form
+            // keeps the immediate and never touches %rcx; the variable form
+            // needs the count in %cl (staged low-32 by `operand_to_cl`).
+            // Sub-word values stage into %eax with their typed load so the
+            // zero-extension discipline holds through the rotate, and the
+            // 4-byte `store_eax_to` keeps it in the (>=4-byte) slot.
+            let width: i64 = match ty {
+                IrType::I8 | IrType::U8 => 8,
+                IrType::I16 | IrType::U16 => 16,
+                IrType::I32 | IrType::U32 => 32,
+                IrType::I64 | IrType::U64 | IrType::Ptr => 64,
+                _ => 64,
+            };
+            let acc_typed: &str = match width {
+                8 => "al",
+                16 => "ax",
+                32 => "eax",
+                _ => "rax",
+            };
+            let narrow_load: Option<&str> = match width {
+                8 => Some("movzbl"),
+                16 => Some("movzwl"),
+                _ => None,
+            };
+            // Stage the lhs into the accumulator at its own width.
+            match narrow_load {
+                Some(load) => {
+                    let staged = match lhs {
+                        Operand::Value(v)
+                            if self
+                                .dest_reg(v)
+                                .is_some_and(|r| !super::emit::is_xmm_reg(r)) =>
+                        {
+                            let src =
+                                super::emit::typed_phys_reg_name(self.dest_reg(v).unwrap(), ty);
+                            self.state
+                                .emit_fmt(format_args!("    {} %{}, %eax", load, src));
+                            true
+                        }
+                        Operand::Value(v)
+                            if !self.state.is_alloca(v.0)
+                                && self.dest_reg(v).is_none()
+                                && self.state.get_slot(v.0).is_some() =>
+                        {
+                            let slot = self.state.get_slot(v.0).unwrap();
+                            let sref = self.slot_ref(slot.0);
+                            self.state
+                                .emit_fmt(format_args!("    {} {}, %eax", load, sref));
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !staged {
+                        // Constants and exotic sources: generic staging then
+                        // re-establish the zero-extension in place.
+                        self.operand_to_eax(lhs);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %eax", load, acc_typed));
+                    }
+                }
+                None => {
+                    if width == 32 {
+                        self.operand_to_eax(lhs);
+                    } else {
+                        self.operand_to_rax(lhs);
+                    }
+                }
+            }
+            let mnem = super::emit::rotate_mnemonic_width(op, width as u32);
+            match Self::const_as_imm32(rhs) {
+                Some(imm) => {
+                    let amount = (imm as i64).rem_euclid(width);
+                    if amount != 0 {
+                        if self.bmi2_enabled
+                            && super::isel::rorx_allowed()
+                            && (width == 32 || width == 64)
+                        {
+                            let ror_amount = match op {
+                                IrBinOp::RotateLeft => (width - amount) % width,
+                                IrBinOp::RotateRight => amount,
+                                _ => amount,
+                            };
+                            // amount != 0 above proves ror_amount != 0 (and a
+                            // hypothetical 0 is still a correct no-op: the
+                            // value is already in acc, `rorx $0` the identity).
+                            debug_assert!(ror_amount != 0);
+                            let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                            // acc_typed is al/ax/eax/rax, but rorx needs 3-operand form with src==dst
+                            // For accumulator path, src and dst are same accumulator.
+                            self.state.emit_fmt(format_args!(
+                                "    {} ${}, %{}, %{}",
+                                ror_mnem, ror_amount, acc_typed, acc_typed
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, acc_typed));
+                        }
+                    }
+                }
+                None => {
+                    self.operand_to_cl(rhs);
+                    self.state
+                        .emit_fmt(format_args!("    {} %cl, %{}", mnem, acc_typed));
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+            if width == 64 {
+                self.store_rax_to(dest);
+            } else {
+                if width == 32 {
+                    // Normalize the upper half for a signed 32-bit result:
+                    // the rotate can place any bit at bit 31. No-op when
+                    // unsigned. Sub-word results keep zero-extended homes.
+                    self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                }
+                self.store_eax_to(dest);
+            }
+            return;
+        }
+
+        // Accumulator-based fallback: try immediate optimizations first
+        if self.try_emit_acc_immediate(dest, op, lhs, rhs, use_32bit, is_unsigned) {
+            return;
+        }
+
+        // Memory-destination ALU: for in-place updates (a op= expr) where dest/lhs share
+        // a stack slot. Emits `op %reg, mem` or `op $imm, mem` which does NOT modify
+        // any register — breaks the serial %rax dependency chain for ILP.
+        // Works for Add, Sub, And, Or, Xor (all have reg/imm-to-memory forms on x86).
+        let mem_dest_mnem = match op {
+            IrBinOp::Add => Some("add"),
+            IrBinOp::Sub => Some("sub"),
+            IrBinOp::And => Some("and"),
+            IrBinOp::Or => Some("or"),
+            IrBinOp::Xor => Some("xor"),
+            _ => None,
+        };
+        if let Some(mnem) = mem_dest_mnem {
+            if let Operand::Value(lhs_val) = lhs {
+                if self.dest_reg(dest).is_none() && self.dest_reg(lhs_val).is_none() {
+                    if let (Some(dest_slot), Some(lhs_slot)) =
+                        (self.state.get_slot(dest.0), self.state.get_slot(lhs_val.0))
+                    {
+                        if dest_slot.0 == lhs_slot.0 {
+                            // Width guard: the 64-bit `opq %reg/$imm, mem`
+                            // forms read AND write 8 bytes. A 4-byte small
+                            // slot must only be touched by the 32-bit form;
+                            // fall through to the register path otherwise
+                            // (I8/I16 ALU ops have use_32bit == false).
+                            let dest_is_small = self.state.is_small_slot(dest.0);
+                            // A 32-bit memory update of an 8-byte signed
+                            // home leaves its old upper half untouched. If a
+                            // wide consumer needs the canonical sign, use the
+                            // accumulator path and its shared extending store.
+                            let needs_canonical_store = use_32bit
+                                && !is_unsigned
+                                && !dest_is_small
+                                && self.needs_sext_values.contains(&dest.0);
+                            if (!dest_is_small || use_32bit) && !needs_canonical_store {
+                                let sref = self.slot_ref(dest_slot.0);
+                                // Try register source: op %reg, mem
+                                if let Some(rhs_phys) = self
+                                    .operand_reg(rhs)
+                                    .filter(|r| !super::emit::is_xmm_reg(*r))
+                                {
+                                    if use_32bit {
+                                        let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}l %{}, {}",
+                                            mnem, rhs_32, sref
+                                        ));
+                                    } else {
+                                        let rhs_64 = super::emit::phys_reg_name(rhs_phys);
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}q %{}, {}",
+                                            mnem, rhs_64, sref
+                                        ));
+                                    }
+                                    // The MEMORY holding dest/lhs changed; a prior
+                                    // `store_rax_to` may have cached dest/lhs in the
+                                    // accumulator, which now holds a stale value.
+                                    // The register source is untouched, so only the
+                                    // memory-backed ids are invalidated.
+                                    self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
+                                    return;
+                                }
+                                // Try immediate source: op $imm, mem
+                                if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                                    if use_32bit {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}l ${}, {}",
+                                            mnem, imm, sref
+                                        ));
+                                    } else {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}q ${}, {}",
+                                            mnem, imm, sref
+                                        ));
+                                    }
+                                    self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
+                                    return;
+                                }
+                            } // width guard
+                        }
+                    }
+                }
+            }
+        }
+
+        // Memory-operand optimization: for ALU ops with memory source form,
+        // use memory source directly instead of loading rhs into %rcx first.
+        // Pattern: addq -N(%rbp), %rax  (saves one movq load instruction)
+        // For Mul: imull -N(%rbp), %eax  (2-operand form, does NOT use rdx)
+        // Extends to And/Or/Xor which have identical instruction forms.
+        let mem_op_mnem = match op {
+            IrBinOp::Add => Some("add"),
+            IrBinOp::Sub => Some("sub"),
+            IrBinOp::Mul => Some("imul"),
+            IrBinOp::And => Some("and"),
+            IrBinOp::Or => Some("or"),
+            IrBinOp::Xor => Some("xor"),
+            _ => None,
+        };
+        if let Some(mnem) = mem_op_mnem {
+            if let Operand::Value(rhs_val) = rhs {
+                // Check if rhs has a stack slot and is NOT register-allocated.
+                // An alloca's stack slot IS its data, but the alloca's VALUE is its
+                // ADDRESS (a pointer), so folding an alloca as a memory source here
+                // (`opq slot, %rax`) would read the array's first element instead of
+                // adding the base address. Skip allocas so the general path below
+                // materializes them with `lea` (value_to_reg/operand_to_rax).
+                // Width guard: the 64-bit `opq mem, %rax` form reads 8 bytes;
+                // a 4-byte small slot may only be folded with the 32-bit form.
+                if self.dest_reg(&rhs_val).is_none()
+                    && !self.state.is_alloca(rhs_val.0)
+                    && (use_32bit || !self.state.is_small_slot(rhs_val.0))
+                {
+                    // ACC-RESIDENT SOURCE (slot-independent): the accumulator
+                    // may already hold rhs_val (its own computation, or a
+                    // historical `store_eax_to` park). Folding the slot in
+                    // that state is an exposed store-to-load forward
+                    // (measured ~5% end-to-end on sha256_transform's MAJ
+                    // chain) — and staging lhs into %eax first would destroy
+                    // the resident copy. Consume %eax in place instead,
+                    // sourcing the OTHER operand without touching the
+                    // accumulator: immediate, register home, or %ecx staging.
+                    // Sub is excluded: `sub src, %eax` would compute rhs-lhs,
+                    // not lhs-rhs (non-commutative).
+                    // The check is deliberately UNGATED from the slot lookup
+                    // below: an acc-hinted sole-consumer value (the commuted
+                    // RHS class, is_safe_sole_consumer) has NO slot — its
+                    // slot was the write-only park this arm makes redundant —
+                    // and the acc residency is a complete source of truth on
+                    // its own (the cache entry was set by the producer's
+                    // store, nothing between the adjacent def and this
+                    // consumer can have evicted it without the cache knowing).
+                    if !matches!(op, IrBinOp::Sub) && self.state.acc_has_verified(rhs_val.0, false)
+                    {
+                        let suffix = if use_32bit { "l" } else { "q" };
+                        let acc = if use_32bit { "eax" } else { "rax" };
+                        let src_reg = if let Some(imm) = Self::const_as_imm32_typed(lhs, use_32bit)
+                        {
+                            self.state.emit_fmt(format_args!(
+                                "    {}{} ${}, %{}",
+                                mnem, suffix, imm, acc
+                            ));
+                            if use_32bit {
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
+                                self.store_eax_to(dest);
+                            } else {
+                                self.store_rax_to(dest);
+                            }
+                            return;
+                        } else if let Some(lreg) = self
+                            .operand_reg(lhs)
+                            .filter(|r| !super::emit::is_xmm_reg(*r))
+                        {
+                            let name = if use_32bit {
+                                super::emit::phys_reg_name_32(lreg)
+                            } else {
+                                super::emit::phys_reg_name(lreg)
+                            };
+                            self.state.emit_fmt(format_args!(
+                                "    {}{} %{}, %{}",
+                                mnem, suffix, name, acc
+                            ));
+                            if use_32bit {
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
+                                self.store_eax_to(dest);
+                            } else {
+                                self.store_rax_to(dest);
+                            }
+                            return;
+                        } else {
+                            // %ecx staging: the last resort that still
+                            // avoids the exposed forward. The staging
+                            // never writes %rax, so the resident copy
+                            // survives to be consumed here.
+                            self.operand_to_rcx(lhs);
+                            "ecx"
+                        };
+                        let src_name = if use_32bit { src_reg } else { "rcx" };
+                        self.state.emit_fmt(format_args!(
+                            "    {}{} %{}, %{}",
+                            mnem, suffix, src_name, acc
+                        ));
+                        if use_32bit {
+                            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                            self.store_eax_to(dest);
+                        } else {
+                            self.store_rax_to(dest);
+                        }
+                        return;
+                    }
+                    // Slot-homed (and NOT acc-resident): fold the slot as a
+                    // memory source — the historical path.
+                    if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                        if use_32bit {
+                            self.operand_to_eax(lhs);
+                        } else {
+                            self.operand_to_rax(lhs);
+                        }
+                        let sref = self.slot_ref(slot.0);
+                        if use_32bit {
+                            self.state
+                                .emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
+                            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                            self.store_eax_to(dest);
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    {}q {}, %rax", mnem, sref));
+                            self.store_rax_to(dest);
+                        }
+                        return;
+                    }
+                }
+            }
+            // Also try memory-operand for lhs (swap: rhs to rax, lhs from memory)
+            // for commutative ops: Add, Mul, And, Or, Xor (NOT Sub — non-commutative).
+            // Same alloca caveat as above: an alloca lhs is a base-address pointer and
+            // must NOT be folded as a memory source (that would read its data, not its
+            // address).
+            let is_commutative = !matches!(op, IrBinOp::Sub);
+            if is_commutative {
+                if let Operand::Value(lhs_val) = lhs {
+                    // Width guard mirrors the rhs path: the 64-bit form reads
+                    // 8 bytes from the slot, which a small slot cannot serve.
+                    if self.dest_reg(&lhs_val).is_none()
+                        && !self.state.is_alloca(lhs_val.0)
+                        && (use_32bit || !self.state.is_small_slot(lhs_val.0))
+                    {
+                        // ACC-RESIDENT SOURCE (the commutative mirror of the
+                        // rhs path above, equally slot-independent): the
+                        // accumulator holds lhs_val; consume it in place and
+                        // source rhs without touching the accumulator.
+                        // `op src, %eax` computes rhs OP lhs — equal to
+                        // lhs OP rhs for every commutative op that reaches
+                        // here (Sub is excluded above). An acc-hinted
+                        // sole-consumer lhs has no slot (the commuted-RHS
+                        // class of is_safe_sole_consumer never got one), so
+                        // the residency check must not require one.
+                        if self.state.acc_has_verified(lhs_val.0, false) {
+                            let suffix = if use_32bit { "l" } else { "q" };
+                            let acc = if use_32bit { "eax" } else { "rax" };
+                            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                                self.state.emit_fmt(format_args!(
+                                    "    {}{} ${}, %{}",
+                                    mnem, suffix, imm, acc
+                                ));
+                                if use_32bit {
+                                    self.emit_implicit_sext32_for_value(
+                                        "eax",
+                                        "rax",
+                                        is_unsigned,
+                                        dest.0,
+                                    );
+                                    self.store_eax_to(dest);
+                                } else {
+                                    self.store_rax_to(dest);
+                                }
+                                return;
+                            }
+                            if let Some(rreg) = self
+                                .operand_reg(rhs)
+                                .filter(|r| !super::emit::is_xmm_reg(*r))
+                            {
+                                let name = if use_32bit {
+                                    super::emit::phys_reg_name_32(rreg)
+                                } else {
+                                    super::emit::phys_reg_name(rreg)
+                                };
+                                self.state.emit_fmt(format_args!(
+                                    "    {}{} %{}, %{}",
+                                    mnem, suffix, name, acc
+                                ));
+                                if use_32bit {
+                                    self.emit_implicit_sext32_for_value(
+                                        "eax",
+                                        "rax",
+                                        is_unsigned,
+                                        dest.0,
+                                    );
+                                    self.store_eax_to(dest);
+                                } else {
+                                    self.store_rax_to(dest);
+                                }
+                                return;
+                            }
+                            // %ecx staging (never writes %rax).
+                            self.operand_to_rcx(rhs);
+                            let src_name = if use_32bit { "ecx" } else { "rcx" };
+                            self.state.emit_fmt(format_args!(
+                                "    {}{} %{}, %{}",
+                                mnem, suffix, src_name, acc
+                            ));
+                            if use_32bit {
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
+                                self.store_eax_to(dest);
+                            } else {
+                                self.store_rax_to(dest);
+                            }
+                            return;
+                        }
+                        // Slot-homed (and NOT acc-resident): fold the slot.
+                        if let Some(slot) = self.state.get_slot(lhs_val.0) {
+                            if use_32bit {
+                                self.operand_to_eax(rhs);
+                            } else {
+                                self.operand_to_rax(rhs);
+                            }
+                            let sref = self.slot_ref(slot.0);
+                            if use_32bit {
+                                self.state
+                                    .emit_fmt(format_args!("    {}l {}, %eax", mnem, sref));
+                                self.emit_implicit_sext32_for_value(
+                                    "eax",
+                                    "rax",
+                                    is_unsigned,
+                                    dest.0,
+                                );
+                                self.store_eax_to(dest);
+                            } else {
+                                self.state
+                                    .emit_fmt(format_args!("    {}q {}, %rax", mnem, sref));
+                                self.store_rax_to(dest);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Immediate multiply: `imull $imm, %eax, %eax` (3-operand immediate
+        // form) is one instruction and needs no scratch register, versus the
+        // two-instruction `movq $imm, %rcx; imull %ecx, %eax` general path.
+        // IMUL with imm32 sign-extends the immediate; for the 32-bit form any
+        // 32-bit bit pattern yields the correct low 32 bits (N ≡ -1 mod 2^32),
+        // so the typed helper's unsigned extension is sound there. The 64-bit
+        // form is restricted to the signed i32 range.
+        if op == IrBinOp::Mul {
+            let imm = Self::const_as_imm32_typed(rhs, use_32bit);
+            if let Some(imm) = imm {
+                // A non-scratch register-homed lhs allows both GCC-parity
+                // forms with NO accumulator staging: ×(2^k±1) selects LEA
+                // (`leal (%r11d,%r11d,2), %eax` for ×3/×5/×9), everything
+                // else the three-operand imul (`imull $7, %r11d, %eax`) —
+                // the source register and destination may differ. The old
+                // path staged the lhs into %eax first (csv main:
+                // `movq %r11,%rax; leal (%eax,%eax,2), %eax` = 2 insns
+                // where GCC emits 1). LEA scale = imm-1 ∈ {2,4,8}; the
+                // 32-bit form's wraparound matches imull exactly.
+                let src_home = match lhs {
+                    Operand::Value(v) => self
+                        .reg_assignments
+                        .get(&v.0)
+                        .copied()
+                        .filter(|&r| {
+                            let name = super::emit::phys_reg_name(r);
+                            !super::emit::is_xmm_reg(r)
+                                && name != "rax"
+                                && name != "rcx"
+                                && name != "rdx"
+                        })
+                        .map(|r| {
+                            if use_32bit {
+                                super::emit::phys_reg_name_32(r).to_string()
+                            } else {
+                                super::emit::phys_reg_name(r).to_string()
+                            }
+                        }),
+                    _ => None,
+                };
+                if let Some(src) = src_home {
+                    let lea_scale = match imm {
+                        3 => Some(2),
+                        5 => Some(4),
+                        9 => Some(8),
+                        _ => None,
+                    };
+                    if let Some(scale) = lea_scale {
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!(
+                                "    leal (%{s},%{s},{}), %eax",
+                                scale,
+                                s = src
+                            ));
+                            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                            self.store_eax_to(dest);
+                        } else {
+                            self.state.emit_fmt(format_args!(
+                                "    leaq (%{s},%{s},{}), %rax",
+                                scale,
+                                s = src
+                            ));
+                            self.store_rax_to(dest);
+                        }
+                        return;
+                    }
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    imull ${}, %{}, %eax", imm, src));
+                        self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                        self.store_eax_to(dest);
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    imulq ${}, %{}, %rax", imm, src));
+                        self.store_rax_to(dest);
+                    }
+                    return;
+                }
+                if use_32bit {
+                    self.operand_to_eax(lhs);
+                    self.state
+                        .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+                    self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                    self.store_eax_to(dest);
+                } else {
+                    self.operand_to_rax(lhs);
+                    self.state
+                        .emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
+                    self.store_rax_to(dest);
+                }
+                return;
+            }
+        }
+
+        // General case: load lhs to rax, rhs to rcx.
+        //
+        // Two source-direct shortcuts avoid the rcx staging copy entirely:
+        //   1. Commutative-eligible immediates (Add/Sub/And/Or/Xor and the
+        //      `imull $imm` form above) emit `op $imm, %eax` directly.
+        //   2. A register-homed rhs (not rax itself — lhs just landed there)
+        //      emits `op %rhs, %eax` straight from its home register.
+        // Before this, every scalar add in a loop paid `movl %rN, %ecx`
+        // (loop_patterns prefix-sum remainder: 9 → 7 instructions/element).
+        // Div/rem keep the rcx contract (idiv reads it); shifts need %cl.
+        let alu_reg_direct: Option<String> = match (op, rhs) {
+            (
+                IrBinOp::Add
+                | IrBinOp::Sub
+                | IrBinOp::Mul
+                | IrBinOp::And
+                | IrBinOp::Or
+                | IrBinOp::Xor,
+                Operand::Value(v),
+            ) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                // Only NON-SCRATCH homes qualify: the emitter uses rax/rcx/rdx
+                // as internal scratch (Select's `movq $0,%rcx; cmoveq`,
+                // accumulator staging), which can clobber a statically-homed
+                // value between its def and this use — `reg_assignments` is a
+                // point-insensitive map, so trusting a scratch-register home
+                // here miscompiled `(h^v)*K` when K was homed %rcx
+                // (bitops_builtins: mix() returned garbage). Callee-saved and
+                // rsi/rdi/r8-r11 homes are RA-managed end-to-end and safe.
+                .filter(|&r| {
+                    let name = super::emit::phys_reg_name(r);
+                    !super::emit::is_xmm_reg(r) && name != "rax" && name != "rcx" && name != "rdx"
+                })
+                .map(|r| {
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(r).to_string()
+                    } else {
+                        super::emit::phys_reg_name(r).to_string()
+                    }
+                }),
+            _ => None,
+        };
+        let alu_imm_direct: Option<i64> = match op {
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => match rhs {
+                Operand::Const(c) => c
+                    .to_i64()
+                    .filter(|&imm| imm >= i32::MIN as i64 && imm <= i32::MAX as i64),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(reg_name) = alu_reg_direct {
+            if use_32bit {
+                self.operand_to_eax(lhs);
+            } else {
+                self.operand_to_rax(lhs);
+            }
+            match op {
+                IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul => {
+                    let mnem = match op {
+                        IrBinOp::Add => "add",
+                        IrBinOp::Sub => "sub",
+                        IrBinOp::Mul => "imul",
+                        _ => unreachable!("unexpected i64 binop: {:?}", op),
+                    };
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    {}l %{}, %eax", mnem, reg_name));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {}q %{}, %rax", mnem, reg_name));
+                    }
+                }
+                IrBinOp::And => {
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    andl %{}, %eax", reg_name));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    andq %{}, %rax", reg_name));
+                    }
+                }
+                IrBinOp::Or => {
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    orl %{}, %eax", reg_name));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    orq %{}, %rax", reg_name));
+                    }
+                }
+                IrBinOp::Xor => {
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    xorl %{}, %eax", reg_name));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    xorq %{}, %rax", reg_name));
+                    }
+                }
+                _ => unreachable!("register-direct path gated to ALU ops"),
+            }
+            self.state.reg_cache.invalidate_acc();
+            if use_32bit {
+                self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                self.store_eax_to(dest);
+            } else {
+                self.store_rax_to(dest);
+            }
+            return;
+        }
+        if let Some(imm) = alu_imm_direct {
+            if use_32bit {
+                self.operand_to_eax(lhs);
+            } else {
+                self.operand_to_rax(lhs);
+            }
+            let mnem = match op {
+                IrBinOp::Add => "add",
+                IrBinOp::Sub => "sub",
+                IrBinOp::And => "and",
+                IrBinOp::Or => "or",
+                IrBinOp::Xor => "xor",
+                _ => unreachable!("imm-direct path gated to ALU ops"),
+            };
+            if use_32bit {
+                self.state
+                    .emit_fmt(format_args!("    {}l ${}, %eax", mnem, imm));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    {}q ${}, %rax", mnem, imm));
+            }
+            self.state.reg_cache.invalidate_acc();
+            if use_32bit {
+                self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                self.store_eax_to(dest);
+            } else {
+                self.store_rax_to(dest);
+            }
+            return;
+        }
+        if use_32bit {
+            self.operand_to_eax(lhs);
+        } else {
+            self.operand_to_rax(lhs);
+        }
+        self.operand_to_rcx(rhs);
+
+        match op {
+            IrBinOp::Add
+            | IrBinOp::Sub
+            | IrBinOp::Mul
+            | IrBinOp::And
+            | IrBinOp::Or
+            | IrBinOp::Xor => {
+                let mnem = match op {
+                    IrBinOp::Add => "add",
+                    IrBinOp::Sub => "sub",
+                    IrBinOp::Mul => "imul",
+                    IrBinOp::And => "and",
+                    IrBinOp::Or => "or",
+                    _ => "xor",
+                };
+                if use_32bit {
+                    self.state
+                        .emit_fmt(format_args!("    {}l %ecx, %eax", mnem));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {}q %rcx, %rax", mnem));
+                }
+            }
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
+                self.emit_divrem_reg(op, ty, use_32bit)
+            }
+            IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
+                // Count already in %rcx, lhs in %rax: on Intel the VEX
+                // form is 1 µop against 2–3 for `shl %cl` (uops.info
+                // SHL_R64_CL vs SHLX_R64_R64_R64); on Zen both are 1 µop and
+                // the legacy encoding is shorter (tune row decides).
+                if self.tune.prefer_shlx(self.bmi2_enabled) {
+                    let (x32, x64) = super::emit::shiftx_mnemonic(op);
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    {} %ecx, %eax, %eax", x32));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} %rcx, %rax, %rax", x64));
+                    }
+                } else {
+                    let (mnem32, mnem64) = shift_mnemonic(op);
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    {} %cl, %eax", mnem32));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} %cl, %rax", mnem64));
+                    }
+                }
+            }
+            IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
+            IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+                self.emit_bit_modify_acc(op, ty)
+            }
+            IrBinOp::Bzhi => self.emit_bzhi_acc(use_32bit),
+            IrBinOp::UMulHigh | IrBinOp::SMulHigh => self.emit_mul_high_acc(op, use_32bit),
+            // Rotates of every integer width are emitted above
+            // (register-direct or accumulator, both width-aware); this arm
+            // is structurally dead for well-typed IR.
+            IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+                unreachable!("rotate handled above (register-direct or accumulator)")
+            }
+        }
+
+        self.state.reg_cache.invalidate_acc();
+        if use_32bit {
+            self.emit_implicit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+            self.store_eax_to(dest);
+        } else {
+            self.store_rax_to(dest);
+        }
+    }
+
+    /// Accumulator-path BitTest. Subword widths have no native BT form, so
+    /// the index is reduced modulo the IR width and the 32-bit BT form reads
+    /// the base's low 8/16 bits; 32/64-bit widths use their native BT form.
+    fn emit_bit_test_acc(
+        &mut self,
+        dest: &Value,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        use_32bit: bool,
+    ) {
+        // Use the native BT instruction: base stays in %rax, the index is
+        // consumed from its own register when it has one (BT's index is an
+        // ordinary r/m operand — only variable shifts are pinned to %cl),
+        // SETC materializes CF, and the boolean is stored to the
+        // destination.  This is the cross-cutting canonical lower instead
+        // of patching text peepholes.
+        self.emit_load_operand(lhs);
+        let bits = (ty.size() * 8) as u32;
+        debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            let bit = (imm as u32) % bits;
+            let bt_line = if bits <= 32 {
+                format!("    btl ${bit}, %eax")
+            } else {
+                format!("    btq ${bit}, %rax")
+            };
+            self.state.emit(&bt_line);
+        } else if bits < 32 {
+            // Subword BT has no native form. Stage the index through
+            // %rcx, reduce it modulo the IR width, and use the 32-bit BT
+            // form; the base's low 8/16 bits are the whole IR value.
+            self.operand_to_rcx(rhs);
+            self.state.emit(&format!("    andl ${}, %ecx", bits - 1));
+            self.state.emit("    btl %ecx, %eax");
+        } else {
+            // %rax is not allocatable on x86-64, so a register-resident
+            // index can never be clobbered by the base load above.  A
+            // value without a home still stages through %rcx.
+            let own_reg = match rhs {
+                Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
+                _ => None,
+            };
+            match own_reg {
+                Some(reg) if !super::emit::is_xmm_reg(reg) => {
+                    let idx = if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    };
+                    let dst = if use_32bit { "eax" } else { "rax" };
+                    let bt = if use_32bit { "btl" } else { "btq" };
+                    self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dst}"));
+                }
+                _ => {
+                    self.operand_to_rcx(rhs);
+                    self.state.emit(if use_32bit {
+                        "    btl %ecx, %eax"
+                    } else {
+                        "    btq %rcx, %rax"
+                    });
+                }
+            }
+        }
+        self.state.emit("    setc %al");
+        self.state.emit(if use_32bit {
+            "    movzbl %al, %eax"
+        } else {
+            "    movzbq %al, %rax"
+        });
+        self.store_rax_to(dest);
+        return;
+    }
+
+    /// The x86 mnemonic for one of the three bit-modify operations.  `bts`,
+    /// `btr` and `btc` all write the base operand back and all read the index
+    /// modulo the operand width, so the only difference between the three
+    /// lowerings is this table.
+    fn bit_modify_mnemonic(op: IrBinOp) -> &'static str {
+        match op {
+            IrBinOp::BitSet => "bts",
+            IrBinOp::BitClear => "btr",
+            _ => "btc",
+        }
+    }
+
+    /// `BitSet`/`BitClear`/`BitToggle` register-direct: stage the base into `dest_phys`
+    /// and let `bts`/`btr` write the modified base there.  Unlike BT — which
+    /// only reads its base and writes CF — the bit-modify forms write the
+    /// base operand, so the staging move must not destroy the index:
+    ///
+    /// * an index homed in `dest_phys` itself is refused (the base move would
+    ///   overwrite it before the instruction reads it), as is one with no home
+    ///   when `dest_phys` is `%rcx` (the homeless index stages through `%rcx`);
+    /// * an XMM-homed base is refused, like the ALU register-direct form:
+    ///   `phys_reg_name_32` has no name for it.
+    ///
+    /// Returning `false` lets the caller fall through to the accumulator path,
+    /// which stages through `%rax`/`%rcx` and is correct for every width.
+    fn emit_bit_modify_reg_direct(
+        &mut self,
+        op: IrBinOp,
+        base: &Operand,
+        index: &Operand,
+        dest_phys: PhysReg,
+        ty: IrType,
+    ) -> bool {
+        // 8/16-bit operations have no register-direct bit-modify form here:
+        // the shared `use_32bit`/sext plumbing is written for 32/64.  The
+        // accumulator path owns the narrow widths and reduces the index modulo
+        // the operation width (see `IrBinOp::BitSet`).
+        let use_32bit = match ty {
+            IrType::I32 | IrType::U32 => true,
+            IrType::I64 | IrType::U64 | IrType::Ptr => false,
+            _ => return false,
+        };
+        let base_homed_in_xmm = match base {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .is_some_and(|r| super::emit::is_xmm_reg(*r)),
+            _ => false,
+        };
+        if base_homed_in_xmm {
+            return false;
+        }
+        let own_idx_reg = match index {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| !super::emit::is_xmm_reg(*r)),
+            _ => None,
+        };
+        if own_idx_reg == Some(dest_phys) {
+            return false;
+        }
+        let dest64 = super::emit::phys_reg_name(dest_phys);
+        if own_idx_reg.is_none() && dest64 == "rcx" {
+            return false;
+        }
+        self.operand_to_callee_reg(base, dest_phys);
+        let mnemonic = Self::bit_modify_mnemonic(op);
+        if let Some(imm) = Self::const_as_imm32(index) {
+            // Reduce explicitly: an index of W or more is defined by the
+            // operation's contract, and the emitted immediate then documents
+            // the bit instead of leaning on the hardware's count mask.
+            let width = if use_32bit { 32i64 } else { 64 };
+            let bit = i64::from(imm as u32 as i32).rem_euclid(width);
+            let (mnem, dst) = if use_32bit {
+                (
+                    format!("{mnemonic}l"),
+                    super::emit::phys_reg_name_32(dest_phys),
+                )
+            } else {
+                (format!("{mnemonic}q"), dest64)
+            };
+            self.state
+                .emit_fmt(format_args!("    {mnem} ${bit}, %{dst}"));
+        } else {
+            let idx_name = match own_idx_reg {
+                Some(reg) => {
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
+                    }
+                }
+                None => {
+                    self.operand_to_rcx(index);
+                    if use_32bit { "ecx" } else { "rcx" }
+                }
+            };
+            let (mnem, dst) = if use_32bit {
+                (
+                    format!("{mnemonic}l"),
+                    super::emit::phys_reg_name_32(dest_phys),
+                )
+            } else {
+                (format!("{mnemonic}q"), dest64)
+            };
+            self.state
+                .emit_fmt(format_args!("    {mnem} %{idx_name}, %{dst}"));
+        }
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    /// `BitSet`/`BitClear` on the accumulator path: the base is in `%rax`
+    /// (`%eax` for I32/U32) and the index in `%rcx`, both staged by the
+    /// shared sequence above, and the shared postlude stores `%rax`.
+    ///
+    /// `bts`/`btr` exist at 16, 32 and 64 bits and read the index modulo the
+    /// operand width, which is exactly the operation's contract.  The 8-bit
+    /// width has no `btsb`, so it reduces the index to three bits and uses the
+    /// 64-bit form: the extra index reduction is the same modulo-8 the
+    /// operation specifies, and the untouched bits above bit 7 are the same
+    /// container garbage the pre-existing shift/OR sequence left there (every
+    /// consumer of an I8 value reads it through its truncating name).
+    fn emit_bit_modify_acc(&mut self, op: IrBinOp, ty: IrType) {
+        let mnemonic = Self::bit_modify_mnemonic(op);
+        match ty.size() {
+            8 => self
+                .state
+                .emit_fmt(format_args!("    {mnemonic}q %rcx, %rax")),
+            4 => self
+                .state
+                .emit_fmt(format_args!("    {mnemonic}l %ecx, %eax")),
+            2 => self
+                .state
+                .emit_fmt(format_args!("    {mnemonic}w %cx, %ax")),
+            _ => {
+                self.state.emit("    andl $7, %ecx");
+                self.state
+                    .emit_fmt(format_args!("    {mnemonic}q %rcx, %rax"));
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Invalidate acc/sec cache entries that claim to hold one of `ids`. Used
+    /// after in-place memory updates (`op %reg/imm, mem`): the registers are
+    /// unchanged, but the memory those ids live in is now different, so a
+    /// cached register copy of them is stale.
+    fn invalidate_cache_for_values(&mut self, ids: &[u32]) {
+        if let Some(e) = self.state.reg_cache.acc {
+            if ids.contains(&e.value_id) {
+                self.state.reg_cache.invalidate_acc();
+            }
+        }
+        if let Some(e) = self.state.reg_cache.sec {
+            if ids.contains(&e.value_id) {
+                self.state.reg_cache.invalidate_sec();
+            }
+        }
+    }
+
+    /// Fused multiply-add: add_dest = acc + (mul_lhs * mul_rhs).
+    ///
+    /// Emits a 3-instruction sequence: load one mul operand to %eax, multiply
+    /// by the other (memory-source or register-source), then add %eax to the
+    /// accumulator (register-dest or memory-dest).
+    pub(super) fn emit_fused_mul_add_impl(
+        &mut self,
+        mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        add_dest: &Value,
+        ty: IrType,
+    ) {
+        if matches!(ty, IrType::F32 | IrType::F64) {
+            self.emit_scalar_fma231(mul_lhs, mul_rhs, acc, add_dest, ty);
+            return;
+        }
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+
+        // v12 Fix B improvement 1: 3-operand immediate multiply from a
+        // register-homed lhs — `imull $imm, %lhs, %eax` — drops the leading
+        // `movl %lhs, %eax` entirely. Only fires when lhs is a register-homed
+        // GPR (so the 3-operand form reads it in place) and rhs is a constant
+        // that fits in imm32. Order matters: try this BEFORE the memory-source
+        // and operand_to_eax paths so the register-homed lhs is not staged.
+        if let Operand::Value(lhs_val) = mul_lhs {
+            // Home-freshness gate (see emit.rs home_fresh): the 3-operand
+            // form reads the LHS in place from its home — only sound while
+            // the register provably still holds that value. A stale home
+            // (the accumulator emitter reuses destination registers in
+            // place for derived values) falls through to the general path,
+            // which stages the LHS through the reload machinery (kernel
+            // 6.18.50 free_area_init_node: the fused mul-add consumed the
+            // zone POINTER as the loop index).
+            if let Some(lhs_reg) = self
+                .fresh_home_of(lhs_val.0)
+                .filter(|r| !super::emit::is_xmm_reg(*r))
+            {
+                if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {
+                    if use_32bit {
+                        let lhs_name = super::emit::phys_reg_name_32(lhs_reg);
+                        // If lhs and eax coincide, the 2-operand form is fine;
+                        // otherwise use the 3-operand form to keep lhs intact.
+                        if lhs_name == "eax" {
+                            self.state
+                                .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    imull ${}, %{}, %eax", imm, lhs_name));
+                        }
+                    } else {
+                        let lhs_name = super::emit::phys_reg_name(lhs_reg);
+                        if lhs_name == "rax" {
+                            self.state
+                                .emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    imulq ${}, %{}, %rax", imm, lhs_name));
+                        }
+                    }
+                    self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+                    return;
+                }
+            }
+        }
+
+        // Step 1: Compute mul_lhs * mul_rhs into %eax.
+        // Strategy: load one operand to %eax, imul the other (prefer memory-source).
+        // ACC-RESIDENT RHS (commuted, slot-independent): if the RHS is a
+        // Value with no register home that the accumulator cache already
+        // holds (a commuted-RHS sole-consumer producer — see
+        // is_safe_sole_consumer — has no slot), staging the LHS into %eax
+        // first would destroy it. Mul is commutative: keep the resident
+        // RHS in %eax and source the LHS instead — immediate, register
+        // home, slot, or %rcx staging — exactly the rhs-arm contract of
+        // emit_int_binop_impl. Without this arm the fused integer madd
+        // (unroll_stride_complete.c: Load; Mul(lhs, load); Add(acc, mul))
+        // fell through to operand_to_rcx(load) and hit the loud
+        // no-location panic.
+        if let Operand::Value(rhs_val) = mul_rhs {
+            let acc_rhs = self.dest_reg(rhs_val).is_none()
+                && !self.state.is_alloca(rhs_val.0)
+                && (use_32bit || !self.state.is_small_slot(rhs_val.0))
+                && self.state.acc_has_verified(rhs_val.0, false);
+            if acc_rhs {
+                let acc_reg = if use_32bit { "eax" } else { "rax" };
+                if let Some(imm) = Self::const_as_imm32_typed(mul_lhs, use_32bit) {
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    imull ${}, %{}", imm, acc_reg));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    imulq ${}, %{}", imm, acc_reg));
+                    }
+                    self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+                    return;
+                }
+                if let Some(lreg) = self
+                    .operand_reg(mul_lhs)
+                    .filter(|r| !super::emit::is_xmm_reg(*r))
+                {
+                    let name = if use_32bit {
+                        super::emit::phys_reg_name_32(lreg)
+                    } else {
+                        super::emit::phys_reg_name(lreg)
+                    };
+                    self.state.emit_fmt(format_args!(
+                        "    imul{} %{}, %{}",
+                        if use_32bit { 'l' } else { 'q' },
+                        name,
+                        acc_reg
+                    ));
+                    self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+                    return;
+                }
+                if let Operand::Value(lhs_val) = mul_lhs {
+                    if self.dest_reg(lhs_val).is_none()
+                        && !self.state.is_alloca(lhs_val.0)
+                        && (use_32bit || !self.state.is_small_slot(lhs_val.0))
+                    {
+                        if let Some(slot) = self.state.get_slot(lhs_val.0) {
+                            let sref = self.slot_ref(slot.0);
+                            self.state.emit_fmt(format_args!(
+                                "    imul{} {}, %{}",
+                                if use_32bit { 'l' } else { 'q' },
+                                sref,
+                                acc_reg
+                            ));
+                            self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+                            return;
+                        }
+                    }
+                }
+                // %rcx staging (never writes %rax): the resident RHS survives.
+                self.operand_to_rcx(mul_lhs);
+                if use_32bit {
+                    self.state.emit("    imull %ecx, %eax");
+                } else {
+                    self.state.emit("    imulq %rcx, %rax");
+                }
+                self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+                return;
+            }
+        }
+        if use_32bit {
+            self.operand_to_eax(mul_lhs);
+        } else {
+            self.operand_to_rax(mul_lhs);
+        }
+
+        // Try memory-source multiply for rhs. An alloca's VALUE is its ADDRESS
+        // (a pointer), so folding it as a memory source would read the array's
+        // first element instead of multiplying by the base address — the same
+        // alloca guard the plain binop mem-source path has. Width guard: the
+        // 64-bit imulq memory form reads 8 bytes; small slots need the 32-bit
+        // form (or no folding at all).
+        if let Operand::Value(rhs_val) = mul_rhs {
+            if self.dest_reg(rhs_val).is_none()
+                && !self.state.is_alloca(rhs_val.0)
+                && (use_32bit || !self.state.is_small_slot(rhs_val.0))
+            {
+                if let Some(slot) = self.state.get_slot(rhs_val.0) {
+                    let sref = self.slot_ref(slot.0);
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    imull {}, %eax", sref));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    imulq {}, %rax", sref));
+                    }
+                    // Fall through to add
+                    self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+                    return;
+                }
+            }
+        }
+
+        // Immediate multiply: fold the constant into the 3-operand immediate
+        // form instead of staging it in %rcx first (`imull $imm, %eax, %eax`).
+        if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {
+            if use_32bit {
+                self.state
+                    .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
+            }
+            self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+            return;
+        }
+
+        // Register-source multiply
+        self.operand_to_rcx(mul_rhs);
+        if use_32bit {
+            self.state.emit("    imull %ecx, %eax");
+        } else {
+            self.state.emit("    imulq %rcx, %rax");
+        }
+
+        self.emit_fused_add_acc(mul_dest, acc, add_dest, use_32bit);
+    }
+
+    /// True when `operand_to_callee_reg(acc, _)` stages without writing %rax.
+    ///
+    /// The fused integer madd holds the product live in %rax across acc
+    /// staging; any staging shape that relays through %rax would destroy
+    /// it, so the caller routes those through the %rcx fallback instead.
+    /// Mirrors operand_to_callee_reg's arms exactly:
+    /// - integer/zero consts stage inline; every other const (floats, i128,
+    ///   decimals) relays via %rax;
+    /// - a fresh home or a stack slot stages straight into the target; a
+    ///   stale home stages via def-chain remat, whose recursion can relay
+    ///   through %rax (Copy-of-remat-GlobalAddr) — refused;
+    /// - an acc-cached acc reads %rax (exact: the caller registered the
+    ///   product there);
+    /// - a rematerialisable GlobalAddr stages `leaq sym,%target` straight
+    ///   into the destination (see operand_to_callee_reg).
+    fn fused_madd_acc_stages_without_rax(&self, acc: &Operand) -> bool {
+        match acc {
+            Operand::Const(c) => matches!(
+                c,
+                IrConst::I8(_)
+                    | IrConst::I16(_)
+                    | IrConst::I32(_)
+                    | IrConst::I64(_)
+                    | IrConst::Zero
+            ),
+            Operand::Value(v) => {
+                if self.reg_assignments.contains_key(&v.0) {
+                    return self.fresh_home_of(v.0).is_some();
+                }
+                if self.state.get_slot(v.0).is_some() {
+                    return true;
+                }
+                if self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)) {
+                    return true;
+                }
+                self.get_defining_instruction(v.0).is_some_and(|inst| {
+                    matches!(inst, crate::ir::reexports::Instruction::GlobalAddr { .. })
+                })
+            }
+        }
+    }
+
+    /// Helper for fused mul-add: add %eax to the accumulator operand and store to dest.
+    fn emit_fused_add_acc(
+        &mut self,
+        mul_dest: &Value,
+        acc: &Operand,
+        add_dest: &Value,
+        use_32bit: bool,
+    ) {
+        // v12 Fix B improvement 2: constant accumulator with a REGISTER-HOMED
+        // dest. Adding the immediate directly to %eax (`addl $imm, %eax`) then
+        // moving to the dest register avoids staging the constant through the
+        // dest (`movq $imm, %dest`; 7 bytes for i64-sign-extended constants, 10
+        // for true imm64) before the add. Restricted to register-dest so the
+        // memory-dest / GEP-dest paths keep the original, well-exercised store
+        // sequencing — the LCG loop (the hot beneficiary) is register-homed by
+        // Fix A's precise-span seed.
+        //
+        // Ground truth: every mul path above leaves the fresh product in
+        // %rax/%eax (= mul_dest's value) but the imul emission itself never
+        // updates the cache, so the entry still names the LHS (or older).
+        // Register the product before any staging decision consults the
+        // cache — a stale entry here silently redirected acc staging into
+        // reading the product AS the acc.
+        self.state.park_acc(mul_dest.0, false);
+
+        let dest_phys = self
+            .dest_reg(add_dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r));
+        if let Some(dest_phys) = dest_phys {
+            if let Some(imm) = Self::const_as_imm32_typed(acc, use_32bit) {
+                if use_32bit {
+                    self.state.emit_fmt(format_args!("    addl ${}, %eax", imm));
+                } else {
+                    self.state.emit_fmt(format_args!("    addq ${}, %rax", imm));
+                }
+                let dest_name = super::emit::phys_reg_name_32(dest_phys);
+                let dest_name_64 = super::emit::phys_reg_name(dest_phys);
+                if use_32bit {
+                    if dest_name != "eax" {
+                        self.state
+                            .emit_fmt(format_args!("    movl %eax, %{}", dest_name));
+                    }
+                } else if dest_name_64 != "rax" {
+                    self.state
+                        .emit_fmt(format_args!("    movq %rax, %{}", dest_name_64));
+                }
+                self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the relay wrote the
+                // fused add's result into its dest home (PR #487 root cause:
+                // fused mul-add chains left the dest permanently stale).
+                self.note_inplace_compute(dest_phys, add_dest.0);
+                return;
+            }
+
+            // Register-dest, non-constant acc: stage acc into dest, then add %eax.
+            //
+            // SOUNDNESS (torture execute/strlen-4.c @O2): the product is
+            // live in %rax across the staging, but operand_to_callee_reg
+            // relays some shapes through %rax — a homeless+slotless acc (a
+            // rematerialisable GlobalAddr: `leaq sym,%rax; movq %rax,%dest`)
+            // destroyed the product, so the trailing `addq %rax,%dest`
+            // doubled the base (`strlen(2*&a+2)` SIGSEGV). Only stage what
+            // provably avoids %rax; the rest bypasses the memory-dest shape
+            // (dest's HOME must be written, not just its slot) and falls
+            // into the %rcx fallback below, which never writes %rax.
+            if self.fused_madd_acc_stages_without_rax(acc) {
+                self.operand_to_callee_reg(acc, dest_phys);
+                if use_32bit {
+                    self.state.emit_fmt(format_args!(
+                        "    addl %eax, %{}",
+                        super::emit::phys_reg_name_32(dest_phys)
+                    ));
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    addq %rax, %{}",
+                        super::emit::phys_reg_name(dest_phys)
+                    ));
+                }
+                self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the staging + in-place add
+                // derived the fused add's dest into its home; without this note
+                // the acc-staging eviction (mulacc tail's patched segment) stuck
+                // and the consumer hit the stale-home refusal (PR #487,
+                // crash_synth_20260908: `movq %r10, %rsi; addq %rax, %rsi`).
+                self.note_inplace_compute(dest_phys, add_dest.0);
+                return;
+            }
+            // Rax-relaying acc with a register-homed dest: skip the
+            // memory-dest shape straight into the %rcx fallback.
+        } else if let Operand::Value(acc_val) = acc {
+            if self.dest_reg(acc_val).is_none() {
+                if let (Some(dest_slot), Some(acc_slot)) = (
+                    self.state.get_slot(add_dest.0),
+                    self.state.get_slot(acc_val.0),
+                ) {
+                    if dest_slot.0 == acc_slot.0 {
+                        let sref = self.slot_ref(dest_slot.0);
+                        if use_32bit {
+                            self.state.emit_fmt(format_args!("    addl %eax, {}", sref));
+                        } else {
+                            self.state.emit_fmt(format_args!("    addq %rax, {}", sref));
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fallback: load acc to %ecx, add to %eax, store result.
+        self.operand_to_rcx(acc);
+        if use_32bit {
+            self.state.emit("    addl %ecx, %eax");
+            self.store_eax_to(add_dest);
+        } else {
+            self.state.emit("    addq %rcx, %rax");
+            self.store_rax_to(add_dest);
+        }
+    }
+
+    pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
+        self.operand_to_rax_rdx(src);
+        self.store_rax_rdx_to(dest);
+    }
+}
+
+/// The IR types `Bzhi` is defined on (see `IrBinOp::Bzhi`).
+fn is_bzhi_type(ty: IrType) -> bool {
+    matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+}
+
+#[cfg(test)]
+mod bit_test_width_tests {
+    use super::*;
+
+    fn emit_var(ty: IrType) -> String {
+        let mut cg = X86Codegen::new();
+        // Give the base/index ordinary GPR homes so the emitter can stage
+        // them; subword BitTest still takes the accumulator path because the
+        // register-direct path refuses narrow widths.
+        cg.reg_assignments.insert(1, super::super::machinst::R12);
+        cg.reg_assignments.insert(2, super::super::machinst::R13);
+        cg.emit_int_binop_impl(
+            &Value(3),
+            IrBinOp::BitTest,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            ty,
+        );
+        cg.state.out.buf
+    }
+
+    #[test]
+    fn narrow_bit_test_reduces_the_index_modulo_the_operation_width() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let width = (ty.size() * 8) as u32;
+            let asm = emit_var(ty);
+            assert!(
+                asm.contains(&format!("andl ${}, %ecx", width - 1)),
+                "BitTest {ty:?} must reduce the index modulo {width}:\n{asm}"
+            );
+            assert!(
+                asm.contains("btl %ecx, %eax"),
+                "BitTest {ty:?} must use the 32-bit BT form after reduction:\n{asm}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_narrow_bit_test_reduces_the_immediate() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(1, super::super::machinst::R12);
+        cg.emit_int_binop_impl(
+            &Value(3),
+            IrBinOp::BitTest,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I32(9)),
+            IrType::U8,
+        );
+        let asm = cg.state.out.buf;
+        assert!(asm.contains("btl $1, %eax"), "9 mod 8 is 1:\n{asm}");
+    }
+}

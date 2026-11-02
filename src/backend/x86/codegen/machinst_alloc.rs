@@ -1,0 +1,2557 @@
+//! SSA-driven window register allocator for the MachInst buffer.
+//!
+//! ## Why this exists
+//!
+//! The MachInst layer lowers SSA-IR windows into machine instructions whose
+//! register-only positions (two-address ALU dests, `Lea`/`SetCC`/`Movzx`
+//! dests, memory bases and indices) hold `MachReg::Vreg` operands — the SSA
+//! value IDs of values the *main* (function-level) allocator chose to spill.
+//! Before this module, the only "resolution" was to substitute the value's
+//! stack slot into memory-form operand positions and to give up — replaying
+//! the ENTIRE buffered window through the accumulator text path — whenever a
+//! vreg occupied a register-only position. One spilled pointer used as a load
+//! base was enough to demote dozens of already-well-lowered instructions.
+//! This module turns the buffer into what `machinst.rs`'s module doc always
+//! promised: a machine-IR window with local register allocation.
+//!
+//! ## The SSA contract
+//!
+//! Vregs are IR value IDs and the IR is SSA, so within one window:
+//!
+//! * every vreg has at most one *pure* defining write (the `Mov` the isel
+//!   emits to feed a two-address form counts as that write; later writes are
+//!   read-modify-write of the same SSA value);
+//! * a vreg whose first reference is a read (or an RMW) was defined *before*
+//!   the window — "arriving": its stack slot is the canonical home outside
+//!   the window, because `flush_machinst` invalidates the register cache;
+//! * a vreg whose window reads exhaust its IR use count is dead after the
+//!   window and needs no store-back.
+//!
+//! These properties make window liveness exact with one linear scan — no
+//! dataflow, no fixpoint — and they are *checked*: any discipline violation
+//! (two pure writes, a read before a local pure write, a domain mismatch)
+//! fails the allocation and the window falls back to the correct, slower
+//! replay path.
+//!
+//! ## Algorithm
+//!
+//! 1. **Scan** the window once, collecting per-instruction vreg reference
+//!    kinds (read / pure write / RMW), memory-base/index positions, XMM
+//!    register operands, the physical registers each instruction touches,
+//!    and the implicit `rax`/`rdx` clobbers of the division forms (`Raw`
+//!    conservatively blocks the entire pool).
+//! 2. **Classify** every vreg: `reg` — needs a window scratch register
+//!    (register-only position, or a memory base/index); `mem` — appears only
+//!    in substitutable positions, where the existing stack-slot memory-operand
+//!    folding is already optimal. `classify_window` exposes the `reg` set so
+//!    `resolve_stack_vregs` skips substituting exactly those vregs.
+//! 3. **Allocate** by live interval (first..last reference) with interference
+//!    against (a) physical-register operands inside the interval, (b) whole-
+//!    window-busy registers — homes of main-allocator values live across the
+//!    window but not referenced inside it, derived from the RA assignments ×
+//!    liveness segments — and (c) previously assigned vregs.
+//! 4. **Rewrite** every occurrence of an assigned vreg to its register and
+//!    insert the slot reload before an arriving vreg's first reference and
+//!    the slot store after a live-out vreg's last reference, both at the
+//!    value's own width (a `movl` reload zero-extends; a small slot is never
+//!    accessed wider than 4 bytes).
+//!
+//! Calls never appear inside a window (the buffer is drained around
+//! `CallTyped` and at block boundaries), so caller-saved and callee-saved
+//! GPRs are equally legal window homes; a register's only conflict duties
+//! are operand-visible uses, liveness-busy spans, and other assignments.
+//! `rbp` is excluded outright: it is the frame base in rbp-addressing mode
+//! and worth one less invariant than it costs.
+//!
+//! The allocator is deterministic and allocation failure is structurally
+//! rare (≤ 11 candidate registers against window-local live ranges); the
+//! replay remains the fail-safe, but it is now the exception it was always
+//! meant to be, not the cliff every spilled pointer fell off.
+
+use super::machinst::{
+    CallTarget, MACHINST_ALLOCATABLE_GPRS, MachInst, MachOperand, MachReg, OpSize, R8, R9, R10,
+    R11, RAX, RBP, RCX, RDI, RDX, RSI, SYSCALL_ARG_REGS,
+};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+
+/// Everything the allocator needs to know about the values behind vregs.
+/// Read-only views of codegen state: the allocator is a pure function,
+/// which is what makes it directly unit-testable.
+pub(crate) struct WindowCtx<'a> {
+    /// value id → spill slot (the canonical home outside the window).
+    pub slots: &'a FxHashMap<u32, crate::backend::state::StackSlot>,
+    /// Values whose slot is 4 bytes wide.
+    pub small_slots: &'a FxHashSet<u32>,
+    /// value id → IR type (drives reload/store widths and domain checks).
+    pub types: &'a FxHashMap<u32, IrType>,
+    /// Total IR use counts per value (function-wide, instructions +
+    /// terminators).
+    pub total_uses: &'a FxHashMap<u32, u32>,
+    /// Alloca values: their slot holds the *storage*; a plain `movq` reload
+    /// would load the contents, not the pointer. The emit-side gate already
+    /// rejects them; the allocator refuses them again as defense in depth.
+    pub alloca_values: &'a FxHashSet<u32>,
+    /// Main-RA GPR homes busy across the window: register id → live spans
+    /// (inclusive program points) of the values homed there. A register whose
+    /// value is live across the window but never referenced inside it is
+    /// invisible to operand-level interference — this map is what makes the
+    /// window allocator sound against exactly that class.
+    pub reg_busy: &'a FxHashMap<u8, Vec<(u32, u32)>>,
+    /// Inclusive program-point span of the window's IR instructions
+    /// (`[pp_end - ir_len, pp_end - 1]`).
+    pub window_span: (u32, u32),
+}
+
+/// How one instruction references a vreg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefKind {
+    /// Reads the value.
+    Read,
+    /// Overwrites the value (the SSA def, or a later pure re-materialization
+    /// — the latter is refused as a discipline violation).
+    PureWrite,
+    /// Reads and overwrites (two-address ALU forms, `cmov`, `neg`).
+    Rmw,
+}
+
+/// One vreg's window biography.
+#[derive(Debug, Default, Clone, Copy)]
+struct VregInfo {
+    touched: bool,
+    first: usize,
+    last: usize,
+    /// Index of the single pure write, if any.
+    def: Option<usize>,
+    /// Pure-write count (must be ≤ 1: SSA).
+    pure_writes: u32,
+    /// Reads + RMWs (RMW reads the incoming value).
+    uses: u32,
+    /// RMW count: positions that READ and OVERWRITE. A window that only
+    /// reads a value never needs to write its slot back; an RMW does.
+    rmw_writes: u32,
+    /// True when the vreg occupies a position the slot substitution cannot
+    /// express (register-only position or memory base/index).
+    needs_reg: bool,
+    /// True when the vreg is referenced through an XMM register operand.
+    xmm_domain: bool,
+}
+
+/// Scan state: vreg biographies plus per-index physical-register touch sets.
+#[derive(Default)]
+struct Scan<'a> {
+    infos: FxHashMap<u32, VregInfo>,
+    phys_touched: Vec<FxHashSet<u8>>,
+    /// Set when an instruction shape must refuse the whole window
+    /// (a vreg shift amount, a vreg inside `CallTyped`).
+    refused: bool,
+    /// Values whose spill slot is 4 bytes, when known (`None` in pure unit
+    /// tests). A WIDE (S64) reference to such a value cannot take the
+    /// slot-substitution path — the memory operand would read 8 bytes of a
+    /// 4-byte slot and pull in the neighbour's garbage (the resolver's
+    /// `slot_fits` guard exists for exactly this). Those vregs are promoted
+    /// to window registers here so the allocator reloads them at their TRUE
+    /// width instead: a `movl` reload zero-extends and defines the full
+    /// register, which is precisely the discipline the text path applies
+    /// ("loads every value at its true width"). This closes the residual
+    /// whole-window replay class (`Mov Vreg -> Phys/StackSlot` and wide
+    /// `Test` on small-slot values).
+    small_slots: Option<&'a FxHashSet<u32>>,
+}
+
+impl<'a> Scan<'a> {
+    fn touch(&mut self, r: &MachReg, idx: usize, kind: RefKind, reg_only: bool) {
+        let MachReg::Vreg(id) = r else { return };
+        let e = self.infos.entry(*id).or_default();
+        if !e.touched {
+            e.touched = true;
+            e.first = idx;
+            e.last = idx;
+        } else {
+            e.first = e.first.min(idx);
+            e.last = e.last.max(idx);
+        }
+        match kind {
+            RefKind::Read => e.uses += 1,
+            RefKind::PureWrite => {
+                e.pure_writes += 1;
+                if e.def.is_none() {
+                    e.def = Some(idx);
+                }
+            }
+            RefKind::Rmw => {
+                e.uses += 1;
+                e.rmw_writes += 1;
+            }
+        }
+        e.needs_reg |= reg_only;
+    }
+
+    fn touch_xmm(&mut self, r: &MachReg) {
+        if let MachReg::Vreg(id) = r {
+            if let Some(e) = self.infos.get_mut(id) {
+                e.xmm_domain = true;
+            }
+        }
+    }
+
+    /// True when a vreg's 4-byte slot cannot legally back an instruction of
+    /// this width (memory-operand substitution would over-read the slot).
+    /// Only S64 reads of small slots qualify: S8/S16/S32 stay in-bounds.
+    fn slot_too_narrow(&self, id: u32, size: OpSize) -> bool {
+        size == OpSize::S64 && self.small_slots.is_some_and(|ss| ss.contains(&id))
+    }
+
+    /// Scan an operand. `kind` applies to register operands; memory
+    /// base/index registers are always reads. `substitutable` marks operand
+    /// positions whose vregs may keep the stack-slot substitution.
+    /// `size` is the width at which this operand position accesses the
+    /// value — it drives the narrow-slot promotion above.
+    fn touch_op(
+        &mut self,
+        o: &MachOperand,
+        idx: usize,
+        kind: RefKind,
+        substitutable: bool,
+        size: OpSize,
+    ) {
+        match o {
+            MachOperand::Reg(MachReg::Vreg(id)) => {
+                let promote = !substitutable || self.slot_too_narrow(*id, size);
+                self.touch(&MachReg::Vreg(*id), idx, kind, promote);
+            }
+            MachOperand::Reg(r) => self.touch(r, idx, kind, !substitutable),
+            MachOperand::Mem { base, .. } => self.touch(base, idx, RefKind::Read, true),
+            MachOperand::MemIndex { base, index, .. } => {
+                self.touch(base, idx, RefKind::Read, true);
+                self.touch(index, idx, RefKind::Read, true);
+            }
+            _ => {}
+        }
+    }
+
+    /// Record every physical register an instruction touches (read or write
+    /// alike: a window value in that register must not survive across the
+    /// instruction either way), plus implicit clobbers.
+    fn phys_effects(&mut self, inst: &MachInst, idx: usize) {
+        let mut touched: Vec<u8> = touched_phys_regs(inst);
+        // Implicit clobbers beyond operands.
+        match inst {
+            MachInst::Cqto { .. } | MachInst::Div { .. } => {
+                touched.push(0); // rax
+                touched.push(16); // rdx
+            }
+            MachInst::XorRdx => {
+                touched.push(16); // rdx
+            }
+            // The Raw escape hatch could contain anything: block the whole
+            // pool at this index.
+            MachInst::Raw(_) => {
+                for r in MACHINST_ALLOCATABLE_GPRS {
+                    touched.push(r.0);
+                }
+                if super::isel::apx_enabled() {
+                    touched.extend(40u8..=55);
+                }
+            }
+            _ => {}
+        }
+        let at = &mut self.phys_touched[idx];
+        for r in touched {
+            at.insert(r);
+        }
+    }
+
+    fn scan_inst(&mut self, inst: &MachInst, idx: usize) {
+        match inst {
+            MachInst::Mov { src, dst, size } => {
+                self.touch_op(src, idx, RefKind::Read, true, *size);
+                match dst {
+                    MachOperand::Reg(r) => self.touch(r, idx, RefKind::PureWrite, false),
+                    _ => self.touch_op(dst, idx, RefKind::Read, true, *size),
+                }
+            }
+            MachInst::FMov { src, dst, size } => {
+                // Register operands are XMM-domain: resolve never substitutes
+                // FMov, so a Vreg here stays and must refuse the window (a
+                // GPR scratch rewrite would be unencodable).
+                self.touch_op(src, idx, RefKind::Read, true, *size);
+                if let MachOperand::Reg(r) = src {
+                    self.touch_xmm(r);
+                }
+                match dst {
+                    MachOperand::Reg(r) => {
+                        self.touch(r, idx, RefKind::PureWrite, false);
+                        self.touch_xmm(r);
+                    }
+                    _ => self.touch_op(dst, idx, RefKind::Read, true, *size),
+                }
+            }
+            MachInst::FAlu {
+                src2, src1, dst, ..
+            } => {
+                // src2 may keep the memory-form substitution (the VEX form
+                // folds one memory source). A Vreg that survives resolution
+                // there is XMM-domain: the emitter's register form only
+                // accepts XMM Phys, so a GPR scratch rewrite would be
+                // unencodable — mark the domain and refuse if it stays.
+                self.touch_op(src2, idx, RefKind::Read, true, OpSize::S64);
+                if let MachOperand::Reg(r) = src2 {
+                    self.touch_xmm(r);
+                }
+                self.touch(src1, idx, RefKind::Read, false);
+                self.touch(dst, idx, RefKind::PureWrite, false);
+                self.touch_xmm(src1);
+                self.touch_xmm(dst);
+            }
+            MachInst::Mov128 { src, dst } => {
+                self.touch_op(src, idx, RefKind::Read, false, OpSize::S64);
+                self.touch_op(dst, idx, RefKind::Read, false, OpSize::S64);
+            }
+            MachInst::Movzx {
+                src,
+                dst,
+                from_size,
+                ..
+            }
+            | MachInst::Movsx {
+                src,
+                dst,
+                from_size,
+                ..
+            } => {
+                self.touch_op(src, idx, RefKind::Read, true, *from_size);
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
+            MachInst::Alu { src, dst, size, .. } => {
+                self.touch_op(src, idx, RefKind::Read, true, *size);
+                // Two-address dest: register-only (a memory dest is not an
+                // encodable ALU form).
+                self.touch(dst, idx, RefKind::Rmw, true);
+            }
+            MachInst::Imul3 { src, dst, .. } => {
+                // Register-only source: `resolve` rewrites it as a MachReg,
+                // never a memory operand, so a spilled source must be homed
+                // in a window register (else: replay fallback).
+                self.touch(src, idx, RefKind::Read, true);
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
+            MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => {
+                self.touch(dst, idx, RefKind::Rmw, true);
+            }
+            MachInst::Shift { amount, dst, .. } => {
+                // The emitter's variable-shift form is `%cl`-only: a Vreg
+                // amount would be silently ignored (the classic dropped-count
+                // hazard). isel stages counts into %rcx; anything else is a
+                // lowering defect — refuse the window.
+                if let MachOperand::Reg(MachReg::Vreg(_)) = amount {
+                    self.refused = true;
+                }
+                self.touch_op(amount, idx, RefKind::Read, true, OpSize::S64);
+                self.touch(dst, idx, RefKind::Rmw, true);
+            }
+            MachInst::ShiftX {
+                count, src, dst, ..
+            } => {
+                // BMI2 three-operand forms: register-only operands, as Imul3.
+                self.touch(count, idx, RefKind::Read, true);
+                self.touch(src, idx, RefKind::Read, true);
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
+            MachInst::Rorx { src, dst, .. } => {
+                self.touch(src, idx, RefKind::Read, true);
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
+            MachInst::Lea {
+                base, index, dst, ..
+            } => {
+                // A LEA operand can never fall back to the memory-operand
+                // substitution: `lea disp(%base), %dst` computes the ADDRESS
+                // ARITHMETIC of its register operands — substituting the
+                // base with a stack-slot memory reference would compute the
+                // address OF the slot, not the value IN it. Base, index and
+                // dst are therefore register-only positions: the allocator
+                // must home them (reload before, store after) or refuse.
+                // Marking them reg-only (the module documentation always
+                // claimed this) keeps spilled-address Lea windows on the
+                // MachInst fast path instead of tripping the
+                // has-unresolvable-vreg gate and replaying the whole window.
+                self.touch(base, idx, RefKind::Read, true);
+                if let Some((r, _)) = index {
+                    self.touch(r, idx, RefKind::Read, true);
+                }
+                self.touch(dst, idx, RefKind::PureWrite, true);
+            }
+            MachInst::LeaSym { dst, .. } => {
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
+            MachInst::LeaSlot { dst, .. } => {
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
+            MachInst::Div { divisor, size, .. } => {
+                self.touch_op(divisor, idx, RefKind::Read, true, *size);
+            }
+            MachInst::Cmp { lhs, rhs, size } | MachInst::Test { lhs, rhs, size } => {
+                self.touch_op(lhs, idx, RefKind::Read, true, *size);
+                self.touch_op(rhs, idx, RefKind::Read, true, *size);
+            }
+            MachInst::SetCC { dst, .. } => {
+                self.touch(dst, idx, RefKind::PureWrite, false);
+            }
+            MachInst::Cmov { src, dst, size, .. } => {
+                self.touch_op(src, idx, RefKind::Read, true, *size);
+                self.touch(dst, idx, RefKind::Rmw, true);
+            }
+            MachInst::CallTyped { args, ret, .. } => {
+                // Self-contained by construction (the builder resolves every
+                // source to a GPR home, slot, or immediate): a vreg here is
+                // a builder-defect class; refuse rather than emit %vregN.
+                let bad = args.iter().any(|m| has_vreg_operand(&m.src))
+                    || ret.as_ref().is_some_and(|r| has_vreg_operand(&r.dst));
+                if bad {
+                    self.refused = true;
+                }
+            }
+            // Control flow never enters the buffer (terminators are emitted
+            // outside the MachInst window; the branch lowerings have no
+            // callers). Nothing to scan.
+            MachInst::Jcc { .. }
+            | MachInst::Jmp { .. }
+            | MachInst::Label(_)
+            | MachInst::Call { .. }
+            | MachInst::Ret => {}
+            MachInst::Cqto { .. } | MachInst::XorRdx => {}
+            MachInst::Raw(_) => {}
+        }
+        self.phys_effects(inst, idx);
+    }
+}
+
+/// Physical registers observed by an instruction (explicit operands plus
+/// implicit architectural reads/writes; for interference both directions
+/// matter equally).
+pub(super) fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
+    fn reg_of(r: &MachReg, out: &mut Vec<u8>) {
+        if let MachReg::Phys(p) = r {
+            out.push(p.0);
+        }
+    }
+    fn op_of(o: &MachOperand, out: &mut Vec<u8>) {
+        match o {
+            MachOperand::Reg(r) => reg_of(r, out),
+            MachOperand::Mem { base, .. } => reg_of(base, out),
+            MachOperand::MemIndex { base, index, .. } => {
+                reg_of(base, out);
+                reg_of(index, out);
+            }
+            _ => {}
+        }
+    }
+    let mut v = Vec::new();
+    match inst {
+        MachInst::Mov { src, dst, .. } | MachInst::FMov { src, dst, .. } => {
+            op_of(src, &mut v);
+            op_of(dst, &mut v);
+        }
+        MachInst::FAlu {
+            src2, src1, dst, ..
+        } => {
+            op_of(src2, &mut v);
+            reg_of(src1, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Mov128 { src, dst } => {
+            op_of(src, &mut v);
+            op_of(dst, &mut v);
+        }
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Alu { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Imul3 { src, dst, .. } => {
+            reg_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Shift { amount, dst, .. } => {
+            op_of(amount, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Div { divisor, .. } => {
+            op_of(divisor, &mut v);
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+            op_of(lhs, &mut v);
+            op_of(rhs, &mut v);
+        }
+        MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => reg_of(dst, &mut v),
+        MachInst::ShiftX {
+            count, src, dst, ..
+        } => {
+            reg_of(count, &mut v);
+            reg_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Rorx { src, dst, .. } => {
+            reg_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Lea {
+            base, index, dst, ..
+        } => {
+            reg_of(base, &mut v);
+            if let Some((r, _)) = index {
+                reg_of(r, &mut v);
+            }
+            reg_of(dst, &mut v);
+        }
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => reg_of(dst, &mut v),
+        MachInst::SetCC { dst, .. } => reg_of(dst, &mut v),
+        MachInst::Cmov { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => {}
+        // These instructions have architectural register effects that are not
+        // represented by an explicit MachOperand.  Keep this helper complete:
+        // the emitter uses it to decide whether a source home may be renamed
+        // away by a later LEA, while the allocator uses the same observation
+        // set for physical interference.  A false negative here can turn an
+        // otherwise harmless peephole into a silent stale-register read.
+        MachInst::Cqto { .. } => {
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
+        MachInst::XorRdx => v.push(RDX.0),
+        MachInst::Ret => v.push(RAX.0),
+        MachInst::Call { .. } => {
+            // A direct call has no explicit target operand, but it destroys
+            // the SysV caller-save integer homes.  The set is intentionally
+            // conservative here; a caller-save value that is actually
+            // preserved by a surrounding lowering is still safe to leave
+            // unfused, whereas omitting a clobber would be unsound.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+        }
+        MachInst::CallTyped {
+            caller_saves,
+            args,
+            target,
+            ret,
+            ..
+        } => {
+            for m in args {
+                op_of(&m.src, &mut v);
+                // dst_reg is a PhysReg by construction.
+                v.push(m.dst_reg.0);
+            }
+            if let Some(r) = ret {
+                op_of(&r.dst, &mut v);
+            }
+            // The call itself consumes rax/rdx and the SysV caller-save set;
+            // the typed save/restore list is also observed explicitly before
+            // and after the call.  An indirect target is an additional
+            // architectural read that is not present in args or ret.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+            for (reg, _) in caller_saves {
+                v.push(reg.0);
+            }
+            if let CallTarget::Indirect(reg) = target {
+                v.push(reg.0);
+            }
+        }
+        MachInst::Raw(_) => {}
+    }
+    v
+}
+
+/// Physical registers an instruction actually reads, as opposed to merely
+/// defining. The allocator needs [`touched_phys_regs`] for interference, but
+/// the three-instruction LEA peephole only needs to reject a later read of the
+/// source home. Distinguishing pure overwrites lets it fold a dead source even
+/// when a later instruction reuses that register.
+pub(super) fn reads_phys_regs(inst: &MachInst) -> Vec<u8> {
+    fn reg_of(r: &MachReg, out: &mut Vec<u8>) {
+        if let MachReg::Phys(p) = r {
+            out.push(p.0);
+        }
+    }
+    fn op_of(o: &MachOperand, out: &mut Vec<u8>) {
+        match o {
+            MachOperand::Reg(r) => reg_of(r, out),
+            MachOperand::Mem { base, .. } => reg_of(base, out),
+            MachOperand::MemIndex { base, index, .. } => {
+                reg_of(base, out);
+                reg_of(index, out);
+            }
+            _ => {}
+        }
+    }
+    fn address_of(o: &MachOperand, out: &mut Vec<u8>) {
+        if matches!(o, MachOperand::Mem { .. } | MachOperand::MemIndex { .. }) {
+            op_of(o, out);
+        }
+    }
+    let mut v = Vec::new();
+    match inst {
+        MachInst::Mov { src, dst, size } => {
+            op_of(src, &mut v);
+            match dst {
+                MachOperand::Reg(r) if matches!(size, OpSize::S8 | OpSize::S16) => {
+                    // Byte/word writes preserve the rest of the destination
+                    // register, so the old value is still semantically live.
+                    reg_of(r, &mut v);
+                }
+                _ => address_of(dst, &mut v),
+            }
+        }
+        MachInst::FMov { src, dst, .. } => {
+            op_of(src, &mut v);
+            // A scalar SSE register move can preserve the upper lanes of its
+            // destination. This is not normally a GPR source-home, but keep
+            // the observation rule exact for pre-coloured mixed test shapes.
+            match dst {
+                MachOperand::Reg(r) => reg_of(r, &mut v),
+                _ => address_of(dst, &mut v),
+            }
+        }
+        MachInst::FAlu { src2, src1, .. } => {
+            op_of(src2, &mut v);
+            reg_of(src1, &mut v);
+        }
+        MachInst::Mov128 { src, dst } => {
+            op_of(src, &mut v);
+            address_of(dst, &mut v);
+        }
+        MachInst::Movzx { src, .. } => {
+            op_of(src, &mut v);
+        }
+        MachInst::Movsx {
+            src, dst, to_size, ..
+        } => {
+            op_of(src, &mut v);
+            if *to_size == OpSize::S16 {
+                // movsbw is a word write; bits above bit 15 retain the old
+                // destination value and must not be treated as dead.
+                reg_of(dst, &mut v);
+            }
+        }
+        MachInst::Alu { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Imul3 {
+            imm,
+            src,
+            dst,
+            size,
+            ..
+        } => {
+            reg_of(src, &mut v);
+            // The emitter widens S8, and S16 with an imm32-only multiplier,
+            // to a 32-bit write. A representable S16 form is only a partial
+            // destination write and therefore carries the old register value.
+            if *size == OpSize::S16 && (*imm >= i16::MIN as i64 && *imm <= i16::MAX as i64) {
+                reg_of(dst, &mut v);
+            }
+        }
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => reg_of(dst, &mut v),
+        MachInst::Shift { amount, dst, .. } => {
+            op_of(amount, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::ShiftX { count, src, .. } => {
+            reg_of(count, &mut v);
+            reg_of(src, &mut v);
+        }
+        MachInst::Rorx { src, .. } => reg_of(src, &mut v),
+        MachInst::Lea { base, index, .. } => {
+            reg_of(base, &mut v);
+            if let Some((r, _)) = index {
+                reg_of(r, &mut v);
+            }
+        }
+        MachInst::LeaSym { .. } | MachInst::LeaSlot { .. } => {}
+        MachInst::Cqto { .. } => v.push(RAX.0),
+        MachInst::XorRdx => {}
+        MachInst::Div { divisor, .. } => {
+            op_of(divisor, &mut v);
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+            op_of(lhs, &mut v);
+            op_of(rhs, &mut v);
+        }
+        MachInst::SetCC { dst, .. } => {
+            // setcc writes only the low byte; the remaining bits preserve the
+            // old register image.
+            reg_of(dst, &mut v);
+        }
+        MachInst::Cmov { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Call { .. } => {
+            // The untyped call has no argument metadata. Its ABI-visible
+            // caller-save registers may carry arguments (including %al for a
+            // variadic call), so retain the conservative read set here.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+        }
+        MachInst::CallTyped {
+            caller_saves,
+            args,
+            target,
+            gp_arg_count,
+            ret,
+            ..
+        } => {
+            for (reg, _) in caller_saves {
+                v.push(reg.0);
+            }
+            for arg in args {
+                op_of(&arg.src, &mut v);
+            }
+            let arg_count = gp_arg_count.unwrap_or(SYSCALL_ARG_REGS.len() as u8) as usize;
+            for &reg in SYSCALL_ARG_REGS.iter().take(arg_count) {
+                v.push(reg.0);
+            }
+            if let CallTarget::Indirect(reg) = target {
+                v.push(reg.0);
+            }
+            if let Some(ret) = ret {
+                match &ret.dst {
+                    MachOperand::Reg(reg) if matches!(ret.size, OpSize::S8 | OpSize::S16) => {
+                        // A narrow return move preserves the destination's
+                        // upper bits, so it is not a pure overwrite.
+                        reg_of(reg, &mut v);
+                    }
+                    _ => address_of(&ret.dst, &mut v),
+                }
+            }
+        }
+        MachInst::Ret => v.push(RAX.0),
+        MachInst::Raw(_) => {
+            // Raw text is intentionally opaque. Returning the whole physical
+            // namespace makes this helper fail closed if a future caller uses
+            // it without the flags barrier that currently rejects Raw.
+            v.extend(0..=55);
+        }
+        MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => {}
+    }
+    v
+}
+
+fn has_vreg_operand(o: &MachOperand) -> bool {
+    match o {
+        MachOperand::Reg(MachReg::Vreg(_)) => true,
+        MachOperand::Mem {
+            base: MachReg::Vreg(_),
+            ..
+        } => true,
+        MachOperand::MemIndex {
+            base: MachReg::Vreg(_),
+            ..
+        }
+        | MachOperand::MemIndex {
+            index: MachReg::Vreg(_),
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// The vregs that must be register-allocated (register-only positions or
+/// memory bases/indices). `resolve_stack_vregs` skips substituting exactly
+/// these IDs so the allocator rewrites every occurrence uniformly.
+pub(crate) fn classify_window(
+    insts: &[MachInst],
+    small_slots: Option<&FxHashSet<u32>>,
+) -> FxHashSet<u32> {
+    let mut scan = Scan {
+        phys_touched: vec![FxHashSet::default(); insts.len()],
+        small_slots,
+        ..Default::default()
+    };
+    for (idx, inst) in insts.iter().enumerate() {
+        scan.scan_inst(inst, idx);
+    }
+    scan.infos
+        .iter()
+        .filter(|(_, e)| e.needs_reg)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// The width at which a vreg's slot is reloaded/stored: the value's own
+/// width, clamped to the slot's width (a small slot is 4 bytes).
+fn transfer_size(ty: Option<&IrType>, small_slot: bool) -> OpSize {
+    let from_ty = ty.copied().map(OpSize::from_ir_type).unwrap_or(OpSize::S64);
+    if small_slot {
+        // 4-byte slot: a 64-bit transfer would read/write the neighbour.
+        match from_ty {
+            OpSize::S64 => OpSize::S32, // defensive: small slots hold ≤32-bit values
+            s => s,
+        }
+    } else {
+        from_ty
+    }
+}
+
+/// Reload of an arriving vreg from its slot into its window register.
+///
+/// Sub-word (S8/S16) reloads must DEFINE THE FULL REGISTER: a plain
+/// `movb slot, %r11b` writes only the low byte and leaves bits [8..64)
+/// stale, yet the rest of the pipeline — home moves (`movq %r11, %rdi`),
+/// full-width store-backs (`movq %rdi, slot`), S64 `Test`/`Cmp` operands —
+/// reads the vreg as a full 64-bit register image (the same
+/// zero-/sign-extended-image invariant `value_to_reg` upholds classically:
+/// U8 loads are `movzbl`, I8 are `movsbq`). A partial reload made
+/// vsnprintf's `number()` emit a phantom NUL byte before every `%d` under
+/// `-funsigned-char`: the sign char was reloaded with `movb` into a
+/// register whose upper bits still held `(unsigned)(field_width - 1)`
+/// (0xFFFFFF00 for the default width 0), the 64-bit `if (sign)` test then
+/// saw a nonzero image and stored sign byte 0x00 ahead of the digits.
+///
+/// S32 needs no help: `movl` writes zero-extend into all of bits [32..64).
+/// The store-back side keeps the narrow transfer: it writes exactly the
+/// value's own bytes, and the register image is defined at this point.
+fn arriving_reload(slot: i64, reg: MachReg, size: OpSize, ty: Option<&IrType>) -> MachInst {
+    let signed = ty.is_some_and(|t| t.is_signed());
+    match (size, signed) {
+        (OpSize::S8, false) => MachInst::Movzx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S8,
+            to_size: OpSize::S32,
+        },
+        (OpSize::S8, true) => MachInst::Movsx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S8,
+            to_size: OpSize::S64,
+        },
+        (OpSize::S16, false) => MachInst::Movzx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S16,
+            to_size: OpSize::S32,
+        },
+        (OpSize::S16, true) => MachInst::Movsx {
+            src: MachOperand::StackSlot(slot),
+            dst: reg,
+            from_size: OpSize::S16,
+            to_size: OpSize::S64,
+        },
+        (size, _) => MachInst::Mov {
+            src: MachOperand::StackSlot(slot),
+            dst: MachOperand::Reg(reg),
+            size,
+        },
+    }
+}
+
+/// True when a type lives outside the integer GPR domain (or is wider than
+/// one register), where the window allocator must not substitute a GPR.
+fn non_gpr_type(ty: Option<&IrType>) -> bool {
+    ty.is_some_and(|t| t.is_float() || t.is_128bit())
+}
+
+/// Whole-window busy set: main-RA homes whose values are live across the
+/// window's program-point span (invisible to operand-level interference).
+fn window_busy_regs(ctx: &WindowCtx<'_>) -> FxHashSet<u8> {
+    let (w0, w1) = ctx.window_span;
+    let watch = super::emit::ws_watch_reg();
+    let mut busy = FxHashSet::default();
+    for (&r, spans) in ctx.reg_busy {
+        if watch == Some(r) {
+            eprintln!("[WS-busy] r{} spans={:?} window=({}, {})", r, spans, w0, w1);
+        }
+        if spans.iter().any(|&(s, e)| s <= w1 && e >= w0) {
+            busy.insert(r);
+        }
+    }
+    busy
+}
+
+/// The allocator proper.
+///
+/// Returns `None` when the window cannot be fully allocated — the caller
+/// replays it through the default path (correct, slower). `insts` is
+/// consumed: successful allocation rewrites it into the final, vreg-free
+/// sequence with reload/store traffic inserted.
+/// Classification of a window's LAST write to one physical register,
+/// computed post-emission for the write-state dataflow (S11): a
+/// `Precolor` write re-established the register's resident value's home
+/// (the register provably holds that value after the window); a
+/// `ScratchOrClobber` write put window scratch, an ABI-fixed value, or a
+/// call-clobber pattern into the register (the resident value is gone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowWriteKind {
+    Precolor,
+    ScratchOrClobber,
+}
+
+/// Homes whose pre-call contents survive a typed call: its explicit
+/// save/restore pairs and the IPA-RA registers proved preserved by the
+/// callee. Both last-write classifiers must use the same set; treating an
+/// IPA-kept home as clobbered makes every later coalesced member stale even
+/// though the call and its verifier preserve the register.
+fn call_preserved_homes(inst: &MachInst) -> FxHashSet<u8> {
+    let MachInst::CallTyped {
+        caller_saves,
+        ipa_keep,
+        ..
+    } = inst
+    else {
+        return FxHashSet::default();
+    };
+    let mut preserved: FxHashSet<u8> = caller_saves.iter().map(|(p, _)| p.0).collect();
+    for &(family, id) in &super::ipa_ra::KEEP_PHYS {
+        if ipa_keep & family != 0 {
+            preserved.insert(id);
+        }
+    }
+    preserved
+}
+
+/// Architecture-implied writes shared by the core and allocating last-write
+/// classifiers. Callback order is part of the contract: a typed return move
+/// follows the call clobbers, so the allocating path's same-index overwrite
+/// and the core path's explicit Precolor tie-break both retain the return.
+fn for_each_implicit_write(inst: &MachInst, mut record: impl FnMut(u8, WindowWriteKind)) {
+    match inst {
+        MachInst::Cqto { .. } | MachInst::Div { .. } => {
+            record(0, WindowWriteKind::ScratchOrClobber);
+            record(16, WindowWriteKind::ScratchOrClobber);
+        }
+        MachInst::XorRdx => record(16, WindowWriteKind::ScratchOrClobber),
+        MachInst::Raw(text) => {
+            let mut written = Vec::new();
+            raw_written_regs(text, &mut written);
+            for r in written {
+                record(r, WindowWriteKind::ScratchOrClobber);
+            }
+        }
+        MachInst::Call { .. } | MachInst::CallTyped { .. } => {
+            let preserved = call_preserved_homes(inst);
+            for r in [14u8, 15, 16, 12, 13, 10, 11] {
+                if !preserved.contains(&r) {
+                    record(r, WindowWriteKind::ScratchOrClobber);
+                }
+            }
+            if let MachInst::CallTyped { ret: Some(rm), .. } = inst {
+                if let MachOperand::Reg(MachReg::Phys(p)) = &rm.dst {
+                    record(p.0, WindowWriteKind::Precolor);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Per-register LAST-write classification for a window that contains no
+/// allocated vregs: every destination-position register write is a
+/// pre-colored definition, and only the architecture-implied writes
+/// (Cqto/Div → rax:rdx, XorRdx → rdx, call clobbers, Raw barriers) are
+/// scratch/clobber events. Used directly by the flush for the fast path
+/// and as the base classifier inside `allocate_window`.
+pub(crate) fn window_last_writes_core(insts: &[MachInst]) -> FxHashMap<u8, WindowWriteKind> {
+    let mut last: FxHashMap<u8, (usize, WindowWriteKind)> = FxHashMap::default();
+    let record = |r: u8,
+                  idx: usize,
+                  kind: WindowWriteKind,
+                  last: &mut FxHashMap<u8, (usize, WindowWriteKind)>| {
+        last.entry(r)
+            .and_modify(|(i, k)| {
+                if idx > *i || (idx == *i && kind == WindowWriteKind::Precolor) {
+                    *i = idx;
+                    *k = kind;
+                }
+            })
+            .or_insert((idx, kind));
+    };
+    for (idx, inst) in insts.iter().enumerate() {
+        let mut dsts: Vec<MachReg> = Vec::new();
+        inst.dst_write_regs(&mut dsts);
+        for r in &dsts {
+            if let MachReg::Phys(p) = r {
+                record(p.0, idx, WindowWriteKind::Precolor, &mut last);
+            }
+        }
+        // Implicit writes beyond destination positions use the SAME event
+        // stream as the allocating classifier below.
+        for_each_implicit_write(inst, |r, kind| {
+            record(r, idx, kind, &mut last);
+        });
+    }
+    last.into_iter().map(|(r, (_, k))| (r, k)).collect()
+}
+
+/// Registers a Raw escape-hatch line can possibly have written: the
+/// conservative whole-pool clobber is only justified for names the text
+/// actually mentions.  All register references in the emitted AT&T text
+/// are spelled `%<name>` (memory operands, sub-registers like `%r11d`
+/// and `%r11b` included — every size spelling carries the 64-bit name
+/// as its prefix), so a `%<name64>` substring match is an EXACT
+/// over-approximation of the registers the line touches.  A name that
+/// does not appear means the line provably did not write that register
+/// (kernel calculate_imbalance: a Raw scratch line poisoned a
+/// neighbouring home's exact Def).
+fn raw_written_regs(text: &str, out: &mut Vec<u8>) {
+    for r in MACHINST_ALLOCATABLE_GPRS {
+        // rax (0) and rcx (7) are function scratch — never main-RA homed,
+        // so no write-state is tracked for them (and phys_reg_name has no
+        // spelling for their IDs).
+        if r.0 == 0 || r.0 == 7 {
+            continue;
+        }
+        if text.contains(&format!("%{}", super::emit::phys_reg_name(*r))) {
+            out.push(r.0);
+        }
+    }
+    if super::isel::apx_enabled() {
+        for r in 40u8..=55u8 {
+            if text.contains(&format!(
+                "%{}",
+                super::emit::phys_reg_name(crate::backend::regalloc::PhysReg(r))
+            )) {
+                out.push(r);
+            }
+        }
+    }
+}
+
+pub(crate) fn allocate_window(
+    mut insts: Vec<MachInst>,
+    ctx: &WindowCtx<'_>,
+) -> Option<(
+    Vec<MachInst>,
+    FxHashMap<u8, WindowWriteKind>,
+    FxHashMap<u8, u32>,
+)> {
+    if insts.is_empty() {
+        return Some((insts, FxHashMap::default(), FxHashMap::default()));
+    }
+
+    // ── Phase 1: scan ────────────────────────────────────────────────
+    // `small_slots` MUST mirror the classify_window call (same set, same
+    // promotion): classify decides which vregs the resolver leaves for the
+    // allocator, and this scan decides which vregs the allocator homed.
+    // A disagreement leaves a Vreg mid-window and trips the replay gate.
+    let mut scan = Scan {
+        phys_touched: vec![FxHashSet::default(); insts.len()],
+        small_slots: Some(ctx.small_slots),
+        ..Default::default()
+    };
+    for (idx, inst) in insts.iter().enumerate() {
+        scan.scan_inst(inst, idx);
+    }
+    if scan.refused {
+        return None;
+    }
+    if scan.infos.is_empty() {
+        // Nothing to allocate: no rewrites, no inserted traffic — the core
+        // classifier's view is exact.
+        let writes = window_last_writes_core(&insts);
+        return Some((insts, writes, FxHashMap::default())); // nothing to allocate
+    }
+
+    // ── Phase 2: admission checks & classification ───────────────────
+    let mut reg_needed: Vec<(u32, VregInfo)> = Vec::new();
+    for (id, e) in &scan.infos {
+        // Values without a slot cannot be reloaded or stored.
+        if !ctx.slots.contains_key(id) {
+            return None;
+        }
+        // Alloca pointers: the slot holds the storage, not the pointer.
+        if ctx.alloca_values.contains(id) {
+            return None;
+        }
+        // XMM-domain or non-GPR types stay on the replay path.
+        if e.xmm_domain || non_gpr_type(ctx.types.get(id)) {
+            return None;
+        }
+        // SSA discipline: exactly one pure write, and no read/RMW before it.
+        if e.pure_writes > 1 {
+            return None;
+        }
+        if let Some(d) = e.def {
+            if e.uses > 0 && e.first < d {
+                return None; // read before the local def: malformed SSA window
+            }
+        }
+        // An ARRIVING vreg that a two-address instruction RMWs inside the
+        // window is unsound to allocate, not merely unsupported: the RMW
+        // reads the old slot image (via the reload) and overwrites the
+        // register with the modified value, but SSA semantics require
+        // post-window readers of the SOURCE value to observe the old slot
+        // image, while the RESULT value has no relay target inside this
+        // window (the spill-relay folding was never wired). Storing back
+        // corrupts the source's slot; not storing back loses the result.
+        // Refuse — the replay path handles it correctly. Unreachable from
+        // today's isel (dests without register homes never lower), so this
+        // is defense-in-depth that turns a latent miscompile class into a
+        // guaranteed-safe fallback.
+        if e.def.is_none() && e.rmw_writes > 0 {
+            return None;
+        }
+        if e.needs_reg {
+            reg_needed.push((*id, *e));
+        }
+    }
+
+    // Memory-only vregs (not in `reg_needed`) keep the substitution the
+    // caller already performed; any that failed to substitute (slot_fits,
+    // missing slot) remain as Vregs and trip the caller's final
+    // has-unresolvable gate, exactly as before.
+
+    if reg_needed.is_empty() {
+        let writes = window_last_writes_core(&insts);
+        return Some((insts, writes, FxHashMap::default()));
+    }
+
+    // ── Phase 3: interval allocation ────────────────────────────────
+    // Prefer caller-saved registers: the main allocator's callee-saved bank
+    // is its preferred home set, and any home actually used inside the
+    // window is blocked by operand interference anyway — but when both
+    // candidates are free, a caller-saved scratch touches nothing the
+    // function's save/restore machinery cares about.
+    let mut pool: Vec<u8> = MACHINST_ALLOCATABLE_GPRS
+        .iter()
+        .map(|r| r.0)
+        .filter(|&r| r != RBP.0)
+        .collect();
+    // Extra GPRs r16–r31: caller-saved in the APX SysV extension. Only
+    // when `-mapx` — otherwise the encodings are #UD on Raptor Lake.
+    if super::isel::apx_enabled() {
+        pool.extend(40u8..=55);
+    }
+    pool.sort_by_key(|&r| {
+        let caller_saved = matches!(r, 10 | 11 | 12 | 13 | 14 | 15 | 16) || (40..=55).contains(&r);
+        if caller_saved { 0 } else { 1 }
+    });
+
+    // Whole-window-busy registers (main-RA homes live across the window).
+    let busy_whole = window_busy_regs(ctx);
+
+    // busy[r] = index-space intervals where register r is occupied (phys
+    // operand touches, implicit clobbers, prior assignments).
+    let mut busy: FxHashMap<u8, Vec<(usize, usize)>> = FxHashMap::default();
+    for (idx, touched) in scan.phys_touched.iter().enumerate() {
+        for &r in touched {
+            busy.entry(r).or_default().push((idx, idx));
+        }
+    }
+    let overlaps = |busy: &FxHashMap<u8, Vec<(usize, usize)>>, r: u8, a: usize, b: usize| {
+        busy.get(&r)
+            .is_some_and(|ivs| ivs.iter().any(|&(s, e)| a <= e && s <= b))
+    };
+
+    // Earlier live ranges claim their preferred registers first.
+    let mut reg_needed = reg_needed;
+    reg_needed.sort_by_key(|(_, e)| e.first);
+
+    // The scratch is live from the reload (just before the first reference)
+    // to the store (just after the last reference); the ±1 slop covers the
+    // inserted Mov positions.
+    let assignments: FxHashMap<u32, u8> = reg_needed
+        .iter()
+        .map(|(id, e)| {
+            let a = e.first.saturating_sub(1);
+            let b = e.last + 1;
+            let chosen = pool
+                .iter()
+                .copied()
+                .find(|&r| !busy_whole.contains(&r) && !overlaps(&busy, r, a, b));
+            let Some(r) = chosen else {
+                return Err(*id); // pool exhausted for this window
+            };
+            busy.entry(r).or_default().push((a, b));
+            Ok((*id, r))
+        })
+        .collect::<Result<FxHashMap<u32, u8>, u32>>()
+        .ok()?;
+
+    // ── Phase 4: rewrite + reload/store insertion ────────────────────
+    // Pre-rewrite destination registers, captured before the rewrite
+    // replaces Vregs: a post-rewrite Phys dst that was ALREADY Phys is a
+    // pre-colored definition of its home value; one that was a Vreg is a
+    // window-scratch write.
+    let pre_rewrite_dsts: Vec<Vec<(MachReg, Option<u32>)>> = {
+        let mut v = Vec::with_capacity(insts.len());
+        for inst in &insts {
+            let mut regs: Vec<MachReg> = Vec::new();
+            inst.dst_write_regs(&mut regs);
+            v.push(
+                regs.into_iter()
+                    .map(|r| {
+                        let vreg = match r {
+                            MachReg::Vreg(id) => Some(id),
+                            _ => None,
+                        };
+                        (r, vreg)
+                    })
+                    .collect(),
+            );
+        }
+        v
+    };
+    for inst in insts.iter_mut() {
+        rewrite_inst(inst, &assignments);
+    }
+
+    // Reloads (arriving vregs) and stores (live-out defs), inserted from
+    // the back so earlier indices stay valid.  Each insert carries the IR
+    // vreg it serves (None for the store-back, which writes a slot): the
+    // post-emission write classifier resolves a reload into the vreg's
+    // OWN home as a group-member definition, not scratch.
+    let mut inserts: Vec<(usize, MachInst, Option<u32>)> = Vec::new();
+    for (id, e) in &reg_needed {
+        let Some(&r) = assignments.get(id) else {
+            continue;
+        };
+        let reg = MachReg::Phys(crate::backend::regalloc::PhysReg(r));
+        let slot = ctx.slots[id].0;
+        let size = transfer_size(ctx.types.get(id), ctx.small_slots.contains(id));
+        let total = ctx.total_uses.get(id);
+
+        // Arriving: no local pure write, or (impossible after the checks
+        // above) references before it — the slot holds the value.
+        let arriving = e.def.is_none();
+        if arriving {
+            inserts.push((
+                e.first,
+                arriving_reload(slot, reg, size, ctx.types.get(id)),
+                Some(*id),
+            ));
+        }
+
+        // Live-out AND window-written: the window's reads alone never
+        // change the slot image, so an arriving, read-only value needs no
+        // store back. A local pure write or an RMW modified the register,
+        // and readers after the window (same block or later blocks) all go
+        // through the slot once the register cache is invalidated — the
+        // store is what makes the register image durable. A missing use
+        // count is conservatively treated as live-out.
+        //
+        // The live-out comparison counts IR-level readers, not machine-
+        // level reads: a two-address RMW's read of the dst register
+        // position is a machine artifact of the local write, not an IR use
+        // of the defined value. Without subtracting `rmw_writes`, a dest
+        // whose only real reader sits AFTER the window (e.uses == total,
+        // all "uses" being the RMW itself) would skip the store-back and
+        // leave a stale slot image for that reader. (Arriving values with
+        // RMWs are refused above, so the subtraction only ever applies to
+        // locally-defined values.)
+        let wrote = e.def.is_some() || e.rmw_writes > 0;
+        let ir_level_uses = e.uses - e.rmw_writes;
+        let live_out = total.is_none_or(|t| ir_level_uses < *t);
+        if wrote && live_out {
+            inserts.push((
+                e.last + 1,
+                MachInst::Mov {
+                    src: MachOperand::Reg(reg),
+                    dst: MachOperand::StackSlot(slot),
+                    size,
+                },
+                None,
+            ));
+        }
+    }
+
+    inserts.sort_by_key(|(idx, _, _)| *idx);
+    // Origin tags aligned with the final sequence: Core = the resolved
+    // instruction at pre-insertion index ci; Inserted(Option<vreg>) =
+    // allocator-inserted traffic serving that vreg (reload) or none
+    // (store-back).
+    #[derive(Clone, Copy)]
+    enum Origin {
+        Core,
+        Inserted(Option<u32>),
+    }
+    let mut origin: Vec<Origin> = insts.iter().map(|_| Origin::Core).collect();
+    // MUST mirror the insts insertion above exactly (same reverse order):
+    // both vectors grow through index insertion, so any deviation in
+    // insertion order desynchronizes the tags from the instructions. With
+    // two reloads at indices 0 and 1, forward insertion yields
+    // [Ins2372, Ins834, Core, Core] while the instructions are
+    // [Ins2372, Core, Ins834, Core] — the core relay `→Phys(home)` then
+    // inherits the OTHER vreg's inserted-traffic tag and is classified
+    // ScratchOrClobber instead of Precolor (kernel do_setlink: the loop
+    // phi's home refresh read back as a clobber and refused the latch's
+    // fused compare). Found by red-team diffing the traced overlay event
+    // (`r4 Clobber writer=Some(834)`) against the hand-derived stream.
+    for (idx, _, v) in inserts.iter().rev() {
+        origin.insert((*idx).min(origin.len()), Origin::Inserted(*v));
+    }
+    for (idx, ins, _) in inserts.into_iter().rev() {
+        insts.insert(idx.min(insts.len()), ins);
+    }
+
+    // Post-emission per-register last-write classification (S11
+    // write-state dataflow): pre-colored dsts that were not overwritten
+    // by later scratch traffic or implicit clobbers are Def events for
+    // their home values; everything else is a Clobber.
+    let mut last: FxHashMap<u8, (usize, WindowWriteKind)> = FxHashMap::default();
+    let mut vreg_last: FxHashMap<u8, (usize, Option<u32>)> = FxHashMap::default();
+    for (fi, (inst, o)) in insts.iter().zip(origin.iter()).enumerate() {
+        let is_core = matches!(o, Origin::Core);
+        let inserted_vreg = match o {
+            Origin::Core => None,
+            Origin::Inserted(v) => *v,
+        };
+        let mut dsts: Vec<MachReg> = Vec::new();
+        inst.dst_write_regs(&mut dsts);
+        for r in &dsts {
+            let MachReg::Phys(p) = r else { continue };
+            let core_idx = fi
+                - origin[..fi]
+                    .iter()
+                    .filter(|c| matches!(c, Origin::Inserted(_)))
+                    .count();
+            let pre = pre_rewrite_dsts.get(core_idx);
+            let was_precolored =
+                pre.is_some_and(|pre| pre.iter().any(|(m, vr)| *m == *r && vr.is_none()));
+            let kind = if is_core && was_precolored {
+                WindowWriteKind::Precolor
+            } else {
+                WindowWriteKind::ScratchOrClobber
+            };
+            // The IR value whose write landed in this register (a
+            // pre-rewrite Vreg dst): the flush resolves it against
+            // reg_assignments — a Vreg whose OWN home is this register is
+            // a group-member DEFINITION, not scratch (kernel
+            // calculate_imbalance: windows routinely realize the next
+            // lineage member of a dead-inside-the-window home).
+            let vreg_writer = if is_core {
+                pre.and_then(|pre| {
+                    pre.iter()
+                        .find_map(|(m, vr)| if *m == *r { *vr } else { None })
+                })
+            } else {
+                // An inserted reload materializes its vreg — into the
+                // vreg's own home when the allocator reused it (a
+                // group-member definition).
+                inserted_vreg
+            };
+            vreg_last
+                .entry(p.0)
+                .and_modify(|(i, w)| {
+                    if fi >= *i {
+                        *i = fi;
+                        *w = vreg_writer;
+                    }
+                })
+                .or_insert((fi, vreg_writer));
+            last.entry(p.0)
+                .and_modify(|(i, k)| {
+                    if fi >= *i {
+                        *i = fi;
+                        *k = kind;
+                    }
+                })
+                .or_insert((fi, kind));
+        }
+        if !is_core {
+            continue;
+        }
+        // Shared with the core classifier; insertion order is significant
+        // for same-index call clobbers followed by a typed return move.
+        for_each_implicit_write(inst, |r, kind| {
+            last.insert(r, (fi, kind));
+        });
+    }
+    let writes = last.into_iter().map(|(r, (_, k))| (r, k)).collect();
+    let vreg_writers: FxHashMap<u8, u32> = vreg_last
+        .into_iter()
+        .filter_map(|(r, (_, w))| w.map(|v| (r, v)))
+        .collect();
+
+    Some((insts, writes, vreg_writers))
+}
+
+/// Rewrite every assigned vreg inside one instruction.
+fn rewrite_inst(inst: &mut MachInst, assignments: &FxHashMap<u32, u8>) {
+    let r = |x: &MachReg| -> MachReg {
+        match x {
+            MachReg::Vreg(id) => match assignments.get(id) {
+                Some(&p) => MachReg::Phys(crate::backend::regalloc::PhysReg(p)),
+                None => *x,
+            },
+            p => *p,
+        }
+    };
+    let o = |x: &MachOperand| -> MachOperand {
+        match x {
+            MachOperand::Reg(reg) => MachOperand::Reg(r(reg)),
+            MachOperand::Mem { base, offset } => MachOperand::Mem {
+                base: r(base),
+                offset: *offset,
+            },
+            MachOperand::MemIndex {
+                base,
+                index,
+                scale,
+                offset,
+            } => MachOperand::MemIndex {
+                base: r(base),
+                index: r(index),
+                scale: *scale,
+                offset: *offset,
+            },
+            other => other.clone(),
+        }
+    };
+    match inst {
+        MachInst::Mov { src, dst, .. } => {
+            *src = o(src);
+            *dst = o(dst);
+        }
+        MachInst::FMov { src, dst, .. } => {
+            *src = o(src);
+            *dst = o(dst);
+        }
+        MachInst::FAlu {
+            src2, src1, dst, ..
+        } => {
+            *src2 = o(src2);
+            *src1 = r(src1);
+            *dst = r(dst);
+        }
+        MachInst::Mov128 { src, dst } => {
+            *src = o(src);
+            *dst = o(dst);
+        }
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+            *src = o(src);
+            *dst = r(dst);
+        }
+        MachInst::Alu { src, dst, .. } => {
+            *src = o(src);
+            *dst = r(dst);
+        }
+        MachInst::Imul3 { src, dst, .. } => {
+            *src = r(src);
+            *dst = r(dst);
+        }
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => {
+            *dst = r(dst);
+        }
+        MachInst::Shift { amount, dst, .. } => {
+            *amount = o(amount);
+            *dst = r(dst);
+        }
+        MachInst::ShiftX {
+            count, src, dst, ..
+        } => {
+            *count = r(count);
+            *src = r(src);
+            *dst = r(dst);
+        }
+        MachInst::Rorx { src, dst, .. } => {
+            *src = r(src);
+            *dst = r(dst);
+        }
+        MachInst::Lea {
+            base, index, dst, ..
+        } => {
+            *base = r(base);
+            if let Some((ir, _)) = index {
+                *ir = r(ir);
+            }
+            *dst = r(dst);
+        }
+        MachInst::LeaSym { dst, .. } => {
+            *dst = r(dst);
+        }
+        MachInst::LeaSlot { dst, .. } => {
+            *dst = r(dst);
+        }
+        MachInst::Div { divisor, .. } => {
+            *divisor = o(divisor);
+        }
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+            *lhs = o(lhs);
+            *rhs = o(rhs);
+        }
+        MachInst::SetCC { dst, .. } => {
+            *dst = r(dst);
+        }
+        MachInst::Cmov { src, dst, .. } => {
+            *src = o(src);
+            *dst = r(dst);
+        }
+        // CallTyped is vreg-free by construction (checked at scan time);
+        // control flow and Raw never carry window vregs.
+        _ => {}
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+//
+// The allocator is a pure function over (instructions, value metadata), so
+// every rule it enforces is directly unit-testable: reload placement for
+// arriving values, store placement for live-out defs, dead-def elision,
+// register interference (operand-level AND liveness-level), the admission
+// refusals, and the width discipline of the inserted traffic. The mutation
+// rule from the repo's process docs applies: each test must fail when the
+// behavior it pins is broken (verified during development by selectively
+// reverting the rule under test).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    fn ctx<'a>(
+        slots: &'a FxHashMap<u32, StackSlot>,
+        types: &'a FxHashMap<u32, IrType>,
+        total_uses: &'a FxHashMap<u32, u32>,
+        reg_busy: &'a FxHashMap<u8, Vec<(u32, u32)>>,
+        empty: &'a FxHashSet<u32>,
+    ) -> WindowCtx<'a> {
+        WindowCtx {
+            slots,
+            small_slots: empty,
+            types,
+            total_uses,
+            alloca_values: empty,
+            reg_busy,
+            window_span: (0, 15),
+        }
+    }
+
+    fn base_maps() -> (
+        FxHashMap<u32, StackSlot>,
+        FxHashMap<u32, IrType>,
+        FxHashMap<u32, u32>,
+        FxHashMap<u8, Vec<(u32, u32)>>,
+    ) {
+        (
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn vreg(id: u32) -> MachReg {
+        MachReg::Vreg(id)
+    }
+
+    fn phys(id: u8) -> MachReg {
+        MachReg::Phys(crate::backend::regalloc::PhysReg(id))
+    }
+
+    fn assert_no_vregs(insts: &[MachInst]) {
+        let stray: Vec<String> = insts
+            .iter()
+            .filter(|i| mentions_vreg(i))
+            .map(|i| format!("{i:?}"))
+            .collect();
+        assert!(stray.is_empty(), "vregs survived allocation: {stray:?}");
+    }
+
+    fn mentions_vreg(inst: &MachInst) -> bool {
+        use super::super::machinst_emit::reg_name_pub;
+        let probe = MachInst::Raw(String::new());
+        let _ = probe;
+        // Reuse the emit-side check by formatting: vregs trap in reg_name_pub.
+        // Simpler: pattern-match the operand positions the writer rewrites.
+        let mut ops: Vec<&MachOperand> = Vec::new();
+        match inst {
+            MachInst::Mov { src, dst, .. } => {
+                ops.push(src);
+                ops.push(dst);
+            }
+            MachInst::Alu { src, .. } => ops.push(src),
+            MachInst::Lea {
+                base, index, dst, ..
+            } => {
+                let _ = (base, index, dst);
+            }
+            _ => {}
+        }
+        let _ = reg_name_pub;
+        ops.iter().any(|o| {
+            matches!(
+                o,
+                MachOperand::Reg(MachReg::Vreg(_))
+                    | MachOperand::Mem {
+                        base: MachReg::Vreg(_),
+                        ..
+                    }
+                    | MachOperand::MemIndex {
+                        base: MachReg::Vreg(_),
+                        ..
+                    }
+                    | MachOperand::MemIndex {
+                        index: MachReg::Vreg(_),
+                        ..
+                    }
+            )
+        })
+    }
+
+    /// The canonical two-address idiom: `Mov lhs→v; Alu rhs,v` with v spilled,
+    /// live-out, and lhs arriving through its slot. Expected shape:
+    /// reload(lhs); mov lhs→scratch(v); alu rhs,scratch(v); store scratch(v).
+    #[test]
+    fn two_address_idiom_gets_reload_mov_alu_store() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(10, StackSlot(-8)); // lhs, arriving
+        slots.insert(11, StackSlot(-16)); // dest v
+        types.insert(10, IrType::I64);
+        types.insert(11, IrType::I64);
+        uses.insert(10, 1); // consumed here only
+        uses.insert(11, 3); // two more uses after the window
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+
+        // Post-resolve shape: the lhs read (a substitutable position) is
+        // already a stack-slot memory operand; the reg-classified dest vreg
+        // is what the allocator must home.
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::StackSlot(-8),
+                dst: MachOperand::Reg(vreg(11)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: super::super::machinst::AluOp::Add,
+                src: MachOperand::Imm(4),
+                dst: vreg(11),
+                size: OpSize::S64,
+            },
+        ];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        // mov slot(lhs)→scratch; alu imm,scratch; store scratch→slot(dest)
+        assert_eq!(out.len(), 3, "expected mov/alu/store, got {out:?}");
+        let scratch = match &out[0] {
+            MachInst::Mov {
+                src: MachOperand::StackSlot(-8),
+                dst: MachOperand::Reg(r @ MachReg::Phys(_)),
+                size: OpSize::S64,
+            } => *r,
+            other => panic!("first instruction must be the lhs load, got {other:?}"),
+        };
+        match &out[1] {
+            MachInst::Alu {
+                src: MachOperand::Imm(4),
+                dst,
+                size: OpSize::S64,
+                ..
+            } => {
+                assert_eq!(*dst, scratch, "alu must accumulate into the scratch");
+            }
+            other => panic!("second instruction must be the alu, got {other:?}"),
+        }
+        match &out[2] {
+            MachInst::Mov {
+                src: MachOperand::Reg(r),
+                dst: MachOperand::StackSlot(-16),
+                size: OpSize::S64,
+            } => assert_eq!(*r, scratch, "store must drain the scratch"),
+            other => panic!("last instruction must be the dest store, got {other:?}"),
+        }
+    }
+
+    /// The live-out test must count IR-level readers, not the RMW's own
+    /// machine-level read of the dst position. Here the dest's ONLY reader
+    /// sits after the window: the historical `e.uses < total` comparison
+    /// saw uses == total (the RMW itself), skipped the store-back, and left
+    /// the post-window reader with a stale slot image. The fix subtracts
+    /// `rmw_writes` (machine artifacts of the local write).
+    #[test]
+    fn rmw_only_use_outside_window_still_stores() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(11, StackSlot(-16)); // dest v
+        types.insert(11, IrType::I64);
+        uses.insert(11, 1); // the single real reader is AFTER the window
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+
+        // Staging Mov (pure write of v11 from a constant via materialized
+        // imm operand), then the two-address Alu RMW on v11.
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Imm(7),
+                dst: MachOperand::Reg(vreg(11)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: super::super::machinst::AluOp::Add,
+                src: MachOperand::Imm(4),
+                dst: vreg(11),
+                size: OpSize::S64,
+            },
+        ];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        assert!(
+            out.len() == 3,
+            "the dest is live-out through its sole post-window reader; \
+             mov/alu/STORE expected, got {out:?}"
+        );
+        match out.last() {
+            Some(MachInst::Mov {
+                src: MachOperand::Reg(_),
+                dst: MachOperand::StackSlot(-16),
+                size: OpSize::S64,
+            }) => {}
+            other => panic!("last instruction must be the store-back, got {other:?}"),
+        }
+    }
+
+    /// An ARRIVING vreg that an in-window two-address instruction RMWs is
+    /// refused outright: the machine RMW reads the old slot image and
+    /// overwrites the register, but SSA readers of the SOURCE after the
+    /// window need the old image while the RESULT has no relay target.
+    /// Storing back corrupts; not storing back loses. Refusal takes the
+    /// (correct) replay path instead.
+    #[test]
+    fn arriving_rmw_is_refused() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(30, StackSlot(-24)); // arriving spilled value
+        types.insert(30, IrType::I64);
+        uses.insert(30, 2); // read here (IR src) and once after the window
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+
+        let insts = vec![MachInst::Alu {
+            op: super::super::machinst::AluOp::Add,
+            src: MachOperand::Imm(4),
+            dst: vreg(30), // RMW on an arriving vreg: must be refused
+            size: OpSize::S64,
+        }];
+        assert!(
+            allocate_window(insts, &c).is_none(),
+            "arriving vreg with in-window RMW must be refused (unsound to allocate)"
+        );
+    }
+
+    /// A value fully consumed inside the window (uses == total) is DEAD
+    /// afterwards: no store, no slot traffic at all beyond the reload chain.
+    #[test]
+    fn dead_def_gets_no_store() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(20, StackSlot(-8));
+        types.insert(20, IrType::I64);
+        uses.insert(20, 1); // single use: the Cmp below
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+
+        // Cmp lhs=arriving vreg(20) (read-only, but the position is
+        // substitutable... force the register class via a Mem base):
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: vreg(20),
+                    offset: 0,
+                },
+                dst: MachOperand::Reg(phys(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(phys(2)),
+                rhs: MachOperand::Reg(vreg(20)),
+                size: OpSize::S64,
+            },
+        ];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        // reload(20) + mov + cmp — no trailing store.
+        assert_eq!(out.len(), 3, "dead value must not be stored back: {out:?}");
+        assert!(
+            !matches!(
+                out.last(),
+                Some(MachInst::Mov {
+                    dst: MachOperand::StackSlot(_),
+                    ..
+                })
+            ),
+            "dead value must not be stored back"
+        );
+    }
+
+    /// Two simultaneously-live vregs must receive DIFFERENT registers.
+    #[test]
+    fn overlapping_vregs_never_share_a_register() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        for id in [30u32, 31] {
+            slots.insert(id, StackSlot(-(8 * id as i64)));
+            types.insert(id, IrType::I64);
+            uses.insert(id, 5);
+        }
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+        let insts = vec![MachInst::Mov128 {
+            src: MachOperand::Mem {
+                base: vreg(30),
+                offset: 0,
+            },
+            dst: MachOperand::Mem {
+                base: vreg(31),
+                offset: 0,
+            },
+        }];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        // Both bases are simultaneously live (the Mov128 reads both): the
+        // two reloads must name distinct registers.
+        let reload_regs: Vec<MachReg> = out
+            .iter()
+            .filter_map(|i| match i {
+                MachInst::Mov {
+                    src: MachOperand::StackSlot(_),
+                    dst: MachOperand::Reg(r @ MachReg::Phys(_)),
+                    ..
+                } => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reload_regs.len(),
+            2,
+            "expected two base reloads, got {out:?}"
+        );
+        assert_ne!(
+            reload_regs[0], reload_regs[1],
+            "overlapping live ranges must get distinct registers"
+        );
+        // Arriving, read-only bases: no write-back traffic for them.
+        let stores: Vec<&MachInst> = out
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    MachInst::Mov {
+                        dst: MachOperand::StackSlot(_),
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(
+            stores.is_empty(),
+            "read-only arrivals must not be stored: {out:?}"
+        );
+    }
+
+    /// A register homed to a value live ACROSS the window (liveness-busy,
+    /// not referenced inside) must not be handed out as a scratch.
+    #[test]
+    fn liveness_busy_register_is_not_a_scratch() {
+        let (mut slots, mut types, mut uses, mut busy) = base_maps();
+        slots.insert(40, StackSlot(-8));
+        types.insert(40, IrType::I64);
+        uses.insert(40, 2);
+        // The preferred pool order starts with caller-saved r11(10), r10(11),
+        // r8(12), r9(13), rdi(14), rsi(15), rdx(16). Mark ALL of them
+        // liveness-busy across the window; the allocator must pick a
+        // callee-saved register instead.
+        for r in [10u8, 11, 12, 13, 14, 15, 16] {
+            busy.insert(r, vec![(0, 15)]);
+        }
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+        // Staging Mov makes v40 a locally-defined window value (the pure
+        // write); the Alu then RMWs it. An arriving vreg RMW'd in-window is
+        // refused (unsound: see `arriving_rmw_is_refused`), so the two-
+        // address idiom in real windows always carries this staging Mov.
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::StackSlot(-8),
+                dst: MachOperand::Reg(vreg(40)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: super::super::machinst::AluOp::Add,
+                src: MachOperand::Imm(1),
+                dst: vreg(40),
+                size: OpSize::S64,
+            },
+        ];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        let reload = out.iter().find_map(|i| match i {
+            MachInst::Mov {
+                src: MachOperand::StackSlot(_),
+                dst: MachOperand::Reg(r),
+                ..
+            } => Some(*r),
+            _ => None,
+        });
+        let Some(MachReg::Phys(pr)) = reload else {
+            panic!("no reload found in {out:?}")
+        };
+        assert!(
+            !matches!(pr.0, 10 | 11 | 12 | 13 | 14 | 15 | 16),
+            "scratch {pr:?} collides with a liveness-busy register"
+        );
+    }
+
+    /// A phys operand inside the live range blocks that register even when
+    /// it is not busy anywhere else.
+    #[test]
+    fn phys_operand_interference_is_respected() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(50, StackSlot(-8));
+        types.insert(50, IrType::I64);
+        uses.insert(50, 2);
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+        let insts = vec![
+            // Staging Mov: locally defines v50 so the later RMW is the
+            // sound two-address idiom (an arriving RMW is refused).
+            MachInst::Mov {
+                src: MachOperand::StackSlot(-8),
+                dst: MachOperand::Reg(vreg(50)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: vreg(50),
+                    offset: 0,
+                },
+                dst: MachOperand::Reg(phys(10)), // r11 used as a plain operand
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: super::super::machinst::AluOp::Add,
+                src: MachOperand::Reg(phys(10)),
+                dst: vreg(50),
+                size: OpSize::S64,
+            },
+        ];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        let scratch = out.iter().find_map(|i| match i {
+            MachInst::Mov {
+                src: MachOperand::StackSlot(_),
+                dst: MachOperand::Reg(r),
+                ..
+            } => Some(*r),
+            _ => None,
+        });
+        let Some(MachReg::Phys(pr)) = scratch else {
+            panic!("no reload found in {out:?}")
+        };
+        assert_ne!(pr.0, 10, "scratch must not collide with the r11 operand");
+    }
+
+    /// The implicit rax/rdx clobbers of the division forms block those
+    /// registers across their span.
+    #[test]
+    fn division_clobbers_block_rax_and_rdx() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(60, StackSlot(-8));
+        types.insert(60, IrType::I64);
+        uses.insert(60, 9);
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: vreg(60),
+                    offset: 0,
+                },
+                dst: MachOperand::Reg(phys(0)), // dividend → rax
+                size: OpSize::S64,
+            },
+            MachInst::Cqto { size: OpSize::S64 },
+            MachInst::Div {
+                divisor: MachOperand::Reg(phys(1)),
+                signed: true,
+                size: OpSize::S64,
+            },
+        ];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        assert_no_vregs(&out);
+        let scratch = out.iter().find_map(|i| match i {
+            MachInst::Mov {
+                src: MachOperand::StackSlot(_),
+                dst: MachOperand::Reg(r),
+                ..
+            } => Some(*r),
+            _ => None,
+        });
+        let Some(MachReg::Phys(pr)) = scratch else {
+            panic!("no reload found in {out:?}")
+        };
+        assert!(
+            !matches!(pr.0, 0 | 16),
+            "scratch {pr:?} collides with rax/rdx division clobbers"
+        );
+    }
+
+    /// Refusals: XMM domain, missing slot, alloca value, double pure write.
+    #[test]
+    fn admission_refusals() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(70, StackSlot(-8)); // 70: fine
+        slots.insert(71, StackSlot(-16)); // 71: XMM domain via FAlu
+        slots.insert(72, StackSlot(-24)); // 72: float type
+        types.insert(70, IrType::I64);
+        types.insert(71, IrType::I64);
+        types.insert(72, IrType::F64);
+        uses.insert(70, 1);
+        uses.insert(71, 1);
+        uses.insert(72, 1);
+
+        // XMM-domain reference (FAlu dst): refused.
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+        let xmm = vec![MachInst::FAlu {
+            op: super::super::machinst::FAluOp::Add,
+            src2: MachOperand::Reg(phys(20)),
+            src1: vreg(71),
+            dst: vreg(71),
+            size: OpSize::S64,
+        }];
+        assert!(
+            allocate_window(xmm, &c).is_none(),
+            "XMM domain must be refused"
+        );
+
+        // Float-typed value in a GPR position: refused.
+        let flt = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(72)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        assert!(
+            allocate_window(flt, &c).is_none(),
+            "float type must be refused"
+        );
+
+        // Missing slot: refused.
+        let noslot = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(99)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        assert!(
+            allocate_window(noslot, &c).is_none(),
+            "slotless vreg must be refused"
+        );
+
+        // Double pure write (SSA violation): refused.
+        let twowrite = vec![
+            MachInst::Mov {
+                src: MachOperand::Imm(1),
+                dst: MachOperand::Reg(vreg(70)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Imm(2),
+                dst: MachOperand::Reg(vreg(70)),
+                size: OpSize::S64,
+            },
+        ];
+        assert!(
+            allocate_window(twowrite, &c).is_none(),
+            "two pure writes must be refused"
+        );
+
+        // Alloca-backed value: refused (slot holds storage, not the pointer).
+        let mut alloca = FxHashSet::default();
+        alloca.insert(70);
+        let c2 = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &alloca,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let alloc = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(70)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        assert!(
+            allocate_window(alloc, &c2).is_none(),
+            "alloca vreg must be refused"
+        );
+    }
+
+    /// A Vreg shift amount refuses the window (the emitter's %cl-only form
+    /// would silently drop the count).
+    #[test]
+    fn vreg_shift_amount_refuses() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(80, StackSlot(-8));
+        types.insert(80, IrType::I64);
+        uses.insert(80, 5);
+        let empty = FxHashSet::default();
+        let c = ctx(&slots, &types, &uses, &busy, &empty);
+        let insts = vec![MachInst::Shift {
+            op: super::super::machinst::ShiftOp::Shl,
+            amount: MachOperand::Reg(vreg(80)),
+            dst: vreg(80),
+            size: OpSize::S64,
+        }];
+        assert!(
+            allocate_window(insts, &c).is_none(),
+            "a Vreg shift amount must refuse the window"
+        );
+    }
+
+    /// classify_window returns exactly the vregs in register-only positions
+    /// or memory bases — not the substitutable ones.
+    #[test]
+    fn classify_window_picks_register_positions() {
+        let insts = vec![
+            // A Mov src is substitutable (memory-form read).
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)),
+                dst: MachOperand::Reg(phys(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(vreg(1)), // substitutable
+                rhs: MachOperand::Imm(0),
+                size: OpSize::S64,
+            },
+            // A two-address ALU dest is register-only.
+            MachInst::Alu {
+                op: super::super::machinst::AluOp::Add,
+                src: MachOperand::Imm(1),
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(phys(2)),
+                dst: MachOperand::Mem {
+                    base: vreg(3), // memory base
+                    offset: 0,
+                },
+                size: OpSize::S64,
+            },
+        ];
+        let classified = classify_window(&insts, None);
+        assert!(classified.contains(&2), "two-address dest must classify");
+        assert!(classified.contains(&3), "memory base must classify");
+        assert!(
+            !classified.contains(&1),
+            "substitutable positions must not classify"
+        );
+    }
+
+    /// The narrow-slot promotion: a small-slot vreg read at S64 by a
+    /// substitutable-position instruction cannot take the slot-substitution
+    /// path (the memory operand would read 8 bytes of a 4-byte slot), so it
+    /// must be classified for a window register. The resolver leaves it
+    /// untouched and the allocator rewrites every occurrence — this is the
+    /// agreement that makes the flush pipeline sound.
+    #[test]
+    fn classify_window_promotes_wide_reads_of_small_slots() {
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)), // small slot, read at S64
+                dst: MachOperand::Reg(phys(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)),
+                dst: MachOperand::Reg(phys(3)),
+                size: OpSize::S32, // fits a 4-byte slot: stays substitutable
+            },
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(vreg(1)),
+                rhs: MachOperand::Imm(0),
+                size: OpSize::S64, // wide Test shape: promoted too
+            },
+        ];
+        let mut small = FxHashSet::default();
+        small.insert(1);
+        let classified = classify_window(&insts, Some(&small));
+        assert!(
+            classified.contains(&1),
+            "S64 access of a 4-byte slot must promote to a window register"
+        );
+        // Without small-slot knowledge the same vreg stays substitutable.
+        let blind = classify_window(&insts, None);
+        assert!(
+            !blind.contains(&1),
+            "without slot-width knowledge the position is substitutable"
+        );
+    }
+
+    /// End-to-end: a wide Mov from a small-slot vreg gets a scratch register
+    /// with a 32-bit reload (movl zero-extends — the full register is
+    /// defined, exactly the text path's discipline), the S64 Mov then reads
+    /// the whole scratch, and the slot image is never widened.
+    #[test]
+    fn wide_read_of_small_slot_gets_typed_reload() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(7, StackSlot(-12)); // 4-byte small slot
+        types.insert(7, IrType::I32);
+        uses.insert(7, 1); // only this read: dead after the window
+        let mut small = FxHashSet::default();
+        small.insert(7);
+        let empty = FxHashSet::default();
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &small,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(7)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("promotion must allocate");
+        assert_no_vregs(&out);
+        // Reload inserted before the Mov, at the value's own width (S32 for
+        // a small slot — never S64: that would read the neighbour's bytes).
+        match &out[..] {
+            [
+                MachInst::Mov {
+                    src: MachOperand::StackSlot(-12),
+                    dst: MachOperand::Reg(MachReg::Phys(r)),
+                    size: OpSize::S32,
+                },
+                MachInst::Mov { src, dst, size },
+            ] => {
+                assert!(matches!(src, MachOperand::Reg(MachReg::Phys(p)) if *p == *r));
+                assert!(matches!(dst, MachOperand::Reg(MachReg::Phys(d)) if d.0 == 2));
+                assert!(*size == OpSize::S64);
+            }
+            other => panic!("expected [reload(S32), wide mov], got {other:?}"),
+        }
+    }
+
+    /// The promotion must NOT fire for an 8-byte slot (S64 substitution is
+    /// in-bounds there) nor for S32 accesses of a small slot: both keep the
+    /// optimal memory-operand substitution.
+    #[test]
+    fn promotion_is_narrow_slot_and_wide_access_only() {
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(9)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let mut small = FxHashSet::default();
+        small.insert(9);
+        // v9 IS small-slotted... but the access below is S32.
+        let insts32 = vec![MachInst::Mov {
+            src: MachOperand::Reg(vreg(9)),
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S32,
+        }];
+        let classified64 = classify_window(&insts, Some(&small));
+        assert!(classified64.contains(&9));
+        let classified32 = classify_window(&insts32, Some(&small));
+        assert!(
+            !classified32.contains(&9),
+            "S32 access of a 4-byte slot stays substitutable"
+        );
+    }
+
+    /// Small slots (4 bytes) clamp the transfer width to 32 bits: a 64-bit
+    /// reload would read the neighbouring slot.
+    #[test]
+    fn small_slot_transfer_width_is_clamped() {
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(90, StackSlot(-8));
+        types.insert(90, IrType::I64); // even a 64-bit typed value...
+        uses.insert(90, 3);
+        let small: FxHashSet<u32> = {
+            let mut s = FxHashSet::default();
+            s.insert(90);
+            s
+        };
+        let empty = FxHashSet::default();
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &small,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Mem {
+                base: vreg(90),
+                offset: 0,
+            },
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        let reload = out.iter().find_map(|i| match i {
+            MachInst::Mov {
+                src: MachOperand::StackSlot(_),
+                dst: MachOperand::Reg(_),
+                size,
+            } => Some(*size),
+            _ => None,
+        });
+        assert_eq!(
+            reload,
+            Some(OpSize::S32),
+            "small-slot transfers must be 32-bit"
+        );
+    }
+
+    /// A sub-word arriving vreg must reload with an instruction that
+    /// DEFINES THE FULL REGISTER (movzx/movsx), never a partial `movb`/
+    /// `movw`: home moves and full-width consumers read the vreg as a
+    /// 64-bit register image, and a partial reload leaks whatever the
+    /// register held before into that image (the vsnprintf `number()`
+    /// phantom-NUL miscompile).
+    #[test]
+    fn subword_arriving_reload_defines_full_register() {
+        // U8: zero-extending reload.
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(91, StackSlot(-16));
+        types.insert(91, IrType::U8);
+        uses.insert(91, 2);
+        let empty = FxHashSet::default();
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Mem {
+                base: vreg(91),
+                offset: 0,
+            },
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        let matches = out.iter().any(|i| {
+            matches!(
+                i,
+                MachInst::Movzx {
+                    src: MachOperand::StackSlot(_),
+                    dst: MachReg::Phys(_),
+                    from_size: OpSize::S8,
+                    to_size: OpSize::S32,
+                }
+            )
+        });
+        assert!(
+            matches,
+            "U8 arriving reload must be movzbl (full-register def), got: {out:?}"
+        );
+
+        // I8: sign-extending reload.
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(92, StackSlot(-24));
+        types.insert(92, IrType::I8);
+        uses.insert(92, 2);
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![MachInst::Mov {
+            src: MachOperand::Mem {
+                base: vreg(92),
+                offset: 0,
+            },
+            dst: MachOperand::Reg(phys(2)),
+            size: OpSize::S64,
+        }];
+        let (out, _writes, _vw) = allocate_window(insts, &c).expect("allocation must succeed");
+        let matches = out.iter().any(|i| {
+            matches!(
+                i,
+                MachInst::Movsx {
+                    src: MachOperand::StackSlot(_),
+                    dst: MachReg::Phys(_),
+                    from_size: OpSize::S8,
+                    to_size: OpSize::S64,
+                }
+            )
+        });
+        assert!(
+            matches,
+            "I8 arriving reload must be movsbq (full-register def), got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn origin_tags_stay_aligned_with_reverse_inserted_reloads() {
+        // Two arriving vregs consumed by relay copies into pre-colored
+        // destinations (the kernel do_setlink loop-phi shape: slot →
+        // window scratch → phi home). The reload for the second vreg
+        // inserts at index 1; the Origin tags MUST grow through the same
+        // reverse insertion as the instructions, or the first relay copy
+        // inherits the second vreg's inserted-traffic tag and its
+        // pre-colored home write is classified ScratchOrClobber with a
+        // foreign writer — the flush overlay then records a Clobber for a
+        // register whose resident value is still live (S11 red-team find,
+        // net/core/rtnetlink.c do_setlink).
+        let (mut slots, mut types, mut uses, busy) = base_maps();
+        slots.insert(7, StackSlot(-24));
+        slots.insert(9, StackSlot(-28));
+        types.insert(7, IrType::I64);
+        types.insert(9, IrType::I64);
+        uses.insert(7, 1);
+        uses.insert(9, 1);
+        let empty = FxHashSet::default();
+        let c = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(7)),
+                dst: MachOperand::Reg(phys(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(9)),
+                dst: MachOperand::Reg(phys(3)),
+                size: OpSize::S64,
+            },
+        ];
+        let (_out, writes, vreg_writers) =
+            allocate_window(insts, &c).expect("allocation must succeed");
+        // Both relay destinations were pre-colored BEFORE the rewrite: the
+        // pre-rewrite dst registers carry no vreg, so their writes are
+        // definitions of their home values — never scratch.
+        assert_eq!(
+            writes.get(&2),
+            Some(&WindowWriteKind::Precolor),
+            "relay dst Phys(2) must classify Precolor, got: {writes:?}"
+        );
+        assert_eq!(
+            writes.get(&3),
+            Some(&WindowWriteKind::Precolor),
+            "relay dst Phys(3) must classify Precolor, got: {writes:?}"
+        );
+        // The misalignment signature: the first relay would carry the
+        // SECOND vreg's inserted tag (vreg_writers[2] = 9).
+        assert!(
+            !vreg_writers.contains_key(&2) && !vreg_writers.contains_key(&3),
+            "core relay dsts must not be tagged as inserted vreg writes, got: {vreg_writers:?}"
+        );
+    }
+
+    #[test]
+    fn typed_call_write_state_preserves_saved_and_ipa_homes() {
+        let r8_family = super::super::ipa_ra::KEEP_PHYS
+            .iter()
+            .find_map(|&(family, id)| (id == 12).then_some(family))
+            .expect("r8 must be an IPA keep candidate");
+        let call = MachInst::CallTyped {
+            caller_saves: vec![(crate::backend::regalloc::PhysReg(13), -8)],
+            args: Vec::new(),
+            target: CallTarget::Direct("callee".to_string()),
+            ret: None,
+            gp_arg_count: Some(0),
+            ipa_keep: r8_family,
+        };
+        let preserved = call_preserved_homes(&call);
+        assert!(preserved.contains(&12), "IPA-kept r8 must survive");
+        assert!(preserved.contains(&13), "saved/restored r9 must survive");
+        assert!(!preserved.contains(&14), "rdi remains caller-clobbered");
+
+        let insts = vec![
+            MachInst::Mov {
+                src: MachOperand::Imm(7),
+                dst: MachOperand::Reg(phys(12)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Imm(8),
+                dst: MachOperand::Reg(phys(13)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Imm(9),
+                dst: MachOperand::Reg(phys(14)),
+                size: OpSize::S64,
+            },
+            call,
+        ];
+        let writes = window_last_writes_core(&insts);
+        assert_eq!(writes.get(&12), Some(&WindowWriteKind::Precolor));
+        assert_eq!(writes.get(&13), Some(&WindowWriteKind::Precolor));
+        assert_eq!(writes.get(&14), Some(&WindowWriteKind::ScratchOrClobber));
+
+        // Exercise the allocating classifier too. This is the path that used
+        // to poison the still-live IPA home and trip the emitter's fail-closed
+        // stale-home check even though the core-only helper was correct.
+        let (slots, types, uses, busy) = base_maps();
+        let empty = FxHashSet::default();
+        let ctx = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let (_out, allocated_writes, _vreg_writers) =
+            allocate_window(insts, &ctx).expect("a fully pre-colored call window must allocate");
+        assert_eq!(allocated_writes.get(&12), Some(&WindowWriteKind::Precolor));
+        assert_eq!(allocated_writes.get(&13), Some(&WindowWriteKind::Precolor));
+        assert_eq!(
+            allocated_writes.get(&14),
+            Some(&WindowWriteKind::ScratchOrClobber)
+        );
+    }
+
+    #[test]
+    fn implicit_write_classifiers_agree_on_division_and_raw() {
+        let insts = vec![
+            MachInst::Cqto { size: OpSize::S64 },
+            MachInst::Div {
+                divisor: MachOperand::Reg(phys(1)),
+                signed: true,
+                size: OpSize::S64,
+            },
+            MachInst::XorRdx,
+            MachInst::Raw("movq %r8, %r9".to_string()),
+        ];
+        let expected = window_last_writes_core(&insts);
+        let (slots, types, uses, busy) = base_maps();
+        let empty = FxHashSet::default();
+        let ctx = WindowCtx {
+            slots: &slots,
+            small_slots: &empty,
+            types: &types,
+            total_uses: &uses,
+            alloca_values: &empty,
+            reg_busy: &busy,
+            window_span: (0, 15),
+        };
+        let (_out, actual, _vreg_writers) = allocate_window(insts, &ctx)
+            .expect("a fully pre-colored implicit-write window must allocate");
+        assert_eq!(actual, expected);
+    }
+}

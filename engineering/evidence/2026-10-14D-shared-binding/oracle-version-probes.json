@@ -1,0 +1,352 @@
+{
+  "gcc16.2": {
+    "id": "cg162",
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "response": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [
+        {
+          "text": "\u001b[01m\u001b[K<source>:1:9:\u001b[m\u001b[K \u001b[01;36m\u001b[Knote: \u001b[m\u001b[K'\u001b[01m\u001b[K#pragma message: 16.2.0\u001b[m\u001b[K'",
+          "tag": {
+            "line": 1,
+            "column": 9,
+            "text": "note: '#pragma message: 16.2.0'",
+            "severity": 1,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "    1 | #pragma \u001b[01;36m\u001b[Kmessage\u001b[m\u001b[K(__VERSION__)"
+        },
+        {
+          "text": "      |         \u001b[01;36m\u001b[K^~~~~~~\u001b[m\u001b[K"
+        }
+      ],
+      "truncated": false,
+      "execTime": 149,
+      "processExecutionResultTime": 0.03816499997628853,
+      "instructionSet": "amd64",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "-S",
+        "-fdiagnostics-color=always",
+        "-O2",
+        "/app/example.c"
+      ],
+      "downloads": [],
+      "tools": [],
+      "asmSize": 2314,
+      "asm": [
+        {
+          "text": "version_probe:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  xorl %eax, %eax",
+          "source": {
+            "file": null,
+            "line": 2,
+            "column": 34
+          },
+          "labels": []
+        },
+        {
+          "text": "  ret",
+          "source": {
+            "file": null,
+            "line": 2,
+            "column": 34
+          },
+          "labels": []
+        }
+      ],
+      "optOutput": [],
+      "labelDefinitions": {
+        "version_probe": 1
+      },
+      "parsingTime": 1,
+      "filteredCount": 139,
+      "popularArguments": {},
+      "queueTime": 58
+    }
+  },
+  "clang": {
+    "id": "cclang2310",
+    "metadata": {
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang"
+    },
+    "response": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [
+        {
+          "text": "\u001b[1m<source>:1:9: \u001b[0m\u001b[0;1;35mwarning: \u001b[0m\u001b[1mClang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) [-W#pragma-messages]\u001b[0m",
+          "tag": {
+            "line": 1,
+            "column": 9,
+            "text": "warning: Clang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4) [-W#pragma-messages]",
+            "severity": 2,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "    1 | #pragma message(__VERSION__)\u001b[0m"
+        },
+        {
+          "text": "      | \u001b[0;1;32m        ^"
+        },
+        {
+          "text": "\u001b[0m1 warning generated."
+        }
+      ],
+      "truncated": false,
+      "execTime": 44,
+      "processExecutionResultTime": 0.046852000057697296,
+      "instructionSet": "amd64",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "-S",
+        "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+        "-fcolor-diagnostics",
+        "-fno-crash-diagnostics",
+        "-O2",
+        "/app/example.c"
+      ],
+      "downloads": [],
+      "tools": [],
+      "asmSize": 2529,
+      "asm": [
+        {
+          "text": "version_probe:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  xorl %eax, %eax",
+          "source": {
+            "file": null,
+            "line": 2,
+            "column": 25
+          },
+          "labels": []
+        },
+        {
+          "text": "  retq",
+          "source": {
+            "file": null,
+            "line": 2,
+            "column": 25
+          },
+          "labels": []
+        },
+        {
+          "text": "",
+          "source": null,
+          "labels": []
+        }
+      ],
+      "optOutput": [],
+      "labelDefinitions": {
+        "version_probe": 1
+      },
+      "parsingTime": 0,
+      "filteredCount": 148,
+      "popularArguments": {},
+      "queueTime": 11
+    }
+  },
+  "icc": {
+    "id": "cicc2021100",
+    "metadata": {
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": ""
+    },
+    "response": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "Intel(R) C++ gcc 13.2 mode"
+        }
+      ],
+      "stderr": [
+        {
+          "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+        }
+      ],
+      "truncated": false,
+      "execTime": 1044,
+      "processExecutionResultTime": 0.029296999797225,
+      "instructionSet": "amd64",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-S",
+        "-gxx-name=/opt/compiler-explorer/gcc-13.2.0/bin/g++",
+        "-O2",
+        "/app/example.c"
+      ],
+      "downloads": [],
+      "tools": [],
+      "asmSize": 4151,
+      "asm": [
+        {
+          "text": "version_probe:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "..B1.1: # Preds ..B1.0",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  xorl %eax, %eax #2.32",
+          "source": {
+            "file": null,
+            "line": 2
+          },
+          "labels": []
+        },
+        {
+          "text": "  ret #2.32",
+          "source": {
+            "file": null,
+            "line": 2
+          },
+          "labels": []
+        }
+      ],
+      "optOutput": [],
+      "labelDefinitions": {
+        "version_probe": 1,
+        "..B1.1": 2
+      },
+      "parsingTime": 4,
+      "filteredCount": 202,
+      "popularArguments": {},
+      "queueTime": 6
+    }
+  },
+  "icx": {
+    "id": "cicxlatest",
+    "metadata": {
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel"
+    },
+    "response": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [
+        {
+          "text": "\u001b[1m<source>:1:9: \u001b[0m\u001b[0;1;35mwarning: \u001b[0m\u001b[1mIntel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017) [-W#pragma-messages]\u001b[0m",
+          "tag": {
+            "line": 1,
+            "column": 9,
+            "text": "warning: Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017) [-W#pragma-messages]",
+            "severity": 2,
+            "file": "example.c"
+          }
+        },
+        {
+          "text": "    1 | #pragma message(__VERSION__)\u001b[0m"
+        },
+        {
+          "text": "      | \u001b[0;1;32m        ^"
+        },
+        {
+          "text": "\u001b[0m1 warning generated."
+        }
+      ],
+      "truncated": false,
+      "execTime": 245,
+      "processExecutionResultTime": 0.04226299747824669,
+      "instructionSet": "amd64",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "-S",
+        "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+        "-fcolor-diagnostics",
+        "-fno-crash-diagnostics",
+        "-O2",
+        "/app/example.c"
+      ],
+      "downloads": [],
+      "tools": [],
+      "asmSize": 2143,
+      "asm": [
+        {
+          "text": "version_probe:",
+          "source": null,
+          "labels": []
+        },
+        {
+          "text": "  xorl %eax, %eax",
+          "source": {
+            "file": null,
+            "line": 2,
+            "column": 25
+          },
+          "labels": []
+        },
+        {
+          "text": "  retq",
+          "source": {
+            "file": null,
+            "line": 2,
+            "column": 25
+          },
+          "labels": []
+        },
+        {
+          "text": "",
+          "source": null,
+          "labels": []
+        }
+      ],
+      "optOutput": [],
+      "labelDefinitions": {
+        "version_probe": 1
+      },
+      "parsingTime": 2,
+      "filteredCount": 123,
+      "popularArguments": {},
+      "queueTime": 4
+    }
+  }
+}

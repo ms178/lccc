@@ -1,0 +1,3 @@
+PASS: registered SSE1-only assertion still rejects an SSE2-enabled build.
+/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c:9:2: error: #error this workload must exercise an SSE1-only target
+ccc: error: 1 preprocessor error(s) in tests/benchmark/programs/f32_sse1_map.c

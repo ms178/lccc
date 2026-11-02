@@ -1,0 +1,11 @@
+{
+  "repo": "ms178/archpkgbuilds",
+  "main": "2e62d34d5970fea9dc20ea1f940497ab058ca42d",
+  "recipe_path": "packages/zstd/PKGBUILD",
+  "recipe_sha256": "faad56c131e93f28c509528efa0133cd07f909c6f658f4bb5fa5675c1bb993f3",
+  "patch_sha256": "aa15486d10778c9d00a9b6273101e11feb952aca0b66432a53625dfb67390d8e",
+  "source_sha256": "5b331d961d6989dc21bb03397fc7a2a4d86bc65a14adc5ffbbce050354e30fd2",
+  "version": "1.5.7",
+  "pkgrel": 16,
+  "interpretation": "Recipe refreshed; upstream source and patch unchanged. No fresh performance run implied."
+}

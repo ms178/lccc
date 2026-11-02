@@ -1,0 +1,1707 @@
+//! Function lowering pipeline: AST function definitions -> IR functions.
+//!
+//! Handles the complete function lowering pipeline:
+//! 1. Set up return type (handling sret, two-reg, complex ABI overrides)
+//! 2. Build IR parameter list (decomposing complex params for ABI)
+//! 3. Allocate parameters as locals (3-phase: basic allocas, struct setup, complex reconstruction)
+//! 4. Handle K&R float promotion
+//! 5. Lower the function body
+//! 6. Finalize (implicit return, emit IrFunction)
+//!
+//! Also handles VLA parameter stride computation and dimension collection.
+
+use super::definitions::{FuncSig, IrParamBuildResult, LocalInfo, ParamKind, VarInfo, VlaDimInfo};
+use super::func_state::FunctionBuildState;
+use super::lower::Lowerer;
+use crate::common::fx_hash::FxHashMap;
+use crate::common::types::{AddressSpace, CType, IrType};
+use crate::frontend::parser::ast::{
+    BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, ParamDecl, Stmt, TypeSpecifier,
+};
+use crate::ir::reexports::{
+    Instruction, IrBinOp, IrConst, IrFunction, IrParam, Operand, Terminator, Value,
+};
+
+impl Lowerer {
+    /// Lower a function definition to IR.
+    ///
+    /// Orchestrates the function lowering pipeline:
+    /// 1. Set up return type (handling sret, two-reg, complex ABI overrides)
+    /// 2. Build IR parameter list (decomposing complex params for ABI)
+    /// 3. Allocate parameters as locals (3-phase: basic allocas, struct setup, complex reconstruction)
+    /// 4. Handle K&R float promotion
+    /// 5. Lower the function body
+    /// 6. Finalize (implicit return, emit IrFunction)
+    pub(super) fn lower_function(&mut self, func: &FunctionDef) {
+        if self.defined_functions.contains(&func.name) {
+            // GNU89 extern-inline redefinition: an `extern __inline` body
+            // (gnu89 mode or __attribute__((gnu_inline))) does NOT provide
+            // the external definition, and GCC explicitly permits a later
+            // plain definition of the same name in the same TU — that one
+            // becomes THE external definition. glibc's libio/feof_u.c is
+            // exactly this shape: include/stdio.h provides __extern_inline
+            // __feof_unlocked, feof_u.c provides the out-of-line definition
+            // plus weak_alias(feof_unlocked). The weak alias makes the name
+            // "referenced", so the inline husk is lowered first; first-wins
+            // then silently DROPPED the real definition and feof_u.o was
+            // empty (ldconfig: undefined reference to feof_unlocked).
+            //
+            // Replace the husk with the real definition. The plain body is
+            // authoritative for both emission and inlining from here on.
+            let new_is_extern_def = !self.is_gnu_inline_no_extern_def(&func.attrs);
+            let emitted_name = self
+                .asm_label_map
+                .get(&func.name)
+                .cloned()
+                .unwrap_or_else(|| func.name.clone());
+            let husk_idx =
+                self.module.functions.iter().position(|f| {
+                    f.name == emitted_name && f.is_gnu_inline_def && !f.is_declaration
+                });
+            match husk_idx {
+                Some(i) if new_is_extern_def => {
+                    self.module.functions.remove(i);
+                }
+                // Plain duplicate definition (a frontend diagnostic case) or
+                // an extern-inline body FOLLOWING the real definition (GCC
+                // errors on that shape): keep the first definition.
+                _ => return,
+            }
+        }
+        self.defined_functions.insert(func.name.clone());
+
+        let prev_no_sanitize = self.func_no_sanitize;
+        let mut func_no_san = self
+            .decl_no_sanitize_map
+            .get(&func.name)
+            .copied()
+            .unwrap_or_default();
+        if let Some(ref ns) = func.attrs.no_sanitize {
+            func_no_san = func_no_san.union(super::ubsan::UbsanFlags::parse_no_sanitize_attr(ns));
+        }
+        self.func_no_sanitize = func_no_san;
+
+        let return_is_bool = self.is_type_bool(&func.return_type);
+        let base_return_type = self.type_spec_to_ir(&func.return_type);
+        self.fp_expr_tags.clear();
+        self.func_state = Some(FunctionBuildState::new(
+            func.name.clone(),
+            base_return_type,
+            return_is_bool,
+        ));
+        self.diagnose_x86_target_attribute(func);
+        self.func_mut().target_features = func
+            .attrs
+            .target
+            .as_deref()
+            .map(crate::ir::module::normalize_target_features)
+            .unwrap_or_default();
+        self.func_mut().x86_defers_isa =
+            func.attrs.is_always_inline() && self.func_mut().target_features.is_empty();
+        let return_ctype = self.type_spec_to_ctype(&func.return_type);
+        if !func.attrs.is_static() && !self.is_internal_function(&func.name) {
+            self.diagnose_unsupported_ext_vector_abi(&return_ctype, true, func.span);
+        }
+        self.func_mut().return_ctype = Some(return_ctype);
+        // Clear get_expr_ctype memoization cache: results depend on
+        // per-function state (local variables), so cannot span functions.
+        self.expr_ctype_cache.borrow_mut().clear();
+        // Mark whether this function is an inline candidate. __builtin_constant_p
+        // in non-inline functions always resolves to 0 for non-constant expressions
+        // at lowering time. In inline candidates, it emits an IsConstant IR instruction
+        // that can be resolved to 1 after inlining if the parameter becomes constant.
+        self.func_mut().is_inline_candidate =
+            func.attrs.is_always_inline() || func.attrs.is_inline() || func.attrs.is_static();
+        self.push_scope();
+
+        // Step 1: Compute ABI-adjusted return type
+        let return_type = self.compute_function_return_type(func);
+        self.func_mut().return_type = return_type;
+
+        // Step 2: Build IR parameter list with ABI decomposition
+        let param_info = self.build_ir_params(func);
+
+        // Step 3: Allocate parameters as locals (3-phase)
+        let entry_label = self.fresh_label();
+        self.start_block(entry_label);
+        self.func_mut().sret_ptr = None;
+        self.allocate_function_params(func, &param_info);
+
+        // Step 4: Evaluate VLA parameter size expressions for side effects.
+        // E.g., `void foo(int a, int b[a++])` - the `a++` must be evaluated
+        // so that `a` is incremented before the function body runs.
+        self.evaluate_vla_param_side_effects(func);
+
+        // Step 5: K&R float promotion
+        self.handle_kr_float_promotion(func);
+
+        // Step 5.5: Pre-scan the function body for label definitions and their scope depths.
+        // This is needed so that `goto` can determine how many cleanup scopes to exit,
+        // even for forward references (goto before label definition).
+        let label_depths = Self::prescan_label_depths(&func.body);
+        self.func_mut().user_label_depths = label_depths;
+
+        // Step 6: Lower body
+        self.lower_compound_stmt(&func.body);
+
+        // Step 7: Finalize
+        let uses_sret = param_info.uses_sret;
+        self.finalize_function(func, return_type, param_info.params, uses_sret);
+        self.func_no_sanitize = prev_no_sanitize;
+    }
+
+    /// Compute the IR return type for a function, applying ABI overrides.
+    pub(super) fn compute_function_return_type(&mut self, func: &FunctionDef) -> IrType {
+        // Record complex return type for expr_ctype resolution
+        let ret_ctype = self.type_spec_to_ctype(&func.return_type);
+        if ret_ctype.is_complex() {
+            self.types
+                .func_return_ctypes
+                .insert(func.name.clone(), ret_ctype.clone());
+        }
+
+        // Use the return type from the already-registered signature, which has
+        // complex ABI overrides applied (e.g., ComplexDouble -> F64, ComplexFloat -> F64/F32).
+        if let Some(sig) = self.func_meta.sigs.get(&func.name) {
+            // Two-register struct returns (9-16 bytes) are packed into I128 by the
+            // IR lowering (Shl+Or), so the function's return type must be I128 to
+            // ensure the codegen uses the register-pair return path (a0+a1).
+            if sig.two_reg_ret_size.is_some() {
+                return IrType::I128;
+            }
+            // Small vector returns (≤8 bytes) are packed into I64 by the
+            // lowering. On 64-bit targets, small struct returns also use I64.
+            // On 32-bit targets (i686), ALL struct/union returns use sret, so
+            // this struct branch is now unreachable for i686; kept as a safety
+            // fallback for indirect calls with missing signatures.
+            if sig.sret_size.is_none() && sig.two_reg_ret_size.is_none() {
+                if let Some(ref rc) = sig.return_ctype {
+                    if rc.is_struct_or_union() && crate::common::types::target_is_32bit() {
+                        return IrType::Ptr;
+                    }
+                    if rc.is_vector() {
+                        // i686 ExtVector signatures already carry the ABI lane
+                        // bundle type (I32/I64/I128) computed in the first pass.
+                        // Do not collapse the three-register case back to I64.
+                        if crate::common::types::target_is_32bit()
+                            && rc.i686_ext_vector_ret_carrier().is_some()
+                        {
+                            return sig.return_type;
+                        }
+                        // X87-class vector return (a one-lane `long double`
+                        // ext vector: Clang's `<1 x x86_fp80>` scalarizes to
+                        // `%st(0)`): the signature carries F128 and the
+                        // return statement loads the long double out of the
+                        // object (`ret_x87_aggregate`). Collapsing it to I64
+                        // here made the definition return a double image in
+                        // %rax while every caller — Clang and lccc's own —
+                        // popped %st(0) (ABI-EXTVEC-LD-1: `ldx1 ident/kfour`
+                        // failed even lccc -> lccc).
+                        if sig.ret_x87_aggregate || sig.ret_x87_pair {
+                            return sig.return_type;
+                        }
+                        // Small legacy vector_size returns (≤8 bytes) use I64.
+                        return IrType::I64;
+                    }
+                }
+            }
+            return sig.return_type;
+        }
+
+        // Fallback: compute directly (shouldn't normally be reached)
+        self.type_spec_to_ir(&func.return_type)
+    }
+
+    /// Build the IR parameter list for a function, handling ABI decomposition.
+    pub(super) fn build_ir_params(&mut self, func: &FunctionDef) -> IrParamBuildResult {
+        let mut params: Vec<IrParam> = Vec::new();
+        let mut param_kinds: Vec<ParamKind> = Vec::new();
+        let mut uses_sret = false;
+
+        // Check if function returns a large struct via sret
+        if let Some(sig) = self.func_meta.sigs.get(&func.name) {
+            if let Some(sret_size) = sig.sret_size {
+                params.push(IrParam {
+                    ty: IrType::Ptr,
+                    noalias: false,
+                    struct_size: None,
+                    struct_align: None,
+                    param_align: None,
+                    struct_eightbyte_classes: Vec::new(),
+                    riscv_float_class: None,
+                    is_f128_sse: false,
+                });
+                uses_sret = true;
+                let _ = sret_size; // used for alloca sizing in allocate_function_params
+            }
+        }
+
+        for param in func.params.iter() {
+            let param_ctype = self.type_spec_to_ctype(&param.type_spec);
+
+            // Complex parameter decomposition
+            if param_ctype.is_complex()
+                && self.try_push_complex_param_ir(&param_ctype, &mut params, &mut param_kinds)
+            {
+                continue;
+            }
+
+            // Clang 23.1.3's i386 ext-vector parameter carriers
+            // (`CType::i386_ext_vector_arg`). Scalarized vectors take one
+            // ordinary scalar slot per logical lane (including floating and
+            // x87 lanes); the lane CType drives the slot width. Widened
+            // vectors arrive as 16-byte `[Sse, SseUp]` pieces (%xmm0-2, then
+            // 16-byte-aligned stack). 8-byte integer images and diagnosed
+            // shapes fall through to the by-value aggregate path below.
+            if !func.attrs.is_static() && !self.is_internal_function(&func.name) {
+                self.diagnose_unsupported_ext_vector_abi(&param_ctype, false, func.span);
+            }
+            let i386_carrier = if crate::common::types::target_is_32bit() {
+                param_ctype.i386_ext_vector_arg()
+            } else {
+                None
+            };
+            if let Some(crate::common::types::I386ExtVectorCarrier::Xmm { pieces }) = i386_carrier {
+                let mut piece_indices = Vec::with_capacity(pieces);
+                for _ in 0..pieces {
+                    piece_indices.push(params.len());
+                    params.push(IrParam {
+                        ty: IrType::Ptr,
+                        noalias: false,
+                        struct_size: Some(16),
+                        struct_align: Some(16),
+                        param_align: None,
+                        struct_eightbyte_classes: vec![
+                            crate::common::types::EightbyteClass::Sse,
+                            crate::common::types::EightbyteClass::SseUp,
+                        ],
+                        riscv_float_class: None,
+                        // On i686 this only selects the 16-byte stack slot
+                        // alignment shared with the `__float128` carrier.
+                        is_f128_sse: true,
+                    });
+                }
+                param_kinds.push(ParamKind::ExtVectorXmm(piece_indices));
+                continue;
+            }
+            if i386_carrier == Some(crate::common::types::I386ExtVectorCarrier::Lanes) {
+                let (elem, lanes) = param_ctype.vector_lanes();
+                let lane_ty = if matches!(elem, CType::Bool) {
+                    IrType::I32
+                } else {
+                    IrType::from_ctype(elem)
+                };
+                let mut lane_indices = Vec::with_capacity(lanes);
+                for _ in 0..lanes {
+                    let ir_idx = params.len();
+                    params.push(IrParam {
+                        ty: lane_ty,
+                        noalias: false,
+                        struct_size: None,
+                        struct_align: None,
+                        param_align: None,
+                        // `[NoClass]` is an internal marker for an i686
+                        // ExtVector scalar lane: Clang forces these lanes to
+                        // the stack even under regparm/fastcall, without
+                        // consuming the ordinary scalar register sequence.
+                        struct_eightbyte_classes: vec![
+                            crate::common::types::EightbyteClass::NoClass,
+                        ],
+                        riscv_float_class: None,
+                        is_f128_sse: false,
+                    });
+                    lane_indices.push(ir_idx);
+                }
+                param_kinds.push(ParamKind::ExtVectorDecomposed(lane_indices));
+                continue;
+            }
+
+            // Struct/union/vector parameter (pass by value), including ComplexLongDouble
+            // on x86-64/RISC-V where it's not decomposed, and ComplexDouble/ComplexFloat
+            // on i686 where they are passed as structs on the stack.
+            // Transparent unions are passed as their first member (a pointer),
+            // not as a by-value aggregate, so struct_size is None for them.
+            // vector_size keeps its historical aggregate-by-value ABI.
+            let is_complex_as_struct = matches!(param_ctype, CType::ComplexLongDouble)
+                || (matches!(param_ctype, CType::ComplexDouble)
+                    && !self.decomposes_complex_double())
+                || (matches!(param_ctype, CType::ComplexFloat) && !self.decomposes_complex_float());
+            if self.is_type_struct_or_union(&param.type_spec)
+                || is_complex_as_struct
+                || param_ctype.is_vector()
+            {
+                let ir_idx = params.len();
+                let struct_size = if self.is_transparent_union(&param.type_spec) {
+                    None
+                } else {
+                    Some(self.sizeof_type(&param.type_spec))
+                };
+                // Compute struct alignment, per-eightbyte SysV ABI classification,
+                // and RISC-V LP64D float field classification
+                // x86-64: the psABI classes of the struct, union or vector
+                // (`[Memory]`, `[Sse, SseUp]` = ONE %xmm, ...).
+                let sysv_abi = self.sysv_arg_abi(&param_ctype);
+                let (struct_align, struct_eightbyte_classes, riscv_float_class) =
+                    if struct_size.is_some() {
+                        if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
+                            let ctx = &*self.types.borrow_struct_layouts();
+                            let classes = if let Some(classes) =
+                                self.i386_gnu_vector_memory_classes(&param_ctype)
+                            {
+                                classes
+                            } else {
+                                match &sysv_abi {
+                                    Some((classes, _)) => classes.clone(),
+                                    None => layout.classify_sysv_eightbytes(ctx),
+                                }
+                            };
+                            let rv_class = layout.classify_riscv_float_fields(ctx);
+                            (Some(layout.align), classes, rv_class)
+                        } else if let Some((classes, _)) = sysv_abi.clone() {
+                            // A vector: no record layout.
+                            (Some(self.ctype_align(&param_ctype)), classes, None)
+                        } else if self.target == crate::backend::Target::I686
+                            && matches!(&param_ctype, CType::Vector(..))
+                        {
+                            // Memory-passed i386 GNU vectors use their natural
+                            // stack alignment, unlike over-aligned records.
+                            // `[Memory, NoClass]` is an internal target-local
+                            // marker (the AMD64 classifier is not involved).
+                            (
+                                Some(self.ctype_align(&param_ctype)),
+                                vec![
+                                    crate::common::types::EightbyteClass::Memory,
+                                    crate::common::types::EightbyteClass::NoClass,
+                                ],
+                                None,
+                            )
+                        } else {
+                            (None, Vec::new(), None)
+                        }
+                    } else {
+                        (None, Vec::new(), None)
+                    };
+                // ABI alignment belongs to the underlying aggregate/vector
+                // type. A typedef or parameter-declaration alignment can raise
+                // the LOCAL parameter object's alignment without changing its
+                // incoming stack position (GCC copies such objects to an aligned
+                // home). Do not fold that request into the ABI classifier.
+                let struct_align =
+                    struct_align.or_else(|| struct_size.map(|_| self.ctype_align(&param_ctype)));
+                let declared_align = self.alignof_type(&param.type_spec);
+                let direct_align = self.param_explicit_alignment(param);
+                let object_align = declared_align.max(direct_align.unwrap_or(0));
+                let param_align =
+                    (object_align > struct_align.unwrap_or(0)).then_some(object_align);
+                params.push(IrParam {
+                    ty: IrType::Ptr,
+                    noalias: false,
+                    struct_size,
+                    struct_align,
+                    param_align,
+                    struct_eightbyte_classes,
+                    riscv_float_class,
+                    // "ONE 16-byte %xmm" -- the same carrier _Float128 uses.
+                    // A one-XMM aggregate is identified by its `[Sse, SseUp]`
+                    // classes; the flag is reserved for `_Float128` values.
+                    //
+                    // Exception: a 16-byte SIMD vector parameter of a
+                    // VARIADIC i386 function (pre-SSE baseline or -mno-sse,
+                    // where the type has no XMM carrier and reaches this
+                    // by-value path). The GCC 4.6 va rule 16-byte-aligns the
+                    // 16-byte class inside the variadic argument area, and
+                    // GCC 16.2 -m32 places a named 16-byte SIMD vector
+                    // there: `v4u f(v4u a, ...)` puts a at call-esp+16
+                    // (after the hidden sret word), and `int f(v4u a, ...)`
+                    // puts a at call-esp+0 (16-aligned on every psABI
+                    // caller). The caller mirrors this through the variadic
+                    // decompose pieces (which carry this same marker), so
+                    // the named-param layout, the va_start overflow offset
+                    // derived from it, and the caller's piece placement all
+                    // agree. Non-variadic functions keep the 4-byte slot
+                    // granularity (measured GCC/Clang pre-SSE fixed args).
+                    is_f128_sse: func.variadic
+                        && crate::common::types::target_is_32bit()
+                        && param_ctype.is_i386_16b_simd_vector(),
+                });
+                param_kinds.push(ParamKind::Struct(ir_idx));
+                continue;
+            }
+
+            // _Float128 parameters: ONE 16-byte XMM register (SysV psABI).
+            // Carried in a U128-typed param (bit-exact storage); classified as
+            // a 16-byte SSE struct so the backend routes it through XMM regs.
+            if matches!(param_ctype, CType::Float128 | CType::Decimal128) {
+                let ir_idx = params.len();
+                // The carrier is 16 bytes / 16-aligned by ABI, but the
+                // DECLARED alignment may exceed that (typedef override or a
+                // direct parameter-list spelling): `&x` of an
+                // `aligned(32)` _Float128 parameter must be 32-aligned.
+                // Keep it in param_align, not in the ABI carrier alignment.
+                let natural_align = self.ctype_align(&param_ctype);
+                let declared_align = self.alignof_type(&param.type_spec);
+                let direct_align = self.param_explicit_alignment(param);
+                let declared = declared_align.max(direct_align.unwrap_or(0));
+                let param_align = (declared > natural_align).then_some(declared);
+                params.push(IrParam {
+                    ty: IrType::U128,
+                    noalias: false,
+                    struct_size: Some(16),
+                    struct_align: Some(natural_align),
+                    param_align,
+                    struct_eightbyte_classes: vec![
+                        crate::common::types::EightbyteClass::Sse,
+                        crate::common::types::EightbyteClass::Sse,
+                    ],
+                    riscv_float_class: None,
+                    is_f128_sse: true,
+                });
+                param_kinds.push(ParamKind::Normal(ir_idx));
+                continue;
+            }
+
+            // Normal scalar parameter
+            let ir_idx = params.len();
+            let mut ty = self.type_spec_to_ir(&param.type_spec);
+            // K&R default argument promotions: float->double, char/short->int
+            // (_Float16 / __bf16 never promote!)
+            if func.is_kr && !param_ctype.is_half_float() {
+                ty = match ty {
+                    IrType::F32 => IrType::F64,
+                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
+                    other => other,
+                };
+            }
+            // Declared alignment of the parameter type, honoring typedef
+            // `__attribute__((aligned(N)))` / `_Alignas(N)` overrides. An
+            // override above the type's natural alignment must reach the
+            // backend so the parameter alloca is homed at that alignment
+            // (GCC realigns its frame for over-aligned parameter types, so
+            // `&x` of an `aligned(32)` parameter is 32-aligned there).
+            // Without this, a typedef-aligned scalar parameter is copied to
+            // a naturally-placed slot and `&x` is misaligned.
+            let natural_align = self.ctype_align(&param_ctype);
+            let declared_align = self.alignof_type(&param.type_spec);
+            // Direct spellings written IN the parameter list
+            // (`int x __attribute__((aligned(32)))`, `_Alignas(32) int x`)
+            // ride on ParamDecl, not the type spec. lccc accepts them
+            // (GCC/Clang reject), so they MUST be honored — otherwise the
+            // parameter is homed at natural alignment while the user asked
+            // for more (silent misalignment of `&x`).
+            let direct_align = self.param_explicit_alignment(param);
+            let declared_align = declared_align.max(direct_align.unwrap_or(0));
+            let param_align = (declared_align > natural_align).then_some(declared_align);
+            params.push(IrParam {
+                ty,
+                noalias: param.is_restrict && ty == IrType::Ptr,
+                struct_size: None,
+                struct_align: None,
+                param_align,
+                struct_eightbyte_classes: Vec::new(),
+                riscv_float_class: None,
+                is_f128_sse: param_ctype.is_half_float(),
+            });
+            param_kinds.push(ParamKind::Normal(ir_idx));
+        }
+
+        IrParamBuildResult {
+            params,
+            param_kinds,
+            uses_sret,
+        }
+    }
+
+    /// Allocate function parameters as local variables (3-phase process).
+
+    /// Push the IR params for a `_Complex` parameter when this target
+    /// decomposes complex parameters into float registers; return whether
+    /// the parameter was consumed (the caller must not run its struct or
+    /// scalar arms).
+    ///
+    /// Per-target policy, mirrored from the platform ABIs: _Complex long
+    /// double decomposes only on ARM64 (HFA in Q regs) — on x86-64/RISC-V it
+    /// is passed as an aggregate; _Complex double/float decompose unless the
+    /// i686 struct-on-stack policy applies; x86-64 additionally packs
+    /// `_Complex float` into a single F64.
+    fn try_push_complex_param_ir(
+        &self,
+        param_ctype: &CType,
+        params: &mut Vec<IrParam>,
+        param_kinds: &mut Vec<ParamKind>,
+    ) -> bool {
+        // ComplexLongDouble: only decompose on ARM64 (HFA in Q regs);
+        // on x86-64/RISC-V it's passed as a struct (on stack / by reference).
+        if matches!(param_ctype, CType::ComplexLongDouble) && !self.decomposes_complex_long_double()
+        {
+            // Fall through to struct handling in the caller.
+            return false;
+        }
+        if matches!(param_ctype, CType::ComplexDouble) && !self.decomposes_complex_double() {
+            // i686: _Complex double (16 bytes) is passed as a struct on the stack.
+            return false;
+        }
+        if matches!(param_ctype, CType::ComplexFloat) && !self.decomposes_complex_float() {
+            // i686: _Complex float (8 bytes) is passed as a struct on the stack.
+            return false;
+        }
+        if matches!(param_ctype, CType::ComplexFloat) && self.uses_packed_complex_float() {
+            // x86-64: _Complex float packed into single F64
+            let ir_idx = params.len();
+            params.push(IrParam {
+                ty: IrType::F64,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                riscv_float_class: None,
+                is_f128_sse: false,
+            });
+            param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
+            return true;
+        }
+        // Decompose into two FP params (ComplexFloat/ComplexDouble on 64-bit,
+        // ComplexLongDouble on ARM64 only)
+        let comp_ty = Self::complex_component_ir_type(param_ctype);
+        let real_idx = params.len();
+        params.push(IrParam {
+            ty: comp_ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+            is_f128_sse: false,
+        });
+        let imag_idx = params.len();
+        params.push(IrParam {
+            ty: comp_ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+            is_f128_sse: false,
+        });
+        param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
+        true
+    }
+    pub(super) fn allocate_function_params(
+        &mut self,
+        func: &FunctionDef,
+        info: &IrParamBuildResult,
+    ) {
+        // Phase 1: Emit allocas for all IR params
+        let mut ir_allocas: Vec<Value> = Vec::new();
+        for param in &info.params {
+            let alloca = self.fresh_value();
+            if info.uses_sret && ir_allocas.is_empty() {
+                let ptr_size = crate::common::types::target_ptr_size();
+                self.emit(Instruction::Alloca {
+                    dest: alloca,
+                    ty: IrType::Ptr,
+                    size: ptr_size,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                });
+                self.func_mut().sret_ptr = Some(alloca);
+                ir_allocas.push(alloca);
+                continue;
+            }
+            let size = param
+                .ty
+                .size()
+                .max(param.struct_size.unwrap_or(param.ty.size()));
+            // Carry the parameter's declared alignment onto its alloca. Without
+            // this, a by-value `_Alignas(16)` struct parameter is copied into an
+            // 8-aligned slot in emit_store_params and `&s` (or an aligned vector
+            // access on the param) sees a misaligned address. `param_align`
+            // extends the same guarantee to typedef-aligned scalar parameters
+            // (`typedef int A32 __attribute__((aligned(32)))`), whose alignment
+            // the frontend would otherwise drop entirely.
+            let align = param
+                .struct_align
+                .into_iter()
+                .chain(param.param_align)
+                .max()
+                .unwrap_or(0);
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                ty: param.ty,
+                size,
+                align,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            ir_allocas.push(alloca);
+        }
+
+        // Save param alloca values for the backend to detect unused param allocas.
+        self.func_mut().param_alloca_values = ir_allocas.clone();
+
+        // Phase 1b: Emit explicit ParamRef + Store for scalar parameter allocas.
+        // This makes the parameter->alloca store visible in the IR so mem2reg
+        // can promote parameter allocas to SSA values, enabling constant
+        // propagation when parameters are reassigned (e.g., `x &= 0`).
+        // Only non-struct scalar params are eligible: struct params (struct_size != None)
+        // use special by-value handling in emit_store_params that we must not duplicate.
+        // Also skip sret pointer params (first param when uses_sret is true).
+        for (i, param) in info.params.iter().enumerate() {
+            // Skip struct params - they have special ABI handling
+            if param.struct_size.is_some() {
+                continue;
+            }
+            // Skip sret pointer param
+            if info.uses_sret && i == 0 {
+                continue;
+            }
+            let ty_size = param.ty.size();
+            if ty_size <= 8 {
+                let param_val = self.fresh_value();
+                self.emit(Instruction::ParamRef {
+                    dest: param_val,
+                    param_idx: i,
+                    ty: param.ty,
+                });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(param_val),
+                    ptr: ir_allocas[i],
+                    ty: param.ty,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                });
+            }
+        }
+
+        // Phase 2 & 3: Process each original parameter by kind
+        for (orig_idx, kind) in info.param_kinds.iter().enumerate() {
+            let orig_param = &func.params[orig_idx];
+            match kind {
+                ParamKind::Normal(ir_idx) => {
+                    self.register_normal_param(
+                        orig_param,
+                        &info.params[*ir_idx],
+                        ir_allocas[*ir_idx],
+                    );
+                }
+                ParamKind::Struct(ir_idx) => {
+                    self.register_struct_or_complex_param(orig_param, ir_allocas[*ir_idx]);
+                }
+                ParamKind::ComplexFloatPacked(ir_idx) => {
+                    self.register_packed_complex_float_param(orig_param, ir_allocas[*ir_idx]);
+                }
+                ParamKind::ComplexDecomposed(real_ir_idx, imag_ir_idx) => {
+                    self.reconstruct_decomposed_complex_param(
+                        orig_param,
+                        ir_allocas[*real_ir_idx],
+                        ir_allocas[*imag_ir_idx],
+                    );
+                }
+                ParamKind::ExtVectorDecomposed(lane_ir_idxs) => {
+                    self.reconstruct_decomposed_ext_vector_param(
+                        orig_param,
+                        lane_ir_idxs,
+                        &ir_allocas,
+                        &info.params,
+                    );
+                }
+                ParamKind::ExtVectorXmm(piece_ir_idxs) => {
+                    let ctype = self.type_spec_to_ctype(&orig_param.type_spec);
+                    let slots: Vec<Value> = piece_ir_idxs.iter().map(|&i| ir_allocas[i]).collect();
+                    let vector = self.i386_ext_vector_param_from_pieces(&ctype, &slots);
+                    self.register_struct_or_complex_param(orig_param, vector);
+                }
+            }
+        }
+
+        self.compute_vla_param_strides(func);
+    }
+
+    /// Register a normal (non-struct, non-complex) parameter as a local variable.
+    /// A parameter's explicit alignment: the strictest of its `aligned(N)` /
+    /// `_Alignas(N)` and `_Alignas(type)` (C11 6.7.5p6).
+    fn param_explicit_alignment(&self, param: &ParamDecl) -> Option<usize> {
+        crate::common::types::strictest_alignment([
+            param.alignment,
+            param.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+        ])
+    }
+
+    fn register_normal_param(&mut self, orig_param: &ParamDecl, ir_param: &IrParam, alloca: Value) {
+        let ty = ir_param.ty;
+        let param_size = self.sizeof_type(&orig_param.type_spec).max(ty.size());
+        let elem_size = if ty == IrType::Ptr {
+            self.pointee_elem_size(&orig_param.type_spec)
+        } else {
+            0
+        };
+        let pointee_type = if ty == IrType::Ptr {
+            self.pointee_ir_type(&orig_param.type_spec)
+        } else {
+            None
+        };
+        let struct_layout = if ty == IrType::Ptr {
+            self.get_struct_layout_for_pointer_param(&orig_param.type_spec)
+        } else {
+            None
+        };
+        let c_type = Some(self.param_ctype(orig_param));
+        let is_bool = self.is_type_bool(&orig_param.type_spec);
+        let array_dim_strides = if ty == IrType::Ptr {
+            self.compute_ptr_array_strides(&orig_param.type_spec)
+        } else {
+            vec![]
+        };
+
+        // Detect pointer-to-function-pointer parameters using the parser's
+        // fptr_inner_ptr_depth field. This records how many `*` were inside the
+        // parenthesized declarator: (*fp) has depth 1, (**fpp) has depth 2.
+        // A depth >= 2 means pointer-to-function-pointer. This correctly
+        // distinguishes `int (**fpp)(int)` (depth 2, ptr-to-func-ptr) from
+        // `void *(*fp)(size_t)` (depth 1, func ptr returning void*), which
+        // have identical CType representations.
+        let is_ptr_to_func_ptr =
+            orig_param.fptr_params.is_some() && orig_param.fptr_inner_ptr_depth >= 2;
+
+        let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
+        self.insert_local_scoped(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty,
+                    elem_size,
+                    is_array: false,
+                    pointee_type,
+                    struct_layout,
+                    is_struct: false,
+                    array_dim_strides,
+                    c_type,
+                    is_ptr_to_func_ptr,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                    type_align: None,
+                    base_const,
+                },
+                alloca,
+                alloc_size: param_size,
+                is_bool,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                base_type_volatile: base_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
+                fptr_sig: None,
+            },
+        );
+
+        // Register function pointer parameter signatures for indirect calls
+        if let Some(ref fptr_params) = orig_param.fptr_params {
+            let ret_ty = match &orig_param.type_spec {
+                TypeSpecifier::Pointer(inner, _) => self.type_spec_to_ir(inner),
+                _ => self.type_spec_to_ir(&orig_param.type_spec),
+            };
+            if let Some(ref name) = orig_param.name {
+                let param_tys: Vec<IrType> = fptr_params
+                    .iter()
+                    .map(|fp| self.type_spec_to_ir(&fp.type_spec))
+                    .collect();
+                let mut signature = FuncSig::for_ptr(ret_ty, param_tys);
+                signature.is_variadic = orig_param.fptr_variadic;
+                self.set_local_fptr_sig(name, signature);
+            }
+        } else if let Some(ref name) = orig_param.name {
+            // Fallback: check if the parameter type is a bare function typedef
+            // (e.g., `typedef int filler_t(void*, void*); void foo(filler_t filler)`).
+            // Per C11 6.7.6.3p8, function-type parameters decay to pointer-to-function.
+            // The parser doesn't set fptr_params for typedef-based function types, so
+            // we must register the ptr_sig from the function typedef info here.
+            if let TypeSpecifier::TypedefName(tname) = &orig_param.type_spec {
+                if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
+                    let ret_ty = self.type_spec_to_ir(&fti.return_type);
+                    let param_tys: Vec<IrType> = fti
+                        .params
+                        .iter()
+                        .map(|fp| self.type_spec_to_ir(&fp.type_spec))
+                        .collect();
+                    self.set_local_fptr_sig(name, FuncSig::for_ptr(ret_ty, param_tys));
+                }
+            }
+        }
+    }
+
+    /// Register a struct/union or non-decomposed complex parameter as a local variable.
+    fn register_struct_or_complex_param(&mut self, orig_param: &ParamDecl, alloca: Value) {
+        let is_struct = self.is_type_struct_or_union(&orig_param.type_spec);
+        let layout = if is_struct {
+            self.get_struct_layout_for_type(&orig_param.type_spec)
+        } else {
+            None
+        };
+        let size = if is_struct {
+            layout.as_ref().map_or(8, |l| l.size)
+        } else {
+            self.sizeof_type(&orig_param.type_spec)
+        };
+        let c_type = Some(self.type_spec_to_ctype(&orig_param.type_spec));
+
+        let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
+        self.insert_local_scoped(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty: IrType::Ptr,
+                    elem_size: 0,
+                    is_array: false,
+                    pointee_type: None,
+                    struct_layout: layout,
+                    is_struct: true,
+                    array_dim_strides: vec![],
+                    c_type,
+                    is_ptr_to_func_ptr: false,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                    type_align: None,
+                    base_const,
+                },
+                alloca,
+                alloc_size: size,
+                is_bool: false,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                base_type_volatile: base_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
+                fptr_sig: None,
+            },
+        );
+    }
+
+    /// Reconstruct an i686 ExtVector local from scalar ABI lane parameters.
+    fn reconstruct_decomposed_ext_vector_param(
+        &mut self,
+        orig_param: &ParamDecl,
+        lane_ir_idxs: &[usize],
+        ir_allocas: &[Value],
+        ir_params: &[IrParam],
+    ) {
+        let ctype = self.type_spec_to_ctype(&orig_param.type_spec);
+        let size = self.sizeof_type(&orig_param.type_spec);
+        let align = self.ctype_align(&ctype);
+        let vector_alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: vector_alloca,
+            ty: IrType::Ptr,
+            size,
+            align,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        // This also initializes the padding and the other packed bool lanes
+        // before the first lane insertion read-modify-write.
+        self.zero_init_alloca(vector_alloca, size);
+        for (lane, &ir_idx) in lane_ir_idxs.iter().enumerate() {
+            let lane_ty = ir_params[ir_idx].ty;
+            let lane_val = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: lane_val,
+                ptr: ir_allocas[ir_idx],
+                ty: lane_ty,
+                seg_override: AddressSpace::Default,
+            });
+            let lane_val = self.i386_bool_lane_bit(&ctype, Operand::Value(lane_val), lane_ty);
+            self.store_vector_lane(
+                vector_alloca,
+                &ctype,
+                lane,
+                lane_val,
+                lane_ty,
+                AddressSpace::Default,
+                false,
+            );
+        }
+        self.register_struct_or_complex_param(orig_param, vector_alloca);
+    }
+
+    /// Register a packed complex float parameter (x86-64 only) as a local variable.
+    fn register_packed_complex_float_param(&mut self, orig_param: &ParamDecl, alloca: Value) {
+        let ct = self.type_spec_to_ctype(&orig_param.type_spec);
+        let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
+        self.insert_local_scoped(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty: IrType::Ptr,
+                    elem_size: 0,
+                    is_array: false,
+                    pointee_type: None,
+                    struct_layout: None,
+                    is_struct: true,
+                    array_dim_strides: vec![],
+                    c_type: Some(ct),
+                    is_ptr_to_func_ptr: false,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                    type_align: None,
+                    base_const,
+                },
+                alloca,
+                alloc_size: 8,
+                is_bool: false,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                base_type_volatile: base_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
+                fptr_sig: None,
+            },
+        );
+    }
+
+    /// Reconstruct a decomposed complex parameter from its real/imag Phase 1 allocas.
+    fn reconstruct_decomposed_complex_param(
+        &mut self,
+        orig_param: &ParamDecl,
+        real_alloca: Value,
+        imag_alloca: Value,
+    ) {
+        let ct = self.type_spec_to_ctype(&orig_param.type_spec);
+        let comp_ty = Self::complex_component_ir_type(&ct);
+        let comp_size = Self::complex_component_size(&ct);
+        let complex_size = ct.size();
+
+        let complex_alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: complex_alloca,
+            ty: IrType::Ptr,
+            size: complex_size,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
+
+        let real_val = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: real_val,
+            ptr: real_alloca,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(real_val),
+            ptr: complex_alloca,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
+
+        let imag_val = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: imag_val,
+            ptr: imag_alloca,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
+        let imag_ptr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: imag_ptr,
+            base: complex_alloca,
+            offset: Operand::Const(IrConst::I64(comp_size as i64)),
+            ty: IrType::I8,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(imag_val),
+            ptr: imag_ptr,
+            ty: comp_ty,
+            seg_override: AddressSpace::Default,
+        });
+
+        let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
+        self.func_mut().locals.insert(
+            name,
+            LocalInfo {
+                var: VarInfo {
+                    ty: IrType::Ptr,
+                    elem_size: 0,
+                    is_array: false,
+                    pointee_type: None,
+                    struct_layout: None,
+                    is_struct: true,
+                    array_dim_strides: vec![],
+                    c_type: Some(ct),
+                    is_ptr_to_func_ptr: false,
+                    address_space: AddressSpace::Default,
+                    explicit_alignment: None,
+                    type_align: None,
+                    base_const,
+                },
+                alloca: complex_alloca,
+                alloc_size: complex_size,
+                is_bool: false,
+                static_global_name: None,
+                vla_strides: vec![],
+                vla_size: None,
+                asm_register: None,
+                asm_register_has_init: false,
+                cleanup_fn: None,
+                base_type_volatile: base_volatile,
+                // Parameter declarators do not record the object qualifier yet.
+                object_volatile: false,
+                fptr_sig: None,
+            },
+        );
+    }
+
+    /// Handle K&R default argument promotions: narrow promoted params back to declared types.
+    /// float->double promotion: narrow double back to float.
+    /// char/short->int promotion: narrow int back to char/short.
+    pub(super) fn handle_kr_float_promotion(&mut self, func: &FunctionDef) {
+        if !func.is_kr {
+            return;
+        }
+        for param in &func.params {
+            let declared_ty = self.type_spec_to_ir(&param.type_spec);
+            let name = param.name.clone().unwrap_or_default();
+            let local_info = match self.func_mut().locals.get(&name).cloned() {
+                Some(i) => i,
+                None => continue,
+            };
+            match declared_ty {
+                IrType::F32 => {
+                    // Received as F64, narrow to F32
+                    let f64_val = self.fresh_value();
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: f64_val,
+                        ptr: local_info.alloca,
+                        ty: IrType::F64,
+                        seg_override: AddressSpace::Default,
+                    });
+                    let f32_val =
+                        self.emit_cast_val(Operand::Value(f64_val), IrType::F64, IrType::F32);
+                    let f32_alloca = self.fresh_value();
+                    self.emit(Instruction::Alloca {
+                        dest: f32_alloca,
+                        ty: IrType::F32,
+                        size: 4,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: Operand::Value(f32_val),
+                        ptr: f32_alloca,
+                        ty: IrType::F32,
+                        seg_override: AddressSpace::Default,
+                    });
+                    if let Some(local) = self.func_mut().locals.get_mut(&name) {
+                        local.alloca = f32_alloca;
+                        local.ty = IrType::F32;
+                        local.alloc_size = 4;
+                    }
+                }
+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
+                    // Received as I32, narrow to declared type
+                    let i32_val = self.fresh_value();
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: i32_val,
+                        ptr: local_info.alloca,
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    });
+                    let narrow_val =
+                        self.emit_cast_val(Operand::Value(i32_val), IrType::I32, declared_ty);
+                    let narrow_alloca = self.fresh_value();
+                    let size = declared_ty.size().max(1);
+                    self.emit(Instruction::Alloca {
+                        dest: narrow_alloca,
+                        ty: declared_ty,
+                        size,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: Operand::Value(narrow_val),
+                        ptr: narrow_alloca,
+                        ty: declared_ty,
+                        seg_override: AddressSpace::Default,
+                    });
+                    if let Some(local) = self.func_mut().locals.get_mut(&name) {
+                        local.alloca = narrow_alloca;
+                        local.ty = declared_ty;
+                        local.alloc_size = size;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Finalize a function: add implicit return, build IrFunction, push to module.
+    fn finalize_function(
+        &mut self,
+        func: &FunctionDef,
+        return_type: IrType,
+        params: Vec<IrParam>,
+        uses_sret: bool,
+    ) {
+        if !self.func_mut().instrs.is_empty()
+            || self.func_mut().blocks.is_empty()
+            || !matches!(
+                self.func_mut().blocks.last().map(|b| &b.terminator),
+                Some(Terminator::Return(_))
+            )
+        {
+            let ret_op = if return_type == IrType::Void {
+                None
+            } else {
+                Some(Operand::Const(IrConst::I32(0)))
+            };
+            // Falling off the end returns at the closing brace (GCC's row).
+            if let Some(close) = func.body_span.closing_delimiter() {
+                self.func_mut().current_span = close;
+            }
+            self.terminate(Terminator::Return(ret_op));
+        }
+
+        // Merge deferred entry-block allocas into blocks[0], right after
+        // the existing parameter allocas. mem2reg skips the first N allocas
+        // (where N = param count) so deferred local allocas must come after them.
+        let entry_allocas = std::mem::take(&mut self.func_mut().entry_allocas);
+        if !entry_allocas.is_empty() {
+            if let Some(entry_block) = self.func_mut().blocks.first_mut() {
+                // Find the insertion point: right after the initial contiguous run
+                // of Alloca instructions at the start of the entry block (parameter allocas).
+                // We must NOT use rposition (last alloca anywhere in the block) because
+                // SSE intrinsic lowering emits inline allocas deep in the block via
+                // self.emit(Alloca), and placing deferred allocas after those would put
+                // them after their uses, violating dominance.
+                let insert_pos = entry_block
+                    .instructions
+                    .iter()
+                    .position(|inst| !matches!(inst, Instruction::Alloca { .. }))
+                    .unwrap_or(entry_block.instructions.len());
+                // Splice deferred allocas at the insertion point.
+                let num_allocas = entry_allocas.len();
+                entry_block
+                    .instructions
+                    .splice(insert_pos..insert_pos, entry_allocas);
+                // Insert dummy spans for the spliced allocas
+                if !entry_block.source_spans.is_empty() {
+                    let dummy_spans = vec![crate::common::source::Span::dummy(); num_allocas];
+                    entry_block
+                        .source_spans
+                        .splice(insert_pos..insert_pos, dummy_spans);
+                }
+            }
+        }
+
+        // Runtime CPU probe initialisation (AUD-CPU-1): one guarded call at
+        // the end of the entry block for every function that reads a probe
+        // word.  Pushed last so it is after every IR instruction (it can
+        // therefore not perturb the leading alloca run mem2reg identifies
+        // positionally) and still dominates every successor block.
+        self.splice_cpu_probe_init();
+
+        // Inline linkage rules (GNU89 vs C99):
+        //
+        // GNU89 mode (explicit __attribute__((gnu_inline)) OR -fgnu89-inline / -std=c89):
+        //   extern inline = inline definition only, no external def → static
+        //   inline (no extern) = external definition → global
+        //
+        // C99 mode (default for -std=c99 and later):
+        //   extern inline = provides external definition → global
+        //   plain inline (no extern) = inline definition only → static (local)
+        //
+        // C99 6.7.4p7 additional rule: if ANY file-scope declaration of the function
+        // does NOT include `inline`, then the definition provides an external definition.
+        // This handles cases like jq's tsd_dtoa_context_get() where the header declares
+        // the function without `inline` and the .c file defines it with `inline`.
+        let is_gnu_inline_no_extern_def = self.is_gnu_inline_no_extern_def(&func.attrs);
+        // C99 6.7.4p7: A plain `inline` definition (without `extern`) does not
+        // provide an external definition ONLY if ALL file-scope declarations include
+        // `inline`. If any declaration lacks `inline`, this is an external definition.
+        // Note: in GNU89 mode, `inline` without `extern` provides an external def,
+        // so this rule does not apply.
+        let is_c99_inline_def = !self.gnu89_inline
+            && func.attrs.is_inline()
+            && !func.attrs.is_extern()
+            && !func.attrs.is_static()
+            && !func.attrs.is_gnu_inline()
+            && !self.has_non_inline_decl.contains(&func.name);
+        // C99 inline-only definitions (inline without extern/static, all declarations
+        // have inline) don't provide an external definition per C99 6.7.4p7.
+        // We lower them as static so their bodies are available for inlining.
+        // If all call sites are inlined, dead code elimination removes them.
+        // If not inlined, they're emitted as local symbols (safe fallback).
+        let is_static = func.attrs.is_static()
+            || self.static_functions.contains(&func.name)
+            || is_gnu_inline_no_extern_def
+            || is_c99_inline_def;
+        let next_val = self.func_mut().next_value;
+        let param_alloca_vals = std::mem::take(&mut self.func_mut().param_alloca_values);
+        let global_init_labels = std::mem::take(&mut self.func_mut().global_init_label_blocks);
+        // Get return eightbyte classes from the function's signature metadata
+        let ret_eightbyte_classes = self
+            .func_meta
+            .sigs
+            .get(&func.name)
+            .map(|s| s.ret_eightbyte_classes.clone())
+            .unwrap_or_default();
+        // _Float128 returns come back in ONE XMM register (SysV psABI).
+        let ret_is_f128_sse = self
+            .func_meta
+            .sigs
+            .get(&func.name)
+            .map(|s| s.ret_is_f128_sse)
+            .unwrap_or(false);
+        // Use the lowerer's global next_label counter to ensure labels are globally unique
+        let next_label = self.next_label;
+        let emitted_name = self
+            .asm_label_map
+            .get(&func.name)
+            .cloned()
+            .unwrap_or_else(|| func.name.clone());
+        let is_retain = func.attrs.is_retain() || self.retained_function_decls.contains(&func.name);
+
+        let ir_func = IrFunction {
+            pass_policy: Default::default(),
+            // GCC __asm__("symbol") asm labels: a function DEFINITION must be
+            // emitted under the asm label, not its C name. The declaration
+            // (e.g. `extern int __printf__(...) __asm__("rpl_printf")` from
+            // gnulib's stdio.h) has already been collected into asm_label_map
+            // by the signature pass, and call sites resolve through it, so we
+            // only need to rename the emitted definition symbol here.
+            name: emitted_name.clone(),
+            return_type,
+            params,
+            blocks: std::mem::take(&mut self.func_mut().blocks),
+            is_variadic: func.variadic,
+            is_declaration: false,
+            is_static,
+            is_inline: func.attrs.is_inline(),
+            is_always_inline: func.attrs.is_always_inline(),
+            x86_isa_needs: std::mem::take(&mut self.func_mut().x86_isa_needs),
+            is_noinline: func.attrs.is_noinline(),
+            target_features: func
+                .attrs
+                .target
+                .as_deref()
+                .map(crate::ir::module::normalize_target_features)
+                .unwrap_or_default(),
+            next_value_id: next_val,
+            fp_expr_tags: std::mem::take(&mut self.fp_expr_tags),
+            next_label,
+            // `__attribute__((cold))` without an explicit `section(...)`
+            // goes to `.text.unlikely`, matching GCC's cold partition.
+            // Downstream consumers key on the section name (e.g. the
+            // loop-alignment pass skips unlikely-section functions, whose
+            // padding could never be amortized).
+            section: func.attrs.section.clone().or_else(|| {
+                func.attrs.is_cold().then(|| {
+                    if is_retain {
+                        format!(".text.unlikely.{emitted_name}")
+                    } else {
+                        ".text.unlikely".to_string()
+                    }
+                })
+            }),
+            visibility: func.attrs.visibility.clone(),
+            is_weak: func.attrs.is_weak(),
+            is_used: func.attrs.is_used() || self.used_function_decls.contains(&func.name),
+            has_inlined_calls: false,
+            param_alloca_values: param_alloca_vals,
+            uses_sret,
+            is_fastcall: func.attrs.is_fastcall(),
+            regparm: func.attrs.regparm,
+            is_naked: func.attrs.is_naked(),
+            no_instrument: func.attrs.is_no_instrument(),
+            global_init_label_blocks: global_init_labels,
+            ret_eightbyte_classes,
+            ret_is_f128_sse,
+            is_gnu_inline_def: is_gnu_inline_no_extern_def,
+            loop_promoted_f64_values: Vec::new(),
+            ssp: crate::ir::module::SspInfo {
+                stack_protect: func.attrs.is_stack_protect(),
+                no_stack_protector: func.attrs.is_no_stack_protector(),
+                has_array: self.func().ssp_has_array,
+                max_char_array_bytes: self.func().ssp_max_char_array_bytes,
+                stack_guard_alloca: None,
+            },
+            body_span: func.body_span,
+            terminator_spans: std::mem::take(&mut self.func_mut().term_spans),
+        };
+        // Collect __attribute__((symver("..."))) directives
+        if let Some(ref sv) = func.attrs.symver {
+            self.module
+                .symver_directives
+                .push((func.name.clone(), sv.clone()));
+        }
+        // A definition's own `aligned(...)` attribute.  Prototypes register
+        // theirs in `lower_global_decl`; a definition has no declarator list to
+        // walk, so it registers here instead.  The key is the EMITTED name (the
+        // asm label when one exists), because that is what the emitter looks the
+        // alignment up by -- using the C name would silently miss every function
+        // renamed by `__asm__("...")`.
+        if let Some(align) = func.alignment {
+            let slot = self
+                .module
+                .function_alignments
+                .entry(ir_func.name.clone())
+                .or_insert(align);
+            *slot = (*slot).max(align);
+        }
+        if func.attrs.externally_visible {
+            self.module
+                .externally_visible_symbols
+                .insert(ir_func.name.clone());
+        }
+        if let Some(ref zr) = func.attrs.zero_call_used_regs
+            && let Some(mode) = crate::backend::zero_call_used_regs::ZeroCallUsedRegs::parse(zr)
+        {
+            self.module
+                .zero_call_used_regs_attrs
+                .insert(ir_func.name.clone(), mode);
+        }
+        if is_retain {
+            self.module.retained_functions.insert(ir_func.name.clone());
+        }
+        self.module.functions.push(ir_func);
+        self.pop_scope();
+        self.func_state = None;
+    }
+
+    /// Evaluate VLA parameter size expressions for their side effects.
+    ///
+    /// In C, array parameter declarations like `void foo(int a, int b[a++])` have
+    /// the outermost dimension decayed to a pointer, but the size expression (here
+    /// `a++`) must still be evaluated for its side effects. The expression was
+    /// preserved in `ParamDecl::vla_size_exprs` during parsing; we evaluate it here
+    /// (discarding the result) so that side effects take effect before the body runs.
+    pub(super) fn evaluate_vla_param_side_effects(&mut self, func: &FunctionDef) {
+        for param in &func.params {
+            for expr in &param.vla_size_exprs {
+                // Evaluate the expression for its side effects; discard the result.
+                self.lower_expr_discarded(expr);
+            }
+        }
+    }
+
+    /// For pointer-to-array function parameters with VLA (runtime) dimensions,
+    /// compute strides at runtime and store them in the LocalInfo.
+    fn compute_vla_param_strides(&mut self, func: &FunctionDef) {
+        // Collect VLA info first, then emit code (avoids borrow issues)
+        let mut vla_params: Vec<(String, Vec<VlaDimInfo>)> = Vec::new();
+
+        for param in &func.params {
+            let param_name = match &param.name {
+                Some(n) => n.clone(),
+                None => continue,
+            };
+
+            // Check if this parameter is a pointer-to-array with VLA dimensions
+            let ts = self.resolve_type_spec(&param.type_spec);
+            if let TypeSpecifier::Pointer(inner, _) = ts {
+                let dim_infos = self.collect_vla_dims(inner);
+                if dim_infos.iter().any(|d| d.is_vla) {
+                    vla_params.push((param_name, dim_infos));
+                }
+            } else {
+                // Check CType for typedef'd pointer-to-array
+                let ctype = self.type_spec_to_ctype(&param.type_spec);
+                if let CType::Pointer(ref inner_ct, _) = ctype {
+                    if matches!(inner_ct.as_ref(), CType::Array(_, _)) {
+                        // TypeSpecifier-based VLA detection won't work for typedef'd types,
+                        // but VLA dimensions in typedef'd pointers are rare
+                    }
+                }
+            }
+        }
+
+        for (param_name, dim_infos) in vla_params {
+            let vla_strides = self.emit_vla_pointee_strides(&dim_infos);
+            if let Some(local) = self.func_mut().locals.get_mut(&param_name) {
+                local.vla_strides = vla_strides;
+            }
+        }
+    }
+
+    /// Emit the runtime strides of a pointer to `dim_infos` (outermost
+    /// dimension first): `strides[d]` is the byte size of what `d + 1`
+    /// subscripts reach, `None` where it is a compile-time constant.
+    pub(super) fn emit_vla_pointee_strides(
+        &mut self,
+        dim_infos: &[VlaDimInfo],
+    ) -> Vec<Option<Value>> {
+        let num_strides = dim_infos.len() + 1; // +1 for base element size
+        let mut vla_strides: Vec<Option<Value>> = vec![None; num_strides];
+
+        let base_elem_size = dim_infos.last().map_or(1, |d| d.base_elem_size);
+        let mut current_stride: Option<Value> = None;
+        let mut current_const_stride = base_elem_size;
+
+        // Process dimensions from innermost to outermost
+        for (i, dim_info) in dim_infos.iter().enumerate().rev() {
+            if dim_info.is_vla {
+                let ptr_int_ty = crate::common::types::target_int_ir_type();
+                let dim_val = if let Some(ref expr) = dim_info.dim_expr {
+                    let op = self.lower_expr(expr);
+                    let expr_ty = self.value_ir_type(expr);
+                    let casted = self.emit_implicit_cast(op, expr_ty, ptr_int_ty);
+                    match casted {
+                        Operand::Value(v) => v,
+                        Operand::Const(c) => {
+                            let v = self.fresh_value();
+                            self.emit(Instruction::Copy {
+                                dest: v,
+                                src: Operand::Const(c),
+                            });
+                            v
+                        }
+                    }
+                } else {
+                    self.load_vla_dim_value(&dim_info.dim_expr_name)
+                };
+                let stride_val = if let Some(prev) = current_stride {
+                    self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(dim_val),
+                        Operand::Value(prev),
+                        ptr_int_ty,
+                    )
+                } else {
+                    self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(dim_val),
+                        Operand::Const(IrConst::ptr_int(current_const_stride as i64)),
+                        ptr_int_ty,
+                    )
+                };
+                vla_strides[i] = Some(stride_val);
+                current_stride = Some(stride_val);
+                current_const_stride = 0;
+            } else {
+                let const_dim = dim_info.const_size.unwrap_or(1) as usize;
+                if let Some(prev) = current_stride {
+                    let ptr_int_ty = crate::common::types::target_int_ir_type();
+                    let result = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(prev),
+                        Operand::Const(IrConst::ptr_int(const_dim as i64)),
+                        ptr_int_ty,
+                    );
+                    vla_strides[i] = Some(result);
+                    current_stride = Some(result);
+                } else {
+                    current_const_stride *= const_dim;
+                }
+            }
+        }
+        vla_strides
+    }
+
+    /// Load the value of a VLA dimension variable (a function parameter).
+    fn load_vla_dim_value(&mut self, dim_name: &str) -> Value {
+        if let Some(info) = self.func_mut().locals.get(dim_name).cloned() {
+            let loaded = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: info.alloca,
+                ty: info.ty,
+                seg_override: AddressSpace::Default,
+            });
+            loaded
+        } else {
+            // Fallback: use constant 1
+            let val = self.fresh_value();
+            self.emit(Instruction::Copy {
+                dest: val,
+                src: Operand::Const(IrConst::ptr_int(1)),
+            });
+            val
+        }
+    }
+
+    /// Collect VLA dimension information from a pointer-to-array type.
+    pub(super) fn collect_vla_dims(&self, inner: &TypeSpecifier) -> Vec<VlaDimInfo> {
+        let mut dims = Vec::new();
+        let mut current = inner;
+        loop {
+            let resolved = self.resolve_type_spec(current);
+            if let TypeSpecifier::Array(elem, size_expr) = resolved {
+                let (is_vla, dim_expr, dim_name, const_size) = if let Some(expr) = size_expr {
+                    if let Some(val) = self.expr_as_array_size(expr) {
+                        (false, None, String::new(), Some(val))
+                    } else {
+                        let name = Self::extract_dim_expr_name(expr);
+                        (true, Some((**expr).clone()), name, None)
+                    }
+                } else {
+                    (false, None, String::new(), None)
+                };
+
+                let base_elem_size = self.sizeof_type(elem);
+
+                dims.push(VlaDimInfo {
+                    is_vla,
+                    dim_expr,
+                    dim_expr_name: dim_name,
+                    const_size,
+                    base_elem_size,
+                });
+                current = elem;
+            } else {
+                break;
+            }
+        }
+        dims
+    }
+
+    /// Extract variable name from a VLA dimension expression.
+    fn extract_dim_expr_name(expr: &Expr) -> String {
+        match expr {
+            Expr::Identifier(name, _) => name.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Pre-scan a function body to find all label definitions and their scope depths.
+    ///
+    /// This walks the AST without generating IR, just tracking compound statement
+    /// nesting depth. The result maps each label name to its scope depth (number
+    /// of compound statements it's nested within, starting from 1 for the function
+    /// body itself, matching the scope_stack depth during lowering since push_scope
+    /// is called before lowering the function body).
+    ///
+    /// This information is used by `lower_goto_stmt` to determine which cleanup
+    /// scopes need to be exited: only scopes deeper than the target label's depth
+    /// should have their cleanup destructors called.
+    pub(super) fn prescan_label_depths(body: &CompoundStmt) -> FxHashMap<String, usize> {
+        let mut result = FxHashMap::default();
+        // depth starts at 1 because lower_function calls push_scope() before
+        // lower_compound_stmt, and then lower_compound_stmt calls push_scope again
+        // for the function body's own compound statement.
+        Self::prescan_compound_stmt(body, 1, &mut result);
+        result
+    }
+
+    fn prescan_compound_stmt(
+        compound: &CompoundStmt,
+        depth: usize,
+        result: &mut FxHashMap<String, usize>,
+    ) {
+        // Match the lowering behavior: only push a scope (increment depth) when the
+        // compound statement contains declarations. Declaration-free compound statements
+        // don't push a scope in lower_compound_stmt, so we must not increment depth here.
+        let has_declarations = Self::block_needs_scope(compound);
+        let inner_depth = if has_declarations { depth + 1 } else { depth };
+        for item in &compound.items {
+            match item {
+                BlockItem::Statement(stmt) => Self::prescan_stmt(stmt, inner_depth, result),
+                // A nested function's labels live in ITS body, not the
+                // parent's: skip the whole definition. The nested function
+                // gets its own prescan when it is lowered independently.
+                BlockItem::Declaration(_)
+                | BlockItem::NestedFunction(_)
+                | BlockItem::StaticAssert(_) => {}
+            }
+        }
+    }
+
+    fn prescan_stmt(stmt: &Stmt, depth: usize, result: &mut FxHashMap<String, usize>) {
+        match stmt {
+            Stmt::Label(name, inner_stmt, _) => {
+                // Record the label at the current scope depth.
+                result.insert(name.clone(), depth);
+                Self::prescan_stmt(inner_stmt, depth, result);
+            }
+            Stmt::Compound(compound) => {
+                Self::prescan_compound_stmt(compound, depth, result);
+            }
+            Stmt::If(_, then_stmt, else_stmt, _) => {
+                Self::prescan_stmt(then_stmt, depth, result);
+                if let Some(else_stmt) = else_stmt {
+                    Self::prescan_stmt(else_stmt, depth, result);
+                }
+            }
+            Stmt::While(_, body, _) | Stmt::DoWhile(body, _, _) => {
+                Self::prescan_stmt(body, depth, result);
+            }
+            Stmt::For(init, _, _, body, _) => {
+                // C99: for-init declarations have their own scope, matching
+                // the push_scope() in lower_for_stmt.
+                let has_decl_init = init
+                    .as_ref()
+                    .is_some_and(|i| matches!(i.as_ref(), ForInit::Declaration(_)));
+                let for_depth = if has_decl_init { depth + 1 } else { depth };
+                Self::prescan_stmt(body, for_depth, result);
+            }
+            Stmt::Switch(_, body, _) => {
+                Self::prescan_stmt(body, depth, result);
+            }
+            Stmt::Case(_, inner, _) | Stmt::CaseRange(_, _, inner, _) | Stmt::Default(inner, _) => {
+                Self::prescan_stmt(inner, depth, result);
+            }
+            // Leaf statements: no labels inside
+            Stmt::Expr(_)
+            | Stmt::Return(_, _)
+            | Stmt::Break(..)
+            | Stmt::Continue(..)
+            | Stmt::Goto(_, _)
+            | Stmt::GotoIndirect(_, _)
+            | Stmt::Declaration(_)
+            | Stmt::InlineAsm { .. } => {}
+        }
+    }
+}

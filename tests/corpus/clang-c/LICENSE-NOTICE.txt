@@ -1,0 +1,19 @@
+Files in this directory originate from the EDG C/C++ front end test
+suite (https://github.com/edgcpp/compiler), subtrees
+tests/tests/imported/clang/**, licensed Apache-2.0 WITH LLVM
+exception (see the LICENSE.txt in that subtree, with its legacy
+University of Illinois/NCSA section).  Each adapted file carries an
+SPDX attribution header.  Full license text:
+../../../third_party_licenses/EDG-Clang-Apache-2.0-LLVM.txt
+
+Mixed-origin classification (review P1-5): some tests embed
+system-header declarations expanded inline (e.g. /usr/include
+prototypes chosen by the upstream authors as stable fixtures).
+Those declaration blocks originate with their respective system
+libraries under their own terms; we classify them, we do not
+assert a blanket license over them.  The index flag
+`contains_expanded_system_headers` records which files carry such
+material.  This corpus contains no GPL-licensed GNU testsuite
+material; those are referenced by name only in
+../gnu-torture-manifest.jsonl (GPL-3.0-or-later upstream; facts
+only, no source text, no license text required here).

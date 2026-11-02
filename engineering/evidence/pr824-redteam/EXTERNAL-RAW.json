@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "artifacts": [
+    {
+      "path": "artifacts/pr824-raw/oracle-and-callgrind-raw.tar.gz",
+      "bytes": 4439094,
+      "sha256": "d011515f08a266612c469c7f9e12931c5a74f21b1457fe811c8059be039465d1"
+    },
+    {
+      "path": "artifacts/pr824-raw/unsigned-and-compiler-work-raw.tar.xz",
+      "bytes": 5278988,
+      "sha256": "0f9802aabb52f5cfd65857abcc2dd8765bda75409e5e6bf4fb840d49343366d1"
+    },
+    {
+      "path": "artifacts/pr824-raw/s23-control-proof-raw.tar.xz",
+      "bytes": 185616,
+      "sha256": "b64ae53d31d842ad121fcbd85d7c18b95fccce8e4f8a26b9512805d9d773645e"
+    }
+  ],
+  "retained_commit": "b9629da366b8a65b3831c50e8c4b666a3d666be9",
+  "relocations": [
+    {
+      "former_repository_path": "engineering/evidence/pr824-redteam/oracle-and-callgrind-raw.tar.gz",
+      "external_path": "artifacts/pr824-raw/oracle-and-callgrind-raw.tar.gz",
+      "bytes": 4439094,
+      "sha256": "d011515f08a266612c469c7f9e12931c5a74f21b1457fe811c8059be039465d1",
+      "retained_commit": "b9629da366b8a65b3831c50e8c4b666a3d666be9"
+    },
+    {
+      "former_repository_path": "engineering/evidence/pr824-redteam/unsigned-and-compiler-work-raw.tar.xz",
+      "external_path": "artifacts/pr824-raw/unsigned-and-compiler-work-raw.tar.xz",
+      "bytes": 5278988,
+      "sha256": "0f9802aabb52f5cfd65857abcc2dd8765bda75409e5e6bf4fb840d49343366d1",
+      "retained_commit": "b9629da366b8a65b3831c50e8c4b666a3d666be9"
+    },
+    {
+      "former_repository_path": "engineering/evidence/pr824-redteam/s23-control-proof-raw.tar.xz",
+      "external_path": "artifacts/pr824-raw/s23-control-proof-raw.tar.xz",
+      "bytes": 185616,
+      "sha256": "b64ae53d31d842ad121fcbd85d7c18b95fccce8e4f8a26b9512805d9d773645e",
+      "retained_commit": "b9629da366b8a65b3831c50e8c4b666a3d666be9"
+    }
+  ]
+}

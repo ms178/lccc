@@ -1,0 +1,59 @@
+--- main-f07f4c5
++++ candidate-b52a114
+@@ -115,7 +115,7 @@
+ 	cmp    $0x4000,%r8
+ 	jl     <main+0x40>
+ 	lea    0x375f(%rip),%r8        # <array>
+-	vpxor  %xmm13,%xmm13,%xmm13
++	pxor   %xmm13,%xmm13
+ 	xor    %r9d,%r9d
+ 	cmp    $0x10000,%r9d
+ 	jge    <main+0xd9>
+@@ -138,10 +138,10 @@
+ 	cmp    $0x10000,%r9d
+ 	jl     <main+0x90>
+ 	vpaddq %xmm13,%xmm15,%xmm15
+-	vmovdqa %xmm15,%xmm2
++	movdqa %xmm15,%xmm2
+ 	cmp    $0x10000,%r9d
+ 	jge    <main+0x11c>
+-	nopl   0x0(%rax,%rax,1)
++	nopl   0x0(%rax)
+ 	movslq %r9d,%rsi
+ 	vmovdqu (%r8,%rsi,1),%xmm0
+ 	vpmovsxdq %xmm0,%xmm1
+@@ -226,7 +226,7 @@
+ 	add    $0x20,%rdi
+ 	cmp    $0x10000,%rdi
+ 	jl     <main+0x250>
+-	vpxor  %xmm15,%xmm15,%xmm15
++	pxor   %xmm15,%xmm15
+ 	xor    %esi,%esi
+ 	cmp    $0x10000,%esi
+ 	jge    <main+0x2c7>
+@@ -248,10 +248,10 @@
+ 	cmp    $0x10000,%esi
+ 	jl     <main+0x280>
+ 	vpaddq %xmm15,%xmm14,%xmm14
+-	vmovdqa %xmm14,%xmm3
++	movdqa %xmm14,%xmm3
+ 	cmp    $0x10000,%esi
+ 	jge    <main+0x30a>
+-	nopl   0x0(%rax,%rax,1)
++	nopl   0x0(%rax)
+ 	movslq %esi,%rdi
+ 	vmovdqu (%r9,%rdi,1),%xmm0
+ 	vpmovsxdq %xmm0,%xmm1
+@@ -262,9 +262,9 @@
+ 	add    $0x10,%esi
+ 	cmp    $0x10000,%esi
+ 	jl     <main+0x2e0>
+-	vmovdqa %xmm3,%xmm0
+-	vpshufd $0xee,%xmm3,%xmm1
+-	vpaddq %xmm1,%xmm0,%xmm0
++	movdqa %xmm3,%xmm0
++	pshufd $0xee,%xmm3,%xmm1
++	paddq  %xmm1,%xmm0
+ 	vmovq  %xmm0,%rax
+ 	mov    %rax,0x10(%rsp)
+ 	xor    %ebx,%ebx

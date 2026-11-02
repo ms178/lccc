@@ -1,0 +1,83 @@
+{
+  "source": "user-provided screening report; not independently reproduced",
+  "utc": "2026-10-15T10:18:56Z",
+  "cpu": "EPYC 9V45 VM; four vCPUs; pinned CPU0; no PMU",
+  "revision": "6b6723d176390452e68d29b3e929aac0edab28a5",
+  "binary_sha256": "484301fac0ca92de53aec48a33ff9049a2a916c67bce2cb2032b30dd82c5bf8c",
+  "flags": null,
+  "gcc_version": null,
+  "verified_pmu": false,
+  "all_cases": null,
+  "worst15": [
+    {
+      "name": "chacha20_block",
+      "reported_paired_time_ratio": 2.0116
+    },
+    {
+      "name": "byte_load_reassembly",
+      "reported_paired_time_ratio": 1.7987
+    },
+    {
+      "name": "spectral_norm",
+      "reported_paired_time_ratio": 1.4297
+    },
+    {
+      "name": "sieve",
+      "reported_paired_time_ratio": 1.2591
+    },
+    {
+      "name": "sha256_transform",
+      "reported_paired_time_ratio": 1.2344
+    },
+    {
+      "name": "binary_trees",
+      "reported_paired_time_ratio": 1.1989
+    },
+    {
+      "name": "expat_xml_scan",
+      "reported_paired_time_ratio": 1.1709
+    },
+    {
+      "name": "lz4_match_extend",
+      "reported_paired_time_ratio": 1.1369
+    },
+    {
+      "name": "sqlite_varint",
+      "reported_paired_time_ratio": 1.0792
+    },
+    {
+      "name": "fannkuch",
+      "reported_paired_time_ratio": 1.0548
+    },
+    {
+      "name": "hash_table",
+      "reported_paired_time_ratio": 1.0532
+    },
+    {
+      "name": "tls_seg_access",
+      "reported_paired_time_ratio": 1.0518
+    },
+    {
+      "name": "mandelbrot",
+      "reported_paired_time_ratio": 1.0427
+    },
+    {
+      "name": "strlen_bench",
+      "reported_paired_time_ratio": 1.0378
+    },
+    {
+      "name": "linux_rbtree",
+      "reported_paired_time_ratio": 1.0362
+    }
+  ],
+  "reported_45_case_summary": {
+    "correct": 45,
+    "geometric_ratio": 0.7291,
+    "arithmetic_ratio": 0.9459
+  },
+  "tree_identity": {
+    "screen": "282be93bfedca7e27b2e6ced04e33b8eddcedf35",
+    "pr832": "282be93bfedca7e27b2e6ced04e33b8eddcedf35",
+    "main": "282be93bfedca7e27b2e6ced04e33b8eddcedf35"
+  }
+}

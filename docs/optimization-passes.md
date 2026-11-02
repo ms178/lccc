@@ -1,0 +1,668 @@
+---
+layout: doc
+title: Optimization Passes
+description: The CCC/LCCC optimizer pass pipeline — what runs, in what order, and why.
+prev_page:
+  title: Register Allocator
+  url: /docs/register-allocator
+next_page:
+  title: Benchmarks
+  url: /docs/benchmarks
+---
+
+# Optimization Passes
+{:.doc-subtitle}
+LCCC inherits CCC's optimizer. **Tiers are real** (authoritative: `src/passes/README.md`):
+
+- `-O0`: skip the pipeline except mandatory inline-asm symbol resolution
+- `-O1`: mem2reg, constant folding, copy-prop, DCE
+- `-O2`: full scalar/IPO pipeline
+- `-O3`: `-O2` plus size-increasing unroll
+- `-Os` / `-Oz`: size; `-Oz` also disables inlining
+
+Older text that claimed “all `-O` levels run the same pipeline” is **obsolete**.
+
+The `-O` flags still set `__OPTIMIZE__` / `__OPTIMIZE_SIZE__` for kernel-style `#ifdef`s.
+
+## Recently added passes
+
+`src/passes/README.md` and `src/passes/mod.rs` are authoritative for the IR
+passes; the backend peepholes are documented per backend
+(`src/backend/<arch>/codegen/`). Landed since this page was written:
+
+- **Path-duplicating jump threading** (`jump_thread.rs`, IR pass, `>= -O2`
+  except `-Os`/`-Oz`, after the main loop) -- duplicates a path of at most 4
+  blocks / 8 instructions for a predecessor that decides a later branch
+  (constant phi arm, dominating test, implied integer compare); at most 16
+  threads per function. Loop-header tail duplication is limited to
+  load-fed header branches that choose within the iteration, 1-2 latches,
+  private arms; measured rejections are listed in
+  `engineering/subsystems/optimizer.md`. Disable: `CCC_DISABLE_PASSES=jump_thread`
+  (not the x86 peephole of the same name, `CCC_PEEPHOLE_SKIP=jump_thread`).
+- **Join store forwarding** (`join_store_forward.rs`) -- a reload after a
+  join whose predecessors all store to the same pointer becomes a phi of the
+  stored values (list_sort's `tail->next`). `join_store_forward`.
+- **Phi relay folding** (`phi_relay_fold.rs`, `>= -O2`, right before phi
+  elimination) -- phi-only latch relays fold into the header so each edge
+  gets one parallel copy. `phi_relay_fold`.
+- **Phi webs** (`ir/mem2reg/phi_webs.rs`) -- acyclic phi webs inside one
+  innermost loop share one name (class cap 32, pass-through pairs first);
+  cross-loop unions are refused because they spill. `CCC_NO_PHI_WEB_COALESCE`.
+- **Accumulator recursion elimination** (`tail_call_elim.rs`,
+  `accumulator_calls_to_loops`, after `rec2iter`) -- `return x OP f(...)`
+  with an integer (<= 64-bit) Add/Mul/And/Or/Xor becomes a loop with an
+  accumulator; one operator per function. It must run after `rec2iter`,
+  which owns the O(n) Fibonacci rewrite. `tce_acc`.
+- **Bounded recursive self-inlining** (`inline/self_recursion.rs`, off at
+  `-Os`/`-Oz`) -- a frame-neutral, directly self-recursive body of at most
+  32 instructions and 2 self-calls is inlined into itself (at most 8 copies,
+  3 rounds, 160 instructions; no setjmp/`__builtin_setjmp`/non-local goto),
+  so each level owns its base-case branch. binary_trees: Callgrind
+  mispredicts 198,691 -> 89,642, Ir -4.7%. `self_inline`.
+- **Compare narrowing rule** (`simplify.rs`) -- `cmp (ext x), C` narrows to
+  the source width only when the extension's sole reader is the compare;
+  otherwise the wide value stays live anyway, and the narrow compare plus
+  the wide use cost an extra register (sqlite_vdbe_serial spill).
+- **Aggregate-copy forwarding** (`sret_copy_elision.rs`) — forwards eligible
+  same-block, dominated aggregate copies into their loads, retaining copies
+  with escaping, ambiguous, volatile, or otherwise unowned uses. Set
+  `CCC_NO_SRET_COPY_ELISION` (presence-based, including an empty value) to
+  disable both pipeline invocations for diagnosis.
+- **Two-block reduction unrolling** (`loop_unroll.rs`, Pass B) — guard-free
+  k-body unroll of a two-block counted loop, k | trip. Two profit reasons
+  admit a load-only latch whose k copies stay a single chain: a private
+  **unsigned** accumulation (`loop_unroll_reduction.rs`, which then balances
+  the additions) and, since the 2026-10-29 audit, a **serial carried
+  accumulator of any type** — `acc = acc + x`, one accumulation per iteration,
+  one use of the back-edge value. The second reason is what makes strict-FP
+  reductions unrollable: the k bodies are threaded, so the association order is
+  unchanged and no fast-math permission is needed. Measured with callgrind on
+  `reduction_vecreg` (corpus worst row): 3,277,948,036 → 1,803,403,033
+  instructions, ratio 1.905 → 1.048 against GCC 16.2. Gate:
+  `tests/regression/check_fp_reduction_unroll.sh` (shape + bit-exact results
+  across `-O0`/`-O1`/`-O2`/`-O3`/`-mno-avx`/`-march=x86-64-v3`, every trip
+  residue modulo 8, association-sensitive payloads).
+- **Constant-trip before the vectorizer** (`run_passes`, "Phase 2b-pre-vec") —
+  IPCP also runs *before* iteration 0's vectorizer and post-vectorize unroller,
+  not only at the end of each iteration. Without it a callee whose trip count
+  only becomes constant when its `n` parameter is specialized (the ubiquitous
+  `sum(const T *v, int n)` shape with one call site) is a dynamic-trip loop for
+  both, and by iteration 1 `loop_rotate` has already rewritten it into the
+  rotated self-loop form that no unroller accepts — so those callees never got
+  unrolled at all. The late IPCP stays (call-site simplification still wants the
+  end-of-iteration position); the early call is idempotent. It is placed after
+  the Early unroller on purpose: earlier placement perturbed shapes that the
+  store-motion and segment-SIB contracts depend on (measured: those gates'
+  fixtures then unrolled completely, which is why the two gates now state their
+  contract for what it is — see `check_loop_store_motion.sh`'s `UNROLLED` arm
+  and `check_seg_gs_runtime.sh`'s `CCC_DISABLE_PASSES=ipcp` shape build).
+- **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
+  escape analysis and byte-range kills (`CCC_NO_DSE`).
+- **Backedge PRE** — integer recurrences default-on (1.14x measured);
+  FP variants gated (`CCC_BEPRE_FP=1` research).
+- **GlobalAddr CSE** (`global_addr_cse.rs`) — oracle-derived placement:
+  cold singletons branch-local, loop addresses to the innermost preheader,
+  dominating defs reused, derived variable-index bases site-local.
+- **Stencil vectorizer** — constant-tap affine loops, bit-exact vs scalar
+  (`CCC_NO_STENCIL_VEC`).
+- **Map expression trees** — elementwise FP/int map loops (`CCC_NO_MAP_VEC`).
+- **Generator-map vectorizer** (`vectorize_generator_map.rs`) — counted
+  loops that store a byte computed from the induction variable alone
+  (`dst[i] = (u8)F(i)`, no source loads), AVX2 only, 32 elements per packed
+  iteration with a scalar tail. Kill switch `CCC_NO_GENERATOR_MAP`; the
+  `[VEC-GEN]` trace under `LCCC_DEBUG_VECTORIZE`. Gate:
+  `tests/regression/check_generator_map.sh`.
+- **Strided-2 i32 sum reductions** (`vectorize_strided_i32_reduce.rs`,
+  pass `vectorize_strided_reduce_pre_unroll`) — counted loops whose byte IV
+  steps by 8 and whose accumulator adds a pure 32-bit modular expression of
+  the loaded dwords. Every vector covers four elements (32 bytes of the IV).
+  **AVX2:** the elements sit in the even YMM lanes — four exact `vmovd` /
+  `vpinsrd` reads, or one full `vmovdqu` when the window is proven — so the
+  per-element DAG needs no in-loop shuffle; the epilogue masks the odd lanes;
+  4x unrolled with two accumulator chains at `>= 8` safe vectors. **SSE2
+  baseline:** the elements fill all four XMM lanes — a proven window is
+  compacted from two `movdqu` with one `shufps $0x88`, an unproven pointer is
+  gathered with four exact `movd` reads joined by `punpckldq`/`punpcklqdq` —
+  so streams of either kind mix and no lane mask exists; unrolled twice with
+  two accumulators and two in-place IV vectors. The loop bound is the scalar
+  loop's own dereferenced footprint (`32v + 31 <= 8(T-1) + 3`), so the
+  vector prefix never reads past the last scalar element. A stream qualifies
+  for a gap-reading wide load only under a proof that its whole window lies
+  in one object: a current-frame alloca of sufficient extent, or — through
+  `ModuleSymbolFacts` — a strong, locally binding global whose defined size
+  covers the window (interposable, weak, common, alias- and
+  asm-label-redirected names are excluded, so a link-time replacement can
+  never shrink the proof). Unproven pointers read only their elements:
+  intervening bytes may belong to another, independently shared or
+  device-mapped object. The untouched scalar loop runs the tail. Kill switch
+  `CCC_NO_STRIDED_REDUCE`; i686 and AArch64 fail closed. The trip count, the
+  wrap-free admission and the resume constant are pure functions with
+  exhaustive unit tests (`cargo test -p lccc vectorize_strided_i32_reduce`);
+  `tests/regression/check_vector_remainder_codegen.sh` pins both widths,
+  checks exact access with hardware watchpoints on the gaps
+  (`fixtures/strided_exact/`) and runs a boundary stress
+  (`tests/regression/lib/strided_reduce_stress.py`) against GCC.
+- **Vector fill** (`vector_fill.rs`, late, x86-64 SSE2+, `-O2`/`-O3`) —
+  `for (i = 0; i < n; i++) p[i] = v` whose element is 16/32/64-bit (or a
+  float constant) and whose value is not one repeated byte (those are
+  `loop_memset`'s `memset`): a 32-byte-per-iteration pre-loop of two
+  `movdqu` stores of the splatted value runs up to `n & -L`, then the
+  untouched scalar loop finishes the tail and still defines every exit
+  value. A constant trip count that is a multiple of the step exits straight
+  past the (then dead) scalar loop. Exactness argument and admission rules
+  (64-bit affine address chain, `sext` only under a signed exit test,
+  negative signed bounds clamp to zero) in the module doc; obeys
+  `-fno-tree-vectorize`; pass name `vector_fill`. Gate:
+  `tests/regression/check_vector_remainder_codegen.sh`
+  (`tests/regression/lib/vector_fill_stress.py`).
+- **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
+  pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
+- **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level
+  (`CCC_LOOP_ROTATE=1`), runs after vectorize; default-enable pending
+  hardening (see `engineering/tasks/TASK-PF-17-LOOP-ROTATE-DEFAULT.md`).
+  Independently, the **ARM backend peephole rotates simple loops by default**
+  (`rotate_simple_loops`, off only under `CCC_NO_LOOP_ROTATE`).
+- **General complete unrolling** — nested/multi-block constant-trip loops
+  with FP-aware expansion budget.
+- **Tri-state FP contraction** — `FpContract { Off, OnExpr, Fast }`,
+  default Off (GCC `gnu*` parity); FMA emission requires the FMA3 feature.
+- **Identical basic-block merging** (`merge_identical_blocks`, ARM + RISC-V
+  backend peepholes) — collapses duplicate blocks that a switch's phi
+  trampolines, repeated guard sequences and cloned epilogue stubs leave behind.
+  Ported from the x86 backend's `identical_blocks` pass.  Measured on the
+  43-program corpus: **-45 / -30 instructions (ARM `-Os` / `-O2`)** and
+  **-51 / -45 (RISC-V)**.
+
+### Backend peepholes worth knowing about
+
+- **Register-copy coalescing** — whole-function: renames a copy's destination
+  onto its source everywhere and deletes the copy. Installed in **x86**
+  (`passes/copy_coalesce.rs`), **ARM** and **RISC-V**
+  (`coalesce_entry_copies`); i686 has its own equivalents. It is the only way
+  to remove an entry-shuffle copy, whose destination is live to the end of the
+  function, so no local pass can touch it.
+
+  The copy must sit in the straight-line entry run, and then the admission
+  question is whether the rename is safe afterwards. **x86 and ARM** answer it
+  with exact backward dataflow: the source must be dead immediately after the
+  copy, a later write to the source must not clobber the value, and a later
+  write to the *destination* (the epilogue restore of a callee-saved register,
+  typically) must not destroy whatever is still live in the source. **RISC-V**
+  still uses the older syntactic rule — the source must not be mentioned
+  anywhere else in the function — which is why it fires far less often.
+  `scripts/coalesce_census.py` measures both against the emitted assembly.
+- **Alias folding** (ARM `propagate_address_aliases`) — deletes `mov xD, xS`
+  when dst is only ever used as an address base. Gated on an exact CFG query
+  (`Cfg::redef_covers_all_reads`): every read of dst reachable *without passing
+  the redefinition* must be a rewritable address use. A `ret` invalidates it
+  for x0-x7, which carry the return value.
+
+- **Dual-layout metric pairs** (`-O1` and up, **all four backends**) — when
+  `block_layout`'s static chain cannot predict whether its reordering helps
+  (measured: -42 instructions on `linux_rbtree`, +38 on `strlen_bench`), the
+  backend emits both candidate orders, runs its full text peephole over each
+  and keeps the smaller instruction count. The candidates are independent
+  fragments, so the pair is split across a scoped worker and the caller. This
+  is a compile-*latency* change only: every backend's metric peephole is a
+  pure `text -> text` function, and generated assembly is byte-identical by
+  contract, per backend, in the gate.
+
+  The policy lives in `backend/metric_pair.rs` and is shared by x86-64, i686,
+  AArch64 and RISC-V; each backend's `ArchCodegen::peephole_pair_for_metric`
+  override supplies only its own `peephole_optimize`. `LCCC_PEEPHOLE_PAIR_PARALLEL`
+  controls it: `0`/`off` never spawns, `1`/`on` always spawns on a multi-thread
+  host (the A/B lever the gate uses to reach the concurrent path anywhere), and
+  unset/`auto`/a typo keeps the heuristic — serial below
+  `MIN_PARALLEL_PAIR_BYTES` (1 KiB combined, an 8x floor over the measured
+  spawn crossover) or on a single-thread host.
+  `CCC_TIME_PEEPHOLE=1` prints one
+  `[pair] arch=… chain=…B orig=…B mode=… parallel=… serial=… deduped=…` line per
+  pair, which is the only way to observe the split (both modes emit the same
+  text). Identical candidates skip the second pass.
+
+  `tests/regression/check_peephole_pair_parallel.py` pins, per backend and per
+  pair, assembly identity across the three modes, the kill switch, the
+  single-thread fallback, pair liveness, counter accounting
+  (`parallel + serial + deduped` = pairs reported), **and reproducibility**
+  (three compiles, one hash — the RISC-V identical-block pass used to iterate a
+  randomly seeded `HashMap` and emit different labels on every run). It uses a
+  header-free fixture that forces ten explorations per compile, so no cross
+  sysroot is needed and no backend's verdict rests on one lucky pair; x86-64
+  additionally compiles real benchmark TUs and repeats at `-O2`. `scripts/measure_peephole_pair.py`
+  regenerates the timings. `CCC_DUMP_ASM` / `CCC_PEEPHOLE_TRACE` suffix their
+  files `-chain`/`-orig` so an explored function keeps both candidates instead
+  of one overwriting the other.
+
+- **Identical basic-block merging** (`merge_identical_blocks`) — a block is
+  deleted and its predecessors retargeted when its instruction text matches
+  another block's and either (a) both have the **same non-empty predecessor
+  set**, so the live-in state is identical, or (b) both are **live-in
+  independent** — every register they read is defined inside the block — so
+  the live-in state is irrelevant.  Additionally the deleted block must be
+  entered only by explicit branches (a fall-through edge cannot be retargeted
+  by renaming a label), must not be a function's entry block, and blocks whose
+  predecessors are unknown (an indirect `br xN` jump table, or a `jalr`) are
+  excluded rather than poisoning the whole function.
+
+## Pass Order
+
+The optimizer runs up to three full iterations. Each iteration runs this pipeline:
+
+```
+1.  CFG simplification      — remove dead blocks, thread jump chains, simplify branches
+2.  Copy propagation        — replace uses of copies with original values
+2a. Division-by-constant    — replace idiv/div with multiply-shift (iter 0 only)
+2b. Integer narrowing       — shrink operation widths (e.g. i64 add → i32 add)
+3.  Algebraic simplification — strength reduction, identity removal
+4.  Constant folding        — evaluate constant expressions at compile time
+5.  GVN + LICM + IVSR       — shared CFG analysis (computed once per function):
+    ├── GVN                 — global value numbering / CSE across dominated blocks
+    ├── LICM                — loop-invariant code motion
+    └── IVSR                — induction variable strength reduction
+7.  If-conversion           — convert branch+phi diamonds to cmov/Select
+8.  Copy propagation        — clean up copies created by GVN, simplify, LICM
+9.  Dead code elimination   — remove dead instructions (excluded from convergence check)
+10. CFG simplification      — clean up after DCE empties blocks
+10.5 IPCP                   — interprocedural constant propagation (all iterations)
+```
+
+**Phase 0** (before the loop):
+- Tail-call elimination (TCE) — converts self-recursive tail calls to loops
+- Function inlining (including the **post-structural** inlining round after
+  TCE/rec2iter)
+- `recursion_to_iter` (rec2iter) — non-tail binary recursion to iterative
+  accumulators
+- mem2reg
+- Initial constant-fold/copy-prop round
+- **Vectorization** (iteration 0 only) — transforms reduction loops to AVX2/SSE2 SIMD
+
+**Phase 11** (after the loop):
+- dead static function elimination — removes `static inline` functions that
+  became unreferenced after inlining
+- **Outline switch** — large cold switches lowered out of line when beneficial
+
+Additional passes in the pipeline (see `src/passes/`): `resolve_asm` (inline-asm
+symbol resolution), `vector_temp_promotion` (SIMD temp slot promotion), and the
+standalone `univsr` (universal induction-variable strength reduction) pass that
+runs under explicit control.
+
+**PGO** (`src/pgo/`) wraps the optimizer: with `-fprofile-generate` it
+instruments the post-optimization IR; with `-fprofile-use` it drives inlining,
+loop unrolling, block/function layout, switch lowering, and indirect-call
+devirtualization from a runtime profile. See the PGO section below.
+
+## Convergence
+
+Iterations stop when:
+- No pass made any change (fixpoint reached), **or**
+- This iteration made fewer than 1/20th the changes of the first iteration (diminishing returns).
+
+DCE changes are excluded from the convergence check because DCE's large removal counts inflate the first-iteration baseline and cause premature exit.
+
+## Pass Interactions
+
+The passes form a dependency graph. LCCC uses a `should_run!` macro to skip passes when their upstream passes made no changes in the previous iteration:
+
+| Pass | Only re-runs if... |
+|------|-------------------|
+| CFG simplify | constfold changed (constant branches) or DCE changed (empty blocks) |
+| Copy prop | CFG, GVN, LICM, or if-convert changed |
+| Simplify | Copy prop or narrowing changed |
+| Constfold | Copy prop, narrowing, simplify, or if-convert changed |
+| GVN | CFG, copy prop, or simplify changed |
+| LICM | CFG, copy prop, or GVN changed |
+| DCE | GVN, LICM, if-convert, or copy prop2 changed |
+
+## Key Passes
+
+### GVN (Global Value Numbering)
+
+Eliminates redundant computations across basic blocks. If two blocks both compute `a + b` where `a` and `b` have the same value, GVN replaces the second with a copy of the first. Operates on `BinOp`, `UnaryOp`, `Cmp`, `Cast`, `GetElementPtr`, and `Load` instructions within the dominator tree.
+
+GVN, LICM, and IVSR share a single `CfgAnalysis` (dominator tree + loop nesting) per function per iteration, saving significant compile time on large translation units.
+
+### LICM (Loop-Invariant Code Motion)
+
+Hoists computations out of loops when their operands don't change within the loop. Identifies natural loops via the dominator tree, then moves invariant instructions to loop preheaders. Critical for inner-loop performance on code like matrix multiply.
+
+### IPCP (Interprocedural Constant Propagation)
+
+When a function is always called with the same constant argument, IPCP specializes the function for that constant and folds the resulting dead branches. Important for Linux kernel code (`IS_ENABLED()`, `cpucap_is_possible()` chains) where `static inline` wrappers gate large blocks of dead code.
+
+### Division-by-Constant
+
+Replaces `idiv`/`div` instructions (20–90 cycle latency on modern CPUs) with multiply-and-shift sequences. Runs only on the first iteration, before narrowing and constant folding can further simplify the expanded sequence. Disabled on i686 where 64-bit multiply overflow semantics differ.
+
+## Disabling Passes
+
+For debugging, individual passes can be disabled:
+
+```bash
+CCC_DISABLE_PASSES="gvn,licm" ./target/fastbuild/lccc input.c -o output
+CCC_DISABLE_PASSES="all"      ./target/fastbuild/lccc input.c -o output
+```
+
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`, `jump_thread`, `join_store_forward`, `phi_relay_fold`, `ret_dup`, `loop_memset`, `vector_fill`, `tce`, `tce_acc`, `rec2iter`, `self_inline`, `boolthread`.
+
+Timing data is available via:
+
+```bash
+CCC_TIME_PASSES=1 ./target/fastbuild/lccc input.c -o output 2>&1 | grep PASS
+```
+
+## Performance-Relevant Knobs (measured defaults)
+
+The tree carries 300+ environment knobs; most are debug switches with
+neutral defaults. Two change CODE GENERATION and have measured,
+data-backed defaults — a build that flips either silently changes the
+benchmark standings:
+
+| Knob | Default | What it controls | Why this default |
+|---|---|---|---|
+| `CCC_IVSR_SCALAR_DERIVED=1` | **off** (opt-in) | The scalar derived-IV flavor of `ivsr`: rewrites loop-recurrence-derived scalars (rbtree subtree pointers) into IV increments. | Measured net LOSS at default-on: linux_rbtree +1.2%, expat +4.0%, glibc_strstr +4.3%, five golden workloads past the codegen-quality bands (data in `src/passes/iv_strength_reduce.rs`; re-verified 2026-09-24 on x86-64: expat opt-in ≈+20%, glibc_strstr ≈+6.5%, linux_rbtree tie). Pinned opt-in by `tests/regression/check_ivsr_scalar_derived_default.sh`, which also proves the knob stays LIVE (knob-set and knob-unset asm must differ) so it cannot silently rot into a no-op. |
+| `CCC_NO_STRIDED_REDUCE` | **unset** (vectorizer on) | Kill switch for the strided-2 i32 sum-reduction vectorizer (`vectorize_strided_i32_reduce.rs`). Set to any value (including empty) to disable the transform and keep the counted scalar loop. | The transform is gated on `x86_simd_available()` and the same `force_two_wide` / late-minmax exclusions as the rest of the vectorizer; there is deliberately no `force_sse2` exclusion because the reducer selects its own width (`x86_avx2_available() && !sse2_forced()` yields the 32-byte X8 schedule, otherwise the SSE2-safe X4 / X4Compact schedules), and its bound proof is the scalar loop's own footprint; the switch exists for bisection parity with the other vectorizers, not as a supported configuration. |
+| `CCC_NO_ANDN_FUSION` | **unset** (fusion on) | Kill switch for the Not+And → 3-operand `andn` fusion (BMI1) and, with it, the middle-end CH-mux defer that leaves the Not for the backend to fuse. | The fused shape is the GCC/Clang/ICX four-oracle consensus for SHA-256's CH (`tests/regression/check_ch_maj_codegen.sh` pins exactly one `andn` under `-mbmi`, zero without). The switch exists for bisection parity with the other branch fusions, not as a supported configuration. |
+| `CCC_NO_SELF_ZEXT_FALLTHROUGH` | **unset** (fallthrough tracking on) | Presence, including an empty value, restores the conservative conditional-branch barrier in the x86-64 self-zero-extension pass. Labels, unconditional transfers, unknown directives and clobbers remain barriers in either mode. | This is a diagnostic A/B control for the fallthrough policy, not a supported target or optimization level; the rest of the zero-extension pass remains active. |
+
+The andn knob is resolved ONCE per `run_passes` (the `scalar_andn_available`
+spelling shared by both `bit_idioms` tiers) and re-read at emission
+(`supports_and_not`), so fold-time prediction and emission-time decision
+cannot drift within one compilation.
+
+## Debug / explain knobs added with the S07-S08 work
+
+These three are pure diagnostics: each gates a trace the compiler otherwise
+computes nothing for, none changes emitted code, and each is named here because
+`scripts/audit_census.py` requires every `CCC_*`/`LCCC_*` literal in `src/` to be
+documented in a tracked markdown file.
+
+| Knob | What it shows |
+|---|---|
+| `CCC_DEBUG_VOLRED=1` | `volatile_reduce`'s interleave budget: how many lanes the pass admitted, which bound (lane count vs. budget) bound the group, and why a candidate was dropped. Budget exhaustion is a normal outcome, not a defect, so it is silent by default. |
+| `CCC_DEBUG_STATIC_INIT=1` | The static-initializer builder's decision for an element it cannot fold: which evaluator ran (scalar constant, sema's folded value, address constant, byte fill), and the offset each one wrote. |
+| `CCC_DEBUG_TYPES_COMPATIBLE=1` | `__builtin_types_compatible_p`'s verdict for each query with the two resolved types in canonical form, i.e. exactly the pair the predicate compared after qualification stripping and parameter-name erasure. |
+
+Debug traces are opt-in and rate-limited by construction: each is a
+`std::env::var_os` probe per decision site, so a knob left exported in a
+benchmark or kernel environment changes nothing.  That is a checked invariant,
+not a promise: `tests/regression/check_debug_knobs_neutral.py` compiles a
+fixture that reaches all three decision sites at `-O0/-O1/-O2/-O3` with the
+knob unset and set and requires the emitted assembly to be identical, and
+requires the knob name to still be present in the compiler binary so a knob
+cannot rot into dead documentation.
+
+## Verifying IR Between Passes
+
+`CCC_VERIFY_IR` runs a structural check on the IR after **every** pass, so the
+stage it names is the pass that *produced* the malformed IR rather than a later
+pass that tripped over it:
+
+```bash
+CCC_VERIFY_IR=1     ./target/fastbuild/lccc input.c -o output   # report to stderr
+CCC_VERIFY_IR=abort ./target/fastbuild/lccc input.c -o output   # panic on the first violation
+```
+
+It checks that block labels are unique, that every branch and `asm goto` target
+names a real block, that phis form a contiguous prefix of their block, and that a
+phi's incoming labels are exactly its CFG predecessors — no stale entries, no
+duplicates, none missing.
+
+That last check matters more than it sounds. Phi elimination resolves an operand's
+label to a block *index* and emits the copy there, so a phi naming a block that is
+no longer a predecessor still "works" whenever that block happens to dominate. A
+`loop_rotate` defect hid behind exactly that accident until SCCP — which trusts the
+predecessor list and prunes operands on edges it proves dead — deleted an induction
+variable's initialisation. See
+`../engineering/journal/2026-08.md`.
+
+Verification is off by default and costs one atomic load per pass when disabled.
+
+## Debugging SCCP
+
+SCCP performs four independent rewrites. Each can be suppressed on its own, which
+makes bisecting a miscompile a single rebuild rather than a bisect over the pass:
+
+| Variable | Suppresses |
+|---|---|
+| `CCC_SCCP_NO_PRUNE` | pruning phi operands on provably-dead edges |
+| `CCC_SCCP_NO_DEFS` | rewriting definitions to `Copy { dest, Const }` |
+| `CCC_SCCP_NO_SUBST` | substituting constants into operands |
+| `CCC_SCCP_NO_FOLD` | folding `CondBranch`/`Switch` into `Branch` |
+| `CCC_SCCP_TRACE_PRUNE` | prints every pruned phi operand and its edge verdict |
+
+## LCCC-Specific Passes
+
+LCCC adds two optimization passes that run before CCC's main optimizer loop.
+
+### Tail-Call Elimination (`tce`)
+
+Converts self-recursive tail calls to back-edge branches. A tail call is a recursive call whose result is returned immediately — `return f(args)` with no further computation.
+
+```c
+// Before: 10M stack frames
+long sum(int n, long acc) {
+    if (n <= 0) return acc;
+    return sum(n - 1, acc + n);
+}
+
+// After TCE: tight counted loop (identical to GCC output)
+long sum(int n, long acc) {
+loop:
+    if (n <= 0) return acc;
+    acc += n; n -= 1; goto loop;
+}
+```
+
+TCE runs once after inlining, before the main optimization loop, so that LICM, IVSR, and GVN can subsequently optimize the resulting loop.
+
+**Pass name:** `tce` (disable with `CCC_DISABLE_PASSES=tce`)
+
+**Implementation:** [`src/passes/tail_call_elim.rs`](https://github.com/ms178/lccc/blob/main/src/passes/tail_call_elim.rs)
+
+### Phi-Copy Stack Slot Coalescing (backend)
+
+This is a backend optimization in `src/backend/stack_layout/copy_coalescing.rs`, not a pass in the traditional sense. It runs during stack layout, before code generation.
+
+When CCC's phi elimination lowers SSA phi nodes to Copy instructions, it creates separate stack slots for the phi destination and its backedge update value. For a 32-variable loop, this generates ~20 redundant stack-to-stack `movq` pairs per iteration.
+
+LCCC detects the phi-copy pattern — where the source is defined and killed in the backedge block — and aliases the source to use the phi destination's wider-live slot. The Copy becomes a same-slot no-op and is dropped by `generate_copy`.
+
+**Result:** `arith_loop` (32 variables): 550 → 507 assembly lines; 0.124s → 0.104s.
+
+## LCCC-Specific: Reduction Vectorization
+
+**Added in Phase 8** — LCCC detects and transforms reduction loops into AVX2/SSE2 SIMD operations.
+
+### What Gets Vectorized
+
+Simple reduction patterns:
+```c
+// Sum reduction
+double sum = 0.0;
+for (int i = 0; i < n; i++)
+    sum += arr[i];
+
+// Dot product
+double dot = 0.0;
+for (int i = 0; i < n; i++)
+    dot += a[i] * b[i];
+```
+
+### What deliberately stays scalar
+
+- **64-bit multiplies** (I64/U64 `Mul`, in a map or as a dot-product lane op).
+  No SSE2/AVX2 instruction produces a 64x64 low-half product (`vpmullq` is
+  AVX-512DQ), so `VecMulI64x2` is a 13-instruction emulation per **two** lanes —
+  6.5 instructions per lane against one scalar `imulq` — and the emulated
+  value's live range is long enough that its operand also lands in a stack
+  slot. callgrind on `unsigned_reduction`'s `dot_u64`: 291,009,947 instructions
+  against 202,784,913 for GCC 16.2's **scalar** loop (+50.3M `movq` lane
+  extractions, +77.6M `movdqu` spills, +33.6M `pshufd`). Refusing the shape
+  drops that program to 175,665,816 instructions (ratio 0.866 vs GCC) with
+  identical results. 64-bit **sums** keep their packed form: `paddq` is a real
+  instruction and that shape wins. `tests/regression/check_unsigned_reduction_codegen.sh`
+  pins both halves of the rule.
+- **Strict-FP reassociation.** A horizontal FP add tree changes the summation
+  order, so FP reductions either unroll as a *threaded* chain (see the
+  two-block reduction unrolling note) or wait for `-ffast-math`
+  (`fp_reassoc`) — never a reassociated packed tree.
+
+### Transformation Strategy
+
+1. **Pattern detection**: Identifies loops with a scalar accumulator PHI and a single reduction operation
+2. **Loop splitting**: Divides loop bound by vector width (4 for AVX2, 2 for SSE2)
+3. **Vector body**: Replaces scalar ops with vector intrinsics (VecLoad, VecAdd, VecMul)
+4. **Horizontal reduction**: Extracts scalar from final vector (`vextractf128` + `vunpckhpd` + `vaddsd`)
+5. **Remainder loop**: Handles `N % vec_width != 0` with scalar operations
+6. **Correct return**: Exit block returns scalar from remainder loop, not vector from main loop
+
+### Backend Implementation
+
+Vector values are treated as first-class SSA values that:
+- Get unique, never-reused stack slots (protected from slot recycler)
+- Are excluded from GPR allocation (forced to stack)
+- Use direct slot access in intrinsics (no pointer indirection)
+- Support vector-to-vector Copy via ymm/xmm registers
+
+### Generated Code (AVX2 Example)
+
+```asm
+vxorpd %ymm0, %ymm0, %ymm0          # Zero vector accumulator
+.loop:
+    vmovupd (%rax,%rcx), %ymm0      # Load 4 doubles
+    vaddpd %ymm1, %ymm0, %ymm0      # Add 4 doubles
+    ; loop back...
+
+; Horizontal reduction
+vextractf128 $1, %ymm0, %xmm1       # Extract high 128 bits
+vaddpd %xmm1, %xmm0, %xmm0          # Add high + low (2 doubles each)
+vunpckhpd %xmm0, %xmm0, %xmm1       # Unpack high double
+vaddsd %xmm1, %xmm0, %xmm0          # Final scalar
+
+; Remainder loop (scalar)
+.remainder:
+    movsd (%rbx,%r13,8), %xmm0      # Load single element
+    addsd -24(%rbp), %xmm0          # Add to scalar accumulator
+    ; loop back...
+
+; Return scalar result
+movsd -24(%rbp), %xmm0              # Return scalar (not vector!)
+```
+
+### Why It Beats GCC
+
+GCC's auto-vectorizer is conservative on simple reductions:
+- Worries about aliasing even with clear array indexing
+- Considers the pattern "too simple" to benefit
+- Falls back to 2× scalar loop unrolling
+
+LCCC's pattern-based approach:
+- Explicitly targets common reduction idioms
+- Aggressively transforms when pattern matches
+- Generates complete vectorization (4× for AVX2 vs GCC's 2× unroll)
+
+**Result**: LCCC vectorizes patterns GCC -O3 leaves scalar, achieving ~2.7× speedup.
+
+### Debug Flags
+
+```bash
+LCCC_DEBUG_VECTORIZE=1    # Show vectorization transformations
+LCCC_DEBUG_PROTECT=1      # Show stack slot protection decisions
+```
+
+---
+
+## PGO (Profile-Guided Optimization)
+
+PGO is implemented in `src/pgo/` and wraps the pass pipeline. It uses the
+GCC-compatible flag surface: `-fprofile-generate[=dir]`,
+`-fprofile-use[=dir]`, `-fbranch-probabilities`, `-fauto-profile`, and
+`-fprofile-update=atomic|single`.
+
+### Profile generation (instrumentation)
+
+`instrument.rs` instruments the *post-optimization* IR so no optimization pass
+ever sees a counter. For each function it:
+
+1. builds the CFG (with a virtual EXIT node for `return`-terminated blocks);
+2. chooses the edges to count with a **maximum-weight directed arborescence**
+   (backedges and cycle edges stay off the counter path; every non-entry node,
+   including loop latches, keeps exactly one incoming tree edge);
+3. emits a single `incq sym+off(%rip)` per counted edge (or a `lock`-prefixed
+   increment under `-fprofile-update=atomic`), splitting critical edges so a
+   counter never sits between a fused `cmp` and its branch;
+4. instruments **indirect-call value profiling** (top-4 callee slots per site).
+
+At runtime the counters are dumped to `lccc-<unit>-<pid>.profraw` files (or the
+`LCCC_PROFILE_FILE` / `LLVM_PROFILE_FILE` override) and merged deterministically.
+
+### Profile use
+
+`profile.rs` loads the `.profraw` text format (multi-file merge, version-tolerant
+parsing, per-file corruption tolerance) and `derive_block_counts` recovers every
+block count and tree-edge count from the instrumented edges by **flow
+conservation**.
+
+**Identity & drift:** profiles are keyed by a PRE-pass CFG fingerprint (stable
+across generate/use). A POST-pass fingerprint detects CFG drift from PGO-guided
+transforms; drifted functions keep their stable entry count for hot/cold
+*sections* but get **no** stale edge-derived data (fail-closed).
+
+**Profile summary** (`summary.rs`): an LLVM `ProfileSummaryInfo` analogue. The
+hot/cold thresholds come from the count distribution, and `has_spread()` tests
+whether one function uniquely dominates the runner-up — the gate that keeps a
+**flat** profile from perturbing the hot path.
+
+### Consumers
+
+- **Inlining** (`inline_pgo.rs`): percentile hot/cold classification,
+  label-independent entry-count-ratio force-inline for hot loop sites, bounded
+  force-inline budget, and a working hotness threshold multiplier.
+- **Loop unrolling** (`unroll_pgo.rs`): derived trip count (`backedge / entry`)
+  drives whether hot high-trip loops unroll and cold low-trip loops do not.
+- **Layout** (`layout.rs`): hot/cold function sections, profile-driven switch
+  lowering (dominant case hoisted out of a jump table; cold switches forced to a
+  compare chain), switch-case ordering, and conservative
+  (preserve-source-order) block layout that never perturbs register allocation.
+- **Devirtualization** (`promote.rs`): cost-aware indirect-call promotion — a
+  site whose top target is ≥95% of calls is already BTB-predicted and left
+  indirect; genuinely multi-valued sites are promoted to a guarded direct call.
+- **Backend branch inversion**: the hot successor of a `CondBranch` is made the
+  physical fall-through so the hot path takes no branch, without reordering
+  blocks.
+
+### Debug / tuning knobs
+
+```bash
+CCC_INLINE_DEBUG=1          # explain inliner decisions
+CCC_INLINE_PARAMREF_DEBUG=1  # trace parameter-reference remapping during inlining
+LCCC_DEBUG_LAYOUT=1          # layout decisions
+LCCC_DEBUG_PROMOTE=1        # devirtualization decisions
+LCCC_PGO_NO_LAYOUT=1        # disable PGO layout
+LCCC_PGO_PROMOTE_STABLE=95  # top-share % treated as "already predicted"
+LCCC_PGO_HOT_FRAC / LCCC_PGO_COLD_FRAC  # summary percentiles
+```
+
+The PGO A/B harness — `tests/benchmark/run_pgo_ab.py` — builds plain and
+profile-guided binaries for lccc and a reference compiler, verifies differential
+output equivalence, and reports paired bootstrap-CI speedups.
+
+## Exact FP recurrence reuse and late branch threading
+
+- **`loop_square`**: first O2+ optimizer iteration on x86-64/SIMD, outside size
+  mode; reuse one existing next-square per innermost loop. Signed-zero seed,
+  dominance, SSA, single-latch and stable FP-environment proofs prevent
+  speculation/reassociation. Six FP header phis reject the pressure heuristic.
+  Disable: `CCC_DISABLE_PASSES=loop_square`.
+- **`fp_double`**: x86-64/SIMD O2+ (including size modes), after scalar algebra and
+  before FP constant hoisting. Exact `2*x` to `x+x`; protect copy-connected
+  add/sub consumers only when permitted target FMA contraction can occur.
+  Disable: `CCC_DISABLE_PASSES=fp_double`; timings: `CCC_TIME_PASSES=1`.
+- **`jump_thread`**: late x86 peephole after `identical_blocks`, before
+  `epilogue_merge`; retarget local branch-only relays, preserving labels/code.
+  Only inert debug attribution crosses directive boundaries. Disabled for
+  size-oriented codegen until layout-aware growth control is available.
+  Disable: `CCC_PEEPHOLE_SKIP=jump_thread`.
+
+The floating transforms are not fast-math identities. Architecture expansion
+requires equivalent rounding/environment proofs and target-specific measurement.

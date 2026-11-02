@@ -1,0 +1,413 @@
+{
+  "schema": 1,
+  "flags": "-O2 -march=x86-64-v3",
+  "rows": [
+    {
+      "id": "ra01_global_match_probe",
+      "function": "global_match_probe",
+      "source": "engineering/evidence/godbolt/ra01_global_remat.c",
+      "lccc": {
+        "insns": 89,
+        "stack": 2,
+        "got": 0,
+        "push": 6
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 55,
+          "stack": 0,
+          "got": 0,
+          "push": 1
+        },
+        "clang": {
+          "insns": 106,
+          "stack": 0,
+          "got": 0,
+          "push": 3
+        },
+        "icx": {
+          "insns": 56,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "zlib_ng_adler32_c",
+      "function": "zlib_ng_adler32_c",
+      "source": "tests/oracle/programs/zlib_ng_adler32_kernel.c",
+      "lccc": {
+        "insns": 269,
+        "stack": 14,
+        "got": 0,
+        "push": 6
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 173,
+          "stack": 10,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 204,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "icx": {
+          "insns": 132,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "gzip_crc32_loop",
+      "function": "gzip_crc32_update_no_xor",
+      "source": "tests/oracle/programs/gzip_crc32_kernel.c",
+      "lccc": {
+        "insns": 14,
+        "stack": 0,
+        "got": 0,
+        "push": 0
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 15,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 49,
+          "stack": 0,
+          "got": 2,
+          "push": 0
+        },
+        "icx": {
+          "insns": 64,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "expat_name_length",
+      "function": "expat_utf8_name_length",
+      "source": "tests/oracle/programs/expat_name_scan_kernel.c",
+      "lccc": {
+        "insns": 69,
+        "stack": 0,
+        "got": 0,
+        "push": 0
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 78,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 67,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "icx": {
+          "insns": 71,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "expat_scan_document",
+      "function": "expat_scan_document",
+      "source": "tests/oracle/programs/expat_name_scan_kernel.c",
+      "lccc": {
+        "insns": 81,
+        "stack": 3,
+        "got": 0,
+        "push": 6
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 50,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 118,
+          "stack": 0,
+          "got": 0,
+          "push": 1
+        },
+        "icx": {
+          "insns": 132,
+          "stack": 0,
+          "got": 0,
+          "push": 3
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "clz_full",
+      "function": "clz_full",
+      "source": "tests/regression/count_zero_intermediate_casts.c",
+      "lccc": {
+        "insns": 4,
+        "stack": 0,
+        "got": 0,
+        "push": 0
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 27,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 28,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "icx": {
+          "insns": 28,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "ctz_full",
+      "function": "ctz_full",
+      "source": "tests/regression/count_zero_intermediate_casts.c",
+      "lccc": {
+        "insns": 6,
+        "stack": 0,
+        "got": 0,
+        "push": 0
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 44,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 35,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "icx": {
+          "insns": 35,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "clz_guard32",
+      "function": "clz_guard32",
+      "source": "tests/regression/clz_safe_guards.c",
+      "lccc": {
+        "insns": 7,
+        "stack": 0,
+        "got": 0,
+        "push": 0
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 30,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 32,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "icx": {
+          "insns": 32,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    },
+    {
+      "id": "ctz_guard64",
+      "function": "ctz_guard64",
+      "source": "tests/regression/clz_safe_guards.c",
+      "lccc": {
+        "insns": 7,
+        "stack": 0,
+        "got": 0,
+        "push": 0
+      },
+      "oracles": {
+        "gcc16.2": {
+          "insns": 47,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "clang": {
+          "insns": 39,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        },
+        "icx": {
+          "insns": 39,
+          "stack": 0,
+          "got": 0,
+          "push": 0
+        }
+      },
+      "resolved": {
+        "gcc16.2": {
+          "id": "cg162",
+          "name": "x86-64 gcc 16.2"
+        },
+        "clang": {
+          "id": "cclang2310",
+          "name": "x86-64 clang 23.1.0"
+        },
+        "icx": {
+          "id": "cicxlatest",
+          "name": "x86-64 icx (latest)"
+        }
+      }
+    }
+  ],
+  "errors": [],
+  "failures": []
+}

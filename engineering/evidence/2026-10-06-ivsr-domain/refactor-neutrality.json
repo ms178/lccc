@@ -1,0 +1,31 @@
+{
+ "date": "2026-10-06",
+ "claim": "factoring the two cast-legality predicates onto IrType and pointing generation.rs's SIB-index peel, iv_strength_reduce.rs and (by cross-reference) loop_carried_forward.rs at them changes NO generated code",
+ "method": "byte-comparison of -S output between the pre-refactor and post-refactor fastbuild compiler over every .c in tests/regression, tests/benchmark/programs and tests/oracle/programs",
+ "matrix": {
+  "optimisation": [
+   [
+    "-O2"
+   ],
+   [
+    "-O3"
+   ],
+   [
+    "-O2",
+    "-march=x86-64-v3"
+   ]
+  ],
+  "targets": [
+   "x86-64",
+   "i686 (-m32 -msse2)"
+  ]
+ },
+ "sources": 911,
+ "comparisons": 5388,
+ "identical": 5388,
+ "differing": 0,
+ "skipped_not_compilable": 78,
+ "build_determinism": "the rebuilt post-refactor binary is byte-identical (cmp) to the one saved before the differential run",
+ "host": "Debian 13 VM, GCC 14.2 assembler path, Rust 1.99.0, fastbuild (-O1, -j2)",
+ "limits": "static assembly identity only; no runtime, no PMU, no Raptor Lake, no slow/benchmark gate (out of scope this round by explicit instruction)"
+}

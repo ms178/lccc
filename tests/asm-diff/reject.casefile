@@ -1,0 +1,149 @@
+;;; r00_paddb reject
+.text
+paddb %mm2, %xmm1
+;;; r01_vpaddb reject
+.text
+vpaddb %ymm1, %ymm0
+;;; r02_vbroadcasti128 reject
+.text
+vbroadcasti128 %xmm0, %ymm0
+;;; r03_vmovdqu reject
+.text
+vmovdqu %ymm0, %xmm1
+;;; r04_paddb reject
+.text
+paddb %xmm32, %xmm1
+;;; r05_mov reject
+.text
+mov %rax, %eax
+;;; r06_mov reject
+.text
+mov %eax, %rax
+;;; r07_mov reject
+.text
+mov %al, %ax
+;;; r08_add reject
+.text
+add %rax, %ecx
+;;; r09_movl reject
+.text
+movl $1, %rax
+;;; r10_lea reject
+.text
+lea %rax, %rbx
+;;; r11_mov reject
+.text
+mov (%rax,%rsp,4), %rbx
+;;; r12_mov reject
+.text
+mov (%rax,%rbx,3), %rcx
+;;; r13_mov reject
+.text
+mov (%rax,%rbx,16), %rcx
+;;; r14_push reject
+.text
+push %eax
+;;; r15_pop reject
+.text
+pop %esp
+;;; r16_movsbl reject
+.text
+movsbl %ax, %ecx
+;;; r17_movzbq reject
+.text
+movzbq %eax, %rcx
+;;; r18_shl reject
+.text
+shl $1, $2
+;;; r19_vfmadd132ps reject
+.text
+vfmadd132ps %ymm1, %ymm2
+;;; r20_vextracti128 reject
+.text
+vextracti128 %ymm1, %xmm2
+;;; r21_vaddps reject
+.text
+vaddps %ymm1, %xmm2, %ymm3
+;;; r22_cmovz reject
+.text
+cmovz %al, %bl
+;;; r23_jmp reject
+.text
+jmp $1
+;;; r24_call reject
+.text
+call $1
+;;; r25_movq reject
+.text
+movq %xmm0, %ymm1
+;;; r26_vzeroupper reject
+.text
+vzeroupper %ymm0
+;;; r27_notaninstruction reject
+.text
+notaninstruction %rax, %rbx
+;;; r28_add reject
+.text
+add %rax
+;;; r30_mov reject
+.text
+mov $1, $2
+;;; r31_bswapw reject
+.text
+bswapw %ax
+;;; suffix_width_mismatch reject
+.text
+bsfq %r8d, %r9d
+bsrq %r8d, %r9d
+popcntq %r8d, %r9d
+lzcntq %r8d, %r9d
+tzcntq %r8d, %r9d
+bsfq %r8d, %r9
+bsfq %r8, %r9d
+bsfl %r8, %r9
+;;; vex_scalar_unary_two_operand reject
+.text
+vsqrtsd %xmm1, %xmm2
+vsqrtss %xmm1, %xmm2
+vsqrtsd (%rax), %xmm2
+vsqrtss %xmm3, %xmm3
+;;; bt_suffix_width_mismatch reject
+.text
+btl $31, %r8
+btl %ecx, %r8
+btq $31, %r8d
+btl $5, %rax
+
+;;; vphminposuw_ymm reject
+.text
+vphminposuw %ymm0, %ymm1
+
+;;; evex_sae_er_mismatch reject
+.text
+vaddps {sae}, %zmm1, %zmm2, %zmm3
+vmaxps {rn-sae}, %zmm1, %zmm2, %zmm3
+vpaddd {sae}, %zmm1, %zmm2, %zmm3
+;;; cmp_k_dest_zeroing reject
+.text
+vpcmpgtd %xmm5, %xmm6, %k5{%k7}{z}
+;;; gather_mask_dst_mismatch reject
+.text
+vgatherdps %ymm2, (%rdi,%xmm1,4), %xmm3
+;;; gather_qps_ymm_dst reject
+.text
+vgatherqps %ymm12, (%r13,%ymm14,2),%ymm11
+;;; gather_dpd_ymm_index reject
+.text
+vgatherdpd %ymm5,(%r13,%ymm4,2),%ymm6
+;;; evex_gather_bare_mask reject
+.text
+vgatherdps (%rdi,%ymm1,4), %ymm3
+;;; evex_gather_zeroing reject
+.text
+vgatherdps (%rdi,%ymm1,4), %ymm3 {%k1}{z}
+;;; evex_gather_mem_mask reject
+.text
+vgatherdps (%rdi,%ymm1,4){%k2}, %ymm3
+;;; evex_gather_qps_zmm_dst reject
+.text
+vgatherqps (%rdi,%zmm1,4), %zmm3 {%k1}

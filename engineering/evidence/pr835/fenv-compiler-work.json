@@ -1,0 +1,858 @@
+{
+  "complete": true,
+  "metric": "simulated compiler work; NOT wall-clock speedup",
+  "flags": [
+    "-O2",
+    "-march=x86-64-v3",
+    "-fwrapv"
+  ],
+  "geometry": {
+    "I1": "32768,8,64",
+    "D1": "32768,8,64",
+    "LL": "33554432,16,64"
+  },
+  "geometry_overrides": {},
+  "valgrind": {
+    "command": [
+      "valgrind"
+    ],
+    "executable": "/usr/bin/valgrind",
+    "sha256": "4652774bd116cb49951ef74115ad4237cad5021b2bd4d80002f09d986ec438b9",
+    "version": "valgrind-3.27.1"
+  },
+  "binaries": {
+    "mine": {
+      "original": "/home/user/.cache/pr835-frozen/fenv-fixed/lccc",
+      "sha256": "425434f41681737401366aadfbc8347fc14265bacf51db192728d434c50db740"
+    },
+    "ref": {
+      "original": "/home/user/.cache/pr835-frozen/final/lccc",
+      "sha256": "ade7c12a8796fc10e8f5dfc94d522e8e4676c1700dbd73bb33e3a8568c443c37"
+    }
+  },
+  "results": [
+    {
+      "source": "/home/user/.cache/lccc-work/tests/benchmark/programs/tls_seg_access.c",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "rounds": [
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-0-round-0.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/tls_seg_access.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-0.s"
+              ],
+              "events": {
+                "Ir": 124532707,
+                "Dr": 27267775,
+                "Dw": 15179389,
+                "I1mr": 442793,
+                "D1mr": 200812,
+                "D1mw": 118349,
+                "ILmr": 45084,
+                "DLmr": 19581,
+                "DLmw": 36493,
+                "Bc": 20539029,
+                "Bcm": 1102612,
+                "Bi": 2997451,
+                "Bim": 202569
+              },
+              "profile_sha256": "9931ecb7af7a07e44d5e26c3aad98f025281773c929c28ea92ac6cd6283c7bc0",
+              "assembly_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+              "stderr": "--13393-- warning: L3 cache found, using its data for the LL simulation.\n--13393-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13393-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-0-round-0.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/tls_seg_access.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-0.s"
+              ],
+              "events": {
+                "Ir": 124732253,
+                "Dr": 27266181,
+                "Dw": 15179023,
+                "I1mr": 457967,
+                "D1mr": 197684,
+                "D1mw": 117790,
+                "ILmr": 45115,
+                "DLmr": 19590,
+                "DLmw": 36495,
+                "Bc": 20622645,
+                "Bcm": 1134329,
+                "Bi": 2997533,
+                "Bim": 213788
+              },
+              "profile_sha256": "88a19aa37bac3f6caa266bf9a32d51630d271b461fa9ede0c35dd45757af6942",
+              "assembly_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+              "stderr": "--13413-- warning: L3 cache found, using its data for the LL simulation.\n--13413-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13413-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.9984002052781008
+        },
+        {
+          "order": [
+            "ref",
+            "mine"
+          ],
+          "arms": {
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-0-round-1.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/tls_seg_access.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-0.s"
+              ],
+              "events": {
+                "Ir": 124733530,
+                "Dr": 27266605,
+                "Dw": 15179062,
+                "I1mr": 457967,
+                "D1mr": 197726,
+                "D1mw": 117780,
+                "ILmr": 45115,
+                "DLmr": 19590,
+                "DLmw": 36488,
+                "Bc": 20622776,
+                "Bcm": 1134327,
+                "Bi": 2997581,
+                "Bim": 213788
+              },
+              "profile_sha256": "a9856b9b31fdbddbf8df74aa067a4f28accd93d8e7c0559eef9aa3f3830280a2",
+              "assembly_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+              "stderr": "--13417-- warning: L3 cache found, using its data for the LL simulation.\n--13417-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13417-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-0-round-1.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/tls_seg_access.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-0.s"
+              ],
+              "events": {
+                "Ir": 124533135,
+                "Dr": 27267915,
+                "Dw": 15179418,
+                "I1mr": 442789,
+                "D1mr": 200814,
+                "D1mw": 118366,
+                "ILmr": 45085,
+                "DLmr": 19581,
+                "DLmw": 36495,
+                "Bc": 20539067,
+                "Bcm": 1102595,
+                "Bi": 2997468,
+                "Bim": 202569
+              },
+              "profile_sha256": "1cf12f4c901a8a2e4063a48eeb96c80b3ca9a7f7fdfba2d61feec6ca00b4dfad",
+              "assembly_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+              "stderr": "--13421-- warning: L3 cache found, using its data for the LL simulation.\n--13421-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13421-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.9983934151466731
+        },
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-0-round-2.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/tls_seg_access.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-0.s"
+              ],
+              "events": {
+                "Ir": 124532601,
+                "Dr": 27267796,
+                "Dw": 15179415,
+                "I1mr": 442788,
+                "D1mr": 200768,
+                "D1mw": 118351,
+                "ILmr": 45084,
+                "DLmr": 19581,
+                "DLmw": 36496,
+                "Bc": 20538999,
+                "Bcm": 1102609,
+                "Bi": 2997457,
+                "Bim": 202570
+              },
+              "profile_sha256": "933cd60bfb64c5f5155a6d349c844b4d6fe9be605737828d5ca017d7ae0f0830",
+              "assembly_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+              "stderr": "--13425-- warning: L3 cache found, using its data for the LL simulation.\n--13425-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13425-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-0-round-2.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/tls_seg_access.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-0.s"
+              ],
+              "events": {
+                "Ir": 124732258,
+                "Dr": 27266173,
+                "Dw": 15179012,
+                "I1mr": 457967,
+                "D1mr": 197695,
+                "D1mw": 117763,
+                "ILmr": 45115,
+                "DLmr": 19590,
+                "DLmw": 36493,
+                "Bc": 20622664,
+                "Bcm": 1134331,
+                "Bi": 2997531,
+                "Bim": 213788
+              },
+              "profile_sha256": "d1397ab288a39064ea77564e879133cd975dfb9c7f1aafe73fc2e8ee95410a5e",
+              "assembly_sha256": "97ed4f1c919280c9f89348f33d536f6d65f4c77cf843ad606df283b32a61aabc",
+              "stderr": "--13429-- warning: L3 cache found, using its data for the LL simulation.\n--13429-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13429-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.9983993154361079
+        }
+      ],
+      "median_ir_ratio": 0.9983993154361079
+    },
+    {
+      "source": "/home/user/.cache/lccc-work/tests/benchmark/programs/sieve.c",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "rounds": [
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-1-round-0.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/sieve.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-1.s"
+              ],
+              "events": {
+                "Ir": 180494612,
+                "Dr": 39498101,
+                "Dw": 21697751,
+                "I1mr": 573608,
+                "D1mr": 279970,
+                "D1mw": 146142,
+                "ILmr": 45176,
+                "DLmr": 19789,
+                "DLmw": 43173,
+                "Bc": 29947608,
+                "Bcm": 1637251,
+                "Bi": 4320275,
+                "Bim": 297306
+              },
+              "profile_sha256": "664d35dd2030726b5899e42e53bceff2ffe21105a1fe8f8f725dffff70656fc6",
+              "assembly_sha256": "4c06321cf75962607c98474c057250e6e2ae8bfe8ac4e171935d05ec242ba4bc",
+              "stderr": "--13455-- warning: L3 cache found, using its data for the LL simulation.\n--13455-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13455-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-1-round-0.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/sieve.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-1.s"
+              ],
+              "events": {
+                "Ir": 180765072,
+                "Dr": 39492917,
+                "Dw": 21697622,
+                "I1mr": 597946,
+                "D1mr": 274074,
+                "D1mw": 145736,
+                "ILmr": 45176,
+                "DLmr": 19790,
+                "DLmw": 43171,
+                "Bc": 30066761,
+                "Bcm": 1676037,
+                "Bi": 4320346,
+                "Bim": 308634
+              },
+              "profile_sha256": "e0d14a799ccdaf42787847fa51d0126e066a5ea12c727c61572629284b561dc5",
+              "assembly_sha256": "4c06321cf75962607c98474c057250e6e2ae8bfe8ac4e171935d05ec242ba4bc",
+              "stderr": "--13502-- warning: L3 cache found, using its data for the LL simulation.\n--13502-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13502-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.998503803876448
+        },
+        {
+          "order": [
+            "ref",
+            "mine"
+          ],
+          "arms": {
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-1-round-1.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/sieve.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-1.s"
+              ],
+              "events": {
+                "Ir": 180764934,
+                "Dr": 39492893,
+                "Dw": 21697595,
+                "I1mr": 597946,
+                "D1mr": 274056,
+                "D1mw": 145753,
+                "ILmr": 45176,
+                "DLmr": 19790,
+                "DLmw": 43173,
+                "Bc": 30066791,
+                "Bcm": 1675969,
+                "Bi": 4320340,
+                "Bim": 308634
+              },
+              "profile_sha256": "1cbd053c8b1ab3975e159ad05884889a4f28c96010c853443c6f53b1c57464b7",
+              "assembly_sha256": "4c06321cf75962607c98474c057250e6e2ae8bfe8ac4e171935d05ec242ba4bc",
+              "stderr": "--13510-- warning: L3 cache found, using its data for the LL simulation.\n--13510-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13510-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-1-round-1.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/sieve.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-1.s"
+              ],
+              "events": {
+                "Ir": 180494478,
+                "Dr": 39498099,
+                "Dw": 21697750,
+                "I1mr": 573597,
+                "D1mr": 280002,
+                "D1mw": 146133,
+                "ILmr": 45170,
+                "DLmr": 19789,
+                "DLmw": 43174,
+                "Bc": 29947578,
+                "Bcm": 1637236,
+                "Bi": 4320279,
+                "Bim": 297307
+              },
+              "profile_sha256": "bedf77333678fcfb02a66b02095740801f3e247eeb6abe275296d51f9b58efb3",
+              "assembly_sha256": "4c06321cf75962607c98474c057250e6e2ae8bfe8ac4e171935d05ec242ba4bc",
+              "stderr": "--13514-- warning: L3 cache found, using its data for the LL simulation.\n--13514-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13514-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.9985038248624039
+        },
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-1-round-2.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/sieve.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-1.s"
+              ],
+              "events": {
+                "Ir": 180494952,
+                "Dr": 39498193,
+                "Dw": 21697807,
+                "I1mr": 573599,
+                "D1mr": 279981,
+                "D1mw": 146148,
+                "ILmr": 45171,
+                "DLmr": 19789,
+                "DLmw": 43173,
+                "Bc": 29947607,
+                "Bcm": 1637312,
+                "Bi": 4320288,
+                "Bim": 297307
+              },
+              "profile_sha256": "46ae4fe6bf6136839e431068e777318008be0aaa2564f3c04deff364ffb412de",
+              "assembly_sha256": "4c06321cf75962607c98474c057250e6e2ae8bfe8ac4e171935d05ec242ba4bc",
+              "stderr": "--13548-- warning: L3 cache found, using its data for the LL simulation.\n--13548-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13548-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-1-round-2.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/sieve.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-1.s"
+              ],
+              "events": {
+                "Ir": 180765098,
+                "Dr": 39492881,
+                "Dw": 21697613,
+                "I1mr": 597946,
+                "D1mr": 274089,
+                "D1mw": 145742,
+                "ILmr": 45176,
+                "DLmr": 19790,
+                "DLmw": 43170,
+                "Bc": 30066754,
+                "Bcm": 1675962,
+                "Bi": 4320342,
+                "Bim": 308633
+              },
+              "profile_sha256": "816cad5439ad774a63c4f298a46d0cf5d02eb9147e5d450c32e8981909583ada",
+              "assembly_sha256": "4c06321cf75962607c98474c057250e6e2ae8bfe8ac4e171935d05ec242ba4bc",
+              "stderr": "--13552-- warning: L3 cache found, using its data for the LL simulation.\n--13552-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13552-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 0.99850554115264
+        }
+      ],
+      "median_ir_ratio": 0.9985038248624039
+    },
+    {
+      "source": "/home/user/.cache/lccc-work/tests/benchmark/programs/byte_load_reassembly.c",
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "rounds": [
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-2-round-0.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-2.s"
+              ],
+              "events": {
+                "Ir": 559135673,
+                "Dr": 122804993,
+                "Dw": 61828766,
+                "I1mr": 750855,
+                "D1mr": 1114402,
+                "D1mw": 560730,
+                "ILmr": 47050,
+                "DLmr": 19770,
+                "DLmw": 45422,
+                "Bc": 92585516,
+                "Bcm": 3812703,
+                "Bi": 15777132,
+                "Bim": 789367
+              },
+              "profile_sha256": "81769b9d2e9ed79ac65017f9517cc2eb91b311d9f02eab125692d82883496b69",
+              "assembly_sha256": "9cf97d4640e20432fbb830216a0e7e14689d4065ad1d6d99d55b3dee022dcb9c",
+              "stderr": "--13624-- warning: L3 cache found, using its data for the LL simulation.\n--13624-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13624-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-2-round-0.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-2.s"
+              ],
+              "events": {
+                "Ir": 559004881,
+                "Dr": 122770280,
+                "Dw": 61818248,
+                "I1mr": 802429,
+                "D1mr": 1108223,
+                "D1mw": 561190,
+                "ILmr": 47059,
+                "DLmr": 19783,
+                "DLmw": 45421,
+                "Bc": 92587639,
+                "Bcm": 3861583,
+                "Bi": 15777492,
+                "Bim": 858789
+              },
+              "profile_sha256": "23d70b568b4e4b123acb9d821ce7e4f012b9d8c92eba997836126241a22253a0",
+              "assembly_sha256": "9cf97d4640e20432fbb830216a0e7e14689d4065ad1d6d99d55b3dee022dcb9c",
+              "stderr": "--13797-- warning: L3 cache found, using its data for the LL simulation.\n--13797-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13797-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0002339729123044
+        },
+        {
+          "order": [
+            "ref",
+            "mine"
+          ],
+          "arms": {
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-2-round-1.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-2.s"
+              ],
+              "events": {
+                "Ir": 559004552,
+                "Dr": 122770119,
+                "Dw": 61818188,
+                "I1mr": 802429,
+                "D1mr": 1108248,
+                "D1mw": 561198,
+                "ILmr": 47059,
+                "DLmr": 19783,
+                "DLmw": 45421,
+                "Bc": 92587596,
+                "Bcm": 3861391,
+                "Bi": 15777477,
+                "Bim": 858789
+              },
+              "profile_sha256": "7f874bafab87874c9380525c18a267ac4c25867918c55ca45545a96eed2991fa",
+              "assembly_sha256": "9cf97d4640e20432fbb830216a0e7e14689d4065ad1d6d99d55b3dee022dcb9c",
+              "stderr": "--13847-- warning: L3 cache found, using its data for the LL simulation.\n--13847-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13847-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-2-round-1.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-2.s"
+              ],
+              "events": {
+                "Ir": 559135944,
+                "Dr": 122805074,
+                "Dw": 61828785,
+                "I1mr": 750860,
+                "D1mr": 1114479,
+                "D1mw": 560720,
+                "ILmr": 47050,
+                "DLmr": 19770,
+                "DLmw": 45422,
+                "Bc": 92585540,
+                "Bcm": 3812658,
+                "Bi": 15777136,
+                "Bim": 789367
+              },
+              "profile_sha256": "c354bfcef9d823bd4fec6d92482b5ed11067d3382d77d48f189cecb78134ccf4",
+              "assembly_sha256": "9cf97d4640e20432fbb830216a0e7e14689d4065ad1d6d99d55b3dee022dcb9c",
+              "stderr": "--13851-- warning: L3 cache found, using its data for the LL simulation.\n--13851-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13851-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0002350463865275
+        },
+        {
+          "order": [
+            "mine",
+            "ref"
+          ],
+          "arms": {
+            "mine": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-2-round-2.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/aa/case-2.s"
+              ],
+              "events": {
+                "Ir": 559136984,
+                "Dr": 122805254,
+                "Dw": 61828883,
+                "I1mr": 750869,
+                "D1mr": 1114416,
+                "D1mw": 560713,
+                "ILmr": 47055,
+                "DLmr": 19770,
+                "DLmw": 45422,
+                "Bc": 92585649,
+                "Bcm": 3812797,
+                "Bi": 15777153,
+                "Bim": 789368
+              },
+              "profile_sha256": "81b983833e7a3a115895581705669d4b32b33280c9bca9da71ed8c5adc0d9561",
+              "assembly_sha256": "9cf97d4640e20432fbb830216a0e7e14689d4065ad1d6d99d55b3dee022dcb9c",
+              "stderr": "--13855-- warning: L3 cache found, using its data for the LL simulation.\n--13855-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13855-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            },
+            "ref": {
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-2-round-2.cg",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/compiler",
+                "-O2",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/.cache/lccc-work/tests/benchmark/programs/byte_load_reassembly.c",
+                "-o",
+                "/home/user/.cache/pr835-perf/fenv-compiler-work/bb/case-2.s"
+              ],
+              "events": {
+                "Ir": 559003090,
+                "Dr": 122770060,
+                "Dw": 61818230,
+                "I1mr": 802429,
+                "D1mr": 1108240,
+                "D1mw": 561196,
+                "ILmr": 47059,
+                "DLmr": 19783,
+                "DLmw": 45421,
+                "Bc": 92587406,
+                "Bcm": 3861322,
+                "Bi": 15777483,
+                "Bim": 858789
+              },
+              "profile_sha256": "b983efc9ad82ff0b6b0310ba51ce4ec41fe3884d4167ded00a37b3b133031387",
+              "assembly_sha256": "9cf97d4640e20432fbb830216a0e7e14689d4065ad1d6d99d55b3dee022dcb9c",
+              "stderr": "--13859-- warning: L3 cache found, using its data for the LL simulation.\n--13859-- warning: specified LL cache: line_size 64  assoc 12  total_size 56,623,104\n--13859-- warning: simulated LL cache: line_size 64  assoc 14  total_size 58,720,256\n",
+              "native_stderr": ""
+            }
+          },
+          "ir_ratio": 1.0002395228262513
+        }
+      ],
+      "median_ir_ratio": 1.0002350463865275
+    }
+  ],
+  "error": null
+}

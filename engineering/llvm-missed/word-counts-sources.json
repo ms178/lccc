@@ -1,0 +1,71 @@
+{
+  "method": "GitHub REST API bodies and accessible conversation comments; source hashes identify reviewed records, not correctness or global closure.",
+  "reports": [
+    {
+      "number": 45243,
+      "url": "https://github.com/llvm/llvm-project/issues/45243",
+      "title": "Failure to combine rotate through a select",
+      "upstream_state": "open",
+      "updated_at": "2026-08-08T15:19:09Z",
+      "body_sha256": "75b448562ea22377e0ebd73d78f51e33c02f85a8e5660e439b8fb65001d0d3e8",
+      "issue_json_sha256": "cb316b3f7b232e0ea993818614688f815a57bb8b04632b615f8ad4f7e271682e",
+      "comments_json_sha256": "c24b7cc644e797413ea38c49a756879f28dff58c123eb2ed758b247074bc05e3",
+      "comment_count": 3
+    },
+    {
+      "number": 49562,
+      "url": "https://github.com/llvm/llvm-project/issues/49562",
+      "title": "Failed to combine popcount(x) +  popcount(x >> 32) to popcountl(x)",
+      "upstream_state": "open",
+      "updated_at": "2026-08-08T15:43:26Z",
+      "body_sha256": "1235da39aa3504db4f6061144088bf132d7eef7464b632d4971322e6a01c1760",
+      "issue_json_sha256": "0d19dcc8ebc9905c987d1ec5405971a8b8e28d2b1b53814a0aeb6aa775efcea6",
+      "comments_json_sha256": "161c1bdd2219ce876a8d275f6b4c9b406d949521eef74c90173c5f15a25bd3b1",
+      "comment_count": 3
+    },
+    {
+      "number": 51090,
+      "url": "https://github.com/llvm/llvm-project/issues/51090",
+      "title": "Unrecognized rotate patterns",
+      "upstream_state": "open",
+      "updated_at": "2026-08-08T14:42:45Z",
+      "body_sha256": "6876f83dc13d5bee7380c32c1484951fa69d958c8e231b9989e5fd1b385bf76b",
+      "issue_json_sha256": "3f63ab357129b8e9a6fa7da1baa90a7654544e32d4f2f0603c6318180dabf45f",
+      "comments_json_sha256": "3a0ecca3318862bf934da28ea2fdbef28f3334a73e1a81278327c308232f7dbc",
+      "comment_count": 4
+    },
+    {
+      "number": 90000,
+      "url": "https://github.com/llvm/llvm-project/issues/90000",
+      "title": "`@min(@ctz(x), y)` can become `@ctz(x | (1 << y))`",
+      "upstream_state": "closed",
+      "updated_at": "2024-07-13T14:55:13Z",
+      "body_sha256": "c45abceb0eef3690ba76881d78fb6820be736dc19e2b180f323fff9f89eebf10",
+      "issue_json_sha256": "f04b2b1044bdb5940c901c1eb4039962171b61ab2f8e914b8a933c83d67b2192",
+      "comments_json_sha256": "340a27c70d0b22420363ede6b289caa0a1df9129ca3ff48385055a644fd35507",
+      "comment_count": 13
+    },
+    {
+      "number": 150954,
+      "url": "https://github.com/llvm/llvm-project/issues/150954",
+      "title": "x86 missed optimization for __builtin_clz()^31",
+      "upstream_state": "open",
+      "updated_at": "2025-09-27T15:21:08Z",
+      "body_sha256": "70c1f29e2355b7341eebb5038547966d80c2837a5f5fb7ff89dd3ef4b53ad8db",
+      "issue_json_sha256": "af5b08d9e4d0d8b9f175adb8742f3130ecf708dfd96737780f12d0f9f6f7fdf1",
+      "comments_json_sha256": "2253d4795cfd4139b211e279f784f32c47e39543b02ed350201b01b0ee10251b",
+      "comment_count": 2
+    },
+    {
+      "number": 173691,
+      "url": "https://github.com/llvm/llvm-project/issues/173691",
+      "title": "InstCombine: `umin(clz(x), clz(y)) => clz(x | y)` and `umin(ctz(x), ctz(y)) => ctz(x | y)`",
+      "upstream_state": "closed",
+      "updated_at": "2026-01-11T12:56:53Z",
+      "body_sha256": "8844448d6899d2f260a1d7b62836c1145f6d53b129b11fd25b2df0557b72e92d",
+      "issue_json_sha256": "c99883073df2ef2bb1ac97dd57b03b1d68ee6203d978f0747a7c8982b18efae4",
+      "comments_json_sha256": "9b9dbb4d66234e1cc042b2bb06a0ebd6e377dea12351a14f121ca77dcfcda0c0",
+      "comment_count": 6
+    }
+  ]
+}

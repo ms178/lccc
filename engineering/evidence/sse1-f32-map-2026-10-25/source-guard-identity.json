@@ -1,0 +1,64 @@
+{
+  "clang": {
+    "binary_sha256": "5899845302c34859be3bfec0ff80bebbaf045c88a4d456b2a0e5b06d7b36e302",
+    "identical_to_timed_binary": true,
+    "command": [
+      "/home/user/tools/oracle-bin/clang-23",
+      "-O2",
+      "-o",
+      "/home/user/artifacts/sse1/recompiled-clang",
+      "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+      "-mno-sse2",
+      "-msse",
+      "-ffp-contract=off",
+      "-DSSE1_MAP_REQUIRE_ONLY"
+    ]
+  },
+  "gcc": {
+    "binary_sha256": "9fd0c00d60d20b15b9333f1a083755b4c492c57456600164781b48cf2396ad0d",
+    "identical_to_timed_binary": true,
+    "command": [
+      "/home/user/tools/gcc-16/bin/gcc-16",
+      "-O2",
+      "-o",
+      "/home/user/artifacts/sse1/recompiled-gcc",
+      "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+      "-mno-sse2",
+      "-msse",
+      "-ffp-contract=off",
+      "-DSSE1_MAP_REQUIRE_ONLY"
+    ]
+  },
+  "lccc": {
+    "binary_sha256": "6504f4c5f14f4c8af56e372c379c60b5ef5eb9de547600e712ebac0c1beccc8d",
+    "identical_to_timed_binary": true,
+    "command": [
+      "/home/user/lccc/target/fastbuild/lccc",
+      "-I/home/user/tools/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+      "-O2",
+      "-o",
+      "/home/user/artifacts/sse1/recompiled-lccc",
+      "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+      "-mno-sse2",
+      "-msse",
+      "-ffp-contract=off",
+      "-DSSE1_MAP_REQUIRE_ONLY"
+    ]
+  },
+  "scalar": {
+    "binary_sha256": "589c129ad578b3ebfaece566896b8cb9c0bad550121ca0a9ed10d33a2b2dbf6e",
+    "identical_to_timed_binary": true,
+    "command": [
+      "/home/user/artifacts/sse1/scalar/lccc",
+      "-I/home/user/tools/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+      "-O2",
+      "-o",
+      "/home/user/artifacts/sse1/recompiled-scalar",
+      "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+      "-mno-sse2",
+      "-msse",
+      "-ffp-contract=off",
+      "-DSSE1_MAP_REQUIRE_ONLY"
+    ]
+  }
+}

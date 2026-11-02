@@ -1,0 +1,4109 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.1917993883884508,
+    "best": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.1917993883884508,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.1917993883884508,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.1917993883884508,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.1917993883884508,
+    "best": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.1917993883884508
+    },
+    "geometric_mean_ratio": 1.1917993883884508,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.1917993883884508
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "batch3": {
+          "binary_bytes": 7168,
+          "binary_sha256": "385624f80ca56845bacaec59d544420a5236bbf064ba96395ab66aba578753be",
+          "child_cpu_s": 0.10069099999999997,
+          "command": [
+            "/home/user/lccc/work/lccc-pre-batch4",
+            "-I/home/user/lccc/work/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2050,
+          "wall_s": 0.101198958
+        },
+        "clang": {
+          "binary_bytes": 16040,
+          "binary_sha256": "813f349ed753b36c7cf09a52cafa557942b1b942d6168b0eaace4807ec785cdb",
+          "child_cpu_s": 0.06811300000000003,
+          "command": [
+            "/home/user/lccc/work/toolchains/clang-23.1.3/bin/clang-23",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 3161,
+          "wall_s": 0.068414588
+        },
+        "gcc": {
+          "binary_bytes": 15896,
+          "binary_sha256": "e688f9d8d4d83f7e55a95666332c1966082ae8a361ee4794d61318e7a109ce87",
+          "child_cpu_s": 0.08747299999999997,
+          "command": [
+            "/home/user/lccc/work/toolchains/gcc-16/bin/gcc-16",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2100,
+          "wall_s": 0.094218519
+        },
+        "lccc": {
+          "binary_bytes": 7168,
+          "binary_sha256": "514dfb584ebceef6350a1c41fea0e3106aae83309460de354e6c5dc86d4629e0",
+          "child_cpu_s": 0.09686399999999999,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/home/user/lccc/work/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-o",
+            "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2050,
+          "wall_s": 0.097168905
+        }
+      },
+      "correctness": {
+        "batch3": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "spectral norm / dense floating point",
+      "name": "spectral_norm",
+      "ratios_from_lccc": {
+        "batch3": {
+          "cv": 0.04309997386172947,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.017150544812849777,
+          "max": 0.9656119805159521,
+          "mean": 0.8657287997679048,
+          "median": 0.86123392824937,
+          "median_ci95_bootstrap": [
+            0.843570317387089,
+            0.8702552736388403
+          ],
+          "min": 0.80828894752337,
+          "n": 20,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 0.8239997820920587,
+              "round": 0
+            },
+            {
+              "ratio": 0.8545816781565815,
+              "round": 1
+            },
+            {
+              "ratio": 0.8615377694463655,
+              "round": 2
+            },
+            {
+              "ratio": 0.8673006745959246,
+              "round": 3
+            },
+            {
+              "ratio": 0.8355723770256638,
+              "round": 4
+            },
+            {
+              "ratio": 0.8837889113362908,
+              "round": 5
+            },
+            {
+              "ratio": 0.8703809963710175,
+              "round": 6
+            },
+            {
+              "ratio": 0.9147728800052859,
+              "round": 7
+            },
+            {
+              "ratio": 0.8708811864120453,
+              "round": 8
+            },
+            {
+              "ratio": 0.80828894752337,
+              "round": 9
+            },
+            {
+              "ratio": 0.8383423365039522,
+              "round": 10
+            },
+            {
+              "ratio": 0.9361240213022364,
+              "round": 11
+            },
+            {
+              "ratio": 0.8570053483662384,
+              "round": 12
+            },
+            {
+              "ratio": 0.8445964494859514,
+              "round": 13
+            },
+            {
+              "ratio": 0.8700933511665192,
+              "round": 14
+            },
+            {
+              "ratio": 0.8370673497065199,
+              "round": 15
+            },
+            {
+              "ratio": 0.9656119805159521,
+              "round": 16
+            },
+            {
+              "ratio": 0.8609300870523744,
+              "round": 17
+            },
+            {
+              "ratio": 0.870129550906663,
+              "round": 18
+            },
+            {
+              "ratio": 0.843570317387089,
+              "round": 19
+            }
+          ],
+          "stdev": 0.03731288864134313
+        },
+        "clang": {
+          "cv": 0.04597717777440731,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.01425365247981275,
+          "max": 0.6828342795261457,
+          "mean": 0.610715325571683,
+          "median": 0.6126640194619184,
+          "median_ci95_bootstrap": [
+            0.5909599636184287,
+            0.6163281650007106
+          ],
+          "min": 0.5738198573326696,
+          "n": 20,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.5820955192025643,
+              "round": 0
+            },
+            {
+              "ratio": 0.5738198573326696,
+              "round": 1
+            },
+            {
+              "ratio": 0.5867148562344711,
+              "round": 2
+            },
+            {
+              "ratio": 0.592130060799941,
+              "round": 3
+            },
+            {
+              "ratio": 0.6056217611849042,
+              "round": 4
+            },
+            {
+              "ratio": 0.6126634402679191,
+              "round": 5
+            },
+            {
+              "ratio": 0.6176829099038523,
+              "round": 6
+            },
+            {
+              "ratio": 0.6650185359283795,
+              "round": 7
+            },
+            {
+              "ratio": 0.6156230892948951,
+              "round": 8
+            },
+            {
+              "ratio": 0.5774403591199923,
+              "round": 9
+            },
+            {
+              "ratio": 0.6183857256740817,
+              "round": 10
+            },
+            {
+              "ratio": 0.6828342795261457,
+              "round": 11
+            },
+            {
+              "ratio": 0.615598603243743,
+              "round": 12
+            },
+            {
+              "ratio": 0.6163283068468952,
+              "round": 13
+            },
+            {
+              "ratio": 0.6449943659778833,
+              "round": 14
+            },
+            {
+              "ratio": 0.583881679483692,
+              "round": 15
+            },
+            {
+              "ratio": 0.6126645986559176,
+              "round": 16
+            },
+            {
+              "ratio": 0.6046906731642703,
+              "round": 17
+            },
+            {
+              "ratio": 0.616328023154526,
+              "round": 18
+            },
+            {
+              "ratio": 0.5897898664369164,
+              "round": 19
+            }
+          ],
+          "stdev": 0.028078967093364306
+        },
+        "gcc": {
+          "cv": 0.05172668389921331,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.03249207696688283,
+          "max": 1.3525394788199387,
+          "mean": 1.2070560578301612,
+          "median": 1.1917993883884508,
+          "median_ci95_bootstrap": [
+            1.162407923264895,
+            1.219083481260622
+          ],
+          "min": 1.1342075352696377,
+          "n": 20,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.1522630174037876,
+              "round": 0
+            },
+            {
+              "ratio": 1.144585231697016,
+              "round": 1
+            },
+            {
+              "ratio": 1.1637864745203956,
+              "round": 2
+            },
+            {
+              "ratio": 1.1342075352696377,
+              "round": 3
+            },
+            {
+              "ratio": 1.1765101556512287,
+              "round": 4
+            },
+            {
+              "ratio": 1.1924531797505484,
+              "round": 5
+            },
+            {
+              "ratio": 1.1847944557979442,
+              "round": 6
+            },
+            {
+              "ratio": 1.2947511328655252,
+              "round": 7
+            },
+            {
+              "ratio": 1.219927654812314,
+              "round": 8
+            },
+            {
+              "ratio": 1.1575852508337416,
+              "round": 9
+            },
+            {
+              "ratio": 1.2104864730855867,
+              "round": 10
+            },
+            {
+              "ratio": 1.3159458872706147,
+              "round": 11
+            },
+            {
+              "ratio": 1.2380148141140161,
+              "round": 12
+            },
+            {
+              "ratio": 1.1920595380172478,
+              "round": 13
+            },
+            {
+              "ratio": 1.301462467309825,
+              "round": 14
+            },
+            {
+              "ratio": 1.1570276502075807,
+              "round": 15
+            },
+            {
+              "ratio": 1.3525394788199387,
+              "round": 16
+            },
+            {
+              "ratio": 1.1915392387596535,
+              "round": 17
+            },
+            {
+              "ratio": 1.200152148407228,
+              "round": 18
+            },
+            {
+              "ratio": 1.1610293720093943,
+              "round": 19
+            }
+          ],
+          "stdev": 0.062437007152011295
+        }
+      },
+      "ratios_to_gcc": {
+        "batch3": {
+          "cv": 0.030426121236361483,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.021738543136446964,
+          "max": 1.495773373701772,
+          "mean": 1.3943548840248239,
+          "median": 1.3995424185960736,
+          "median_ci95_bootstrap": [
+            1.3778038754596267,
+            1.409712206951464
+          ],
+          "min": 1.3077443249978618,
+          "n": 20,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.3983778181085182,
+              "round": 0
+            },
+            {
+              "ratio": 1.3393514756436171,
+              "round": 1
+            },
+            {
+              "ratio": 1.3508246716429608,
+              "round": 2
+            },
+            {
+              "ratio": 1.3077443249978618,
+              "round": 3
+            },
+            {
+              "ratio": 1.408029020584884,
+              "round": 4
+            },
+            {
+              "ratio": 1.3492511214556386,
+              "round": 5
+            },
+            {
+              "ratio": 1.361236585745608,
+              "round": 6
+            },
+            {
+              "ratio": 1.4153798840844996,
+              "round": 7
+            },
+            {
+              "ratio": 1.4007968869304774,
+              "round": 8
+            },
+            {
+              "ratio": 1.4321428672019205,
+              "round": 9
+            },
+            {
+              "ratio": 1.443904739600229,
+              "round": 10
+            },
+            {
+              "ratio": 1.4057388308869698,
+              "round": 11
+            },
+            {
+              "ratio": 1.444582366345927,
+              "round": 12
+            },
+            {
+              "ratio": 1.411395393318044,
+              "round": 13
+            },
+            {
+              "ratio": 1.495773373701772,
+              "round": 14
+            },
+            {
+              "ratio": 1.3822396138294495,
+              "round": 15
+            },
+            {
+              "ratio": 1.4007070190836293,
+              "round": 16
+            },
+            {
+              "ratio": 1.3840139364152184,
+              "round": 17
+            },
+            {
+              "ratio": 1.3792798407509386,
+              "round": 18
+            },
+            {
+              "ratio": 1.3763279101683148,
+              "round": 19
+            }
+          ],
+          "stdev": 0.042424810747852044
+        },
+        "clang": {
+          "cv": 0.031390010270419405,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.024166980416920114,
+          "max": 2.2076344573967246,
+          "mean": 1.9768399035138369,
+          "median": 1.9695206676994146,
+          "median_ci95_bootstrap": [
+            1.9466414431349108,
+            1.9825892681322728
+          ],
+          "min": 1.9154702832302997,
+          "n": 20,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.9795084816703594,
+              "round": 0
+            },
+            {
+              "ratio": 1.9946769305221996,
+              "round": 1
+            },
+            {
+              "ratio": 1.9835640126612153,
+              "round": 2
+            },
+            {
+              "ratio": 1.9154702832302997,
+              "round": 3
+            },
+            {
+              "ratio": 1.942648416974609,
+              "round": 4
+            },
+            {
+              "ratio": 1.9463429696883594,
+              "round": 5
+            },
+            {
+              "ratio": 1.9181273057763046,
+              "round": 6
+            },
+            {
+              "ratio": 1.9469399165814623,
+              "round": 7
+            },
+            {
+              "ratio": 1.9816145236033302,
+              "round": 8
+            },
+            {
+              "ratio": 2.004683657023695,
+              "round": 9
+            },
+            {
+              "ratio": 1.957494202774612,
+              "round": 10
+            },
+            {
+              "ratio": 1.9271819337831397,
+              "round": 11
+            },
+            {
+              "ratio": 2.01107476136334,
+              "round": 12
+            },
+            {
+              "ratio": 1.9341307624109703,
+              "round": 13
+            },
+            {
+              "ratio": 2.0177888923675527,
+              "round": 14
+            },
+            {
+              "ratio": 1.981613211825217,
+              "round": 15
+            },
+            {
+              "ratio": 2.2076344573967246,
+              "round": 16
+            },
+            {
+              "ratio": 1.9704938270743921,
+              "round": 17
+            },
+            {
+              "ratio": 1.9472620152245217,
+              "round": 18
+            },
+            {
+              "ratio": 1.9685475083244368,
+              "round": 19
+            }
+          ],
+          "stdev": 0.06205302487427425
+        },
+        "lccc": {
+          "cv": 0.05172668389921331,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.03249207696688283,
+          "max": 1.3525394788199387,
+          "mean": 1.2070560578301612,
+          "median": 1.1917993883884508,
+          "median_ci95_bootstrap": [
+            1.162407923264895,
+            1.219083481260622
+          ],
+          "min": 1.1342075352696377,
+          "n": 20,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.1522630174037876,
+              "round": 0
+            },
+            {
+              "ratio": 1.144585231697016,
+              "round": 1
+            },
+            {
+              "ratio": 1.1637864745203956,
+              "round": 2
+            },
+            {
+              "ratio": 1.1342075352696377,
+              "round": 3
+            },
+            {
+              "ratio": 1.1765101556512287,
+              "round": 4
+            },
+            {
+              "ratio": 1.1924531797505484,
+              "round": 5
+            },
+            {
+              "ratio": 1.1847944557979442,
+              "round": 6
+            },
+            {
+              "ratio": 1.2947511328655252,
+              "round": 7
+            },
+            {
+              "ratio": 1.219927654812314,
+              "round": 8
+            },
+            {
+              "ratio": 1.1575852508337416,
+              "round": 9
+            },
+            {
+              "ratio": 1.2104864730855867,
+              "round": 10
+            },
+            {
+              "ratio": 1.3159458872706147,
+              "round": 11
+            },
+            {
+              "ratio": 1.2380148141140161,
+              "round": 12
+            },
+            {
+              "ratio": 1.1920595380172478,
+              "round": 13
+            },
+            {
+              "ratio": 1.301462467309825,
+              "round": 14
+            },
+            {
+              "ratio": 1.1570276502075807,
+              "round": 15
+            },
+            {
+              "ratio": 1.3525394788199387,
+              "round": 16
+            },
+            {
+              "ratio": 1.1915392387596535,
+              "round": 17
+            },
+            {
+              "ratio": 1.200152148407228,
+              "round": 18
+            },
+            {
+              "ratio": 1.1610293720093943,
+              "round": 19
+            }
+          ],
+          "stdev": 0.062437007152011295
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "batch3"
+          ],
+          "round": 0,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.1409640000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.141270666
+            },
+            "clang": {
+              "child_cpu_s": 0.19933999999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.199979203
+            },
+            "gcc": {
+              "child_cpu_s": 0.10067500000000029,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.101024676
+            },
+            "lccc": {
+              "child_cpu_s": 0.11609599999999975,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.116406998
+            }
+          }
+        },
+        {
+          "order": [
+            "batch3",
+            "gcc",
+            "lccc",
+            "clang"
+          ],
+          "round": 1,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14094799999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.141296088
+            },
+            "clang": {
+              "child_cpu_s": 0.21000400000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.210430236
+            },
+            "gcc": {
+              "child_cpu_s": 0.10516799999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.105495899
+            },
+            "lccc": {
+              "child_cpu_s": 0.12044800000000011,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.120749048
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "batch3"
+          ],
+          "round": 2,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14035200000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.140666028
+            },
+            "clang": {
+              "child_cpu_s": 0.20603999999999978,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.206555356
+            },
+            "gcc": {
+              "child_cpu_s": 0.103688,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.104133446
+            },
+            "lccc": {
+              "child_cpu_s": 0.12078899999999981,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.121189096
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "batch3",
+            "gcc",
+            "lccc"
+          ],
+          "round": 3,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.13976900000000025,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.140181843
+            },
+            "clang": {
+              "child_cpu_s": 0.20497699999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.205326186
+            },
+            "gcc": {
+              "child_cpu_s": 0.10603799999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.107193616
+            },
+            "lccc": {
+              "child_cpu_s": 0.12076000000000064,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.121579807
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc",
+            "batch3"
+          ],
+          "round": 4,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.1398590000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.140215516
+            },
+            "clang": {
+              "child_cpu_s": 0.19308299999999967,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.193454429
+            },
+            "gcc": {
+              "child_cpu_s": 0.09921299999999977,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.099582831
+            },
+            "lccc": {
+              "child_cpu_s": 0.11683500000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.117160212
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "batch3",
+            "clang",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.1387930000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.139187105
+            },
+            "clang": {
+              "child_cpu_s": 0.20040199999999952,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.200782374
+            },
+            "gcc": {
+              "child_cpu_s": 0.10279399999999939,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.103158784
+            },
+            "lccc": {
+              "child_cpu_s": 0.12269100000000055,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.12301202
+            }
+          }
+        },
+        {
+          "order": [
+            "batch3",
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 6,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14120799999999978,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.141562267
+            },
+            "clang": {
+              "child_cpu_s": 0.1991340000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.199476309
+            },
+            "gcc": {
+              "child_cpu_s": 0.10367999999999977,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.103995344
+            },
+            "lccc": {
+              "child_cpu_s": 0.12290699999999966,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.123213107
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "batch3",
+            "gcc",
+            "clang"
+          ],
+          "round": 7,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14285299999999967,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.143298612
+            },
+            "clang": {
+              "child_cpu_s": 0.19672499999999982,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.197115835
+            },
+            "gcc": {
+              "child_cpu_s": 0.10089300000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.101243923
+            },
+            "lccc": {
+              "child_cpu_s": 0.13056399999999968,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.131085684
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "batch3",
+            "gcc",
+            "lccc"
+          ],
+          "round": 8,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.13879899999999967,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.139120098
+            },
+            "clang": {
+              "child_cpu_s": 0.1964750000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.196803983
+            },
+            "gcc": {
+              "child_cpu_s": 0.09899900000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.099314968
+            },
+            "lccc": {
+              "child_cpu_s": 0.12090200000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.121157076
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "batch3"
+          ],
+          "round": 9,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14569399999999977,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.145932713
+            },
+            "clang": {
+              "child_cpu_s": 0.20394299999999976,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.204273562
+            },
+            "gcc": {
+              "child_cpu_s": 0.10065200000000019,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.101898153
+            },
+            "lccc": {
+              "child_cpu_s": 0.11653300000000044,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.117955799
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "batch3",
+            "lccc"
+          ],
+          "round": 10,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.147926,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.148294609
+            },
+            "clang": {
+              "child_cpu_s": 0.20071100000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.201042236
+            },
+            "gcc": {
+              "child_cpu_s": 0.10233499999999918,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.102703873
+            },
+            "lccc": {
+              "child_cpu_s": 0.12370900000000162,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.124321649
+            }
+          }
+        },
+        {
+          "order": [
+            "batch3",
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 11,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.1434989999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.143896441
+            },
+            "clang": {
+              "child_cpu_s": 0.19694700000000154,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.197273217
+            },
+            "gcc": {
+              "child_cpu_s": 0.10199099999999817,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.102363567
+            },
+            "lccc": {
+              "child_cpu_s": 0.13434000000000168,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.134704915
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "clang",
+            "batch3"
+          ],
+          "round": 12,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14560700000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.146034315
+            },
+            "clang": {
+              "child_cpu_s": 0.20278999999999847,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.203301613
+            },
+            "gcc": {
+              "child_cpu_s": 0.1007529999999992,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.101091027
+            },
+            "lccc": {
+              "child_cpu_s": 0.12479900000000121,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.125152189
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "batch3"
+          ],
+          "round": 13,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14212700000000034,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.142668806
+            },
+            "clang": {
+              "child_cpu_s": 0.19514400000000087,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.195508734
+            },
+            "gcc": {
+              "child_cpu_s": 0.1007649999999991,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.101083514
+            },
+            "lccc": {
+              "child_cpu_s": 0.12015799999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.120497567
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "batch3",
+            "clang"
+          ],
+          "round": 14,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14946600000000032,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.150150775
+            },
+            "clang": {
+              "child_cpu_s": 0.2021569999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.202552453
+            },
+            "gcc": {
+              "child_cpu_s": 0.09986300000000092,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.100383372
+            },
+            "lccc": {
+              "child_cpu_s": 0.1299039999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.130645191
+            }
+          }
+        },
+        {
+          "order": [
+            "batch3",
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 15,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14325299999999785,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.143612118
+            },
+            "clang": {
+              "child_cpu_s": 0.20548599999999873,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.205885917
+            },
+            "gcc": {
+              "child_cpu_s": 0.1033210000000011,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.103898135
+            },
+            "lccc": {
+              "child_cpu_s": 0.11979000000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.120213015
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "lccc",
+            "batch3",
+            "gcc"
+          ],
+          "round": 16,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14521099999999976,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.145688617
+            },
+            "clang": {
+              "child_cpu_s": 0.22916000000000025,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.229617762
+            },
+            "gcc": {
+              "child_cpu_s": 0.10360200000000042,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.104010771
+            },
+            "lccc": {
+              "child_cpu_s": 0.14017300000000077,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.140678674
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang",
+            "batch3"
+          ],
+          "round": 17,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.14041800000000038,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.140897478
+            },
+            "clang": {
+              "child_cpu_s": 0.20023899999999983,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.20060319
+            },
+            "gcc": {
+              "child_cpu_s": 0.1014520000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.101803511
+            },
+            "lccc": {
+              "child_cpu_s": 0.12087099999999928,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.121302878
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "batch3",
+            "lccc",
+            "gcc"
+          ],
+          "round": 18,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.1393299999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.13962465
+            },
+            "clang": {
+              "child_cpu_s": 0.19670699999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.197121548
+            },
+            "gcc": {
+              "child_cpu_s": 0.10083400000000076,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.10123011
+            },
+            "lccc": {
+              "child_cpu_s": 0.12114700000000056,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.121491534
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "batch3",
+            "lccc",
+            "gcc"
+          ],
+          "round": 19,
+          "runs": {
+            "batch3": {
+              "child_cpu_s": 0.13896200000000114,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.139396313
+            },
+            "clang": {
+              "child_cpu_s": 0.19893499999999875,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.199377098
+            },
+            "gcc": {
+              "child_cpu_s": 0.10080400000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.101281324
+            },
+            "lccc": {
+              "child_cpu_s": 0.11720699999999873,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152\n",
+              "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+              "wall_s": 0.117590592
+            }
+          }
+        }
+      ],
+      "runs": {
+        "batch3": [
+          {
+            "child_cpu_s": 0.1409640000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.141270666
+          },
+          {
+            "child_cpu_s": 0.14094799999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.141296088
+          },
+          {
+            "child_cpu_s": 0.14035200000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.140666028
+          },
+          {
+            "child_cpu_s": 0.13976900000000025,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.140181843
+          },
+          {
+            "child_cpu_s": 0.1398590000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.140215516
+          },
+          {
+            "child_cpu_s": 0.1387930000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.139187105
+          },
+          {
+            "child_cpu_s": 0.14120799999999978,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.141562267
+          },
+          {
+            "child_cpu_s": 0.14285299999999967,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.143298612
+          },
+          {
+            "child_cpu_s": 0.13879899999999967,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.139120098
+          },
+          {
+            "child_cpu_s": 0.14569399999999977,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.145932713
+          },
+          {
+            "child_cpu_s": 0.147926,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.148294609
+          },
+          {
+            "child_cpu_s": 0.1434989999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.143896441
+          },
+          {
+            "child_cpu_s": 0.14560700000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.146034315
+          },
+          {
+            "child_cpu_s": 0.14212700000000034,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.142668806
+          },
+          {
+            "child_cpu_s": 0.14946600000000032,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.150150775
+          },
+          {
+            "child_cpu_s": 0.14325299999999785,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.143612118
+          },
+          {
+            "child_cpu_s": 0.14521099999999976,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.145688617
+          },
+          {
+            "child_cpu_s": 0.14041800000000038,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.140897478
+          },
+          {
+            "child_cpu_s": 0.1393299999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.13962465
+          },
+          {
+            "child_cpu_s": 0.13896200000000114,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.139396313
+          }
+        ],
+        "clang": [
+          {
+            "child_cpu_s": 0.19933999999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.199979203
+          },
+          {
+            "child_cpu_s": 0.21000400000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.210430236
+          },
+          {
+            "child_cpu_s": 0.20603999999999978,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.206555356
+          },
+          {
+            "child_cpu_s": 0.20497699999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.205326186
+          },
+          {
+            "child_cpu_s": 0.19308299999999967,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.193454429
+          },
+          {
+            "child_cpu_s": 0.20040199999999952,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.200782374
+          },
+          {
+            "child_cpu_s": 0.1991340000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.199476309
+          },
+          {
+            "child_cpu_s": 0.19672499999999982,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.197115835
+          },
+          {
+            "child_cpu_s": 0.1964750000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.196803983
+          },
+          {
+            "child_cpu_s": 0.20394299999999976,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.204273562
+          },
+          {
+            "child_cpu_s": 0.20071100000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.201042236
+          },
+          {
+            "child_cpu_s": 0.19694700000000154,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.197273217
+          },
+          {
+            "child_cpu_s": 0.20278999999999847,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.203301613
+          },
+          {
+            "child_cpu_s": 0.19514400000000087,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.195508734
+          },
+          {
+            "child_cpu_s": 0.2021569999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.202552453
+          },
+          {
+            "child_cpu_s": 0.20548599999999873,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.205885917
+          },
+          {
+            "child_cpu_s": 0.22916000000000025,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.229617762
+          },
+          {
+            "child_cpu_s": 0.20023899999999983,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.20060319
+          },
+          {
+            "child_cpu_s": 0.19670699999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.197121548
+          },
+          {
+            "child_cpu_s": 0.19893499999999875,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.199377098
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.10067500000000029,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.101024676
+          },
+          {
+            "child_cpu_s": 0.10516799999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.105495899
+          },
+          {
+            "child_cpu_s": 0.103688,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.104133446
+          },
+          {
+            "child_cpu_s": 0.10603799999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.107193616
+          },
+          {
+            "child_cpu_s": 0.09921299999999977,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.099582831
+          },
+          {
+            "child_cpu_s": 0.10279399999999939,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.103158784
+          },
+          {
+            "child_cpu_s": 0.10367999999999977,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.103995344
+          },
+          {
+            "child_cpu_s": 0.10089300000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.101243923
+          },
+          {
+            "child_cpu_s": 0.09899900000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.099314968
+          },
+          {
+            "child_cpu_s": 0.10065200000000019,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.101898153
+          },
+          {
+            "child_cpu_s": 0.10233499999999918,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.102703873
+          },
+          {
+            "child_cpu_s": 0.10199099999999817,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.102363567
+          },
+          {
+            "child_cpu_s": 0.1007529999999992,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.101091027
+          },
+          {
+            "child_cpu_s": 0.1007649999999991,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.101083514
+          },
+          {
+            "child_cpu_s": 0.09986300000000092,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.100383372
+          },
+          {
+            "child_cpu_s": 0.1033210000000011,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.103898135
+          },
+          {
+            "child_cpu_s": 0.10360200000000042,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.104010771
+          },
+          {
+            "child_cpu_s": 0.1014520000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.101803511
+          },
+          {
+            "child_cpu_s": 0.10083400000000076,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.10123011
+          },
+          {
+            "child_cpu_s": 0.10080400000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.101281324
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.11609599999999975,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.116406998
+          },
+          {
+            "child_cpu_s": 0.12044800000000011,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.120749048
+          },
+          {
+            "child_cpu_s": 0.12078899999999981,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.121189096
+          },
+          {
+            "child_cpu_s": 0.12076000000000064,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.121579807
+          },
+          {
+            "child_cpu_s": 0.11683500000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.117160212
+          },
+          {
+            "child_cpu_s": 0.12269100000000055,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.12301202
+          },
+          {
+            "child_cpu_s": 0.12290699999999966,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.123213107
+          },
+          {
+            "child_cpu_s": 0.13056399999999968,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.131085684
+          },
+          {
+            "child_cpu_s": 0.12090200000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.121157076
+          },
+          {
+            "child_cpu_s": 0.11653300000000044,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.117955799
+          },
+          {
+            "child_cpu_s": 0.12370900000000162,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.124321649
+          },
+          {
+            "child_cpu_s": 0.13434000000000168,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.134704915
+          },
+          {
+            "child_cpu_s": 0.12479900000000121,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.125152189
+          },
+          {
+            "child_cpu_s": 0.12015799999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.120497567
+          },
+          {
+            "child_cpu_s": 0.1299039999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.130645191
+          },
+          {
+            "child_cpu_s": 0.11979000000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.120213015
+          },
+          {
+            "child_cpu_s": 0.14017300000000077,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.140678674
+          },
+          {
+            "child_cpu_s": 0.12087099999999928,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.121302878
+          },
+          {
+            "child_cpu_s": 0.12114700000000056,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.121491534
+          },
+          {
+            "child_cpu_s": 0.11720699999999873,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.117590592
+          }
+        ]
+      },
+      "runtime": {
+        "batch3": {
+          "child_cpu": {
+            "cv": 0.021970840465901774,
+            "mad": 0.0019454999999992673,
+            "max": 0.14946600000000032,
+            "mean": 0.1422518999999999,
+            "median": 0.14108600000000004,
+            "median_ci95_bootstrap": [
+              0.14006050000000014,
+              0.1434989999999985
+            ],
+            "min": 0.1387930000000006,
+            "n": 20,
+            "outlier_count_mad": 0,
+            "stdev": 0.0031253938008714106
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.141270666,
+            0.141296088,
+            0.140666028,
+            0.140181843,
+            0.140215516,
+            0.139187105,
+            0.141562267,
+            0.143298612,
+            0.139120098,
+            0.145932713,
+            0.148294609,
+            0.143896441,
+            0.146034315,
+            0.142668806,
+            0.150150775,
+            0.143612118,
+            0.145688617,
+            0.140897478,
+            0.13962465,
+            0.139396313
+          ],
+          "wall": {
+            "cv": 0.022204406442785946,
+            "mad": 0.001951149499999999,
+            "max": 0.150150775,
+            "mean": 0.14264975289999998,
+            "median": 0.1414291775,
+            "median_ci95_bootstrap": [
+              0.140440772,
+              0.14375427950000003
+            ],
+            "min": 0.139120098,
+            "n": 20,
+            "outlier_count_mad": 0,
+            "stdev": 0.003167453092354583
+          }
+        },
+        "clang": {
+          "child_cpu": {
+            "cv": 0.037917836374850966,
+            "mad": 0.0036044999999997884,
+            "max": 0.22916000000000025,
+            "mean": 0.2019199499999999,
+            "median": 0.20032049999999968,
+            "median_ci95_bootstrap": [
+              0.19794100000000014,
+              0.20336649999999912
+            ],
+            "min": 0.19308299999999967,
+            "n": 20,
+            "outlier_count_mad": 1,
+            "stdev": 0.007656367624918085
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.199979203,
+            0.210430236,
+            0.206555356,
+            0.205326186,
+            0.193454429,
+            0.200782374,
+            0.199476309,
+            0.197115835,
+            0.196803983,
+            0.204273562,
+            0.201042236,
+            0.197273217,
+            0.203301613,
+            0.195508734,
+            0.202552453,
+            0.205885917,
+            0.229617762,
+            0.20060319,
+            0.197121548,
+            0.199377098
+          ],
+          "wall": {
+            "cv": 0.0379414468438795,
+            "mad": 0.0035740905000000156,
+            "max": 0.229617762,
+            "mean": 0.20232406205000003,
+            "median": 0.20069278200000001,
+            "median_ci95_bootstrap": [
+              0.19832515750000002,
+              0.20378758749999998
+            ],
+            "min": 0.193454429,
+            "n": 20,
+            "outlier_count_mad": 1,
+            "stdev": 0.007676467645507854
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.01871511945007587,
+            "mad": 0.0012359999999991267,
+            "max": 0.10603799999999985,
+            "mean": 0.10187599999999992,
+            "median": 0.10117250000000011,
+            "median_ci95_bootstrap": [
+              0.10075899999999915,
+              0.10305750000000025
+            ],
+            "min": 0.09899900000000006,
+            "n": 20,
+            "outlier_count_mad": 0,
+            "stdev": 0.0019066215090959282
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.101024676,
+            0.105495899,
+            0.104133446,
+            0.107193616,
+            0.099582831,
+            0.103158784,
+            0.103995344,
+            0.101243923,
+            0.099314968,
+            0.101898153,
+            0.102703873,
+            0.102363567,
+            0.101091027,
+            0.101083514,
+            0.100383372,
+            0.103898135,
+            0.104010771,
+            0.101803511,
+            0.10123011,
+            0.101281324
+          ],
+          "wall": {
+            "cv": 0.019410663292614105,
+            "mad": 0.0010804965,
+            "max": 0.107193616,
+            "mean": 0.1023445422,
+            "median": 0.101850832,
+            "median_ci95_bootstrap": [
+              0.10116056849999999,
+              0.1035284595
+            ],
+            "min": 0.099314968,
+            "n": 20,
+            "outlier_count_mad": 0,
+            "stdev": 0.001986575448480935
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.05074002046928749,
+            "mad": 0.0024215000000009645,
+            "max": 0.14017300000000077,
+            "mean": 0.12303115000000023,
+            "median": 0.12088649999999967,
+            "median_ci95_bootstrap": [
+              0.12030300000000005,
+              0.12370900000000162
+            ],
+            "min": 0.11609599999999975,
+            "n": 20,
+            "outlier_count_mad": 2,
+            "stdev": 0.006242603069359991
+          },
+          "quality_warnings": [
+            "wall-clock coefficient of variation is 5.1% (>5%)",
+            "2 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.116406998,
+            0.120749048,
+            0.121189096,
+            0.121579807,
+            0.117160212,
+            0.12301202,
+            0.123213107,
+            0.131085684,
+            0.121157076,
+            0.117955799,
+            0.124321649,
+            0.134704915,
+            0.125152189,
+            0.120497567,
+            0.130645191,
+            0.120213015,
+            0.140678674,
+            0.121302878,
+            0.121491534,
+            0.117590592
+          ],
+          "wall": {
+            "cv": 0.05052723572784688,
+            "mad": 0.0023701719999999968,
+            "max": 0.140678674,
+            "mean": 0.12350535254999999,
+            "median": 0.12139720600000001,
+            "median_ci95_bootstrap": [
+              0.1206233075,
+              0.12376737800000001
+            ],
+            "min": 0.116406998,
+            "n": 20,
+            "outlier_count_mad": 2,
+            "stdev": 0.006240384061944684
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "tags": [
+        "synthetic",
+        "fp",
+        "loop"
+      ],
+      "warmups": {
+        "batch3": [
+          {
+            "child_cpu_s": 0.13931899999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.139577869
+          },
+          {
+            "child_cpu_s": 0.14682199999999979,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.147163688
+          },
+          {
+            "child_cpu_s": 0.14830599999999983,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_batch3"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.148810131
+          }
+        ],
+        "clang": [
+          {
+            "child_cpu_s": 0.196708,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.197665327
+          },
+          {
+            "child_cpu_s": 0.1978740000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.198168443
+          },
+          {
+            "child_cpu_s": 0.2023680000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_clang"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.202777645
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.099379,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.09969753
+          },
+          {
+            "child_cpu_s": 0.10763900000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.108017133
+          },
+          {
+            "child_cpu_s": 0.10530299999999992,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.105597513
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.11939200000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.119687087
+          },
+          {
+            "child_cpu_s": 0.1312310000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.131672714
+          },
+          {
+            "child_cpu_s": 0.12180100000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_uyn_244s/spectral_norm_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152\n",
+            "stdout_sha256": "a1c719a1eb113f34314469d275635aa2dbdc6aa02020cd8a6aa4503813e8528f",
+            "wall_s": 0.122118458
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "d2cf6bdc99da85531b8f37854061fc51e2568833329541bf41b18ed00872def6",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/home/user/lccc/work/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "67ed99639f746b8e83e4e685a7189ae1172fb9c23a3e83aa9b09a1d68f3fb1c2",
+      "executable": "/home/user/lccc/work/toolchains/gcc-16/bin/gcc-16",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    },
+    {
+      "binary_sha256": "913453afb492abab17025139852413ba7fd7a52b4fb75fcce58ff3fe399d0a9e",
+      "executable": "/home/user/lccc/work/toolchains/clang-23.1.3/bin/clang-23",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "clang",
+      "label": "Clang"
+    },
+    {
+      "binary_sha256": "c0ece5bd149f306b8ad01d384a7fb932392cec322814bb9fa21bd13c42959440",
+      "executable": "/home/user/lccc/work/lccc-pre-batch4",
+      "flags": [
+        "-I/home/user/lccc/work/toolchains/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64-v3"
+      ],
+      "key": "batch3",
+      "label": "LCCC candidate: batch3"
+    }
+  ],
+  "complete": true,
+  "metadata": {
+    "compiler_versions": {
+      "batch3": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+      "gcc": "gcc-16 (GCC) 16.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "7f40e2e0f273ffad966aa998da407be7a523fba0\n",
+      "status": ""
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        4034452 kB\nMemFree:         1785396 kB\nMemAvailable:    3726460 kB\nBuffers:            7960 kB\nCached:          2099220 kB\nSwapCached:         1440 kB\nActive:           838568 kB\nInactive:        1300864 kB\nActive(anon):       7952 kB\nInactive(anon):    24744 kB\nActive(file):     830616 kB\nInactive(file):  1276120 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       1048572 kB\nSwapFree:        1039748 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             73232 kB\nWriteback:             0 kB\nAnonPages:         31824 kB\nMapped:            19112 kB\nShmem:               236 kB\nKReclaimable:      77892 kB\nSlab:              95592 kB\nSReclaimable:      77892 kB\nSUnreclaim:        17700 kB\nKernelStack:        1296 kB\nPageTables:          932 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     3065796 kB\nCommitted_AS:     162940 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        4644 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       49152 kB\nDirectMap2M:     2048000 kB\nDirectMap1G:     4194304 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": false,
+      "reason": "not probed"
+    },
+    "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t1048572\t\t8824\t\t-2",
+    "timestamp_utc": "2026-10-20T20:12:56.189555+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 8644804608,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 8644804608,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 8644804608,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 8644804608,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [
+      "-march=x86-64-v3"
+    ],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 20,
+    "seed": 20260810,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 3
+  },
+  "unavailable_compilers": {}
+}

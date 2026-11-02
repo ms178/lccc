@@ -1,0 +1,1 @@
+new-dtags;configure-native-lib-dirs=/usr/local/lib /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu

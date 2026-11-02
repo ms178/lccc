@@ -1,0 +1,7 @@
+thread 'passes::iv_strength_reduce::tests::descending_narrow_offset_product_certificate_is_the_operative_proof' (3831) panicked at src/passes/iv_strength_reduce.rs:3000:9:
+a descending offset that wraps its own ring must not be reduced
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    passes::iv_strength_reduce::tests::descending_narrow_offset_product_certificate_is_the_operative_proof

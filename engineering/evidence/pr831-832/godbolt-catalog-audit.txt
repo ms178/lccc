@@ -1,0 +1,17 @@
+ALIAS         PINNED ID         PINNED      NEWEST      STATUS
+--------------------------------------------------------------
+gcc       cg162           16.2        16.2        ok
+clang     cclang2310      23.1.0      23.1.0      ok
+icc       cicc2021100     2021.10.0   2021.10.0   ok
+arm64gcc  carm64g1610     16.1.0      16.1.0      ok
+armv8clangarmv8-cclang231023.1.0      23.1.0      ok
+rv64gcc   rv64-cgcc1610   16.1.0      16.1.0      ok
+rv64clang rv64-cclang2310 23.1.0      23.1.0      ok
+
+  moving channel icx        -> cicxlatest     x86-64 icx (latest) (latest)
+  moving channel gcc-trunk  -> cgsnapshot     x86-64 gcc (trunk) (trunk)
+  moving channel arm64gcc-trunk -> carm64gtrunk   ARM64 GCC trunk trunk
+  moving channel rv64gcc-trunk -> rv64-cgcctrunk RISC-V (64-bits) gcc (trunk) (trunk)
+
+
+audit: all pinned aliases resolve and are current

@@ -1,0 +1,52 @@
+[
+  {
+    "original": "pr828-licm-red.log",
+    "gzip": "pr828-licm-red.log.gz",
+    "raw_sha256": "4800e9ec39c5837906c19ec94e597d7ee62f52e4a1c7504670f312bc98e2d950"
+  },
+  {
+    "original": "pr828-licm-global-red.log",
+    "gzip": "pr828-licm-global-red.log.gz",
+    "raw_sha256": "be88c66aa0bb5cd147f39be4e372b272559cd5e1efeafb2487a60c4a8add737d"
+  },
+  {
+    "original": "pr828-nbody-green.log",
+    "gzip": "pr828-nbody-green.log.gz",
+    "raw_sha256": "ecd7ba5b75a44f1c6152f17499e61460ce25d58c558dcfaeb286981eaddf0335"
+  },
+  {
+    "original": "pr828-debug-green.log",
+    "gzip": "pr828-debug-green.log.gz",
+    "raw_sha256": "334971058a2f6d2c22aa0ce561e0ac45eb86e328fc1e6069584852b4d3561385"
+  },
+  {
+    "original": "pr828-debug-red.log",
+    "gzip": "pr828-debug-red.log.gz",
+    "raw_sha256": "49ed82325c04e1ef9a3ec7bc0f78088ced43588a4a35761276f06f9162c4a225"
+  },
+  {
+    "original": "pr828-upper-native.log",
+    "gzip": "pr828-upper-native.log.gz",
+    "raw_sha256": "9200325d918f3ce25d5cec31e692ca43803d74fad8b0ff3249e9a531a589ea03"
+  },
+  {
+    "original": "pr828-licm-green.log",
+    "gzip": "pr828-licm-green.log.gz",
+    "raw_sha256": "eee879169ef769050806b641088c15853bbdefb6ff180b2f8136bdb8440fa77a"
+  },
+  {
+    "original": "pr828-effects-green.log",
+    "gzip": "pr828-effects-green.log.gz",
+    "raw_sha256": "f29627c8dfddde66b4950d96e8d404ac86c1ebba4e7d3b32d582dc2679c6a6e8"
+  },
+  {
+    "original": "pr828-external-rust-red.log",
+    "gzip": "pr828-external-rust-red.log.gz",
+    "raw_sha256": "c6162cbb5f63f8377b1c7ab1fe1798f27dda91ae8ddd195ad836585f70431a3c"
+  },
+  {
+    "original": "pr828-nbody-red.log",
+    "gzip": "pr828-nbody-red.log.gz",
+    "raw_sha256": "13031aaf819f5a024518556d2a6fbc212c0e27e486d6cf4a70b9b2048cb9f7f7"
+  }
+]

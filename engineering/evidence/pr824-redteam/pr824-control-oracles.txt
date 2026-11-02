@@ -1,0 +1,6 @@
+compiler      insns  load  stor  spill  brnch  vec
+----------------------------------------------------
+lccc             19     0     0      0      2    0
+gcc16.2          13     0     0      0      4    0
+clang23.1        39     0     0      0      7    0
+icx              40     2     3      3      8    2

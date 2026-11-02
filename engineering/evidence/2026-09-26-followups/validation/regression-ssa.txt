@@ -1,0 +1,50 @@
+lccc: /home/user/lccc/target/followup-vex-lccc
+corpus: 820 tests, jobs=2, timeout=90s each
+
+SKIP-COMPARE bb_slp_v8  (compile:ok run:ok)    2.3s
+      gcc cannot compile (collect2: error: ld returned 1 exit status)
+SKIP-COMPARE builtin_apply_return  (compile:ok run:ok)    0.0s
+      gcc cannot compile (/home/user/lccc/tests/regression/builtin_apply_return.c:24:29: note: expected ‘void (*)()’ but argument is of type ‘int (*)(int,  int,  int)’)
+SKIP-COMPARE casts_roundtrip  (compile:ok run:ok)    0.1s
+      gcc cannot compile (      |                                          ^~~~~~)
+SKIP-COMPARE code16_realmode_encoding  (compile:ok run:ok)    0.1s
+      gcc cannot compile (collect2: error: ld returned 1 exit status)
+SKIP-COMPARE cross_pr_redteam  (compile:ok run:ok)    1.1s
+      gcc cannot compile (collect2: error: ld returned 1 exit status)
+SKIP-COMPARE cross_pr_redteam2  (compile:ok run:ok)    0.5s
+      gcc cannot compile (collect2: error: ld returned 1 exit status)
+SKIP-RUN i686_const_stack_args  (compile:host-skip)    0.0s
+      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically
+SKIP-RUN i686_atomics  (compile:ok run:host-skip)    0.1s
+      compiled successfully; host image has no i386 ELF interpreter
+SKIP-RUN i686_fused_mul_add_operand_order  (compile:ok run:host-skip)    0.0s
+      compiled successfully; host image has no i386 ELF interpreter
+SKIP-RUN i686_narrow_cmp_flag_law  (compile:host-skip)    0.0s
+      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically
+SKIP-RUN i686_narrow_cmp_fold  (compile:host-skip)    0.0s
+      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically
+SKIP-RUN i686_narrow_store_alu_slot_source  (compile:host-skip)    0.0s
+      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically
+SKIP-RUN i686_push_arg_staging  (compile:host-skip)    0.0s
+      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically
+SKIP-RUN i686_stack_param_direct_home  (compile:host-skip)    0.0s
+      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically
+SKIP-COMPARE kernel_flags_and_builtins  (compile:ok run:ok)    0.1s
+      gcc cannot compile (      |        ^~~)
+SKIP-COMPARE machinst_subword_reload_sign  (compile:ok run:ok)    0.2s
+      gcc cannot compile (/home/user/lccc/tests/regression/machinst_subword_reload_sign.c:325:15: note: include ‘<stdio.h>’ or provide a declaration of ‘puts’)
+SKIP-COMPARE regress_tentative_incomplete_global_array_size  (compile:ok run:ok)    0.0s
+      gcc cannot compile (      |     ^)
+SKIP-RUN segment_fill_copy_alias  (compile:ok run:host-skip)    0.0s
+      compiled successfully; host image has no i386 ELF interpreter
+SKIP-COMPARE sqrt_vex_scalar  (compile:ok run:ok)    0.0s
+      gcc cannot compile (collect2: error: ld returned 1 exit status)
+SKIP-COMPARE va_opt_c2x  (compile:ok run:ok)    0.0s
+      gcc cannot compile (      |         ^~~)
+SKIP-COMPARE vzeroupper_after_ymm  (compile:ok run:ok)    0.1s
+      gcc cannot compile (      |            ^~~)
+SKIP-COMPARE spectral_norm  (compile:ok run:ok)    0.3s
+      gcc cannot compile (collect2: error: ld returned 1 exit status)
+
+== 798 passed, 0 failed, 13 skipped-compare, 9 skipped-run, 820 total, 126s
+json: engineering/evidence/2026-09-26-followups/validation/regression-ssa.json

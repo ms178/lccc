@@ -1,0 +1,5 @@
+
+running 1 test
+test backend::x86::codegen::peephole::passes::store_forwarding::tests::sse1_raw_copy_mnemonics_do_not_require_sse2 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6310 filtered out; finished in 0.00s

@@ -1,0 +1,10 @@
+benchmark                 old min    new min    new/old       low3    old->new insn  correctness
+spectral_norm              250.28     205.50      0.821      0.821  199->136   same
+hash_table                9071.38    7632.42      0.841      0.845  228->174   same
+glibc_memcmp                 6.77       7.42      1.096      1.047  325->325   same
+expat_xml_scan              47.53      47.42      0.998      0.997  259->259   same
+gzip_crc32                 117.40     117.51      1.001      1.000  146->92    same
+zlib_ng_adler32             38.16      37.98      0.995      0.998  258->258   same
+nbody                      225.93     225.90      1.000      1.000  394->394   same
+
+geomean new/old = 0.9602 (-3.98%)

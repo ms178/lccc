@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sqlite_varint | 761217 | 822567 | 1.08059 | 1375/1374 | 2234/2245 | 3203/3223 | 12574/10368 | 2054/2061 |
+geomean simulated Ir mine/ref = 1.0805946267621453 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/sqlite_varint/manifest.json

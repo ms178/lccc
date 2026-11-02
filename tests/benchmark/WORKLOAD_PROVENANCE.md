@@ -1,0 +1,256 @@
+# Workload-kernel provenance and scope
+
+This directory contains **small, standalone, workload-derived kernels**, not
+claims that these programs represent the end-to-end performance of their parent
+projects.  Their purpose is to provide reproducible, inspectable compiler
+reproducers between synthetic microbenchmarks and full package builds.
+
+Every kernel has all of the following:
+
+1. a pinned source release/commit selected from `ms178/archpkgbuilds`;
+2. a source-file SHA-256 captured during extraction;
+3. an explicit upstream license in the source header;
+4. a deterministic harness and a local algorithmic self-check; and
+5. compiler-output equivalence checks in `run_benchmarks.py`.
+
+The sources below were retrieved on 2026-08-10.  The source-file digests are
+more useful than an archive digest for these narrow extracts: they identify the
+exact file from which the benchmark kernel was derived, even when an upstream
+release archive is regenerated.  Corresponding upstream license texts are
+shipped in [`third_party_licenses/`](../../third_party_licenses/README.md);
+these test-source licenses do not relicense the compiler/runtime.
+
+| Benchmark | `archpkgbuilds` selector | Extracted upstream source | License | SHA-256 of selected source file(s) | Standalone boundary |
+|---|---|---|---|---|---|
+| `gzip_crc32` | `packages/gzip/PKGBUILD`, `gzip` 1.14 | `lib/crc.c`, scalar table path | LGPL-3.0-or-later | `crc.c`: `9d9c9bfe6001049602d1101dd4dcc329bbca9bbbb7f556a5749acb23dfa1ecb2` | Keeps the scalar lookup table and CRC recurrence; removes configure-time slice/PCLMUL dispatch and gzip interfaces. |
+| `zlib_ng_adler32` | `packages/zlib-ng/PKGBUILD`, tag `2.3.3` | `arch/generic/adler32_c.c`, `adler32_p.h` | Zlib | `adler32_c.c`: `274b9bacf8fa2a1ead2b202b8c9b878b68b100d2df51dee1790b27e47d3bf1de`; `adler32_p.h`: `514cb0157c2e0f15c19c90c3408ea8af1c643cb73991e27073c7aca3659e7dc7` | Keeps NMAX blocking and 8-byte accumulation.  Omits zlib-ng dispatcher, ISA variants, and copy API. |
+| `zlib_ng_compare256` | `packages/zlib-ng/PKGBUILD`, tag `2.3.3` | `arch/generic/compare256_p.h`, `compare256_64` | Zlib | `compare256_p.h`: `42b893a97505f69880b90905eb187510dd5dd42323f8f360e6ff5620c107fac9` | Keeps the 64-bit XOR and first-differing-byte bit scan; uses the upstream `memcpy`-based unaligned-load fallback. Exhaustively checks mismatch positions 0–256 across all 64 pairs of eight independent alignments. No zlib-ng dispatch, ISA-specific variants, or complete compression path. Source retrieved 2026-10-28. |
+| `expat_xml_scan` | `packages/expat/PKGBUILD`, Expat 2.8.2 | `lib/xmltok_impl.c`, especially `nameLength`/UTF-8 token progression | MIT | `xmltok_impl.c`: `94eeaef9ed46d10f80f748924fbf41f950b4859d6f234f61fdb2c8f1a8e77bd1` | A UTF-8-only specialization of the name-scanning path.  It is deliberately **not** a complete XML parser. |
+| `sqlite_varint` | `packages/sqlite/PKGBUILD`, SQLite 3.53.4 (`sqlite-src-3530400`) | `src/util.c`, `sqlite3PutVarint` and `sqlite3GetVarint` | Public domain | `util.c`: `f3ad5a891625459352c1b57c053d3b89dcc973206644126a857c0ff82b7ce37f` | Keeps the fast 1–9 byte decoder control flow; removes SQLite types, assertions, and database interfaces. |
+| `linux_find_bit` | `packages/linux-cachymod-6.18/PKGBUILD`, base `linux-6.18.42` | `lib/find_bit.c`; `include/asm-generic/bitops/__ffs.h` | GPL-2.0-or-later | `find_bit.c`: `5d9a03505728d024e52462662252c127545b0629ff2f7006e4d494372d30459d`; `__ffs.h`: `1e7c8db53caf177033f9832966fd2eac8c9a834cc46ac717646359d6140b7939` | Expands the portable `FIND_NEXT_BIT(addr1[idx] & ~addr2[idx], ...)` form only.  No kernel headers, locking, exports, or random source are benchmarked. |
+| `glibc_memcmp` | `toolchain-stable/glibc/PKGBUILD`, commit `7cba77790f3279bec3ac20e9c7632b021cd53f95` | `string/memcmp.c`, common-alignment strategy | LGPL-2.1-or-later | `memcmp.c`: `5502c6d8ed5a4f9744ac232512575643a5f682bfcc208952a3a04e207157a5bb` | Keeps a defined-behavior, aligned-array adaptation of the four-word fast path.  It intentionally does not call host libc or cover glibc's arbitrary-alignment machinery. |
+| `chacha20_block` | `packages/linux-cachymod-6.18/PKGBUILD`, `crypto/chacha.c` / RFC 7539 | `crypto/chacha_generic.c`, `chacha20_block` | GPL-2.0-or-later / MIT | `chacha.c`: RFC 7539 §2.3.2 | Keeps 20-round ARX state permutation; verifies against RFC 7539 test vectors. |
+| `sha256_transform` | `packages/linux-cachymod-6.18/PKGBUILD`, `crypto/sha256_generic.c` | `crypto/sha256_generic.c`, 64-step core | GPL-2.0-or-later / BSD-3-Clause | FIPS 180-4 standard core | Keeps 64-round expansion schedule and 8-word state compression; verifies with standard "abc" test vector. |
+| `linux_rbtree` | `packages/linux-cachymod-6.18/PKGBUILD`, `lib/rbtree.c` | `lib/rbtree.c`, `tools/lib/rbtree.c` | GPL-2.0-or-later | `rbtree.c` kernel implementation | Intrusive pointer-tagged parent/color Red-Black tree insertion, balance rotations, and tree search. |
+| `zstd_count` | `packages/zstd/PKGBUILD`, `lib/compress/zstd_compress_internal.h` | `lib/compress/zstd_compress_internal.h`, `ZSTD_count` | BSD-3-Clause / GPL-2.0 | `zstd_compress_internal.h`: ZSTD 1.5.7 | Unaligned 64-bit XOR and `__builtin_ctzll` trailing zero count matching loop. |
+| `lz4_compress` | `packages/lz4/PKGBUILD`, `lib/lz4.c` | `lib/lz4.c`, `LZ4_compress_fast` core | BSD-2-Clause | `lz4.c`: LZ4 1.10.0 | Hash-table sliding window 4-byte matching, token output, and literal run encoding. |
+| `glibc_strstr` | `toolchain-stable/glibc/PKGBUILD`, `string/str-two-way.h` | `string/str-two-way.h`, `string/strstr.c` | LGPL-2.1-or-later | `str-two-way.h` | Boyer–Moore–Horspool bad-character shift scan — glibc's `two_way_short_needle` short-needle path (right-to-left scan + 256-entry shift table); the full Crochemore-Perrin factorization is NOT part of the extracted kernel. |
+| `gzip_longest_match` | `packages/gzip/PKGBUILD`, `gzip` 1.14 | `deflate.c`, `longest_match()` (UNALIGNED_OK arm) | LGPL-3.0-or-later | `deflate.c`: gzip 1.14 release | Keeps the hash-chain pre-check, the widened unaligned load with a trailing-zero byte count, the `chain_length` budget and its `>>= 2` thinning, and the loop-carried best-length update. The sliding window, `INSERT_STRING` policy and all gz* interfaces are replaced by a harness-built chain. Self-check: a naive byte-wise longest match over the same chain must return the same length. |
+| `linux_list_sort` | `packages/linux-cachymod-6.18/PKGBUILD`, base `linux-6.18.42` | `lib/list_sort.c` | GPL-2.0-or-later | `list_sort.c` kernel implementation | Keeps the bottom-up 64-bin merge sort, the trailing-zero bin selection, and the `cmp(priv, a, b) <= 0` tie rule. `<linux/...>`, EXPORT_SYMBOL and list_head are replaced by a local node type. Self-check: the result must be sorted AND stable (a rewrite that is fast but unstable fails). |
+| `zstd_double_fast` | `packages/zstd/PKGBUILD`, zstd 1.5.7 | `lib/compress/zstd_double_fast.c` | BSD-3-Clause OR GPL-2.0 | `zstd_double_fast.c`: ZSTD 1.5.7 | Keeps the two-table (`hashLong` 8-byte, `hashSmall` 4-byte) probe per iteration, the unaligned `MEM_read32/64` loads, and `ZSTD_count`'s 64-bit XOR + ctz extension. Context, sequence encoding and entropy stages removed. Self-check: every reported match length is re-derived by a byte-wise scan. |
+| `gzip_crc32_slice8` | `packages/gzip/PKGBUILD`, `gzip` 1.14 | `lib/crc.c`, `lib/crc-sliceby8.h` (`crc32_update_no_xor_slice_by_8`) | LGPL-3.0-or-later | `crc.c`: `9d9c9bfe6001049602d1101dd4dcc329bbca9bbbb7f556a5749acb23dfa1ecb2`; `crc-sliceby8.h`: `82e53cccd3bdd7bf88e0ee3aa3d9ea9114f8db4db298355227339d50f2e37c96` | Keeps the 8x256 CRC-32 lookup tables, 8-byte aligned word XOR + 8-lane byte extraction, and unaligned prefix/tail handling. Self-checks 64 alignment/length slices against bitwise IEEE 802.3 CRC-32. |
+| `zlib_ng_slide_hash` | `packages/zlib-ng/PKGBUILD`, tag `2.3.3` | `arch/generic/slide_hash_c.c`, `insert_string_tpl.h` | Zlib | `slide_hash_c.c`: `016e4b5a12a174f8f01619f778107ada5fe6c88cd836117954e4a16e9b14a3db`; `insert_string_tpl.h`: `7ffdc6f9ed6ee94fdc76a6eed970836e30facdfc958371e98a6e55f483fc66a1` | Keeps `slide_hash_chain` (`val >= wsize ? val - wsize : 0` over `uint16_t` `head[]`/`prev[]`) and rolling 4-byte multiply-shift `quick_insert_string` hash-chain updates. Self-checks `head[]` and `prev[]` against a scalar reference simulator. |
+| `expat_utf8_content` | `packages/expat/PKGBUILD`, Expat `R_2_9_0` (`2.9.0`) | `expat/lib/xmltok_impl.c` (`PREFIX(scanContent)`) | MIT | `xmltok_impl.c`: `857d4d0984aaaca0ff6c907f0e9abf26c476fd80f6cb85896c2aa1d78eb66ae1` | Keeps the UTF-8 byte-type table dispatch (`BT_LT`, `BT_AMP`, `BT_RSQB`, `BT_CR`, `BT_LF`, 2/3/4-byte UTF-8 lead sequences) and `]]>`, entity, and tag boundary transitions. Self-checks token/offset stream against an independent byte scanner. |
+| `sqlite_vdbe_serial` | `packages/sqlite/PKGBUILD`, SQLite `3.54.0` (`sqlite-src-3540000`) | `src/vdbeaux.c` (`sqlite3VdbeSerialGet`, `sqlite3SmallTypeSizes`) | Public domain | `vdbeaux.c`: `f7b74c8ab39183a98637c96f39d681dab4f2c162228d606f96227dc7dbadd932` | Keeps the 12-way serial-type switch (`NULL`, signed 8/16/24/32/48/64-bit big-endian ints, IEEE-754 float64, constants `0`/`1`, variable-length text/blob) and `sqlite3SmallTypeSizes` table lookup. Self-checks decoded record checksum against ground-truth encoder accumulators. |
+| `linux_xxhash64` | `packages/linux-cachymod-6.18/PKGBUILD`, `linux-6.18.58` | `lib/xxhash.c` (`xxh64`, `xxh64_round`, `xxh64_merge_round`, `xxh64_avalanche`) | BSD-2-Clause OR GPL-2.0-only | `xxhash.c`: `1844d67cd0b00978a57561186948b75898c29aeeab56a6e0b4b6523031d25d69` | Keeps the 4-lane 32-byte `v1..v4` rotate-multiply stripe loop, 4-lane merge rounds, 8/4/1-byte tail cascade, and final avalanche over varied alignments and lengths. Self-checks empty/4-byte/48-byte canonical xxHash64 test vectors. |
+| `glibc_dl_hash` | `toolchain-stable/glibc/PKGBUILD`, commit `afd131806b25715a7617ab757db43f0bb610acbf` | `sysdeps/generic/dl-new-hash.h` (`_dl_new_hash`), `string/strchrnul.c` | LGPL-2.1-or-later | `dl-new-hash.h`: `7714a1bcb43037faa582d1a197c08b1a8f0fe9025f8c2d06297e0a476831980a`; `strchrnul.c`: `25d82885a2acbbbd72d4a75caf9fe9884672a1a158d1f2a48adb794c6f09e497` | Keeps the unrolled `_dl_new_hash` (`h * 33 + c`) loop, portable 64-bit SWAR `__strchrnul` magic-bits scan for versioned `@` symbol suffixes, and `.gnu.hash` Bloom + chain lookup. Self-checks canonical `_dl_new_hash` test vectors and lookup table hits/misses. |
+
+## Archive retrieval record
+
+The extraction artifacts (not committed to LCCC) had these SHA-256 values:
+
+```text
+GNU gzip 1.14 tar.xz              01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6
+zlib-ng 2.3.3 GitHub tag archive  f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1
+Expat 2.8.2 tar.bz2               69e7f52417d85b1c2b7fe855e176eec55d0b2d7d92d691372d833a1c7df7923b
+SQLite 3.53.4 source zip           d18fa15aec74d8c17e1463f861095adc01b5ad190256acb4f91d22f0368d232b
+Linux 6.18.42 tar.xz               35a8ef5e8fb44467e56a42b40c23c4c10a61d1e95ff8d738f285230e8bed63e7
+```
+
+### Integrity audit note — recipe checksum mismatches
+
+The following current recipe checksums did **not** match a repeated fetch of
+the exact recipe URL on 2026-08-10.  This is recorded rather than silently
+ignored; it may reflect stale package metadata or an upstream archive
+regeneration, but requires resolution/signature verification before a package
+artifact is treated as independently validated.
+
+| Recipe | Recipe digest | Re-fetched artifact digest | Re-fetch result |
+|---|---|---|---|
+| `packages/gzip/PKGBUILD` (SHA-256) | `7454eb6935db17c6655576c2e1b0fabefd38b4d0936e0f87f48cd062ce91a057` | `01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6` | Two GNU FTP downloads were byte-identical. |
+| `packages/expat/PKGBUILD` (SHA-512) | `46cc9d725f359b77681a2875bfefa15ceee50eb9513f6577607c0c5833dfa4241565c74f26b84b38d802c3cd8c32f00204fd74272bcecbd21229425764eef86c` | `9dc9d7c064c5ffe43af704af5006465f805d13602e458118cb9c32e0ae0b8f88b72a7824c85d313c529774af65c5e4d6a0ef1636362ac57514c176d3119dea22` | GitHub release artifact was fetched once; verify the release signature before package use. |
+| `packages/sqlite/PKGBUILD` (SHA-256) | `2d7b032b6fdfe8c442aa809f850687a81d06381deecd7be3312601d28612e640` | `d18fa15aec74d8c17e1463f861095adc01b5ad190256acb4f91d22f0368d232b` | Two SQLite URL downloads were byte-identical. |
+
+The benchmark sources are additionally pinned by the selected source-file
+digests in the table above.  That makes the small test kernels reproducible,
+but does **not** resolve the package-recipe supply-chain discrepancy.
+
+## Validation performed on 2026-08-10
+
+Before the screening comparison, all six files passed:
+
+1. GCC `-O1 -fsanitize=address,undefined -fno-omit-frame-pointer` execution
+   with `ASAN_OPTIONS=detect_leaks=0` and `UBSAN_OPTIONS=halt_on_error=1`;
+2. a differential optimization-level matrix in which GCC and LCCC at `-O0`,
+   `-O1`, and `-O2` all produced the same deterministic output per kernel; and
+3. a 15-round, two-warm-up, paired/randomized, CPU-pinned LCCC/GCC/Clang VM
+   screening run.  The raw JSON, assembly, compile commands, and section
+   reports were retained outside the source tree by the runner.
+
+The exact cross-compiler outputs were:
+
+```text
+gzip_crc32       372e56ab
+zlib_ng_adler32  8c331ae0
+expat_xml_scan   626766774715194881
+sqlite_varint    deedcdd4edc1c0f1
+linux_find_bit   0
+glibc_memcmp     2158787064
+```
+
+This validates the benchmark harnesses and catches common optimization-level
+miscompilations; it is not a proof of full parent-project behavior.
+
+## Common algorithm microbenchmarks
+
+The following files are self-contained algorithms written for this repository
+(no copied upstream code, MIT/Apache-2.0 dual-license as with the rest of LCCC)
+to broaden coverage beyond the original synthetic set while retaining exact,
+fast cross-compiler output oracles:
+
+| Benchmark | Shape | Primary stresses | Deterministic oracle |
+|---|---|---|---|
+| `ascii_case_fold` | byte parser loop | byte loads, compare/branch/select, dependent accumulator | fixed ASCII table and FNV-style checksum |
+| `binary_search` | sorted table lookup | midpoint splitting, branch-heavy search, array loads | sum of successful search indices |
+| `ring_fifo` | SPSC bounded queue | mask-based wrap, producer/consumer state, dependent load/store | final FNV/LCG stream checksum |
+| `histogram` | 256-bin reduction | scattered indexed increments, loop reduction, 64-bit sum | total count and final checksum |
+
+These are not substitutes for gzip/zlib-ng/expat/SQLite/glibc/kernel extracts;
+they are stable screening kernels for regressions in addressing, branches,
+register allocation, and memory-op folding before graduating to the pinned
+end-to-end workloads.
+
+## Switch-LUT admission microbenchmarks
+
+Four repository-local synthetic programs give `switch_lut` an explicit
+performance oracle. They are deliberately separate shapes rather than claims
+about an application workload:
+
+| Benchmark | Eligible shape | Primary comparison | Deterministic oracle |
+|---|---|---|---|
+| `switch_lut_bool_bench` | forwarded constant returns, `{0,1}` plus zero default | one-bit membership mask versus switch dispatch | fixed LCG stream and accumulated classification sum |
+| `switch_lut_two_val_bench` | forwarded constant returns, two table values including the default | general two-value mask versus switch dispatch | fixed LCG stream and accumulated classification sum |
+| `switch_lut_packed_bench` | sixteen dense four-bit results; default zero is also a table value | packed immediate LUT versus switch dispatch | fixed LCG stream and accumulated lookup sum |
+| `switch_lut_packed_fallback_bench` | same table with default 16, which no table slot encodes | packed extraction plus out-of-range result select | fixed LCG stream and accumulated lookup/default sum |
+
+Each function is `noinline`, each input stream includes out-of-range defaults,
+and `-DN=<count>` scales the hot loop (default eight million iterations).
+Measure the pass directly with the existing interleaved, correctness-gated
+harness:
+
+```sh
+python3 scripts/perf_ab.py \
+  --env CCC_DISABLE_PASSES=switch_lut \
+  --only switch_lut_bool_bench,switch_lut_two_val_bench,switch_lut_packed_bench,switch_lut_packed_fallback_bench \
+  --reps 9
+```
+
+The pass-disabled arm is B, so `B/A > 1` favors the enabled pass. Static
+instruction counts and Callgrind branch simulation answer different questions;
+neither replaces the native timing or a real-application benchmark.
+
+## What these kernels can and cannot establish
+
+They can isolate code-generation questions such as:
+
+- whether a load/index/shift recurrence spills or uses a poor addressing mode;
+- whether a branch-heavy varint or parser path has an unnecessary dependency;
+- whether scalar unrolling, modulo lowering, and bit-scan selection are sound;
+- whether LCCC and reference compilers agree on an exact deterministic output.
+
+They cannot establish full-project wins.  Any promising result must graduate to
+an upstream build/run workload with pinned inputs, assembly capture, controlled
+runtime conditions, and—on bare metal—hardware-counter evidence.
+
+## Graduated end-to-end workload: GNU gzip 1.14
+
+`tests/workloads/gzip-1.14/run.py` now builds and executes the complete pinned
+GNU gzip 1.14 project rather than extrapolating from `gzip_crc32`. The full
+runner verifies archive SHA-256
+`01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6`,
+requires gzip's upstream test suite to pass 30/30 under both LCCC and GCC,
+generates deterministic 8 MiB source-tree and structured/binary corpora,
+requires bit-identical level-1/6/9 streams and exact decompression, captures
+full binary disassembly/size/build logs, and retains randomized CPU-pinned raw
+samples with individual and aggregate statistics.
+
+The first seven-round VM screen on 2026-08-18 did **not** show an LCCC win. LCCC
+was slower in every case: source compression ratios to GCC were 1.94882 (level
+1), 1.81785 (level 6), and 1.88842 (level 9); mixed level 6 was 1.99878; source
+decompression was 1.74329. Arithmetic and geometric ratios were 1.87943 and
+1.87721. LCCC's binary text was 114,738 bytes versus GCC's 106,982. These
+regressions are intentionally explicit rather than hidden by a kernel-only
+score.
+
+A live CE triage of the scalar gzip CRC recurrence found LCCC at 36 static
+instructions, GCC 16.2 at 15, Clang 22.1 at 49, ICC 2021.10 at 35, and latest
+ICX at 64. GCC's key advantage there is a compact pointer/end loop with a
+memory table operand; LCCC repeatedly materializes byte and table addresses.
+That is one plausible generated-code cause, not proof that CRC alone explains
+the end-to-end gap. Raw evidence is retained under
+`artifacts/simd-fp-four/gzip-e2e/`.
+
+This remains VM wall-clock screening without PMU data. The recipe/archive
+checksum discrepancy described above is still unresolved, and the archive
+signature was not verified in this VM; the end-to-end runner reports both
+limitations on every run.
+
+## 2026-10-06: checksum composition (not a second byte-scan benchmark)
+
+`zlib_ng_adler32_combine.c` extracts `adler32_combine_` from zlib-ng 2.3.3,
+selected from archpkgbuilds commit `d9953b4f185fe6b33506af4b5730039af7849174`,
+`packages/zlib-ng/PKGBUILD`. Upstream `adler32.c` SHA-256:
+`bc5308ff3ea584bf13b626e39ad261abbaf7f87e6eb92a9195c8cef70bc0bf9d`.
+The arithmetic body is unchanged; changes are the standalone `int64_t` type,
+function name, `noinline` for observable repeated calls, and an original harness.
+The Zlib license remains in force (see the bundled license directory).
+
+Validation compares all 1025 splits of a 1024-byte message against an independent
+byte-at-a-time Adler checksum, checks invalid negative lengths and algebraic
+zero-run checksums through `INT64_MAX`. The measured loop composes valid chunk
+checksums selected by a carried checksum (no dead loop or fixed constant output).
+`-DPASSES=N` scales runtime; default 50 million. This exercises division by
+65521, multiply, carry-free modular corrections and branch/CMOV decisions,
+which the existing byte-accumulator kernel does not isolate.
+
+
+## 2026-10-10 addition: Expat 2.8.5 SipHash-2-4
+
+`expat_siphash24` is selected from `packages/expat/PKGBUILD` at archpkgbuilds
+commit `39fcd576582ee3320379882965a549a1fe6120e1`. Source: Expat 2.8.5
+`lib/siphash.h`, SHA-256
+`12ecc9915bccb793ea8bb543cc7d002e226f4e4d6b97ec9839dca41cbe4e2e27`.
+Upstream's file-specific license is **CC0-1.0**, not Expat's package-level MIT
+license; attribution remains in the source and the CC0 text is bundled in
+`third_party_licenses/CC0-1.0.txt`.
+
+The SipHash implementation and all 64 known-answer vectors are unchanged.
+Changes are confined to replacing fallthrough annotations with portable no-ops,
+removing the upstream header guard/main, and adding a noinline wrapper plus a
+harness. It checks every streaming split for lengths 0 through 128. Workload
+iterations vary message length, alignment, key and bytes through the carried
+hash to prevent invariant-loop elimination. No XML parser or package-level
+speed claim follows from this keyed-name-hashing kernel.
+
+The release archive's SHA-256 is
+`952c03c33a6b337f12dae7a9b0f9dee86f867550d35c994d6bdaaddd37dc8454`.
+The recipe SHA-512 mismatch was reproduced; the upstream asset digest and the
+detached signature were independently checked against the recipe's pinned key.
+Details and full-project reproduction are in
+`tests/workloads/expat-2.8.5/README.md`. This 2.8.5 evidence does not overwrite
+or reclassify the older 2.8.2 extraction / mismatch recorded above.
+
+Initial evidence: the full default workload agrees under native LCCC/GCC/Clang
+at O2. The reduced-iteration matrix also agrees at O0/O1/O2/O3/Os on
+both x86-64 and i686: 30 compiler executions, with all built-in self-checks
+retained. A matched x86-64-v3 Callgrind screen (`-DPASSES=200000`) records
+442,526,918 LCCC versus 267,107,196 GCC14.2 simulated instructions, a ratio of
+1.656739. This is an instruction-count **deficit**, not a measured speed ratio
+or a Raptor Lake PMU result. Whole-TU static counts at O2/v3 are 707 LCCC,
+308 GCC16.2, 496 Clang23.1, 745 ICC2021.10, 515 ICXlatest and 307 GCCtrunk;
+these include cold self-tests and retained helper bodies, so dynamic counts
+are the stronger attribution signal. LCCC retains a memory-heavy `sip_round`
+loop (ten loads / ten stores) and assembles eight-byte words with separate
+byte loads/shifts/ORs where the GCC oracle uses a word load. Adjacent-byte load
+combining and conservative aggregate promotion are research candidates, not
+implemented optimizations or promised wins.

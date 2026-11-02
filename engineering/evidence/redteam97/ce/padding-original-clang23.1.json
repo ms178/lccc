@@ -1,0 +1,800 @@
+{
+  "inputFilename": "example.c",
+  "code": 0,
+  "okToCache": true,
+  "timedOut": false,
+  "stdout": [],
+  "stderr": [],
+  "truncated": false,
+  "execTime": 1210,
+  "processExecutionResultTime": 0.005095000000437722,
+  "instructionSet": "amd64",
+  "compilationOptions": [
+    "-g",
+    "-o",
+    "/app/output.s",
+    "-fno-verbose-asm",
+    "-S",
+    "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+    "-fcolor-diagnostics",
+    "-fno-crash-diagnostics",
+    "-O2",
+    "-Werror",
+    "/app/example.c"
+  ],
+  "downloads": [],
+  "tools": [],
+  "asmSize": 9010,
+  "asm": [
+    {
+      "text": "padding_witness:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  testl %edi, %edi",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  je .Ls97_witness_bb2",
+      "source": null,
+      "labels": [
+        {
+          "name": ".Ls97_witness_bb2",
+          "range": {
+            "startCol": 6,
+            "endCol": 23
+          }
+        }
+      ]
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  setb %al",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  jmp .Ls97_witness_bb3",
+      "source": null,
+      "labels": [
+        {
+          "name": ".Ls97_witness_bb3",
+          "range": {
+            "startCol": 7,
+            "endCol": 24
+          }
+        }
+      ]
+    },
+    {
+      "text": ".Ls97_witness_bb2:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  setb %al",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  jmp .Ls97_witness_bb3",
+      "source": null,
+      "labels": [
+        {
+          "name": ".Ls97_witness_bb3",
+          "range": {
+            "startCol": 7,
+            "endCol": 24
+          }
+        }
+      ]
+    },
+    {
+      "text": ".Ls97_witness_bb3:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  retq",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "main:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  pushq %rax",
+      "source": {
+        "file": null,
+        "line": 4
+      },
+      "labels": []
+    },
+    {
+      "text": "  leaq .L.str.1(%rip), %rdi",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": [
+        {
+          "name": ".L.str.1",
+          "range": {
+            "startCol": 8,
+            "endCol": 16
+          }
+        }
+      ]
+    },
+    {
+      "text": "  callq puts@PLT",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $-3, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  callq padding_witness@PLT",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness@PLT",
+          "range": {
+            "startCol": 9,
+            "endCol": 28
+          },
+          "target": "padding_witness"
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $10, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ecx, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": []
+    },
+    {
+      "text": "  je .LBB0_1",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": [
+        {
+          "name": ".LBB0_1",
+          "range": {
+            "startCol": 6,
+            "endCol": 13
+          }
+        }
+      ]
+    },
+    {
+      "text": ".LBB0_7:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  popq %rcx",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  retq",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": ".LBB0_1:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movl $-2, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  callq padding_witness@PLT",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness@PLT",
+          "range": {
+            "startCol": 9,
+            "endCol": 28
+          },
+          "target": "padding_witness"
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $11, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ecx, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .LBB0_7",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": [
+        {
+          "name": ".LBB0_7",
+          "range": {
+            "startCol": 7,
+            "endCol": 14
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movl $-1, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  callq padding_witness@PLT",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness@PLT",
+          "range": {
+            "startCol": 9,
+            "endCol": 28
+          },
+          "target": "padding_witness"
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $12, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ecx, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .LBB0_7",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": [
+        {
+          "name": ".LBB0_7",
+          "range": {
+            "startCol": 7,
+            "endCol": 14
+          }
+        }
+      ]
+    },
+    {
+      "text": "  xorl %edi, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  callq padding_witness@PLT",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness@PLT",
+          "range": {
+            "startCol": 9,
+            "endCol": 28
+          },
+          "target": "padding_witness"
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $13, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  cmpl $1, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .LBB0_7",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": [
+        {
+          "name": ".LBB0_7",
+          "range": {
+            "startCol": 7,
+            "endCol": 14
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movl $1, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  callq padding_witness@PLT",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness@PLT",
+          "range": {
+            "startCol": 9,
+            "endCol": 28
+          },
+          "target": "padding_witness"
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $14, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ecx, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .LBB0_7",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": [
+        {
+          "name": ".LBB0_7",
+          "range": {
+            "startCol": 7,
+            "endCol": 14
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movl $2, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  callq padding_witness@PLT",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness@PLT",
+          "range": {
+            "startCol": 9,
+            "endCol": 28
+          },
+          "target": "padding_witness"
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $15, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ecx, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .LBB0_7",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": [
+        {
+          "name": ".LBB0_7",
+          "range": {
+            "startCol": 7,
+            "endCol": 14
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movl $3, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  callq padding_witness@PLT",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness@PLT",
+          "range": {
+            "startCol": 9,
+            "endCol": 28
+          },
+          "target": "padding_witness"
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ecx, %ecx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  setne %al",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  shll $4, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 36
+      },
+      "labels": []
+    },
+    {
+      "text": "  popq %rcx",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  retq",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".L.str.1:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .asciz \"Clang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)\"",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "",
+      "source": null,
+      "labels": []
+    }
+  ],
+  "optOutput": [],
+  "labelDefinitions": {
+    "padding_witness": 1,
+    ".Ls97_witness_bb2": 7,
+    ".Ls97_witness_bb3": 11,
+    "main": 14,
+    ".LBB0_7": 24,
+    ".LBB0_1": 27,
+    ".L.str.1": 68
+  },
+  "parsingTime": 6,
+  "filteredCount": 550,
+  "popularArguments": {},
+  "execResult": {
+    "code": 0,
+    "okToCache": true,
+    "timedOut": false,
+    "stdout": [
+      {
+        "text": "Clang 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)"
+      }
+    ],
+    "stderr": [],
+    "truncated": false,
+    "execTime": 23,
+    "processExecutionResultTime": 0.02447099999699276,
+    "didExecute": true,
+    "buildResult": {
+      "inputFilename": "example.c",
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 94,
+      "processExecutionResultTime": 0.005430999997770414,
+      "instructionSet": "amd64",
+      "downloads": [],
+      "executableFilename": "/nosym/tmp/compiler-explorer-compilerEA2WCh/output.s",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+        "-fcolor-diagnostics",
+        "-fno-crash-diagnostics",
+        "-O2",
+        "-Werror",
+        "/app/example.c",
+        "-L./lib",
+        "-Wl,-rpath,./lib",
+        "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib64",
+        "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib32"
+      ],
+      "preparedLdPaths": [
+        "/opt/compiler-explorer/clang-23.1.0/lib",
+        "/opt/compiler-explorer/clang-23.1.0/lib32",
+        "/opt/compiler-explorer/clang-23.1.0/lib64"
+      ],
+      "defaultExecOptions": {
+        "timeoutMs": 20000,
+        "maxErrorOutput": 5000,
+        "env": {
+          "LD_LIBRARY_PATH": "",
+          "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+          "HOME": "/home/ce"
+        }
+      },
+      "packageStoreTime": 30
+    }
+  },
+  "queueTime": 6,
+  "lcccOracleOptions": {
+    "requested": "-O2 -Werror",
+    "effective": "-O2 -Werror"
+  }
+}

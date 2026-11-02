@@ -1,0 +1,155 @@
+{
+  "feature_profile_complete": true,
+  "runs": [
+    {
+      "workload": "sieve",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "sieve",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "binary_trees",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "binary_trees",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "spectral_norm",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "spectral_norm",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "mandelbrot",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "mandelbrot",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "strlen_bench",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "strlen_bench",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "switch_dispatch",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "switch_dispatch",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "byte_load_reassembly",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "byte_load_reassembly",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "zlib_ng_adler32_combine",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "zlib_ng_adler32_combine",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "expat_xml_scan",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "expat_xml_scan",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "expat_siphash24",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "expat_siphash24",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "sqlite_varint",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "sqlite_varint",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "linux_find_bit",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "linux_find_bit",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "linux_find_bit_scaled",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "linux_find_bit_scaled",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "sha256_transform",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "sha256_transform",
+      "compiler_group": "classic",
+      "exit": 0
+    },
+    {
+      "workload": "lz4_match_extend",
+      "compiler_group": "modern",
+      "exit": 0
+    },
+    {
+      "workload": "lz4_match_extend",
+      "compiler_group": "classic",
+      "exit": 0
+    }
+  ]
+}

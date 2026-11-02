@@ -1,0 +1,22 @@
+{
+  "before-with-tests.rs": {
+    "sha256": "2b42bed71ba5174c563500164eb46270bacf7e38ae5565d718d3a53e7799e336",
+    "bytes": 81761
+  },
+  "after-with-tests.rs": {
+    "sha256": "61d72071b3a67ef9343f505023569262c9f6c01c7aefe842df577c98eeaba9ba",
+    "bytes": 81326
+  },
+  "utils.rs": {
+    "sha256": "e241eaa143a5958ed8561224f90dbd639bf8676131d331815b2c144ecae7bf52",
+    "bytes": 4544
+  },
+  "before-tests.log": {
+    "sha256": "0aa8582036fdc5614f7f6afdc7130650eb3da7d71c171a59450379bc3a2f0f87",
+    "bytes": 1511
+  },
+  "after-tests.log": {
+    "sha256": "55c27197998925a0189f7a26a3a0cdd213309f08cdefe6b3fe78b1bf45683a17",
+    "bytes": 506
+  }
+}

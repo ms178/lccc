@@ -1,0 +1,557 @@
+//! 32-bit ELF relocatable object file writer for i686.
+//!
+//! Thin wrapper around `ElfWriterCore` that provides i686-specific
+//! instruction encoding and relocation types. Uses ELFCLASS32, EM_386,
+//! and REL (not RELA) relocation format. All shared logic lives in
+//! `backend::elf_writer_common`.
+
+use super::encoder::*;
+use crate::backend::elf::{ELFCLASS32, EM_386};
+use crate::backend::elf_writer_common::{
+    ElfWriterCore, EncodeResult, EncoderReloc, JumpDetection, X86Arch,
+};
+use crate::backend::x86::assembler::encoder::{
+    InstructionEncoder as X86_64Encoder, R_X86_64_32, R_X86_64_32S, R_X86_64_64, R_X86_64_PC32,
+    R_X86_64_PLT32,
+};
+use crate::backend::x86::assembler::parser::*;
+
+/// i686 architecture implementation for the shared ELF writer.
+pub struct I686Arch;
+
+impl X86Arch for I686Arch {
+    fn encode_instruction(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        let mut encoder = InstructionEncoder::new();
+        encoder.offset = section_data_len;
+        encoder.encode(instr)?;
+
+        let instr_len = encoder.bytes.len();
+
+        // Detect jump instructions for relaxation
+        let jump = {
+            // `.s`-tolerant matching (see the x86-64 writer): `jmp.s`
+            // relaxes exactly like `jmp`.
+            let mnem: &str = instr.mnemonic.strip_suffix(".s").unwrap_or(&instr.mnemonic);
+            let is_jump =
+                mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
+            if is_jump && instr.operands.len() == 1 {
+                if let Operand::Label(_) = &instr.operands[0] {
+                    let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
+                    let is_conditional = mnem != "jmp";
+                    // A leading 0x67 (the `addr16` word splice or a 16-bit
+                    // counter spelling) puts the displacement at +2 instead
+                    // of +1; the short-only form is still exactly 3 bytes.
+                    let has_67_head = instr_len == 3 && encoder.bytes[0] == 0x67;
+                    if is_short_only && (instr_len == 2 || (instr_len == 3 && has_67_head)) {
+                        // Short-only jumps have no long form; register as already relaxed
+                        Some(JumpDetection {
+                            is_conditional: true,
+                            already_short: true,
+                            prefix66: false,
+                        })
+                    } else {
+                        let expected_len = if is_conditional { 6 } else { 5 };
+                        if instr_len == expected_len {
+                            Some(JumpDetection {
+                                is_conditional,
+                                already_short: false,
+                                prefix66: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let relocations = encoder
+            .relocations
+            .into_iter()
+            .map(|r| EncoderReloc {
+                offset: r.offset,
+                symbol: r.symbol,
+                reloc_type: r.reloc_type,
+                addend: r.addend,
+                diff_symbol: r.diff_symbol,
+            })
+            .collect();
+
+        Ok(EncodeResult {
+            bytes: encoder.bytes,
+            relocations,
+            jump,
+        })
+    }
+
+    fn elf_machine() -> u16 {
+        EM_386
+    }
+    fn elf_class() -> u8 {
+        ELFCLASS32
+    }
+
+    fn reloc_abs(size: usize) -> u32 {
+        // `.word sym` must carry R_386_16, not R_386_32: a 32-bit patch of a
+        // 2-byte slot would overwrite the neighboring field, and the kernel's
+        // relocs tool special-cases R_386_16 against 16-bit segment symbols
+        // (`.word (to), real_mode_seg` in realmode.h LJMPW_RM) while rejecting
+        // R_386_32 against them as "Invalid absolute relocation".
+        match size {
+            1 => R_386_8,
+            2 => R_386_16,
+            _ => R_386_32,
+        }
+    }
+    fn reloc_abs64() -> u32 {
+        R_386_32
+    } // i686 doesn't have 64-bit relocs
+    fn reloc_pc32() -> u32 {
+        R_386_PC32
+    }
+    fn reloc_pc16() -> Option<u32> {
+        Some(R_386_PC16)
+    }
+    fn reloc_pc8() -> Option<u32> {
+        Some(23)
+    } // R_386_PC8
+    fn reloc_patch_size(reloc_type: u32) -> u8 {
+        match reloc_type {
+            // R_386_8 / R_386_PC8: 1-byte fields. A 4-byte addend patch of a
+            // 1-byte slot clobbers the three bytes after it — the kernel's
+            // arch/x86/boot/header.S lost the 'H' of its "HdrS" signature
+            // exactly this way (`.byte start_of_setup-1f` precedes the
+            // `.ascii "HdrS"`), and QEMU refused the bzImage as "too old".
+            22 | 23 => 1,
+            // R_386_16 / R_386_PC16: 2-byte fields (real-mode disp16/rel16).
+            20 | 21 => 2,
+            // R_386_TLS_DESC_CALL marks `call *x@tlscall(%eax)` (`ff 10`)
+            // and owns no field: a 4-byte addend patch at the instruction's
+            // first byte would cover the call and the next instruction.
+            R_386_TLS_DESC_CALL => 0,
+            _ => 4,
+        }
+    }
+    fn reloc_plt32() -> u32 {
+        R_386_PLT32
+    }
+
+    fn uses_rel_format() -> bool {
+        true
+    }
+    fn is_tls_reloc(reloc_type: u32) -> bool {
+        // i386 TLS relocation types (binutils 2.47 `include/elf/i386.h`,
+        // EM_386 — the complete set, verified entry by entry).  Every one
+        // resolves through the STT_TLS symbol (or a per-symbol TLS
+        // descriptor), so local-label folding must never apply to any of
+        // them:
+        //   14 TPOFF, 15 IE, 16 GOTIE, 17 LE, 18 GD, 19 LDM,
+        //   24 GD_32, 25 GD_PUSH, 26 GD_CALL, 27 GD_POP,
+        //   28 LDM_32, 29 LDM_PUSH, 30 LDM_CALL, 31 LDM_POP,
+        //   32 LDO_32, 33 IE_32, 34 LE_32,
+        //   35 DTPMOD32, 36 DTPOFF32, 37 TPOFF32,
+        //   39 GOTDESC, 40 DESC_CALL, 41 DESC
+        // (20-23 are R_386_{16,PC16,8,PC8} and 38 is R_386_SIZE32 —
+        // NOT TLS types.)
+        matches!(reloc_type, 14..=19 | 24..=37 | 39..=41)
+    }
+    fn is_got_slot_reloc(reloc_type: u32) -> bool {
+        // i386 GOT-slot operator classes: @GOT (R_386_GOT32 = 3) and its
+        // relaxable spelling @GOT in a `mov`-load (R_386_GOT32X = 43).  The
+        // GOT-base class @GOTOFF/@GOTPC is NOT in this set: their addend
+        // participates in the same `S + A` arithmetic the section symbol
+        // reproduces, so GAS folds them (`leal .bss@GOTOFF(%ebx)` carries a
+        // section symbol; measured) and so does this writer.
+        matches!(reloc_type, R_386_GOT32 | R_386_GOT32X)
+    }
+
+    fn is_got_pc_reloc(reloc_type: u32) -> bool {
+        reloc_type == R_386_GOTPC
+    }
+
+    fn needs_got_base_symbol(reloc_type: u32) -> bool {
+        // i386 operator classes that make GAS 2.47 record
+        // `_GLOBAL_OFFSET_TABLE_` (GLOBAL UND NOTYPE) in the symbol table
+        // (measured one @operator per object, `readelf -s`): @GOT
+        // (GOT32 = 3 and GOT32X = 43), @GOTOFF (9), @GOTPC (10), and —
+        // unlike x86-64, where only the GOT-based TLS forms qualify —
+        // EVERY @TLS* operator including the LE ones (@NTPOFF → 17,
+        // @TPOFF → 34, @DTPOFF → 32 all probe GOTSYM on i386).  The set
+        // is therefore the GOT trio plus the whole TLS family except the
+        // `.reloc`-only marker pair (40 DESC_CALL / 41 DESC).  20-23 are
+        // R_386_{16,PC16,8,PC8} field types and 38 is SIZE32 — not in the
+        // class.  Constants not yet named in encoder/mod.rs are spelled
+        // numerically with their ABI names so the classifier stays
+        // type-complete ahead of any emitter that grows.
+        matches!(
+            reloc_type,
+            R_386_GOT32
+                | R_386_GOTOFF
+                | R_386_GOTPC
+                | 14..=19  // TPOFF, IE, GOTIE, LE, GD, LDM
+                | 24..=37  // GD_32..GD_CALL, LDM_32..LDM_POP, LDO_32, IE_32, LE_32, DTPMOD32, DTPOFF32, TPOFF32
+                | 39       // TLS_GOTDESC
+                | R_386_GOT32X
+        )
+    }
+    fn supports_deferred_skips() -> bool {
+        true
+    }
+
+    fn default_code_mode() -> u8 {
+        32
+    }
+
+    /// Encode an instruction using the x86-64 encoder for .code64 sections.
+    /// This is needed for kernel realmode trampoline code (trampoline_64.S)
+    /// which is compiled with -m16 but has .code64 sections containing
+    /// 64-bit instructions like jmpq, lidt with RIP-relative addressing, etc.
+    /// `.code16`: real-mode encoding.
+    ///
+    /// Sets the encoder's 16-bit flag, which switches the ModR/M table to the
+    /// 16-bit form (no SIB, disp16) and inverts the 0x66/0x67 override logic,
+    /// since the default operand and address size in real mode is 16 bits.
+    /// The kernel's arch/x86/boot/header.S depends on this exact behaviour.
+    fn encode_instruction_code16(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        code16_encode_inner(instr, section_data_len, false)
+    }
+
+    fn encode_instruction_code16_gcc(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        code16_encode_inner(instr, section_data_len, true)
+    }
+
+    fn encode_instruction_code64(
+        instr: &Instruction,
+        _section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        let mut encoder = X86_64Encoder::new();
+        // Set offset to 0 so relocation offsets are relative to instruction start.
+        // The ElfWriterCore will add base_offset when recording the relocations.
+        encoder.offset = 0;
+        encoder.encode(instr)?;
+
+        let instr_len = encoder.bytes.len();
+
+        // Detect jump instructions for relaxation (same logic as x86-64)
+        let jump = {
+            // `.s`-tolerant, case-insensitive matching: this path encodes
+            // with the x86-64 encoder, so `JMP`/`jmp.s` must relax like `jmp`.
+            let mnem_lower = instr.mnemonic.to_ascii_lowercase();
+            let mnem: &str = mnem_lower.strip_suffix(".s").unwrap_or(&mnem_lower);
+            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
+            if is_jump && instr.operands.len() == 1 {
+                if let Operand::Label(_) = &instr.operands[0] {
+                    let is_conditional = mnem != "jmp";
+                    let expected_len = if is_conditional { 6 } else { 5 };
+                    if instr_len == expected_len {
+                        Some(JumpDetection {
+                            is_conditional,
+                            already_short: false,
+                            prefix66: false,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        // Convert x86-64 relocations. Since we're in a .code64 section of an
+        // i686 object, we need to keep i686 relocation types (R_386_*) because
+        // the object file is still ELF32. The linker (ld -m elf_i386) expects
+        // R_386_* relocations.
+        // The x86-64 encoder marks every branch PLT32 and strips `@PLT`; in
+        // an ELF32 object only an explicit `sym@PLT` means R_386_PLT32
+        // (GAS 2.47 `--32`, `.code64`: `call ext` -> R_386_PC32,
+        // `call ext@PLT` -> R_386_PLT32).
+        // Case-insensitive like GAS's suffix matching (`call foo@plt`
+        // promotes exactly like `foo@PLT`).
+        let explicit_plt = matches!(instr.operands.as_slice(), [Operand::Label(label)]
+            if label.len() >= 4 && label[label.len() - 4..].eq_ignore_ascii_case("@plt"));
+        let relocations = encoder
+            .relocations
+            .into_iter()
+            .map(|r| {
+                // Map x86-64 reloc types to i686 equivalents
+                let reloc_type = match r.reloc_type {
+                    R_X86_64_PLT32 if explicit_plt => R_386_PLT32,
+                    R_X86_64_PC32 | R_X86_64_PLT32 => R_386_PC32,
+                    R_X86_64_64 | R_X86_64_32 | R_X86_64_32S => R_386_32,
+                    other => other,
+                };
+                EncoderReloc {
+                    offset: r.offset,
+                    symbol: r.symbol,
+                    reloc_type,
+                    addend: r.addend,
+                    diff_symbol: None,
+                }
+            })
+            .collect();
+
+        Ok(EncodeResult {
+            bytes: encoder.bytes,
+            relocations,
+            jump,
+        })
+    }
+}
+
+/// Builds a 32-bit ELF relocatable object file from parsed assembly items.
+pub type ElfWriter = ElfWriterCore<I686Arch>;
+
+fn code16_encode_inner(
+    instr: &Instruction,
+    section_data_len: u64,
+    gcc_mode: bool,
+) -> Result<EncodeResult, String> {
+    let mut encoder = InstructionEncoder::new();
+    encoder.offset = section_data_len;
+    encoder.code16 = true;
+    encoder.code16gcc = gcc_mode;
+    encoder.encode(instr)?;
+
+    let instr_len = encoder.bytes.len();
+    let jump = {
+        let mnem = &instr.mnemonic;
+        let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
+        if is_jump && instr.operands.len() == 1 {
+            if let Operand::Label(_) = &instr.operands[0] {
+                let is_conditional = mnem != "jmp";
+                // In 16-bit mode a near jump carries a 16-bit
+                // displacement, so the long forms are one byte shorter
+                // than in 32-bit mode.
+                let expected_len = if is_conditional { 4 } else { 3 };
+                if instr_len == expected_len {
+                    Some(JumpDetection {
+                        is_conditional,
+                        already_short: false,
+                        prefix66: false,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let relocations = encoder
+        .relocations
+        .into_iter()
+        .map(|r| EncoderReloc {
+            offset: r.offset,
+            symbol: r.symbol,
+            reloc_type: r.reloc_type,
+            addend: r.addend,
+            diff_symbol: None,
+        })
+        .collect();
+
+    Ok(EncodeResult {
+        bytes: encoder.bytes,
+        relocations,
+        jump,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::assemble;
+
+    /// R_386_PC8 owns a 1-byte field: the REL-format addend patch must write
+    /// exactly one byte, or the bytes after the field get clobbered. Linux
+    /// arch/x86/boot/header.S puts `.byte start_of_setup-1f` immediately
+    /// before `.ascii "HdrS"`; the old 4-byte patch turned "HdrS" into
+    /// "GdrS" and QEMU refused the bzImage ("kernel too old").
+    #[test]
+    fn rel_pc8_addend_patch_writes_one_byte() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_pc8_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("hdr.o");
+        let asm = concat!(
+            ".code16\n",
+            ".section \".header\", \"a\"\n",
+            "hdr:\n",
+            "\t.byte 0xeb\n",
+            "\t.byte start_of_setup-1f\n",
+            "1:\n",
+            "\t.ascii \"HdrS\"\n",
+            "\t.word 0x020f\n",
+            ".section \".entrytext\", \"ax\"\n",
+            "start_of_setup:\n",
+            "\t.byte 0x90\n",
+        );
+        assemble(asm, out.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        // The 1-byte addend (-1 = 0xff) must sit in the field, with the
+        // string "HdrS" intact immediately after it.
+        assert!(
+            data.windows(6).any(|w| w == b"\xeb\xffHdrS"),
+            "PC8 addend patch clobbered bytes after the field"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Contents of section `name` in an ELF32 object (test-only walk).
+    fn section32(obj: &[u8], name: &str) -> Option<Vec<u8>> {
+        let rd32 = |o: usize| u32::from_le_bytes(obj[o..o + 4].try_into().unwrap()) as usize;
+        let rd16 = |o: usize| u16::from_le_bytes(obj[o..o + 2].try_into().unwrap()) as usize;
+        let (shoff, shentsize, shnum, shstrndx) = (rd32(32), rd16(46), rd16(48), rd16(50));
+        let hdr = |i: usize| shoff + i * shentsize;
+        let strtab = rd32(hdr(shstrndx) + 16);
+        (0..shnum).find_map(|i| {
+            let h = hdr(i);
+            let start = strtab + rd32(h);
+            let end = start + obj[start..].iter().position(|&b| b == 0)?;
+            (&obj[start..end] == name.as_bytes())
+                .then(|| obj[rd32(h + 16)..rd32(h + 16) + rd32(h + 20)].to_vec())
+        })
+    }
+
+    /// i386 psABI branch relocations, as GNU as 2.47 writes them: a bare
+    /// target is R_386_PC32, only `sym@PLT` is R_386_PLT32 (an i386 PIC PLT
+    /// entry needs %ebx = GOT, so the assembler must never invent one), a
+    /// `@PLT` against a local folded into its section is PC32, and
+    /// `.code64` code keeps an explicit `@PLT`.
+    #[test]
+    fn branch_relocations_follow_i386_psabi() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_plt_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("b.o");
+        let asm = concat!(
+            ".text\n",
+            "call ext\njmp ext\njne ext\ncall ext@PLT\ncall lcold@PLT\n",
+            ".code64\ncall ext\ncall ext@PLT\n.code32\n",
+            ".section .text.unlikely,\"ax\",@progbits\nlcold: ret\n",
+        );
+        assemble(asm, out.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        let mut rel: Vec<(u32, u8)> = section32(&data, ".rel.text")
+            .expect(".rel.text present")
+            .chunks_exact(8)
+            .map(|e| {
+                let off = u32::from_le_bytes(e[0..4].try_into().unwrap());
+                (off, e[4])
+            })
+            .collect();
+        rel.sort();
+        // R_386_PC32 = 2, R_386_PLT32 = 4.
+        assert_eq!(
+            rel,
+            [(1, 2), (6, 2), (12, 2), (17, 4), (22, 2), (27, 2), (32, 4)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 32-bit code in an ELF32 object pads with GNU as's `lea` NOPs, never
+    /// NOPL (absent on i686-class Geode LX / VIA C3), and a gap re-padded
+    /// after relaxation keeps the table of the mode its directive was in
+    /// (the trailing `.code16` must not leak into it). A gap that follows
+    /// data rather than an instruction starts with a lone `nop`, as in GAS
+    /// (bytes checked against GNU as 2.47 `--32`).
+    #[test]
+    fn padding_uses_lea_nops_of_the_directive_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_nop_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("n.o");
+        let text_of = |filler: &str| {
+            let asm = format!(".text\nf:\njmp .Lt\n{filler}.p2align 4\n.Lt:\nret\n.code16\nnop\n");
+            assemble(&asm, out.to_str().unwrap()).unwrap();
+            let data = std::fs::read(&out).unwrap();
+            section32(&data, ".text").expect(".text present")
+        };
+        // jmp relaxes to 2 bytes: 2 + 11 = 13, so a 3-byte gap before .Lt.
+        let after_insn = text_of(&"nop\n".repeat(11));
+        assert_eq!(after_insn[..2], [0xeb, 0x0e]);
+        assert_eq!(after_insn[13..17], [0x8d, 0x76, 0x00, 0xc3]);
+        let after_data = text_of(".byte 0,0,0,0,0,0,0,0,0,0,0\n");
+        assert_eq!(after_data[..2], [0xeb, 0x0e]);
+        assert_eq!(after_data[13..17], [0x90, 0x66, 0x90, 0xc3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R_386_PC16 keeps working through the same patch path (2-byte slot).
+    #[test]
+    fn rel_pc16_addend_patch_writes_two_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_pc16_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("j.o");
+        let asm = concat!(
+            ".code16\n",
+            ".section \".text\", \"ax\"\n",
+            "\t.word ext_sym\n",
+            "\t.byte 0xaa\n",
+            ".section \".data\"\n",
+            "ext_sym:\n",
+            "\t.byte 0xbb\n",
+        );
+        assemble(asm, out.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        // `.word ext_sym` is an R_386_16 with addend 0: the 2-byte patch must
+        // write 00 00 into the field and leave the 0xaa marker byte intact.
+        assert!(
+            data.windows(3).any(|w| w == b"\x00\x00\xaa"),
+            "R_386_16 addend patch clobbered bytes after the field"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complete i386 TLS reloc set (binutils 2.47 `include/elf/i386.h`,
+    /// verified entry by entry): 14..=19, 24..=37, 39..=41.  Same hazard
+    /// as on x86-64 — a folded TLS reloc resolves through the section
+    /// instead of the thread pointer — and the same need to keep the gaps
+    /// foldable (20-23 are R_386_{16,PC16,8,PC8}, 38 is R_386_SIZE32).
+    #[test]
+    fn tls_reloc_classification_matches_elf_i386() {
+        use super::I686Arch;
+        use crate::backend::elf_writer_common::X86Arch;
+        let is_tls =
+            |t: u32| (14..=19).contains(&t) || (24..=37).contains(&t) || (39..=41).contains(&t);
+        for t in 0..=41 {
+            assert_eq!(
+                I686Arch::is_tls_reloc(t),
+                is_tls(t),
+                "reloc {t} misclassified"
+            );
+        }
+        assert!(!I686Arch::is_tls_reloc(42));
+        assert!(!I686Arch::is_tls_reloc(u32::MAX));
+    }
+}

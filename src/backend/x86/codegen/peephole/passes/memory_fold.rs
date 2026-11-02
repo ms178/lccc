@@ -1,0 +1,5543 @@
+//! Memory operand folding pass.
+//!
+//! Folds a stack load followed by an ALU instruction that uses the loaded register
+//! as a source operand into a single instruction with a memory source operand.
+//!
+//! Pattern:
+//!   movq  -N(%rbp), %rcx       ; LoadRbp { reg: 1(rcx), offset: -N, size: Q }
+//!   addq  %rcx, %rax           ; Other: rax = rax + rcx
+//!
+//! Transformed to:
+//!   addq  -N(%rbp), %rax       ; rax = rax + mem[rbp-N]
+//!
+//! Supported ALU ops: add, sub, and, or, xor, cmp, test (with q/l suffixes).
+//! The loaded register must be used as the first (source) operand in AT&T syntax.
+//! We only fold when the loaded register is one of the scratch registers (rax=0,
+//! rcx=1, rdx=2) to avoid breaking live register values.
+
+use super::super::types::*;
+use super::dead_writes::LabelRefs;
+use super::fma_forms::{FmaWidth, parse_scalar_fma};
+use super::fp_liveness::FpLiveness;
+use super::helpers::{
+    implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, src_mentions_family,
+    writes_family,
+};
+use super::liveness::{FileLiveness, call_window_verdict};
+use super::relay_and_lea::{LazyDeadness, split_two_operands};
+
+/// True when a line transfers control or merges paths, so that textual line
+/// order can diverge from execution order.  A load-value reader textually
+/// AFTER a "killing" pure overwrite may still be reached from the load
+/// without ever executing the overwrite when a branch lies in between; the
+/// overwrite only dominates the code that follows it on the same straight-
+/// line fall-through.  Calls are deliberately NOT listed here, but they
+/// are not free passage either: a Call is an OPAQUE READER of %xmm0-%xmm7
+/// (the SysV FP argument registers — when the loaded value is passed to
+/// the call, the caller reads it implicitly, and the self-move-elided
+/// argument staging leaves no textual trace).  Every fold that deletes a
+/// load whose register can be read that way therefore carries its own
+/// call veto for %xmm0-%xmm7.  A call cannot read %xmm8-%xmm15 (they are
+/// callee-saved and never argument registers, and compiled code never
+/// reads a callee-saved register before defining it), so those are
+/// genuinely safe to scan across.
+fn is_cf_transfer(kind: LineKind) -> bool {
+    matches!(
+        kind,
+        LineKind::Label | LineKind::CondJmp | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
+    )
+}
+
+/// Format a stack slot as an assembly memory operand string.
+/// Uses (%rbp) or (%rsp) depending on the original instruction text.
+fn format_stack_offset(offset: i32, original_line: &str) -> String {
+    if original_line.contains("(%rsp)") {
+        format!("{}(%rsp)", offset)
+    } else {
+        format!("{}(%rbp)", offset)
+    }
+}
+
+/// Try to parse an ALU instruction of the form "OPsuffix %src, %dst"
+/// where OP is add/sub/and/or/xor/cmp/test.
+/// Returns (op_name_with_suffix, dst_reg_str, src_family, dst_family).
+fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
+    let b = trimmed.as_bytes();
+    if b.len() < 6 {
+        return None;
+    }
+
+    let op_len = if b.starts_with(b"add")
+        || b.starts_with(b"sub")
+        || b.starts_with(b"and")
+        || b.starts_with(b"xor")
+        || b.starts_with(b"cmp")
+    {
+        3
+    } else if b.starts_with(b"test") || b.starts_with(b"imul") {
+        4
+    } else if b.starts_with(b"or")
+        && b.len() > 2
+        && (b[2] == b'q' || b[2] == b'l' || b[2] == b'w' || b[2] == b'b')
+    {
+        2
+    } else {
+        return None;
+    };
+
+    let suffix = b[op_len];
+    if suffix != b'q' && suffix != b'l' && suffix != b'w' && suffix != b'b' {
+        return None;
+    }
+    let op_with_suffix = &trimmed[..op_len + 1];
+
+    let rest = trimmed[op_len + 1..].trim();
+    let (src_str, dst_str) = rest.split_once(',')?;
+    let src_str = src_str.trim();
+    let dst_str = dst_str.trim();
+
+    if !src_str.starts_with('%') || !dst_str.starts_with('%') {
+        return None;
+    }
+
+    let src_fam = register_family_fast(src_str);
+    let dst_fam = register_family_fast(dst_str);
+    if src_fam == REG_NONE || dst_fam == REG_NONE {
+        return None;
+    }
+
+    Some((op_with_suffix, dst_str, src_fam, dst_fam))
+}
+
+/// Fold movsd stack load into subsequent scalar FP binary op as memory operand.
+///
+/// Pattern (produced after eliminate_fp_xmm_roundtrips):
+///   movsd -M(%rbp), %xmm1   ; LoadXmmRbp{offset: -M} (historically Other{dest_reg: 25})
+///   OP %xmm1, %xmm0          ; OP ∈ {mulsd, addsd, subsd, divsd}
+///
+/// Transformed to:
+///   OP -M(%rbp), %xmm0
+///
+/// This reduces 4 instructions per FP binop (after roundtrip elimination) to 3.
+pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Candidate: an XMM slot LOAD (`movsd -M(%rbp), %xmmN`). The line
+        // classifier routes these to LoadXmmRbp (with `rbp_offset` cached by
+        // xmm_slot_line_info); when this pass was written they were classified
+        // as `Other{dest_reg: 25}` and the stale pre-filter silently disabled
+        // the whole fold (caught by test_fp_memory_fold_mulsd after the
+        // classifier gained the dedicated XMM slot kinds). The dest-register
+        // check stays textual below: LoadXmmRbp records offset/size, not the
+        // register, and the pass folds only the exact `%xmm1` dest form.
+        if let LineKind::LoadXmmRbp { .. } = infos[i].kind {
+            let offset = infos[i].rbp_offset;
+            if offset == RBP_OFFSET_NONE {
+                i += 1;
+                continue;
+            }
+
+            let line_i = infos[i].trimmed(store.get(i));
+            // Verify it is a movsd load from stack (not another xmm1-writing insn)
+            if !line_i.starts_with("movsd ") || !line_i.ends_with(", %xmm1") {
+                i += 1;
+                continue;
+            }
+
+            // Find next non-NOP (skip only NOPs, not other instructions)
+            let mut j = i + 1;
+            while j < len && j < i + 4 && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+
+            let line_j = infos[j].trimmed(store.get(j));
+            let mem_op = format_stack_offset(offset, line_i);
+            let replacement = match line_j {
+                "mulsd %xmm1, %xmm0" => Some(format!("    mulsd {}, %xmm0", mem_op)),
+                "addsd %xmm1, %xmm0" => Some(format!("    addsd {}, %xmm0", mem_op)),
+                "subsd %xmm1, %xmm0" => Some(format!("    subsd {}, %xmm0", mem_op)),
+                "divsd %xmm1, %xmm0" => Some(format!("    divsd {}, %xmm0", mem_op)),
+                _ => None,
+            };
+            if let Some(new_text) = replacement {
+                mark_nop(&mut infos[i]);
+                replace_line(store, &mut infos[j], j, new_text);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+    changed
+}
+
+/// Fold a single-use scalar-FP register load into an adjacent scalar-FP
+/// arithmetic instruction (VEX 3-operand and legacy 2-operand forms).
+///
+/// ```text
+/// movsd 8(%rsi), %xmm5
+/// vsubsd %xmm5, %xmm4, %xmm4
+///   ->
+/// vsubsd 8(%rsi), %xmm4, %xmm4
+///
+/// movsd -40(%rbp), %xmm1
+/// mulsd %xmm1, %xmm0
+///   ->
+/// mulsd -40(%rbp), %xmm0
+/// ```
+///
+/// This deliberately uses a stronger-than-necessary liveness proof: the loaded
+/// XMM register must not be READ again before the function's `.size` — the
+/// first later mention may also be a full overwrite of the register (see
+/// [`is_pure_xmm_overwrite`]), which kills the loaded value and unblocks the
+/// fold when the allocator reuses the register later.  That still misses
+/// registers read after an intervening redefinition, but keeps deleting the
+/// defining load safe without teaching the text peephole full XMM dataflow.
+/// The load and consumer must be adjacent, so no address register or memory
+/// state can change between them.  Source==destination is rejected because the
+/// removed load also supplies the destructive destination's old value.
+pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
+    let mut i = 0;
+    while i + 1 < len {
+        let j = next_non_debug(store, infos, i + 1, len);
+        if j == len {
+            break;
+        }
+        if infos[i].is_nop() || infos[i].pinned || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let load = infos[i].trimmed(store.get(i));
+        let Some((load_op, operands)) = load.split_once(' ') else {
+            i += 1;
+            continue;
+        };
+        if load_op != "movsd" && load_op != "movss" {
+            i += 1;
+            continue;
+        }
+        let Some((mem, src_reg)) = operands.rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
+        let mem = mem.trim();
+        let src_reg = src_reg.trim();
+        if !src_reg.starts_with("%xmm") || !mem.contains('(') || mem.starts_with('%') {
+            i += 1;
+            continue;
+        }
+
+        let consumer = infos[j].trimmed(store.get(j));
+        let Some((arith_op, arith_operands)) = consumer.split_once(' ') else {
+            i += 1;
+            continue;
+        };
+        let legal_op = match load_op {
+            "movsd" => matches!(
+                arith_op,
+                "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd" | "addsd" | "subsd" | "mulsd" | "divsd"
+            ),
+            "movss" => matches!(
+                arith_op,
+                "vaddss" | "vsubss" | "vmulss" | "vdivss" | "addss" | "subss" | "mulss" | "divss"
+            ),
+            _ => false,
+        };
+        if !legal_op {
+            i += 1;
+            continue;
+        }
+        let ops: Vec<&str> = arith_operands.split(',').map(str::trim).collect();
+        // VEX 3-operand form (dst == src2 required, and dst may not be the
+        // loaded register: the removed load also supplies the destructive
+        // destination's old value).  Legacy 2-operand form (mulsd/addsd/
+        // subsd/divsd and the *ss variants): src must be the loaded register
+        // and dst must differ from it for the same reason.
+        if arith_op.starts_with('v') {
+            if ops.len() != 3 || ops[0] != src_reg || ops[1] != ops[2] || ops[1] == src_reg {
+                i += 1;
+                continue;
+            }
+        } else if ops.len() != 2 || ops[0] != src_reg || ops[1] == src_reg {
+            i += 1;
+            continue;
+        }
+
+        // The loaded value must be dead after the consumer.  Proven by the
+        // CFG-aware XMM dataflow (`FpLiveness`): loop back-edges, calls
+        // (implicit readers of %xmm0-%xmm7, clobbers of everything) and
+        // merge-form redefinitions are all modelled.  The textual "first
+        // later mention is a full overwrite" proof this replaced was blind
+        // to back-edges — `lc.c`: the folded register was the loop-carried
+        // `prev`, read at the top of the NEXT iteration (miscompile).
+        // Without an analysable CFG the fallback is textual uniqueness of
+        // the register in the whole function (any-CFG-sound), never a
+        // forward scan.
+        let src_n = src_reg
+            .strip_prefix("%xmm")
+            .and_then(|d| d.parse::<u32>().ok())
+            .unwrap_or(u32::MAX);
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, j, src_n, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        // No other mention of the register between the load and the
+        // consumer besides the consumer itself (adjacent by construction).
+
+        let replacement = if arith_op.starts_with('v') {
+            format!("    {} {}, {}, {}", arith_op, mem, ops[1], ops[2])
+        } else {
+            format!("    {} {}, {}", arith_op, mem, ops[1])
+        };
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, replacement);
+        lv_ref.refresh_at(store, infos, i);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// Fold stack-load-to-scratch relay moves: eliminate the scratch register
+/// as intermediary when loading from a stack slot to another register.
+///
+/// Pattern:
+///   movq  -N(%rbp), %rax       ; LoadRbp { reg: 0(rax), offset: -N, size: Q }
+///   movq  %rax, %r12           ; Other: copy rax to callee-saved/arg register
+///
+/// Transformed to:
+///   movq  -N(%rbp), %r12       ; direct load to destination register
+///
+/// Safety: The scratch register (rax) must not be read between the load and
+/// the copy. We only fold loads to rax (reg 0) since codegen guarantees rax
+/// is a temporary. The destination register must be a different GP register.
+/// We verify rax is dead after (not read before being overwritten) to ensure
+/// we don't break code that uses rax after the copy.
+pub(super) fn fold_load_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: Find a load from stack to %rax (scratch register).
+        if let LineKind::LoadRbp {
+            reg: 0,
+            offset,
+            size,
+        } = infos[i].kind
+        {
+            // Only fold Q and L loads (not sign-extending SLQ, which changes value).
+            if size != MoveSize::Q && size != MoveSize::L {
+                i += 1;
+                continue;
+            }
+
+            // Step 2: Find next non-NOP instruction.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+
+            // Step 3: Check if it's "movq %rax, %DEST" or "movl %eax, %DESTd"
+            // where DEST is a different GP register.
+            let dest_reg = match infos[j].kind {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
+                    let line_j = infos[j].trimmed(store.get(j));
+                    // Must be a simple register-to-register mov
+                    let is_movq_rax = line_j.starts_with("movq %rax, %") && !line_j.contains('(');
+                    let is_movl_eax = line_j.starts_with("movl %eax, %") && !line_j.contains('(');
+                    if is_movq_rax || is_movl_eax {
+                        dest_reg
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+
+            // Step 4: Verify no intervening store to the same offset.
+            let mut intervening_store = false;
+            for k in (i + 1)..j {
+                if let LineKind::StoreRbp { offset: so, .. } = infos[k].kind {
+                    if so == offset {
+                        intervening_store = true;
+                        break;
+                    }
+                }
+            }
+            if intervening_store {
+                i += 1;
+                continue;
+            }
+
+            // Step 5: Check rax liveness after the copy.
+            if !is_rax_dead_after(store, infos, j + 1, len) {
+                i += 1;
+                continue;
+            }
+
+            // Step 6: Transform! Replace load target and eliminate the copy.
+            let load_line = infos[i].trimmed(store.get(i));
+            let mem_op = format_stack_offset(offset, load_line);
+            let dest_name = REG_NAMES[if size == MoveSize::L { 1 } else { 0 }][dest_reg as usize];
+            let mnemonic = size.mnemonic();
+            let new_load = format!("    {} {}, {}", mnemonic, mem_op, dest_name);
+
+            if !all_editable(infos, &[i, j]) {
+                i += 1;
+                continue;
+            }
+            replace_line(store, &mut infos[i], i, new_load);
+            mark_nop(&mut infos[j]);
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
+/// Fold load+leaq+store relay: eliminate accumulator relay for address computation.
+///
+/// Pattern:
+///   movq  -N(%rbp), %rax       ; load base pointer from stack
+///   leaq  K(%rax), %rax        ; compute base + offset
+///   movq  %rax, %r12           ; store result to dest register
+///
+/// Transformed to:
+///   movq  -N(%rbp), %r12       ; load directly to dest
+///   leaq  K(%r12), %r12        ; compute offset in-place
+///
+/// Saves 1 instruction per occurrence. Safe when %rax is dead after the copy.
+pub(super) fn fold_leaq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 2 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: Load from stack to %rax.
+        if let LineKind::LoadRbp {
+            reg: 0,
+            offset,
+            size: MoveSize::Q,
+        } = infos[i].kind
+        {
+            // Step 2: Next must be leaq K(%rax), %rax
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+
+            let leaq_offset = {
+                let lj = infos[j].trimmed(store.get(j));
+                if !lj.starts_with("leaq ") || !lj.ends_with(", %rax") {
+                    i += 1;
+                    continue;
+                }
+                let inner = &lj[5..lj.len() - 6]; // between "leaq " and ", %rax"
+                if !inner.ends_with("(%rax)") {
+                    i += 1;
+                    continue;
+                }
+                let num_str = &inner[..inner.len() - 6]; // before "(%rax)"
+                match num_str.parse::<i64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            };
+
+            // Step 3: Next must be movq %rax, %DEST
+            let mut k = j + 1;
+            while k < len && infos[k].is_nop() {
+                k += 1;
+            }
+            if k >= len {
+                i += 1;
+                continue;
+            }
+
+            let dest_reg = match infos[k].kind {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
+                    let lk = infos[k].trimmed(store.get(k));
+                    if lk.starts_with("movq %rax, %") && !lk.contains('(') {
+                        dest_reg
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+
+            // Step 4: Check rax is dead after k.
+            let rax_dead = is_rax_dead_after(store, infos, k + 1, len);
+            if !rax_dead {
+                i += 1;
+                continue;
+            }
+
+            // Step 5: Transform.
+            let load_line = infos[i].trimmed(store.get(i));
+            let mem_op = format_stack_offset(offset, load_line);
+            let dest_64 = REG_NAMES[0][dest_reg as usize];
+            let new_load = format!("    movq {}, {}", mem_op, dest_64);
+            let new_leaq = format!("    leaq {}({}), {}", leaq_offset, dest_64, dest_64);
+
+            if !all_editable(infos, &[i, j, k]) {
+                i += 1;
+                continue;
+            }
+            replace_line(store, &mut infos[i], i, new_load);
+            replace_line(store, &mut infos[j], j, new_leaq);
+            mark_nop(&mut infos[k]);
+            changed = true;
+            i = k + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Fold load+cltq+store relay: eliminate accumulator relay for sign-extend load.
+///
+/// Pattern:
+///   movq  -N(%rbp), %rax       ; load 64-bit value (only lower 32 used)
+///   cltq                       ; sign-extend %eax → %rax
+///   movq  %rax, %r12           ; store sign-extended result
+///
+/// Transformed to:
+///   movslq -N(%rbp), %r12      ; sign-extending load directly to dest
+///
+/// Saves 2 instructions per occurrence.
+pub(super) fn fold_cltq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 2 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: Load from stack to %rax (either movq or movl).
+        if let LineKind::LoadRbp {
+            reg: 0,
+            offset,
+            size,
+        } = infos[i].kind
+        {
+            if size != MoveSize::Q && size != MoveSize::L {
+                i += 1;
+                continue;
+            }
+
+            // Step 2: Next must be cltq.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+            {
+                let lj = infos[j].trimmed(store.get(j));
+                if lj != "cltq" {
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Step 3: Next must be movq %rax, %DEST.
+            let mut k = j + 1;
+            while k < len && infos[k].is_nop() {
+                k += 1;
+            }
+            if k >= len {
+                i += 1;
+                continue;
+            }
+
+            let dest_reg = match infos[k].kind {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
+                    let lk = infos[k].trimmed(store.get(k));
+                    if lk.starts_with("movq %rax, %") && !lk.contains('(') {
+                        dest_reg
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+
+            // Step 4: Check rax is dead after k.
+            let rax_dead = is_rax_dead_after(store, infos, k + 1, len);
+            if !rax_dead {
+                i += 1;
+                continue;
+            }
+
+            // Step 5: Transform! Replace all 3 instructions with one movslq.
+            let load_line = infos[i].trimmed(store.get(i));
+            let mem_op = format_stack_offset(offset, load_line);
+            let dest_64 = REG_NAMES[0][dest_reg as usize];
+            let new_inst = format!("    movslq {}, {}", mem_op, dest_64);
+
+            if !all_editable(infos, &[i, j, k]) {
+                i += 1;
+                continue;
+            }
+            replace_line(store, &mut infos[i], i, new_inst);
+            mark_nop(&mut infos[j]);
+            mark_nop(&mut infos[k]);
+            changed = true;
+            i = k + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Fold movzbq/movzwq/movsbq/movswq relay: eliminate rax as intermediary
+/// for zero/sign-extend-then-copy patterns.
+///
+/// Pattern:
+///   movzbq  %al, %rax          ; zero-extend byte result to 64-bit
+///   movq    %rax, %r12         ; copy to dest register
+///
+/// Transformed to:
+///   movzbl  %al, %r12d         ; zero-extend directly to dest (32-bit write, implicit 64-bit zext)
+///
+/// Also handles movzwq→movq, movsbq→movq, movswq→movq, and movslq→movq.
+/// Saves 1 instruction per occurrence.
+pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: Look for extension instructions writing to %rax from %al/%ax/%eax.
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+
+            // Parse the extension type and source sub-register.
+            let (new_op, src_sub_idx) = if line_i == "movzbq %al, %rax" {
+                // movzbq %al, %rax → movzbl %al, %DESTd
+                ("movzbl", 3usize) // 3 = B (byte) index in REG_NAMES
+            } else if line_i == "movzwq %ax, %rax" {
+                ("movzwl", 2) // W (word)
+            } else if line_i == "movsbq %al, %rax" {
+                ("movsbl", 3) // B
+            } else if line_i == "movswq %ax, %rax" {
+                ("movswl", 2) // W
+            } else {
+                i += 1;
+                continue;
+            };
+
+            // Step 2: Next must be movq %rax, %DEST.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+
+            let dest_reg = match infos[j].kind {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
+                    let lj = infos[j].trimmed(store.get(j));
+                    if lj.starts_with("movq %rax, %") && !lj.contains('(') {
+                        dest_reg
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+
+            // Step 3: Check rax is dead after.
+            if !is_rax_dead_after(store, infos, j + 1, len) {
+                i += 1;
+                continue;
+            }
+
+            // Step 4: Transform.
+            // Use the same sub-register for the source (al/ax from rax family=0).
+            let src_name = REG_NAMES[src_sub_idx][0]; // %al or %ax
+            // Unsigned extends may target the 32-bit destination because the
+            // architectural 32-bit write zero-extends to the full GPR.  Signed
+            // byte/word extends must target the 64-bit destination: `movsbl
+            // %al,%esi` would sign-extend only to 32 bits and then zero the
+            // upper half of %rsi, corrupting negative values that are live as
+            // I64/long (gcc.c-torture/execute/20030218-1.c: -256 became
+            // 4294967040 after `movswl %ax,%esi; movq %rsi,%rax`).
+            let dest = if matches!(new_op, "movsbl" | "movswl") {
+                REG_NAMES[0][dest_reg as usize]
+            } else {
+                REG_NAMES[1][dest_reg as usize]
+            };
+            let op = match new_op {
+                "movsbl" => "movsbq",
+                "movswl" => "movswq",
+                _ => new_op,
+            };
+            let new_inst = format!("    {} {}, {}", op, src_name, dest);
+
+            if !all_editable(infos, &[i, j]) {
+                i += 1;
+                continue;
+            }
+            replace_line(store, &mut infos[i], i, new_inst);
+            mark_nop(&mut infos[j]);
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// General accumulator relay fold: retarget instructions that write to %rax
+/// when the result is immediately copied to another register.
+///
+/// Handles:
+///   leaq   X, %rax  +  movq %rax, %REG  →  leaq X, %REG
+///   movslq X, %rax   +  movq %rax, %REG  →  movslq X, %REG
+///   xorl   %eax, %eax + movq %rax, %REG  →  xorl %REGd, %REGd
+///   addq   X, %rax  +  movq %rax, %REG  →  (not safe: flags + read-modify-write)
+///
+/// Only applies to instructions that purely write %rax without reading it first,
+/// and where %rax is dead after the copy.
+pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: Instruction writes to %rax (dest_reg == 0).
+        if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
+            let line_i = infos[i].trimmed(store.get(i));
+
+            // Step 2: Next must be movq %rax, %DEST.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
+            let dest_reg = match infos[j].kind {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
+                    let lj = infos[j].trimmed(store.get(j));
+                    if lj.starts_with("movq %rax, %") && !lj.contains('(') {
+                        dest_reg
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+
+            // Step 3: Check rax is dead after.
+            if !is_rax_dead_after(store, infos, j + 1, len) {
+                i += 1;
+                continue;
+            }
+
+            let dest_64 = REG_NAMES[0][dest_reg as usize];
+            let dest_32 = REG_NAMES[1][dest_reg as usize];
+
+            // Step 4: Match specific retargetable patterns.
+            let new_inst = if line_i.starts_with("leaq ") && line_i.ends_with(", %rax") {
+                // leaq X, %rax → leaq X, %REG
+                // Safe: leaq doesn't read %rax (it computes an address, doesn't deref).
+                // But check the source doesn't reference rax!
+                let src = &line_i[5..line_i.len() - 6]; // between "leaq " and ", %rax"
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1;
+                    continue;
+                }
+                Some(format!("    leaq {}, {}", src, dest_64))
+            } else if line_i.starts_with("movslq ") && line_i.ends_with(", %rax") {
+                // movslq X, %rax → movslq X, %REG
+                let src = &line_i[7..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1;
+                    continue;
+                }
+                Some(format!("    movslq {}, {}", src, dest_64))
+            } else if line_i == "xorl %eax, %eax" {
+                // xorl %eax, %eax → xorl %REGd, %REGd
+                Some(format!("    xorl {}, {}", dest_32, dest_32))
+            } else if line_i.starts_with("movq $") && line_i.ends_with(", %rax") {
+                // movq $imm, %rax → movq $imm, %REG
+                let imm = &line_i[5..line_i.len() - 6];
+                Some(format!("    movq {}, {}", imm, dest_64))
+            } else if line_i.starts_with("movl $") && line_i.ends_with(", %eax") {
+                // movl $imm, %eax → movl $imm, %REGd
+                let imm = &line_i[5..line_i.len() - 6];
+                Some(format!("    movl {}, {}", imm, dest_32))
+            } else if line_i.starts_with("movq ")
+                && line_i.ends_with(", %rax")
+                && line_i.contains('(')
+            {
+                // movq N(%reg), %rax → movq N(%reg), %REG (pointer dereference)
+                // Safe: source is a memory operand, doesn't read %rax as a value.
+                // But check the addressing mode doesn't use %rax as base/index!
+                let src = &line_i[5..line_i.len() - 6]; // between "movq " and ", %rax"
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1;
+                    continue;
+                }
+                Some(format!("    movq {}, {}", src, dest_64))
+            } else if line_i.starts_with("movl ")
+                && line_i.ends_with(", %eax")
+                && line_i.contains('(')
+            {
+                // movl N(%reg), %eax → movl N(%reg), %REGd (32-bit pointer dereference)
+                let src = &line_i[5..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1;
+                    continue;
+                }
+                Some(format!("    movl {}, {}", src, dest_32))
+            } else if line_i.starts_with("movzbq ") && line_i.ends_with(", %rax") {
+                // movzbq N(%reg), %rax → movzbl N(%reg), %REGd (byte load zero-extend)
+                let src = &line_i[7..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1;
+                    continue;
+                }
+                Some(format!("    movzbl {}, {}", src, dest_32))
+            } else if line_i.starts_with("movzwq ") && line_i.ends_with(", %rax") {
+                // movzwq N(%reg), %rax → movzwl N(%reg), %REGd
+                let src = &line_i[7..line_i.len() - 6];
+                if src.contains("%rax") || src.contains("%eax") {
+                    i += 1;
+                    continue;
+                }
+                Some(format!("    movzwl {}, {}", src, dest_32))
+            } else {
+                None
+            };
+
+            if let Some(new_text) = new_inst {
+                if !all_editable(infos, &[i, j]) {
+                    i += 1;
+                    continue;
+                }
+                replace_line(store, &mut infos[i], i, new_text);
+                mark_nop(&mut infos[j]);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Fold any-family extension relays: a widening/narrowing extension whose
+/// result is immediately copied to another register, with the extension's
+/// destination dead after the copy, writes the copy's destination directly.
+///
+/// ```text
+///   movslq %eS, %rT        movslq %eS, %rD
+///   movq   %rT, %rD   →    <nop>
+/// ```
+///
+/// The `fold_extend_relay`/`fold_general_relay` passes above handle the
+/// rax-destination special cases; this pass is the general form observed in
+/// RA output (`movslq %ebp, %r15; movq %r15, %rbp` — the sign-extend of a
+/// loop-carried value staged through a scratch, the csv_field_sum shape).
+///
+/// Soundness:
+/// * the extension must not read `%rT` (it reads `%eS`; `S == T` is fine —
+///   the extension reads the low half before writing the whole family, and
+///   retargeting keeps the read intact);
+/// * `%rT` must be dead after the copy (`is_reg_dead_after`, fail-closed) —
+///   otherwise the extension's value is still observed in `%rT`;
+/// * the copy must be a PLAIN full-width register copy (exact text match),
+///   never a flags-producing or memory form;
+/// * `D` may equal `S` (fold `movslq %ebp, %r15; movq %r15, %rbp` to
+///   `movslq %ebp, %rbp`) and may be any valid GP family.
+///
+/// Covers `movslq` (I32→I64 sext). The sub-32 extends already have their
+/// rax-form handled by `fold_extend_relay`; the 32-bit copy form
+/// (`movl %eS, %eT; movq %rT, %rD`) is plain copy coalescing, not an
+/// extension fold.
+pub(super) fn fold_movslq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: `movslq %eS, %rT` — classify as Other (movslq is not a
+        // StoreRbp/LoadRbp form) and parse the two register operands.
+        let line_i = infos[i].trimmed(store.get(i));
+        let Some(rest) = line_i.strip_prefix("movslq %") else {
+            i += 1;
+            continue;
+        };
+        let Some((src32, dst64)) = rest.split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        let src_fam = register_family_fast(&format!("%{}", src32));
+        let tmp_fam = register_family_fast(&format!("%{}", dst64));
+        if src_fam == REG_NONE
+            || src_fam > REG_GP_MAX
+            || tmp_fam == REG_NONE
+            || tmp_fam > REG_GP_MAX
+        {
+            i += 1;
+            continue;
+        }
+
+        // Step 2: the next non-NOP line must be exactly `movq %rT, %rD`
+        // with D a valid GP family distinct from T.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let line_j = infos[j].trimmed(store.get(j));
+        let Some(relay_rest) = line_j.strip_prefix("movq %") else {
+            i += 1;
+            continue;
+        };
+        let Some((relay_src, relay_dst)) = relay_rest.split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        if relay_src != dst64 || relay_dst.contains('(') {
+            i += 1;
+            continue;
+        }
+        let dest_fam = register_family_fast(&format!("%{}", relay_dst));
+        if dest_fam == REG_NONE || dest_fam > REG_GP_MAX || dest_fam == tmp_fam {
+            i += 1;
+            continue;
+        }
+
+        // Step 3: the extension's destination must be dead after the copy —
+        // no later reader observes the value in %rT (fail-closed scan).
+        if !is_reg_dead_after(store, infos, j + 1, len, tmp_fam) {
+            i += 1;
+            continue;
+        }
+
+        // Step 4: retarget the extension and delete the relay copy.  Both
+        // lines must be editable: a pinned copy would survive `mark_nop`
+        // and read the no-longer-written %rT (see `all_editable`).
+        if !all_editable(infos, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        let new_inst = format!("    movslq %{}, %{}", src32, relay_dst);
+        replace_line(store, &mut infos[i], i, new_inst);
+        mark_nop(&mut infos[j]);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// Fold store relay: `movq %reg, %rax; movq %rax, N(%rsp)` → `movq %reg, N(%rsp)`.
+/// Eliminates the intermediate %rax relay for register-to-stack stores.
+pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // Step 1: movq %REG, %rax (or movl %REGd, %eax)
+        let (src_reg, is_32bit) = match infos[i].kind {
+            LineKind::Other { dest_reg: 0 } => {
+                let line = infos[i].trimmed(store.get(i));
+                if line.starts_with("movq %") && line.ends_with(", %rax") && !line.contains('(') {
+                    let src = &line[6..line.len() - 6]; // between "movq %" and ", %rax"
+                    if !src.contains('%') {
+                        // simple register name
+                        (src.to_string(), false)
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else if line.starts_with("movl %")
+                    && line.ends_with(", %eax")
+                    && !line.contains('(')
+                {
+                    let src = &line[6..line.len() - 6];
+                    if !src.contains('%') {
+                        (src.to_string(), true)
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else {
+                    i += 1;
+                    continue;
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Step 2: Next must be movq %rax, N(%rsp) or movl %eax, N(%rsp)
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+
+        let stored = match infos[j].kind {
+            LineKind::StoreRbp {
+                reg: 0,
+                offset,
+                size,
+            } => {
+                // movq/movl %rax/%eax → stack
+                Some((offset, size))
+            }
+            _ => None,
+        };
+
+        if let Some((_offset, size)) = stored {
+            // Check rax is dead after the store
+            if is_rax_dead_after(store, infos, j + 1, len) {
+                // SOUNDNESS FIX: the folded store must write the SAME number
+                // of bytes as the ORIGINAL store, using the STORE's width — NOT
+                // the source move's width. Previously the mnemonic came from the
+                // source `movq %rX,%rax`/`movl %rXd,%eax`, so a `movq %rX,%rax;
+                // movl %eax,N(%rsp)` was folded to `movq %rX,N(%rsp)`, writing 8
+                // bytes where only 4 were written before and corrupting the
+                // adjacent stack slot. Use the store's MoveSize and the matching
+                // sub-register.
+                let src_fam = register_family_fast(&format!("%{}", src_reg));
+                if src_fam == REG_NONE || src_fam as usize >= REG_NAMES[0].len() {
+                    i += 1;
+                    continue;
+                }
+                // SOUNDNESS: a 32-bit source move (`movl %REGd, %eax`) ZERO-EXTENDS
+                // to %rax, so a 64-bit store of %rax stores 0 in the upper 32 bits.
+                // Folding that to `movq %REG, slot` would store %REG's RAW upper bits
+                // (which may be non-zero) — a value change. Only fold a 64-bit store
+                // when the source move was itself 64-bit.
+                let store_is_64 = !matches!(size, MoveSize::L);
+                if is_32bit && store_is_64 {
+                    i += 1;
+                    continue;
+                }
+                let (mnem, reg_name) = match size {
+                    MoveSize::L => ("movl", REG_NAMES[1][src_fam as usize]),
+                    _ => ("movq", REG_NAMES[0][src_fam as usize]),
+                };
+                let line = infos[j].trimmed(store.get(j));
+                if let Some(comma) = line.rfind(',') {
+                    let mem_part = line[comma + 1..].trim();
+                    // REG_NAMES entries already include the leading '%' — do NOT add
+                    // another one (the old double-'%' produced `movl %%ebp, ...`).
+                    let new_inst = format!("    {} {}, {}", mnem, reg_name, mem_part);
+                    if !all_editable(infos, &[i, j]) {
+                        i += 1;
+                        continue;
+                    }
+                    replace_line(store, &mut infos[j], j, new_inst);
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
+/// Returns true if GP family `reg` (0=rax, 1=rcx, 2=rdx, ...) is not read
+/// again before the next write within a 64-instruction window starting at
+/// `start`. Calls follow `call_window_verdict`; every other barrier
+/// conservatively returns false.
+/// Adjacency may ignore source attribution and blank/comment lines, not
+/// layout, unwind, control-flow or protected instructions. Share this walk
+/// between the memory fold and its redundant-reload protection predicate.
+#[inline]
+fn next_memfold_instruction(
+    store: &LineStore,
+    infos: &[LineInfo],
+    mut i: usize,
+    len: usize,
+) -> usize {
+    while i < len
+        && (debug_transparent(store, infos[i], i)
+            || (!infos[i].pinned && infos[i].kind == LineKind::Empty))
+    {
+        i += 1;
+    }
+    i
+}
+
+fn is_reg_dead_after(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    len: usize,
+    reg: u8,
+) -> bool {
+    if reg > REG_GP_MAX {
+        return false; // fail-closed (also guards the shift below)
+    }
+    let mut remaining = 64;
+    let mask = 1u16 << reg;
+    // Complete family names (all 16 fams, every width): the old two-family
+    // mini-table fail-closed the relay fold for tmp >= rsi.
+    let names = reg_names_family(reg);
+    let mut scan = start;
+    while scan < len {
+        scan = next_memfold_instruction(store, infos, scan, len);
+        if scan == len {
+            break;
+        }
+        // Exhausting a bounded search proves nothing about later readers.
+        // Count real lines, not debug attribution, so -g cannot change this
+        // proof budget. The scan remains bounded by 64 semantic lines.
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        if infos[scan].is_nop() {
+            scan += 1;
+            continue;
+        }
+        // A call kills only what it clobbers without reading, and is
+        // transparent to callee-saved families (see `call_window_verdict`).
+        if infos[scan].kind == LineKind::Call {
+            match call_window_verdict(store, infos, scan, reg) {
+                Some(dead) => return dead,
+                None => {
+                    scan += 1;
+                    continue;
+                }
+            }
+        }
+        // Any other barrier means control flow splits or the function
+        // returns. A Ret may use %rax as the return value, and a
+        // branch/label may have the register LIVE on another edge — so we
+        // must NOT treat Ret/branch/label as dead. This was the soundness bug
+        // in the relay passes: they forwarded through barriers and produced
+        // wrong code on paths that used the register.
+        if infos[scan].is_barrier() {
+            return false;
+        }
+        if infos[scan].reg_refs & mask != 0 {
+            match infos[scan].kind {
+                LineKind::LoadRbp { reg: r, size, .. } if r == reg => {
+                    // Byte/word moves preserve upper bits; an address using
+                    // this family also reads the old value before overwriting.
+                    return matches!(size, MoveSize::Q | MoveSize::L | MoveSize::SLQ)
+                        && !src_mentions_family(infos[scan].trimmed(store.get(scan)), reg);
+                }
+                LineKind::Pop { reg: r } if r == reg => return true,
+                LineKind::Other { dest_reg } if dest_reg == reg => {
+                    let t = infos[scan].trimmed(store.get(scan));
+                    if t == format!("xorl {}, {}", names[1], names[1]) {
+                        return true;
+                    }
+                    if t.ends_with(&format!(", {}", names[0]))
+                        || t.ends_with(&format!(", {}", names[1]))
+                    {
+                        // The instruction WRITES the register. It is only dead
+                        // (free to retarget) if this write establishes a FRESH
+                        // value that does NOT depend on the current value — a
+                        // self-move or sign-extension FROM the register still
+                        // depends on it, so it is NOT dead. The guard covers
+                        // EVERY source operand (first AND middle: NDD
+                        // `imull $k, %r, %r` reads the family as its middle
+                        // operand) at EVERY width (16-bit and high-byte
+                        // included) — checking only the first operand, or only
+                        // 3 widths, silently miscompiled the relay fold.
+                        if !src_mentions_family(t, reg) && !is_read_modify_write(t) {
+                            return true;
+                        }
+                    }
+                    return false; // register read (or rmw write)
+                }
+                _ => return false, // register read
+            }
+        }
+        scan += 1;
+    }
+    true // Reached the actual end, not merely the search limit.
+}
+
+/// Liveness for the redundant-reload protection predicate
+/// (`load_would_memfold`). Same windowed scan as `is_reg_dead_after`, but
+/// transparent to control-neutral `push`/`pop` of OTHER registers: those run
+/// before the push/pop elimination phase, do not touch the tracked scratch
+/// register, and do not change control flow. A `pop %reg` (reg == tracked)
+/// counts as the fresh overwrite that makes the current value dead, matching
+/// the LoadRbp treatment. Any real CFG barrier (label, branch, ret) still
+/// fails closed.
+fn scratch_dead_after_relaxed(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    len: usize,
+    reg: u8,
+) -> bool {
+    if reg > REG_GP_MAX {
+        return false; // fail-closed (also guards the shift below)
+    }
+    let mut remaining = 64;
+    let mask = 1u16 << reg;
+    let names = reg_names_family(reg);
+    let mut scan = start;
+    while scan < len {
+        scan = next_memfold_instruction(store, infos, scan, len);
+        if scan == len {
+            break;
+        }
+        // Exhausting a bounded search proves nothing about later readers.
+        // Count real lines, not debug attribution, so -g cannot change this
+        // proof budget. The scan remains bounded by 64 semantic lines.
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        if infos[scan].is_nop() {
+            scan += 1;
+            continue;
+        }
+        match infos[scan].kind {
+            LineKind::Push { reg: r } => {
+                if r == reg || reg == REG_RSP {
+                    return false;
+                }
+                scan += 1;
+                continue;
+            }
+            LineKind::Pop { reg: r } => {
+                if reg == REG_RSP {
+                    return false;
+                }
+                if r == reg {
+                    return true;
+                }
+                scan += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if infos[scan].kind == LineKind::Call {
+            match call_window_verdict(store, infos, scan, reg) {
+                Some(dead) => return dead,
+                None => {
+                    scan += 1;
+                    continue;
+                }
+            }
+        }
+        if infos[scan].is_barrier() {
+            return false;
+        }
+        if infos[scan].reg_refs & mask != 0 {
+            match infos[scan].kind {
+                LineKind::LoadRbp { reg: r, size, .. } if r == reg => {
+                    // Byte/word moves preserve upper bits; an address using
+                    // this family also reads the old value before overwriting.
+                    return matches!(size, MoveSize::Q | MoveSize::L | MoveSize::SLQ)
+                        && !src_mentions_family(infos[scan].trimmed(store.get(scan)), reg);
+                }
+                LineKind::Other { dest_reg } if dest_reg == reg => {
+                    let t = infos[scan].trimmed(store.get(scan));
+                    if t == format!("xorl {}, {}", names[1], names[1]) {
+                        return true;
+                    }
+                    if t.ends_with(&format!(", {}", names[0]))
+                        || t.ends_with(&format!(", {}", names[1]))
+                    {
+                        // All-sources, all-widths guard (see
+                        // `is_reg_dead_after`): first-operand-only missed
+                        // NDD middle reads and 16-bit reads.
+                        if !src_mentions_family(t, reg) && !is_read_modify_write(t) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+        scan += 1;
+    }
+    true
+}
+
+/// True when line `k` is a pure register-to-register GP move that may be
+/// skipped while searching for the ALU consumer of a just-loaded scratch
+/// register. The move must establish ONLY one destination GP register
+/// (`want_dst`, checked by the caller against the ALU destination), must not
+/// read or write the loaded register, must not touch the frame bases, and must
+/// have no memory operand (no load, no store, no flags dependency — plain
+/// MOV copies set no flags).
+fn is_dst_establishing_move(
+    store: &LineStore,
+    infos: &[LineInfo],
+    k: usize,
+    load_reg: RegId,
+) -> Option<RegId> {
+    if infos[k].is_nop() || infos[k].pinned || infos[k].is_barrier() {
+        return None;
+    }
+    let LineKind::Other { dest_reg: dst_fam } = infos[k].kind else {
+        return None;
+    };
+    if dst_fam > 15 || dst_fam == load_reg || dst_fam == REG_RSP || dst_fam == REG_RBP {
+        return None;
+    }
+    let t = infos[k].trimmed(store.get(k));
+    let (mn, operands) = t.split_once(char::is_whitespace)?;
+    // Plain GP copies only (no `movq mem, %reg`, no lea, no stack moves).
+    // Every GAS reg-reg move/extension spelling is accepted: the copy is not
+    // rewritten or deleted, only stepped over, so its extension width is
+    // irrelevant — the fold substitutes the OTHER (scratch) source of the
+    // ALU op. NB: GAS spells the word-zero-extend "movzwl", never "movlzw"
+    // (a typo here silently disabled every such fold).
+    if !matches!(
+        mn,
+        "movq"
+            | "movl"
+            | "movw"
+            | "movb"
+            | "movzbl"
+            | "movzbw"
+            | "movzbq"
+            | "movzwl"
+            | "movzwq"
+            | "movsbl"
+            | "movsbq"
+            | "movswl"
+            | "movswq"
+            | "movslq"
+    ) {
+        return None;
+    }
+    let (src, dst) = operands.split_once(',')?;
+    let src = src.trim();
+    let dst = dst.trim();
+    if src.contains('(') || dst.contains('(') {
+        return None;
+    }
+    let src_fam = register_family_fast(src);
+    let dst_fam2 = register_family_fast(dst);
+    if src_fam == REG_NONE || dst_fam2 != dst_fam {
+        return None;
+    }
+    // The copy must neither read the loaded register nor depend on the flags.
+    if src_fam == load_reg || infos[k].reg_refs & (1u16 << load_reg) != 0 {
+        return None;
+    }
+    Some(dst_fam)
+}
+
+/// Resolve the ALU target for a scratch-register stack load at index `i`.
+///
+/// The common case is an adjacent `addq %rcx, %rax` after `movq slot, %rcx`.
+/// Up to three pure destination-establishing register copies are allowed in
+/// between (the raw `-O0` / pre-relay shape):
+///
+/// ```text
+///   movq -32(%rbp), %rcx
+///   movq %rdx, %rax          # establishes the ALU destination only
+///   addq %rcx, %rax      =>  addq -32(%rbp), %rax
+/// ```
+///
+/// Returns `Some((alu_idx, moved_dst))` where `moved_dst` is `None` for the
+/// adjacent case, or `Some(fam)` when one or more copies establish `fam` (the
+/// caller must verify the ALU destination equals it). All generic soundness
+/// guards (RSP shift, intervening stores, register liveness, width) remain the
+/// caller's responsibility and naturally cover the extended window.
+fn resolve_alu_memfold_target(
+    store: &LineStore,
+    infos: &[LineInfo],
+    _i: usize,
+    j: usize,
+    load_reg: RegId,
+) -> Option<(usize, Option<RegId>)> {
+    let len = store.len();
+    if j >= len || infos[j].pinned {
+        return None;
+    }
+    // An adjacent Other/Cmp line is the target even if it is not an ALU we
+    // understand (the caller re-validates); but a pure destination-establishing
+    // copy is stepped over (up to three), matching the raw `-O0` shape
+    // `load; movq %rdx,%rax; addq %rcx,%rax`.
+    let first_is_move = is_dst_establishing_move(store, infos, j, load_reg).is_some();
+    if !first_is_move {
+        return if matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp) {
+            Some((j, None))
+        } else {
+            None
+        };
+    }
+    let mut k = j;
+    let mut moved_dst: Option<RegId> = None;
+    for _ in 0..3 {
+        k = next_memfold_instruction(store, infos, k, len);
+        if k >= len {
+            return None;
+        }
+        let d = is_dst_establishing_move(store, infos, k, load_reg)?;
+        if let Some(prev) = moved_dst {
+            if prev != d {
+                return None;
+            }
+        }
+        moved_dst = Some(d);
+        k = next_memfold_instruction(store, infos, k + 1, len);
+        if k < len
+            && !infos[k].pinned
+            && matches!(infos[k].kind, LineKind::Other { .. } | LineKind::Cmp)
+            && is_dst_establishing_move(store, infos, k, load_reg).is_none()
+        {
+            return Some((k, moved_dst));
+        }
+    }
+    None
+}
+
+fn is_rax_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: usize) -> bool {
+    is_reg_dead_after(store, infos, start, len, 0)
+}
+
+/// Byte width of a supported binary ALU mnemonic's frame-slot source operand.
+/// Returns None unless `mn` is an integer ALU with a trailing b/w/l/q suffix.
+fn alu_memop_size(mn: &str) -> Option<MoveSize> {
+    if mn.len() < 2 {
+        return None;
+    }
+    let op = &mn[..mn.len() - 1];
+    if !matches!(
+        op,
+        "add" | "sub" | "and" | "or" | "xor" | "cmp" | "test" | "adc" | "sbb" | "imul"
+    ) {
+        return None;
+    }
+    match mn.as_bytes()[mn.len() - 1] {
+        b'q' => Some(MoveSize::Q),
+        b'l' => Some(MoveSize::L),
+        b'w' => Some(MoveSize::W),
+        b'b' => Some(MoveSize::B),
+        _ => None,
+    }
+}
+
+/// Fold a dead `mov %reg, slot` into the following ALU instruction that reads
+/// the same slot as a memory source operand, substituting `%reg` for the
+/// memory operand and deleting the store.
+///
+/// Pattern (the register allocator's "value spilled to a slot then read back
+/// through a memory operand" shape — also the residual form left behind when
+/// `fold_memory_operands`/`fold_store_relay` have already run):
+///
+/// ```text
+///   movl %eax, -404(%rbp)        ; store %reg -> slot
+///   xorl -404(%rbp), %r8d        ; ALU reads slot; writes %r8d
+/// ```
+///
+/// The store's source register still holds exactly the value the ALU reads,
+/// so the memory operand may be replaced by that register and the store
+/// deleted.  The store is only deleted when it is provably dead afterwards
+/// — the slot is never reloaded before its next overwrite — so no reader is
+/// deprived of the value.  `fp_liveness` fails closed (reports the slot live)
+/// when the function is opaque, so a `%rbp` pointer-dereference under a
+/// data-register `%rbp`, or an escaping-slot address, is never folded.
+///
+/// Width rule: the ALU must not read bytes the store did not write.  The slot
+/// is substituted at the ALU's width, so an 8-byte store feeding a 4-byte op
+/// folds to the low 32-bit register (sound: `%eax` observes exactly the low
+/// four bytes `%rax` wrote); a 4-byte store feeding an 8-byte op is refused
+/// (the slot's high half is undefined).
+/// True when the line at index `k` may be safely stepped over while scanning
+/// from the store to a later ALU without clobbering the store's source
+/// register `reg` or invalidating the frame slot the store wrote.  Anything
+/// that touches a frame slot, reads/writes opaque memory, transfers or merges
+/// control, or writes the tracked register terminates the scan.
+fn is_transparent_for_store_fold(
+    store: &LineStore,
+    infos: &[LineInfo],
+    k: usize,
+    reg: RegId,
+    base_fam: u8,
+) -> bool {
+    if infos[k].kind == LineKind::Empty
+        || super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k)))
+    {
+        return true;
+    }
+    if infos[k].pinned {
+        return false;
+    }
+    match infos[k].kind {
+        LineKind::Label
+        | LineKind::Jmp
+        | LineKind::JmpIndirect
+        | LineKind::Ret
+        | LineKind::CondJmp
+        | LineKind::Call
+        | LineKind::InlineAsm
+        | LineKind::Push { .. }
+        | LineKind::Pop { .. } => return false,
+        _ => {}
+    }
+    // Any frame-slot access (load, store, ALU memory operand, lea) could be
+    // our slot revisited or an aliasing neighbour; treat as a boundary.
+    if infos[k].has_indirect_mem || infos[k].rbp_offset != RBP_OFFSET_NONE {
+        return false;
+    }
+    if matches!(
+        infos[k].kind,
+        LineKind::StoreRbp { .. }
+            | LineKind::LoadRbp { .. }
+            | LineKind::StoreXmmRbp { .. }
+            | LineKind::LoadXmmRbp { .. }
+    ) {
+        return false;
+    }
+    // A write to the store's source register or to the frame base register
+    // (which the slot's address depends on) makes the register-carry / address
+    // assumption stale.
+    if writes_family(&infos[k], infos[k].trimmed(store.get(k)), reg)
+        || writes_family(&infos[k], infos[k].trimmed(store.get(k)), base_fam as RegId)
+    {
+        return false;
+    }
+    true
+}
+
+/// Fold a dead `mov %reg, slot` into a later ALU instruction that reads the
+/// same slot as a memory source operand, substituting `%reg` for the memory
+/// operand and deleting the store.
+///
+/// Pattern (the register allocator's "value spilled to a slot then read back
+/// through a memory operand" shape — also the residual form left behind when
+/// `fold_memory_operands`/`fold_store_relay` have already run):
+///
+/// ```text
+///   movl %eax, -404(%rbp)        ; store %reg -> slot
+///   xorl -404(%rbp), %r8d        ; ALU reads slot; writes %r8d
+/// ```
+///
+/// The store's source register still holds exactly the value the ALU reads,
+/// so the memory operand may be replaced by that register.  The store is only
+/// deleted when it is provably dead afterwards — the slot is never reloaded
+/// before its next overwrite — so no reader is deprived of the value; the
+/// forward scan also refuses to step over any line that reads or writes the
+/// slot (so a load between the store and the ALU, which would consume the
+/// store's value, blocks the fold).  `fp_liveness` fails closed (reports the
+/// slot live) when the function is opaque, so a `%rbp` pointer-dereference
+/// under a data-register `%rbp`, or an escaping-slot address, is never folded.
+///
+/// Width rule: the ALU must not read bytes the store did not write.  The slot
+/// is substituted at the ALU's width, so an 8-byte store feeding a 4-byte op
+/// folds to the low 32-bit register (sound: `%eax` observes exactly the low
+/// four bytes `%rax` wrote); a 4-byte store feeding an 8-byte op is refused
+/// (the slot's high half is undefined).
+pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv: Option<FpLiveness> = None;
+    // Built on the first label the scan meets.  The folds below substitute
+    // registers for slot operands and delete stores; they never add a label
+    // reference (the `LabelRefs` staleness contract).
+    let mut label_refs: Option<LabelRefs> = None;
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let LineKind::StoreRbp { reg, offset, size } = infos[i].kind else {
+            i += 1;
+            continue;
+        };
+        if reg > 15 {
+            i += 1;
+            continue;
+        }
+        let tstore = infos[i].trimmed(store.get(i));
+        let base = if tstore.contains("(%rbp)") {
+            5u8
+        } else if tstore.contains("(%rsp)") {
+            4u8
+        } else {
+            i += 1;
+            continue;
+        };
+        let slot_text = format!(
+            "{}(%r{})",
+            offset,
+            if base == REG_RSP { "sp" } else { "bp" }
+        );
+
+        // Scan forward over lines that provably do not touch `reg`, the frame
+        // base, or the slot, looking for the ALU that reads the slot.  A Label
+        // (CFG rejoin), call, opaque memory line, or a slot/register write
+        // terminates the search.
+        let mut j = i + 1;
+        let mut advanced = false;
+        loop {
+            while j < len
+                && (infos[j].kind == LineKind::Empty
+                    || super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))))
+            {
+                j += 1;
+            }
+            if j >= len {
+                break;
+            }
+            let tj = infos[j].trimmed(store.get(j));
+            let (mn, operands) = match tj.split_once(char::is_whitespace) {
+                Some((m, o)) => (m, o.trim()),
+                None => {
+                    // A no-operand line is normally an empty/directive line,
+                    // but a block label (` .LBB34:`) has no whitespace too.
+                    // Skipping it unconditionally forwarded a predecessor
+                    // arm's store ACROSS A CFG JOIN into the merged block's
+                    // ALU (rotl ternary diamond: one arm stored the rotated
+                    // value, the other the identity; the join read the
+                    // identity register unconditionally).
+                    //
+                    // A label is crossable exactly when it begins a block that
+                    // has no incoming branch at all (`label_is_fallthrough_only`):
+                    // such a block is dominated by the code immediately before
+                    // it, so the store's source register still carries the
+                    // slot value past the label (an if-guard block emitted
+                    // before a self-loop body has this shape). A label targeted
+                    // by any branch is a CFG join/loop header with multiple
+                    // predecessor paths the textual scan cannot inspect, and
+                    // terminates the scan like every other opaque line.
+                    if infos[j].kind == LineKind::Label
+                        && label_refs
+                            .get_or_insert_with(|| LabelRefs::build(store, infos))
+                            .is_fallthrough_only(store, infos, j)
+                    {
+                        j += 1;
+                        continue;
+                    }
+                    if !is_transparent_for_store_fold(store, infos, j, reg, base) {
+                        break;
+                    }
+                    j += 1;
+                    continue;
+                }
+            };
+
+            let mut folded_here = false;
+            if !infos[j].pinned {
+                if let Some(alu_size) = alu_memop_size(mn) {
+                    if let Some((a, b)) = operands.split_once(',') {
+                        let src = a.trim();
+                        let dstr = b.trim();
+                        if src == slot_text
+                            && !dstr.contains(',')
+                            && dstr.starts_with('%')
+                            && !dstr.contains('(')
+                            && register_family_fast(dstr) != REG_NONE
+                            && alu_size.byte_size() <= size.byte_size()
+                        {
+                            // The store's source register still holds exactly the
+                            // value the ALU reads, so the memory operand may be
+                            // substituted for any register op — the substitution is
+                            // sound whether or not the store stays (a later slot
+                            // reader still observes the kept store).  The store is
+                            // deleted only when fp_liveness proves it dead: the slot
+                            // is never reloaded before its next overwrite.  It fails
+                            // closed (reports live) for opaque / address-taken
+                            // functions, so the store is kept there — never folded
+                            // across a possibly-aliasing access.
+                            let dead = lv
+                                .get_or_insert_with(|| FpLiveness::new(store, infos))
+                                .slot_dead_after(j, base, offset, size.byte_size());
+                            let regname = reg_id_to_name(reg, alu_size);
+                            let new_inst = format!("    {} {}, {}", mn, regname, dstr);
+                            replace_line(store, &mut infos[j], j, new_inst);
+                            if dead {
+                                mark_nop(&mut infos[i]);
+                            }
+                            changed = true;
+                            folded_here = true;
+                        }
+                    }
+                }
+            }
+
+            if folded_here {
+                i = j + 1;
+                advanced = true;
+                break;
+            }
+
+            // Not (or not foldably) a slot-reading ALU.  If the line is not
+            // transparent, the store's value can no longer be assumed to reach
+            // a later line; stop scanning and move on.
+            if !is_transparent_for_store_fold(store, infos, j, reg, base) {
+                break;
+            }
+            j += 1;
+        }
+
+        if !advanced {
+            i += 1;
+        }
+    }
+    changed
+}
+
+/// Predicate: would `fold_memory_operands` fold the scratch-register stack
+/// load at line `i` into an adjacent (or copy-separated) ALU as a memory
+/// source operand? Mirrors that pass's guards exactly, so a redundant-reload
+/// eliminator can preserve the load instead of deleting it and starving the
+/// memory-fold cascade (the -O0 loop-carried reload chain regression).
+pub(super) fn load_would_memfold(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
+    let len = store.len();
+    if infos[i].is_nop() || infos[i].pinned {
+        return false;
+    }
+    let LineKind::LoadRbp {
+        reg: load_reg,
+        offset,
+        size: load_size,
+    } = infos[i].kind
+    else {
+        return false;
+    };
+    if load_reg > 2 {
+        return false;
+    }
+    if load_size != MoveSize::Q && load_size != MoveSize::L {
+        return false;
+    }
+    let j = next_memfold_instruction(store, infos, i + 1, len);
+    let Some((alu_j, moved_dst)) = resolve_alu_memfold_target(store, infos, i, j, load_reg) else {
+        return false;
+    };
+    for k in (i + 1)..alu_j {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let tk = infos[k].trimmed(store.get(k));
+        if is_rsp_shift_line(tk) {
+            return false;
+        }
+        if writes_family(&infos[k], tk, load_reg) {
+            return false;
+        }
+        if let LineKind::StoreRbp { offset: so, .. } = infos[k].kind {
+            if so == offset {
+                return false;
+            }
+        }
+    }
+    let tj = infos[alu_j].trimmed(store.get(alu_j));
+    let Some((op_suffix, _operands, src_fam, dst_fam)) = parse_alu_reg_reg(tj) else {
+        return false;
+    };
+    if load_size == MoveSize::L && op_suffix.ends_with('q') {
+        return false;
+    }
+    if src_fam != load_reg || dst_fam == load_reg {
+        return false;
+    }
+    if let Some(moved) = moved_dst {
+        if moved != dst_fam {
+            return false;
+        }
+    }
+    scratch_dead_after_relaxed(store, infos, alu_j + 1, len, load_reg)
+}
+
+/// Fold stack loads into subsequent ALU instructions as memory operands.
+///
+/// Safety: We only fold when the loaded register (the one being eliminated) is
+/// a scratch register (rax=0, rcx=1, rdx=2) because the codegen guarantees
+/// these are temporary and overwritten before the next use. We also verify
+/// the loaded register is not the *destination* of the ALU instruction to avoid
+/// creating a memory-destination instruction (which would write to the stack slot).
+pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+
+        if let LineKind::LoadRbp {
+            reg: load_reg,
+            offset,
+            size: load_size,
+        } = infos[i].kind
+        {
+            // Only fold loads into scratch registers (rax=0, rcx=1, rdx=2)
+            if load_reg > 2 {
+                i += 1;
+                continue;
+            }
+
+            // Only fold Q and L loads (64-bit and 32-bit). SLQ (sign-extending)
+            // loads have different semantics.
+            if load_size != MoveSize::Q && load_size != MoveSize::L {
+                i += 1;
+                continue;
+            }
+
+            // Find the next non-NOP, non-empty instruction
+            let mut j = next_memfold_instruction(store, infos, i + 1, len);
+            if j >= len {
+                i += 1;
+                continue;
+            }
+
+            // SOUNDNESS: an RSP-shifting line between the load and the
+            // fold target changes the load's effective slot offset (the fold
+            // would substitute a memory operand at the WRONG address). Skip.
+            let mut shifted = false;
+            for k in (i + 1)..j {
+                if is_rsp_shift_line(infos[k].trimmed(store.get(k))) {
+                    shifted = true;
+                    break;
+                }
+            }
+            if shifted {
+                i += 1;
+                continue;
+            }
+
+            // Resolve the ALU across up to three pure destination-establishing
+            // copies (`movq %rdx,%rax; addq %rcx,%rax`): such a copy only
+            // writes the ALU destination, so the memory fold is as sound as
+            // the adjacent case.
+            let Some((eff_j, moved_dst)) = resolve_alu_memfold_target(store, infos, i, j, load_reg)
+            else {
+                i += 1;
+                continue;
+            };
+            j = eff_j;
+            let is_foldable_target =
+                matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp);
+            if is_foldable_target {
+                // SOUNDNESS: between the load and the fold target, the
+                // loaded register must not be WRITTEN by anything — otherwise
+                // the target instruction operates on a different value than
+                // the one the load produced, and folding the memory operand
+                // would test/combine the WRONG slot. (The old code only
+                // checked for stores to the same stack offset, missing
+                // register re-writes such as `movl mem2, %eax` between
+                // `movl mem1, %eax` and `testl %eax, %eax`.)
+                // `writes_family` catches every register-writing instruction
+                // — explicitly destination-named ones and architecturally
+                // implicit ones alike (`cqto` overwriting %rdx, `idivq`
+                // rewriting %rax:%rdx).
+                let mut reg_rewritten = false;
+                for k in (i + 1)..j {
+                    if writes_family(&infos[k], infos[k].trimmed(store.get(k)), load_reg) {
+                        reg_rewritten = true;
+                        break;
+                    }
+                }
+                if reg_rewritten {
+                    i += 1;
+                    continue;
+                }
+                let trimmed_j = infos[j].trimmed(store.get(j));
+
+                // Special case: testq/testl %REG, %REG where REG is the loaded scratch reg.
+                // Fold to cmpq/cmpl $0, -N(%rbp).
+                //
+                // SOUNDNESS: the folding width MUST come from the TEST
+                // instruction itself, NOT from the load width. `testl %eax, %eax`
+                // tests the 32-bit value (so SF reflects bit 31), whereas
+                // `testq %rax, %rax` tests the 64-bit value (SF reflects bit 63).
+                // If a `testl` follows a 64-bit `movq` load of a value whose upper
+                // 32 bits are non-zero (e.g. a zero-extended unsigned that is
+                // negative as 32-bit: 0x00000000_FFFFFFCD), folding to `cmpq $0, mem`
+                // would test 64 bits and flip the sign flag — miscompiling the
+                // branch. So `testl`→`cmpl`, `testq`→`cmpq`.
+                let test_q = trimmed_j.starts_with("testq ");
+                let test_l = trimmed_j.starts_with("testl ");
+                if (test_q || test_l) && {
+                    // confirm it's the loaded scratch reg self-test
+                    let pat = match load_reg {
+                        0 => ("%rax", "%eax"),
+                        1 => ("%rcx", "%ecx"),
+                        _ => ("%rdx", "%edx"),
+                    };
+                    trimmed_j == &format!("testq {}, {}", pat.0, pat.0)
+                        || trimmed_j == &format!("testl {}, {}", pat.1, pat.1)
+                } {
+                    // SOUNDNESS: the fold deletes the load — the loaded
+                    // register must not be read again before its next write,
+                    // or the value is lost (the register then holds stale
+                    // data). This check was missing in fold_memory_operands
+                    // (the relay folds had it for %rax only); the improved
+                    // emitter produces more multi-use scratch values, which
+                    // exposed it.
+                    if !is_reg_dead_after(store, infos, j + 1, len, load_reg) {
+                        i += 1;
+                        continue;
+                    }
+                    let load_line = infos[i].trimmed(store.get(i));
+                    let mem_op = format_stack_offset(offset, load_line);
+                    // WIDTH SOUNDNESS: the memory test must read exactly
+                    // the bytes the load defined. A 32-bit load
+                    // (`movl mem, %reg`) zero-extends into the register, so a
+                    // following `testq %reg, %reg` only tests the low 32 bits
+                    // — folding it to `cmpq $0, mem` would read 8 bytes from
+                    // a 4-byte slot (stale upper half → wrong flags → wrong
+                    // branch). Fuse width = the LOAD's width, capped by the
+                    // test's width: L-load + testq → `cmpl` (matches the
+                    // register's tested bits); L-load + testl → `cmpl`;
+                    // Q-load + testl → `cmpl` (low 4 bytes of the 8-byte
+                    // value are what testl sees); Q-load + testq → `cmpq`.
+                    let cmp_suffix = if test_l || load_size == MoveSize::L {
+                        "cmpl"
+                    } else {
+                        "cmpq"
+                    };
+                    let new_inst = format!("    {} $0, {}", cmp_suffix, mem_op);
+                    mark_nop(&mut infos[i]);
+                    replace_line(store, &mut infos[j], j, new_inst);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+
+                if let Some((op_suffix, dst_str, src_fam, dst_fam)) = parse_alu_reg_reg(trimmed_j) {
+                    // WIDTH SOUNDNESS: a 32-bit load (`movl mem,%reg`) only
+                    // defines the low 32 bits of the register (upper 32 are
+                    // zeroed, so the load is 4 bytes). Folding it into a
+                    // 64-bit op (`xorq mem,%reg`) would read 8 bytes from a
+                    // 4-byte stack slot, pulling in stale upper bytes —
+                    // miscompile. Q-load into a 32-bit op is fine (reads the
+                    // low 4 bytes of an 8-byte slot), as are matching widths.
+                    let op_is_64 = op_suffix.ends_with('q');
+                    if load_size == MoveSize::L && op_is_64 {
+                        i += 1;
+                        continue;
+                    }
+                    if src_fam == load_reg && dst_fam != load_reg {
+                        // When destination-establishing copies were crossed,
+                        // the ALU destination must be exactly the register
+                        // those copies wrote (the value it reads pre-ALU).
+                        if let Some(moved) = moved_dst {
+                            if moved != dst_fam {
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        // Check for intervening store to the same offset
+                        let mut intervening_store = false;
+                        for k in (i + 1)..j {
+                            if let LineKind::StoreRbp { offset: so, .. } = infos[k].kind {
+                                if so == offset {
+                                    intervening_store = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if intervening_store {
+                            i += 1;
+                            continue;
+                        }
+
+                        // SOUNDNESS: the fold deletes the load; the
+                        // loaded register must not be read again before its
+                        // next write, or the value is lost.
+                        if !is_reg_dead_after(store, infos, j + 1, len, load_reg) {
+                            i += 1;
+                            continue;
+                        }
+
+                        let load_line = infos[i].trimmed(store.get(i));
+                        let mem_op = format_stack_offset(offset, load_line);
+                        let new_inst = format!("    {} {}, {}", op_suffix, mem_op, dst_str);
+
+                        mark_nop(&mut infos[i]);
+                        replace_line(store, &mut infos[j], j, new_inst);
+                        changed = true;
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    changed
+}
+
+/// Fuse a register-memory load with a following dead single-use register copy:
+///
+/// ```text
+///     movzbl (%rcx,%r9), %esi      movzbl (%rcx,%r9), %r8d
+///     movl   %esi, %r8d        =>  (copy removed)
+/// ```
+///
+/// Dominant redundant-copy shape in hot byte loops (gzip longest_match).
+/// Soundness: the copy must be the load's ONLY consumer — the loaded register
+/// is proven dead before any read/redispatch; the rewrite never changes the
+/// load's width or extension semantics (width-narrowing copies are refused).
+/// Fold a single-use scalar FP load into the memory slot of an adjacent scalar
+/// FMA3 instruction, whichever role the loaded value plays:
+///
+/// ```text
+///   movsd 32(%rsi), %xmm11                vfmadd231sd 32(%rsi), %xmm10, %xmm2
+///   vfmadd231sd %xmm11, %xmm10, %xmm2  =>
+///
+///   movsd bodies+96(%rip), %xmm5          vfmadd231sd bodies+96(%rip), %xmm4, %xmm3
+///   vfmadd231sd %xmm4, %xmm5, %xmm3    =>
+///
+///   movsd (%rdi), %xmm4                   vfmadd132sd (%rdi), %xmm2, %xmm0
+///   vfmadd213sd %xmm2, %xmm4, %xmm0    =>
+/// ```
+///
+/// Only AT&T operand 0 (Intel `src3`) has a memory encoding, in every form.
+/// A load feeding operand 1 is therefore not foldable *in the form the line
+/// arrived in*, but the three forms are the same computation with the roles
+/// permuted ([`super::fma_forms`]), so the instruction is re-encoded with the
+/// loaded role at operand 0 and the destination unchanged.  The one role that
+/// can never be memory is whichever one is the destination; that case declines.
+/// When the loaded register is never read or written again, the staging
+/// `movsd` is pure overhead — the dominant shape in the second and later
+/// iterations of unrolled dot products, and in nbody's `bodies[i].mass`
+/// reads, where the multiplicand rather than the addend was staged.
+///
+/// Liveness proof, deliberately stronger than the block-local scan used by
+/// `fold_scalar_fp_memory_into_vex_op`: from the load line to the end of the
+/// function the register must be mentioned in EXACTLY those two lines (token-
+/// bounded, so `%xmm1` never matches inside `%xmm11`), and no `call` may
+/// intervene — a call can read `%xmm0`-`%xmm7` implicitly as the FP
+/// argument registers without naming them in the text.  Mentions BEFORE the load are irrelevant
+/// (the load redefines the register), so a home reused across loop iterations
+/// stays foldable for the later load.  Being function-wide, the proof is
+/// immune to cross-block reads that a block-local scan cannot see.
+pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    /// Parse an exact `%xmmN` operand token into N.
+    fn xmm_num(op: &str) -> Option<u32> {
+        let d = op.strip_prefix("%xmm")?;
+        if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        d.parse().ok()
+    }
+
+    let len = store.len();
+    let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        // ── load side: [v]movs{d,s} <mem>, %xmmN ─────────────────────────
+        let li = infos[i].trimmed(store.get(i));
+        let (width, rest) = if let Some(r) = li.strip_prefix("movsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("movss ") {
+            ("ss", r)
+        } else if let Some(r) = li.strip_prefix("vmovsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("vmovss ") {
+            ("ss", r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // Split on the LAST comma: SIB addresses contain commas of their own
+        // (`32(%rdi,%rax,8)`), and only the final operand is the destination.
+        let Some((addr, dst)) = rest.rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
+        let addr = addr.trim();
+        let Some(n) = xmm_num(dst.trim()) else {
+            i += 1;
+            continue;
+        };
+        // The source must be a plain memory reference (a register source has
+        // no paren; an XMM-form source would make this a reg-reg move).
+        if !addr.contains('(') || addr.contains("%xmm") {
+            i += 1;
+            continue;
+        }
+
+        // ── FMA side: adjacent (NOPs in between are dropped lines) ──────
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let lj = infos[j].trimmed(store.get(j));
+        let Some(fma) = parse_scalar_fma(lj) else {
+            i += 1;
+            continue;
+        };
+        // The load's width has to be the instruction's element width: an
+        // `ss` load defines 32 bits and an `sd` FMA reads 64.
+        let elem = match fma.width {
+            FmaWidth::Sd => "sd",
+            FmaWidth::Ss => "ss",
+        };
+        if elem != width {
+            i += 1;
+            continue;
+        }
+        // The pre-fold line has three plain register operands; a memory
+        // operand already present means either a different load feeds it or
+        // this is not the shape.
+        if fma.ops.iter().any(|o| !o.starts_with('%')) {
+            i += 1;
+            continue;
+        }
+        // The VEX-encoded scalar FMA this pass folds addresses at most
+        // %xmm15: %xmm16 and above need EVEX, which parse_scalar_fma
+        // refuses.  Refuse the fold at the register-number level as well,
+        // so that a future parser extension cannot silently produce a
+        // fold whose re-encoding has no VEX form -- the rejection must not
+        // live only in mentions()==0 as a side effect of the parser's
+        // current reach.
+        if n >= 16 {
+            i += 1;
+            continue;
+        }
+        let Ok(n8) = u8::try_from(n) else {
+            i += 1;
+            continue;
+        };
+        // The loaded register must play exactly one role, and not the
+        // destination: folding one of two reads leaves the other undefined,
+        // and the destination has no memory encoding in any form.
+        let roles = fma.roles();
+        if roles.mentions(n8) != 1 || fma.dst() == n8 {
+            i += 1;
+            continue;
+        }
+
+        // ── liveness: the loaded register must be dead after the FMA on
+        //    every path (CFG-aware; a loop-top reader through the back edge,
+        //    a call reading it as an FP argument, or a merge-form
+        //    redefinition all keep it live). ─────────────────────────────
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, j, n, &[i, j]) {
+            i += 1;
+            continue;
+        }
+
+        // Re-encode with the loaded role as a memory operand.  The encoder
+        // puts the memory role at operand 0 in whichever form allows it and
+        // keeps the destination; with the original form as the tie-break, a
+        // line that was already foldable in place keeps its mnemonic.
+        let Some(enc) = roles.substitute(n8, addr).encode(fma.dst(), fma.form) else {
+            i += 1;
+            continue;
+        };
+        let rewritten = format!("    {}", enc.render());
+
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, rewritten);
+        lv_ref.refresh_at(store, infos, i);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// Extract exact `SYM(%rip)` constant-pool operand tokens (`.LCFP_` family)
+/// from one line.  Both operand boundaries are checked: the token must be
+/// preceded by whitespace/comma/line start and the `(%rip)` must be followed
+/// by comma/whitespace/line end.  Displaced forms (`8+.LCFP_0(%rip)`) have
+/// non-identifier characters in the symbol range and are rejected.
+fn fp_const_rip_tokens(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(".LCFP_") {
+        let at = from + rel;
+        from = at + 6;
+        let before_ok = at == 0 || matches!(bytes[at - 1], b' ' | b',' | b'\t');
+        if !before_ok {
+            continue;
+        }
+        let Some(paren_rel) = line[at..].find('(') else {
+            continue;
+        };
+        let sym = &line[at..at + paren_rel];
+        // Pure pool symbol: identifiers and dots only (no `+`, no whitespace).
+        if sym.is_empty()
+            || !sym
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+        {
+            continue;
+        }
+        if !line[at + paren_rel..].starts_with("(%rip)") {
+            continue;
+        }
+        let after = at + paren_rel + 6;
+        if after < line.len() && !matches!(bytes[after], b',' | b' ' | b'\t') {
+            continue;
+        }
+        out.push(sym.to_string());
+    }
+    out
+}
+
+/// Hoist a repeatedly-loaded RIP-relative FP constant-pool value into a
+/// single register materialization:
+///
+/// ```text
+///     movsd .LCFP_0(%rip), %xmm1   <- placed into a dead (NOP) slot
+///     ...
+///     vaddsd .LCFP_0(%rip), %xmm2, %xmm2     vaddsd %xmm1, %xmm2, %xmm2
+///     vaddsd .LCFP_0(%rip), %xmm4, %xmm4  -> vaddsd %xmm1, %xmm4, %xmm4
+/// ```
+///
+/// The mature emitter homes scalar FP constants in `.rodata` and re-reads
+/// the pool at every use.  In leaf hot kernels that multiplies the load
+/// count — dot8d's SSE2 kernel performed 12 loads per call (8 data plus 4
+/// reads of the SAME 8-byte constant) where gcc/clang materialize the
+/// constant once (gcc: a single `pxor`) — a measured ~18% runtime gap on
+/// the dot8bench2 driver.  The rewritten value bits are identical: the
+/// materialization copies the same pool bytes the folded operand read.
+///
+/// Soundness conditions (all function-wide and conservative):
+/// * no `call` anywhere — every xmm is caller-saved, so a materialization
+///   would be dead after any call;
+/// * no inline-asm region — opaque code may touch any xmm register;
+/// * no `blendv`-family line — those read `%xmm0` implicitly;
+/// * the chosen register has ZERO textual mentions in the whole store,
+///   NOP'd lines included, because later passes may revive a NOP slot with
+///   its original text;
+/// * the materialization lands in a NOP slot before the first rewritten use
+///   with no label between slot and last use, so every use is reached by
+///   fall-through from the materialization;
+/// * only exact `SYM(%rip)` operands of known scalar-FP mnemonics are
+///   rewritten; pinned lines and multi-line combined slots are skipped.
+///
+/// Needs a count of at least 2 rewritten uses of the same symbol: with one
+/// use the materialization would just add an instruction.
+pub(super) fn hoist_repeated_fp_constant_loads(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    const FP_OPS: &[&str] = &[
+        "addsd",
+        "addss",
+        "subsd",
+        "subss",
+        "mulsd",
+        "mulss",
+        "divsd",
+        "divss",
+        "vaddsd",
+        "vaddss",
+        "vsubsd",
+        "vsubss",
+        "vmulsd",
+        "vmulss",
+        "vdivsd",
+        "vdivss",
+        "vfmadd132sd",
+        "vfmadd132ss",
+        "vfmadd213sd",
+        "vfmadd213ss",
+        "vfmadd231sd",
+        "vfmadd231ss",
+        "vfmsub132sd",
+        "vfmsub132ss",
+        "vfmsub213sd",
+        "vfmsub213ss",
+        "vfmsub231sd",
+        "vfmsub231ss",
+        "vfnmadd132sd",
+        "vfnmadd132ss",
+        "vfnmadd213sd",
+        "vfnmadd213ss",
+        "vfnmadd231sd",
+        "vfnmadd231ss",
+        "vfnmsub132sd",
+        "vfnmsub132ss",
+        "vfnmsub213sd",
+        "vfnmsub213ss",
+        "vfnmsub231sd",
+        "vfnmsub231ss",
+    ];
+
+    let len = store.len();
+    for k in 0..len {
+        if infos[k].is_nop() {
+            continue;
+        }
+        if infos[k].kind == LineKind::Call || infos[k].kind == LineKind::InlineAsm {
+            return false;
+        }
+        if infos[k].trimmed(store.get(k)).contains("blendv") {
+            return false;
+        }
+    }
+
+    // Collect rewritten-candidate uses per pool symbol.
+    let mut uses: Vec<(String, Vec<usize>)> = Vec::new();
+    for k in 0..len {
+        if infos[k].is_nop() || infos[k].pinned {
+            continue;
+        }
+        let t = store.get(k);
+        if t.contains('\n') {
+            continue; // combined multi-line slot: leave alone
+        }
+        let tt = infos[k].trimmed(t);
+        let Some((op, _)) = tt.split_once(' ') else {
+            continue;
+        };
+        if !FP_OPS.contains(&op) {
+            continue;
+        }
+        for sym in fp_const_rip_tokens(tt) {
+            match uses.iter_mut().find(|(s, _)| *s == sym) {
+                Some((_, sites)) => sites.push(k),
+                None => uses.push((sym, vec![k])),
+            }
+        }
+    }
+    // A line whose token scanner reports the same symbol twice (rmw spell
+    // variants) must count as ONE use: the "at least two rewritten uses"
+    // threshold counts distinct lines.  Sites are pushed in ascending line
+    // order, so adjacent duplicates dedup in place.
+    for (_, sites) in uses.iter_mut() {
+        sites.dedup();
+    }
+
+    let mut changed = false;
+    for (sym, sites) in uses.iter().filter(|(_, s)| s.len() >= 2) {
+        // Free-register scan over ALL lines (NOP'd text can be revived by
+        // later passes, so its mentions count too).
+        let mut mentioned = [false; 16];
+        for k in 0..len {
+            let t = store.get(k);
+            for n in 0..16 {
+                if !mentioned[n] && mentions_token(t, &format!("%xmm{}", n)) > 0 {
+                    mentioned[n] = true;
+                }
+            }
+        }
+        let Some(free) = (0..16).find(|n| !mentioned[*n]) else {
+            continue;
+        };
+        let reg = format!("%xmm{}", free);
+
+        // Materialization slot: the latest NOP before the first use, with
+        // no label between slot and last use (pure fall-through). Not a
+        // hidden `-g` row (`hide_debug_rows`): those slots exist only under
+        // `-g`, so taking one hoisted there and not in the plain build (and
+        // overwrote the row).
+        let first = sites[0];
+        let last = sites[sites.len() - 1];
+        let Some(slot) = (0..first).rev().find(|&p| {
+            infos[p].is_nop()
+                && !crate::backend::peephole_common::is_loc_directive(store.get(p).trim())
+        }) else {
+            continue;
+        };
+        if (slot + 1..=last).any(|k| infos[k].kind == LineKind::Label) {
+            continue;
+        }
+
+        // Materialization width: `movss` for a symbol used only by
+        // single-precision ops (an exact 4-byte pool read, zero-extending
+        // into the register), `movsd` as soon as any double-precision site
+        // needs the full 8 bytes.  Mnemonics are never touched by the
+        // rewrite below, so reading them off the live store is exact.
+        let any_double = sites.iter().any(|&k| {
+            store
+                .get(k)
+                .trim()
+                .split_once(' ')
+                .is_some_and(|(op, _)| op.ends_with("sd"))
+        });
+        let load_op = if any_double { "movsd" } else { "movss" };
+
+        replace_line(
+            store,
+            &mut infos[slot],
+            slot,
+            format!("    {} {}(%rip), {}", load_op, sym, reg),
+        );
+        let tok = format!("{}(%rip)", sym);
+        for &k in sites {
+            let t = store.get(k).to_string();
+            let new = crate::backend::peephole_common::replace_whole_word(&t, &tok, &reg);
+            replace_line(store, &mut infos[k], k, new);
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// Count occurrences of a register token (e.g. `%xmm3`) in `text` with
+/// operand-boundary checks on both sides: `%xmm1` must not match inside
+/// `%xmm11`, and `%ax` must not match inside `%rax`.
+fn mentions_token(text: &str, token: &str) -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(token) {
+        let at = from + rel;
+        let after = at + token.len();
+        let ok_before = at == 0
+            || !text[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '%');
+        let ok_after = !text[after..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        if ok_before && ok_after {
+            count += 1;
+        }
+        from = at + 1;
+    }
+    count
+}
+
+/// True for the canonical zero materializations of %xmm0.
+fn is_xmm0_zeroing(t: &str) -> bool {
+    let t = t.trim();
+    t == "xorpd %xmm0, %xmm0"
+        || t == "xorps %xmm0, %xmm0"
+        || t == "pxor %xmm0, %xmm0"
+        || t == "vxorpd %xmm0, %xmm0, %xmm0"
+        || t == "vxorps %xmm0, %xmm0, %xmm0"
+        || t == "vpxor %xmm0, %xmm0, %xmm0"
+}
+
+/// True when `t` unconditionally overwrites `reg` (its last operand) from
+/// sources that do not include `reg`: the full-width mov families, the
+/// zero-extending narrow movs, and the self-xor zeroings.  Anything else
+/// (ALU/FMA/cvt forms) READS the register even when it also writes it, so
+/// it does not redefine it.
+///
+/// MERGE-WRITE RULE (red-team fix, PR #359 follow-up): the scalar move
+/// forms `movsd`/`movss`/`vmovsd`/`vmovss` with a REGISTER source write
+/// only the low element and PRESERVE the remaining bits of the destination
+/// (SDM: MOVSD/MOVSS 128-bit legacy and VEX forms merge).  Those preserved
+/// bits may have been defined by the very load a fold deletes — a
+/// memory-source scalar load zeroes bits above the element — so treating a
+/// reg-reg scalar move as a full overwrite let the load-folding passes
+/// delete a load whose zeroed high half was still observable through the
+/// merge chain (`vmovsd %xmm12, %xmm11` followed by a packed
+/// `vmovapd %xmm11, ...`).  Reg-reg scalar moves are therefore NOT
+/// overwrites; only their memory-source forms are.  VEX-encoded xor keeps
+/// the full self-xor spelling (`vxorpd %r, %r, %r`) as an overwrite.
+fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
+    let t = t.trim();
+    for z in ["xorpd", "xorps", "pxor", "vxorpd", "vxorps", "vpxor"] {
+        if let Some(rest) = t.strip_prefix(z) {
+            let rest = rest.trim_start();
+            if rest == format!("{}, {}", reg, reg) || rest == format!("{}, {}, {}", reg, reg, reg) {
+                return true;
+            }
+        }
+    }
+    // Scalar merge forms: only the memory-source spelling defines the whole
+    // register (upper bits zeroed); the register-source spelling merges.
+    const MERGE_MOVS: &[&str] = &["vmovsd ", "vmovss ", "movsd ", "movss "];
+    for m in MERGE_MOVS {
+        if let Some(rest) = t.strip_prefix(m) {
+            if let Some((srcs, dst)) = rest.trim().rsplit_once(',') {
+                if dst.trim() == reg
+                    && mentions_token(srcs, reg) == 0
+                    && !srcs.trim_start().starts_with('%')
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    // Full-width packed and zero-extending narrow forms define the whole
+    // register from any source.
+    const FULL_MOVS: &[&str] = &[
+        "vmovapd ", "vmovaps ", "movapd ", "movaps ", "vmovdqa ", "vmovdqu ", "movdqa ", "movdqu ",
+        "vmovd ", "vmovq ", "movd ", "movq ",
+    ];
+    for m in FULL_MOVS {
+        if let Some(rest) = t.strip_prefix(m) {
+            if let Some((srcs, dst)) = rest.trim().rsplit_once(',') {
+                if dst.trim() == reg && mentions_token(srcs, reg) == 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Fold a zero-addend 213-form FMA whose multiplier was JUST loaded into
+/// the 132 form with the load folded into the memory SRC3 slot:
+///
+/// ```text
+///   movsd 8(%rsi), %xmm3              xorpd %xmm0, %xmm0
+///   xorpd %xmm0, %xmm0          ->    vfmadd132sd 8(%rsi), %xmm0, %xmm2
+///   vfmadd213sd %xmm0, %xmm3, %xmm2
+/// ```
+///
+/// 213 computes dst = vvvv*dst + src2 with src2 = the zero; 132 computes
+/// dst = dst*mem + vvvv with the zero moved to vvvv and the multiplier
+/// moved to the memory-legal rm slot.  FP multiplication is commutative
+/// (IEEE 754 requires x*y == y*x bitwise), and both forms read the same
+/// two values in the same roles, so the rewrite is value-identical — this
+/// is the exact form GCC picks for constant-accumulator dot products.
+///
+/// Soundness: the loaded register must be mentioned exactly twice between
+/// the load and the end of the function (the load itself and the FMA), the
+/// same last-mention proof as [`fold_fma_memory_operand`]; the three lines
+/// must be adjacent (NOPs aside) so no label makes the FMA reachable
+/// without the zeroing; and neither the zero nor the destination may be
+/// the loaded register.  The zeroing itself is preserved — %xmm0 is
+/// general scratch, so its zero state is not provable here;
+/// [`eliminate_redundant_xmm0_zeroing`] removes the repeats block-locally.
+pub(super) fn fold_zero_addend_fma213_to_132(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    /// Parse `%xmmN` -> N.
+    fn xmm_num(op: &str) -> Option<u32> {
+        let d = op.strip_prefix("%xmm")?;
+        if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        d.parse().ok()
+    }
+
+    let len = store.len();
+    let mut changed = false;
+    let mut lv: Option<FpLiveness> = None;
+    let mut i = 0;
+    while i + 2 < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        // ── load side: [v]movs{d,s} <mem>, %xmmB ─────────────────────────
+        let li = infos[i].trimmed(store.get(i));
+        let (width, rest) = if let Some(r) = li.strip_prefix("movsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("movss ") {
+            ("ss", r)
+        } else if let Some(r) = li.strip_prefix("vmovsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("vmovss ") {
+            ("ss", r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((addr, dst)) = rest.rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
+        let addr = addr.trim();
+        let Some(b) = xmm_num(dst.trim()) else {
+            i += 1;
+            continue;
+        };
+        if b == 0 || !addr.contains('(') || addr.contains("%xmm") {
+            i += 1;
+            continue;
+        }
+        let b_tok = format!("%xmm{}", b);
+
+        // ── zeroing line ──────────────────────────────────────────────────
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].pinned || !is_xmm0_zeroing(infos[j].trimmed(store.get(j))) {
+            i += 1;
+            continue;
+        }
+
+        // ── FMA side: vfmadd213s{d,s} %xmm0, %xmmB, %dstA ────────────────
+        let k = next_non_nop(infos, j + 1, len);
+        if k >= len || infos[k].pinned {
+            i += 1;
+            continue;
+        }
+        let lk = infos[k].trimmed(store.get(k));
+        let Some(body) = lk.strip_prefix(&format!("vfmadd213{} ", width)) else {
+            i += 1;
+            continue;
+        };
+        let ops: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
+        let ok =
+            ops.len() == 3 && ops[0] == "%xmm0" && ops[1] == b_tok && xmm_num(ops[2]) != Some(b);
+        if !ok {
+            i += 1;
+            continue;
+        }
+
+        // ── liveness: the FMA must be the LAST reader of the loaded value
+        //    (%xmmB) on every path — CFG-aware dataflow, same contract as
+        //    fold_fma_memory_operand. ─────────────────────────────────────────
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, k, b, &[i, k]) {
+            i += 1;
+            continue;
+        }
+
+        mark_nop(&mut infos[i]);
+        replace_line(
+            store,
+            &mut infos[k],
+            k,
+            format!("    vfmadd132{} {}, %xmm0, {}", width, addr, ops[2]),
+        );
+        lv_ref.refresh_at(store, infos, i);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+/// Delete `xorpd %xmm0, %xmm0` (and pxor/vxorpd/vxorps forms) whose zero is
+/// still live from an earlier zeroing in the same basic block.  Forward
+/// state machine: the zero state is set by a zeroing, and cleared by any
+/// line whose LAST operand is %xmm0 (the AT&T destination — writes only;
+/// reads of %xmm0 such as `vfmadd213sd %xmm0, ...` preserve it), by any
+/// call/label/branch/ret (control flow merges unknown states; calls
+/// clobber), and by opaque inline asm.  This is what turns the per-
+/// accumulator zero materialization of a constant-accumulator loop into
+/// GCC's single resident zero.
+pub(super) fn eliminate_redundant_xmm0_zeroing(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut zero_live = false;
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        if is_xmm0_zeroing(t) {
+            if zero_live && !infos[i].pinned {
+                mark_nop(&mut infos[i]);
+                changed = true;
+            } else {
+                zero_live = true;
+            }
+            continue;
+        }
+        match infos[i].kind {
+            LineKind::Label
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::InlineAsm => zero_live = false,
+            _ => {
+                // Writes %xmm0 exactly when the last AT&T operand is %xmm0.
+                if t.rsplit_once(',')
+                    .map(|(_, last)| last.trim() == "%xmm0")
+                    .unwrap_or(false)
+                {
+                    zero_live = false;
+                }
+            }
+        }
+    }
+    changed
+}
+
+pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    use super::super::types::register_family_fast;
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    let dbg = std::env::var("CCC_DEBUG_LCR").is_ok();
+    let mut stats = [0u32; 6]; // loads, copy-ok, dead, fused, copy-bad, not-dead
+    let mut cur_fn = String::new();
+
+    // Parse "MNEM MEM, %reg" with a parenthesized MEM that has no segment
+    // prefix, lock/rep prefix, or destination-in-source aliasing concerns.
+    fn parse_mem_load(t: &str) -> Option<(&str, &str, &str)> {
+        const LOADS: &[&str] = &[
+            "movzbl", "movzbw", "movzwl", "movslq", "movswq", "movsbq", "movsbl", "movswl", "movl",
+            "movq",
+        ];
+        let mnem = LOADS
+            .iter()
+            .find(|m| t.starts_with(*m) && t.as_bytes().get(m.len()) == Some(&b' '))?;
+        let rest = &t[mnem.len() + 1..];
+        let comma = rest.rfind(',')?;
+        let mem = rest[..comma].trim();
+        let dst = rest[comma + 1..].trim();
+        // A validated segment override (`%gs:8(%rsi)`) qualifies the address
+        // space and travels with the operand, so strip it and judge the
+        // address body; `*%gs:…`, `%gss:…` and lock/rep-prefixed spellings
+        // stay refused (the mnemonic table cannot produce the last one
+        // anyway).  This rewrite retargets the load's destination IN PLACE —
+        // it never re-reads memory at a later position — so, unlike the ALU
+        // fusion, it needs no adjacency requirement for segmented operands.
+        // `CCC_NO_SEG_OPERAND_FUSE=1` (shared with load_op_fuse) restores the
+        // pre-fusion refusal for A/B measurement.
+        let (_, body) = if std::env::var_os("CCC_NO_SEG_OPERAND_FUSE").is_some() {
+            ("", mem)
+        } else {
+            super::relay_and_lea::strip_segment_prefix(mem)
+        };
+        if !body.contains('(') || body.starts_with('%') || body.contains('%') && !body.contains('(')
+        {
+            return None;
+        }
+        if !dst.starts_with('%') {
+            return None;
+        }
+        if body.contains(':') {
+            return None;
+        }
+        Some((mnem, mem, dst))
+    }
+
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        if dbg && t.ends_with(':') && !t.starts_with('.') && !t.starts_with('%') {
+            cur_fn = t.trim_end_matches(':').to_string();
+        }
+        let (mnem, mem, dst) = match parse_mem_load(t) {
+            Some(x) => x,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        stats[0] += 1;
+        let load_fam = register_family_fast(dst);
+        if load_fam == super::super::types::REG_NONE {
+            i += 1;
+            continue;
+        }
+        // The memory operand must be a pure address (no write side effects),
+        // and we must be able to re-emit it unchanged.
+        // Find the copy: the next non-NOP instruction must be a pure
+        // register-to-register mov consuming the loaded register.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].is_barrier() || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let tc = infos[j].trimmed(store.get(j));
+        let copy_parts: Vec<&str> = tc.split(", ").collect();
+        let copy_ok = if copy_parts.len() == 2 {
+            // copy_parts[0] still carries the mnemonic ("movl %r8d").
+            let src = copy_parts[0].rsplit_once(' ').map(|(_, r)| r).unwrap_or("");
+            let cdest = copy_parts[1];
+            let is_movq = tc.starts_with("movq ");
+            let is_movl = tc.starts_with("movl ");
+            // Both copy operands must be GENERAL-PURPOSE registers: the
+            // family mapper aliases %xmm/%ymm names onto GPR families, and a
+            // GPR<->XMM move is a conversion, never a pure relay.
+            let is_gp = |r: &str| r.starts_with("%r") || r.starts_with("%e");
+            if !(is_movq || is_movl) {
+                false
+            } else if !is_gp(src) || !is_gp(cdest) || cdest.contains('(') {
+                false
+            } else {
+                let src_fam = register_family_fast(src);
+                let dest_fam = register_family_fast(cdest);
+                if src_fam != load_fam
+                    || dest_fam == super::super::types::REG_NONE
+                    || src_fam == dest_fam
+                {
+                    false
+                } else if mem.contains(cdest) {
+                    false
+                } else {
+                    match (mnem, is_movl) {
+                        // Zero-extending loads: 32-bit and 64-bit copies both
+                        // reproduce the same full-register value.
+                        ("movzbl", _) | ("movzbw", _) | ("movzwl", _) | ("movl", _) => true,
+                        // Sign-extending loads: only a width-preserving 64-bit
+                        // copy keeps the sign extension intact.
+                        ("movslq", false) | ("movswq", false) | ("movsbq", false) => true,
+                        ("movq", false) => true,
+                        _ => false,
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        if !copy_ok {
+            stats[4] += 1;
+            if dbg && stats[4] < 30 {
+                eprintln!("[LCR][{}] copy-bad: load=[{}] copy=[{}]", cur_fn, t, tc);
+            }
+            i += 1;
+            continue;
+        }
+        stats[1] += 1;
+        let cdest = copy_parts[1];
+        // Prove the loaded register is dead after the copy within a bounded
+        // window: no read before the next write; calls kill caller-saved regs.
+        let mut dead = false;
+        let mut k = j + 1;
+        let limit = (len).min(j + 16);
+        while k < limit {
+            if infos[k].is_nop() {
+                k += 1;
+                continue;
+            }
+            if infos[k].pinned {
+                // Pinned lines are immovable; if one references the loaded
+                // register we cannot prove deadness inside this window.
+                if infos[k].reg_refs & (1u16 << load_fam) != 0 {
+                    break;
+                }
+                k += 1;
+                continue;
+            }
+            if infos[k].is_barrier() {
+                // A call CONSUMES the loaded register if it is passed as an
+                // argument — the fuse would retarget the load and the call
+                // would read the un-loaded register. The call-site authority
+                // (`call_window_verdict`: argument count, variadic %al,
+                // static chain, retpoline target, IPA keep set, the call's
+                // own text) decides; only a caller-saved family the call
+                // provably does not read is killed by it. Checking the call
+                // TEXT alone missed every implicit argument read
+                // (`movq 8(%rbx), %rdi; movq %rdi, %r12; call g`).
+                if matches!(infos[k].kind, LineKind::Call)
+                    && call_window_verdict(store, infos, k, load_fam) == Some(true)
+                {
+                    dead = true;
+                }
+                // Labels/branches: conservatively keep the value (another path
+                // may read it), unless we already saw a full overwrite.
+                break;
+            }
+            match infos[k].kind {
+                LineKind::LoadRbp { reg, .. } if reg == load_fam => {
+                    dead = true;
+                    break;
+                }
+                LineKind::Pop { reg } if reg == load_fam => {
+                    dead = true;
+                    break;
+                }
+                _ => {
+                    // Instructions with implicit register usage (cltq/cqto/cdq/
+                    // cqo read %eax, div/idiv/mul read %rax:%rdx, shld/shrd read
+                    // %cl) can read the loaded register even when the text names
+                    // no register of this family. They are never a pure write, so
+                    // they must veto the fuse: retargeting the load would leave
+                    // the implicit read seeing an un-loaded register.
+                    // (Regression: gzip 1.14 pqdownheap/gen_codes SIGBUS/SIGSEGV
+                    // when `cltq` after a relayed load read undefined %eax.)
+                    let td = infos[k].trimmed(store.get(k));
+                    if implicit_read_reg_family(td) == Some(load_fam) {
+                        break;
+                    }
+                    if infos[k].reg_refs & (1u16 << load_fam) != 0 {
+                        // A FULL redefinition of the family kills the loaded
+                        // value; anything else (a read, a read-modify-write, a
+                        // store of the register, a byte/word partial write)
+                        // vetoes the fuse.  The authoritative predicate is the
+                        // same one relay elimination and the narrow-copy fold
+                        // use, so the three passes agree by construction.
+                        //
+                        // This replaces a `writes && !reads_src` test whose
+                        // `reads_src` half searched the whole line text for any
+                        // spelling of the family — including the destination —
+                        // and therefore never proved deadness for a line that
+                        // names the family at all; only the `LoadRbp`/`Pop`
+                        // fast paths above could fuse.
+                        if super::relay_and_lea::is_full_write(&infos[k], td, load_fam) {
+                            dead = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            k += 1;
+        }
+        if !dead {
+            stats[5] += 1;
+            if dbg && stats[5] < 30 {
+                eprintln!("[LCR][{}] not-dead: load=[{}] copy=[{}]", cur_fn, t, tc);
+            }
+            i = j + 1;
+            continue;
+        }
+        stats[2] += 1;
+        // Rewrite the load to target the copy's destination; drop the copy.
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static LCR_FUSED: AtomicU32 = AtomicU32::new(0);
+            let lim = std::env::var("CCC_LCR_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            if let Some(l) = lim {
+                if LCR_FUSED.load(Ordering::Relaxed) >= l {
+                    i = j + 1;
+                    continue;
+                }
+                LCR_FUSED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        stats[3] += 1;
+        if dbg {
+            eprintln!(
+                "[LCR][{}] FUSE #{}: [{}] + [{}] -> dest {}",
+                cur_fn, stats[3], t, tc, cdest
+            );
+        }
+        let new_load = format!("    {} {}, {}", mnem, mem, cdest);
+        replace_line(store, &mut infos[i], i, new_load);
+        mark_nop(&mut infos[j]);
+        changed = true;
+        i = j + 1;
+    }
+    if dbg && stats[0] > 0 {
+        eprintln!(
+            "[LCR] loads={} copy-ok={} dead={} fused={} copy-bad={} not-dead={}",
+            stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]
+        );
+    }
+    changed
+}
+
+/// Every textual name of a register family (all widths): a read of ANY of
+/// them after the relay would see a value the retargeted load no longer
+/// provides, so all of them must veto the fuse.
+fn reg_names_family(fam: u8) -> &'static [&'static str] {
+    match fam {
+        0 => &["%rax", "%eax", "%ax", "%al", "%ah"],
+        1 => &["%rcx", "%ecx", "%cx", "%cl", "%ch"],
+        2 => &["%rdx", "%edx", "%dx", "%dl", "%dh"],
+        3 => &["%rbx", "%ebx", "%bx", "%bl", "%bh"],
+        4 => &["%rsp", "%esp", "%sp", "%spl"],
+        5 => &["%rbp", "%ebp", "%bp", "%bpl"],
+        6 => &["%rsi", "%esi", "%si", "%sil"],
+        7 => &["%rdi", "%edi", "%di", "%dil"],
+        8 => &["%r8", "%r8d", "%r8w", "%r8b"],
+        9 => &["%r9", "%r9d", "%r9w", "%r9b"],
+        10 => &["%r10", "%r10d", "%r10w", "%r10b"],
+        11 => &["%r11", "%r11d", "%r11w", "%r11b"],
+        12 => &["%r12", "%r12d", "%r12w", "%r12b"],
+        13 => &["%r13", "%r13d", "%r13w", "%r13b"],
+        14 => &["%r14", "%r14d", "%r14w", "%r14b"],
+        15 => &["%r15", "%r15d", "%r15w", "%r15b"],
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod fold_load_copy_relay_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_load_copy_relay;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_load_copy_relay(&mut store, &mut infos);
+        let out = (0..store.len()).map(|i| store.get(i).to_string()).collect();
+        (changed, out)
+    }
+
+    /// Regression: gzip 1.14 pqdownheap prologue. After a redundant-copy
+    /// elimination the sequence is:
+    ///   movslq 40(%rsp), %rax ; movq %rax, %rbp ; cltq ; movq %rax, 16(%rsp)
+    /// `cltq` implicitly READS %eax (the loaded value's low 32 bits) and then
+    /// writes %rax. Treating it as a pure write to %rax let the pass retarget
+    /// the load to %rbp, leaving `cltq` reading undefined %eax and storing
+    /// garbage (SIGBUS in pqdownheap / SIGSEGV in gen_codes).
+    #[test]
+    fn refuses_fuse_when_cltq_reads_loaded_register() {
+        let asm = "\
+    movslq 40(%rsp), %rax\n\
+    movq %rax, %rbp\n\
+    cltq\n\
+    movq %rax, 16(%rsp)\n\
+    leaq heap(%rip), %r9\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "fuse must be refused: cltq reads %eax implicitly");
+    }
+
+    /// A call reads its argument registers without naming them: the window
+    /// must ask the call-site authority (`call_window_verdict`), not the
+    /// call's text. Loading the first argument and copying it to a
+    /// callee-saved home is the ordinary "keep x across f(x)" shape; the fuse
+    /// used to retarget the load to %r12 and call `g` with a stale %rdi.
+    #[test]
+    fn refuses_fuse_when_a_call_reads_the_loaded_argument_register() {
+        let asm = concat!(
+            "    movq 8(%rbx), %rdi\n",
+            "    movq %rdi, %r12\n",
+            "    call g\n",
+            "    movq %r12, %rax\n",
+        );
+        let (changed, _) = run(asm);
+        assert!(!changed, "g reads %rdi: the load must keep its register");
+        // With the codegen's marker saying the call reads no GP argument the
+        // caller-saved clobber is a genuine kill, and the fuse is legal.
+        let no_args = asm.replace("    call g\n", "    call g\n    # LCCC_CALL_ARGS 0\n");
+        assert_ne!(no_args, asm, "fixture must carry the marker");
+        let (changed, out) = run(&no_args);
+        assert!(
+            changed,
+            "a zero-argument call clobbers %rdi unread: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.trim() == "movq 8(%rbx), %r12"),
+            "{out:?}"
+        );
+    }
+
+    /// A plain dead copy with no implicit reader MAY be fused.
+    #[test]
+    fn fuses_when_loaded_register_is_truly_dead() {
+        let asm = "\
+    movslq 40(%rsp), %rax\n\
+    movq %rax, %rbp\n\
+    movslq 8(%rsp), %rax\n\
+    movslq heap_len(%rip), %r10\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "safe relay should fuse");
+        assert!(
+            out[0].contains("%rbp"),
+            "load retargeted to copy dest: {out:?}"
+        );
+    }
+
+    /// A segment-qualified load relays exactly like a DS-relative one: the
+    /// rewrite retargets the load's destination IN PLACE (it never re-reads
+    /// memory at a later position), so the override travels with the operand
+    /// and `movq %gs:8(%rsi), %rax ; movq %rax, %r8` becomes
+    /// `movq %gs:8(%rsi), %r8`.
+    #[test]
+    fn fuses_segment_qualified_load_relay() {
+        let asm = "\
+    movq %gs:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movq 8(%rdi), %rax\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "segment relay should fuse");
+        assert!(
+            out[0].contains("%gs:8(%rsi), %r8"),
+            "load retargeted to the copy destination with the override intact: {out:?}"
+        );
+    }
+
+    /// `%gss:` is not one of the six segment registers — the operand must be
+    /// refused, not relayed with a bogus prefix.
+    #[test]
+    fn refuses_malformed_segment_prefix() {
+        let asm = "\
+    movq %gss:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movq 8(%rdi), %rax\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "malformed segment prefix must not relay");
+    }
+
+    /// A full 64-bit redefinition of the loaded register through an ordinary
+    /// (non-stack) instruction kills the loaded value just like a stack load
+    /// does, so the relay fuses.
+    #[test]
+    fn fuses_when_family_is_redefined_by_a_plain_move() {
+        let asm = "\
+    movq %gs:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movq 8(%rdi), %rax\n\
+";
+        let (changed, out) = run(asm);
+        assert!(
+            changed,
+            "full redefinition should license the relay: {out:?}"
+        );
+    }
+
+    /// ...but a byte/word partial write leaves the upper bits observable and
+    /// must veto it.
+    #[test]
+    fn refuses_fuse_when_only_part_of_the_family_is_rewritten() {
+        let asm = "\
+    movq %gs:8(%rsi), %rax\n\
+    movq %rax, %r8\n\
+    movb %dl, %al\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "partial write must not prove deadness");
+    }
+
+    /// Shifts reading %cl must veto a relay of a %rcx-family load.
+    #[test]
+    fn refuses_fuse_when_shld_reads_cl() {
+        let asm = "\
+    movslq 8(%rsp), %rcx\n\
+    movq %rcx, %rdx\n\
+    shldq $1, %rdx, %rax\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "shld reads %cl implicitly; fuse must be refused");
+    }
+}
+
+#[cfg(test)]
+mod fma_mem_fold_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_fma_memory_operand;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_fma_memory_operand(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// The canonical dot-product shape: single-use b-element load folded
+    /// into the FMA's memory src2 slot.
+    #[test]
+    fn folds_single_use_load_into_fma_src2() {
+        let (changed, out) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n");
+        assert!(changed, "single-use load should fold");
+        assert_eq!(out.len(), 1, "load must be gone: {out:?}");
+        assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
+    }
+
+    /// A later mention of the loaded register vetoes the fold — the value
+    /// is still needed after the FMA.
+    #[test]
+    fn refuses_when_register_mentioned_later() {
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   vaddsd %xmm11, %xmm0, %xmm0\n");
+        assert!(!changed, "later reader must veto the fold");
+    }
+
+    /// %xmm16 and above have no VEX encoding, so a load into them must
+    /// never fold — even if every other precondition holds.  The rejection
+    /// is deliberate (audit F4): leaving it to `mentions() == 0` as a side
+    /// effect of the parser's reach would let a future EVEX-aware parser
+    /// silently emit an unencodable re-write.
+    #[test]
+    fn refuses_xmm16_and_above() {
+        let (changed, out) = run("    movsd 32(%rsi), %xmm16\n\
+             \x20   vfmadd231sd %xmm16, %xmm10, %xmm2\n");
+        assert!(
+            !changed,
+            "xmm16 has no VEX encoding; the fold must be refused"
+        );
+        assert_eq!(out.len(), 2, "both lines must survive verbatim: {out:?}");
+        assert_eq!(out[0], "movsd 32(%rsi), %xmm16");
+        assert_eq!(out[1], "vfmadd231sd %xmm16, %xmm10, %xmm2");
+    }
+
+    /// A later FULL overwrite of the loaded register kills the loaded
+    /// value, so the fold is sound: everything past the overwrite uses
+    /// the new value.  This is the register-reuse shape real allocators
+    /// emit constantly (the dot8d SSE2 kernel reuses %xmm3 for the last
+    /// a-element load).
+    #[test]
+    fn folds_when_next_mention_fully_overwrites() {
+        let (changed, out) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   movsd 40(%rdi), %xmm11\n");
+        assert!(changed, "pure overwrite kills the loaded value");
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
+        assert_eq!(out[1], "movsd 40(%rdi), %xmm11");
+    }
+
+    /// SIB addressing has commas of its own; the destination check must
+    /// look past them to the final operand.
+    #[test]
+    fn folds_when_overwrite_uses_sib_addressing() {
+        let (changed, out) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   vmovsd 32(%rdi,%rax,8), %xmm11\n");
+        assert!(changed, "SIB-addressed overwrite still kills the value");
+        assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
+        assert_eq!(out.len(), 2, "{out:?}");
+    }
+
+    /// A self-zeroing xor is a full overwrite too.
+    #[test]
+    fn folds_when_next_mention_is_self_zeroing_xor() {
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   pxor %xmm11, %xmm11\n");
+        assert!(changed, "pxor zeroes the whole register");
+    }
+
+    /// A STORE mentioning the register reads it — not an overwrite.
+    #[test]
+    fn refuses_when_next_mention_is_a_store() {
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   movsd %xmm11, (%rax)\n");
+        assert!(!changed, "a store reads the loaded value");
+    }
+
+    /// A partial write (movhpd keeps the low half) does not kill the
+    /// loaded value.
+    #[test]
+    fn refuses_when_next_mention_partially_writes() {
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   movhpd (%rax), %xmm11\n");
+        assert!(!changed, "movhpd leaves the low lane untouched");
+    }
+
+    /// RED-TEAM REGRESSION (PR #359 follow-up): the three-mention scan must
+    /// apply the same merge-write rule as the two-mention proof — a reg-reg
+    /// scalar `vmovsd` past load+consumer is NOT a full overwrite (it
+    /// preserves the high bits the deleted load zeroed).
+    #[test]
+    fn refuses_reg_reg_scalar_movsd_merge_after_consumer() {
+        let (changed, _) = run("    movapd %xmm9, %xmm11\n\
+             \x20   movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   vmovsd %xmm12, %xmm11\n\
+             \x20   vmovapd %xmm11, %xmm5\n");
+        assert!(
+            !changed,
+            "merge write preserves high bits from the deleted load"
+        );
+    }
+
+    /// dest == loaded register means the FMA line mentions it twice; the
+    /// two-mention budget is exhausted, so the fold is refused (sound even
+    /// though the rewrite would actually be valid).
+    #[test]
+    fn refuses_when_dest_equals_loaded_reg() {
+        let (changed, _) = run("    movsd (%rsi), %xmm2\n\
+             \x20   vfmadd231sd %xmm2, %xmm3, %xmm2\n");
+        assert!(!changed, "dest==src2 shape must be refused");
+    }
+
+    /// Mentions BEFORE the load are irrelevant (the load redefines the
+    /// register), so a home reused across iterations stays foldable — and
+    /// both pairs fold: the first feeds a 213 form's multiplicand, which
+    /// re-encodes as 132 with the load at operand 0 (`xmm2 = xmm2 * mem +
+    /// xmm0`, the same roles as `xmm2 = xmm5 * xmm2 + xmm0` with `xmm5` the
+    /// loaded value), and the second is the plain 231 case.
+    #[test]
+    fn folds_reused_home_when_later_use_is_last() {
+        let (changed, out) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd213sd %xmm0, %xmm5, %xmm2\n\
+             \x20   movsd 56(%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
+             \x20   ret\n");
+        assert!(changed, "both loads should fold");
+        assert_eq!(
+            out,
+            vec![
+                "vfmadd132sd (%rsi), %xmm0, %xmm2",
+                "vfmadd231sd 56(%rsi), %xmm3, %xmm8",
+                "ret",
+            ],
+            "{out:?}"
+        );
+    }
+
+    /// A call after the pair reads the FP argument registers its census
+    /// (`movb $N, %al`, emitted by lccc for every call with FP arguments)
+    /// names — veto for the loaded register when it is inside that range.
+    #[test]
+    fn refuses_when_call_intervenes_for_arg_reg() {
+        let (changed, _) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
+             \x20   movb $6, %al\n\
+             \x20   call printf\n");
+        assert!(!changed, "call reads %xmm5 as its sixth FP argument");
+    }
+
+    /// A census below the register's index proves the call does not read
+    /// it: the fold stays enabled.
+    #[test]
+    fn folds_past_call_whose_census_excludes_the_register() {
+        let (changed, out) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
+             \x20   movb $2, %al\n\
+             \x20   call printf\n");
+        assert!(changed, "two FP arguments: %xmm5 is not read: {out:?}");
+        assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
+    }
+
+    /// Same shape with a register outside the argument range: xmm11 is
+    /// never an implicit call operand, so the fold is safe.
+    #[test]
+    fn folds_past_call_for_non_arg_reg() {
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n\
+             \x20   call printf\n");
+        assert!(changed, "xmm11 cannot be a variadic arg");
+        assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
+    }
+
+    /// Token-bounded matching: a later `%xmm11` mention is NOT a mention
+    /// of `%xmm1` and must not veto the fold.
+    #[test]
+    fn token_boundary_distinguishes_xmm1_from_xmm11() {
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
+             \x20   vfmadd231sd %xmm1, %xmm3, %xmm8\n\
+             \x20   movsd (%rdi), %xmm11\n");
+        assert!(changed, "%xmm11 must not count as %xmm1");
+        assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
+    }
+
+    /// Width mismatch (movss load feeding an -sd FMA) is not our pattern.
+    #[test]
+    fn refuses_width_mismatch() {
+        let (changed, _) = run("    movss (%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n");
+        assert!(!changed, "ss load must not fold into sd fma");
+    }
+
+    /// Every form has exactly one memory-legal slot, operand 0, and the
+    /// forms are the same computation with the roles permuted: a load that
+    /// feeds operand 0 of a 213 form (the addend) folds in place, a load that
+    /// feeds operand 1 (a multiplicand) folds after re-encoding as 132, and a
+    /// 132 form's operand 1 (the addend) folds after re-encoding as 213.  The
+    /// destination is the one role that never has a memory encoding.
+    #[test]
+    fn folds_every_form_by_re_encoding_around_the_memory_slot() {
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
+             \x20   vfmadd213sd %xmm11, %xmm3, %xmm8\n");
+        assert!(changed);
+        assert_eq!(out, vec!["vfmadd213sd (%rsi), %xmm3, %xmm8"]);
+
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
+             \x20   vfmadd213sd %xmm3, %xmm11, %xmm8\n");
+        assert!(changed);
+        assert_eq!(out, vec!["vfmadd132sd (%rsi), %xmm3, %xmm8"]);
+
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
+             \x20   vfnmsub132ss %xmm3, %xmm11, %xmm8\n");
+        assert!(!changed, "an ss FMA must not take an sd load");
+        assert_eq!(out.len(), 2);
+        let (changed, out) = run("    movss (%rsi), %xmm11\n\
+             \x20   vfnmsub132ss %xmm3, %xmm11, %xmm8\n");
+        assert!(changed);
+        assert_eq!(out, vec!["vfnmsub213ss (%rsi), %xmm3, %xmm8"]);
+
+        // nbody's shape: the staged multiplicand sits at operand 1 of a 231.
+        let (changed, out) = run("    movsd bodies+96(%rip), %xmm5\n\
+             \x20   vfmadd231sd %xmm4, %xmm5, %xmm3\n");
+        assert!(changed);
+        assert_eq!(out, vec!["vfmadd231sd bodies+96(%rip), %xmm4, %xmm3"]);
+
+        // The destination role: no form can read it from memory.
+        let (changed, _) = run("    movsd (%rsi), %xmm8\n\
+             \x20   vfmadd132sd %xmm3, %xmm11, %xmm8\n");
+        assert!(!changed, "the destination has no memory encoding");
+    }
+
+    /// A register that plays two roles cannot be folded once: the second
+    /// read would be left reading a register nothing defines.
+    #[test]
+    fn refuses_a_load_that_feeds_two_roles() {
+        let (changed, _) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm5, %xmm8\n");
+        assert!(!changed, "x*x needs the register twice");
+        let (changed, _) = run("    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd132sd %xmm5, %xmm5, %xmm8\n");
+        assert!(!changed);
+    }
+
+    /// A label between the load and the FMA means the FMA is reachable
+    /// without the load — adjacency (NOPs aside) is mandatory.
+    #[test]
+    fn refuses_when_label_between() {
+        let (changed, _) = run("    movsd (%rsi), %xmm11\n\
+             .L5:\n\
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n");
+        assert!(!changed, "label breaks adjacency");
+    }
+
+    /// A BRANCH between the FMA and the "killing" overwrite breaks the
+    /// whole-function textual proof: when the branch is taken, %xmm5 still
+    /// holds the LOADED value at the merge, and the reader past `.Ldone`
+    /// depends on it.  The overwrite only dominates the fall-through path,
+    /// so the fold must be refused even though the first later mention is a
+    /// pure full-width overwrite.
+    #[test]
+    fn refuses_when_branch_bypasses_the_killing_overwrite() {
+        let (changed, out) = run("    movsd 32(%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm10, %xmm2\n\
+             \x20   jne .Ldone\n\
+             \x20   vmovsd 40(%rdi), %xmm5\n\
+             .Ldone:\n\
+             \x20   vaddsd %xmm5, %xmm3, %xmm3\n\
+             \x20   ret\n");
+        assert!(!changed, "taken path reads the loaded value: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fma132_zero_tests {
+    use super::super::super::types::classify_line;
+    use super::{eliminate_redundant_xmm0_zeroing, fold_zero_addend_fma213_to_132};
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let mut changed = fold_zero_addend_fma213_to_132(&mut store, &mut infos);
+        changed |= eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// The canonical dot-product first-iteration shape: the b load folds
+    /// into the 132-form memory slot, the zeroing stays for the FMA.
+    #[test]
+    fn folds_zero_addend_triple_to_132() {
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n");
+        assert!(changed, "triple must fold");
+        assert_eq!(out.len(), 2, "b load must be gone: {out:?}");
+        assert_eq!(out[0], "xorpd %xmm0, %xmm0");
+        assert_eq!(out[1], "vfmadd132sd (%rsi), %xmm0, %xmm2");
+    }
+
+    /// A later use of the loaded register vetoes the fold.
+    #[test]
+    fn refuses_when_multiplier_used_later() {
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   vaddsd %xmm3, %xmm2, %xmm2\n");
+        assert!(!changed, "later reader must veto");
+    }
+
+    /// Without the zeroing line between, the 132 rewrite would read an
+    /// unproven %xmm0 — refuse.
+    #[test]
+    fn refuses_without_zeroing_line() {
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n");
+        assert!(!changed, "missing zeroing must veto");
+    }
+
+    /// A label between load and zeroing breaks adjacency (the FMA could be
+    /// entered without the load).
+    #[test]
+    fn refuses_when_label_between() {
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
+             .L5:\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n");
+        assert!(!changed, "label breaks adjacency");
+    }
+
+    /// The dot8 first-iteration shape: four triples collapse to ONE zeroing
+    /// plus four 132-form FMAs (the b loads all fold, the repeated xorpds
+    /// die block-locally).
+    #[test]
+    fn dot8_first_iteration_collapses_to_one_zero() {
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   movsd 8(%rsi), %xmm5\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm5, %xmm4\n\
+             \x20   movsd 16(%rsi), %xmm7\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm7, %xmm6\n\
+             \x20   movsd 24(%rsi), %xmm9\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm9, %xmm8\n");
+        assert!(changed);
+        let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
+        assert_eq!(zeros, 1, "exactly one resident zero: {out:?}");
+        let fma132 = out.iter().filter(|l| l.starts_with("vfmadd132sd")).count();
+        assert_eq!(fma132, 4, "all four must be 132-form: {out:?}");
+    }
+
+    /// The zero state dies at a call: the zeroing after it must stay.
+    #[test]
+    fn zero_state_dies_at_call() {
+        let (_, out) = run("    xorpd %xmm0, %xmm0\n\
+             \x20   call foo\n\
+             \x20   xorpd %xmm0, %xmm0\n");
+        let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
+        assert_eq!(zeros, 2, "call clobbers the zero: {out:?}");
+    }
+
+    /// Reads of %xmm0 (as an FMA addend) preserve the zero state; a write
+    /// (last operand) kills it.
+    #[test]
+    fn zero_state_survives_reads_dies_on_writes() {
+        let (_, out) = run("    xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vaddsd %xmm1, %xmm0\n\
+             \x20   xorpd %xmm0, %xmm0\n");
+        let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
+        // first stays; second dies (still zero after the read); third stays
+        // (the 2-operand vaddsd wrote %xmm0).
+        assert_eq!(zeros, 2, "read preserves, write kills: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fma132_reuse_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_zero_addend_fma213_to_132;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_zero_addend_fma213_to_132(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// The dot8 iteration-2 register-reuse shape: %xmm3 is later redefined
+    /// by a pure load, so the first-iteration fold is still sound.
+    #[test]
+    fn folds_when_multiplier_redefined_later() {
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   movsd 56(%rdi), %xmm3\n\
+             \x20   vfmadd231sd 56(%rsi), %xmm3, %xmm8\n");
+        assert!(changed, "pure later redefinition must allow the fold");
+        assert!(
+            out.iter().any(|l| l == "vfmadd132sd (%rsi), %xmm0, %xmm2"),
+            "expected 132 form: {out:?}"
+        );
+    }
+
+    /// A later read-modify-write whose DEST is the multiplier still reads
+    /// the loaded value — must veto.
+    #[test]
+    fn refuses_rmw_on_multiplier() {
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   vaddsd %xmm1, %xmm3, %xmm3\n");
+        assert!(!changed, "rmw reads the loaded value");
+    }
+
+    /// Same dominance gap as the other two folds: a branch between the FMA
+    /// and the later redefinition means the branch-taken path reaches the
+    /// merge reader with the LOADED multiplier intact.  The textual
+    /// whole-function scan must refuse despite the pure overwrite being the
+    /// first later mention.
+    #[test]
+    fn refuses_when_branch_between_fma_and_redefinition() {
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   jne .Ldone\n\
+             \x20   movsd 56(%rdi), %xmm3\n\
+             .Ldone:\n\
+             \x20   vaddsd %xmm3, %xmm0, %xmm0\n\
+             \x20   ret\n");
+        assert!(!changed, "taken path reads the loaded multiplier: {out:?}");
+    }
+
+    /// Same call-as-argument-reader gap as fold_fp_register_loads: the
+    /// loaded multiplier %xmm1 survives the FMA (dest %xmm2), and a later
+    /// call may read it implicitly as its second FP argument.  The first
+    /// TEXTUAL mention being a pure overwrite does not make the value
+    /// dead — the call in between reads it without mentioning it.
+    #[test]
+    fn refuses_when_call_reads_loaded_multiplier_register() {
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm1, %xmm2\n\
+             \x20   movb $2, %al\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm3, %xmm1\n");
+        assert!(
+            !changed,
+            "the call reads %xmm1 as its second argument: {out:?}"
+        );
+    }
+
+    /// The veto is call-specific: a non-call line in the stretch leaves
+    /// the fold enabled.
+    #[test]
+    fn still_folds_when_non_call_intervenes() {
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm1, %xmm2\n\
+             \x20   vaddsd %xmm4, %xmm3, %xmm3\n\
+             \x20   vmovapd %xmm3, %xmm1\n");
+        assert!(
+            changed,
+            "no implicit reader of %xmm1 in the stretch: {out:?}"
+        );
+    }
+
+    /// A call is harmless when the multiplier lives in the callee-saved
+    /// half: %xmm9 is never an implicit call operand.
+    #[test]
+    fn still_folds_when_call_does_not_read_callee_saved_reg() {
+        let (changed, out) = run("    movsd (%rsi), %xmm9\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm9, %xmm2\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm3, %xmm9\n");
+        assert!(changed, "xmm9 is not an implicit call operand: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fp_reg_load_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_fp_register_loads;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_fp_register_loads(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// A Call is an OPAQUE reader of %xmm0-%xmm7 (the SysV FP argument
+    /// registers): when the loaded value is passed to the call, the caller
+    /// reads it implicitly and the read is invisible to a textual scan
+    /// ("call foo" mentions no register — the argument move is a self-move
+    /// the builder elided).  The later full overwrite therefore does NOT
+    /// prove the loaded value dead: the call in between would read a stale
+    /// register.  (Unreachable through the current per-use constant
+    /// materialization; pinned as defense in depth so the contract holds
+    /// if the isel ever shares one load across uses.)
+    #[test]
+    fn refuses_when_call_reads_loaded_arg_register() {
+        let (changed, out) = run("    movsd (%rsi), %xmm0\n\
+             \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
+             \x20   movb $1, %al\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm1, %xmm0\n");
+        assert!(!changed, "the call reads %xmm0 as its argument: {out:?}");
+    }
+
+    /// No census, no staging: a GP-only call reads no XMM register, so a
+    /// value parked in an argument register survives it as dead.
+    #[test]
+    fn folds_past_gp_only_call() {
+        let (changed, out) = run("    movsd (%rsi), %xmm0\n\
+             \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
+             \x20   movq %rbx, %rdi\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm1, %xmm0\n");
+        assert!(changed, "GP-only call does not read %xmm0: {out:?}");
+    }
+
+    /// Same stretch with a non-call line in place of the call: the fold
+    /// must stay enabled (the veto is call-specific, not a general
+    /// straight-line restriction).
+    #[test]
+    fn still_folds_when_non_call_intervenes() {
+        let (changed, out) = run("    movsd (%rsi), %xmm0\n\
+             \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
+             \x20   vaddsd %xmm4, %xmm2, %xmm2\n\
+             \x20   vmovapd %xmm1, %xmm0\n");
+        assert!(
+            changed,
+            "no implicit reader between load and overwrite: {out:?}"
+        );
+    }
+
+    /// Calls are harmless for the callee-saved half: %xmm8-%xmm15 are never
+    /// argument registers and compiled code never reads one before
+    /// defining it, so the kill proof holds across the call.
+    #[test]
+    fn still_folds_when_call_does_not_read_callee_saved_reg() {
+        let (changed, out) = run("    movsd (%rsi), %xmm9\n\
+             \x20   vaddsd %xmm9, %xmm5, %xmm5\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm1, %xmm9\n");
+        assert!(changed, "xmm9 is not an implicit call operand: {out:?}");
+    }
+
+    /// The dot8d SSE2 shape: %xmm3 carries the b0 load, the consumer is
+    /// adjacent, and %xmm3 is later REUSED by a full-overwrite load of
+    /// the last a element.  The reuse kills the loaded value, so the
+    /// fold is sound.
+    #[test]
+    fn folds_when_register_reused_by_later_overwrite() {
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd %xmm4, %xmm2, %xmm2\n\
+             \x20   movsd 0x38(%rdi), %xmm3\n");
+        assert!(changed, "later full overwrite kills the loaded value");
+        assert_eq!(out[0], "vmulsd (%rsi), %xmm2, %xmm2");
+        assert_eq!(out.len(), 3, "{out:?}");
+    }
+
+    /// A later reader vetoes the fold even with the refinement.
+    #[test]
+    fn refuses_when_later_line_reads_register() {
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd %xmm3, %xmm0, %xmm0\n");
+        assert!(!changed, "later reader must veto");
+    }
+
+    /// Register-token boundary: a later mention of %xmm11 is NOT a
+    /// mention of %xmm1 — the scan must run past it and fold.
+    #[test]
+    fn folds_when_later_line_mentions_wider_numbered_register() {
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
+             \x20   vmulsd %xmm1, %xmm2, %xmm2\n\
+             \x20   movsd (%rdi), %xmm11\n");
+        assert!(changed, "%xmm11 does not mention %xmm1");
+        assert_eq!(out[0], "vmulsd (%rsi), %xmm2, %xmm2");
+    }
+
+    /// A read-modify-write on the loaded register reads the old value —
+    /// not a pure overwrite.
+    #[test]
+    fn refuses_when_reuse_is_read_modify_write() {
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd %xmm5, %xmm3, %xmm3\n");
+        assert!(!changed, "rmw reads the loaded value before writing");
+    }
+
+    /// RED-TEAM REGRESSION (PR #359 follow-up): a reg-reg scalar `vmovsd`
+    /// is a MERGE write — it preserves bits 64:127 of the destination.
+    /// Here those preserved bits come from the load being deleted (a
+    /// memory-source `movsd` zeroes them), and the final packed `vmovapd`
+    /// observes them through the merge chain. Deleting the load therefore
+    /// changes observable state; the fold must be refused.
+    #[test]
+    fn refuses_when_next_mention_is_reg_reg_scalar_movsd_merge() {
+        let (changed, _) = run("    movapd %xmm9, %xmm11\n\
+             \x20   movsd 32(%rsi), %xmm11\n\
+             \x20   vmulsd %xmm11, %xmm2, %xmm2\n\
+             \x20   vmovsd %xmm12, %xmm11\n\
+             \x20   vmovapd %xmm11, %xmm5\n");
+        assert!(
+            !changed,
+            "reg-reg vmovsd preserves the high half — not a full overwrite"
+        );
+    }
+
+    /// Same shape, single-precision: a reg-reg `movss` merges bits 32:127.
+    #[test]
+    fn refuses_when_next_mention_is_reg_reg_scalar_movss_merge() {
+        let (changed, _) = run("    movaps %xmm9, %xmm11\n\
+             \x20   movss 32(%rsi), %xmm11\n\
+             \x20   vmulss %xmm11, %xmm2, %xmm2\n\
+             \x20   movss %xmm12, %xmm11\n\
+             \x20   movaps %xmm11, %xmm5\n");
+        assert!(
+            !changed,
+            "reg-reg movss merges bits 32:127 — not an overwrite"
+        );
+    }
+
+    /// Memory-source scalar moves DO define the full register (the upper
+    /// bits are zeroed), so the accept side of the refinement is preserved
+    /// even with a packed read after the merge.
+    #[test]
+    fn folds_when_next_mention_is_memory_source_scalar_movsd() {
+        let (changed, out) = run("    movapd %xmm9, %xmm11\n\
+             \x20   movsd 32(%rsi), %xmm11\n\
+             \x20   vmulsd %xmm11, %xmm2, %xmm2\n\
+             \x20   movsd 40(%rdi), %xmm11\n\
+             \x20   vmovapd %xmm11, %xmm5\n");
+        assert!(
+            changed,
+            "memory-source movsd zeroes the high half: full overwrite"
+        );
+        assert_eq!(out[1], "vmulsd 32(%rsi), %xmm2, %xmm2", "{out:?}");
+    }
+
+    /// A BRANCH between the consumer and the pure overwrite invalidates the
+    /// textual kill proof: the taken path reaches the reader past the merge
+    /// with the LOADED value still in %xmm3, while the overwrite only runs
+    /// on the fall-through path.  Deleting the load corrupts the taken path.
+    #[test]
+    fn refuses_when_branch_skips_the_killing_overwrite() {
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   jne .Ldone\n\
+             \x20   vmovsd 40(%rdi), %xmm3\n\
+             .Ldone:\n\
+             \x20   vaddsd %xmm3, %xmm0, %xmm0\n\
+             \x20   ret\n");
+        assert!(!changed, "taken path reads the loaded value: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fp_const_hoist_tests {
+    use super::super::super::types::{LineInfo, LineKind, classify_line, mark_nop};
+    use super::hoist_repeated_fp_constant_loads;
+    use crate::backend::peephole_common::LineStore;
+
+    /// Run the pass over `asm` after marking `nop_lines` dead and applying
+    /// `mutate` to the classification vector (for InlineAsm injection).
+    fn run_with(
+        asm: &str,
+        nop_lines: &[usize],
+        mutate: impl FnOnce(&mut [LineInfo]),
+    ) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        for &i in nop_lines {
+            mark_nop(&mut infos[i]);
+        }
+        mutate(&mut infos);
+        let changed = hoist_repeated_fp_constant_loads(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    fn run(asm: &str, nop_lines: &[usize]) -> (bool, Vec<String>) {
+        run_with(asm, nop_lines, |_| {})
+    }
+
+    /// The dot8d SSE2 shape: the constant zero is re-read at every use;
+    /// a dead slot before the first use hosts the single materialization.
+    #[test]
+    fn hoists_repeated_constant_into_free_register() {
+        let (changed, out) = run(
+            "    movsd (%rdi), %xmm2\n\
+             \x20   movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[1],
+        );
+        assert!(changed, "two constant reads must hoist");
+        assert_eq!(
+            out[1], "movsd .LCFP_0(%rip), %xmm0",
+            "slot hosts load: {out:?}"
+        );
+        assert_eq!(out[3], "vaddsd %xmm0, %xmm2, %xmm2");
+        assert_eq!(out[4], "vaddsd %xmm0, %xmm4, %xmm4");
+    }
+
+    /// Without a dead slot there is nowhere to materialize.
+    #[test]
+    fn refuses_without_a_dead_slot() {
+        let (changed, _) = run(
+            "    vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[],
+        );
+        assert!(!changed, "no NOP slot, no hoist");
+    }
+
+    /// A label between slot and uses breaks fall-through dominance.
+    #[test]
+    fn refuses_when_a_label_separates_slot_and_uses() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20L5:\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+        );
+        assert!(!changed, "jump could enter past the materialization");
+    }
+
+    /// Any call kills every caller-saved xmm after it.
+    #[test]
+    fn refuses_when_function_contains_a_call() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   call foo\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+        );
+        assert!(!changed, "calls clobber all xmm registers");
+    }
+
+    /// One use: the materialization would only add an instruction.
+    #[test]
+    fn refuses_when_only_one_use() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n",
+            &[0],
+        );
+        assert!(!changed, "single use must not hoist");
+    }
+
+    /// blendv-family instructions read %xmm0 implicitly.
+    #[test]
+    fn refuses_with_blendv_present() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   pblendvb %xmm7, %xmm6\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+        );
+        assert!(!changed, "implicit xmm0 reader vetoes");
+    }
+
+    /// Opaque inline asm may touch any register.
+    #[test]
+    fn refuses_with_inline_asm() {
+        let (changed, _) = run_with(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+            |infos| infos[1].kind = LineKind::InlineAsm,
+        );
+        assert!(!changed, "inline asm vetoes");
+    }
+
+    /// Every xmm mentioned somewhere: no free materialization register.
+    #[test]
+    fn refuses_when_all_registers_mentioned() {
+        let mut asm = String::from("    movsd (%rsi), %xmm3\n");
+        for n in 0..16 {
+            asm.push_str(&format!("    vmovsd %xmm{}, (%rsp)\n", n));
+        }
+        asm.push_str("    vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n");
+        asm.push_str("    vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n");
+        let (changed, _) = run(&asm, &[0]);
+        assert!(!changed, "no free register, no hoist");
+    }
+
+    /// NOP'd lines' mentions still count: later passes may revive the slot
+    /// text, so a register mentioned only in dead lines is NOT free.
+    #[test]
+    fn dead_line_mentions_still_block_a_register() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   movsd (%rax), %xmm0\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0, 1],
+        );
+        assert!(changed, "still hoists with another register");
+        assert_eq!(
+            out[0], "movsd .LCFP_0(%rip), %xmm1",
+            "xmm0 is claimed by the dead line: {out:?}"
+        );
+    }
+
+    /// RED-TEAM REGRESSION (PR #359 follow-up): one rmw line mentions the
+    /// token twice (`vaddsd .LCFP_0(%rip), %xmm2, %xmm2`); the site list
+    /// must be deduplicated so a SINGLE rewritten line does not pass the
+    /// "at least two rewritten uses" threshold — hoisting there keeps the
+    /// static instruction count identical and adds a dynamic pool load.
+    #[test]
+    fn refuses_single_use_line_mentioned_twice() {
+        let (changed, _) = run(
+            "    movsd (%rdi), %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n",
+            &[0],
+        );
+        assert!(!changed, "one distinct use line is below the >=2 threshold");
+    }
+
+    /// Single-precision-only sites materialize with `movss` (an exact
+    /// 4-byte pool read); any double-precision site keeps `movsd`.
+    #[test]
+    fn materializes_movss_for_single_precision_sites() {
+        let (changed, out) = run(
+            "    movss (%rdi), %xmm2\n\
+             \x20   movss (%rsi), %xmm3\n\
+             \x20   vmulss %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddss .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddss .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[1],
+        );
+        assert!(changed, "two constant reads must hoist");
+        assert_eq!(
+            out[1], "movss .LCFP_0(%rip), %xmm0",
+            "single-precision pool read: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod store_alu_memop_tests {
+    use super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_store_alu_memop(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    fn header(body: &str) -> String {
+        format!(
+            "foo:\n.cfi_startproc\n    pushq %rbp\n    movq %rsp, %rbp\n    subq $64, %rsp\n{body}    addq $64, %rsp\n    popq %rbp\n    ret\n.cfi_endproc\n"
+        )
+    }
+
+    /// The core PF-STORE-FOLDOP-1 shape: a dead `mov %reg, slot` immediately
+    /// followed by an ALU reading the slot as a memory operand folds to a
+    /// pure-register ALU and the store is deleted.
+    #[test]
+    fn folds_adjacent_dead_store_into_alu_memop() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    xorl -4(%rbp), %r8d\n    addl %r8d, %r12d\n",
+        ));
+        assert!(changed, "{out:?}");
+        assert!(out.contains(&"xorl %eax, %r8d".to_string()), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("-4(%rbp)")),
+            "store must be gone: {out:?}"
+        );
+    }
+
+    /// The register-carrying instruction between the store and the ALU may be
+    /// stepped over only when it provably leaves `%reg` and the slot intact.
+    /// Here `movl %r14d, %edx` writes a different register, so the fold still
+    /// applies.
+    #[test]
+    fn steps_over_an_unrelated_register_move() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    movl %r14d, %edx\n    addl -4(%rbp), %edx\n",
+        ));
+        assert!(changed, "{out:?}");
+        assert!(out.contains(&"addl %eax, %edx".to_string()), "{out:?}");
+    }
+
+    /// SOUNDNESS: if the store's source register is rewritten between the store
+    /// and the ALU, the ALU no longer observes the stored value and the fold
+    /// must be refused (otherwise it would read the clobbering value).
+    #[test]
+    fn refuses_when_the_source_register_is_clobbered() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    movl %edi, %eax\n    xorl -4(%rbp), %eax\n",
+        ));
+        assert!(!changed, "{out:?}");
+        assert!(out.iter().any(|l| l.contains("-4(%rbp)")), "{out:?}");
+    }
+
+    /// SOUNDNESS: a load of the slot between the store and the ALU consumes the
+    /// store's value, so deleting the store would leak a stale slot read.  The
+    /// scan must stop at the load.
+    #[test]
+    fn refuses_when_a_slot_load_intervenes() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    movl -4(%rbp), %ecx\n    xorl -4(%rbp), %r8d\n",
+        ));
+        assert!(!changed, "{out:?}");
+        assert!(out.iter().any(|l| l.contains("-4(%rbp)")), "{out:?}");
+    }
+
+    /// SOUNDNESS: the ALU must not read bytes the store did not write.  A
+    /// 4-byte store feeding an 8-byte read is refused (the slot's high half is
+    /// undefined); the register form would pull in the register's stale upper
+    /// bits.
+    #[test]
+    fn refuses_a_wider_alu_than_the_store() {
+        let (changed, out) = run(&header(
+            "    movl %eax, -4(%rbp)\n    addq -4(%rbp), %rdx\n",
+        ));
+        assert!(!changed, "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod store_alu_cross_join_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_store_alu_memop;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_store_alu_memop(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// Rotation ternary diamond: the join block's ALU merges two arms that
+    /// stored DIFFERENT registers to the same slot. The store immediately
+    /// before the join (identity arm) must not be forwarded across the join
+    /// label; the ALU keeps its slot memory operand.
+    /// Regression: differential fuzz seeds 20260912/20260939/20260960/20260990
+    /// at -O1 — `xorq slot,%r11` became `xorq %rbp,%r11`, discarding the
+    /// rotated arm's value.
+    #[test]
+    fn refuses_forward_across_cfg_join_label() {
+        let asm = "    testl %ecx, %ecx\n\
+     \x20   je .Ljoin_alt\n\
+    .Lrot_arm:\n\
+    \x20   movq %r12, 8(%rsp)\n\
+    \x20   jmp .Ljoin\n\
+    .Ljoin_alt:\n\
+    \x20   movq %rbp, 8(%rsp)\n\
+    .Ljoin:\n\
+    \x20   xorq 8(%rsp), %r11\n";
+        let (_, out) = run(asm);
+        let alu = out.iter().find(|l| l.starts_with("xorq")).unwrap();
+        assert!(
+            alu.contains("8(%rsp)"),
+            "join ALU must keep the slot operand (merge of two arms): {alu:?}"
+        );
+        assert!(
+            !alu.starts_with("xorq %rbp"),
+            "identity-arm register must not be forwarded across the join: {alu:?}"
+        );
+    }
+
+    /// Positive control: the same fold inside one straight-line block stays
+    /// legal and must continue to fire (the label barrier fix must not
+    /// disable the pass wholesale).
+    #[test]
+    fn folds_straightline_store_to_alu() {
+        let asm = "    movq %rax, 8(%rsp)\n\
+    \x20   xorq 8(%rsp), %r11\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "straight-line store->ALU window must fold");
+        assert!(
+            out.iter().any(|l| l == "xorq %rax, %r11"),
+            "expected register substitution: {out:?}"
+        );
+    }
+
+    /// An `if`-guard label that NO branch targets is reached only by falling
+    /// through, so its block is dominated by the code before it and the
+    /// store's source register still carries the slot value past the label.
+    /// Regression: machinst_window_alloc_spill_base -O1..-Os.
+    #[test]
+    fn folds_across_untargeted_guard_label() {
+        let asm = "    movq %rax, 16(%rsp)\n\
+    \x20   xorl %r11d, %r11d\n\
+    \x20   xorl %r10d, %r10d\n\
+    .LBB1:\n\
+    \x20   cmpq 16(%rsp), %r10\n\
+    \x20   jge .LBB3\n\
+    .LBB2:\n\
+    \x20   addq $1, %r10\n\
+    \x20   cmpq 16(%rsp), %r10\n\
+    \x20   jl .LBB2\n\
+    .LBB3:\n\
+    \x20   ret\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "dominated guard-label window must fold");
+        assert!(
+            out.iter().any(|l| l == "cmpq %rax, %r10"),
+            "expected register compare past untargeted label: {out:?}"
+        );
+    }
+
+    /// Negative twin: a label targeted by a branch is a CFG join/loop
+    /// header and must terminate the scan.
+    #[test]
+    fn refuses_across_targeted_loop_header_label() {
+        let asm = "    movq %rax, 16(%rsp)\n\
+    \x20   jmp .Lh\n\
+    .Lh:\n\
+    \x20   cmpq 16(%rsp), %r10\n\
+    \x20   ret\n";
+        let (changed, out) = run(asm);
+        assert!(
+            !out.iter().any(|l| l == "cmpq %rax, %r10"),
+            "join label must block the fold: {out:?}, changed={changed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod memfold_dst_move_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_memory_operands;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_memory_operands(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// Raw -O0 shape: a pure destination-establishing copy between the
+    /// scratch load and the ALU must not prevent the memory-operand fold.
+    /// Regression: ra_folded_index_wave_follow -O0.
+    #[test]
+    fn folds_through_dst_establishing_move() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq %rdx, %rax\n\
+    \x20   addq %rcx, %rax\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert!(out.iter().any(|l| l == "addq -32(%rbp), %rax"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "the scratch load must be deleted: {out:?}"
+        );
+    }
+
+    /// The intervening copy READS the loaded register: refuse.
+    #[test]
+    fn refuses_when_move_reads_loaded_register() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq %rcx, %rax\n\
+    \x20   addq %rcx, %rax\n";
+        let (_, out) = run(asm);
+        assert!(
+            out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "load must stay when the copy reads its register: {out:?}"
+        );
+    }
+
+    /// The intervening copy loads from MEMORY: refuse.
+    #[test]
+    fn refuses_when_move_is_a_memory_load() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq (%rdx), %rax\n\
+    \x20   addq %rcx, %rax\n";
+        let (_, out) = run(asm);
+        assert!(
+            out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "memory copy must block the fold: {out:?}"
+        );
+    }
+
+    /// The copy writes a different register than the ALU destination.
+    #[test]
+    fn refuses_when_move_dst_differs_from_alu_dst() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movq %rdx, %rdi\n\
+    \x20   addq %rcx, %rax\n";
+        let (_, out) = run(asm);
+        assert!(
+            out.iter().any(|l| l == "movq -32(%rbp), %rcx"),
+            "copy destination must match ALU destination: {out:?}"
+        );
+    }
+
+    /// GAS spells word-zero-extend `movzwl` (not `movlzw`): the typo once
+    /// blocked folds through this raw -O0 establisher.
+    #[test]
+    fn folds_through_movzwl_establisher() {
+        let asm = "    movl -32(%rbp), %ecx\n\
+    \x20   movzwl %dx, %eax\n\
+    \x20   addl %ecx, %eax\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert!(
+            out.iter().any(|l| l == "addl -32(%rbp), %eax"),
+            "expected fold through movzwl establisher: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movzwl %dx, %eax"),
+            "the establishing copy itself must remain: {out:?}"
+        );
+    }
+
+    /// A partial-width destination copy (`movb`) is still only the ALU's
+    /// destination establisher; the scratch-source fold is unaffected.
+    #[test]
+    fn folds_through_movb_establisher() {
+        let asm = "    movq -32(%rbp), %rcx\n\
+    \x20   movb %dl, %al\n\
+    \x20   addq %rcx, %rax\n";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert!(
+            out.iter().any(|l| l == "addq -32(%rbp), %rax"),
+            "expected fold through movb establisher: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movb %dl, %al"),
+            "the establishing movb must remain: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod movslq_relay_call_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_movslq_relay;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_movslq_relay(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// `int sz = ...; p = malloc(sz); memset(p, 0, sz);` — the widened size
+    /// is homed in callee-saved %rbx and read again after the call. A call
+    /// does not end a callee-saved family's lifetime, so the relay must stay.
+    #[test]
+    fn callee_saved_tmp_read_after_call_is_live() {
+        let asm = "\
+    movslq %eax, %rbx\n\
+    movq %rbx, %rdi\n\
+    call malloc@PLT\n\
+    # LCCC_CALL_ARGS 1\n\
+    movq %rax, %rdi\n\
+    xorl %esi, %esi\n\
+    movq %rbx, %rdx\n\
+    call memset@PLT\n\
+    # LCCC_CALL_ARGS 3\n\
+";
+        let (changed, out) = run(asm);
+        assert!(!changed, "must keep the %rbx home: {out:?}");
+    }
+
+    /// A caller-saved scratch the callee does not read is clobbered by the
+    /// call, so the relay still folds.
+    #[test]
+    fn caller_saved_scratch_dies_at_call() {
+        let asm = "\
+    movslq %eax, %r11\n\
+    movq %r11, %rdi\n\
+    call malloc@PLT\n\
+    # LCCC_CALL_ARGS 1\n\
+    movq %r11, %rdx\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "r11 is clobbered by the call: {out:?}");
+        assert_eq!(out[0], "movslq %eax, %rdi");
+    }
+
+    /// An argument register the call consumes is live at the call.
+    #[test]
+    fn argument_register_read_by_call_is_live() {
+        let asm = "\
+    movslq %eax, %rsi\n\
+    movq %rsi, %rdi\n\
+    call f@PLT\n\
+    # LCCC_CALL_ARGS 2\n\
+";
+        let (changed, _) = run(asm);
+        assert!(!changed, "%rsi is the second argument");
+    }
+
+    /// Callee-saved and never read again: the scan continues past the call
+    /// and finds the redefinition, so the relay folds.
+    #[test]
+    fn callee_saved_tmp_redefined_after_call_folds() {
+        let asm = "\
+    movslq %eax, %rbx\n\
+    movq %rbx, %rdi\n\
+    call f@PLT\n\
+    # LCCC_CALL_ARGS 1\n\
+    movl $7, %ebx\n\
+    movq %rbx, %rsi\n\
+";
+        let (changed, out) = run(asm);
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "movslq %eax, %rdi");
+    }
+}
+
+// ── Memory read-modify-write coalescing ─────────────────────────────────────
+
+/// Fold a load / increment / store-back of the SAME address into one
+/// read-modify-write ALU op:
+///
+/// ```text
+///   movq (%r9), %r13          movq (%r9), %rax
+///   leaq 1(%r13), %rax   →    addq $1, (%r9)
+///   movq %rax, (%r9)
+/// ```
+///
+/// Why it matters: `bins[bytes[i]]++` -- the histogram shape, and the same
+/// shape in any parser/compressor table update -- emitted six instructions per
+/// element (load, lea/add, store) where GCC emits one `addq $1,(mem)` on top of
+/// its load.  Measured on tests/benchmark/programs/histogram.c with Callgrind
+/// at `-O2 -march=x86-64-v3`: lccc 4,179,149 Ir against GCC's 1,667,758 before
+/// this fold.
+///
+/// Soundness (all of these are checked, in this order):
+///
+/// * the three lines are CONSECUTIVE real lines -- only nop padding may sit
+///   between them -- so nothing can write the address, change a register used
+///   in it, or consume the loaded value in between;
+/// * the load and the store name the SAME memory operand TEXT, so both address
+///   the same location;
+/// * the register the increment writes must not appear in the memory operand
+///   (if it did, the store's address would be computed from the incremented
+///   value while the fused RMW computes it from the old one -- different
+///   address);
+/// * the width suffixes agree (`movl`... with `addl`, `movb` with `addb`, and
+///   `leaq` only for 64-bit moves), and the increment is a constant: the fused
+///   instruction has no room for a register addend;
+/// * every register family the three lines define (the loaded register and the
+///   increment's destination) is dead after the store: the rewrite deletes
+///   their definitions, so a later reader would otherwise observe the old
+///   value;
+/// * the flags are dead after the store: the removed trio was flag-neutral and
+///   `add` writes flags, so a later flag reader would see different flags.
+///
+/// VOLATILE POLICY -- what this fold does and does not decide.
+///
+/// The folded form performs exactly ONE read and ONE write of the object, in
+/// the source's order, with no access to any other location in between; the
+/// trio it replaces performs the same one read and one write.  Access COUNT and
+/// ORDER are therefore preserved, which is the observable contract `volatile`
+/// states for a single-threaded observer -- and the only one the standard
+/// guarantees, since C11 5.1.2.4p25 makes conflicting accesses to a non-atomic
+/// object from another thread undefined behaviour regardless of `volatile`.
+///
+/// What the fused form changes is granularity: the read and the write become
+/// indivisible, so no other agent can interleave between them.  For a
+/// single-threaded observer that is strictly more than the abstract machine
+/// promises -- but the PR #716 review is right that it is NOT a blanket
+/// "stronger, never weaker": an observer that is not a thread of this program
+/// (an MMIO device register, an ISR, a signal handler that reads the object and
+/// expects to see one of the two WRITTEN values of a partially-updated
+/// multi-word object) is outside the model the standard reasons about, and the
+/// fused form is the one that gives it no opportunity to observe the
+/// intermediate state.  The supported contract is therefore stated narrowly:
+/// for objects with ordinary memory semantics, access count and order are
+/// preserved and the loop-visible value at each program point is unchanged; for
+/// a device register or a value shared with an interrupt handler, `_Atomic` (or
+/// a `volatile` access in a separately compiled translation unit) is the
+/// supported spelling and neither this fold nor this compiler promises
+/// anything about the sequence of bus accesses.  It is the reason the shape is
+/// emitted at all: `h += 3` on a `volatile long`
+/// already reaches this pass as `addq $3, h(%rip)` from the IR lowering, at
+/// `-O0` as well as `-O2` (verified on the tree that added this note).  The
+/// DECISION therefore lives where volatility is visible -- the IR/isel layer --
+/// and not here: this pass matches assembly TEXT, in which a volatile load is
+/// indistinguishable from any other load, so a volatility test here could only
+/// be a claim about something this layer cannot see.  The residual is recorded
+/// rather than hidden: a fused RMW is not a substitute for `_Atomic`, and code
+/// that needs the read/write pair to be interruptible by an ISR (a lock-free
+/// ring producer, an MMIO FIFO) must use atomics, exactly as it must against
+/// GCC, which keeps the pair separate but gives no ordering guarantee either.
+pub(super) fn fold_memory_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    use super::flag_peepholes::flags_dead_after;
+    use super::relay_and_lea::line_refs_family;
+
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        // A volatile load is pinned, but it is the one pinned line this
+        // fold may start from: fusing a volatile load/op/store into a
+        // single memory RMW preserves the access contract exactly (one
+        // read, one write, same address, same width), so the pin's
+        // purpose is served, not violated. Every other pinned line --
+        // user inline asm above all -- stays untouchable.
+        if infos[i].is_nop() || (infos[i].pinned && !infos[i].volatile_access) {
+            i += 1;
+            continue;
+        }
+        let li = infos[i].trimmed(store.get(i)).to_string();
+        let Some((mem_width, reg_width, mem, loaded_reg)) = parse_load_mem_to_reg(&li) else {
+            i += 1;
+            continue;
+        };
+        let loaded_fam = register_family_fast(loaded_reg);
+        if loaded_fam == REG_NONE || loaded_fam > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        // The increment sits on the next real line, possibly behind ONE
+        // same-width register copy: the backend loads a global into a
+        // scratch register and only then moves it into the accumulator
+        // (`movq h(%rip), %rdi; movq %rdi, %rax; addq $3, %rax`), a shape
+        // copy coalescing used to canonicalize away -- and still does,
+        // except where the load or store is pinned (volatile accesses,
+        // which coalescing must not rename into). The copy is accepted
+        // only at the load's full register width, so the incremented
+        // value is bit-identical to the loaded one.
+        let mut copy_idx: Option<usize> = None;
+        let mut j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let mut lj = infos[j].trimmed(store.get(j)).to_string();
+        // Owned copies of the increment's register and immediate: the
+        // copy parse borrows `lj`, which the copy arm then replaces with
+        // the increment's own line text.
+        let (value_reg, imm_text, op): (String, String, IncOp) =
+            match parse_const_increment(&lj, reg_width, loaded_reg) {
+                Some((reg, imm, op)) => (reg.to_string(), imm.to_string(), op),
+                None => {
+                    let Some(copy_dest) = parse_same_width_copy(&lj, reg_width, loaded_reg) else {
+                        i += 1;
+                        continue;
+                    };
+                    let copy_dest = copy_dest.to_string();
+                    copy_idx = Some(j);
+                    j = next_non_nop(infos, j + 1, len);
+                    if j >= len || infos[j].is_barrier() {
+                        i += 1;
+                        continue;
+                    }
+                    lj = infos[j].trimmed(store.get(j)).to_string();
+                    let Some((reg, imm, op)) = parse_const_increment(&lj, reg_width, &copy_dest)
+                    else {
+                        i += 1;
+                        continue;
+                    };
+                    (reg.to_string(), imm.to_string(), op)
+                }
+            };
+        let value_fam = register_family_fast(&value_reg);
+        if value_fam == REG_NONE || value_fam > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        // The store-back is the line after that, to the identical address.
+        let k = next_non_nop(infos, j + 1, len);
+        if k >= len || infos[k].is_barrier() {
+            i += 1;
+            continue;
+        }
+        // The store may be reached directly or through ONE narrow copy, which
+        // is what the backend emits for a byte/word counter:
+        //
+        //     movzbl (%rdx), %r8d      <- load
+        //     addl   $1, %r8d          <- increment
+        //     movzbl %r8b, %r9d        <- narrow copy of the low byte
+        //     movb   %r9b, (%rdx)      <- store
+        //
+        // The copy is accepted only in the exact spelling of the value family
+        // at the memory width (`%r8b` for family 8 at width B): a WIDER read of
+        // the family (`movzwl %r8w, %r9d`) would drag the freshly incremented
+        // high bits into a value the fused `addb` never computes.  The copy's
+        // destination carries its own deadness obligation, because the fold
+        // deletes its definition too.
+        let lk = infos[k].trimmed(store.get(k)).to_string();
+        let mut owned_vec: Vec<usize> = vec![i, j, k];
+        if let Some(copy_line) = copy_idx {
+            owned_vec.push(copy_line);
+        }
+        // Family whose low `mem_width` bits hold exactly the value the fused
+        // `add` computes.
+        let mut store_fam = value_fam;
+        let mut store_idx = k;
+        let direct = parse_store_reg_to_mem(&lk)
+            .map(|(_, reg, _)| register_family_fast(reg) == value_fam)
+            .unwrap_or(false);
+        if !direct {
+            let Some(copy_fam) = parse_narrow_copy(&lk, mem_width) else {
+                i += 1;
+                continue;
+            };
+            if copy_fam != value_fam {
+                i += 1;
+                continue;
+            }
+            let k2 = next_non_nop(infos, k + 1, len);
+            if k2 >= len || infos[k2].is_barrier() {
+                i += 1;
+                continue;
+            }
+            let lk2 = infos[k2].trimmed(store.get(k2)).to_string();
+            let Some((w2, reg2, _)) = parse_store_reg_to_mem(&lk2) else {
+                i += 1;
+                continue;
+            };
+            if w2 != mem_width {
+                i += 1;
+                continue;
+            }
+            store_fam = register_family_fast(reg2);
+            if store_fam == REG_NONE || store_fam > REG_GP_MAX {
+                i += 1;
+                continue;
+            }
+            store_idx = k2;
+            owned_vec.push(k2);
+        }
+        // The store must name the load's MEMORY operand and write the load's
+        // MEMORY width -- that is the width the fused `add` produces.  The
+        // store's own register spelling is compared by FAMILY, not text: a byte
+        // store of the widened temporary names `%r8b` where the increment wrote
+        // `%r8d`.
+        let store_line = infos[store_idx].trimmed(store.get(store_idx)).to_string();
+        let Some((store_width, _stored_reg, mem2)) = parse_store_reg_to_mem(&store_line) else {
+            i += 1;
+            continue;
+        };
+        if store_width != mem_width || mem2 != mem {
+            i += 1;
+            continue;
+        }
+        let k = store_idx;
+        let owned = owned_vec.as_slice();
+        // No register whose value the fold CHANGES may participate in the
+        // address text: the values diverge between the load line and the store
+        // line, so a text-equal operand would denote two different addresses.
+        //
+        // * The INCREMENTED one: the fused form computes the address from the
+        //   pre-increment value, while the original computed the store's
+        //   address from the incremented one (`movq (%r9),%r9; leaq 1(%r9),%rax;
+        //   movq %rax,(%r9)` stores to a different slot than it loaded from --
+        //   fusing it would silently pick the load's address).
+        // * The LOADED one: a load that overwrites its own address register
+        //   (`movq (%rax),%rax`) leaves the third line's `(%rax)` naming a
+        //   DIFFERENT address than the first line's.  Text equality of the two
+        //   operands is therefore not sufficient on its own.
+        // * The narrow-copy destination, when there is one.
+        if line_refs_family(mem, value_fam)
+            || line_refs_family(mem, loaded_fam)
+            || (store_fam != value_fam && line_refs_family(mem, store_fam))
+        {
+            i += 1;
+            continue;
+        }
+        // Pinned lines are normally untouchable (`all_editable`), but a
+        // pinned VOLATILE load/store in this exact sequence is the fold's
+        // reason to exist: the fused instruction performs the same single
+        // read and single write, and it is re-pinned below. Any other
+        // pinned line in the window still refuses the fold.
+        if !owned
+            .iter()
+            .all(|&l| !infos[l].pinned || infos[l].volatile_access)
+        {
+            i += 1;
+            continue;
+        }
+        // Every definition the fold deletes must be dead afterwards.  The
+        // shared oracle is used rather than a hand-rolled disjunction:
+        // `provably_dead_lv` is the audited union of CFG liveness and the two
+        // syntactic proofs, and it covers the case this pass needs most -- the
+        // loaded value is a dead temporary, but the ALLOCATOR may hand the same
+        // family to an unrelated temporary in a later block, which flat
+        // liveness reports as live and a text scan cannot resolve.
+        if !dead.dead_after(store, infos, k, loaded_fam, owned)
+            || !dead.dead_after(store, infos, k, value_fam, owned)
+        {
+            i += 1;
+            continue;
+        }
+        if store_fam != value_fam && !dead.dead_after(store, infos, k, store_fam, owned) {
+            i += 1;
+            continue;
+        }
+        if !flags_dead_after(store, infos, k + 1) {
+            i += 1;
+            continue;
+        }
+        let suffix = mem_width.mnemonic_suffix();
+        let imm_text = narrow_imm_text(&imm_text, mem_width);
+        let new_line = format!("    {}{} ${}, {}", op.mnemonic(), suffix, imm_text, mem);
+        // A volatile store fuses into a volatile RMW: the fused line must
+        // stay pinned, or a later pass could reuse or delete the access
+        // the fold just preserved. `replace_line` re-classifies, so the
+        // flags are re-applied explicitly. The consumed lines are
+        // unpinned first, because `mark_nop` refuses pinned lines -- by
+        // the time we get here the fold has already proven (deadness,
+        // address identity, flags) that consuming them is sound.
+        let store_volatile = infos[k].volatile_access;
+        replace_line(store, &mut infos[k], k, new_line);
+        if store_volatile {
+            infos[k].pinned = true;
+            infos[k].volatile_access = true;
+        }
+        for &consumed in owned_vec.iter().filter(|&&l| l != k) {
+            infos[consumed].pinned = false;
+            mark_nop(&mut infos[consumed]);
+        }
+        dead.invalidate(store, infos, k);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+/// Move width of a plain `mov` and the ALU mnemonic suffix it pairs with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RmwWidth {
+    Q,
+    L,
+    W,
+    B,
+}
+
+impl RmwWidth {
+    fn from_mov(mnemonic: &str) -> Option<Self> {
+        Some(match mnemonic {
+            "movq" => Self::Q,
+            "movl" => Self::L,
+            "movw" => Self::W,
+            "movb" => Self::B,
+            _ => return None,
+        })
+    }
+
+    fn mnemonic_suffix(self) -> char {
+        match self {
+            Self::Q => 'q',
+            Self::L => 'l',
+            Self::W => 'w',
+            Self::B => 'b',
+        }
+    }
+
+    /// The `MoveSize` carrying this width's register spelling.
+    fn move_size(self) -> MoveSize {
+        match self {
+            Self::Q => MoveSize::Q,
+            Self::L => MoveSize::L,
+            Self::W => MoveSize::W,
+            Self::B => MoveSize::B,
+        }
+    }
+
+    /// Operand width in bits, so two widths can be ordered.
+    fn bits(self) -> u16 {
+        match self {
+            Self::Q => 64,
+            Self::L => 32,
+            Self::W => 16,
+            Self::B => 8,
+        }
+    }
+}
+
+/// Split an `add`/`sub` mnemonic into its operation stem and its operand
+/// width (`addq` -> `("add", Q)`).  Only the two operations the fold re-emits
+/// are recognized, and the stem must be spelled out in full: `sub` on its own
+/// ends in `b`, so a bare suffix strip would read it as a byte operation.
+fn split_alu_width(mnemonic: &str) -> Option<(&str, RmwWidth)> {
+    for (suffix, width) in [
+        ('b', RmwWidth::B),
+        ('w', RmwWidth::W),
+        ('l', RmwWidth::L),
+        ('q', RmwWidth::Q),
+    ] {
+        if let Some(stem) = mnemonic.strip_suffix(suffix) {
+            if matches!(stem, "add" | "sub") {
+                return Some((stem, width));
+            }
+        }
+    }
+    None
+}
+
+/// Widths of a load mnemonic: `(memory width, register width)`.
+///
+/// The widening forms are accepted because the fused `add` only has to
+/// reproduce the value's LOW `memory width` bits: the store truncates to
+/// exactly those, and `add{b,w,l} $imm,MEM` wraps modulo the same power of two.
+/// Sign- and zero-extension agree on the low bits, so `movsbl` and `movzbl`
+/// are interchangeable here -- including against the STORE width, which is what
+/// selects the fused mnemonic.
+fn load_widths(mnemonic: &str) -> Option<(RmwWidth, RmwWidth)> {
+    use RmwWidth::*;
+    Some(match mnemonic {
+        "movb" => (B, B),
+        "movw" => (W, W),
+        "movl" => (L, L),
+        "movq" => (Q, Q),
+        "movzbl" | "movsbl" => (B, L),
+        "movzbq" | "movsbq" => (B, Q),
+        "movzbw" | "movsbw" => (B, W),
+        "movzwl" | "movswl" => (W, L),
+        "movzwq" | "movswq" => (W, Q),
+        "movslq" => (L, Q),
+        _ => return None,
+    })
+}
+
+/// `movzbl (%r9), %eax` -> `(B, L, "(%r9)", "%eax")`.  Memory-only source,
+/// plain register destination: a register-to-register widening moves no memory
+/// and is not this fold's business.
+fn parse_load_mem_to_reg(t: &str) -> Option<(RmwWidth, RmwWidth, &str, &str)> {
+    let sp = t.find(' ')?;
+    let (mnemonic, rest) = t.split_at(sp);
+    let (mem_width, reg_width) = load_widths(mnemonic)?;
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    if !src.contains('(') || !dst.starts_with('%') || dst.contains('(') {
+        return None;
+    }
+    Some((mem_width, reg_width, src, dst))
+}
+
+/// `movq %rax, (%r9)` -> `(Q, "%rax", "(%r9)")`.
+fn parse_store_reg_to_mem(t: &str) -> Option<(RmwWidth, &str, &str)> {
+    let sp = t.find(' ')?;
+    let (mnemonic, rest) = t.split_at(sp);
+    let width = RmwWidth::from_mov(mnemonic)?;
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    if !src.starts_with('%') || src.contains('(') || !dst.contains('(') {
+        return None;
+    }
+    Some((width, src, dst))
+}
+
+/// The ALU operation a fused read-modify-write re-emits.  Both are exact
+/// modulo 2^width, so a narrow store of the low bits of a wider `add`/`sub`
+/// equals the narrow memory-destination form of the same operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IncOp {
+    Add,
+    Sub,
+}
+
+impl IncOp {
+    fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Sub => "sub",
+        }
+    }
+}
+
+/// A constant increment of `reg` on a line, in one of the forms the backend
+/// emits:
+///
+/// * `add{width} $IMM, %reg` / `sub{width} $IMM, %reg` -- in place, and
+/// * `lea{l,q} IMM(%reg), %dst` -- the register-width LEA form (there is no
+///   8/16-bit LEA), always an add.
+///
+/// Returns `(value_reg, immediate_text, op)`; the text is the source's own
+/// spelling (`1`, `0x1`, `-4`), re-emitted with a `$` after the same
+/// operation, so no immediate is ever negated (`sub $-2147483648` has no
+/// `add` spelling).
+fn parse_const_increment<'a>(
+    t: &'a str,
+    width: RmwWidth,
+    reg: &'a str,
+) -> Option<(&'a str, &'a str, IncOp)> {
+    let sp = t.find(' ')?;
+    let (mnemonic, rest) = t.split_at(sp);
+    let rest = rest.trim_start();
+    // The increment may be spelled at ANY width that is not narrower than the
+    // load's register width.  The fused form only has to reproduce the value's
+    // LOW `mem_width` bits -- `add{b,w,l,q} $imm,MEM` wraps modulo the same
+    // power of two -- and an add at a wider width leaves those low bits
+    // identical (`(x + K) mod 2^w` does not depend on the width the addition
+    // ran at, for every `w` the narrow operation can see).  The backend really
+    // does emit the mixed spelling, because staging a narrow value into the
+    // 64-bit accumulator canonicalizes it there while the load stays 32-bit:
+    //
+    //     movzwl (%rdx), %eax
+    //     addq   $1, %rax        <- address width, load was `movzwl`
+    //     movw   %ax, (%rdx)
+    //
+    // A NARROWER increment is refused: its low bits would no longer be the sum
+    // the load's width implies once its own width drops below the store's.
+    if let Some((stem, inc_width)) = split_alu_width(mnemonic) {
+        let op = match stem {
+            "add" => IncOp::Add,
+            _ => IncOp::Sub,
+        };
+        let (imm, dst) = split_two_operands(rest)?;
+        let imm = imm.strip_prefix('$')?;
+        if inc_width.bits() < width.bits() {
+            return None;
+        }
+        if inc_width == width {
+            // Same width: the destination is the loaded register, exactly as
+            // spelled by the load.
+            if dst != reg {
+                return None;
+            }
+        } else {
+            // Wider: the destination must be the SAME FAMILY's spelling at the
+            // increment's own width, and nothing else.
+            let fam = register_family_fast(reg);
+            if fam == REG_NONE || fam > REG_GP_MAX {
+                return None;
+            }
+            if dst != reg_id_to_name(fam, inc_width.move_size()) {
+                return None;
+            }
+        }
+        parse_plain_imm(imm)?;
+        return Some((reg, imm, op));
+    }
+    // A 32-bit-destination load accepts BOTH address-width spellings: the
+    // truncating-ring pass lowers a narrow unsigned add through the address
+    // width (`movzwl (%rdi,%rsi,2), %r9d; leaq 4464(%r9), %rax; movw`),
+    // and `leaq K(%r9)`'s low 32 bits equal `leal K(%r9)`'s for every `K`
+    // (mod 2^32 both compute `(r9 + K)`), so refusing the 64-bit mnemonic
+    // there would drop the fused form exactly on the byte/word RMW shapes
+    // this fold exists for. A 64-bit load stays `leaq`-only: `leal` would
+    // truncate the value the fused `addq` must produce.
+    let lea_ok = match width {
+        RmwWidth::L => mnemonic == "leal" || mnemonic == "leaq",
+        RmwWidth::Q => mnemonic == "leaq",
+        _ => false,
+    };
+    if lea_ok {
+        let (src, dst) = split_two_operands(rest)?;
+        let open = src.find('(')?;
+        let imm = &src[..open];
+        let inner = src.get(open + 1..src.len().checked_sub(1)?)?;
+        // Base-register-only addressing: an index term would mean the
+        // "increment" is not a constant add of this register.  The base is
+        // spelled in ADDRESS width, which on x86-64 is the 64-bit name of the
+        // family: the backend's own spelling of `x + K` for a 32-bit `x` in
+        // `%r9d` is `leal K(%r9), %dst`.  That is exactly the 32-bit add --
+        // `leal` keeps the low 32 bits of `%r9 + K`, which are `%r9d + K`
+        // modulo 2^32 whatever the upper half holds -- so the base is
+        // compared by family, accepting the loaded register's own spelling or
+        // its 64-bit address spelling and nothing else (no 16/8-bit names, no
+        // other family).
+        let fam = register_family_fast(reg);
+        if fam > 15 || (inner != reg && inner != reg_id_to_name(fam, MoveSize::Q)) {
+            return None;
+        }
+        if imm.is_empty() || parse_plain_imm(imm).is_none() {
+            return None;
+        }
+        if !dst.starts_with('%') || dst.contains('(') {
+            return None;
+        }
+        return Some((dst, imm, IncOp::Add));
+    }
+    None
+}
+
+/// The immediate of a fused narrow RMW.  The increment ran at register width
+/// (`leal 300(%r9), %eax` feeding a byte store), but the fused instruction
+/// carries a `width`-bit immediate: a byte/word operation only ever sees the
+/// value modulo 2^width, so an out-of-range literal is re-spelled as its
+/// wrapped signed value (`300` -> `44` for a byte), which encodes the same
+/// bytes the assembler would have truncated to -- without the "shortened"
+/// warning or the misleading text.  In-range literals (signed or unsigned
+/// reading) keep the source's spelling.
+fn narrow_imm_text(imm: &str, width: RmwWidth) -> String {
+    let bits = match width {
+        RmwWidth::B => 8,
+        RmwWidth::W => 16,
+        RmwWidth::L | RmwWidth::Q => return imm.to_string(),
+    };
+    let Some(v) = parse_plain_imm(imm) else {
+        return imm.to_string();
+    };
+    if (-(1i64 << (bits - 1))..(1i64 << bits)).contains(&v) {
+        return imm.to_string();
+    }
+    // Two's-complement wrap into `bits`: keep the low bits, then re-sign.
+    let sign = 1i64 << (bits - 1);
+    (((v & ((1i64 << bits) - 1)) ^ sign) - sign).to_string()
+}
+
+/// Decimal or `0x` integer literal with an optional sign, in `i32` range --
+/// the width an x86 ALU immediate can carry.
+fn parse_plain_imm(s: &str) -> Option<i64> {
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let value = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        body.parse::<i64>().ok()?
+    };
+    let value = if neg { -value } else { value };
+    (i32::try_from(value).is_ok()).then_some(value)
+}
+
+/// `movzbl %r8b, %r9d` -> `Some(8)` for a copy of family 8's byte.  Only the
+/// exact spelling of the family at `mem_width` is accepted (see the call site):
+/// a wider read would drag the incremented high bits into the value the fused
+/// read-modify-write never sees.
+/// A plain same-width register copy of the loaded value: `movq %rdi, %rax`
+/// where the load produced `%rdi` at register width `width`. Returns the
+/// copy's destination register text. Only the exact width-matched plain
+/// `mov` is accepted: the copied value must be bit-identical to the loaded
+/// value, which is what makes incrementing the copy equivalent to
+/// incrementing the load's own register.
+fn parse_same_width_copy<'a>(t: &'a str, width: RmwWidth, loaded_reg: &str) -> Option<&'a str> {
+    let (mnemonic, rest) = t.split_once(' ')?;
+    let want = match width {
+        RmwWidth::Q => "movq",
+        RmwWidth::L => "movl",
+        RmwWidth::W => "movw",
+        RmwWidth::B => "movb",
+    };
+    if mnemonic != want {
+        return None;
+    }
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    if src != loaded_reg || !dst.starts_with('%') || dst.contains('(') || dst == loaded_reg {
+        return None;
+    }
+    Some(dst)
+}
+
+fn parse_narrow_copy(t: &str, mem_width: RmwWidth) -> Option<RegId> {
+    let (mnemonic, rest) = t.split_once(' ')?;
+    let (mem_w, _dst_w) = {
+        let mut found = None;
+        for m in [
+            "movzbl", "movzbq", "movzbw", "movzwl", "movzwq", "movslq", "movsbl", "movsbq",
+            "movsbw", "movswl", "movswq",
+        ] {
+            if mnemonic == m {
+                found = load_widths(m);
+                break;
+            }
+        }
+        found?
+    };
+    if mem_w != mem_width {
+        return None;
+    }
+    let (src, dst) = split_two_operands(rest.trim_start())?;
+    let fam = register_family_fast(src);
+    if fam == REG_NONE || fam > REG_GP_MAX {
+        return None;
+    }
+    let row = match mem_width {
+        RmwWidth::B => 3,
+        RmwWidth::W => 2,
+        RmwWidth::L => 1,
+        RmwWidth::Q => 0,
+    };
+    if src != REG_NAMES[row][fam as usize] {
+        return None;
+    }
+    if !dst.starts_with('%') || dst.contains('(') {
+        return None;
+    }
+    Some(fam)
+}
+
+#[cfg(test)]
+mod rmw_increment_form_tests {
+    use super::super::super::types::classify_line;
+    use super::{RmwWidth, fold_memory_rmw, narrow_imm_text};
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_memory_rmw(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// Every temporary the fold deletes is redefined before `ret`, and the
+    /// redefinitions also kill the flags, so deadness is never the reason a
+    /// case below folds or refuses.
+    const TAIL: &str = "    xorl %eax, %eax\n    xorl %r9d, %r9d\n    xorl %r10d, %r10d\n    ret\n";
+
+    /// The backend's spelling of a 32-bit `x + K`: the LEA base is the
+    /// family's 64-bit (address-width) name.  This is `C[idx]++` on an `int`
+    /// table, and it used to be refused because `%r9` != `%r9d` textually.
+    #[test]
+    fn folds_lea_with_address_width_base() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi, %rsi, 4), %r9d\n    leal 1(%r9), %eax\n    movl %eax, (%rdi, %rsi, 4)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addl $1, (%rdi, %rsi, 4)", "{out:?}");
+    }
+
+    /// A `uint16_t` counter at `-O2`: the load stays 32-bit while the
+    /// increment runs at 64-bit address width, because staging a narrow value
+    /// into the accumulator canonicalizes it there.  Refusing the mixed
+    /// spelling left the whole relay in place and made
+    /// `check_rmw_sib_folds.sh` contract 2b fail, so this is a real regression
+    /// witness, not a hypothetical shape.
+    #[test]
+    fn folds_a_wider_increment_over_a_narrower_load() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// The same shape with a self-extending truncate between the increment and
+    /// the store: what `x++` on a `uint16_t` global actually emits once the
+    /// accumulator staging is canonicalizing.
+    #[test]
+    fn folds_a_wider_increment_relayed_through_a_narrow_self_extend() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movzwl %ax, %eax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// A NARROWER increment must still refuse: once the addition wraps below
+    /// the load's width, its low bits are no longer the sum the narrow store
+    /// has to see.
+    #[test]
+    fn refuses_an_increment_narrower_than_the_load() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addb $1, %al\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// A wider increment that names a DIFFERENT register of the family is not
+    /// the loaded value: `%rax` may hold an address-width copy, `%r10` cannot
+    /// belong to an `%eax` load at all.
+    #[test]
+    fn refuses_a_wider_increment_naming_another_register() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %r10\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// The loaded register's own spelling stays accepted.
+    #[test]
+    fn folds_lea_with_exact_base() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %r9d\n    leal 7(%r9d), %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addl $7, (%rdi)", "{out:?}");
+    }
+
+    /// A base of ANOTHER family is not an increment of the loaded value.
+    #[test]
+    fn refuses_lea_with_other_family_base() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %r9d\n    leal 1(%r10), %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// An index term makes it `x + y + K`, not a constant increment.
+    #[test]
+    fn refuses_lea_with_index_term() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %r9d\n    leal 1(%r9, %r9), %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// `C[i] -= K` fuses to the same operation, never to a negated `add`.
+    #[test]
+    fn folds_sub_with_same_operation() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi, %rsi, 4), %eax\n    subl $3, %eax\n    movl %eax, (%rdi, %rsi, 4)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "subl $3, (%rdi, %rsi, 4)", "{out:?}");
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %eax\n    subl $-2147483648, %eax\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "subl $-2147483648, (%rdi)", "{out:?}");
+    }
+
+    /// Staging a narrow value into the 64-bit accumulator canonicalizes it
+    /// there, so a `uint16_t` counter is loaded at 32-bit width and incremented
+    /// at address width.  The fused `addw` reproduces the low 16 bits either
+    /// way, so the mixed spelling folds -- this is `g_c16[c]++` at `-O2`, and
+    /// refusing it here is what `check_rmw_sib_folds.sh` contract 2b catches.
+    #[test]
+    fn folds_wider_increment_than_the_load() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// The same shape with the accumulator's own re-canonicalization in
+    /// between: one narrow copy of the value family is transparent.
+    #[test]
+    fn folds_wider_increment_behind_a_narrow_copy() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %rax\n    movzwl %ax, %eax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addw $1, (%rdx)", "{out:?}");
+    }
+
+    /// `sub` at address width folds as a `sub`, never as a negated `add`.
+    #[test]
+    fn folds_wider_sub_increment() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    subq $5, %rax\n    movw %ax, (%rdx)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "subw $5, (%rdx)", "{out:?}");
+    }
+
+    /// A NARROWER increment is refused: once the addition runs at a width
+    /// below the store's, its low bits are no longer the sum the store needs.
+    #[test]
+    fn refuses_narrower_increment_than_the_load() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %eax\n    addb $1, %al\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// The wider increment must name the SAME family and that family's own
+    /// width spelling: `%r10` is not an increment of `%eax`.
+    #[test]
+    fn refuses_wider_increment_of_other_family() {
+        let (changed, out) = run(&format!(
+            "    movzwl (%rdx), %eax\n    addq $1, %r10\n    movw %r10w, (%rdx)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// A `sub` of a register other than the loaded one is not an increment.
+    #[test]
+    fn refuses_sub_of_other_register() {
+        let (changed, out) = run(&format!(
+            "    movl (%rdi), %eax\n    subl $3, %r10d\n    movl %eax, (%rdi)\n{TAIL}"
+        ));
+        assert!(!changed, "{out:?}");
+    }
+
+    /// A byte counter incremented at register width: the fused `addb` gets the
+    /// immediate wrapped into 8 bits instead of a literal GAS must truncate.
+    #[test]
+    fn narrow_fold_wraps_out_of_range_immediate() {
+        let (changed, out) = run(&format!(
+            "    movzbl (%rdi), %r9d\n    leal 300(%r9), %eax\n    movb %al, (%rdi)\n{TAIL}"
+        ));
+        assert!(changed, "{out:?}");
+        assert_eq!(out[0], "addb $44, (%rdi)", "{out:?}");
+    }
+
+    #[test]
+    fn narrow_imm_text_is_exact_modulo_width() {
+        let cases = [
+            ("1", RmwWidth::B, "1"),
+            ("-3", RmwWidth::B, "-3"),
+            ("255", RmwWidth::B, "255"),
+            ("-128", RmwWidth::B, "-128"),
+            ("200", RmwWidth::B, "200"),
+            ("300", RmwWidth::B, "44"),
+            ("-129", RmwWidth::B, "127"),
+            ("0x1ff", RmwWidth::B, "-1"),
+            ("70000", RmwWidth::W, "4464"),
+            ("65535", RmwWidth::W, "65535"),
+            ("-32769", RmwWidth::W, "32767"),
+            ("70000", RmwWidth::L, "70000"),
+            ("-2147483648", RmwWidth::Q, "-2147483648"),
+        ];
+        for (imm, width, want) in cases {
+            assert_eq!(narrow_imm_text(imm, width), want, "{imm} at {width:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug_and_pin_memfold_tests {
+    use super::*;
+
+    fn run(asm: &str, pinned: Option<usize>) -> (bool, Vec<String>, bool) {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        if let Some(index) = pinned {
+            infos[index].pinned = true;
+        }
+        let predicted = load_would_memfold(&store, &infos, 0);
+        let changed = fold_memory_operands(&mut store, &mut infos);
+        let output = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, output, predicted)
+    }
+
+    #[test]
+    fn debug_directives_preserve_memory_fold_and_prediction() {
+        for gap in [".loc 1 23 4\n", ".file 1 \"kernel.c\"\n.loc 1 23 4\n"] {
+            let asm = format!("movq 176(%rsp), %rax\n{gap}addq %rax, %r11\nmovq $0, %rax\n");
+            let (changed, output, predicted) = run(&asm, None);
+            assert!(predicted && changed, "{output:?}");
+            assert!(output.iter().any(|s| s == "addq 176(%rsp), %r11"));
+            assert!(output.iter().any(|s| s.starts_with(".loc ")));
+        }
+    }
+
+    #[test]
+    fn debug_separated_destination_copy_is_transparent() {
+        let (changed, output, predicted) = run(
+            "movq 32(%rsp), %rcx\n.loc 1 2 0\nmovq %rdx, %r8\n.loc 1 3 0\naddq %rcx, %r8\nmovq $0, %rcx\n",
+            None,
+        );
+        assert!(predicted && changed, "{output:?}");
+        assert!(output.iter().any(|s| s == "addq 32(%rsp), %r8"));
+    }
+
+    #[test]
+    fn pinned_load_or_consumer_cannot_be_half_rewritten() {
+        let asm = "movq 32(%rsp), %rax\naddq %rax, %r11\nmovq $0, %rax\n";
+        for pinned in [0, 1] {
+            let (changed, output, predicted) = run(asm, Some(pinned));
+            assert!(!predicted && !changed, "pin={pinned}: {output:?}");
+            assert_eq!(output, asm.lines().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn debug_transparency_does_not_cross_layout_or_unwind_barriers() {
+        for barrier in [
+            ".p2align 4,,10",
+            ".cfi_adjust_cfa_offset 8",
+            ".long 42",
+            ".Ljoin:",
+            "call f",
+        ] {
+            let asm = format!(
+                "movq 32(%rsp), %rax\n.loc 1 2 0\n{barrier}\naddq %rax, %r11\nmovq $0, %rax\n"
+            );
+            let (changed, _, predicted) = run(&asm, None);
+            assert!(!changed && !predicted, "crossed {barrier}");
+        }
+    }
+
+    #[test]
+    fn debug_transparency_keeps_width_and_liveness_guards() {
+        for asm in [
+            "movl 32(%rsp), %eax\n.loc 1 2 0\naddq %rax, %r11\nmovq $0, %rax\n",
+            "movq 32(%rsp), %rax\n.loc 1 2 0\naddq %rax, %r11\naddq %rax, %r10\n",
+            "movq 32(%rsp), %rax\n.loc 1 2 0\nmovq %r11, 32(%rsp)\naddq %rax, %r10\nmovq $0, %rax\n",
+        ] {
+            let (changed, _, predicted) = run(asm, None);
+            assert!(!changed && !predicted);
+        }
+    }
+    #[test]
+    fn exhausting_liveness_budget_is_not_a_deadness_proof() {
+        let asm = format!(
+            "movq 32(%rsp), %rax\naddq %rax, %r11\n{}movq %rax, %r9\n",
+            "addq $1, %r10\n".repeat(80)
+        );
+        let (changed, output, predicted) = run(&asm, None);
+        assert!(
+            !changed && !predicted,
+            "live scratch definition deleted: {output:?}"
+        );
+    }
+
+    #[test]
+    fn debug_markers_do_not_consume_liveness_budget() {
+        let asm = format!(
+            "movq 32(%rsp), %rax\naddq %rax, %r11\n{}movq $0, %rax\n",
+            ".loc 1 3 0\n".repeat(80)
+        );
+        let (changed, output, predicted) = run(&asm, None);
+        assert!(
+            changed && predicted,
+            "metadata hid the real kill: {output:?}"
+        );
+    }
+    #[test]
+    fn partial_stack_load_does_not_kill_upper_register_bits() {
+        for (mnemonic, destination) in [("movb", "%al"), ("movw", "%ax")] {
+            let asm = format!(
+                "movq 32(%rsp), %rax\naddq %rax, %r11\n{mnemonic} 8(%rsp), {destination}\nmovq %rax, %r9\n"
+            );
+            let (changed, output, predicted) = run(&asm, None);
+            assert!(!changed && !predicted, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn stack_load_that_reads_the_tracked_base_is_not_a_kill() {
+        let store = LineStore::new("movq 32(%rbp), %rbp\n".to_string());
+        let infos = vec![classify_line(store.get(0))];
+        assert!(!is_reg_dead_after(&store, &infos, 0, 1, 5));
+        assert!(!scratch_dead_after_relaxed(&store, &infos, 0, 1, 5));
+    }
+
+    #[test]
+    fn push_and_pop_read_the_old_stack_pointer() {
+        for line in ["pushq %r8\n", "popq %r8\n", "popq %rsp\n"] {
+            let store = LineStore::new(line.to_string());
+            let infos = vec![classify_line(store.get(0))];
+            assert!(
+                !scratch_dead_after_relaxed(&store, &infos, 0, 1, 4),
+                "{line}"
+            );
+        }
+    }
+}

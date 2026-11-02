@@ -1,0 +1,491 @@
+{
+  "correct": true,
+  "native_kernels": 52,
+  "gcc_version": "16.2.0",
+  "gcc_16_2_normative": true,
+  "clang_version": "23.1.3",
+  "receipts": [
+    {
+      "width": 128,
+      "checksum": "be00f3386b866038 286720",
+      "comparisons": [
+        {
+          "name": "packed_shl_chain_16_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shl_zero_16_128",
+          "enabled": 8,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_chain_16_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_zero_16_128",
+          "enabled": 8,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_chain_16_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_saturate_16_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_mask_direct_16_128",
+          "enabled": 8,
+          "disabled": 10,
+          "baseline": 10
+        },
+        {
+          "name": "packed_mask_reextend_16_128",
+          "enabled": 8,
+          "disabled": 12,
+          "baseline": 12
+        },
+        {
+          "name": "packed_mask_tree_16_128",
+          "enabled": 66,
+          "disabled": 70,
+          "baseline": 70
+        },
+        {
+          "name": "packed_nonmask_control_16_128",
+          "enabled": 6,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shared_control_16_128",
+          "enabled": 13,
+          "disabled": 13,
+          "baseline": 13
+        },
+        {
+          "name": "packed_shl_chain_32_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shl_zero_32_128",
+          "enabled": 8,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_chain_32_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_zero_32_128",
+          "enabled": 8,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_chain_32_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_saturate_32_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_mask_direct_32_128",
+          "enabled": 8,
+          "disabled": 10,
+          "baseline": 10
+        },
+        {
+          "name": "packed_mask_reextend_32_128",
+          "enabled": 8,
+          "disabled": 12,
+          "baseline": 12
+        },
+        {
+          "name": "packed_mask_tree_32_128",
+          "enabled": 66,
+          "disabled": 70,
+          "baseline": 70
+        },
+        {
+          "name": "packed_nonmask_control_32_128",
+          "enabled": 6,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shared_control_32_128",
+          "enabled": 13,
+          "disabled": 13,
+          "baseline": 13
+        },
+        {
+          "name": "packed_shl_chain_64_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shl_zero_64_128",
+          "enabled": 8,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_chain_64_128",
+          "enabled": 4,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_zero_64_128",
+          "enabled": 8,
+          "disabled": 6,
+          "baseline": 6
+        }
+      ]
+    },
+    {
+      "width": 256,
+      "checksum": "58932d410ec1ccce 860160",
+      "comparisons": [
+        {
+          "name": "packed_shl_chain_16_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_shl_zero_16_128",
+          "enabled": 8,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_lshr_chain_16_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_lshr_zero_16_128",
+          "enabled": 8,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_ashr_chain_16_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_ashr_saturate_16_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_mask_direct_16_128",
+          "enabled": 7,
+          "disabled": 8,
+          "baseline": 8
+        },
+        {
+          "name": "packed_mask_reextend_16_128",
+          "enabled": 7,
+          "disabled": 9,
+          "baseline": 9
+        },
+        {
+          "name": "packed_mask_tree_16_128",
+          "enabled": 39,
+          "disabled": 41,
+          "baseline": 41
+        },
+        {
+          "name": "packed_nonmask_control_16_128",
+          "enabled": 5,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_shared_control_16_128",
+          "enabled": 10,
+          "disabled": 10,
+          "baseline": 10
+        },
+        {
+          "name": "packed_shl_chain_32_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_shl_zero_32_128",
+          "enabled": 8,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_lshr_chain_32_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_lshr_zero_32_128",
+          "enabled": 8,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_ashr_chain_32_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_ashr_saturate_32_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_mask_direct_32_128",
+          "enabled": 7,
+          "disabled": 8,
+          "baseline": 8
+        },
+        {
+          "name": "packed_mask_reextend_32_128",
+          "enabled": 7,
+          "disabled": 9,
+          "baseline": 9
+        },
+        {
+          "name": "packed_mask_tree_32_128",
+          "enabled": 39,
+          "disabled": 41,
+          "baseline": 41
+        },
+        {
+          "name": "packed_nonmask_control_32_128",
+          "enabled": 5,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_shared_control_32_128",
+          "enabled": 10,
+          "disabled": 10,
+          "baseline": 10
+        },
+        {
+          "name": "packed_shl_chain_64_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_shl_zero_64_128",
+          "enabled": 8,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_lshr_chain_64_128",
+          "enabled": 4,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_lshr_zero_64_128",
+          "enabled": 8,
+          "disabled": 5,
+          "baseline": 5
+        },
+        {
+          "name": "packed_shl_chain_16_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shl_zero_16_256",
+          "enabled": 9,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_chain_16_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_zero_16_256",
+          "enabled": 9,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_chain_16_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_saturate_16_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_mask_direct_16_256",
+          "enabled": 8,
+          "disabled": 9,
+          "baseline": 9
+        },
+        {
+          "name": "packed_mask_reextend_16_256",
+          "enabled": 8,
+          "disabled": 10,
+          "baseline": 10
+        },
+        {
+          "name": "packed_mask_tree_16_256",
+          "enabled": 40,
+          "disabled": 42,
+          "baseline": 42
+        },
+        {
+          "name": "packed_nonmask_control_16_256",
+          "enabled": 6,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shared_control_16_256",
+          "enabled": 11,
+          "disabled": 11,
+          "baseline": 11
+        },
+        {
+          "name": "packed_shl_chain_32_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shl_zero_32_256",
+          "enabled": 9,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_chain_32_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_zero_32_256",
+          "enabled": 9,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_chain_32_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_ashr_saturate_32_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_mask_direct_32_256",
+          "enabled": 8,
+          "disabled": 9,
+          "baseline": 9
+        },
+        {
+          "name": "packed_mask_reextend_32_256",
+          "enabled": 8,
+          "disabled": 10,
+          "baseline": 10
+        },
+        {
+          "name": "packed_mask_tree_32_256",
+          "enabled": 40,
+          "disabled": 42,
+          "baseline": 42
+        },
+        {
+          "name": "packed_nonmask_control_32_256",
+          "enabled": 6,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shared_control_32_256",
+          "enabled": 11,
+          "disabled": 11,
+          "baseline": 11
+        },
+        {
+          "name": "packed_shl_chain_64_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_shl_zero_64_256",
+          "enabled": 9,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_chain_64_256",
+          "enabled": 5,
+          "disabled": 6,
+          "baseline": 6
+        },
+        {
+          "name": "packed_lshr_zero_64_256",
+          "enabled": 9,
+          "disabled": 6,
+          "baseline": 6
+        }
+      ]
+    }
+  ],
+  "timing_claim": false,
+  "control": "only vecrelations disabled; existing lowering, SSA and backend optimizations remain active"
+}

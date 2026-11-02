@@ -1,0 +1,321 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "binary_trees",
+    "byte_load_reassembly",
+    "chacha20_block",
+    "expat_xml_scan",
+    "gzip_longest_match",
+    "hot_web_loop",
+    "llvm_scalar_facts",
+    "nbody",
+    "sqlite_varint",
+    "switch_dispatch"
+  ],
+  "results": {
+    "llvm_scalar_facts": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DSCALAR_FACTS_TRIPS=1024",
+      "metrics": {
+        "conditional_mispredicts": [
+          3421,
+          3421
+        ],
+        "d1_misses": [
+          1828,
+          1828
+        ],
+        "i1_misses": [
+          1322,
+          1322
+        ],
+        "indirect_mispredicts": [
+          205,
+          205
+        ],
+        "ir_mine": 310053,
+        "ir_ratio": 1.0,
+        "ir_ref": 310053,
+        "ll_misses": [
+          2795,
+          2795
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/llvm_scalar_facts/manifest.json"
+    },
+    "hot_web_loop": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DHOT_WEB_TRIPS=4096",
+      "metrics": {
+        "conditional_mispredicts": [
+          3418,
+          3432
+        ],
+        "d1_misses": [
+          1825,
+          1824
+        ],
+        "i1_misses": [
+          1301,
+          1301
+        ],
+        "indirect_mispredicts": [
+          204,
+          204
+        ],
+        "ir_mine": 226177,
+        "ir_ratio": 1.0185216874414582,
+        "ir_ref": 222064,
+        "ll_misses": [
+          2776,
+          2776
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/hot_web_loop/manifest.json"
+    },
+    "nbody": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3572,
+          3576
+        ],
+        "d1_misses": [
+          1851,
+          1851
+        ],
+        "i1_misses": [
+          1395,
+          1395
+        ],
+        "indirect_mispredicts": [
+          202,
+          202
+        ],
+        "ir_mine": 826715,
+        "ir_ratio": 1.0122392156910762,
+        "ir_ref": 816719,
+        "ll_misses": [
+          2875,
+          2875
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/nbody/manifest.json"
+    },
+    "binary_trees": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "metrics": {
+        "conditional_mispredicts": [
+          203635,
+          203635
+        ],
+        "d1_misses": [
+          54214,
+          54214
+        ],
+        "i1_misses": [
+          1310,
+          1310
+        ],
+        "indirect_mispredicts": [
+          206,
+          206
+        ],
+        "ir_mine": 31174983,
+        "ir_ratio": 1.0,
+        "ir_ref": 31174983,
+        "ll_misses": [
+          4834,
+          4834
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/binary_trees/manifest.json"
+    },
+    "switch_dispatch": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -fwrapv -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3392,
+          3392
+        ],
+        "d1_misses": [
+          1822,
+          1822
+        ],
+        "i1_misses": [
+          1290,
+          1290
+        ],
+        "indirect_mispredicts": [
+          18962,
+          18962
+        ],
+        "ir_mine": 548167,
+        "ir_ratio": 1.0,
+        "ir_ref": 548167,
+        "ll_misses": [
+          2763,
+          2763
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/switch_dispatch/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm",
+      "metrics": {
+        "conditional_mispredicts": [
+          23442,
+          23442
+        ],
+        "d1_misses": [
+          1893,
+          1893
+        ],
+        "i1_misses": [
+          1317,
+          1317
+        ],
+        "indirect_mispredicts": [
+          205,
+          205
+        ],
+        "ir_mine": 38761047,
+        "ir_ratio": 1.0,
+        "ir_ref": 38761047,
+        "ll_misses": [
+          2852,
+          2852
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/byte_load_reassembly/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25591,
+          25591
+        ],
+        "d1_misses": [
+          2123,
+          2123
+        ],
+        "i1_misses": [
+          1297,
+          1297
+        ],
+        "indirect_mispredicts": [
+          201,
+          201
+        ],
+        "ir_mine": 1503755,
+        "ir_ratio": 1.0,
+        "ir_ref": 1503755,
+        "ll_misses": [
+          3025,
+          3025
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/expat_xml_scan/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          12425,
+          12425
+        ],
+        "d1_misses": [
+          2163,
+          2163
+        ],
+        "i1_misses": [
+          1314,
+          1314
+        ],
+        "indirect_mispredicts": [
+          2023,
+          2023
+        ],
+        "ir_mine": 816366,
+        "ir_ratio": 1.0,
+        "ir_ref": 816366,
+        "ll_misses": [
+          3075,
+          3075
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/sqlite_varint/manifest.json"
+    },
+    "chacha20_block": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          3949,
+          3949
+        ],
+        "d1_misses": [
+          1827,
+          1827
+        ],
+        "i1_misses": [
+          1315,
+          1315
+        ],
+        "indirect_mispredicts": [
+          204,
+          204
+        ],
+        "ir_mine": 528899,
+        "ir_ratio": 1.0,
+        "ir_ref": 528899,
+        "ll_misses": [
+          2787,
+          2787
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/chacha20_block/manifest.json"
+    },
+    "gzip_longest_match": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DWINDOW_SIZE=4096 -DPASSES=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          4572,
+          4572
+        ],
+        "d1_misses": [
+          4503,
+          4503
+        ],
+        "i1_misses": [
+          1331,
+          1331
+        ],
+        "indirect_mispredicts": [
+          205,
+          205
+        ],
+        "ir_mine": 535182,
+        "ir_ratio": 1.0,
+        "ir_ref": 535182,
+        "ll_misses": [
+          5179,
+          5179
+        ]
+      },
+      "manifest": "/home/user/audit/final-callgrind/gzip_longest_match/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "hot_web_loop",
+    "nbody",
+    "llvm_scalar_facts",
+    "binary_trees",
+    "switch_dispatch",
+    "byte_load_reassembly",
+    "expat_xml_scan",
+    "sqlite_varint",
+    "chacha20_block",
+    "gzip_longest_match"
+  ]
+}

@@ -1,0 +1,92 @@
+[
+  {
+    "path": "binary_trees/gcc/benchmark.bin",
+    "sha256": "f4499f4bfcf8e34ee5a75d4fe2746e83b7933570dfbf7f708f9fc945ef8ab887",
+    "original_sha256": "f4499f4bfcf8e34ee5a75d4fe2746e83b7933570dfbf7f708f9fc945ef8ab887",
+    "identical": true
+  },
+  {
+    "path": "binary_trees/lccc/benchmark.bin",
+    "sha256": "40e21b0b9fd2d8f60db38c863c4420e8320a21c4615f8d4c5af90d32e0ca83f9",
+    "original_sha256": "40e21b0b9fd2d8f60db38c863c4420e8320a21c4615f8d4c5af90d32e0ca83f9",
+    "identical": true
+  },
+  {
+    "path": "binary_trees/main/benchmark.bin",
+    "sha256": "c0806e78e99998dc811360ef4ad6af86a2bd62bc26eeeaed149533bb175a5273",
+    "original_sha256": "c0806e78e99998dc811360ef4ad6af86a2bd62bc26eeeaed149533bb175a5273",
+    "identical": true
+  },
+  {
+    "path": "expat_xml_scan/gcc/benchmark.bin",
+    "sha256": "90a4e91896a7c2f57c3ff1f8d548f78525500ac24347dd9fc2f69da0f096f0f5",
+    "original_sha256": "90a4e91896a7c2f57c3ff1f8d548f78525500ac24347dd9fc2f69da0f096f0f5",
+    "identical": true
+  },
+  {
+    "path": "expat_xml_scan/lccc/benchmark.bin",
+    "sha256": "751cf554279a3874076409d72873a520e970a5e8591617c82282d156f44eb139",
+    "original_sha256": "751cf554279a3874076409d72873a520e970a5e8591617c82282d156f44eb139",
+    "identical": true
+  },
+  {
+    "path": "expat_xml_scan/main/benchmark.bin",
+    "sha256": "f99c5dd65cce50435508ccc2acbf9c2e1bf01f6ad578875ecc9947ed37933910",
+    "original_sha256": "f99c5dd65cce50435508ccc2acbf9c2e1bf01f6ad578875ecc9947ed37933910",
+    "identical": true
+  },
+  {
+    "path": "spectral_norm/gcc/benchmark.bin",
+    "sha256": "70b77391f4894ef671356350fba886faf3bb06ee53e2731fea213dfdf32271ed",
+    "original_sha256": "70b77391f4894ef671356350fba886faf3bb06ee53e2731fea213dfdf32271ed",
+    "identical": true
+  },
+  {
+    "path": "spectral_norm/lccc/benchmark.bin",
+    "sha256": "4b43298ef8b8d200c8d13348ff3f42045d4be854eab890a9493fabba114b89dd",
+    "original_sha256": "4b43298ef8b8d200c8d13348ff3f42045d4be854eab890a9493fabba114b89dd",
+    "identical": true
+  },
+  {
+    "path": "spectral_norm/main/benchmark.bin",
+    "sha256": "c1f4873c1291dd8ee7e6ac891574a263ae4907bbff2bce3610786e22b57078d0",
+    "original_sha256": "c1f4873c1291dd8ee7e6ac891574a263ae4907bbff2bce3610786e22b57078d0",
+    "identical": true
+  },
+  {
+    "path": "sqlite_varint/gcc/benchmark.bin",
+    "sha256": "1b49e1e0d060f5cd216672686a6e6dba810f9489e0e29d41c230c8a26eef9092",
+    "original_sha256": "1b49e1e0d060f5cd216672686a6e6dba810f9489e0e29d41c230c8a26eef9092",
+    "identical": true
+  },
+  {
+    "path": "sqlite_varint/lccc/benchmark.bin",
+    "sha256": "44cea6cc00f93942c8b972c5da61f800fe0c606443dfeee721b1058f248e1732",
+    "original_sha256": "44cea6cc00f93942c8b972c5da61f800fe0c606443dfeee721b1058f248e1732",
+    "identical": true
+  },
+  {
+    "path": "sqlite_varint/main/benchmark.bin",
+    "sha256": "e4bce50f4c6940e143ff9fa66dcfae300f5af488dcf98eb9d1bec1af9a3c6b9b",
+    "original_sha256": "e4bce50f4c6940e143ff9fa66dcfae300f5af488dcf98eb9d1bec1af9a3c6b9b",
+    "identical": true
+  },
+  {
+    "path": "strlen_bench/gcc/benchmark.bin",
+    "sha256": "f634e69a7906c303d9d61254a2dd7b80b5a48ce247d939a585420e240e974cfb",
+    "original_sha256": "f634e69a7906c303d9d61254a2dd7b80b5a48ce247d939a585420e240e974cfb",
+    "identical": true
+  },
+  {
+    "path": "strlen_bench/lccc/benchmark.bin",
+    "sha256": "d4097634324a7e4909c12da10f01d8855a59ef1d31e9ec2c0ef8a2479524fceb",
+    "original_sha256": "d4097634324a7e4909c12da10f01d8855a59ef1d31e9ec2c0ef8a2479524fceb",
+    "identical": true
+  },
+  {
+    "path": "strlen_bench/main/benchmark.bin",
+    "sha256": "8657f8aa45741b238e87dcc18950fc1484a50c841680bc544f37b459dbb45a18",
+    "original_sha256": "8657f8aa45741b238e87dcc18950fc1484a50c841680bc544f37b459dbb45a18",
+    "identical": true
+  }
+]

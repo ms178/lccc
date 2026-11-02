@@ -1,0 +1,156 @@
+{
+  "base": "1e83776f41529e2d754380d1d934ff901e25a097",
+  "compiler_sha256": "a2c4e6aecfc1a6857bae644497039cfacf8779da465acc4c8a826e0d55dcd56a",
+  "records": [
+    {
+      "arm": "gcc-O2",
+      "argv": [
+        "gcc",
+        "-O2",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {},
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": true,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+    },
+    {
+      "arm": "clang-O2",
+      "argv": [
+        "clang",
+        "-O2",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {},
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": true,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+    },
+    {
+      "arm": "gcc-sanitizers",
+      "argv": [
+        "gcc",
+        "-O1",
+        "-fsanitize=address,undefined",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=0",
+        "UBSAN_OPTIONS": "halt_on_error=1"
+      },
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": true,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+    },
+    {
+      "arm": "lccc-O0",
+      "argv": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O0",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {},
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": true,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+    },
+    {
+      "arm": "lccc-O1",
+      "argv": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O1",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {},
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": true,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+    },
+    {
+      "arm": "lccc-O2",
+      "argv": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {},
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": false,
+      "stdout_sha256": "531118a2c07a32090b063ce1fb96e713f0716273c7924f114c49c78e8619cd32"
+    },
+    {
+      "arm": "lccc-O3",
+      "argv": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O3",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {},
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": false,
+      "stdout_sha256": "531118a2c07a32090b063ce1fb96e713f0716273c7924f114c49c78e8619cd32"
+    },
+    {
+      "arm": "lccc-no-widen",
+      "argv": [
+        "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "-O2",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+        "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+        "-o",
+        "/tmp/tmpiovbbbrh/a"
+      ],
+      "environment": {
+        "CCC_NO_IV_WIDEN": "1"
+      },
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "run_rc": 0,
+      "run_stderr": "",
+      "matches": true,
+      "stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+    }
+  ]
+}

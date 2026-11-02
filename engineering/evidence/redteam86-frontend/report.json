@@ -1,0 +1,136 @@
+{
+  "before": {
+    "n": 292,
+    "failures": [
+      {
+        "source": "S(MAJOR.MINOR.PATCH)",
+        "gcc": "\"1.5.7\"",
+        "actual": "\"1.MINOR. 7\""
+      },
+      {
+        "source": "S(F(MAJOR))",
+        "gcc": "\"1.5.7\"",
+        "actual": "\"1.MINOR.PATCH\""
+      },
+      {
+        "source": "S(PLUS+)",
+        "gcc": "\"++\"",
+        "actual": "\"+ +\""
+      },
+      {
+        "source": "S(MINUS-)",
+        "gcc": "\"--\"",
+        "actual": "\"- -\""
+      },
+      {
+        "source": "S(MAJOR.MINOR . PATCH)",
+        "gcc": "\"1.5 . 7\"",
+        "actual": "\"1.MINOR . 7\""
+      },
+      {
+        "source": "S(MAJOR.MAJOR)",
+        "gcc": "\"1.1\"",
+        "actual": "\"1.MAJOR\""
+      },
+      {
+        "source": "S(MAJOR.MINOR)",
+        "gcc": "\"1.5\"",
+        "actual": "\"1.MINOR\""
+      },
+      {
+        "source": "S(MAJOR.PATCH)",
+        "gcc": "\"1.7\"",
+        "actual": "\"1.PATCH\""
+      },
+      {
+        "source": "S(MAJOR.I)",
+        "gcc": "\"1.13\"",
+        "actual": "\"1.I\""
+      },
+      {
+        "source": "S(MAJOR.L)",
+        "gcc": "\"1.27\"",
+        "actual": "\"1.L\""
+      },
+      {
+        "source": "S(MINOR.MAJOR)",
+        "gcc": "\"5.1\"",
+        "actual": "\"5.MAJOR\""
+      },
+      {
+        "source": "S(MINOR.MINOR)",
+        "gcc": "\"5.5\"",
+        "actual": "\"5.MINOR\""
+      },
+      {
+        "source": "S(MINOR.PATCH)",
+        "gcc": "\"5.7\"",
+        "actual": "\"5.PATCH\""
+      },
+      {
+        "source": "S(MINOR.I)",
+        "gcc": "\"5.13\"",
+        "actual": "\"5.I\""
+      },
+      {
+        "source": "S(MINOR.L)",
+        "gcc": "\"5.27\"",
+        "actual": "\"5.L\""
+      },
+      {
+        "source": "S(PATCH.MAJOR)",
+        "gcc": "\"7.1\"",
+        "actual": "\"7.MAJOR\""
+      },
+      {
+        "source": "S(PATCH.MINOR)",
+        "gcc": "\"7.5\"",
+        "actual": "\"7.MINOR\""
+      },
+      {
+        "source": "S(PATCH.PATCH)",
+        "gcc": "\"7.7\"",
+        "actual": "\"7.PATCH\""
+      },
+      {
+        "source": "S(PATCH.I)",
+        "gcc": "\"7.13\"",
+        "actual": "\"7.I\""
+      },
+      {
+        "source": "S(PATCH.L)",
+        "gcc": "\"7.27\"",
+        "actual": "\"7.L\""
+      },
+      {
+        "source": "S(I.MAJOR)",
+        "gcc": "\"13.1\"",
+        "actual": "\"13.MAJOR\""
+      },
+      {
+        "source": "S(I.MINOR)",
+        "gcc": "\"13.5\"",
+        "actual": "\"13.MINOR\""
+      },
+      {
+        "source": "S(I.PATCH)",
+        "gcc": "\"13.7\"",
+        "actual": "\"13.PATCH\""
+      },
+      {
+        "source": "S(I.I)",
+        "gcc": "\"13.13\"",
+        "actual": "\"13.I\""
+      },
+      {
+        "source": "S(I.L)",
+        "gcc": "\"13.27\"",
+        "actual": "\"13.L\""
+      }
+    ]
+  },
+  "after": {
+    "n": 292,
+    "failures": []
+  }
+}

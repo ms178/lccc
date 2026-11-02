@@ -1,0 +1,97 @@
+{
+  "label": "steal x precisionOFF",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_ki1_uhav/arm_a",
+    "sha256": "edb4079e161d02a1193e78eb090dde8c0fdb6c33618558b5361292274756306f",
+    "env": "CCC_NO_SAME_DST_RELOAD=1,CCC_NO_FRAME_SLOT_ALIASING=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_ki1_uhav/arm_b",
+    "sha256": "c8a89e258196067f12972c12fdab95fb7e648d24e985a4141c2f9bf459f423ee",
+    "env": "CCC_NO_X64_SPAN_STEAL=1,CCC_NO_SAME_DST_RELOAD=1,CCC_NO_FRAME_SLOT_ALIASING=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "stONprOFF",
+    "n": 15,
+    "min_ms": 454.788,
+    "median_ms": 464.342,
+    "mean_ms": 463.791,
+    "stdev_ms": 8.061,
+    "samples_ms": [
+      456.067,
+      454.79,
+      454.788,
+      454.834,
+      464.342,
+      470.611,
+      457.377,
+      458.123,
+      467.812,
+      455.687,
+      467.309,
+      470.155,
+      478.418,
+      476.752,
+      469.799
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "stOFFprOFF",
+    "n": 15,
+    "min_ms": 405.247,
+    "median_ms": 407.88,
+    "mean_ms": 413.834,
+    "stdev_ms": 9.855,
+    "samples_ms": [
+      405.827,
+      407.09,
+      406.228,
+      405.678,
+      406.642,
+      423.489,
+      407.88,
+      405.247,
+      409.238,
+      405.78,
+      423.218,
+      411.559,
+      432.203,
+      430.875,
+      426.552
+    ]
+  },
+  "paired_diffs_ms": [
+    50.24,
+    47.7,
+    48.56,
+    49.156,
+    57.7,
+    47.122,
+    49.497,
+    52.876,
+    58.574,
+    49.907,
+    44.092,
+    58.596,
+    46.214,
+    45.877,
+    43.246
+  ],
+  "median_ratio_b_over_a": 0.87841,
+  "min_ratio_b_over_a": 0.89107,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "stONprOFF SLOWER by 12.16% (median)"
+}

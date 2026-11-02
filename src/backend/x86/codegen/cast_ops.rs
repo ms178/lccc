@@ -1,0 +1,1807 @@
+//! X86Codegen: cast operations.
+
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32};
+use crate::backend::generation::is_i128_type;
+use crate::backend::regalloc::PhysReg;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrConst, Operand, Value};
+
+/// One deferred widening move (PF-15): the Cast was eligible but its
+/// emission is postponed until the consuming compare (or any other next
+/// instruction) decides. See `X86Codegen::pending_widen` for the full
+/// soundness contract.
+pub(super) struct PendingWiden {
+    /// Cast destination value (single-use; the use is the consumer).
+    pub dest: u32,
+    /// Cast source operand (always `Operand::Value`, reg- or slot-homed).
+    pub src: Operand,
+    /// Narrow source type (I8/U8/I16/U16) — the compare's new width.
+    pub from_ty: IrType,
+    /// Destination register home the widening move would have written.
+    pub dest_phys: PhysReg,
+    /// The move writes the 32-bit form (`X86Codegen::sext_widen_writes_32`),
+    /// decided at record time so the flush equals the immediate emission.
+    pub to_32: bool,
+}
+
+/// Policy: does a value's home already hold its own zero-extended 64-bit
+/// image, so that widening it is a plain register copy?
+///
+/// True only when the source is an unsigned (or pointer) integer of at most
+/// 32 bits and the destination is a non-float integer that is neither
+/// narrower nor 128-bit. A 32-bit write clears bits 32..63 on x86-64, which
+/// is exactly why such a value needs no `movzbl`/`movzwl`/`movslq`.
+///
+/// This is the ONE definition of the rule. `try_emit_zext_loaded_cast`
+/// (direct register path) and `emit_int_widen_move` (deferred-widen flush,
+/// comparison/cast kernels) both consult it, so the two emitters cannot
+/// disagree about what "already zero-extended" means.
+fn zext_home_widen_ok(from_ty: IrType, to_ty: IrType) -> bool {
+    !from_ty.is_signed()
+        && !from_ty.is_float()
+        && from_ty.size() <= 4
+        && !to_ty.is_float()
+        && to_ty.size() >= from_ty.size()
+        && !is_i128_type(to_ty)
+}
+
+impl X86Codegen {
+    /// Emit an int→float conversion of `src` into `dst`, with the cvtsi2sd
+    /// family's FALSE DEPENDENCY ON THE DESTINATION broken and the
+    /// narrowest legal source form selected.
+    ///
+    /// The legacy 2-operand `cvtsi2sdq %rax, %dst` merges the converted
+    /// value into dst's upper 64 bits — i.e. it READS dst's previous full
+    /// content, so back-to-back conversions into the same register
+    /// serialize at cvtsi2sd latency (~5-6 cycles on Skylake-derived
+    /// cores) even though the conversions are data-independent. In a loop
+    /// like spectral_norm's `A(i,j)` divisor recurrence this alone costs
+    /// ~6 cycles per iteration.
+    ///
+    ///   AVX:    `vcvtsi2sd{q,l} %src, %other, %dst` — the VEX form takes
+    ///           the upper-half bits from an explicit source register;
+    ///           picking one that never aliases dst removes the read of
+    ///           dst's old content entirely (register renaming then
+    ///           overlaps consecutive conversions). %xmm0/%xmm1 are pure
+    ///           scratch under the XMM-homes-are-xmm2..15 contract, so one
+    ///           of them always differs from dst.
+    ///   legacy: `pxor %dst, %dst` first (exactly GCC's spelling): one
+    ///           extra uop, rename-elided on modern cores, and it
+    ///           substitutes a known-zero upper half for the merge.
+    ///
+    /// Source form: when the value is GPR-homed AND its type provably
+    /// fills the register — I32 defs write the full 32-bit register and
+    /// 32-bit writes zero-extend to 64 (x86), so U32 and I64 defs fill
+    /// their whole home — the conversion reads the HOME directly: no
+    /// `movq home,%rax` staging, no extension (GCC's one-instruction
+    /// `cvtsi2sdl %eax` form). I8/I16/U8/U16 may have partial-register
+    /// defs, so they keep the staged-and-extended form.
+    ///
+    /// The upper-half CONTENT is a scalar don't-care: every scalar
+    /// consumer (movsd/movss stores, scalar FP arithmetic, ucomis, ABI
+    /// argument/return lanes) reads only the low lane, and the legacy
+    /// merge left the same class of unspecified bits there anyway.
+    pub(super) fn emit_cvt_si2fp(
+        &mut self,
+        src: &Operand,
+        from_ty: IrType,
+        to_f64: bool,
+        dst: &str,
+    ) {
+        // Direct-from-home: the value's full width is in its GPR home.
+        if let Operand::Value(v) = src {
+            if let Some(reg) = self.fresh_home_of(v.0).filter(|r| !is_xmm_reg(*r)) {
+                let n64 = phys_reg_name(reg);
+                let n32 = phys_reg_name_32(reg);
+                let home_form: Option<(&str, String)> = match (to_f64, from_ty) {
+                    (true, IrType::I32) => Some(("cvtsi2sdl", format!("%{}", n32))),
+                    (true, IrType::U32) | (true, IrType::I64) => {
+                        Some(("cvtsi2sdq", format!("%{}", n64)))
+                    }
+                    (false, IrType::I32) => Some(("cvtsi2ssl", format!("%{}", n32))),
+                    (false, IrType::U32) | (false, IrType::I64) => {
+                        Some(("cvtsi2ssq", format!("%{}", n64)))
+                    }
+                    _ => None,
+                };
+                if let Some((insn, sreg)) = home_form {
+                    if self.isa.avx {
+                        let other = if dst == "xmm0" { "xmm1" } else { "xmm0" };
+                        self.state
+                            .emit_fmt(format_args!("    v{} {}, %{}, %{}", insn, sreg, other, dst));
+                    } else {
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            if self.isa.simd { "pxor" } else { "xorps" },
+                            dst,
+                            dst
+                        ));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}", insn, sreg, dst));
+                    }
+                    return;
+                }
+            }
+        }
+        // Staged form: value into %rax, extension per type, L/Q per width.
+        self.operand_to_rax(src);
+        if from_ty.is_unsigned() {
+            self.emit_zero_extend_to_rax(from_ty);
+        } else if from_ty != IrType::I32 {
+            // I32 needs no extension: the L-form conversion reads %eax
+            // directly (the cltq would be dead).
+            self.emit_sign_extend_to_rax(from_ty);
+        }
+        self.emit_cvt_si2fp_from_rax(from_ty, to_f64, dst);
+    }
+
+    /// The %rax-staged core of [`Self::emit_cvt_si2fp`]: the value (already
+    /// extended per its type) sits in %rax/%eax; convert into `dst` with
+    /// the destination false dependency broken.
+    ///
+    /// I8/I16/I32 and U8/U16 are exactly representable in the signed 32-bit
+    /// %eax after extension → the L form (one instruction for I32 where the
+    /// old path paid cltq + q-form). U32 keeps the Q form (values ≥ 2^31
+    /// are negative as i32; %rax holds the zero-extended value). I64 and
+    /// Ptr take the Q form.
+    pub(super) fn emit_cvt_si2fp_from_rax(&mut self, from_ty: IrType, to_f64: bool, dst: &str) {
+        let narrow = matches!(
+            from_ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32
+        );
+        if self.isa.avx {
+            let other = if dst == "xmm0" { "xmm1" } else { "xmm0" };
+            let (insn, src) = match (to_f64, narrow) {
+                (true, true) => ("vcvtsi2sdl", "%eax"),
+                (true, false) => ("vcvtsi2sdq", "%rax"),
+                (false, true) => ("vcvtsi2ssl", "%eax"),
+                (false, false) => ("vcvtsi2ssq", "%rax"),
+            };
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}, %{}", insn, src, other, dst));
+        } else {
+            let (insn, src) = match (to_f64, narrow) {
+                (true, true) => ("cvtsi2sdl", "%eax"),
+                (true, false) => ("cvtsi2sdq", "%rax"),
+                (false, true) => ("cvtsi2ssl", "%eax"),
+                (false, false) => ("cvtsi2ssq", "%rax"),
+            };
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                if self.isa.simd { "pxor" } else { "xorps" },
+                dst,
+                dst
+            ));
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}", insn, src, dst));
+        }
+    }
+
+    fn pf15_trace(&self, msg: &str) {
+        if std::env::var_os("CCC_DEBUG_PF15").is_some() {
+            eprintln!("[pf15] {msg}");
+        }
+    }
+
+    pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
+        self.emit_cast_instrs_x86(from_ty, to_ty);
+    }
+
+    pub(super) fn emit_cast_impl(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) {
+        // Flag-fusion forwarding: this cast's destination is never read (the
+        // fused consumer uses the live Cmp flags), and its source is the
+        // never-materialized boolean — emitting it would read a stale register.
+        if self.fused_forward_dests.contains(&dest.0) {
+            return;
+        }
+        // W2 Load->Cast fold handshake: skip ONLY when the adjacent load
+        // ACTUALLY emitted the redirected load into this value's register
+        // (handshake set by emit_load_impl). Any other situation emits the
+        // cast normally — the fold is sound by construction.
+        if self.fold_skip_cast == Some(dest.0) {
+            self.fold_skip_cast = None;
+            return;
+        }
+        self.fold_skip_cast = None;
+        // DE MORGAN SPLIT: Cast passthru (`bool c = a&&b; if (c)` — the
+        // materialized boolean is cast to the branch-cond type) — the
+        // branch replays the original comparisons, so the cast result is
+        // never read; emitting it would convert a never-written home. No
+        // widen-flush is needed (unlike the Cmp gate): the skipped Cmp
+        // gates ahead of this instruction already flushed every deferred
+        // narrowing widen, and the replay reads only the Cmp operands.
+        if self.demorgan_skip.contains(&dest.0) {
+            return;
+        }
+        // A cast OF an x87 bit-pattern value (LDFabs/LDCopysign result,
+        // tracked in f128_direct_slots) is a no-op regardless of the source
+        // type in the IR (the value is already the 16-byte x87 format).
+        // Without this, the I64->F128 cast path ran fildq on the bit pattern
+        // — 0xC000000000000000 (-3.0 x87) became -2^62.
+        if to_ty == IrType::F128 && from_ty != IrType::F128 {
+            if let Operand::Value(v) = src {
+                if self.state.f128_direct_slots.contains(&v.0) {
+                    // Pure type relabel: the 16 bytes are already the x87
+                    // format. Propagate the marker to dest and copy the
+                    // payload; the cast must NOT run the integer (fildq)
+                    // conversion below. F128 SSA temps hold the value
+                    // directly in their slot (resolve_slot_addr calls
+                    // non-allocas "Indirect", but that only applies to
+                    // pointer-holding slots), so copy straight to
+                    // get_slot(dest) — a Direct-only copy silently dropped
+                    // the payload for every non-alloca dest (the return then
+                    // fldt'ed the uninitialized slot).
+                    self.state.f128_direct_slots.insert(dest.0);
+                    if let (Some(src_slot), Some(dest_slot)) =
+                        (self.state.get_slot(v.0), self.state.get_slot(dest.0))
+                    {
+                        if src_slot.0 != dest_slot.0 {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movdqu", src_slot.0, "xmm0");
+                            self.state
+                                .out
+                                .emit_instr_reg_rbp("    movdqu", "xmm0", dest_slot.0);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        // Intercept casts TO F128: produce full 80-bit x87 value in dest slot.
+        if to_ty == IrType::F128 && from_ty != IrType::F128 && !is_i128_type(from_ty) {
+            if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                if from_ty == IrType::F64 {
+                    self.operand_to_rax(src);
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fldl (%rsp)");
+                    self.state.emit("    addq $8, %rsp");
+                } else if from_ty == IrType::F32 {
+                    self.operand_to_rax(src);
+                    self.state.emit("    subq $4, %rsp");
+                    self.state.emit("    movl %eax, (%rsp)");
+                    self.state.emit("    flds (%rsp)");
+                    self.state.emit("    addq $4, %rsp");
+                } else if from_ty.is_signed() || (!from_ty.is_float() && !from_ty.is_unsigned()) {
+                    self.operand_to_rax(src);
+                    if from_ty.size() < 8 {
+                        self.emit_cast_instrs_x86(from_ty, IrType::I64);
+                    }
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fildq (%rsp)");
+                    self.state.emit("    addq $8, %rsp");
+                } else {
+                    self.operand_to_rax(src);
+                    if from_ty.size() < 8 {
+                        self.emit_cast_instrs_x86(from_ty, IrType::I64);
+                    }
+                    let big_label = self.state.fresh_label("u2f128_big");
+                    let done_label = self.state.fresh_label("u2f128_done");
+                    self.state.emit("    testq %rax, %rax");
+                    self.state.out.emit_jcc_label("    js", &big_label);
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fildq (%rsp)");
+                    self.state.emit("    addq $8, %rsp");
+                    self.state.out.emit_jmp_label(&done_label);
+                    self.state.out.emit_named_label(&big_label);
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state.emit("    fildq (%rsp)");
+                    self.state.emit("    addq $8, %rsp");
+                    self.state.emit("    subq $16, %rsp");
+                    self.state.out.emit_instr_imm_reg(
+                        "    movabsq",
+                        -9223372036854775808i64,
+                        "rax",
+                    );
+                    self.state.emit("    movq %rax, (%rsp)");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", 0x403Fi64, "rax");
+                    self.state.emit("    movq %rax, 8(%rsp)");
+                    self.state.emit("    fldt (%rsp)");
+                    self.state.emit("    addq $16, %rsp");
+                    self.state.emit("    faddp %st, %st(1)");
+                    self.state.out.emit_named_label(&done_label);
+                }
+                self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
+                self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    fstpl (%rsp)");
+                self.state.emit("    popq %rax");
+                self.state.park_acc(dest.0, false);
+                self.state.f128_direct_slots.insert(dest.0);
+                return;
+            }
+        }
+
+        // Intercept F128 -> F64/F32 casts
+        if from_ty == IrType::F128 && (to_ty == IrType::F64 || to_ty == IrType::F32) {
+            self.emit_f128_load_to_x87(src);
+            if to_ty == IrType::F64 {
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    fstpl (%rsp)");
+                self.state.emit("    movq (%rsp), %rax");
+                self.state.emit("    addq $8, %rsp");
+            } else {
+                self.state.emit("    subq $4, %rsp");
+                self.state.emit("    fstps (%rsp)");
+                self.state.emit("    movl (%rsp), %eax");
+                self.state.emit("    addq $4, %rsp");
+            }
+            self.state.reg_cache.invalidate_acc();
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Intercept F128 -> integer casts when we know the source's memory location
+        if from_ty == IrType::F128 && !to_ty.is_float() && !is_i128_type(to_ty) {
+            if let Operand::Value(v) = src {
+                if self.state.f128_direct_slots.contains(&v.0) {
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        let addr = crate::backend::state::SlotAddr::Direct(slot);
+                        self.emit_f128_to_int_from_memory(&addr, to_ty);
+                        self.store_rax_to(dest);
+                        return;
+                    }
+                }
+                if let Some((ptr_id, _offset, _is_indirect)) = self.state.get_f128_source(v.0) {
+                    if let Some(addr) = self.state.resolve_slot_addr(ptr_id) {
+                        self.emit_f128_to_int_from_memory(&addr, to_ty);
+                        self.store_rax_to(dest);
+                        return;
+                    }
+                }
+            }
+            if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = src {
+                let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+                self.state.emit("    subq $16, %rsp");
+                let lo = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+                let hi = u16::from_le_bytes(x87[8..10].try_into().unwrap());
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movabsq", lo as i64, "rax");
+                self.state.emit("    movq %rax, (%rsp)");
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movq", hi as i64, "rax");
+                self.state.emit("    movq %rax, 8(%rsp)");
+                self.state.emit("    fldt (%rsp)");
+                self.state.emit("    addq $16, %rsp");
+                self.emit_f128_st0_to_int(to_ty);
+                self.store_rax_to(dest);
+                return;
+            }
+        }
+        // PF-15 narrowing-widen defer: a single-use widening cast from a
+        // byte/half type is NOT emitted here — it is recorded and the
+        // consuming compare (if it is one) folds it into a narrow `cmpb`/
+        // `cmpw` on the original source. Any other consumer flushes the
+        // recorded move first, making the defer invisible. try_record
+        // returns false for every non-eligible shape (flushing whatever is
+        // deferred — its own emission could clobber a deferred source
+        // home) and this cast then emits normally below.
+        if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
+            return;
+        }
+        if self.try_emit_zext_loaded_cast(dest, src, from_ty, to_ty) {
+            return;
+        }
+        // PF-16b: widening casts of Clz/Ctz/Popcount results (bit31
+        // provably zero, upper bits zeroed by the 32-bit write itself)
+        // take the UNSIGNED path: zero-extension equals the required
+        // sign-extension, and movl/movzbl beats cltq/movslq/movsbq on
+        // length and decoded opacity. The rewrite is a pure from_ty
+        // reclassification — every downstream unsigned path (register-
+        // direct, slot, accumulator) then emits the zero form.
+        let from_ty = if from_ty.is_signed()
+            && !from_ty.is_float()
+            && from_ty.size() <= 4
+            && to_ty.size() == 8
+            && !to_ty.is_float()
+            && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
+        {
+            match from_ty {
+                IrType::I8 => IrType::U8,
+                IrType::I16 => IrType::U16,
+                _ => IrType::U32,
+            }
+        } else {
+            from_ty
+        };
+
+        // Register-direct integer casts: bypass the accumulator when the destination
+        // has a physical register. Instead of load→cast→store through %rax, emit the
+        // cast instruction directly targeting the destination register.
+        if !from_ty.is_float()
+            && !to_ty.is_float()
+            && !is_i128_type(from_ty)
+            && !is_i128_type(to_ty)
+        {
+            if let Some(dest_phys) = self.dest_reg(dest) {
+                if !super::emit::is_xmm_reg(dest_phys) {
+                    if self.try_emit_cast_reg_direct(dest, src, from_ty, to_ty, dest_phys) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // register-direct integer -> float casts. Emit cvtsi2sd/cvtsi2ss
+        // directly into the destination's allocated XMM register instead of the
+        // accumulator path's GPR round-trip (cvtsi2sd %rax,%xmm0; movq
+        // %xmm0,%rax; movq %rax,%xmmN). U64 needs the shift+round dance and is
+        // left to the general scalar path below. This runs BEFORE the general
+        // scalar-FP path because targeting the destination register directly
+        // beats staging through %xmm0 + store_xmm_to.
+        if !from_ty.is_float()
+            && (to_ty == IrType::F64 || to_ty == IrType::F32)
+            && from_ty != IrType::U64
+            // Ptr normalizes to U64: a high-bit address must take the U64
+            // shift+round dance below, not the plain signed cvtsi2sdq this
+            // fast path emits (`(double)(void*)0xffffffff80000000` was
+            // -2^31 instead of 1.8e19). Ptr == U64 semantically, so exclude
+            // it here exactly like U64.
+            && from_ty != IrType::Ptr
+            && !is_i128_type(from_ty)
+        {
+            if let Some(dest_phys) = self.dest_reg(dest) {
+                if super::emit::is_xmm_reg(dest_phys) {
+                    let dname = super::emit::phys_reg_name(dest_phys);
+                    // operand_to_rax handles the accumulator cache
+                    // (immediately-consumed sources have no slot and no
+                    // register — value_to_reg/operand_to_reg would panic).
+                    self.emit_cvt_si2fp(src, from_ty, to_ty == IrType::F64, dname);
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+
+        // Scalar FP casts: stage FP sources directly in XMM registers and keep
+        // FP results in the SSE domain instead of round-tripping through %rax.
+        if !is_i128_type(from_ty)
+            && !is_i128_type(to_ty)
+            && from_ty != IrType::F128
+            && to_ty != IrType::F128
+            && (from_ty.is_float() || to_ty.is_float())
+        {
+            if self.try_emit_scalar_fp_cast(dest, src, from_ty, to_ty) {
+                return;
+            }
+        }
+
+        // Fall through to default implementation for all other cases
+        crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
+
+    /// Try to emit an integer widening cast of a value whose home register
+    /// is already known to hold its own zero-extended 64-bit image.
+    ///
+    /// Returns false (caller falls through) whenever the shared policy
+    /// [`zext_home_widen_ok`] refuses, the source or destination is
+    /// XMM-homed, or the source home is stale.
+    fn try_emit_zext_loaded_cast(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        let Operand::Value(v) = src else { return false };
+        if !self.zext_loaded_values.contains(&v.0) || !zext_home_widen_ok(from_ty, to_ty) {
+            return false;
+        }
+        let (Some(&d_reg), Some(&s_reg)) = (
+            self.reg_assignments.get(&dest.0),
+            self.reg_assignments.get(&v.0),
+        ) else {
+            return false;
+        };
+        if super::emit::is_xmm_reg(d_reg)
+            || super::emit::is_xmm_reg(s_reg)
+            || self.fresh_home_of(v.0) != Some(s_reg)
+        {
+            return false;
+        }
+        if d_reg != s_reg {
+            if to_ty.size() == 8 {
+                let s64 = super::emit::phys_reg_name(s_reg);
+                let d64 = super::emit::phys_reg_name(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    movq %{}, %{}", s64, d64));
+            } else {
+                let s32 = phys_reg_name_32(s_reg);
+                let d32 = phys_reg_name_32(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    movl %{}, %{}", s32, d32));
+            }
+        }
+        self.zext_loaded_values.insert(dest.0);
+        self.note_inplace_compute(d_reg, dest.0);
+        true
+    }
+
+    /// Try to emit a scalar F64/F32 cast keeping FP values in XMM registers
+    /// end-to-end. Returns true if the cast was emitted, false to fall through.
+    /// Mirrors the instruction sequences of emit_generic_cast in f128.rs, but
+    /// takes FP inputs directly in %xmm0 and stores FP results via store_xmm_to.
+    fn try_emit_scalar_fp_cast(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        use crate::backend::cast::{CastKind, classify_cast};
+        match classify_cast(from_ty, to_ty) {
+            CastKind::Noop if from_ty.is_float() && to_ty.is_float() => {
+                // Float-to-float copy (e.g. LongDouble-as-F64): just move it.
+                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
+                self.store_xmm_to(dest, "xmm0", to_ty);
+                true
+            }
+            CastKind::FloatToFloat { widen } => {
+                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
+                if widen {
+                    self.state.emit("    cvtss2sd %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    cvtsd2ss %xmm0, %xmm0");
+                }
+                self.store_xmm_to(dest, "xmm0", to_ty);
+                true
+            }
+            CastKind::SignedToFloat {
+                to_f64,
+                from_ty: ft,
+            } => {
+                self.operand_to_rax(src);
+                // Sign-extend sub-64-bit sources to 64 bits (Noop for I64).
+                self.emit_cast_instrs_x86(ft, IrType::I64);
+                self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
+                self.store_xmm_to(dest, "xmm0", to_ty);
+                true
+            }
+            CastKind::UnsignedToFloat {
+                to_f64,
+                from_ty: ft,
+            } => {
+                self.operand_to_rax(src);
+                if ft == IrType::U64 {
+                    // U64: handle values >= 2^63 via shift+round (mirrors
+                    // emit_u64_to_float, but the result stays in %xmm0).
+                    let big_label = self.state.fresh_label("u2f_big");
+                    let done_label = self.state.fresh_label("u2f_done");
+                    self.state.emit("    testq %rax, %rax");
+                    self.state.out.emit_jcc_label("    js", &big_label);
+                    self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
+                    self.state.out.emit_jmp_label(&done_label);
+                    self.state.out.emit_named_label(&big_label);
+                    self.state.emit("    movq %rax, %rcx");
+                    self.state.emit("    shrq $1, %rax");
+                    self.state.emit("    andq $1, %rcx");
+                    self.state.emit("    orq %rcx, %rax");
+                    self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
+                    if to_f64 {
+                        self.state.emit("    addsd %xmm0, %xmm0");
+                    } else {
+                        self.state.emit("    addss %xmm0, %xmm0");
+                    }
+                    self.state.out.emit_named_label(&done_label);
+                    self.state.reg_cache.invalidate_sec(); // clobbered %rcx
+                    // The big-value path REWRITES %rax (`shrq`, `orq`) and the
+                    // merge point is reached with either image, so a source
+                    // that operand_to_rax parked in the accumulator is no
+                    // longer what %rax holds. Without this, a second use of
+                    // the same value takes the accumulator fast path and reads
+                    // the mangled conversion operand: `x = ptr ^ (1<<63);
+                    // d = (double)x; e = (double)x;` produced d != e at -O1
+                    // (the first conversion's `orq` result fed the second's
+                    // `cvtsi2sdq`). Debug builds flag this as an epoch
+                    // violation; release builds silently miscompiled.
+                    self.state.reg_cache.invalidate_acc();
+                    self.store_xmm_to(dest, "xmm0", to_ty);
+                } else {
+                    // U8/U16/U32: already zero-extended in %rax by the load.
+                    self.emit_cvt_si2fp_from_rax(ft, to_f64, "xmm0");
+                    self.store_xmm_to(dest, "xmm0", to_ty);
+                }
+                true
+            }
+            CastKind::FloatToSigned { from_f64 } | CastKind::FloatToUnsigned { from_f64, .. } => {
+                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
+                self.emit_cvtt_xmm0_to_rax(from_f64, to_ty);
+                if to_ty == IrType::U64 {
+                    self.state.reg_cache.invalidate_sec(); // clobbered %rcx
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(dest);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Try to emit an integer cast directly to the destination register.
+    /// Returns true if the cast was emitted, false if we should fall through.
+    ///
+    /// Key optimization: when the source is a stack slot, fuse the load and cast
+    /// into a single instruction (e.g., `movslq -N(%rsp), %r12`), saving 2 instructions
+    /// vs the accumulator path (`movq -N(%rsp), %rax; cltq; movq %rax, %r12`).
+    /// Emit the widening move for an IntWiden cast into a register home,
+    /// from either a register or a slot source. This is the SINGLE
+    /// definition of the widening sequences: the register-direct cast path
+    /// and the PF-15 deferred-widen flush both route through it, so the
+    /// deferred form is bit-identical to the immediate form.
+    ///
+    /// `to_32`: a signed byte/half source is extended into the 32-bit
+    /// register (`movsbl`/`movswl`) instead of the full 64-bit one; see
+    /// `sext_widen_writes_32`, the only place that decides it.
+    fn emit_int_widen_move(&mut self, src: &Operand, ft: IrType, dest_phys: PhysReg, to_32: bool) {
+        use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+        let dest_64 = phys_reg_name(dest_phys);
+        let dest_32 = phys_reg_name_32(dest_phys);
+        let mut src_phys = self.operand_reg(src);
+        // Data home only: an alloca's slot holds its pointee, so an alloca
+        // source must be materialized as an address below and then extended
+        // from its own low lanes, never loaded from the slot.
+        let src_slot = match src {
+            Operand::Value(v) => self.state.data_home_slot(v.0).map(|sl| sl.0),
+            _ => None,
+        };
+        // A generic move only transfers bits; it is not a widening cast.
+        // Materialize unusual homes first, then apply the same typed extension
+        // as for a normal GPR. This also covers deferred byte/half flushes.
+        if src_phys.is_some_and(super::emit::is_xmm_reg)
+            || (src_phys.is_none() && src_slot.is_none())
+        {
+            self.operand_to_callee_reg(src, dest_phys);
+            src_phys = Some(dest_phys);
+        }
+        if let Some(src_reg) = src_phys {
+            // Source is in a register — emit reg-to-reg extending move.
+            let src_typed = typed_phys_reg_name(src_reg, ft);
+            if ft.is_signed() {
+                match ft.size() {
+                    1 if to_32 => self
+                        .state
+                        .emit_fmt(format_args!("    movsbl %{}, %{}", src_typed, dest_32)),
+                    2 if to_32 => self
+                        .state
+                        .emit_fmt(format_args!("    movswl %{}, %{}", src_typed, dest_32)),
+                    1 => self
+                        .state
+                        .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
+                    2 => self
+                        .state
+                        .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
+                    4 => self.state.emit_fmt(format_args!(
+                        "    movslq %{}, %{}",
+                        phys_reg_name_32(src_reg),
+                        dest_64
+                    )),
+                    _ => {
+                        self.operand_to_callee_reg(src, dest_phys);
+                    }
+                }
+            } else if zext_home_widen_ok(ft, IrType::U64)
+                && matches!(src, Operand::Value(v) if self.zext_loaded_values.contains(&v.0))
+            {
+                // Widening to a 64-bit home: same policy as the direct cast
+                // path, so the deferred flush cannot emit an extension the
+                // immediate path would have elided (or vice versa).
+                if src_reg != dest_phys {
+                    let src_64 = phys_reg_name(src_reg);
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %{}", src_64, dest_64));
+                }
+            } else {
+                match ft.size() {
+                    1 => self
+                        .state
+                        .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+                    2 => self
+                        .state
+                        .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+                    4 => {
+                        let src_32 = phys_reg_name_32(src_reg);
+                        self.state
+                            .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                    }
+                    _ => {
+                        self.operand_to_callee_reg(src, dest_phys);
+                    }
+                }
+            }
+        } else if let Some(slot_off) = src_slot {
+            // Source is a stack slot — emit fused load+extend directly to
+            // dest. Uses emit_instr_rbp_reg which handles rbp/rsp
+            // addressing automatically.
+            if ft.is_signed() {
+                match ft.size() {
+                    1 if to_32 => {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movsbl", slot_off, dest_32)
+                    }
+                    2 if to_32 => {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movswl", slot_off, dest_32)
+                    }
+                    1 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
+                    2 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movswq", slot_off, dest_64),
+                    4 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movslq", slot_off, dest_64),
+                    _ => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                }
+            } else {
+                match ft.size() {
+                    1 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                    2 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                    4 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                    _ => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                }
+            }
+        }
+    }
+
+    /// PF-15 record path. Returns true when the cast's widening move was
+    /// DEFERRED (nothing emitted); false when the cast must emit normally.
+    ///
+    /// Eligibility: widening cast from a byte/half type to a 32/64-bit
+    /// type, destination in a GPR home, source a Value with a stable home
+    /// (register or slot), destination used exactly once. The consumer
+    /// match (is that single use an integer compare of two such casts?)
+    /// happens at the compare; any other consumer simply flushes.
+    ///
+    /// Refusal contract: the caller emits this cast normally, and those
+    /// emissions (register moves, slot stores) may legally clobber a
+    /// deferred source's home — RA reused it the moment the deferred
+    /// source's only modelled use (this cast) stopped covering it. Any
+    /// refusal therefore flushes the deferred moves FIRST.
+    fn try_record_pending_widen(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        macro_rules! refuse {
+            ($why:expr_2021) => {{
+                self.pf15_trace(concat!("refuse: ", $why));
+                self.flush_pending_widen_impl();
+                return false;
+            }};
+        }
+        if !matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            refuse!("from_ty");
+        }
+        if to_ty.is_float() || !(to_ty.size() == 4 || to_ty.size() == 8) || is_i128_type(to_ty) {
+            refuse!("to_ty");
+        }
+        if self.value_use_counts.get(&dest.0).copied() != Some(1) {
+            refuse!("use_count");
+        }
+        let src_val = match src {
+            Operand::Value(v) => v.0,
+            _ => refuse!("src_not_value"),
+        };
+        let Some(dest_phys) = self.dest_reg(dest) else {
+            refuse!("no_dest_reg");
+        };
+        if super::emit::is_xmm_reg(dest_phys) {
+            refuse!("xmm_dest");
+        }
+        let src_reg = self.operand_reg(src);
+        // Data home only (see data_home_slot): an alloca source has none, so
+        // the record refuses below instead of deferring a compare against the
+        // pointee bytes.
+        let src_slot = self.state.data_home_slot(src_val).map(|sl| sl.0);
+        if src_reg.is_none() && src_slot.is_none() {
+            refuse!("no_src_home");
+        }
+        // A deferred cast must not be shadowed by another deferred cast
+        // whose widening move would clobber this cast's source register
+        // home before the compare (or a flush) reads it. RA may legally
+        // hand this destination the first source's home: the source's only
+        // modelled use is this deferred move, so its range appears to end
+        // here. Conflict => flush the earlier moves and emit this cast
+        // normally (the transform degrades, never miscompiles).
+        for slot in 0..2 {
+            let pending_src = self.pending_widen[slot]
+                .as_ref()
+                .map(|p| match &p.src {
+                    Operand::Value(v) => Some(v.0),
+                    _ => None,
+                })
+                .flatten();
+            if let Some(pv) = pending_src {
+                if self.reg_assignments.get(&pv).copied() == Some(dest_phys) {
+                    refuse!("conflict with earlier pending src home");
+                }
+            }
+        }
+        // Slots are never full here: only a Cmp consumes a full pair and
+        // every non-Cmp/Cast dispatch flushes first (generate_instruction).
+        // Belt-and-braces: if they somehow are, fall back to normal emit.
+        if self.pending_widen.iter().all(|p| p.is_some()) {
+            refuse!("both slots full");
+        }
+        let free = if self.pending_widen[0].is_none() {
+            0
+        } else {
+            1
+        };
+        let to_32 = self.sext_widen_writes_32(from_ty, to_ty, dest.0);
+        self.pending_widen[free] = Some(PendingWiden {
+            dest: dest.0,
+            src: src.clone(),
+            from_ty,
+            dest_phys,
+            to_32,
+        });
+        self.pf15_trace("record");
+        true
+    }
+
+    /// Emit any deferred widening moves, in program order. Called by the
+    /// generate_instruction pre-dispatch hook for every non-Cmp/non-Cast
+    /// instruction, on every refused cast, by the compare-replay exits,
+    /// and on any compare that does not (or only partially) match.
+    pub(super) fn flush_pending_widen_impl(&mut self) {
+        for slot in 0..2 {
+            if let Some(p) = self.pending_widen[slot].take() {
+                self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys, p.to_32);
+                if !p.from_ty.is_signed()
+                    && p.from_ty.size() <= 4
+                    && matches!(p.src, Operand::Value(v) if self.zext_loaded_values.contains(&v.0))
+                {
+                    self.zext_loaded_values.insert(p.dest);
+                }
+                // Definition-writes-home accounting: the deferred widening
+                // move IS the cast dest's definition into its home.
+                self.note_inplace_compute(p.dest_phys, p.dest);
+            }
+        }
+    }
+
+    /// If `lhs`/`rhs` are exactly the two recorded deferred casts (in
+    /// either order), take both records and return
+    /// `((lhs_src, lhs_ty, lhs_signed), (rhs_src, rhs_ty, rhs_signed))`.
+    /// Leaves the records untouched on any mismatch — a lone pending is
+    /// NEVER silently dropped here (its widening move would otherwise
+    /// never be emitted and the consumer would read garbage).
+    #[expect(clippy::type_complexity)]
+    fn take_pending_widen_pair(
+        &mut self,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> Option<(
+        (Operand, IrType, bool, PhysReg, bool),
+        (Operand, IrType, bool, PhysReg, bool),
+    )> {
+        let (lv, rv) = match (lhs, rhs) {
+            (Operand::Value(l), Operand::Value(r)) => (l.0, r.0),
+            _ => {
+                self.pf15_trace("take_pair: operands not both values");
+                return None;
+            }
+        };
+        let p0 = self.pending_widen[0].take();
+        let p1 = self.pending_widen[1].take();
+        if p0.is_none() || p1.is_none() {
+            // Partial occupancy: restore whatever was taken and refuse.
+            self.pf15_trace("take_pair: partial occupancy");
+            if let Some(a) = p0 {
+                self.pending_widen[0] = Some(a);
+            }
+            if let Some(b) = p1 {
+                self.pending_widen[1] = Some(b);
+            }
+            return None;
+        }
+        let a = p0.unwrap();
+        let b = p1.unwrap();
+        // Positional match, both orders.
+        if a.dest == lv && b.dest == rv {
+            let sa = a.from_ty.is_signed();
+            let sb = b.from_ty.is_signed();
+            return Some((
+                (a.src, a.from_ty, sa, a.dest_phys, a.to_32),
+                (b.src, b.from_ty, sb, b.dest_phys, b.to_32),
+            ));
+        }
+        if a.dest == rv && b.dest == lv {
+            let sa = b.from_ty.is_signed();
+            let sb = a.from_ty.is_signed();
+            return Some((
+                (b.src, b.from_ty, sa, b.dest_phys, b.to_32),
+                (a.src, a.from_ty, sb, a.dest_phys, a.to_32),
+            ));
+        }
+        // Mismatch: restore and report.
+        self.pf15_trace("take_pair: dest mismatch");
+        self.pending_widen[0] = Some(a);
+        self.pending_widen[1] = Some(b);
+        None
+    }
+
+    /// PF-15 consume path, called from the generate_instruction Cmp arm
+    /// BEFORE emit_cmp — including when MachInst will lower the compare —
+    /// so every possible consumer sees either a folded narrow compare or
+    /// fully materialized widening moves, never a half-deferred state.
+    ///
+    /// Full-pair shape `cmp(cast a, cast b)`: folds to
+    /// `(src_a, src_b, narrow_ty, mapped_op)` when the extension/opcode
+    /// compatibility matrix accepts; the two widening moves are then never
+    /// emitted at all. Single-side shape `cmp(cast a, C)`: folds when the
+    /// constant fits the narrow domain exactly under the same matrix.
+    /// Everything else: flush the deferred moves and return None (the
+    /// caller emits the wide compare from the original operands).
+    ///
+    /// Flag-exactness matrix (the defer-side contract lives on
+    /// `X86Codegen::pending_widen`):
+    ///   * sext+sext: sign-extension is order-preserving, so the narrow
+    ///     signed compare produces flag-identical answers for the signed
+    ///     setcc family {eq, ne, slt, sle, sgt, sge}. Unsigned opcodes on
+    ///     sign-extended operands compare negated bit patterns — refused.
+    ///   * zext+zext: zero-extension makes both values non-negative, where
+    ///     signed and unsigned relational order coincide; every IR opcode
+    ///     maps onto the unsigned narrow set {eq, ne, ult, ule, ugt, uge}.
+    ///   * mixed sext/zext: the widened values diverge (0xFF -> -1 vs
+    ///     255) — refused.
+    ///   * const rhs: allowed inside the narrow type's exact domain, with
+    ///     the same per-extension opcode sets (a negative constant can
+    ///     never compare against a zero-extended value; unsigned opcodes
+    ///     on sign-extended operands are refused, as above).
+    pub(super) fn narrow_cmp_operands_impl(
+        &mut self,
+        dest: u32,
+        op: crate::ir::reexports::IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> Option<(Operand, Operand, IrType, crate::ir::reexports::IrCmpOp)> {
+        use crate::ir::reexports::IrCmpOp;
+        // Compare-replay dests re-emit the comparison at a DISTANT consumer
+        // (cmov/jcc far from here). The adjacency guarantee that keeps the
+        // deferred sources' homes intact does not reach there: materialize.
+        if self.cmp_replay.contains_key(&dest) {
+            self.pf15_trace("narrow: replay dest, flushing");
+            self.flush_pending_widen_impl();
+            return None;
+        }
+        self.pf15_trace("narrow: entered");
+        let op_map_zext = |op: IrCmpOp| -> IrCmpOp {
+            match op {
+                IrCmpOp::Slt => IrCmpOp::Ult,
+                IrCmpOp::Sle => IrCmpOp::Ule,
+                IrCmpOp::Sgt => IrCmpOp::Ugt,
+                IrCmpOp::Sge => IrCmpOp::Uge,
+                signed_or_unsigned_keep => signed_or_unsigned_keep,
+            }
+        };
+        let signed_only = |op: IrCmpOp| -> Option<IrCmpOp> {
+            match op {
+                IrCmpOp::Eq
+                | IrCmpOp::Ne
+                | IrCmpOp::Slt
+                | IrCmpOp::Sle
+                | IrCmpOp::Sgt
+                | IrCmpOp::Sge => Some(op),
+                _ => None,
+            }
+        };
+        // Full-pair shape.
+        if let Some(((lsrc, lty, lsign, ldest, l32), (rsrc, rty, rsign, rdest, r32))) =
+            self.take_pending_widen_pair(lhs, rhs)
+        {
+            let folded = if lty != rty {
+                None
+            } else if lsign && rsign {
+                signed_only(op).map(|m| (lsrc.clone(), rsrc.clone(), lty, m))
+            } else if !lsign && !rsign {
+                Some((lsrc.clone(), rsrc.clone(), lty, op_map_zext(op)))
+            } else {
+                None // mixed sext/zext: widened values diverge
+            };
+            self.pf15_trace(if folded.is_some() {
+                "pair FOLD"
+            } else {
+                "pair matrix refuse"
+            });
+            if let Some(f) = folded {
+                return Some(f);
+            }
+            // Refused: the records are already taken OUT of the slots, so
+            // re-emit both widening moves explicitly, in program order.
+            self.emit_int_widen_move(&lsrc, lty, ldest, l32);
+            self.emit_int_widen_move(&rsrc, rty, rdest, r32);
+            return None;
+        }
+        // Single-side const shape: cmp(cast(x), C) with C in the narrow
+        // domain. (Cmp with a constant lhs is canonicalized to rhs
+        // upstream; a const lhs here simply takes the flush path below.)
+        if self.pending_widen[1].is_some() {
+            self.flush_pending_widen_impl();
+            return None;
+        }
+        let (src, from_ty, dest_phys, to_32) = match (lhs, self.pending_widen[0].take()) {
+            (Operand::Value(v), Some(p)) if p.dest == v.0 => {
+                (p.src, p.from_ty, p.dest_phys, p.to_32)
+            }
+            (_, other) => {
+                self.pending_widen[0] = other;
+                self.flush_pending_widen_impl();
+                return None;
+            }
+        };
+        let (lo, hi) = if from_ty.is_signed() {
+            (
+                -(1i64 << (from_ty.size() * 8 - 1)),
+                (1i64 << (from_ty.size() * 8 - 1)) - 1,
+            )
+        } else {
+            (0i64, (1i64 << (from_ty.size() * 8)) - 1)
+        };
+        let folded = match rhs {
+            Operand::Const(c) => match c.clone().to_i64() {
+                Some(cv) if (lo..=hi).contains(&cv) => {
+                    if from_ty.is_signed() {
+                        signed_only(op).map(|m| (src.clone(), rhs.clone(), from_ty, m))
+                    } else {
+                        Some((src.clone(), rhs.clone(), from_ty, op_map_zext(op)))
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(f) = folded {
+            return Some(f);
+        }
+        // Refused after take: re-emit the taken widening move explicitly.
+        self.emit_int_widen_move(&src, from_ty, dest_phys, to_32);
+        None
+    }
+
+    /// Register-direct cast whose source currently lives in the accumulator
+    /// (see the call site in `try_emit_cast_reg_direct`). Returns false for
+    /// shapes that have no single-instruction extending/truncating move;
+    /// nothing is emitted in that case.
+    fn emit_cast_from_accumulator(
+        &mut self,
+        kind: crate::backend::cast::CastKind,
+        to_ty: IrType,
+        dest_32: &str,
+        dest_64: &str,
+    ) -> bool {
+        use crate::backend::cast::CastKind;
+        match kind {
+            // Signed sources keep the 64-bit form even for a 32-bit result
+            // (unlike `emit_int_widen_move`, see `sext_widen_writes_32`): the
+            // accumulator typically holds a just-loaded `movsbq`/`movswq`
+            // value, the repeated extension becomes a 64-bit copy, and the
+            // copy-propagation peepholes collapse 64-bit chains but not the
+            // 32-bit `movl` pair (popcount_loop_density's argv parse: +2
+            // instructions with movsbl).
+            CastKind::IntWiden { from_ty: ft, .. } => {
+                let (insn, src, dst) = match (ft.is_signed(), ft.size()) {
+                    (true, 1) => ("movsbq", "al", dest_64),
+                    (true, 2) => ("movswq", "ax", dest_64),
+                    (true, 4) => ("movslq", "eax", dest_64),
+                    (false, 1) => ("movzbl", "al", dest_32),
+                    (false, 2) => ("movzwl", "ax", dest_32),
+                    (false, 4) => ("movl", "eax", dest_32),
+                    _ => return false,
+                };
+                self.state
+                    .emit_fmt(format_args!("    {insn} %{src}, %{dst}"));
+                true
+            }
+            CastKind::IntNarrow { to_ty: t } => {
+                let (insn, src, dst) = match (t.size(), t.is_unsigned()) {
+                    (4, true) => ("movl", "eax", dest_32),
+                    (4, false) => ("movslq", "eax", dest_64),
+                    (2, _) => ("movzwl", "ax", dest_32),
+                    (1, _) => ("movzbl", "al", dest_32),
+                    _ => return false,
+                };
+                self.state
+                    .emit_fmt(format_args!("    {insn} %{src}, %{dst}"));
+                true
+            }
+            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {
+                if to_ty.size() <= 4 {
+                    self.state
+                        .emit_fmt(format_args!("    movl %eax, %{dest_32}"));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movq %rax, %{dest_64}"));
+                }
+                true
+            }
+            CastKind::SignedToUnsignedSameSize { to_ty: t } if t.size() == 4 => {
+                self.state
+                    .emit_fmt(format_args!("    movl %eax, %{dest_32}"));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Materialize an alloca's ADDRESS into the destination register and
+    /// apply the cast in place — the register-direct form of `(int)&local`.
+    ///
+    /// The source must be pointer-width, so the alloca's value really is the
+    /// address; anything else refuses before emitting. `value_to_reg` produces
+    /// the `leaq slot` (including the runtime realignment for an alloca that
+    /// asks for more than 16-byte alignment), and the truncation then runs
+    /// between the destination register and itself. The extension choices are
+    /// the ones every other register-direct narrow uses: a 32-bit write zeroes
+    /// the upper half for U32, a signed 32-bit result takes `movslq` so a
+    /// 64-bit reader sees a canonical signed home, and the sub-word forms take
+    /// the zero-extending `movz{w,b}l`.
+    fn emit_alloca_addr_cast(
+        &mut self,
+        v: u32,
+        slot: i64,
+        kind: crate::backend::cast::CastKind,
+        dest_phys: PhysReg,
+        dest_32: &str,
+        dest_64: &str,
+    ) -> bool {
+        use super::emit::typed_phys_reg_name;
+        use crate::backend::cast::CastKind;
+        let narrow_to = match kind {
+            // Same width: the address IS the cast's result.
+            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => None,
+            CastKind::IntNarrow { to_ty } => Some(to_ty),
+            // A pointer-width integer source cannot widen, and an alloca source
+            // never carries a float or i128 type on this path; refuse without
+            // emitting so the caller's fallback still owns the instruction
+            // stream.
+            _ => return false,
+        };
+        // Fuse the address computation with the truncation when the cast's
+        // result is at most 32 bits: `leal slot, %r32` produces exactly what
+        // `leaq slot, %r64` followed by the 32-bit move produces — the low 32
+        // bits of the slot's address, zero-extended — because the 64-bit
+        // address exists ONLY to be truncated here, so its upper half is dead
+        // by construction. One instruction instead of two. An over-aligned
+        // alloca keeps the 64-bit form: its realignment is arithmetic on the
+        // full address.
+        let fused32 = matches!(narrow_to, Some(t) if t.size() <= 4)
+            && self.state.alloca_over_align(v).is_none();
+        if fused32 {
+            self.state.out.emit_instr_rbp_reg("    leal", slot, dest_32);
+        } else {
+            self.value_to_reg(&Value(v), dest_64);
+        }
+        if let Some(t) = narrow_to {
+            match (t.size(), t.is_unsigned()) {
+                (4, true) => {
+                    // The `leal` above already zero-extended the value; only
+                    // the 64-bit form still needs uppers cleared.
+                    if !fused32 {
+                        self.state
+                            .emit_fmt(format_args!("    movl %{}, %{}", dest_32, dest_32));
+                    }
+                }
+                (4, false) => self
+                    .state
+                    .emit_fmt(format_args!("    movslq %{}, %{}", dest_32, dest_64)),
+                (2, _) => {
+                    let src = typed_phys_reg_name(dest_phys, t);
+                    self.state
+                        .emit_fmt(format_args!("    movzwl %{}, %{}", src, dest_32))
+                }
+                (1, _) => {
+                    let src = typed_phys_reg_name(dest_phys, t);
+                    self.state
+                        .emit_fmt(format_args!("    movzbl %{}, %{}", src, dest_32))
+                }
+                // IntNarrow is only produced for a strictly narrower target.
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Does a sign-extending widen of a byte/half into a 32-bit result write
+    /// the 32-bit form (`movsbl`/`movswl`, bits 32..63 cleared) rather than
+    /// `movsbq`/`movswq`? The 64-bit form is needed only for a raw 64-bit
+    /// reader of the home, and that is the contract every 32-bit ALU result
+    /// already follows (`emit_sext32_for_value` over `needs_sext_values`,
+    /// computed by `signed_i32_home_requirements`; explicit widening casts
+    /// extend their own input). A U32 result always takes the 32-bit form:
+    /// its canonical home is zero-extended. The accumulator emits the same
+    /// cast as `movsbl %al,%eax`; without this, a register home turned it
+    /// into `movsbq`, which no 32-bit fold (`fold_copy_logical_shift_signext`)
+    /// recognizes.
+    pub(super) fn sext_widen_writes_32(&self, from_ty: IrType, to_ty: IrType, dest: u32) -> bool {
+        if !from_ty.is_signed() || from_ty.size() >= 4 || to_ty.is_float() || to_ty.size() != 4 {
+            return false;
+        }
+        if !to_ty.is_signed() {
+            return true;
+        }
+        self.skip_i32_sext
+            || (!self.needs_sext_values.is_empty() && !self.needs_sext_values.contains(&dest))
+    }
+
+    /// Register-direct cast emission, wrapped so the
+    /// definition-writes-home invariant is enforced at ONE boundary: every
+    /// arm of the inner emitter writes `dest_phys` with the cast's result
+    /// (staged copy, widening move, narrowing move, or accumulator-targeted
+    /// extension). Forgetting the note on any arm is exactly the PR #487
+    /// bug class — the dest stays home_clobbered and its consumer hits the
+    /// stale-home refusal — so the boundary note covers them all.
+    fn try_emit_cast_reg_direct(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+        dest_phys: crate::backend::regalloc::PhysReg,
+    ) -> bool {
+        let widen_to_32 = self.sext_widen_writes_32(from_ty, to_ty, dest.0);
+        if !self.try_emit_cast_reg_direct_inner(src, from_ty, to_ty, dest_phys, widen_to_32) {
+            return false;
+        }
+        // A same-width unsigned-to-signed cast may be a low-bit identity,
+        // but not a canonical wide signed home. Unlike the accumulator
+        // store path, this direct path has no later result-store boundary.
+        if to_ty == IrType::I32 && matches!(from_ty, IrType::I32 | IrType::U32) {
+            self.emit_sext32_for_value(
+                super::emit::phys_reg_name_32(dest_phys),
+                super::emit::phys_reg_name(dest_phys),
+                false,
+                dest.0,
+            );
+        }
+        self.note_inplace_compute(dest_phys, dest.0);
+        true
+    }
+
+    fn try_emit_cast_reg_direct_inner(
+        &mut self,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+        dest_phys: crate::backend::regalloc::PhysReg,
+        widen_to_32: bool,
+    ) -> bool {
+        use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+        use crate::backend::cast::{CastKind, classify_cast};
+
+        let dest_64 = phys_reg_name(dest_phys);
+        let dest_32 = phys_reg_name_32(dest_phys);
+        let kind = classify_cast(from_ty, to_ty);
+
+        // Resolve source: either a physical register or a stack slot offset.
+        // An alloca's slot is its STORAGE, not a home for its value, so the
+        // data-home accessor refuses it: reading that slot would turn
+        // `(int)(uintptr_t)&local` into a load of `local` (`movl slot, %r`
+        // where `leaq slot` + truncation is required). With no data home the
+        // alloca falls through to the accumulator/default paths, which
+        // materialize the address.
+        let src_phys = self.operand_reg(src);
+        let src_slot = match src {
+            Operand::Value(v) => self.state.data_home_slot(v.0).map(|s| s.0),
+            _ => None,
+        };
+
+        // For constants, fall through to default path (it's already efficient).
+        if matches!(src, Operand::Const(_)) {
+            return false;
+        }
+
+        // Accumulator-staged source (an immediately-consumed producer with
+        // no register and no slot: `j = (long)(i - 1)` where `i - 1` was
+        // computed straight into %eax). The generic path would emit the
+        // accumulator form and then relay the result (`cltq; movq %rax,%r10`
+        // / `movl %eax,%eax; movq %rax,%r10`); the extending move can
+        // target the destination register directly from %rax's sub-
+        // register (`movslq %eax, %r10`): one instruction and no %rax
+        // write — %rax keeps holding the SOURCE, so the register cache
+        // stays exactly as it was. Bit-identical to the accumulator form:
+        // both read the same low `from_ty` bits and produce the same
+        // extension. Shapes without a one-instruction form fall through to
+        // the generic path (which handles them today).
+        if src_phys.is_none() && src_slot.is_none() {
+            let Operand::Value(v) = src else { return false };
+            if self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)) {
+                return self.emit_cast_from_accumulator(kind, to_ty, dest_32, dest_64);
+            }
+            // An alloca's value is its slot's ADDRESS, and an address has no
+            // data home (`data_home_slot` above refuses one). Materialize the
+            // `leaq` straight into the cast destination and narrow in place:
+            // the generic path would stage the address through %rax and relay
+            // the result back into `dest_phys`, which is one instruction and
+            // one accumulator round trip more for exactly the shape this
+            // dispatch was built for.
+            // The slot lookup here is an ADDRESS lookup (`get_slot`, not
+            // `data_home_slot`): the slot's location is the address we want.
+            // An alloca with no slot at all (a dead parameter alloca) has no
+            // address to take and falls through.
+            if from_ty.size() == 8 && self.state.is_alloca(v.0) {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    return self
+                        .emit_alloca_addr_cast(v.0, slot.0, kind, dest_phys, dest_32, dest_64);
+                }
+            }
+            return false;
+        }
+        // An XMM-homed source is an integer bit-punned in the float domain
+        // (fp-select/int-select blending keeps the value in the SSE domain).
+        // The extending moves below encode GP register names only — route
+        // such sources through the accumulator fallback, which performs the
+        // xmm→GPR move (same contract as emit_int_cmp_insn_typed).
+        if src_phys.is_some_and(super::emit::is_xmm_reg) {
+            return false;
+        }
+
+        match kind {
+            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {
+                // No conversion needed — just move src to dest register.
+                self.operand_to_callee_reg(src, dest_phys);
+                return true;
+            }
+            CastKind::IntWiden { from_ty: ft, .. } => {
+                // Widen: sign or zero extend from smaller to larger type.
+                // (Single definition shared with the PF-15 deferred-widen
+                // flush — emit_int_widen_move above.)
+                self.emit_int_widen_move(src, ft, dest_phys, widen_to_32);
+                true
+            }
+            CastKind::IntNarrow { to_ty: t } => {
+                // Narrow: truncate to the target width.
+                // For unsigned 32-bit types: movl zero-extends, giving correct U32 semantics.
+                // For signed 32-bit types: movslq sign-extends, preserving I32 semantics
+                // when the value later flows into 64-bit operations.
+                if let Some(src_reg) = src_phys {
+                    let src_typed = typed_phys_reg_name(src_reg, t);
+                    match t.size() {
+                        4 => {
+                            if t.is_unsigned() {
+                                // U32 narrowing: movl truncates to 32 bits and zero-extends.
+                                let src_32 = phys_reg_name_32(src_reg);
+                                self.state
+                                    .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                            } else {
+                                // I32 narrowing: movslq truncates to 32 bits and sign-extends
+                                // to 64 bits, preserving negative values.
+                                let src_32 = phys_reg_name_32(src_reg);
+                                self.state
+                                    .emit_fmt(format_args!("    movslq %{}, %{}", src_32, dest_64));
+                            }
+                        }
+                        2 => self
+                            .state
+                            .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+                        1 => self
+                            .state
+                            .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+                        _ => {
+                            self.operand_to_callee_reg(src, dest_phys);
+                        }
+                    }
+                } else if let Some(slot_off) = src_slot {
+                    // For narrowing from stack: just load the narrower size.
+                    match t.size() {
+                        4 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                        2 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                        1 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                        _ => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                    }
+                } else {
+                    return false;
+                }
+                return true;
+            }
+            CastKind::SignedToUnsignedSameSize { to_ty: t } => {
+                // I32→U32: reinterpret signed as unsigned, zero-extending upper bits.
+                // movl truncates to 32 bits and clears upper 32 — correct for unsigned.
+                if let Some(src_reg) = src_phys {
+                    match t.size() {
+                        4 => {
+                            let src_32 = phys_reg_name_32(src_reg);
+                            self.state
+                                .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                        }
+                        2 => self.state.emit_fmt(format_args!(
+                            "    movzwl %{}, %{}",
+                            typed_phys_reg_name(src_reg, t),
+                            dest_32
+                        )),
+                        1 => self.state.emit_fmt(format_args!(
+                            "    movzbl %{}, %{}",
+                            typed_phys_reg_name(src_reg, t),
+                            dest_32
+                        )),
+                        _ => {
+                            self.operand_to_callee_reg(src, dest_phys);
+                        }
+                    }
+                } else if let Some(slot_off) = src_slot {
+                    match t.size() {
+                        4 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                        2 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                        1 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                        _ => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                    }
+                } else {
+                    return false;
+                }
+                return true;
+            }
+            _ => {
+                // Float casts, F128, etc. — not handled here.
+                return false;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod widening_home_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    fn emitter(home: u8, from: IrType) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.skip_i32_sext = true;
+        cg.value_types.insert(1, from);
+        cg.state.value_use_counts = vec![1; 10];
+        cg.reg_assignments.insert(9, PhysReg(2));
+        match home {
+            0 => {
+                cg.reg_assignments.insert(1, PhysReg(1));
+            }
+            1 => {
+                cg.reg_assignments.insert(1, PhysReg(16));
+            }
+            2 => {
+                cg.state.value_locations.insert(1, StackSlot(-8));
+            }
+            _ => cg.state.park_acc(1, false),
+        }
+        cg
+    }
+
+    #[test]
+    fn explicit_i32_cast_extends_every_source_home_without_def_side_help() {
+        for home in 0..4 {
+            for to in [IrType::I64, IrType::U64, IrType::Ptr] {
+                let mut cg = emitter(home, IrType::I32);
+                cg.emit_cast_impl(&Value(9), &Operand::Value(Value(1)), IrType::I32, to);
+                let out = &cg.state.out.buf;
+                assert!(
+                    out.contains("movslq") || out.contains("cltq"),
+                    "home={home}, to={to:?}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_width_signed_results_honor_raw_wide_home_demand() {
+        for home in 0..4 {
+            for from in [IrType::I32, IrType::U32] {
+                for wide in [false, true] {
+                    let mut cg = emitter(home, from);
+                    cg.value_types
+                        .insert(9, if wide { IrType::Ptr } else { IrType::I32 });
+                    cg.signed_i32_defs.insert(9);
+                    cg.skip_i32_sext = !wide;
+                    if wide {
+                        cg.needs_sext_values.insert(9);
+                    }
+                    cg.emit_cast_impl(&Value(9), &Operand::Value(Value(1)), from, IrType::I32);
+                    let out = &cg.state.out.buf;
+                    assert_eq!(
+                        out.contains("movslq") || out.contains("cltq"),
+                        wide,
+                        "home={home}, from={from:?}, wide={wide}: {out}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A signed byte/half widened to a 32-bit result takes the 64-bit form
+    /// exactly when a raw 64-bit reader needs the canonical home (I32 in
+    /// `needs_sext_values`) or the result is 64-bit; U32 results are
+    /// always zero-extended. Register and slot homes, immediate and
+    /// deferred; an accumulator-staged source keeps the 64-bit form
+    /// (`emit_cast_from_accumulator`).
+    #[test]
+    fn signed_sub_word_widen_writes_64_bits_only_for_wide_readers() {
+        for home in 0..4 {
+            for (from, narrow, full) in [
+                (IrType::I8, "movsbl", "movsbq"),
+                (IrType::I16, "movswl", "movswq"),
+            ] {
+                for to in [IrType::I32, IrType::U32, IrType::I64] {
+                    for wide in [false, true] {
+                        let expect_full =
+                            home == 3 || to == IrType::I64 || (to == IrType::I32 && wide);
+                        let mut cg = emitter(home, from);
+                        cg.value_types.insert(9, to);
+                        cg.skip_i32_sext = !wide;
+                        if wide {
+                            cg.needs_sext_values.insert(9);
+                        }
+                        assert_eq!(
+                            cg.sext_widen_writes_32(from, to, 9),
+                            !(to == IrType::I64 || (to == IrType::I32 && wide)),
+                            "policy: from={from:?}, to={to:?}, wide={wide}"
+                        );
+                        cg.emit_cast_impl(&Value(9), &Operand::Value(Value(1)), from, to);
+                        // A deferred (PF-15) record emits at its flush.
+                        cg.flush_pending_widen_impl();
+                        let out = &cg.state.out.buf;
+                        let want = if expect_full { full } else { narrow };
+                        let other = if expect_full { narrow } else { full };
+                        assert!(
+                            out.contains(want) && !out.contains(other),
+                            "home={home}, from={from:?}, to={to:?}, wide={wide}: {out}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_fallback_moves_are_typed_extensions_not_bit_copies() {
+        for home in 0..4 {
+            for (ty, mnemonic) in [
+                (IrType::I8, "movsbq"),
+                (IrType::I16, "movswq"),
+                (IrType::I32, "movslq"),
+                (IrType::U8, "movzbl"),
+                (IrType::U16, "movzwl"),
+                (IrType::U32, "movl"),
+            ] {
+                let mut cg = emitter(home, ty);
+                cg.emit_int_widen_move(&Operand::Value(Value(1)), ty, PhysReg(2), false);
+                let out = &cg.state.out.buf;
+                assert!(out.contains(mnemonic), "home={home}, ty={ty:?}: {out}");
+            }
+        }
+    }
+}
+
+/// Contract tests for the zero-extended-home widening policy and its two
+/// emitters. The policy is a pure function, so the matrix below is
+/// exhaustive over the decision boundaries: signedness, float domains,
+/// 4-byte source ceiling, narrowing destinations and 128-bit targets.
+#[cfg(test)]
+mod zext_home_policy_tests {
+    use super::*;
+
+    #[test]
+    fn policy_admits_only_unsigned_narrow_to_wide_integer() {
+        // (from, to, expected) — every boundary is represented at least once.
+        let cases: &[(IrType, IrType, bool)] = &[
+            // Admitted: unsigned/pointer source, 1..=4 bytes, widening.
+            (IrType::U8, IrType::U64, true),
+            (IrType::U8, IrType::U32, true),
+            (IrType::U16, IrType::U64, true),
+            (IrType::U16, IrType::I64, true),
+            (IrType::U32, IrType::U64, true),
+            (IrType::U32, IrType::I64, true),
+            (IrType::U32, IrType::Ptr, true),
+            // `IrType::Ptr` is TARGET-sized: a 4-byte pointer source is an
+            // ordinary zero-extending widen on ILP32 and is refused on LP64,
+            // where it is already 8 bytes. Pin the host-relative answer
+            // instead of a number that is only right on one ABI.
+            (IrType::Ptr, IrType::U64, IrType::Ptr.size() <= 4),
+            // Same width: a copy, not an extension — admitted (no extension
+            // instruction is needed either way).
+            (IrType::U32, IrType::U32, true),
+            // Refused: signed sources sign-extend, so bits 8..63 are not
+            // guaranteed zero.
+            (IrType::I8, IrType::U64, false),
+            (IrType::I16, IrType::U64, false),
+            (IrType::I32, IrType::U64, false),
+            // Refused: float domains are not zero-extended integers.
+            (IrType::F32, IrType::U64, false),
+            (IrType::U32, IrType::F32, false),
+            // Refused: wider than 32 bits is not a "32-bit write zeroed it".
+            (IrType::U64, IrType::U64, false),
+            // Refused: narrowing never zero-extends.
+            (IrType::U32, IrType::U16, false),
+            (IrType::U32, IrType::U8, false),
+            // Refused: a 128-bit destination needs a real wide extension.
+            (IrType::U32, IrType::I128, false),
+            (IrType::U32, IrType::U128, false),
+        ];
+        for &(from, to, expected) in cases {
+            assert_eq!(
+                zext_home_widen_ok(from, to),
+                expected,
+                "zext_home_widen_ok({from:?}, {to:?})"
+            );
+        }
+    }
+
+    /// Register homes for the emit tests: a caller-saved GPR pair and one
+    /// XMM home. The NUMBERS come from `PhysReg`'s allocator ids; the test
+    /// derives the expected spelling from `phys_reg_name`, so a change to
+    /// the id-to-name table cannot silently make these tests vacuous.
+    const SRC_REG: PhysReg = PhysReg(14); // %rdi
+    const DST_REG: PhysReg = PhysReg(15); // %rsi
+    const XMM_REG: PhysReg = PhysReg(20); // %xmm2
+
+    /// A value recorded by a 32-bit zero-extending load widens with ONE
+    /// register copy: no movzbl/movzwl/movslq re-extension.
+    fn zext_cg(from: IrType) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.skip_i32_sext = true;
+        cg.value_types.insert(1, from);
+        cg.state.value_use_counts = vec![1; 10];
+        cg.reg_assignments.insert(1, SRC_REG);
+        cg.reg_assignments.insert(9, DST_REG);
+        cg.zext_loaded_values.insert(1);
+        cg
+    }
+
+    #[test]
+    fn zext_loaded_source_widens_without_an_extension_instruction() {
+        for (from, to) in [
+            (IrType::U8, IrType::U64),
+            (IrType::U16, IrType::U64),
+            (IrType::U32, IrType::U64),
+            (IrType::U32, IrType::I64),
+        ] {
+            let mut cg = zext_cg(from);
+            assert!(
+                cg.try_emit_zext_loaded_cast(&Value(9), &Operand::Value(Value(1)), from, to),
+                "{from:?}->{to:?} must take the plain-copy path"
+            );
+            let out = cg.state.out.buf.clone();
+            let expect = format!(
+                "movq %{}, %{}",
+                phys_reg_name(SRC_REG),
+                phys_reg_name(DST_REG)
+            );
+            assert!(
+                out.contains(&expect),
+                "{from:?}->{to:?} must be a single 64-bit copy ({expect}), got:\n{out}"
+            );
+            for ext in ["movzbl", "movzwl", "movslq"] {
+                assert!(
+                    !out.contains(ext),
+                    "{from:?}->{to:?} must not re-extend ({ext}), got:\n{out}"
+                );
+            }
+            // The destination inherits the property: its home now holds the
+            // same zero-extended image.
+            assert!(cg.zext_loaded_values.contains(&9));
+        }
+    }
+
+    #[test]
+    fn zext_loaded_source_still_extends_when_policy_refuses() {
+        // Signed source: the load's zero-extension is NOT the cast's
+        // semantics, so the plain-copy path must refuse and the caller must
+        // be free to emit movsbq/movswq/movslq.
+        for from in [IrType::I8, IrType::I16, IrType::I32] {
+            let mut cg = zext_cg(from);
+            assert!(
+                !cg.try_emit_zext_loaded_cast(
+                    &Value(9),
+                    &Operand::Value(Value(1)),
+                    from,
+                    IrType::I64
+                ),
+                "{from:?}->I64 must not take the zero-extended copy path"
+            );
+            assert!(
+                cg.state.out.buf.is_empty(),
+                "{from:?} refusal must not emit anything, got:\n{}",
+                cg.state.out.buf
+            );
+            assert!(!cg.zext_loaded_values.contains(&9));
+        }
+        // Untracked value: no proof of zero extension, no shortcut.
+        let mut cg = zext_cg(IrType::U16);
+        cg.zext_loaded_values.clear();
+        assert!(!cg.try_emit_zext_loaded_cast(
+            &Value(9),
+            &Operand::Value(Value(1)),
+            IrType::U16,
+            IrType::U64
+        ));
+        assert!(cg.state.out.buf.is_empty());
+    }
+
+    #[test]
+    fn zext_loaded_source_refuses_xmm_and_stale_homes() {
+        // An XMM-homed source is a bit-punned float word: the GP copy path
+        // must not claim it.
+        let mut cg = zext_cg(IrType::U32);
+        assert!(
+            super::super::emit::is_xmm_reg(XMM_REG),
+            "precondition: a real XMM id"
+        );
+        cg.reg_assignments.insert(1, XMM_REG);
+        assert!(!cg.try_emit_zext_loaded_cast(
+            &Value(9),
+            &Operand::Value(Value(1)),
+            IrType::U32,
+            IrType::U64
+        ));
+        // A clobbered home no longer holds the loaded value.
+        let mut cg = zext_cg(IrType::U32);
+        cg.mark_home_clobbered(1, "cast-ops");
+        assert!(
+            !cg.try_emit_zext_loaded_cast(
+                &Value(9),
+                &Operand::Value(Value(1)),
+                IrType::U32,
+                IrType::U64
+            ),
+            "a stale home must fall back to the reload path"
+        );
+    }
+}

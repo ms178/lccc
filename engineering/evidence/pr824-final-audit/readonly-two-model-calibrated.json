@@ -1,0 +1,97 @@
+{
+  "label": "CALIBRATED 100x rounds: source-model two-way, NOT production codegen",
+  "arm_a": {
+    "binary": "/home/user/.cache/pr824-measurements/readonly-native/long-before",
+    "sha256": "2d26bc93fec0aa07f87e216fef03fc2808cba9a9d6cd7a06ca9bc06082c6228c",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "4775ffc27eb3624b1f3b3bdde74b19d30721fdddf25d640024b6aa1fe5be8a31"
+    }
+  },
+  "arm_b": {
+    "binary": "/home/user/.cache/pr824-measurements/readonly-native/long-two-model",
+    "sha256": "88eabd735e7419f39239f3ac02d15f627b812cc22e093a368cc744d2b6c7f89c",
+    "env": "",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "4775ffc27eb3624b1f3b3bdde74b19d30721fdddf25d640024b6aa1fe5be8a31"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 1,
+  "arm_a_timings": {
+    "arm": "S31",
+    "n": 15,
+    "min_ms": 355.975,
+    "median_ms": 373.27,
+    "mean_ms": 376.937,
+    "stdev_ms": 18.451,
+    "samples_ms": [
+      369.113,
+      364.754,
+      383.276,
+      383.023,
+      375.883,
+      365.647,
+      373.27,
+      370.059,
+      389.705,
+      437.909,
+      355.975,
+      368.76,
+      380.953,
+      373.465,
+      362.267
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "source-model-two",
+    "n": 15,
+    "min_ms": 339.221,
+    "median_ms": 362.074,
+    "mean_ms": 366.401,
+    "stdev_ms": 22.319,
+    "samples_ms": [
+      363.774,
+      366.583,
+      423.157,
+      351.992,
+      365.047,
+      343.63,
+      339.221,
+      362.074,
+      409.194,
+      377.117,
+      345.953,
+      357.407,
+      352.445,
+      362.039,
+      376.381
+    ]
+  },
+  "paired_diffs_ms": [
+    5.339,
+    -1.83,
+    -39.881,
+    31.031,
+    10.836,
+    22.017,
+    34.049,
+    7.985,
+    -19.489,
+    60.793,
+    10.023,
+    11.353,
+    28.508,
+    11.426,
+    -14.114
+  ],
+  "median_ratio_b_over_a": 0.97001,
+  "min_ratio_b_over_a": 0.95293,
+  "sign_test_p": 0.12134,
+  "median_and_min_agree": true,
+  "significant": false,
+  "verdict": "S31 SLOWER by 3.00% (median) \u2014 NOT significant (sign test p > 0.05); treat as noise"
+}

@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "archive": "oracle-recheck.tar.xz",
+  "sha256": "51153673e081812d4518dea3b60fe226f464885d81ee1ac6e94bda9000c15e0d",
+  "bytes": 161252,
+  "fresh_client_cache": "/home/user/.cache/pr831/ce-refresh-cache",
+  "server_caching_not_controlled": true,
+  "upstream_main": "63e783b15586eca86f306bd75a52b82c57304bbb",
+  "pr831": "acd48b0ca8b8427e95d30ecdae72bfb1fd888f38",
+  "measured_compiler": "3b78f2e710e8c0d7fd3949a005623d3abcbe3455fbba085caeb44df2b9f40656",
+  "current_compiler": "bca00af65791e99ac8f1cbc56ce6a5d49a99965540810715314cd8846c76be49",
+  "assembly_cases": 7,
+  "remote_assembly_rows": 28,
+  "execution_requests": 20,
+  "local_memcheck_cases": 24,
+  "unit_passes": 4782,
+  "unit_ignored": 8,
+  "all_target_all_feature_check": "passed",
+  "whole_elf_continuity": "post-unit-repair-binary-equivalence.json",
+  "performance_approval": "withheld"
+}

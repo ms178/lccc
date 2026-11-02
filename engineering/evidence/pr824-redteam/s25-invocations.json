@@ -1,0 +1,16 @@
+{
+  "comparison": "S25 candidate vs frozen S24",
+  "default_environment": {
+    "CCC_LOOP_ROTATE": null,
+    "CCC_NO_AFFINE_EXIT_FOLD": null
+  },
+  "rotated_environment": {
+    "CCC_LOOP_ROTATE": "1",
+    "CCC_NO_AFFINE_EXIT_FOLD": null
+  },
+  "native_binary_identity": {
+    "default": 45,
+    "rotated": 45
+  },
+  "compiler_work": "default environment, one paired round per source"
+}

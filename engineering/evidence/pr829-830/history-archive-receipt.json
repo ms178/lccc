@@ -1,0 +1,42 @@
+{
+  "archive": "/home/user/artifacts/checkpoint-history-combined-through-S37.tar.xz",
+  "sha256": "a5b853ca7260e2c84593583a2ab17c4ea6476d3179c07480cb32b7b269116f32",
+  "members": {
+    "checkpoint-history-through-S25.tar": {
+      "source": "/home/user/artifacts/checkpoint-history-through-S25.tar.xz",
+      "source_sha256": "245639e4da2e6df8c8da4b43404a20fba096124b6fdc55dda73ffb940cc628ea",
+      "tar_sha256": "4bb44b1484e18a419fe66580737880294ef62ee0d22e656fea269b4a9f5ad494",
+      "tar_bytes": 96993280
+    },
+    "checkpoint-history-through-S29.tar": {
+      "source": "/home/user/artifacts/checkpoint-history-through-S29.tar.xz",
+      "source_sha256": "2633163a549469a72b5914f1a76ddbf1d1d055e47fb9b2b2224e549a8c3277df",
+      "tar_sha256": "2bec024f7f9385bafcefa0f455896aa631aacdf9cecb3a96a9714cea7de6d347",
+      "tar_bytes": 89292800
+    },
+    "checkpoint-history-through-S31.tar": {
+      "source": "/home/user/artifacts/checkpoint-history-through-S31.tar.xz",
+      "source_sha256": "f3941a237de040475c2ccb9b11841b9503b24d0c97024635d8ad9b9e34fbc552",
+      "tar_sha256": "fa744b83ab72f86c7a66f473713d297c6b60de458f850b48cee74000645f60d7",
+      "tar_bytes": 54999040
+    },
+    "checkpoint-history-through-S33.tar": {
+      "source": "/home/user/artifacts/checkpoint-history-through-S33.tar.xz",
+      "source_sha256": "a99ce4e0b62ddde6c711911d3934a90ef517578cb9567586355180368b616778",
+      "tar_sha256": "6717c4ab5c0dcbc64f8047ededadc83e9602e48460cf78bd9cc8d0c3367af3f7",
+      "tar_bytes": 45158400
+    },
+    "checkpoint-history-through-S35.tar": {
+      "source": "/home/user/artifacts/checkpoint-history-through-S35.tar.xz",
+      "source_sha256": "2b69f8b3c80d4a46321f6151f5214a4d4ce067bd6e7ed4c1e1879c7a6758bdcf",
+      "tar_sha256": "e98390ccf9c23777aeeb68c3f23968f18f332987593806bf029663471e2f8bd8",
+      "tar_bytes": 43591680
+    },
+    "checkpoint-history-through-S37.tar": {
+      "source": "/home/user/artifacts/checkpoint-history-through-S37.tar.xz",
+      "source_sha256": "8edf0ed3093edc9bd68bce0694d238317634eb70c2caf804ff57c4f2b7fb9f70",
+      "tar_sha256": "88fcc293a1a7314741fd5928dc5a64faa3efbc35e99870c7935c5c4c48c141a8",
+      "tar_bytes": 43632640
+    }
+  }
+}

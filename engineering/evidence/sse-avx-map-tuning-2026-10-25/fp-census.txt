@@ -1,0 +1,10 @@
+  panic_sites               833   baseline    834
+  panic_sites_hot           105   baseline    105
+  unsafe_sites               25   baseline     25
+  ignored_tests              10   baseline     10
+  fns_over_300              228   baseline    228
+  fns_over_500               94   baseline     94
+  fns_over_1000              27   baseline     27
+  knob_literals             536   baseline    536
+  knobs_undocumented        269   baseline    269
+PASS: audit census held (no metric grew)

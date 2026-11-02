@@ -1,0 +1,1160 @@
+{
+  "tools": {
+    "lccc": {
+      "path": "/home/user/.cache/lccc/target/fastbuild/lccc-riscv",
+      "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0\nGCC is maintained by the Free Software Foundation, Inc.\nThis program is a fork of CCC (written by Claude Opus 4.6);\nIt is not intended for production use.\nBackend: standalone\n",
+      "sha256": "4fa0863900193dd2f1320987cab67b9284db312f5e0c750edaf31ac780b953d2"
+    },
+    "clang": {
+      "path": "/usr/lib/llvm-19/bin/clang",
+      "version": "Debian clang version 19.1.7 (3+b1)\nTarget: x86_64-pc-linux-gnu\nThread model: posix\nInstalledDir: /usr/lib/llvm-19/bin\n",
+      "sha256": "0a3c55936ac43954fbe4914e6e73b577ca9e35e75d89ef13d3e28c187f41ca1a"
+    },
+    "linker": {
+      "path": "/usr/lib/llvm-19/bin/lld",
+      "version": "Debian LLD 19.1.7 (compatible with GNU linkers)\n",
+      "sha256": "7a2fd87d82662beac4371a1a21067b37cd4b7d43777aa61c089d85c45f772f6e"
+    },
+    "qemu": {
+      "path": "/usr/bin/qemu-riscv64",
+      "version": "qemu-riscv64 version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)\nCopyright (c) 2003-2025 Fabrice Bellard and the QEMU Project developers\n",
+      "sha256": "f2bb9b35eb97fc6b67c43a65d944ea9dcd7b1908df95faf28cea68511e762dc5"
+    }
+  },
+  "records": [
+    {
+      "case": "default",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "32a5415cb7043b8585df336e95383378b844ce46a75b49b6cedf4a3860bba16b",
+        "shared.so": "cef88dbaecf040db9a3813ccfd0de92caf02dadf3642bc8d494e5d36080ccc57",
+        "runner.o": "7e8b8f2ffd8b2aad2900cc431143d0776258fab2cdb7c18794d7e3cef676b6e1",
+        "runner": "562f301fd66f271f4d83343cabc9418eb9885129aebbbbd0221b8f00bd631165"
+      }
+    },
+    {
+      "case": "weak-definition",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "__attribute__((weak)) int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "9d7ca607f34fde8b477f84f0035984c3fc819db265831d9346a1a778c9c725b4",
+        "shared.so": "c1efbcc709694b947408e4df86b18fa12e1b0c03f1125e585cd70a2143e53a92",
+        "runner.o": "7e8b8f2ffd8b2aad2900cc431143d0776258fab2cdb7c18794d7e3cef676b6e1",
+        "runner": "562f301fd66f271f4d83343cabc9418eb9885129aebbbbd0221b8f00bd631165"
+      }
+    },
+    {
+      "case": "import",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "9f02abdcfc908f89b8c6b81cba10eb2a06632b3efdd86dccafaba8bb441f5da5",
+        "shared.so": "dc4048721966754d6cf906f8490170203563deaf9a58ad6150e90b23511bd1af",
+        "runner.o": "7e8b8f2ffd8b2aad2900cc431143d0776258fab2cdb7c18794d7e3cef676b6e1",
+        "runner": "562f301fd66f271f4d83343cabc9418eb9885129aebbbbd0221b8f00bd631165"
+      }
+    },
+    {
+      "case": "weak-import",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern __attribute__((weak)) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "870b03cc01b5f892ac7ea3fd0ea6681d639adc37b4de303b81745f16fdc05eea",
+        "shared.so": "f3b959ac471c0b84a5d56eb2b0d4ce3f459b793a1c3f1957c4dd9c02c4235d8a",
+        "runner.o": "7e8b8f2ffd8b2aad2900cc431143d0776258fab2cdb7c18794d7e3cef676b6e1",
+        "runner": "562f301fd66f271f4d83343cabc9418eb9885129aebbbbd0221b8f00bd631165"
+      }
+    },
+    {
+      "case": "weak-missing",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern __attribute__((weak)) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,0\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n",
+      "file_sha256": {
+        "shared.o": "870b03cc01b5f892ac7ea3fd0ea6681d639adc37b4de303b81745f16fdc05eea",
+        "shared.so": "f3b959ac471c0b84a5d56eb2b0d4ce3f459b793a1c3f1957c4dd9c02c4235d8a",
+        "runner.o": "c43afededad0f18d7d3d092e5ed04edbc338103402d75ff83b4de53d0d1111ef",
+        "runner": "23e96af48421a8ec7b652bee86f418a73e326f28d6f11c3777cf1e2793ffed40"
+      }
+    },
+    {
+      "case": "hidden",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "__attribute__((visibility(\"hidden\"))) int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n lw t1,0(s0)\n li t2,42\n bne t1,t2,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "8b080ef8a25d5db18689bc014028dbfa9f140c5329b8bea895ffb3061af95898",
+        "shared.so": "771279fb1ffb6cfc77a206f9370c66b7904e78e37f4472d8b1ac805f2d093a9c",
+        "runner.o": "4874eca49c7bd7bb93477890ea3aba752bcac1bdf5046908039002244b02246b",
+        "runner": "af4c03524ba4572c36878d699b1f5861540ae1f8f8d0de7544094df8036d45a4"
+      }
+    },
+    {
+      "case": "protected",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "__attribute__((visibility(\"protected\"))) int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n lw t1,0(s0)\n li t2,42\n bne t1,t2,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "8e728baec08e3b2a7242026fc95c87a4b57fc984b810a739ae475252dda99733",
+        "shared.so": "56653aa66afc1aa93d50f9ed632a52b47a1039d2c347ec61a1bb3cfa31d052a8",
+        "runner.o": "4874eca49c7bd7bb93477890ea3aba752bcac1bdf5046908039002244b02246b",
+        "runner": "af4c03524ba4572c36878d699b1f5861540ae1f8f8d0de7544094df8036d45a4"
+      }
+    },
+    {
+      "case": "local",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "static int target=42;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n lw t1,0(s0)\n li t2,42\n bne t1,t2,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "c04c9a20fa9211a74c62f42138114cf8455f15d7cdca624171ecf1759cf9a9e5",
+        "shared.so": "771279fb1ffb6cfc77a206f9370c66b7904e78e37f4472d8b1ac805f2d093a9c",
+        "runner.o": "4874eca49c7bd7bb93477890ea3aba752bcac1bdf5046908039002244b02246b",
+        "runner": "af4c03524ba4572c36878d699b1f5861540ae1f8f8d0de7544094df8036d45a4"
+      }
+    },
+    {
+      "case": "weak-hidden-missing",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern __attribute__((weak,visibility(\"hidden\"))) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,0\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "3c19e721e5dddc2cc43d97e197b2d9f00c7c49c7435c1b697c84055bb67f0636",
+        "shared.so": "b431e3f8b433ecc8757a46d702b0414e68db11125211baf32f0656897b6d76b4",
+        "runner.o": "f0bbf88a8e87fe18b5e977a9ab3b478cfa8334595176b5675572fb57cbd9794d",
+        "runner": "c19b1d36cbaac4d3a4b6ee42cf1ae380a47e43eee5a7746c343db2ce67b5088b"
+      }
+    },
+    {
+      "case": "weak-protected-missing",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern __attribute__((weak,visibility(\"protected\"))) int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,0\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "file_sha256": {
+        "shared.o": "1c9607aaae6853ee907c3c8578991ef0c32be106b6511862e63dd50d314162ee",
+        "shared.so": "b431e3f8b433ecc8757a46d702b0414e68db11125211baf32f0656897b6d76b4",
+        "runner.o": "f0bbf88a8e87fe18b5e977a9ab3b478cfa8334595176b5675572fb57cbd9794d",
+        "runner": "c19b1d36cbaac4d3a4b6ee42cf1ae380a47e43eee5a7746c343db2ce67b5088b"
+      }
+    },
+    {
+      "case": "absolute-default",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "definition": ".globl target\n.set target,256\n",
+      "file_sha256": {
+        "shared.o": "9f02abdcfc908f89b8c6b81cba10eb2a06632b3efdd86dccafaba8bb441f5da5",
+        "shared.so": "ddc66ea1762c3453425846477e0b0928906bcc762617f726a9176cf02b41c0fa",
+        "runner.o": "7e8b8f2ffd8b2aad2900cc431143d0776258fab2cdb7c18794d7e3cef676b6e1",
+        "runner": "562f301fd66f271f4d83343cabc9418eb9885129aebbbbd0221b8f00bd631165"
+      }
+    },
+    {
+      "case": "absolute-weak",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n la s1,target\n bne s0,s1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "definition": ".weak target\n.set target,256\n",
+      "file_sha256": {
+        "shared.o": "9f02abdcfc908f89b8c6b81cba10eb2a06632b3efdd86dccafaba8bb441f5da5",
+        "shared.so": "435cd3d68186a89d6dc9821e6107fe2b05f2c934d5169cdec31d28cd23d446f6",
+        "runner.o": "7e8b8f2ffd8b2aad2900cc431143d0776258fab2cdb7c18794d7e3cef676b6e1",
+        "runner": "562f301fd66f271f4d83343cabc9418eb9885129aebbbbd0221b8f00bd631165"
+      }
+    },
+    {
+      "case": "absolute-protected",
+      "passed": true,
+      "commands": [
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-O2",
+            "-fPIC",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.c",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "target/fastbuild/lccc-riscv",
+            "-shared",
+            "-nostdlib",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.o",
+            "/tmp/rv-shared-loader-w55tkz6l/absolute.o",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "clang-19",
+            "--target=riscv64-linux-gnu",
+            "-march=rv64gc",
+            "-mabi=lp64d",
+            "-c",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.s",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "ld.lld",
+            "-m",
+            "elf64lriscv",
+            "-pie",
+            "-E",
+            "--dynamic-linker",
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/tmp/rv-shared-loader-w55tkz6l/runner.o",
+            "/tmp/rv-shared-loader-w55tkz6l/shared.so",
+            "-o",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        },
+        {
+          "argv": [
+            "qemu-riscv64",
+            "-L",
+            "/usr/riscv64-linux-gnu",
+            "/tmp/rv-shared-loader-w55tkz6l/runner"
+          ],
+          "returncode": 0,
+          "output": ""
+        }
+      ],
+      "source": "extern int target;\nint *observed=&target;\nint *get_ptr(void){return &target;}\n",
+      "runner": ".option pic\n.text\n.globl _start\n_start:\n la t0,observed\n ld s0,0(t0)\n li t1,256\n bne s0,t1,.fail\n la t0,get_ptr\n jalr ra,t0,0\n bne a0,s0,.fail\n li a0,0\n j .exit\n.fail:\n li a0,91\n.exit:\n li a7,93\n ecall\n.data\n.globl target\ntarget: .word 99\n",
+      "definition": ".globl target\n.protected target\n.set target,256\n",
+      "file_sha256": {
+        "shared.o": "9f02abdcfc908f89b8c6b81cba10eb2a06632b3efdd86dccafaba8bb441f5da5",
+        "shared.so": "9c4fed39792c49b7fe898c343a6427fa47923c84807792eaa35dde2de3824fa2",
+        "runner.o": "692c4f26483b1cdf631400ab1a4555800f77082c6a5ca027bea5afc58b0aa6b9",
+        "runner": "7d07bdf49368186006bb1e007ffcb68603f9d1f89b89c096306d40a1c751108c"
+      }
+    }
+  ],
+  "loader": {
+    "path": "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1",
+    "sha256": "7e97103205227da46cf46b338dba685e4ecc9b6b652a48bb3dd927c3ec8d666f"
+  },
+  "passed": 13,
+  "failed": 0,
+  "skipped": 0
+}

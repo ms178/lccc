@@ -1,0 +1,19 @@
+======================================================================
+ LCCC Differential Fuzzing & Testing Harness
+ Engine   : synthetic
+ Target   : x86_64 | Runner: native
+ LCCC     : /home/user/lccc/target/fastbuild/lccc
+ Reference: /home/user/tools/gcc-16/bin/gcc-16, /home/user/tools/oracle-bin/clang-23
+ Opt levels: -O2
+ Workers  : 1 | Count: 12 | Seed: 20261025
+======================================================================
+............ [12/12]
+
+======================================================================
+ Differential Fuzzing Results (2.58s elapsed)
+ TOTAL : 12
+ PASS  : 12
+ FAIL  : 0
+ SKIP  : 0
+======================================================================
+Saved results JSON to /home/user/artifacts/sse1/fuzz.json

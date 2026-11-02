@@ -1,0 +1,48 @@
+[
+  {
+    "command": [
+      "gcc-16",
+      "-O2",
+      "-fwrapv",
+      "engineering/evidence/pr824-review/rotate-wrap-plain.c",
+      "-o",
+      "/home/user/.cache/pr824-review/wrap-control"
+    ],
+    "env": {},
+    "compile_exit": 0,
+    "run_exit": 0,
+    "stderr": ""
+  },
+  {
+    "command": [
+      "/home/user/.cache/pr824-original/lccc",
+      "-O2",
+      "-fwrapv",
+      "engineering/evidence/pr824-review/rotate-wrap-plain.c",
+      "-o",
+      "/home/user/.cache/pr824-review/wrap-control"
+    ],
+    "env": {
+      "CCC_LOOP_ROTATE": "0"
+    },
+    "compile_exit": 0,
+    "run_exit": 0,
+    "stderr": ""
+  },
+  {
+    "command": [
+      "/home/user/.cache/pr824-original/lccc",
+      "-O2",
+      "-fwrapv",
+      "engineering/evidence/pr824-review/rotate-wrap-plain.c",
+      "-o",
+      "/home/user/.cache/pr824-review/wrap-control"
+    ],
+    "env": {
+      "CCC_LOOP_ROTATE": "1"
+    },
+    "compile_exit": 0,
+    "run_exit": 1,
+    "stderr": ""
+  }
+]

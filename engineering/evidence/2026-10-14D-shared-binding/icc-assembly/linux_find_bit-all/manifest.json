@@ -1,0 +1,27 @@
+{
+  "source": "tests/benchmark/programs/linux_find_bit.c",
+  "function": null,
+  "arch": "x86",
+  "errors": [],
+  "records": [
+    {
+      "key": "icc",
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": "",
+      "flags": "-O2 -march=core-avx2",
+      "elapsed_s": 0.49674291999986053,
+      "instructions": 187,
+      "loads": 17,
+      "stores": 12,
+      "spills": 11,
+      "stack_refs": 11,
+      "xmm_reg_moves": 0,
+      "branches": 25,
+      "vectors": 24,
+      "calls": 2,
+      "ratio_vs_best": 1.0
+    }
+  ]
+}

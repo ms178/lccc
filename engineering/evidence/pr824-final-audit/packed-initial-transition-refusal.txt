@@ -1,0 +1,9 @@
+gcc: PASS 1260 bitwise cases + Memcheck
+clang: PASS 1260 bitwise cases + Memcheck
+Traceback (most recent call last):
+  File "/home/user/.cache/lccc/scripts/check_strict_packed_recip.py", line 103, in <module>
+    main()
+    ~~~~^^
+  File "/home/user/.cache/lccc/scripts/check_strict_packed_recip.py", line 90, in main
+    raise RuntimeError(f'{name}: legacy SIMD in the promoted AVX loop')
+RuntimeError: packed: legacy SIMD in the promoted AVX loop

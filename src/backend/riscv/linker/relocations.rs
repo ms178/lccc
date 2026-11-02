@@ -1,0 +1,781 @@
+//! RISC-V linker shared types and utilities.
+//!
+//! This module provides all the building blocks used by `link.rs` for both
+//! executable and shared library linking:
+//!
+//! - **Relocation constants**: All `R_RISCV_*` values from the ELF psABI spec.
+//! - **Instruction patching**: `patch_{u,i,s,b,j,cb,cj}_type` functions that
+//!   encode resolved addresses into RISC-V instruction formats.
+//! - **Symbol resolution**: `resolve_symbol_value`, `got_sym_key`,
+//!   `find_hi20_value` for AUIPC/LO12 relocation pairing.
+//! - **Shared types**: `GlobalSym`, `MergedSection`, `InputSecRef`.
+//! - **ELF writing helpers** (re-exported from `linker_common`):
+//!   `write_phdr`, `write_phdr_at`, `align_up`, `pad_to`.
+//! - **Utility functions**: `build_gnu_hash`, `find_versioned_soname`,
+//!   `resolve_archive_members`, `output_section_name`, `section_order`.
+
+use super::elf_read::*;
+use super::got::{GotKind, GotLayout};
+use crate::common::fx_hash::FxHashMap;
+
+// ── RISC-V relocation type constants ─────────────────────────────────────
+// Values from the RISC-V ELF psABI specification.
+
+pub const R_RISCV_NONE: u32 = 0;
+pub const R_RISCV_32: u32 = 1;
+pub const R_RISCV_64: u32 = 2;
+pub const R_RISCV_BRANCH: u32 = 16;
+pub const R_RISCV_JAL: u32 = 17;
+/// Deprecated by the psABI in favour of `CALL_PLT`, still emitted by older
+/// assemblers; resolved identically.
+pub const R_RISCV_CALL: u32 = 18;
+pub const R_RISCV_CALL_PLT: u32 = 19;
+pub const R_RISCV_GOT_HI20: u32 = 20;
+pub const R_RISCV_TLS_GOT_HI20: u32 = 21;
+pub const R_RISCV_TLS_GD_HI20: u32 = 22;
+pub const R_RISCV_PCREL_HI20: u32 = 23;
+pub const R_RISCV_PCREL_LO12_I: u32 = 24;
+pub const R_RISCV_PCREL_LO12_S: u32 = 25;
+pub const R_RISCV_HI20: u32 = 26;
+pub const R_RISCV_LO12_I: u32 = 27;
+pub const R_RISCV_LO12_S: u32 = 28;
+pub const R_RISCV_TPREL_HI20: u32 = 29;
+pub const R_RISCV_TPREL_LO12_I: u32 = 30;
+pub const R_RISCV_TPREL_LO12_S: u32 = 31;
+pub const R_RISCV_TPREL_ADD: u32 = 32;
+pub const R_RISCV_ADD8: u32 = 33;
+pub const R_RISCV_ADD16: u32 = 34;
+pub const R_RISCV_ADD32: u32 = 35;
+pub const R_RISCV_ADD64: u32 = 36;
+pub const R_RISCV_SUB8: u32 = 37;
+pub const R_RISCV_SUB16: u32 = 38;
+pub const R_RISCV_SUB32: u32 = 39;
+pub const R_RISCV_SUB64: u32 = 40;
+pub const R_RISCV_ALIGN: u32 = 43;
+pub const R_RISCV_RVC_BRANCH: u32 = 44;
+pub const R_RISCV_RVC_JUMP: u32 = 45;
+pub const R_RISCV_RVC_LUI: u32 = 46;
+/// 47-50 are reserved by the current psABI; GNU ld still produces them while
+/// relaxing (as `relax.rs` does) and accepts them from input, as lccc does.
+pub const R_RISCV_GPREL_I: u32 = 47;
+pub const R_RISCV_GPREL_S: u32 = 48;
+pub const R_RISCV_TPREL_I: u32 = 49;
+pub const R_RISCV_TPREL_S: u32 = 50;
+pub const R_RISCV_RELAX: u32 = 51;
+pub const R_RISCV_SET6: u32 = 53;
+pub const R_RISCV_SUB6: u32 = 52;
+pub const R_RISCV_SET8: u32 = 54;
+pub const R_RISCV_SET16: u32 = 55;
+pub const R_RISCV_SET32: u32 = 56;
+pub const R_RISCV_32_PCREL: u32 = 57;
+pub const R_RISCV_SET_ULEB128: u32 = 60;
+pub const R_RISCV_SUB_ULEB128: u32 = 61;
+
+// ── Instruction patching ─────────────────────────────────────────────────
+
+/// Patch a U-type instruction (LUI/AUIPC) with a 20-bit immediate.
+pub fn patch_u_type(data: &mut [u8], off: usize, value: u32) {
+    if off + 4 > data.len() {
+        return;
+    }
+    let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let hi = (value.wrapping_add(0x800)) & 0xFFFFF000;
+    let insn = (insn & 0xFFF) | hi;
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch an I-type instruction with a 12-bit immediate.
+pub fn patch_i_type(data: &mut [u8], off: usize, value: u32) {
+    if off + 4 > data.len() {
+        return;
+    }
+    let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let imm = value & 0xFFF;
+    let insn = (insn & 0x000FFFFF) | (imm << 20);
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch an S-type instruction with a 12-bit immediate.
+pub fn patch_s_type(data: &mut [u8], off: usize, value: u32) {
+    if off + 4 > data.len() {
+        return;
+    }
+    let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let imm = value & 0xFFF;
+    let imm_hi = (imm >> 5) & 0x7F;
+    let imm_lo = imm & 0x1F;
+    let insn = (insn & 0x01FFF07F) | (imm_hi << 25) | (imm_lo << 7);
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch a B-type instruction with a 13-bit PC-relative offset.
+pub fn patch_b_type(data: &mut [u8], off: usize, value: u32) {
+    if off + 4 > data.len() {
+        return;
+    }
+    let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let imm = value;
+    let bit12 = (imm >> 12) & 1;
+    let bits10_5 = (imm >> 5) & 0x3F;
+    let bits4_1 = (imm >> 1) & 0xF;
+    let bit11 = (imm >> 11) & 1;
+    let insn =
+        (insn & 0x01FFF07F) | (bit12 << 31) | (bits10_5 << 25) | (bits4_1 << 8) | (bit11 << 7);
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch a J-type instruction with a 21-bit PC-relative offset.
+pub fn patch_j_type(data: &mut [u8], off: usize, value: u32) {
+    if off + 4 > data.len() {
+        return;
+    }
+    let insn = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+    let imm = value;
+    let bit20 = (imm >> 20) & 1;
+    let bits10_1 = (imm >> 1) & 0x3FF;
+    let bit11 = (imm >> 11) & 1;
+    let bits19_12 = (imm >> 12) & 0xFF;
+    let insn =
+        (insn & 0xFFF) | (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
+    data[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch a CB-type (compressed branch) instruction with an 8-bit signed offset.
+/// Used for c.beqz/c.bnez (R_RISCV_RVC_BRANCH).
+pub fn patch_cb_type(data: &mut [u8], off: usize, value: u32) {
+    if off + 2 > data.len() {
+        return;
+    }
+    let insn = u16::from_le_bytes(data[off..off + 2].try_into().unwrap());
+    let imm = value;
+    let bit8 = (imm >> 8) & 1;
+    let bits4_3 = (imm >> 3) & 0x3;
+    let bits7_6 = (imm >> 6) & 0x3;
+    let bits2_1 = (imm >> 1) & 0x3;
+    let bit5 = (imm >> 5) & 1;
+    let insn = (insn & 0xE383)
+        | ((bit8 as u16) << 12)
+        | ((bits4_3 as u16) << 10)
+        | ((bits7_6 as u16) << 5)
+        | ((bits2_1 as u16) << 3)
+        | ((bit5 as u16) << 2);
+    data[off..off + 2].copy_from_slice(&insn.to_le_bytes());
+}
+
+/// Patch a CJ-type (compressed jump) instruction with an 11-bit signed offset.
+/// Used for c.j/c.jal (R_RISCV_RVC_JUMP).
+pub fn patch_cj_type(data: &mut [u8], off: usize, value: u32) {
+    if off + 2 > data.len() {
+        return;
+    }
+    let insn = u16::from_le_bytes(data[off..off + 2].try_into().unwrap());
+    let imm = value;
+    let bit11 = (imm >> 11) & 1;
+    let bit4 = (imm >> 4) & 1;
+    let bits9_8 = (imm >> 8) & 0x3;
+    let bit10 = (imm >> 10) & 1;
+    let bit6 = (imm >> 6) & 1;
+    let bit7 = (imm >> 7) & 1;
+    let bits3_1 = (imm >> 1) & 0x7;
+    let bit5 = (imm >> 5) & 1;
+    let encoded = (bit11 << 10)
+        | (bit4 << 9)
+        | (bits9_8 << 7)
+        | (bit10 << 6)
+        | (bit6 << 5)
+        | (bit7 << 4)
+        | (bits3_1 << 1)
+        | bit5;
+    let insn = (insn & 0xE003) | ((encoded as u16) << 2);
+    data[off..off + 2].copy_from_slice(&insn.to_le_bytes());
+}
+
+// ── Symbol resolution helpers ────────────────────────────────────────────
+
+/// Resolve a symbol to its virtual address, handling section symbols, globals,
+/// and locals.
+pub fn resolve_symbol_value(
+    sym: &Symbol,
+    sym_idx: usize,
+    obj: &ElfObject,
+    obj_idx: usize,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
+    section_vaddrs: &[u64],
+    local_sym_vaddrs: &[Vec<u64>],
+    global_syms: &FxHashMap<String, GlobalSym>,
+) -> u64 {
+    if sym.sym_type() == STT_SECTION {
+        if (sym.shndx as usize) < obj.sections.len() {
+            if let Some(&(mi, mo)) = sec_mapping.get(&(obj_idx, sym.shndx as usize)) {
+                return section_vaddrs[mi] + mo;
+            }
+        }
+        0
+    } else if !sym.name.is_empty() && sym.binding() != STB_LOCAL {
+        global_syms
+            .get(sym.name.as_str())
+            .map(|gs| gs.value)
+            .unwrap_or(0)
+    } else {
+        local_sym_vaddrs
+            .get(obj_idx)
+            .and_then(|v| v.get(sym_idx))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// Build a unique GOT key for a symbol referenced via GOT_HI20 or TLS_GOT_HI20.
+///
+/// Local and section symbols aren't in `global_syms`, so they need synthetic keys
+/// that incorporate the object index to avoid collisions between objects. The addend
+/// is included because different offsets within the same section need distinct GOT
+/// entries pointing to different addresses.
+///
+/// Returns (key, is_local) where is_local indicates the symbol won't be in global_syms.
+pub fn got_sym_key(obj_idx: usize, sym: &Symbol, addend: i64) -> (String, bool) {
+    if sym.sym_type() == STT_SECTION || sym.binding() == STB_LOCAL {
+        // ELF names cannot contain NUL, so an input global cannot impersonate
+        // this internal namespace. Include location as well as name: distinct
+        // unnamed/local symbols in one object need not have distinct names.
+        (
+            format!(
+                "\0local:{}:{}:{}:{}:{}",
+                obj_idx, sym.shndx, sym.value, addend, sym.name
+            ),
+            true,
+        )
+    } else {
+        (sym.name.to_string(), false)
+    }
+}
+
+/// Find the hi20 value for a pcrel_lo12 relocation in executable linking.
+///
+/// RISC-V uses paired AUIPC+LO12 relocations. A pcrel_lo12 references the AUIPC
+/// instruction by its address; this function scans the relocation table to find
+/// the corresponding HI20 relocation and computes the low 12 bits of the resolved
+/// address.
+pub fn find_hi20_value(
+    obj: &ElfObject,
+    obj_idx: usize,
+    sec_idx: usize,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
+    section_vaddrs: &[u64],
+    local_sym_vaddrs: &[Vec<u64>],
+    global_syms: &FxHashMap<String, GlobalSym>,
+    auipc_vaddr: u64,
+    sec_offset: u64,
+    got_vaddr: u64,
+    got: &GotLayout,
+    got_plt_vaddr: u64,
+    gd_tls_relax_info: &FxHashMap<u64, (u64, i64)>,
+    tls_vaddr: u64,
+) -> i64 {
+    // Check if this references a GD->LE relaxed auipc (now a lui)
+    if let Some(&(sym_val, addend)) = gd_tls_relax_info.get(&auipc_vaddr) {
+        let tprel = (sym_val as i64 + addend - tls_vaddr as i64) as u32;
+        return (tprel & 0xFFF) as i64;
+    }
+
+    find_hi20_value_core(
+        obj,
+        obj_idx,
+        sec_idx,
+        sec_mapping,
+        section_vaddrs,
+        local_sym_vaddrs,
+        global_syms,
+        auipc_vaddr,
+        sec_offset,
+        got_vaddr,
+        got,
+        Some(got_plt_vaddr),
+    )
+}
+
+/// Find the hi20 value for a pcrel_lo12 relocation in shared library linking.
+///
+/// Simplified variant without GD->LE relaxation (not valid in shared libs)
+/// and without PLT GOT entries.
+pub fn find_hi20_value_shared(
+    obj: &ElfObject,
+    obj_idx: usize,
+    sec_idx: usize,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
+    section_vaddrs: &[u64],
+    local_sym_vaddrs: &[Vec<u64>],
+    global_syms: &FxHashMap<String, GlobalSym>,
+    auipc_vaddr: u64,
+    sec_offset: u64,
+    got_vaddr: u64,
+    got: &GotLayout,
+) -> i64 {
+    find_hi20_value_core(
+        obj,
+        obj_idx,
+        sec_idx,
+        sec_mapping,
+        section_vaddrs,
+        local_sym_vaddrs,
+        global_syms,
+        auipc_vaddr,
+        sec_offset,
+        got_vaddr,
+        got,
+        None,
+    )
+}
+
+/// Core implementation for finding the hi20 value paired with a pcrel_lo12.
+fn find_hi20_value_core(
+    obj: &ElfObject,
+    obj_idx: usize,
+    sec_idx: usize,
+    sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
+    section_vaddrs: &[u64],
+    local_sym_vaddrs: &[Vec<u64>],
+    global_syms: &FxHashMap<String, GlobalSym>,
+    auipc_vaddr: u64,
+    sec_offset: u64,
+    got_vaddr: u64,
+    got: &GotLayout,
+    got_plt_vaddr: Option<u64>,
+) -> i64 {
+    if sec_idx >= obj.relocations.len() {
+        return 0;
+    }
+    let relocs = &obj.relocations[sec_idx];
+    for reloc in relocs {
+        let reloc_vaddr = sec_offset + reloc.offset;
+        let (mi, _mo) = match sec_mapping.get(&(obj_idx, sec_idx)) {
+            Some(&v) => v,
+            None => continue,
+        };
+        let this_vaddr = section_vaddrs[mi] + reloc_vaddr;
+        if this_vaddr != auipc_vaddr {
+            continue;
+        }
+
+        match reloc.rela_type {
+            R_RISCV_PCREL_HI20 => {
+                let hi_sym_idx = reloc.sym_idx as usize;
+                let sym = &obj.symbols[hi_sym_idx];
+                let s = resolve_symbol_value(
+                    sym,
+                    hi_sym_idx,
+                    obj,
+                    obj_idx,
+                    sec_mapping,
+                    section_vaddrs,
+                    local_sym_vaddrs,
+                    global_syms,
+                );
+                let target = s as i64 + reloc.addend;
+                return (target - auipc_vaddr as i64) & 0xFFF;
+            }
+            R_RISCV_GOT_HI20 | R_RISCV_TLS_GOT_HI20 | R_RISCV_TLS_GD_HI20 => {
+                let Some(kind) = GotKind::of(reloc.rela_type) else {
+                    continue;
+                };
+                let sym = &obj.symbols[reloc.sym_idx as usize];
+                let (key, _) = got_sym_key(obj_idx, sym, reloc.addend);
+                // As `reloc::lookup_got_entry`; a missing slot is reported
+                // by the HI20 relocation itself.
+                let got_entry_vaddr = match got.offset(&key, kind) {
+                    Some(off) => got_vaddr + off,
+                    None => match (kind, got_plt_vaddr, global_syms.get(sym.name.as_str())) {
+                        (GotKind::Addr, Some(gpv), Some(gs)) if gs.needs_plt => {
+                            gpv + (2 + gs.plt_idx) as u64 * 8
+                        }
+                        _ => 0,
+                    },
+                };
+                return (got_entry_vaddr as i64 + reloc.addend - auipc_vaddr as i64) & 0xFFF;
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+/// Represents a global symbol's definition, used by both executable and shared
+/// library linking.
+#[derive(Clone, Debug)]
+pub struct GlobalSym {
+    /// Virtual address of the symbol.
+    pub value: u64,
+    pub size: u64,
+    pub binding: u8,
+    pub sym_type: u8,
+    pub visibility: u8,
+    /// True if this symbol is defined in an input object file.
+    pub defined: bool,
+    /// True if this symbol needs a PLT/GOT entry (from a shared library).
+    pub needs_plt: bool,
+    /// Index into the PLT (if needs_plt).
+    pub plt_idx: usize,
+    /// Section index in the merged section list, if defined locally.
+    pub section_idx: Option<usize>,
+    /// True when this link *synthesized* the definition at value 0 as a weak
+    /// placeholder for an optional runtime hook (`_ITM_registerTMCloneTable`,
+    /// ...). Such a symbol is not a definition of the program: bfd leaves it
+    /// weak and undefined, so `.symtab` must not name an address for it. A
+    /// real definition from an input object never sets this flag, which is why
+    /// it replaces the `value == 0 && weak` guess the symbol table used to
+    /// make -- that guess also discarded legitimate zero-valued definitions.
+    pub placeholder: bool,
+}
+
+/// A merged input section with its assigned virtual address.
+pub struct MergedSection {
+    pub name: String,
+    pub sh_type: u32,
+    pub sh_flags: u64,
+    pub data: Vec<u8>,
+    pub vaddr: u64,
+    pub align: u64,
+    /// `sh_entsize` while the output keeps `SHF_MERGE` (GNU ld's rule,
+    /// `debug::gnu_merge_flags`); 0 otherwise.
+    pub entsize: u64,
+    /// `SHF_WRITE` comes from the script's placement alone (a `.sdata` that
+    /// only `.srodata` inputs fill sits in the RW segment): layout honours
+    /// it, the section header keeps the inputs' flags as GNU ld's does.
+    pub script_write: bool,
+}
+
+/// Tracks where each input section maps to in the merged output.
+pub struct InputSecRef {
+    pub obj_idx: usize,
+    pub sec_idx: usize,
+    pub merged_sec_idx: usize,
+    pub offset_in_merged: u64,
+}
+
+// ── Section name mapping ─────────────────────────────────────────────────
+
+/// Map an input section name to its output section name.
+///
+/// Returns None for sections that should be skipped (non-alloc, group sections).
+/// Handles RISC-V-specific sections (.sdata, .sbss, .riscv.attributes) in
+/// addition to standard ELF section name folding (.text.foo -> .text, etc).
+pub fn output_section_name(name: &str, sh_type: u32, sh_flags: u64) -> Option<String> {
+    // Skip non-alloc sections (except .riscv.attributes which we handle separately)
+    if sh_flags & SHF_ALLOC == 0 && sh_type != SHT_RISCV_ATTRIBUTES {
+        return None;
+    }
+    if sh_type == SHT_GROUP {
+        return None;
+    }
+
+    // Standard section name folding: .text.foo -> .text, etc.
+    let prefixes = [
+        (".text.", ".text"),
+        (".rodata.", ".rodata"),
+        // Read-only after relocation: its own output section in the RELRO
+        // region, as in GNU ld's script (not writable `.data`).
+        (".data.rel.ro", ".data.rel.ro"),
+        (".data.", ".data"),
+        (".bss.", ".bss"),
+        (".tdata.", ".tdata"),
+        (".tbss.", ".tbss"),
+        // RISC-V specific: small data/bss sections.  GNU ld's script puts the
+        // small read-only constants first in `.sdata` (`input_rank`), all of
+        // them within reach of gp.
+        (".srodata.", ".sdata"),
+        (".sdata.", ".sdata"),
+        (".sbss.", ".sbss"),
+    ];
+
+    for (prefix, output) in &prefixes {
+        if name.starts_with(prefix) {
+            return Some(output.to_string());
+        }
+    }
+
+    if name == ".srodata" {
+        return Some(".sdata".to_string());
+    }
+
+    // Array sections: fold numbered variants (.init_array.65535 -> .init_array)
+    for arr in &[".init_array", ".fini_array", ".preinit_array"] {
+        if name == *arr || name.starts_with(&format!("{}.", arr)) {
+            return Some(arr.to_string());
+        }
+    }
+
+    Some(name.to_string())
+}
+
+// ── ELF writing helpers ──────────────────────────────────────────────────
+// Re-exported from linker_common for backward compatibility with link.rs imports.
+
+pub use crate::backend::linker_common::align_up_64 as align_up;
+pub use crate::backend::linker_common::pad_to;
+pub use crate::backend::linker_common::write_elf64_phdr as write_phdr;
+pub use crate::backend::linker_common::write_elf64_phdr_at as write_phdr_at;
+
+/// Build a proper `.gnu.hash` section for the given dynamic symbol names.
+///
+/// Returns `(hash_data, sorted_order)` where `sorted_order[i]` is the original
+/// index in `sym_names` for the i-th symbol in the reordered dynsym.
+/// The dynsym must be reordered according to `sorted_order` for the hash table
+/// to work correctly.
+///
+/// `sym_names` should NOT include the null symbol at index 0.
+pub fn build_gnu_hash(sym_names: &[String]) -> (Vec<u8>, Vec<usize>) {
+    let nsyms = sym_names.len();
+    if nsyms == 0 {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // nbuckets
+        data.extend_from_slice(&1u32.to_le_bytes()); // symoffset
+        data.extend_from_slice(&1u32.to_le_bytes()); // bloom_size
+        data.extend_from_slice(&6u32.to_le_bytes()); // bloom_shift
+        data.extend_from_slice(&0u64.to_le_bytes()); // bloom[0]
+        data.extend_from_slice(&0u32.to_le_bytes()); // bucket[0]
+        return (data, Vec::new());
+    }
+
+    // Compute hashes for all symbols
+    let hashes: Vec<u32> = sym_names
+        .iter()
+        .map(|n| crate::backend::linker_common::gnu_hash(n.as_bytes()))
+        .collect();
+
+    // Shared oracle-measured sizing (linker_common/hash.rs): bloom words =
+    // next_pow2(n/4), buckets = n/4 — the previous n/2-word bloom was 4x
+    // lld's table at no measurable FPR benefit, and its shift 6 probed a
+    // bit window overlapping the low hash bits.
+    let gnu_hp = crate::backend::linker_common::gnu_hash_params(nsyms, 64);
+    let nbuckets = gnu_hp.nbuckets;
+    let bloom_shift = gnu_hp.bloom_shift;
+    let bloom_size = gnu_hp.bloom_size;
+
+    // Sort symbols by bucket (hash % nbuckets), preserving relative order
+    let mut indices: Vec<usize> = (0..nsyms).collect();
+    indices.sort_by_key(|&i| hashes[i] % nbuckets);
+
+    // symoffset = 1 (first hashed symbol is at dynsym index 1, after null entry)
+    let symoffset = 1u32;
+
+    // Bloom filter (ELF64 words), built by the shared helper whose probe
+    // formulas match glibc dl-lookup.c verbatim.
+    let bloom = crate::backend::linker_common::build_gnu_bloom(&hashes, &gnu_hp, 64);
+
+    // Build buckets and hash chain.
+    // bucket[b] = first dynsym index in this bucket, or 0 if empty.
+    // chain[i] = hash value with low bit = 1 if last in chain.
+    let mut buckets: Vec<u32> = vec![0u32; nbuckets as usize];
+    let mut chain: Vec<u32> = vec![0u32; nsyms];
+
+    for (pos, &orig_idx) in indices.iter().enumerate() {
+        let h = hashes[orig_idx];
+        let bucket = (h % nbuckets) as usize;
+        let dynsym_idx = (pos as u32) + symoffset;
+        if buckets[bucket] == 0 {
+            buckets[bucket] = dynsym_idx;
+        }
+        // Store hash with low bit cleared (we set it for chain terminators below)
+        chain[pos] = h & !1;
+    }
+
+    // Set chain terminator bits: the last symbol in each bucket gets bit 0 set.
+    // Walk backwards through the sorted symbols. When the next symbol has a
+    // different bucket (or we're at the end), the current one is a chain end.
+    for pos in (0..nsyms).rev() {
+        let h = hashes[indices[pos]];
+        let bucket = h % nbuckets;
+        let is_last = if pos + 1 >= nsyms {
+            true
+        } else {
+            let next_bucket = hashes[indices[pos + 1]] % nbuckets;
+            next_bucket != bucket
+        };
+        if is_last {
+            chain[pos] |= 1;
+        }
+    }
+
+    // Serialize
+    let mut data = Vec::new();
+    data.extend_from_slice(&nbuckets.to_le_bytes());
+    data.extend_from_slice(&symoffset.to_le_bytes());
+    data.extend_from_slice(&bloom_size.to_le_bytes());
+    data.extend_from_slice(&bloom_shift.to_le_bytes());
+    for &word in &bloom {
+        data.extend_from_slice(&word.to_le_bytes());
+    }
+    for &b in &buckets {
+        data.extend_from_slice(&b.to_le_bytes());
+    }
+    for &c in &chain {
+        data.extend_from_slice(&c.to_le_bytes());
+    }
+
+    (data, indices)
+}
+
+/// Find a versioned soname for a library (e.g., "c" -> "libc.so.6").
+/// Returns None if only an unversioned .so is found.
+pub fn find_versioned_soname(dir: &str, libname: &str) -> Option<String> {
+    let pattern = format!("lib{}.so.", libname);
+    let mut best: Option<String> = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().into_owned();
+            if name_str.starts_with(&pattern)
+                && (best.is_none() || name_str.len() < best.as_ref().unwrap().len())
+            {
+                best = Some(name_str);
+            }
+        }
+    }
+    best
+}
+
+/// Resolve archive members: iteratively pull in members that define currently-undefined symbols.
+pub fn resolve_archive_members(
+    members: Vec<(String, ElfObject)>,
+    input_objs: &mut Vec<(String, ElfObject)>,
+    defined_syms: &mut crate::common::fx_hash::FxHashSet<String>,
+    undefined_syms: &mut crate::common::fx_hash::FxHashSet<String>,
+) {
+    let mut pool = members;
+    loop {
+        let mut added_any = false;
+        let mut remaining = Vec::new();
+        for (name, obj) in pool {
+            let needed = obj.symbols.iter().any(|sym| {
+                sym.shndx != SHN_UNDEF
+                    && sym.binding() != STB_LOCAL
+                    && !sym.name.is_empty()
+                    && undefined_syms.contains(sym.name.as_str())
+            });
+            if needed {
+                for sym in &obj.symbols {
+                    if sym.shndx != SHN_UNDEF && sym.binding() != STB_LOCAL && !sym.name.is_empty()
+                    {
+                        defined_syms.insert(sym.name.to_string());
+                        undefined_syms.remove(sym.name.as_str());
+                    }
+                }
+                for sym in &obj.symbols {
+                    // Non-weak only (`collect_initial_symbols`).
+                    if sym.shndx == SHN_UNDEF
+                        && !sym.name.is_empty()
+                        && !matches!(sym.binding(), STB_LOCAL | STB_WEAK)
+                        && !defined_syms.contains(sym.name.as_str())
+                    {
+                        undefined_syms.insert(sym.name.to_string());
+                    }
+                }
+                input_objs.push((name, obj));
+                added_any = true;
+            } else {
+                remaining.push((name, obj));
+            }
+        }
+        if !added_any || remaining.is_empty() {
+            break;
+        }
+        pool = remaining;
+    }
+}
+
+const EF_RISCV_RVC: u32 = 0x1;
+const EF_RISCV_FLOAT_ABI: u32 = 0x6;
+const EF_RISCV_RVE: u32 = 0x8;
+const EF_RISCV_TSO: u32 = 0x10;
+
+/// The output `e_flags` (GNU ld `_bfd_riscv_elf_merge_private_bfd_data`).
+/// Objects without code cannot conflict and are skipped; the first one with
+/// code sets the flags.  Float ABIs and RVE must agree across the rest; RVC
+/// and TSO accumulate.  No object with code: 0.
+pub fn merged_e_flags(input_objs: &[(String, ElfObject)]) -> Result<u32, String> {
+    fn float_abi(flags: u32) -> &'static str {
+        match flags & EF_RISCV_FLOAT_ABI {
+            0x0 => "soft-float",
+            0x2 => "single-float",
+            0x4 => "double-float",
+            _ => "quad-float",
+        }
+    }
+    let mut merged: Option<u32> = None;
+    for (name, obj) in input_objs {
+        let has_code = obj.sections.iter().any(|sec| {
+            sec.sh_type != SHT_NOBITS
+                && sec.flags & SHF_ALLOC != 0
+                && sec.flags & SHF_EXECINSTR != 0
+        });
+        if !has_code {
+            continue;
+        }
+        let new = obj.e_flags;
+        let Some(old) = merged else {
+            merged = Some(new);
+            continue;
+        };
+        if (old ^ new) & EF_RISCV_FLOAT_ABI != 0 {
+            return Err(format!(
+                "{name}: can't link {} modules with {} modules",
+                float_abi(new),
+                float_abi(old)
+            ));
+        }
+        if (old ^ new) & EF_RISCV_RVE != 0 {
+            return Err(format!("{name}: can't link RVE with other target"));
+        }
+        merged = Some(old | (new & (EF_RISCV_RVC | EF_RISCV_TSO)));
+    }
+    Ok(merged.unwrap_or(0))
+}
+
+/// Canonical output section ordering for layout.
+pub fn section_order(name: &str, flags: u64) -> u64 {
+    match name {
+        // First in the text segment (GNU ld's default script).
+        ".note.gnu.build-id" => 5,
+        ".text" => 100,
+        ".rodata" => 200,
+        ".eh_frame_hdr" => 250,
+        ".eh_frame" => 260,
+        ".preinit_array" => 500,
+        ".init_array" => 510,
+        ".fini_array" => 520,
+        ".data" => 600,
+        ".sdata" => 650,
+        ".bss" | ".sbss" => 700,
+        // Orphan notes: GNU ld places them after the last read-only section
+        // of the text segment (after `.eh_frame`/`.gcc_except_table`).
+        _ if name.starts_with(".note.") && flags & (SHF_WRITE | SHF_EXECINSTR) == 0 => 390,
+        _ if flags & SHF_EXECINSTR != 0 => 150,
+        _ if flags & SHF_WRITE == 0 => 300,
+        _ => 600,
+    }
+}
+
+#[cfg(test)]
+mod auipc_encoding_tests {
+    use super::super::displacement::checked_auipc_delta;
+    use super::patch_u_type;
+
+    #[test]
+    fn checked_displacements_round_trip_through_the_production_encoder() {
+        for high in [-524288_i64, -1, 0, 1, 524287] {
+            for low in -2048_i64..2048 {
+                let expected = high * 4096 + low;
+                let place = 1_u64 << 63;
+                let symbol = place.wrapping_add(expected as u64);
+                let delta = checked_auipc_delta(symbol, 0, place).unwrap();
+                let mut insn = 0x97_u32.to_le_bytes();
+                patch_u_type(&mut insn, 0, delta as u32);
+                let word = u32::from_le_bytes(insn);
+                assert_eq!(word & 0xfff, 0x97);
+                let decoded_high = i64::from((word & 0xfffff000) as i32);
+                let decoded_low = (delta << 52) >> 52;
+                assert_eq!(decoded_high + decoded_low, expected);
+            }
+        }
+    }
+}

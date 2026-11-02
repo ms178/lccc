@@ -1,0 +1,354 @@
+[
+  {
+    "id": "cg162",
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "lang": "c",
+      "compilerType": "",
+      "semver": "16.2",
+      "instructionSet": "amd64"
+    },
+    "flags": "-O2 -march=x86-64-v3 -DDATA_SIZE=4096 -DPASSES=2",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "6d5b5c2b"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 23,
+      "processExecutionResultTime": 0.017066000029444695,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 100,
+        "processExecutionResultTime": 0.003976999782025814,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerUYe9yi/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-march=x86-64-v3",
+          "-DDATA_SIZE=4096",
+          "-DPASSES=2",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/gcc-16.2.0/lib",
+          "/opt/compiler-explorer/gcc-16.2.0/lib32",
+          "/opt/compiler-explorer/gcc-16.2.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 41
+      }
+    },
+    "version_stdout": [
+      {
+        "text": "gcc (Compiler-Explorer-Build-gcc--binutils-2.44) 16.2.0"
+      },
+      {
+        "text": "Copyright (C) 2026 Free Software Foundation, Inc."
+      },
+      {
+        "text": "This is free software; see the source for copying conditions.  There is NO"
+      },
+      {
+        "text": "warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+      },
+      {
+        "text": ""
+      }
+    ]
+  },
+  {
+    "id": "cclang2310",
+    "metadata": {
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "lang": "c",
+      "compilerType": "clang",
+      "semver": "23.1.0",
+      "instructionSet": "amd64"
+    },
+    "flags": "-O2 -march=x86-64-v3 -DDATA_SIZE=4096 -DPASSES=2",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "6d5b5c2b"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 30,
+      "processExecutionResultTime": 0.02244899980723858,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 117,
+        "processExecutionResultTime": 0.004007999785244465,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerpOgbsc/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-15.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-march=x86-64-v3",
+          "-DDATA_SIZE=4096",
+          "-DPASSES=2",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-15.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/clang-23.1.0/lib",
+          "/opt/compiler-explorer/clang-23.1.0/lib32",
+          "/opt/compiler-explorer/clang-23.1.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 35
+      }
+    },
+    "version_stdout": [
+      {
+        "text": "clang version 23.1.0 (https://github.com/llvm/llvm-project.git ea7d852a70e8bdfaf601d6626a760f9771b2c4b4)"
+      },
+      {
+        "text": "Target: x86_64-unknown-linux-gnu"
+      },
+      {
+        "text": "Thread model: posix"
+      },
+      {
+        "text": "InstalledDir: /cefs/82/8233c2273e52509923159766_consolidated/compilers_c++_clang_23.1.0/bin"
+      }
+    ]
+  },
+  {
+    "id": "cicxlatest",
+    "metadata": {
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "lang": "c",
+      "compilerType": "clang-intel",
+      "semver": "(latest)",
+      "instructionSet": "amd64"
+    },
+    "flags": "-O2 -march=x86-64-v3 -DDATA_SIZE=4096 -DPASSES=2",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "6d5b5c2b"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 23,
+      "processExecutionResultTime": 0.029743000864982605,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 150,
+        "processExecutionResultTime": 0.0013200007379055023,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilereHEyzY/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+          "-fcolor-diagnostics",
+          "-fno-crash-diagnostics",
+          "-O2",
+          "-march=x86-64-v3",
+          "-DDATA_SIZE=4096",
+          "-DPASSES=2",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib64",
+          "-Wl,-rpath,/opt/compiler-explorer/gcc-13.2.0/lib32"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/lib",
+          "/opt/compiler-explorer/intel-cpp-2024.0.0.49524/tbb/latest/lib"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/compiler-explorer/intel-cpp-2024.0.0.49524/compiler/latest/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 53
+      }
+    },
+    "version_stdout": [
+      {
+        "text": "Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+      },
+      {
+        "text": "Target: x86_64-unknown-linux-gnu"
+      },
+      {
+        "text": "Thread model: posix"
+      },
+      {
+        "text": "InstalledDir: /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler"
+      },
+      {
+        "text": "Configuration file: /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler/../icx.cfg"
+      }
+    ]
+  },
+  {
+    "id": "cicc2021100",
+    "metadata": {
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "lang": "c",
+      "compilerType": "",
+      "semver": "2021.10.0",
+      "instructionSet": "amd64"
+    },
+    "flags": "-O2 -march=core-avx2 -DDATA_SIZE=4096 -DPASSES=2",
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "6d5b5c2b"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 34,
+      "processExecutionResultTime": 0.02301200106739998,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [
+          {
+            "text": "icc: remark #10441: The Intel(R) C++ Compiler Classic (ICC) is deprecated and will be removed from product release in the second half of 2023. The Intel(R) oneAPI DPC++/C++ Compiler (ICX) is the recommended compiler moving forward. Please transition to use this compiler. Use '-diag-disable=10441' to disable this message."
+          }
+        ],
+        "truncated": false,
+        "execTime": 421,
+        "processExecutionResultTime": 0.0409999992698431,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerqre1Sy/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-gxx-name=/opt/compiler-explorer/gcc-13.2.0/bin/g++",
+          "-O2",
+          "-march=core-avx2",
+          "-DDATA_SIZE=4096",
+          "-DPASSES=2",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/intel64_lin",
+          "-Wl,-rpath,/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/ia32_lin"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/intel64_lin",
+          "/opt/compiler-explorer/intel-cpp-2023.2.1.8/compiler/latest/linux/compiler/lib/ia32_lin"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 54
+      }
+    },
+    "version_stdout": [
+      {
+        "text": "icc (ICC) 2021.10.0 20230609"
+      },
+      {
+        "text": "Copyright (C) 1985-2023 Intel Corporation.  All rights reserved."
+      },
+      {
+        "text": ""
+      }
+    ]
+  }
+]

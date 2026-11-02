@@ -1,0 +1,2239 @@
+//! Macro definitions and expansion logic for the C preprocessor.
+//!
+//! Supports:
+//! - Object-like macros: `#define FOO value`
+//! - Function-like macros: `#define MAX(a,b) ((a)>(b)?(a):(b))`
+//! - Variadic macros: `#define LOG(fmt, ...) printf(fmt, __VA_ARGS__)`
+//! - Stringification: `#param`
+//! - Token pasting: `a ## b`
+//!
+//! Performance: All scanning operates on byte slices (`&[u8]`) to avoid
+//! the overhead of `Vec<char>` allocation. Since C preprocessor tokens are
+//! ASCII, this is safe and correct. UTF-8 multi-byte sequences in string/char
+//! literals are copied verbatim without interpretation.
+
+use std::cell::Cell;
+
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
+use super::utils::{
+    bytes_to_str, copy_literal_bytes_to_string, hash_token_len, is_digit_separator,
+    is_ident_cont_byte, is_ident_start_byte, less_punctuator_len, paste_token_len, ppnumber_end,
+    skip_literal_bytes,
+};
+
+/// Check if two adjacent bytes would form an unintended multi-character token
+/// when concatenated during macro expansion. Returns true if a separating space
+/// is needed to prevent accidental token pasting.
+fn would_paste_tokens(last: u8, first: u8) -> bool {
+    match (last, first) {
+        // -- or -=  or -> from separate sources
+        (b'-', b'-') | (b'-', b'=') | (b'-', b'>') => true,
+        // ++ or +=
+        (b'+', b'+') | (b'+', b'=') => true,
+        // << or <= or <:
+        (b'<', b'<') | (b'<', b'=') | (b'<', b':') | (b'<', b'%') => true,
+        // >> or >=
+        (b'>', b'>') | (b'>', b'=') => true,
+        // == or ending = followed by =
+        (b'=', b'=') => true,
+        // != &= |= *= /= ^= %=
+        (b'!', b'=')
+        | (b'&', b'=')
+        | (b'|', b'=')
+        | (b'*', b'=')
+        | (b'/', b'=')
+        | (b'^', b'=')
+        | (b'%', b'=') => true,
+        // && ||
+        (b'&', b'&') | (b'|', b'|') => true,
+        // Alternative bracket/brace/hash punctuators. `:%` is conservative:
+        // %: followed by %: would otherwise form the single %:%: token.
+        (b':', b'>') | (b'%', b'>') | (b'%', b':') | (b':', b'%') => true,
+        // ## (token paste)
+        (b'#', b'#') => true,
+        // / followed by * or / (comment start)
+        (b'/', b'*') | (b'/', b'/') => true,
+        // . followed by digit (e.g., prevent "1." + "5" pasting weirdly)
+        (b'.', b'0'..=b'9') | (b'0'..=b'9', b'.') => true,
+        // Identifier/number continuation: letter/digit/_ followed by letter/digit/_
+        (a, b) if is_ident_cont_byte(a) && is_ident_cont_byte(b) => true,
+        _ => false,
+    }
+}
+
+/// Represents a macro definition.
+#[derive(Debug, Clone)]
+pub struct MacroDef {
+    /// Name of the macro
+    pub name: String,
+    /// Whether this is a function-like macro
+    pub is_function_like: bool,
+    /// Parameters for function-like macros
+    pub params: Vec<String>,
+    /// Whether the macro is variadic (last param is ...)
+    pub is_variadic: bool,
+    /// Whether the variadic is a named parameter (e.g., `args...` vs `...`).
+    /// When true, the last entry in `params` is the variadic param name.
+    /// When false, variadic args are accessed via `__VA_ARGS__`.
+    pub has_named_variadic: bool,
+    /// The replacement body (as raw text)
+    pub body: String,
+}
+
+/// Marker byte used to "blue paint" tokens that were suppressed due to
+/// self-referential macro expansion (C11 §6.10.3.4).  Prefixed to
+/// identifiers during rescanning so they are never re-expanded, then
+/// stripped from the final output in `expand_line()`.
+const BLUE_PAINT_MARKER: u8 = 0x01;
+// A synthetic separator preserves preprocessing-token boundaries without
+// pretending the source contained whitespace. Rescanning sees a boundary;
+// stringification discards it; final token serialization renders a space.
+const TOKEN_BOUNDARY: u8 = 0x04;
+
+/// Sentinel markers used to protect text injected by `##` token-paste operations
+/// from further parameter substitution in `substitute_params`. The pasted result
+/// is wrapped in START..END so that `substitute_params` copies it verbatim.
+/// These markers are stripped by `substitute_params` itself and never reach
+/// `expand_line`, but `expand_line` strips them defensively as well.
+/// Uses 0x02/0x03 to avoid collision with BLUE_PAINT_MARKER (0x01).
+const PASTE_PROTECT_START: u8 = 0x02;
+const PASTE_PROTECT_END: u8 = 0x03;
+
+/// Strip all blue-paint markers from a string.
+/// Used when substituting arguments into ## token paste operations,
+/// since the pasted result is a new token that should be rescanned
+/// without inheriting blue paint from its operands.
+///
+/// Returns a `Cow<str>` to avoid allocation when no markers are present
+/// (the common case).
+fn strip_blue_paint(s: &str) -> std::borrow::Cow<'_, str> {
+    normalize_internal_markers(s, false)
+}
+
+/// Internal markers are metadata only OUTSIDE preprocessing literal tokens.
+/// Raw control bytes are legal literal payloads, including when a literal is
+/// stringified or pasted with a placemarker. Preserve those bytes and UTF-8.
+/// In final output, discard paint/paste markers and serialize token boundaries;
+/// during token paste, discard blue paint only. Allocate only for a real edit.
+fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'_, str> {
+    let is_marker = |b: u8| {
+        b == BLUE_PAINT_MARKER
+            || (final_output
+                && matches!(b, PASTE_PROTECT_START | PASTE_PROTECT_END | TOKEN_BOUNDARY))
+    };
+    // The four markers are 0x01..=0x04, so the "nothing to do" test is a range
+    // compare that vectorises, instead of a per-byte closure call. This runs for
+    // every expanded line of every translation unit (23.5k times on a 10k-line
+    // TU), and the answer is almost always "no markers".
+    let hit = if final_output {
+        s.as_bytes().iter().any(|&b| b.wrapping_sub(1) < 4)
+    } else {
+        s.as_bytes().iter().any(|&b| b == BLUE_PAINT_MARKER)
+    };
+    if !hit {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let bytes = s.as_bytes();
+    let mut result: Option<String> = None;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
+            i = skip_literal_bytes(bytes, i, bytes[i]);
+        } else if is_marker(bytes[i]) {
+            let out = result.get_or_insert_with(|| String::with_capacity(s.len()));
+            out.push_str(&s[start..i]);
+            if bytes[i] == TOKEN_BOUNDARY {
+                out.push(' ');
+            }
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    match result {
+        Some(mut out) => {
+            out.push_str(&s[start..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(s),
+    }
+}
+
+/// Stores all macro definitions and handles expansion.
+#[derive(Debug, Clone)]
+pub struct MacroTable {
+    macros: FxHashMap<String, MacroDef>,
+    /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
+    counter: Cell<usize>,
+    /// Per-line __LINE__ resolver: maps a byte offset within the line being
+    /// expanded to its physical source line. Set once per processed line by
+    /// set_line_resolver().
+    line_resolver: std::cell::RefCell<super::text_processing::LineResolver>,
+    /// Absolute offset of the line being expanded within the comment-stripped
+    /// text. Macro expansion sees byte offsets relative to the line buffer;
+    /// resolve_line() adds this base to translate them into the resolver's
+    /// absolute coordinate space.
+    line_offset_base: Cell<usize>,
+    /// #line override: (target_line, source_line_at_directive). The stored
+    /// base is 1-based (as passed by process_directive); see resolve_line().
+    line_override: Cell<Option<(usize, usize)>>,
+    /// __LINE__ value pinned while a macro body is being expanded: per C11
+    /// §6.10.8, __LINE__ inside a macro body expands to the line of the
+    /// INVOCATION, not of the body text.
+    line_pinned: Cell<Option<usize>>,
+    /// Whether an invocation is being expanded (its arguments or body); only
+    /// an outermost invocation consumed source line breaks that must be
+    /// re-emitted (see `restore_line_breaks`). Guarded by `InvocationGuard`
+    /// to ensure panic safety — see Intel SDM Vol.3 §6.5 exception handling:
+    /// leaked state after panic would corrupt subsequent macro expansions.
+    in_invocation: Cell<bool>,
+    /// Collects names of macros expanded during the current expand_line_reuse() call.
+    /// Used by the preprocessor to build macro expansion metadata for diagnostics
+    /// ("in expansion of macro 'X'" notes). Wrapped in RefCell because expansion
+    /// methods take &self.
+    expanded_macros: std::cell::RefCell<Vec<String>>,
+    /// Whether to track macro expansions (disabled by default for performance;
+    /// enabled by the preprocessor for the main expansion pass).
+    track_expansions: Cell<bool>,
+    /// Assembly preprocessing mode: when true, '$' is NOT treated as an identifier
+    /// character during macro expansion. In AT&T assembly syntax, '$' is the
+    /// immediate operand prefix (e.g., `$UNIX64_RET_LAST`), not part of the
+    /// identifier. Without this, `$FOO` is tokenized as one identifier and the
+    /// macro `FOO` is never expanded.
+    pub(super) asm_mode: bool,
+    /// `_Pragma("...")` operators encountered during macro expansion (C99
+    /// §6.10.9). The de-escaped string contents are queued here TOGETHER
+    /// WITH the 1-based source line of the operator (resolved at enqueue
+    /// time through the current line resolver); the preprocessor pipeline
+    /// drains them and executes each as if a `#pragma <content>` directive
+    /// had appeared at that point, with diagnostics attributed to that
+    /// line (corpus pins exact lines for `#pragma GCC dependency`
+    /// reached via `_Pragma`).
+    pending_pragmas: std::cell::RefCell<Vec<(String, usize)>>,
+}
+
+impl MacroTable {
+    pub fn new() -> Self {
+        Self {
+            macros: FxHashMap::default(),
+            counter: Cell::new(0),
+            line_resolver: std::cell::RefCell::new(super::text_processing::LineResolver::Flat(1)),
+            line_offset_base: Cell::new(0),
+            line_override: Cell::new(None),
+            line_pinned: Cell::new(None),
+            in_invocation: Cell::new(false),
+            expanded_macros: std::cell::RefCell::new(Vec::new()),
+            track_expansions: Cell::new(false),
+            asm_mode: false,
+            pending_pragmas: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Take the `_Pragma` string contents queued by the last expansion,
+    /// each paired with the 1-based source line of its operator.
+    pub fn take_pending_pragmas(&self) -> Vec<(String, usize)> {
+        std::mem::take(&mut *self.pending_pragmas.borrow_mut())
+    }
+
+    /// Define a new macro.
+    pub fn define(&mut self, def: MacroDef) {
+        self.macros.insert(def.name.clone(), def);
+    }
+
+    /// Undefine a macro.
+    pub fn undefine(&mut self, name: &str) {
+        self.macros.remove(name);
+    }
+
+    /// Check if a macro is defined.
+    pub fn is_defined(&self, name: &str) -> bool {
+        name == "__COUNTER__" || name == "__LINE__" || self.macros.contains_key(name)
+            // These are special preprocessor operators, not real macros.
+            // They need to be recognized by #ifdef but are evaluated as
+            // special functions in #if expressions by resolve_defined_in_expr().
+            || name == "__has_builtin"
+            || name == "__has_attribute"
+            || name == "__has_c_attribute"
+            || name == "__has_feature"
+            || name == "__has_extension"
+            || name == "__has_include"
+            || name == "__has_include_next"
+            || name == "__has_embed"
+            || name == "__has_warning"
+    }
+
+    /// Iterate over all macro definitions.
+    /// Used by -dM (dump defines) to enumerate all predefined and user-defined macros.
+    pub fn iter(&self) -> impl Iterator<Item = &MacroDef> {
+        self.macros.values()
+    }
+
+    /// Get a macro definition.
+    pub fn get(&self, name: &str) -> Option<&MacroDef> {
+        self.macros.get(name)
+    }
+
+    /// Set the line resolver for the line about to be expanded.
+    ///
+    /// `resolver` maps byte offsets within the line to 0-based physical
+    /// source lines (multi-line comment tails and spliced continuations put
+    /// several physical lines' bytes into one output line). `override_` is
+    /// the active `#line` directive state.
+    pub(super) fn set_line_resolver(
+        &self,
+        resolver: super::text_processing::LineResolver,
+        override_: Option<(usize, usize)>,
+        offset_base: usize,
+    ) {
+        *self.line_resolver.borrow_mut() = resolver;
+        self.line_override.set(override_);
+        self.line_offset_base.set(offset_base);
+    }
+
+    /// Physical source line (0-based) of the byte at `offset` within the
+    /// current line, with the `#line` override applied.
+    #[inline]
+    fn resolve_line(&self, offset: usize) -> usize {
+        let phys = self
+            .line_resolver
+            .borrow()
+            .line_at(self.line_offset_base.get() + offset);
+        match self.line_override.get() {
+            // The stored base is 1-based (process_directive convention); the
+            // line right after `#line N` must be N.
+            Some((target, base)) => target + phys.saturating_sub(base),
+            None => phys + 1,
+        }
+    }
+
+    /// Set the __FILE__ macro body without allocating a full MacroDef.
+    /// If __FILE__ already exists in the table, only its body is updated.
+    /// Otherwise, a new entry is created.
+    /// This avoids 2 full MacroDef allocations per #include directive.
+    pub fn set_file(&mut self, body: String) {
+        if let Some(existing) = self.macros.get_mut("__FILE__") {
+            existing.body = body;
+        } else {
+            self.macros.insert(
+                "__FILE__".to_string(),
+                MacroDef {
+                    name: "__FILE__".to_string(),
+                    is_function_like: false,
+                    params: Vec::new(),
+                    is_variadic: false,
+                    has_named_variadic: false,
+                    body,
+                },
+            );
+        }
+    }
+
+    /// Get the current __FILE__ macro body.
+    /// Returns None if __FILE__ is not defined.
+    pub fn get_file_body(&self) -> Option<&str> {
+        self.macros.get("__FILE__").map(|m| m.body.as_str())
+    }
+
+    /// Enable or disable macro expansion tracking.
+    /// When enabled, expand_line_reuse() records which macros were expanded,
+    /// retrievable via take_expanded_macros().
+    pub fn set_track_expansions(&self, enabled: bool) {
+        self.track_expansions.set(enabled);
+    }
+
+    /// Take the list of macro names expanded during the last expand_line_reuse() call.
+    /// Returns an empty Vec if tracking is disabled or no macros were expanded.
+    pub fn take_expanded_macros(&self) -> Vec<String> {
+        std::mem::take(&mut *self.expanded_macros.borrow_mut())
+    }
+
+    /// Expand macros in a line of text.
+    /// Returns the expanded text.
+    pub fn expand_line(&self, line: &str) -> String {
+        let mut expanding = FxHashSet::default();
+        self.expand_line_reuse(line, &mut expanding)
+    }
+
+    /// Expand macros in a line of text, reusing the provided `expanding` set.
+    /// The set is cleared before use. This avoids allocating a new FxHashSet
+    /// for every line (the previous per-line allocation was a measurable
+    /// overhead when preprocessing kernel headers with thousands of lines).
+    pub fn expand_line_reuse(&self, line: &str, expanding: &mut FxHashSet<String>) -> String {
+        expanding.clear();
+        if self.track_expansions.get() {
+            self.expanded_macros.borrow_mut().clear();
+        }
+        let result = self.expand_text(line, expanding);
+        let result = match normalize_internal_markers(&result, true) {
+            std::borrow::Cow::Borrowed(_) => result,
+            std::borrow::Cow::Owned(cleaned) => cleaned,
+        };
+        self.rescan_pragma_operators(result, expanding)
+    }
+
+    /// C99 §6.10.9 corner case: a `_Pragma` operator can come into existence
+    /// only THROUGH expansion — `#define DO_PRAGMA _Pragma` followed by
+    /// `DO_PRAGMA ("GCC dependency \"x\"")`. The first-pass handler saw the
+    /// body `_Pragma` without its argument (the parens live in the outer
+    /// text) and had to leave it alone. After the full line is expanded the
+    /// operator and its argument sit adjacent, so rescan for `_Pragma`
+    /// identifiers and run them through the same handler, which queues the
+    /// pragma for the pipeline and removes the operator from the stream.
+    /// Other macros are NOT re-expanded here: a second `expand_text` pass
+    /// would resurrect blue-painted self-references.
+    fn rescan_pragma_operators(&self, text: String, expanding: &mut FxHashSet<String>) -> String {
+        if !text.contains("_Pragma") {
+            return text;
+        }
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        while i < len {
+            let c = bytes[i];
+            if c == b'"' || (c == b'\'' && !is_digit_separator(bytes, i)) {
+                // Copy string/char literals verbatim: `_Pragma` inside a
+                // literal is ordinary text.
+                let quote = c;
+                let start = i;
+                i += 1;
+                while i < len && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                out.push_str(&text[start..i]);
+                continue;
+            }
+            if is_ident_start_byte(c) {
+                let start = i;
+                i += 1;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let ident = bytes_to_str(bytes, start, i);
+                if ident == "_Pragma" {
+                    i = self.handle_pragma_operator(bytes, i, ident, &mut out, expanding);
+                } else {
+                    out.push_str(ident);
+                }
+                continue;
+            }
+            out.push(c as char);
+            i += 1;
+        }
+        out
+    }
+
+    /// Append `expanded` text to `result`, inserting token boundaries to prevent
+    /// accidental token pasting between the end of `result` and the start/end
+    /// of `expanded`, and between the end of `expanded` and `next_byte` (the
+    /// next byte in the source after the expansion site).
+    fn append_with_paste_guard(result: &mut String, expanded: &str, next_byte: Option<u8>) {
+        if expanded.is_empty() {
+            return;
+        }
+        // Leading edge: prevent pasting between result's last byte and expansion's first byte
+        if !result.is_empty() {
+            let last = result.as_bytes()[result.len() - 1];
+            let first = expanded.as_bytes()[0];
+            if would_paste_tokens(last, first)
+                || (is_ident_cont_byte(last) && is_ident_cont_byte(first))
+            {
+                result.push(TOKEN_BOUNDARY as char);
+            }
+        }
+        result.push_str(expanded);
+        // Trailing edge: prevent pasting between expansion's last byte and next source byte
+        if let Some(next) = next_byte {
+            let last_expanded = expanded.as_bytes()[expanded.len() - 1];
+            if would_paste_tokens(last_expanded, next) {
+                result.push(TOKEN_BOUNDARY as char);
+            }
+        }
+    }
+
+    /// After expanding a function-like macro, check if the result ends with a
+    /// function-like macro name and the remaining source starts with '('.
+    /// If so, expand the trailing macro call, consuming the arguments from the source.
+    /// Returns the updated `expanded` text and new source position.
+    fn expand_trailing_func_macros(
+        &self,
+        mut expanded: String,
+        bytes: &[u8],
+        mut i: usize,
+        source_level: bool,
+        expanding: &mut FxHashSet<String>,
+    ) -> (String, usize) {
+        let len = bytes.len();
+        loop {
+            let trailing = extract_trailing_ident(&expanded);
+            if let Some(ref trail_ident) = trailing {
+                if !expanding.contains(trail_ident.as_str()) {
+                    if let Some(trail_mac) = self.macros.get(trail_ident.as_str()) {
+                        if trail_mac.is_function_like {
+                            let mut k = i;
+                            while k < len && bytes[k].is_ascii_whitespace() {
+                                k += 1;
+                            }
+                            if k < len && bytes[k] == b'(' {
+                                let (trail_args, trail_starts, trail_end) =
+                                    self.parse_macro_args(bytes, k);
+                                i = trail_end;
+                                let trail_mac_clone = trail_mac.clone();
+                                let trimmed_len = expanded.trim_end().len();
+                                let prefix_len = trimmed_len - trail_ident.len();
+                                expanded.truncate(prefix_len);
+                                let (trail_expanded, _) = self.expand_function_macro(
+                                    &trail_mac_clone,
+                                    &trail_args,
+                                    source_level.then_some(&trail_starts[..]),
+                                    expanding,
+                                );
+                                expanded.push_str(&trail_expanded);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        (expanded, i)
+    }
+
+    /// After expanding an object-like macro, check if the result is a function-like
+    /// macro name and the remaining source starts with '('. If so, expand the
+    /// function-like macro call, consuming the arguments from the source.
+    /// Returns Some((expanded_text, new_pos)) if resolution succeeded, or None.
+    fn try_resolve_objlike_to_funclike(
+        &self,
+        expanded: &str,
+        bytes: &[u8],
+        i: usize,
+        source_level: bool,
+        expanding: &mut FxHashSet<String>,
+    ) -> Option<(String, usize)> {
+        let len = bytes.len();
+        let expanded_trimmed = expanded.trim();
+        if expanded_trimmed.is_empty() {
+            return None;
+        }
+        let et_bytes = expanded_trimmed.as_bytes();
+        if !is_ident_start_byte(et_bytes[0])
+            || !et_bytes.iter().all(|&b| is_ident_cont_byte(b))
+            || expanding.contains(expanded_trimmed)
+        {
+            return None;
+        }
+        let target_mac = self.macros.get(expanded_trimmed)?;
+        if !target_mac.is_function_like {
+            return None;
+        }
+        let mut j = i;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= len || bytes[j] != b'(' {
+            return None;
+        }
+        let (args, starts, end_pos) = self.parse_macro_args(bytes, j);
+        let target_mac_clone = target_mac.clone();
+        let (func_expanded, _) = self.expand_function_macro(
+            &target_mac_clone,
+            &args,
+            source_level.then_some(&starts[..]),
+            expanding,
+        );
+        Some((func_expanded, end_pos))
+    }
+
+    /// Recursively expand macros in text, tracking which macros are
+    /// currently being expanded to prevent infinite recursion.
+    ///
+    /// Operates on bytes for performance: avoids allocating Vec<char>.
+    fn expand_text(&self, text: &str, expanding: &mut FxHashSet<String>) -> String {
+        let mut result = String::with_capacity(text.len());
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            let b = bytes[i];
+
+            if b == b'"' || (b == b'\'' && !is_digit_separator(bytes, i)) {
+                i = copy_literal_bytes_to_string(bytes, i, b, &mut result);
+            } else if b == BLUE_PAINT_MARKER {
+                i = Self::copy_blue_painted(bytes, i, &mut result);
+            } else if is_ident_start_byte(b) && !(self.asm_mode && b == b'$') {
+                // `defined X` / `defined(X)` operands must not be macro-expanded
+                // (C11 6.10.1p1). This matters when a macro BODY contains
+                // `defined X` (e.g. glibc's ISA_SHOULD_BUILD): expanding the
+                // operand here would turn `defined FOO` into `defined 1` and
+                // the #if evaluator could no longer resolve it.
+                if bytes[i..].starts_with(b"defined")
+                    && (i + 7 >= len || !is_ident_cont_byte(bytes[i + 7]))
+                {
+                    let mut j = i + 7;
+                    while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        j += 1;
+                    }
+                    let has_paren = j < len && bytes[j] == b'(';
+                    if has_paren {
+                        j += 1;
+                        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                            j += 1;
+                        }
+                    }
+                    let name_start = j;
+                    while j < len && is_ident_cont_byte(bytes[j]) {
+                        j += 1;
+                    }
+                    if name_start == j {
+                        // Not a valid defined-operand; fall back to normal expansion.
+                        i = self.expand_identifier(text, bytes, i, &mut result, expanding);
+                        continue;
+                    }
+                    result.push_str(&text[i..j]); // "defined X" or "defined (X"
+                    i = j;
+                    if has_paren {
+                        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                            i += 1;
+                        }
+                        if i < len && bytes[i] == b')' {
+                            result.push(')');
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                i = self.expand_identifier(text, bytes, i, &mut result, expanding);
+            } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                i = Self::copy_block_comment(bytes, i, &mut result);
+            } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+                i = Self::copy_line_comment(bytes, i, &mut result);
+            } else if b.is_ascii_digit()
+                || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit())
+            {
+                i = Self::copy_ppnumber(bytes, i, &mut result);
+            } else if b < 0x80 {
+                // Batch consecutive non-special ASCII bytes into a single push_str.
+                // This avoids per-byte push overhead for sequences of operators,
+                // whitespace, punctuation etc.
+                let start = i;
+                i += 1;
+                while i < len {
+                    let c = bytes[i];
+                    if c == b'"'
+                        || c == b'\''
+                        || c == BLUE_PAINT_MARKER
+                        || (is_ident_start_byte(c) && !(self.asm_mode && c == b'$'))
+                        || (c == b'/'
+                            && i + 1 < len
+                            && (bytes[i + 1] == b'*' || bytes[i + 1] == b'/'))
+                        || c.is_ascii_digit()
+                        || (c == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit())
+                        || c >= 0x80
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                let slice = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+                result.push_str(slice);
+            } else {
+                let ch = text[i..].chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+
+        result
+    }
+
+    /// Copy a blue-painted identifier verbatim (never re-expanded).
+    /// Uses batch slice copy for the identifier bytes after the marker.
+    fn copy_blue_painted(bytes: &[u8], i: usize, result: &mut String) -> usize {
+        result.push(BLUE_PAINT_MARKER as char);
+        let start = i + 1;
+        let mut j = start;
+        while j < bytes.len() && is_ident_cont_byte(bytes[j]) {
+            j += 1;
+        }
+        let slice = std::str::from_utf8(&bytes[start..j]).unwrap_or("");
+        result.push_str(slice);
+        j
+    }
+
+    /// Process an identifier: expand macros, handle builtins, or copy verbatim.
+    fn expand_identifier(
+        &self,
+        text: &str,
+        bytes: &[u8],
+        start: usize,
+        result: &mut String,
+        expanding: &mut FxHashSet<String>,
+    ) -> usize {
+        let len = bytes.len();
+        let mut i = start + 1;
+        while i < len && is_ident_cont_byte(bytes[i]) {
+            i += 1;
+        }
+        let ident = bytes_to_str(bytes, start, i);
+
+        // Token membership belongs to the input, not the already-expanded
+        // prefix: MAJOR.MINOR must not become the single token 1.MINOR.
+        if Self::is_ppnumber_suffix(&bytes[..start], ident) {
+            result.push_str(ident);
+            return i;
+        }
+
+        // Handle _Pragma("string") operator (C99 §6.10.9): queue the
+        // de-escaped string content as a pragma for the pipeline to execute
+        // (`_Pragma("foo")` is equivalent to `#pragma foo`).
+        if ident == "_Pragma" {
+            return self.handle_pragma_operator(bytes, i, ident, result, expanding);
+        }
+
+        // Handle __COUNTER__ built-in
+        if ident == "__COUNTER__" {
+            let val = self.counter.get();
+            self.counter.set(val + 1);
+            let mut buf = itoa::Buffer::new();
+            result.push_str(buf.format(val));
+            return i;
+        }
+
+        // Handle __LINE__ built-in: inside a macro expansion the value is
+        // pinned to the invocation line; at top level it is the physical
+        // line of this very token (per-offset resolution).
+        if ident == "__LINE__" {
+            let val = match self.line_pinned.get() {
+                Some(v) => v,
+                None => self.resolve_line(start),
+            };
+            let mut buf = itoa::Buffer::new();
+            result.push_str(buf.format(val));
+            return i;
+        }
+
+        // GCC's source-location builtins, `__builtin_LINE()`,
+        // `__builtin_FILE()` and `__builtin_FUNCTION()`: the line (pinned to
+        // the invocation inside a macro, like `__LINE__`), the presumed file
+        // name (`#line` applies, like `__FILE__`) and the enclosing
+        // function's name (`""` at file scope), as an `int` constant and two
+        // `const char *` (GCC 16.2: `static int a[__builtin_LINE()];` is
+        // valid, `sizeof __builtin_FILE()` is a pointer's size).
+        if matches!(
+            ident,
+            "__builtin_LINE" | "__builtin_FILE" | "__builtin_FUNCTION"
+        ) && !self.macros.contains_key(ident)
+        {
+            if let Some(after) = empty_call_parens(bytes, i) {
+                match ident {
+                    "__builtin_LINE" => {
+                        let val = match self.line_pinned.get() {
+                            Some(v) => v,
+                            None => self.resolve_line(start),
+                        };
+                        let mut buf = itoa::Buffer::new();
+                        result.push_str(buf.format(val));
+                    }
+                    "__builtin_FILE" => {
+                        result.push_str("((const char *)");
+                        match self.macros.get("__FILE__") {
+                            Some(file) => result.push_str(&file.body),
+                            None => result.push_str("\"\""),
+                        }
+                        result.push(')');
+                    }
+                    _ => result.push_str("((const char *)__FUNCTION__)"),
+                }
+                return after;
+            }
+        }
+
+        // C11 string/char encoding prefixes: u8, u, U, L.
+        // When an identifier matches one of these and is immediately followed by
+        // a quote ('"' or '\''), it's a string/char literal prefix, not a macro name.
+        // The preprocessor must not expand it; let the lexer handle it as a token.
+        if i < len
+            && (bytes[i] == b'"' || bytes[i] == b'\'')
+            && matches!(ident, "u8" | "u" | "U" | "L")
+        {
+            result.push_str(ident);
+            return i;
+        }
+
+        // Try macro expansion
+        if !expanding.contains(ident) {
+            if let Some(mac) = self.macros.get(ident) {
+                return self.expand_macro_invocation(text, bytes, i, ident, mac, result, expanding);
+            }
+        }
+
+        // Not a macro, or already expanding (blue-painted).
+        if expanding.contains(ident) {
+            result.push(BLUE_PAINT_MARKER as char);
+        }
+        result.push_str(ident);
+        i
+    }
+
+    /// Check if an identifier is a pp-number suffix (e.g., the "I" in "1.I").
+    fn is_ppnumber_suffix(result_bytes: &[u8], _ident: &str) -> bool {
+        let rlen = result_bytes.len();
+        if rlen == 0 {
+            return false;
+        }
+        let prev = result_bytes[rlen - 1];
+        if prev.is_ascii_digit() {
+            true
+        } else if prev == b'.' && rlen >= 2 && result_bytes[rlen - 2].is_ascii_digit() {
+            is_ppnumber_context(result_bytes, rlen - 2)
+        } else if (prev == b'+' || prev == b'-')
+            && rlen >= 3
+            && matches!(result_bytes[rlen - 2], b'e' | b'E' | b'p' | b'P')
+        {
+            is_ppnumber_context(result_bytes, rlen - 3)
+        } else {
+            false
+        }
+    }
+
+    /// Handle a `_Pragma("...")` operator: queue the de-escaped string
+    /// literal content as a pending pragma (C99 §6.10.9.1 — `\\"` becomes
+    /// `"`, `\\\\` becomes `\\`), removing the operator from the token
+    /// stream. Returns the index just past the closing `)`. On any parse
+    /// failure the operator text is preserved verbatim for a downstream
+    /// diagnostic.
+    ///
+    /// Per C11 §6.10.9 the argument undergoes FULL MACRO REPLACEMENT first
+    /// and the result must be a string literal. The kernel's __diag macros
+    /// depend on this: `__diag(s)` is `_Pragma(__diag_str(GCC diagnostic
+    /// s))` where __diag_str stringizes — so the operator is routinely fed
+    /// an unexpanded macro invocation that only becomes a string after
+    /// expansion. Requiring a pre-formed string literal (as this handler
+    /// previously did) left the whole `_Pragma(...)` text in the token
+    /// stream, which the parser then rejected ("expected ')' before string
+    /// literal", mm/slab_common.c via __bpf_kfunc_start_defs).
+    fn handle_pragma_operator(
+        &self,
+        bytes: &[u8],
+        i: usize,
+        ident: &str,
+        result: &mut String,
+        expanding: &mut FxHashSet<String>,
+    ) -> usize {
+        let len = bytes.len();
+        let mut j = i;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= len || bytes[j] != b'(' {
+            result.push_str(ident);
+            return i;
+        }
+        // Scan the balanced parenthesized argument, respecting nested
+        // parentheses and string literals.
+        let mut depth = 0usize;
+        let mut k = j;
+        let mut in_string = false;
+        let mut escaped = false;
+        while k < len {
+            let b = bytes[k];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            k += 1;
+        }
+        if k >= len || bytes[k] != b')' {
+            result.push_str(ident);
+            return i;
+        }
+        let arg_text = std::str::from_utf8(&bytes[j + 1..k]).unwrap_or("");
+        // C11 §6.10.9: macro-replace the argument, then require a string.
+        let expanded = self.expand_text(arg_text, expanding);
+        let et = expanded.trim();
+        // Optional encoding prefix (L, u, U, u8) before the string literal.
+        let mut p = 0;
+        while p < et.len() && (et.as_bytes()[p].is_ascii_alphabetic() || et.as_bytes()[p] == b'8') {
+            p += 1;
+        }
+        let et = et[p..].trim_start();
+        if !et.starts_with('"') {
+            // Not a string literal after expansion: preserve the operator
+            // verbatim for a downstream diagnostic.
+            result.push_str(ident);
+            result.push('(');
+            result.push_str(arg_text);
+            result.push(')');
+            return k + 1;
+        }
+        let mut content = String::new();
+        let mut q = 1;
+        let eb = et.as_bytes();
+        let mut closed = false;
+        while q < eb.len() {
+            match eb[q] {
+                b'\\' if q + 1 < eb.len() => {
+                    // De-stringize: only quote and backslash escapes alter the
+                    // pragma text; unknown escapes keep the character as-is.
+                    match eb[q + 1] {
+                        b'"' => content.push('"'),
+                        b'\\' => content.push('\\'),
+                        c => {
+                            content.push('\\');
+                            content.push(c as char);
+                        }
+                    }
+                    q += 2;
+                }
+                b'"' => {
+                    closed = true;
+                    break;
+                }
+                c => {
+                    // Preserve bytes verbatim (pragma text may be non-ASCII in
+                    // the source encoding).
+                    content.push(c as char);
+                    q += 1;
+                }
+            }
+        }
+        if !closed {
+            result.push_str(ident);
+            return i;
+        }
+        // Resolve the operator's own source line through the current
+        // line resolver so diagnostics emitted while the pipeline executes
+        // this queued pragma point at the `_Pragma` site, not line 0.
+        let op_start = i.saturating_sub(ident.len());
+        let line = self.resolve_line(op_start);
+        self.pending_pragmas.borrow_mut().push((content, line));
+        k + 1
+    }
+
+    /// Expand a macro invocation (function-like or object-like).
+    fn expand_macro_invocation(
+        &self,
+        _text: &str,
+        bytes: &[u8],
+        i: usize,
+        ident: &str,
+        mac: &MacroDef,
+        result: &mut String,
+        expanding: &mut FxHashSet<String>,
+    ) -> usize {
+        // Record this macro expansion for diagnostic tracing
+        if self.track_expansions.get() {
+            self.expanded_macros.borrow_mut().push(ident.to_string());
+        }
+        let len = bytes.len();
+        if mac.is_function_like {
+            let mut j = i;
+            while j < len && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < len && bytes[j] == b'(' {
+                // Pin __LINE__ to the invocation site for the whole expansion
+                // (body AND argument prescan): C11 §6.10.8 requires __LINE__
+                // in a macro body to expand to the line of the invocation.
+                // Body/argument offsets are not source-line offsets, so the
+                // per-offset resolver must not be consulted inside.
+                // Source-level text (no __LINE__ pinned yet): the arguments
+                // are source tokens too, so they are prescanned at their own
+                // positions (`expand_function_macro`).
+                let ident_start = i.saturating_sub(ident.len());
+                let prev_pinned = self.line_pinned.get();
+                let source_level = prev_pinned.is_none();
+                if source_level {
+                    self.line_pinned.set(Some(self.resolve_line(ident_start)));
+                }
+                // Use RAII guard for panic safety: Intel SDM Vol.3 §6.5 requires
+                // exception-safe state cleanup. Without this, a panic in
+                // expand_function_macro (e.g., OOM in FxHashSet) would leak
+                // in_invocation=true, corrupting all subsequent macro expansions
+                // in this MacroTable instance. Casey Muratori: "correctness
+                // under panic is not optional — it's the baseline."
+                struct InvocationGuard<'a>(&'a Cell<bool>, bool);
+                impl Drop for InvocationGuard<'_> {
+                    fn drop(&mut self) {
+                        if self.1 {
+                            self.0.set(false);
+                        }
+                    }
+                }
+                let outermost = !self.in_invocation.replace(true);
+                let _guard = InvocationGuard(&self.in_invocation, outermost);
+                let (args, starts, end_pos) = self.parse_macro_args(bytes, j);
+                let mut i = end_pos;
+                let (expanded, body_ended_with_func_ident) = self.expand_function_macro(
+                    mac,
+                    &args,
+                    source_level.then_some(&starts[..]),
+                    expanding,
+                );
+                // Per C11 §6.10.3.4, only connect trailing function-like macro
+                // identifiers with subsequent source `(` if the substituted body
+                // (before rescan) truly ended with that identifier. If the body
+                // had tokens after the identifier (e.g., `FOO EMPTY()` from deferred
+                // expansion patterns like `#define DEFER(x) x EMPTY()`), those tokens
+                // act as a barrier during left-to-right scanning, preventing FOO from
+                // connecting with `(` in the source.
+                let (expanded, new_i) = if body_ended_with_func_ident {
+                    self.expand_trailing_func_macros(expanded, bytes, i, source_level, expanding)
+                } else {
+                    (expanded, i)
+                };
+                i = new_i;
+                let next = if i < len { Some(bytes[i]) } else { None };
+                let appended_from = result.len();
+                Self::append_with_paste_guard(result, &expanded, next);
+                if outermost {
+                    Self::restore_line_breaks(bytes, ident_start..i, result, appended_from);
+                }
+                self.line_pinned.set(prev_pinned);
+                return i;
+            }
+            result.push_str(ident);
+            return i;
+        }
+
+        // Object-like macro
+        expanding.insert(ident.to_string());
+        // Pin __LINE__ to the invocation site (see function-like path above).
+        let ident_start = i.saturating_sub(ident.len());
+        let prev_pinned = self.line_pinned.get();
+        let source_level = prev_pinned.is_none();
+        if source_level {
+            self.line_pinned.set(Some(self.resolve_line(ident_start)));
+        }
+        // RAII guard for panic safety — see above (Intel SDM Vol.3 §6.5).
+        struct Guard2<'a>(&'a Cell<bool>, bool);
+        impl Drop for Guard2<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.set(false);
+                }
+            }
+        }
+        let outermost = !self.in_invocation.replace(true);
+        let _guard = Guard2(&self.in_invocation, outermost);
+        let expanded = self.expand_text(&mac.body, expanding);
+        expanding.remove(ident);
+
+        if let Some((func_expanded, end_pos)) =
+            self.try_resolve_objlike_to_funclike(&expanded, bytes, i, source_level, expanding)
+        {
+            let appended_from = result.len();
+            result.push_str(&func_expanded);
+            if outermost {
+                Self::restore_line_breaks(bytes, ident_start..end_pos, result, appended_from);
+            }
+            self.line_pinned.set(prev_pinned);
+            return end_pos;
+        }
+
+        // After expanding an object-like macro, the result may end with a function-like
+        // macro name (e.g. `#define i_cmp -c_default_cmp` expands to `-c_default_cmp`).
+        // If the remaining source starts with `(`, we need to chain into function-like
+        // expansion for the trailing identifier.
+        let (expanded, i) =
+            self.expand_trailing_func_macros(expanded, bytes, i, source_level, expanding);
+
+        let next = if i < len { Some(bytes[i]) } else { None };
+        let appended_from = result.len();
+        Self::append_with_paste_guard(result, &expanded, next);
+        if outermost {
+            Self::restore_line_breaks(bytes, ident_start..i, result, appended_from);
+        }
+        self.line_pinned.set(prev_pinned);
+        i
+    }
+
+    /// Expand `text`, the source slice at offset `start` of the text being
+    /// expanded, with offsets resolved at its own position and `__LINE__`
+    /// unpinned.
+    fn expand_source_slice(
+        &self,
+        text: &str,
+        start: usize,
+        expanding: &mut FxHashSet<String>,
+    ) -> String {
+        let base = self.line_offset_base.get();
+        let pinned = self.line_pinned.replace(None);
+        self.line_offset_base.set(base + start);
+        let expanded = self.expand_text(text, expanding);
+        self.line_offset_base.set(base);
+        self.line_pinned.set(pinned);
+        expanded
+    }
+
+    /// After the expansion (`result[appended_from..]`) of an outermost
+    /// invocation whose source `bytes[consumed]` spans lines (arguments, or
+    /// a `(` on a later line), move those line breaks after it: line breaks
+    /// that survived inside the expansion (from arguments) become spaces --
+    /// every expansion token belongs to the expansion point -- and all the
+    /// consumed ones follow, plus spaces up to the column of the byte after
+    /// the invocation. The tokens after it then keep their physical line and
+    /// column (where diagnostics and line tables point) and the pipeline
+    /// counts the lines exactly once. Multi-line text only reaches the
+    /// expander from accumulated ordinary lines, never from a directive, so
+    /// line breaks are plain white space (and never inside a literal).
+    /// Nested invocations (argument prescan, rescanning) must not do this:
+    /// the outermost one accounts for every line break of its source.
+    fn restore_line_breaks(
+        bytes: &[u8],
+        consumed: std::ops::Range<usize>,
+        result: &mut String,
+        appended_from: usize,
+    ) {
+        let end = consumed.end;
+        let consumed = &bytes[consumed.start..end];
+        let breaks = consumed.iter().filter(|&&b| b == b'\n').count();
+        if breaks == 0 {
+            return;
+        }
+        if result.as_bytes()[appended_from..].contains(&b'\n') {
+            let flat = result[appended_from..].replace('\n', " ");
+            result.truncate(appended_from);
+            result.push_str(&flat);
+        }
+        result.extend(std::iter::repeat_n('\n', breaks));
+        if !matches!(bytes.get(end), None | Some(b'\n')) {
+            let tail_start = consumed
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |k| k + 1);
+            result.extend(std::iter::repeat_n(' ', consumed.len() - tail_start));
+        }
+    }
+
+    /// Copy a C-style block comment verbatim.
+    /// Uses batch slice copy instead of per-byte push for the comment body.
+    fn copy_block_comment(bytes: &[u8], i: usize, result: &mut String) -> usize {
+        let len = bytes.len();
+        let start = i;
+        let mut j = i + 2; // skip /*
+        while j + 1 < len && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+            j += 1;
+        }
+        if j + 1 < len {
+            j += 2; // skip */
+        }
+        // All comment content is ASCII, safe to copy as str slice
+        // SAFETY: bytes came from a valid UTF-8 str, and comments contain only ASCII
+        let slice = std::str::from_utf8(&bytes[start..j]).unwrap_or("");
+        result.push_str(slice);
+        j
+    }
+
+    /// Copy a line comment verbatim.
+    /// Uses batch slice copy instead of per-byte push.
+    fn copy_line_comment(bytes: &[u8], i: usize, result: &mut String) -> usize {
+        let len = bytes.len();
+        let mut j = i;
+        while j < len && bytes[j] != b'\n' {
+            j += 1;
+        }
+        let slice = std::str::from_utf8(&bytes[i..j]).unwrap_or("");
+        result.push_str(slice);
+        j
+    }
+
+    /// Copy a pp-number (numeric literal) verbatim.
+    /// Uses batch slice copy instead of per-byte push.
+    fn copy_ppnumber(bytes: &[u8], i: usize, result: &mut String) -> usize {
+        let j = ppnumber_end(bytes, i);
+        result.push_str(std::str::from_utf8(&bytes[i..j]).unwrap_or(""));
+        j
+    }
+
+    /// Parse function-like macro arguments from bytes starting at the opening paren.
+    /// Returns (args, position after closing paren).
+    ///
+    /// Optimized to track byte spans directly into the source text, avoiding
+    /// per-argument String allocations in the common case where arguments contain
+    /// no string/char literals. When all content is plain text, arguments are
+    /// extracted as trimmed `&str` slices and converted to String only once.
+    /// Parse the arguments of the invocation whose `(` is at `bytes[start]`:
+    /// the trimmed argument texts, the offset in `bytes` of each, and the
+    /// position after the closing `)`.
+    fn parse_macro_args(&self, bytes: &[u8], start: usize) -> (Vec<String>, Vec<usize>, usize) {
+        let len = bytes.len();
+        let mut i = start + 1; // skip '('
+        let mut args: Vec<String> = Vec::new();
+        let mut starts: Vec<usize> = Vec::new();
+        // Offset of the trimmed argument `bytes[from..to]`.
+        let trimmed_start = |from: usize, to: usize| {
+            from + bytes[from..to]
+                .iter()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count()
+        };
+        let mut paren_depth = 0;
+        // Start position of the current argument in bytes
+        let mut arg_start = i;
+
+        while i < len {
+            match bytes[i] {
+                b'(' => {
+                    paren_depth += 1;
+                    i += 1;
+                }
+                b')' => {
+                    if paren_depth == 0 {
+                        // Extract the argument as a trimmed &str from the byte span
+                        let arg_slice = std::str::from_utf8(&bytes[arg_start..i]).unwrap_or("");
+                        let trimmed = arg_slice.trim();
+                        if !trimmed.is_empty() || !args.is_empty() {
+                            args.push(trimmed.to_string());
+                            starts.push(trimmed_start(arg_start, i));
+                        }
+                        return (args, starts, i + 1);
+                    } else {
+                        paren_depth -= 1;
+                        i += 1;
+                    }
+                }
+                b',' if paren_depth == 0 => {
+                    let arg_slice = std::str::from_utf8(&bytes[arg_start..i]).unwrap_or("");
+                    args.push(arg_slice.trim().to_string());
+                    starts.push(trimmed_start(arg_start, i));
+                    i += 1;
+                    arg_start = i;
+                }
+                b'"' | b'\'' if !is_digit_separator(bytes, i) => {
+                    // Skip past string/char literal (they are part of the argument
+                    // text and will be included in the byte span)
+                    i = skip_literal_bytes(bytes, i, bytes[i]);
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        // Unterminated - return what we have
+        let arg_slice = std::str::from_utf8(&bytes[arg_start..i]).unwrap_or("");
+        let trimmed = arg_slice.trim();
+        if !trimmed.is_empty() || !args.is_empty() {
+            args.push(trimmed.to_string());
+            starts.push(trimmed_start(arg_start, i));
+        }
+        (args, starts, i)
+    }
+
+    /// Expand a function-like macro with given arguments, returning
+    /// (expanded_text, body_ended_with_func_ident).
+    ///
+    /// Per C11 §6.10.3.1: Arguments are fully macro-expanded before substitution
+    /// into the body. Occurrences adjacent to # or ## use the raw (unexpanded)
+    /// argument, handled by handle_stringify_and_paste. After substitution, the
+    /// result is rescanned with the current macro name suppressed (§6.10.3.4).
+    ///
+    /// `arg_starts` holds the offset of each argument in the text being
+    /// expanded when that text is source (not a macro body): the arguments
+    /// are then prescanned at their own positions, unpinned, so `__LINE__`
+    /// in an argument is its own physical line and a nested invocation pins
+    /// its body to its own name's line, as in GCC and Clang
+    /// (`F(__LINE__,\n__LINE__)` is `F(1, 2)`); body tokens keep the
+    /// invocation's pinned line.
+    ///
+    /// The second return value indicates whether the substituted body (before rescan)
+    /// ended with a function-like macro identifier. This is needed to correctly implement
+    /// C11 §6.10.3.4: the rescan of the replacement list "along with all subsequent
+    /// preprocessing tokens of the source file" must be left-to-right. If the body
+    /// ended with tokens AFTER a function-like macro name (e.g., `FOO EMPTY()` from
+    /// `#define DEFER(x) x EMPTY()`), those tokens act as a barrier preventing the
+    /// function-like macro from connecting with `(` in the subsequent source tokens.
+    fn expand_function_macro(
+        &self,
+        mac: &MacroDef,
+        args: &[String],
+        arg_starts: Option<&[usize]>,
+        expanding: &mut FxHashSet<String>,
+    ) -> (String, bool) {
+        // Step 1-2: Prescan - expand ALL arguments (C11 §6.10.3.1).
+        // Per the standard, arguments adjacent to # or ## use the RAW (unexpanded)
+        // form, but that is handled separately by handle_stringify_and_paste (Step 3)
+        // which receives the original raw `args`. The expanded_args are used only by
+        // substitute_params (Step 4) for non-## occurrences.
+        //
+        // A parameter can appear both with ## and without ## in the same body
+        // (e.g., `#define bitfs(bf, s) __bitf(bf, bf##_##s)`). In that case, the
+        // non-## occurrence needs the expanded argument so that commas from macro
+        // expansion create additional arguments during rescanning.
+        let expanded_args: Vec<String> = args
+            .iter()
+            .enumerate()
+            .map(
+                |(k, arg)| match arg_starts.and_then(|starts| starts.get(k)) {
+                    Some(&start) => self.expand_source_slice(arg, start, expanding),
+                    None => self.expand_text(arg, expanding),
+                },
+            )
+            .collect();
+
+        // C2x __VA_OPT__: include its balanced token sequence iff the variadic
+        // argument is non-empty. This must happen before #/## processing so
+        // commas and paste operators inside the selected sequence participate
+        // in the normal replacement algorithm.
+        let va_body = self.expand_va_opt(
+            &mac.body,
+            &mac.params,
+            args,
+            mac.is_variadic,
+            mac.has_named_variadic,
+        );
+
+        // Step 3: Handle stringification (#param) and token pasting (##).
+        let body = self.handle_stringify_and_paste(
+            &va_body,
+            &mac.params,
+            args,
+            mac.is_variadic,
+            mac.has_named_variadic,
+        );
+
+        // Step 4: Substitute parameters with expanded arguments
+        let body = self.substitute_params(
+            &body,
+            &mac.params,
+            &expanded_args,
+            mac.is_variadic,
+            mac.has_named_variadic,
+        );
+
+        // Check if the substituted body (before rescan) ends with a function-like
+        // macro identifier. Per C11 §6.10.3.4, the rescan processes the replacement
+        // list "along with all subsequent preprocessing tokens" left-to-right. If the
+        // body ends with `FOO EMPTY()` (from deferred expansion patterns), FOO should
+        // NOT connect with `(` from subsequent source tokens because the EMPTY() tokens
+        // act as a barrier during left-to-right scanning. Only if the body truly ends
+        // with a function-like macro identifier (no tokens after it) should we allow
+        // trailing resolution with subsequent source `(`.
+        let body_ends_with_func_ident = {
+            if let Some(trailing) = extract_trailing_ident(&body) {
+                if let Some(tmac) = self.macros.get(trailing.as_str()) {
+                    tmac.is_function_like
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        // Step 5: Rescan with the current macro name suppressed
+        expanding.insert(mac.name.clone());
+        let result = self.expand_text(&body, expanding);
+        expanding.remove(&mac.name);
+
+        // Also check the post-rescan result: token pasting through indirection
+        // (e.g., CONCATENATE -> CONCAT2 -> a##b) can produce a function-like macro
+        // name that wasn't visible in the pre-rescan body. For example:
+        //   #define CONCATENATE(a, b) __CONCAT(a, b)
+        //   #define __CONCAT(a, b) a ## b
+        //   CONCATENATE(FOO_, COUNT_ARGS(x))(args)
+        // After prescan + paste + rescan, result = "FOO_5" which is function-like.
+        // We must detect this so expand_trailing_func_macros connects it with "(args)".
+        //
+        // However, if the trailing identifier was already present in the pre-rescan
+        // body as a standalone token (e.g., `FOO EMPTY()` from DEFER patterns), then
+        // the tokens after it acted as a barrier per C11 §6.10.3.4 left-to-right
+        // scanning. Even if those barrier tokens expanded to nothing during rescan
+        // (like EMPTY() -> ""), the identifier should NOT connect with subsequent
+        // source `(`. Only identifiers that are NEW after rescan (produced by ##
+        // concatenation or other macro expansion) should allow trailing resolution.
+        let result_ends_with_func_ident = if !body_ends_with_func_ident {
+            if let Some(trailing) = extract_trailing_ident(&result) {
+                if let Some(tmac) = self.macros.get(trailing.as_str()) {
+                    if tmac.is_function_like {
+                        // Only allow if this identifier was NOT already present as a
+                        // standalone token in the pre-rescan body. If it was, the
+                        // barrier tokens after it were intentional (DEFER pattern).
+                        !contains_standalone_ident(&body, trailing.as_str())
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        (result, result_ends_with_func_ident)
+    }
+
+    /// Handle # / %: (stringify) and ## / %:%: (token paste) operators.
+    /// Returns `Cow::Borrowed` when neither spelling can occur (the common case),
+    /// avoiding a String allocation.
+    fn handle_stringify_and_paste<'a>(
+        &self,
+        body: &'a str,
+        params: &[String],
+        args: &[String],
+        is_variadic: bool,
+        has_named_variadic: bool,
+    ) -> std::borrow::Cow<'a, str> {
+        let bytes = body.as_bytes();
+        let len = bytes.len();
+
+        // Short-circuit the common case without allocating.
+        if !body.contains('#') && !body.contains("%:") {
+            return std::borrow::Cow::Borrowed(body);
+        }
+
+        let mut result = String::with_capacity(body.len());
+        let mut i = 0;
+
+        while i < len {
+            // An operator spelling inside a literal is ordinary text.
+            if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
+                i = copy_literal_bytes_to_string(bytes, i, bytes[i], &mut result);
+                continue;
+            }
+            let less_len = less_punctuator_len(&bytes[i..]);
+            if less_len != 0 {
+                result.push_str(&body[i..i + less_len]);
+                i += less_len;
+                continue;
+            }
+            let paste_len = paste_token_len(&bytes[i..]);
+            if paste_len != 0 {
+                // Token paste operator ## or %:%:
+                while result.ends_with(' ') || result.ends_with('\t') {
+                    result.pop();
+                }
+
+                let left_token = extract_trailing_ident(&result);
+                if let Some(ref left_ident) = left_token {
+                    if left_ident == "__VA_ARGS__" && is_variadic {
+                        let va_args_raw = self.get_va_args(params, args);
+                        let va_args = strip_blue_paint(&va_args_raw);
+                        let trim_len = result.len() - "__VA_ARGS__".len();
+                        result.truncate(trim_len);
+                        if va_args.is_empty() {
+                            while result.ends_with(' ') || result.ends_with('\t') {
+                                result.pop();
+                            }
+                            if result.ends_with(',') {
+                                result.pop();
+                            }
+                        } else {
+                            // Wrap in paste-protection markers to prevent
+                            // re-substitution in substitute_params (C11 §6.10.3.3)
+                            result.push(PASTE_PROTECT_START as char);
+                            result.push_str(&va_args);
+                            result.push(PASTE_PROTECT_END as char);
+                        }
+                    } else if let Some(idx) = params.iter().position(|p| p == left_ident.as_str()) {
+                        let trim_len = result.len() - left_ident.len();
+                        result.truncate(trim_len);
+                        let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
+                        // Strip blue paint: ## creates a new token that must be rescanned
+                        // without inheriting blue paint from operands (C11 §6.10.3.3)
+                        let clean_arg = strip_blue_paint(arg);
+                        result.push(PASTE_PROTECT_START as char);
+                        result.push_str(&clean_arg);
+                        result.push(PASTE_PROTECT_END as char);
+                    }
+                }
+
+                i += paste_len;
+
+                while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+
+                if i < len && is_ident_start_byte(bytes[i]) {
+                    let start = i;
+                    while i < len && is_ident_cont_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    let right_ident = bytes_to_str(bytes, start, i);
+
+                    if right_ident == "__VA_ARGS__" && is_variadic {
+                        let va_args_raw = self.get_va_args(params, args);
+                        let va_args = strip_blue_paint(&va_args_raw);
+                        if va_args.is_empty() {
+                            while result.ends_with(' ') || result.ends_with('\t') {
+                                result.pop();
+                            }
+                            if result.ends_with(',') {
+                                result.pop();
+                            }
+                        } else {
+                            // Wrap in paste-protection markers to prevent
+                            // re-substitution in substitute_params (C11 §6.10.3.3)
+                            result.push(PASTE_PROTECT_START as char);
+                            result.push_str(&va_args);
+                            result.push(PASTE_PROTECT_END as char);
+                        }
+                    } else if let Some(idx) = params.iter().position(|p| p == right_ident) {
+                        let is_named_variadic_param =
+                            is_variadic && has_named_variadic && idx == params.len() - 1;
+                        if is_named_variadic_param {
+                            let va_args_raw = self.get_named_va_args(idx, args);
+                            let va_args = strip_blue_paint(&va_args_raw);
+                            if va_args.is_empty() {
+                                while result.ends_with(' ') || result.ends_with('\t') {
+                                    result.pop();
+                                }
+                                if result.ends_with(',') {
+                                    result.pop();
+                                }
+                            } else {
+                                result.push(PASTE_PROTECT_START as char);
+                                result.push_str(&va_args);
+                                result.push(PASTE_PROTECT_END as char);
+                            }
+                        } else {
+                            let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
+                            // Strip blue paint: ## creates a new token that must be rescanned
+                            // without inheriting blue paint from operands (C11 §6.10.3.3)
+                            let clean_arg = strip_blue_paint(arg);
+                            if clean_arg.is_empty() {
+                                if i < len && !result.is_empty() {
+                                    result.push(' ');
+                                }
+                            } else {
+                                result.push(PASTE_PROTECT_START as char);
+                                result.push_str(&clean_arg);
+                                result.push(PASTE_PROTECT_END as char);
+                            }
+                        }
+                    } else {
+                        // Wrap non-parameter literal tokens in paste-protection markers
+                        // so that the next ##'s extract_trailing_ident won't greedily
+                        // absorb them and accidentally form a parameter name.
+                        // e.g. _name##_##div##_div with _name=foo,_div=2:
+                        //   without protection: _ and div merge into _div matching param
+                        //   with protection: each literal is isolated by markers
+                        result.push(PASTE_PROTECT_START as char);
+                        result.push_str(right_ident);
+                        result.push(PASTE_PROTECT_END as char);
+                    }
+                } else if i < len {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+
+            let hash_len = hash_token_len(&bytes[i..]);
+            if hash_len != 0 {
+                // Stringification operator # or %:. Preserve the original
+                // spelling if this is not a parameter (diagnosed elsewhere).
+                let operator = &body[i..i + hash_len];
+                i += hash_len;
+                while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+                if i < len && is_ident_start_byte(bytes[i]) {
+                    let start = i;
+                    while i < len && is_ident_cont_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    let param_name = bytes_to_str(bytes, start, i);
+
+                    if param_name == "__VA_ARGS__" && is_variadic {
+                        let va_args = self.get_va_args(params, args);
+                        result.push('"');
+                        result.push_str(&stringify_arg(&va_args));
+                        result.push('"');
+                    } else if let Some(idx) = params.iter().position(|p| p == param_name) {
+                        let arg_str =
+                            if is_variadic && has_named_variadic && idx == params.len() - 1 {
+                                self.get_named_va_args(idx, args)
+                            } else {
+                                args.get(idx).map(|s| s.to_string()).unwrap_or_default()
+                            };
+                        result.push('"');
+                        result.push_str(&stringify_arg(&arg_str));
+                        result.push('"');
+                    } else {
+                        result.push_str(operator);
+                        result.push_str(param_name);
+                    }
+                    continue;
+                } else {
+                    result.push_str(operator);
+                    continue;
+                }
+            }
+
+            // Regular byte
+            if bytes[i] < 0x80 {
+                result.push(bytes[i] as char);
+            } else {
+                let s = std::str::from_utf8(&bytes[i..])
+                    .expect("stringify/paste: source text is not valid UTF-8");
+                let ch = s.chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+            i += 1;
+        }
+
+        std::borrow::Cow::Owned(result)
+    }
+
+    /// Substitute parameter names with argument values in macro body.
+    fn substitute_params(
+        &self,
+        body: &str,
+        params: &[String],
+        args: &[String],
+        is_variadic: bool,
+        has_named_variadic: bool,
+    ) -> String {
+        let mut result = String::with_capacity(body.len() + 32);
+        let bytes = body.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            // Skip over paste-protected regions (text injected by ## paste).
+            // These regions must not be subject to further parameter substitution
+            // per C11 §6.10.3.3 — the result of ## is a new token sequence that
+            // only undergoes rescanning, not parameter replacement.
+            if bytes[i] == PASTE_PROTECT_START {
+                i += 1; // skip the start marker
+                let start = i;
+                while i < len && bytes[i] != PASTE_PROTECT_END {
+                    if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
+                        i = skip_literal_bytes(bytes, i, bytes[i]);
+                    } else {
+                        i += 1;
+                    }
+                }
+                // Copy the protected region as-is (UTF-8 safe via str slice)
+                result.push_str(&body[start..i]);
+                if i < len {
+                    i += 1; // skip the end marker
+                }
+                continue;
+            }
+
+            if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
+                i = copy_literal_bytes_to_string(bytes, i, bytes[i], &mut result);
+                continue;
+            }
+
+            if is_ident_start_byte(bytes[i]) {
+                let start = i;
+                i += 1;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let ident = bytes_to_str(bytes, start, i);
+
+                // Check if this identifier is a pp-number suffix (e.g., the "L"
+                // in "10L", "ULL" in "0xFFULL"). Per C11 §6.4.8, pp-numbers are
+                // single tokens and their suffixes must not be treated as macro
+                // parameters even if they happen to share a name.
+                if Self::is_ppnumber_suffix(&bytes[..start], ident) {
+                    result.push_str(ident);
+                    continue;
+                }
+
+                // Encoding prefixes are part of the following literal token,
+                // not standalone identifiers.  This check must happen during
+                // parameter substitution as well as rescan: in
+                // `#define m(L) L'1' + L`, only the final L is a parameter.
+                // Treating the first L as one produced invalid `0'1'` tokens.
+                if i < len
+                    && matches!(bytes[i], b'\'' | b'"')
+                    && matches!(ident, "u8" | "u" | "U" | "L")
+                {
+                    result.push_str(ident);
+                    continue;
+                }
+
+                if ident == "__VA_ARGS__" && is_variadic {
+                    let va_args = self.get_va_args(params, args);
+                    let next = if i < len { Some(bytes[i]) } else { None };
+                    Self::append_with_paste_guard(&mut result, &va_args, next);
+                } else if let Some(idx) = params.iter().position(|p| p == ident) {
+                    if is_variadic && has_named_variadic && idx == params.len() - 1 {
+                        let va_args = self.get_named_va_args(idx, args);
+                        let next = if i < len { Some(bytes[i]) } else { None };
+                        Self::append_with_paste_guard(&mut result, &va_args, next);
+                    } else {
+                        let arg = args.get(idx).map(|s| s.as_str()).unwrap_or("");
+                        let next = if i < len { Some(bytes[i]) } else { None };
+                        Self::append_with_paste_guard(&mut result, arg, next);
+                    }
+                } else {
+                    result.push_str(ident);
+                }
+                continue;
+            }
+
+            if bytes[i] < 0x80 {
+                // Batch consecutive non-special ASCII bytes
+                let start = i;
+                i += 1;
+                while i < len
+                    && bytes[i] < 0x80
+                    && bytes[i] != PASTE_PROTECT_START
+                    && bytes[i] != b'"'
+                    && bytes[i] != b'\''
+                    && !is_ident_start_byte(bytes[i])
+                {
+                    i += 1;
+                }
+                let slice = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+                result.push_str(slice);
+            } else {
+                let s = std::str::from_utf8(&bytes[i..])
+                    .expect("substitute_params: source text is not valid UTF-8");
+                let ch = s.chars().next().unwrap();
+                result.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+
+        result
+    }
+
+    /// Expand balanced `__VA_OPT__(tokens)` groups for a variadic macro.
+    fn expand_va_opt(
+        &self,
+        body: &str,
+        params: &[String],
+        args: &[String],
+        is_variadic: bool,
+        has_named_variadic: bool,
+    ) -> String {
+        if !is_variadic || !body.contains("__VA_OPT__") {
+            return body.to_string();
+        }
+        let first_va = if has_named_variadic {
+            params.len().saturating_sub(1)
+        } else {
+            params.len()
+        };
+        let has_tokens = args
+            .get(first_va..)
+            .is_some_and(|tail| tail.iter().any(|arg| !arg.trim().is_empty()));
+        let bytes = body.as_bytes();
+        let mut out = String::with_capacity(body.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"__VA_OPT__")
+                && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                && (i + 10 == bytes.len()
+                    || !(bytes[i + 10].is_ascii_alphanumeric() || bytes[i + 10] == b'_'))
+            {
+                let mut open = i + 10;
+                while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                    open += 1;
+                }
+                if open < bytes.len() && bytes[open] == b'(' {
+                    let inner = open + 1;
+                    let mut j = inner;
+                    let mut depth = 1usize;
+                    while j < bytes.len() && depth != 0 {
+                        match bytes[j] {
+                            b'(' => depth += 1,
+                            b')' => depth -= 1,
+                            b'"' | b'\'' if !is_digit_separator(bytes, j) => {
+                                j = skip_literal_bytes(bytes, j, bytes[j]);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    if depth == 0 {
+                        if has_tokens {
+                            out.push_str(&body[inner..j - 1]);
+                        }
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            let ch = body[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// Get variadic arguments (__VA_ARGS__) as a comma-separated string.
+    fn get_va_args(&self, params: &[String], args: &[String]) -> String {
+        let named_count = params.len();
+        if args.len() > named_count {
+            args[named_count..].join(", ")
+        } else {
+            String::new()
+        }
+    }
+
+    /// Get ALL arguments for a named variadic parameter (e.g., `extra...`).
+    fn get_named_va_args(&self, param_idx: usize, args: &[String]) -> String {
+        if args.len() > param_idx {
+            args[param_idx..].join(", ")
+        } else {
+            String::new()
+        }
+    }
+}
+
+impl Default for MacroTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Check whether position `pos` in `bytes` is part of a pp-number token.
+fn is_ppnumber_context(bytes: &[u8], pos: usize) -> bool {
+    let mut j = pos;
+    loop {
+        let ch = bytes[j];
+        if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'.' {
+            if j == 0 {
+                return ch.is_ascii_digit();
+            }
+            j -= 1;
+        } else if (ch == b'+' || ch == b'-')
+            && j >= 1
+            && matches!(bytes[j - 1], b'e' | b'E' | b'p' | b'P')
+        {
+            if j < 2 {
+                return false;
+            }
+            j -= 2;
+        } else {
+            let start = bytes[j + 1];
+            return start.is_ascii_digit()
+                || (start == b'.' && j + 2 <= pos && bytes[j + 2].is_ascii_digit());
+        }
+    }
+}
+
+/// Extract the trailing identifier from a string, if it ends with one.
+/// Returns Some(ident) if the string ends with an identifier (skipping trailing whitespace).
+/// Returns None if the trailing identifier is blue-painted (preceded by \x01 marker).
+/// Operates on bytes for performance (no Vec<char> allocation).
+fn extract_trailing_ident(s: &str) -> Option<String> {
+    let bytes = s.trim_end().as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let end = bytes.len();
+    if !is_ident_cont_byte(bytes[end - 1]) {
+        return None;
+    }
+    let mut start = end - 1;
+    while start > 0 && is_ident_cont_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    if !is_ident_start_byte(bytes[start]) {
+        return None;
+    }
+    // Check for blue-paint marker immediately before the identifier
+    if start > 0 && bytes[start - 1] == BLUE_PAINT_MARKER {
+        return None;
+    }
+    Some(bytes_to_str(bytes, start, end).to_string())
+}
+
+/// Check if a string contains a given identifier as a standalone token
+/// (not part of a larger identifier). Used to detect whether a function-like
+/// macro name was already present in the pre-rescan body, indicating that
+/// barrier tokens after it (like EMPTY()) were intentional and the identifier
+/// should not be connected to trailing `(` from subsequent source tokens.
+fn contains_standalone_ident(s: &str, ident: &str) -> bool {
+    let s_bytes = s.as_bytes();
+    let ident_bytes = ident.as_bytes();
+    let ident_len = ident_bytes.len();
+    if ident_len == 0 || s_bytes.len() < ident_len {
+        return false;
+    }
+    let mut i = 0;
+    while i + ident_len <= s_bytes.len() {
+        if &s_bytes[i..i + ident_len] == ident_bytes {
+            // Check that the character before is not an ident character
+            let before_ok = i == 0 || !is_ident_cont_byte(s_bytes[i - 1]);
+            // Check that the character after is not an ident character
+            let after_ok =
+                i + ident_len >= s_bytes.len() || !is_ident_cont_byte(s_bytes[i + ident_len]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Stringify a macro argument per C11 6.10.3.2.
+/// Operates on bytes to avoid Vec<char> allocation.
+fn stringify_arg(arg: &str) -> String {
+    let trimmed = arg.trim();
+    let mut result = String::with_capacity(64);
+    let bytes = trimmed.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Skip blue-paint markers (they must not appear in stringified output)
+        if bytes[i] == BLUE_PAINT_MARKER || bytes[i] == TOKEN_BOUNDARY {
+            i += 1;
+            continue;
+        }
+
+        // Collapse whitespace sequences to a single space
+        if bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' {
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n') {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Stringification escapes quotes and backslashes in literal tokens,
+        // but preserves their payload bytes (including UTF-8 and whitespace).
+        if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
+            let end = skip_literal_bytes(bytes, i, bytes[i]);
+            for ch in trimmed[i..end].chars() {
+                if matches!(ch, '"' | '\\') {
+                    result.push('\\');
+                }
+                result.push(ch);
+            }
+            i = end;
+            continue;
+        }
+
+        let Some(ch) = trimmed[i..].chars().next() else {
+            break;
+        };
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+
+    // Trim trailing space
+    if result.ends_with(' ') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Parse a #define directive line and return a MacroDef.
+/// The line should be the text after `#define ` (with leading whitespace stripped).
+/// Operates on bytes for performance.
+pub fn parse_define(line: &str) -> Option<MacroDef> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    // Parse macro name
+    if !is_ident_start_byte(bytes[0]) {
+        return None;
+    }
+    while i < len && is_ident_cont_byte(bytes[i]) {
+        i += 1;
+    }
+    let name = bytes_to_str(bytes, 0, i).to_string();
+
+    // Check if function-like (opening paren immediately after name, no space)
+    if i < len && bytes[i] == b'(' {
+        // Function-like macro
+        i += 1; // skip '('
+        let mut params = Vec::with_capacity(8);
+        let mut is_variadic = false;
+        let mut has_named_variadic = false;
+
+        loop {
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+
+            if i >= len {
+                break;
+            }
+
+            if bytes[i] == b')' {
+                i += 1;
+                break;
+            }
+
+            if bytes[i] == b'.' && i + 2 < len && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' {
+                is_variadic = true;
+                i += 3;
+                while i < len && bytes[i] != b')' {
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                break;
+            }
+
+            if is_ident_start_byte(bytes[i]) {
+                let start = i;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let param = bytes_to_str(bytes, start, i).to_string();
+
+                if i + 2 < len && bytes[i] == b'.' && bytes[i + 1] == b'.' && bytes[i + 2] == b'.' {
+                    is_variadic = true;
+                    has_named_variadic = true;
+                    params.push(param);
+                    i += 3;
+                    while i < len && bytes[i] != b')' {
+                        i += 1;
+                    }
+                    if i < len {
+                        i += 1;
+                    }
+                    break;
+                }
+
+                params.push(param);
+            }
+
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+
+            if i < len && bytes[i] == b',' {
+                i += 1;
+            }
+        }
+
+        // Rest is the body
+        let body = if i < len {
+            line[i..].trim().to_string()
+        } else {
+            String::new()
+        };
+
+        Some(MacroDef {
+            name,
+            is_function_like: true,
+            params,
+            is_variadic,
+            has_named_variadic,
+            body,
+        })
+    } else {
+        // Object-like macro
+        let body = if i < len {
+            line[i..].trim().to_string()
+        } else {
+            String::new()
+        };
+
+        Some(MacroDef {
+            name,
+            is_function_like: false,
+            params: Vec::new(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body,
+        })
+    }
+}
+
+/// Inline integer-to-string formatting buffer.
+/// Avoids heap allocation for small integers (which __LINE__, __COUNTER__ produce).
+mod itoa {
+    pub struct Buffer {
+        bytes: [u8; 20], // enough for u64::MAX
+        len: usize,
+    }
+
+    impl Buffer {
+        pub fn new() -> Self {
+            Buffer {
+                bytes: [0u8; 20],
+                len: 0,
+            }
+        }
+
+        pub fn format(&mut self, mut n: usize) -> &str {
+            if n == 0 {
+                self.bytes[0] = b'0';
+                self.len = 1;
+                return std::str::from_utf8(&self.bytes[..1])
+                    .expect("digit buffer is not valid UTF-8");
+            }
+            let mut pos = 20;
+            while n > 0 {
+                pos -= 1;
+                self.bytes[pos] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            self.len = 20 - pos;
+            // Shift to beginning for simpler return
+            self.bytes.copy_within(pos..20, 0);
+            // All bytes are ASCII digits (b'0'..=b'9'), which are valid UTF-8.
+            std::str::from_utf8(&self.bytes[..self.len]).expect("digit buffer is not valid UTF-8")
+        }
+    }
+}
+
+/// The index just past `( )` (blanks allowed) starting at `i`, if the text
+/// there is an empty argument list.
+fn empty_call_parens(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let skip = |mut j: usize| {
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        j
+    };
+    i = skip(i);
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    i = skip(i + 1);
+    if bytes.get(i) != Some(&b')') {
+        return None;
+    }
+    Some(i + 1)
+}
+
+#[cfg(test)]
+mod token_boundary_tests {
+    use super::{MacroDef, MacroTable};
+
+    fn table() -> MacroTable {
+        let mut t = MacroTable::new();
+        for (name, params, body) in [
+            ("MAJOR", None, "1"),
+            ("MINOR", None, "5"),
+            ("PATCH", None, "7"),
+            ("I", None, "13"),
+            ("L", None, "27"),
+            ("PLUS", None, "+"),
+            ("Q", Some("x"), "#x"),
+            ("S", Some("x"), "Q(x)"),
+            ("F", Some("x"), "x.MINOR.PATCH"),
+            ("CAT", Some("x,y"), "x ## y"),
+            ("XCAT", Some("x,y"), "CAT(x,y)"),
+        ] {
+            t.define(MacroDef {
+                name: name.into(),
+                is_function_like: params.is_some(),
+                params: params
+                    .map(|p| p.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+                is_variadic: false,
+                has_named_variadic: false,
+                body: body.into(),
+            });
+        }
+        t
+    }
+
+    #[test]
+    fn internal_markers_preserve_literal_payloads() {
+        let t = table();
+        for marker in ['\x01', '\x02', '\x03', '\x04'] {
+            for quote in ['"', '\''] {
+                let input = format!("{quote}{marker}{quote}");
+                assert_eq!(t.expand_line(&input), input);
+                let pasted = format!("CAT(,{input})");
+                assert_eq!(t.expand_line(&pasted), input);
+            }
+            let input = format!("Q(\"{marker}\")");
+            assert_eq!(t.expand_line(&input), format!("\"\\\"{marker}\\\"\""));
+        }
+        // Escape-aware scanning must not mistake the escaped quote for the end.
+        let input = "\"a\\\"\x04z\" PLUS+";
+        assert_eq!(t.expand_line(input), "\"a\\\"\x04z\" + +");
+        assert_eq!(super::strip_blue_paint("\x01x \"\x01\""), "x \"\x01\"");
+    }
+
+    #[test]
+    fn stringification_preserves_utf8_and_literal_whitespace() {
+        let t = table();
+        for input in ["\"éλ😀\"", "'é'", "\"a  b\\\"c\\\\d\""] {
+            let escaped = input.replace('\\', "\\\\").replace('"', "\\\"");
+            assert_eq!(
+                t.expand_line(&format!("Q({input})")),
+                format!("\"{escaped}\"")
+            );
+            assert_eq!(
+                t.expand_line(&format!("S({input})")),
+                format!("\"{escaped}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_token_boundaries_are_not_stringification_whitespace() {
+        let t = table();
+        for (input, expected) in [
+            ("S(MAJOR.MINOR.PATCH)", "\"1.5.7\""),
+            ("S(F(MAJOR))", "\"1.5.7\""),
+            ("S(MAJOR.MINOR . PATCH)", "\"1.5 . 7\""),
+            ("S(PLUS+)", "\"++\""),
+            ("S(PLUS +)", "\"+ +\""),
+            ("S(XCAT(MAJOR,MINOR))", "\"15\""),
+        ] {
+            assert_eq!(t.expand_line(input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn real_pp_numbers_remain_single_tokens_and_final_boundaries_survive() {
+        let t = table();
+        for token in ["1.I", "15.IF", "0x1p2", "10L"] {
+            assert_eq!(
+                t.expand_line(&format!("S({token})")),
+                format!("\"{token}\"")
+            );
+        }
+        assert_eq!(t.expand_line("PLUS+"), "+ +");
+        assert_eq!(t.expand_line("MAJOR.2"), "1 .2");
+        assert_eq!(t.expand_line("F(MAJOR)"), "1 . 5 . 7");
+    }
+}

@@ -1,0 +1,82 @@
+{
+  "main": {
+    "command": [
+      "/home/user/.cache/reference-source/target/fastbuild/lccc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "/home/user/artifacts/inflight/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/trap-main"
+    ],
+    "compile_status": 0,
+    "stderr": "",
+    "run_status": 43
+  },
+  "pr": {
+    "command": [
+      "/home/user/.cache/pr824-measurements/gather-fixed-lccc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "/home/user/artifacts/inflight/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/trap-pr"
+    ],
+    "compile_status": 0,
+    "stderr": "",
+    "run_status": 43
+  },
+  "candidate": {
+    "command": [
+      "target/fastbuild/lccc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "/home/user/artifacts/inflight/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/trap-candidate"
+    ],
+    "compile_status": 0,
+    "stderr": "",
+    "run_status": 43
+  },
+  "gcc16": {
+    "command": [
+      "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "/home/user/artifacts/inflight/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/trap-gcc16"
+    ],
+    "compile_status": 0,
+    "stderr": "",
+    "run_status": 0
+  },
+  "clang23": {
+    "command": [
+      "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+      "-O2",
+      "-march=x86-64-v3",
+      "-ftrapping-math",
+      "-ffp-contract=off",
+      "/home/user/artifacts/inflight/strict_recip_traps.c",
+      "-lm",
+      "-o",
+      "/home/user/.cache/pr824-static/trap-clang23"
+    ],
+    "compile_status": 0,
+    "stderr": "",
+    "run_status": 0
+  }
+}

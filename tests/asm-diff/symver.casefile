@@ -1,0 +1,78 @@
+;;; symver-same-name-2arg
+	.text
+	.globl foo
+foo:
+	ret
+	.symver foo, foo@VERS_1
+	.globl bar
+bar:
+	call foo
+	ret
+;;; symver-same-name-remove
+	.text
+	.globl foo
+foo:
+	ret
+	.symver foo, foo@VERS_1, remove
+	.globl bar
+bar:
+	call foo
+	ret
+;;; symver-same-name-local
+	.text
+	.globl foo
+foo:
+	ret
+	.symver foo, foo@VERS_1, local
+	.globl bar
+bar:
+	call foo
+	ret
+;;; symver-same-name-hidden
+	.text
+	.globl foo
+foo:
+	ret
+	.symver foo, foo@VERS_1, hidden
+	.globl bar
+bar:
+	call foo
+	ret
+;;; symver-undef-ref-remove
+	.text
+	.globl bar
+bar:
+	call und
+	ret
+	.symver und, und@VERS_2, remove
+;;; symver-undef-ref-2arg
+	.text
+	.globl bar
+bar:
+	call und2
+	ret
+	.symver und2, und2@VERS_2
+;;; symver-set-alias-defined
+	.text
+	.globl base
+base:
+	ret
+	.globl al
+	.set al, base
+	.symver al, al_finite@GLIBC_2.15
+	.globl bar
+bar:
+	call al
+	ret
+;;; symver-default-version
+	.text
+	.globl foo
+foo:
+	ret
+	.symver foo, pub@@VERS_1
+;;; symver-invalid-flag reject
+	.text
+	.globl foo
+foo:
+	ret
+	.symver foo, foo@VERS_1, bogus

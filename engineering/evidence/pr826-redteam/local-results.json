@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "local_compiler_integration": false,
+  "reference_corpus": {
+    "o2": {
+      "workloads": 45,
+      "output_comparisons_passed": 45,
+      "timing_claim": false
+    },
+    "o3": {
+      "workloads": 45,
+      "output_comparisons_passed": 45,
+      "timing_claim": false
+    }
+  },
+  "host_harness_gcc": {
+    "tests": 9,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "compiler": "gcc (Debian 12.2.0-14+deb12u1) 12.2.0"
+  },
+  "host_harness_clang": {
+    "tests": 9,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "compiler": "clang version 21.1.0"
+  },
+  "rust_module_hosted": {
+    "passed_tests": 6,
+    "small_domain_combinations": 49155,
+    "final_additional_samples": 40960,
+    "additional_samples_status": "awaiting final-head CI",
+    "run_url": "https://github.com/ms178/lccc/actions/runs/38584463316"
+  },
+  "exact_hosted_toolchains": {
+    "gcc": "Debian GCC 16.2.0",
+    "rust_toolchain": "1.99.0",
+    "provisioning": "passed",
+    "compiler_build": "passed",
+    "pgo_and_relocation_integration": "passed",
+    "tested_head": "63120c673e1930037f3653d38ae70afde43f5bf5",
+    "run_url": "https://github.com/ms178/lccc/actions/runs/38584463316"
+  },
+  "local_rust_installation": "failed: static.rust-lang.org TLS/egress restriction",
+  "swap_proc": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t0\t\t-2\n",
+  "perf_probe": {
+    "result": "ENOENT (errno 2)",
+    "hardware_cycles_available": false,
+    "source": "#include <errno.h>\n#include <linux/perf_event.h>\n#include <stdio.h>\n#include <string.h>\n#include <sys/syscall.h>\n#include <unistd.h>\nint main(void) {\n    struct perf_event_attr a = {0};\n    a.type = PERF_TYPE_HARDWARE;\n    a.size = sizeof(a);\n    a.config = PERF_COUNT_HW_CPU_CYCLES;\n    a.disabled = 1;\n    a.exclude_kernel = 1;\n    a.exclude_hv = 1;\n    int fd = syscall(__NR_perf_event_open, &a, 0, -1, -1, 0);\n    if (fd < 0) { printf(\"hardware cycles unavailable: errno=%d (%s)\\n\", errno, strerror(errno)); return 1; }\n    close(fd); puts(\"hardware cycles event open succeeded\"); return 0;\n}\n"
+  },
+  "tools": {
+    "gcc_sha256": "75e997ec62297a6484f491bae28ab0ccb489daba23e398fd10fe68e9e6f0def8",
+    "zig_engine_sha256": "2317bbb91798556d9d0f38aabdac23db83f0979b25f767259ae474546724087c",
+    "zig_version": "0.16.0",
+    "clang_version": "21.1.0",
+    "lld_version": "21.1.0"
+  },
+  "artifact_sha256": {
+    "lld-incomplete-field.json": "7d225ef2c5db85f48b8305fc38ee72448e69629915e540306112e8029a173a80",
+    "lld-malformed.json": "a00cf9e379b07e62bff096d9b1303512db99c08c47c8c3eb40d223dcb53aae8d",
+    "lld-valid.json": "6cc96c582e8cb8bba15ca64a4ce965f4107099032f0755ec021b22509e661168",
+    "reference-corpus-o2.json": "48ccbe5c27aa05c7a77de256f126fda015de962e3685cc0ae92c1688bf52555d",
+    "reference-corpus-o3.json": "270c971bac121f5bf17fdbee0ec597e5899966a76f4df30a60221bf70757f98e"
+  }
+}

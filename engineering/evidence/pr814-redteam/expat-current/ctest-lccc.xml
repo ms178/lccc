@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="1"
+	failures="0"
+	disabled="0"
+	skipped="0"
+	hostname=""
+	time="19"
+	timestamp="2026-10-14T19:20:23"
+	>
+	<testcase name="runtests" classname="runtests" time="19.938" status="run">
+		<properties/>
+		<system-out>Expat version: expat_2.8.5
+100%: Checks: 4932, Failed: 0
+</system-out>
+	</testcase>
+</testsuite>

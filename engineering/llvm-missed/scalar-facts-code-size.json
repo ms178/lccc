@@ -1,0 +1,130 @@
+{
+  "flags": [
+    "-O3",
+    "-march=x86-64-v3",
+    "-fPIE",
+    "-S"
+  ],
+  "measurement": "static instruction count including RET, no timing inference",
+  "versions": {
+    "gcc": "gcc-16 (GCC) 16.2.0",
+    "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)"
+  },
+  "compiler_binary_sha256": {
+    "pre_batch": "9fb7e370ab441e4c4fd5f9df86fe01dfeff683cfa867e6bf58bb03a34a9be14a",
+    "lccc": "806862e4fc34133009423d019450a2a54afda66e177e5849c7cd6115e8a1b187",
+    "gcc": "67ed99639f746b8e83e4e685a7189ae1172fb9c23a3e83aa9b09a1d68f3fb1c2",
+    "clang": "913453afb492abab17025139852413ba7fd7a52b4fb75fcce58ff3fe399d0a9e"
+  },
+  "source_sha256": "61b3223f22e491207442b57dce979109b3144f1c55aaa6e50d32040b0486e94d",
+  "counts": {
+    "b6_bits": {
+      "pre_batch": 14,
+      "lccc": 5,
+      "gcc": 11,
+      "clang": 11
+    },
+    "b6_sum": {
+      "pre_batch": 10,
+      "lccc": 9,
+      "gcc": 8,
+      "clang": 6
+    },
+    "b6_sub": {
+      "pre_batch": 10,
+      "lccc": 9,
+      "gcc": 8,
+      "clang": 6
+    },
+    "b6_range": {
+      "pre_batch": 12,
+      "lccc": 5,
+      "gcc": 9,
+      "clang": 10
+    },
+    "b6_even": {
+      "pre_batch": 9,
+      "lccc": 4,
+      "gcc": 5,
+      "clang": 4
+    },
+    "b6_shared": {
+      "pre_batch": 13,
+      "lccc": 13,
+      "gcc": 11,
+      "clang": 12
+    },
+    "b6_masked": {
+      "pre_batch": 9,
+      "lccc": 4,
+      "gcc": 10,
+      "clang": 10
+    },
+    "b6_select": {
+      "pre_batch": 17,
+      "lccc": 4,
+      "gcc": 10,
+      "clang": 9
+    },
+    "b6_signed_select": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "b6_inverse": {
+      "pre_batch": 33,
+      "lccc": 33,
+      "gcc": 17,
+      "clang": 25
+    },
+    "b6_trip": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 5,
+      "clang": 5
+    },
+    "b6_guard": {
+      "pre_batch": 9,
+      "lccc": 6,
+      "gcc": 4,
+      "clang": 4
+    },
+    "b6_lowzero": {
+      "pre_batch": 4,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "b6_lowone": {
+      "pre_batch": 7,
+      "lccc": 4,
+      "gcc": 5,
+      "clang": 5
+    },
+    "b6_boolor": {
+      "pre_batch": 8,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 7
+    },
+    "b6_trip_near": {
+      "pre_batch": 6,
+      "lccc": 6,
+      "gcc": 5,
+      "clang": 5
+    },
+    "b6_mask_near": {
+      "pre_batch": 9,
+      "lccc": 4,
+      "gcc": 10,
+      "clang": 10
+    },
+    "b6_select_near": {
+      "pre_batch": 5,
+      "lccc": 5,
+      "gcc": 4,
+      "clang": 4
+    }
+  }
+}

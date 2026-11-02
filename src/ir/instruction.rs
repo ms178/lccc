@@ -1,0 +1,2093 @@
+use super::constants::IrConst;
+use super::intrinsics::IntrinsicOp;
+use super::ops::{AtomicOrdering, AtomicRmwOp, IrBinOp, IrCmpOp, IrUnaryOp};
+use crate::common::fx_hash::FxHashMap;
+/// IR instruction definitions: the core SSA instruction set.
+///
+/// This module defines the SSA IR instruction enum with 38 variants covering
+/// memory operations, arithmetic, control flow, atomics, SIMD intrinsics,
+/// inline assembly, and ABI support (va_arg, sret, complex returns).
+///
+/// Key types:
+/// - `BlockId`: basic block identifier (u32 index, formats as ".LBB{id}")
+/// - `Value`: SSA value reference (u32 index)
+/// - `Operand`: either a `Value` or an `IrConst`
+/// - `Instruction`: the main instruction enum
+/// - `CallInfo`: shared metadata for direct and indirect calls
+/// - `Terminator`: block terminators (return, branch, switch)
+/// - `BasicBlock`: a labeled sequence of instructions ending in a terminator
+use crate::common::source::Span;
+use crate::common::types::{AddressSpace, EightbyteClass, IrType};
+
+/// A basic block identifier. Uses a u32 index for zero-cost copies
+/// instead of heap-allocated String labels. The block's assembly label
+/// is generated on-the-fly during codegen as ".LBB{id}".
+/// We use ".LBB" instead of ".L" to avoid collisions with the GNU
+/// assembler's internal local labels (e.g., .L0, .L1) used for
+/// RISC-V PCREL_HI20/PCREL_LO12 relocation pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlockId(pub u32);
+
+impl BlockId {
+    /// Format this block ID as an assembly label (e.g., ".LBB5").
+    #[inline]
+    pub fn as_label(&self) -> String {
+        format!(".LBB{}", self.0)
+    }
+}
+
+impl std::fmt::Display for BlockId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, ".LBB{}", self.0)
+    }
+}
+
+/// An SSA value reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Value(pub u32);
+
+/// An operand (either a value reference or a constant).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Operand {
+    Value(Value),
+    Const(IrConst),
+}
+
+/// A basic block in the CFG.
+#[derive(Debug, Clone)]
+pub struct BasicBlock {
+    pub label: BlockId,
+    pub instructions: Vec<Instruction>,
+    pub terminator: Terminator,
+    /// Source location spans for each instruction, parallel to `instructions`.
+    /// Used by the backend to emit .file/.loc directives when compiling with -g.
+    /// Empty when debug info is not being tracked (non-debug builds).
+    pub source_spans: Vec<Span>,
+}
+
+/// Span-preserving edits.
+///
+/// `source_spans` is either empty (no debug tracking for the block) or exactly
+/// parallel to `instructions`; the IR verifier checks this after every pass
+/// (`CCC_VERIFY_IR`), because `.loc` emission indexes spans by instruction
+/// position and every consumer clamps, so drift is otherwise silent until a
+/// pass splices at an index past the shorter list. These primitives keep the
+/// pairing when it holds and touch only `instructions` when it does not:
+/// already-drifted spans are the verifier's to attribute to the pass that
+/// broke them, and an editor must neither panic on them nor paper over them.
+/// Instructions a pass synthesizes take [`Span::dummy`] (no `.loc`: they
+/// inherit the previous line, like phi copies) or the span of the instruction
+/// they replace.
+impl BasicBlock {
+    /// `source_spans` is tracked and parallel to `instructions`.
+    #[inline]
+    pub fn spans_parallel(&self) -> bool {
+        !self.source_spans.is_empty() && self.source_spans.len() == self.instructions.len()
+    }
+
+    /// Whether an insertion carrying `span` keeps (or starts) the pairing: the
+    /// spans are parallel, or the block is empty and `span` is a real
+    /// location -- an instruction moved into a fresh block brings its line
+    /// along instead of leaving the block untracked.
+    #[inline]
+    fn tracks_insertion(&self, span: Span) -> bool {
+        self.spans_parallel()
+            || (self.instructions.is_empty()
+                && self.source_spans.is_empty()
+                && span != Span::dummy())
+    }
+
+    /// The span of instruction `at`, or [`Span::dummy`] when untracked.
+    #[inline]
+    pub fn span_at(&self, at: usize) -> Span {
+        if self.spans_parallel() {
+            self.source_spans[at]
+        } else {
+            Span::dummy()
+        }
+    }
+
+    /// Insert `inst` before position `at` (`at == len` appends).
+    pub fn insert_inst(&mut self, at: usize, inst: Instruction, span: Span) {
+        let tracked = self.tracks_insertion(span);
+        self.instructions.insert(at, inst);
+        if tracked {
+            self.source_spans.insert(at, span);
+        }
+    }
+
+    /// Insert every instruction of `insts` before position `at`, in order,
+    /// each with `span` (one splice: O(len), not O(len * count)).
+    pub fn insert_insts(
+        &mut self,
+        at: usize,
+        insts: impl IntoIterator<Item = Instruction>,
+        span: Span,
+    ) {
+        let tracked = self.tracks_insertion(span);
+        let before = self.instructions.len();
+        self.instructions.splice(at..at, insts);
+        if tracked {
+            let added = self.instructions.len() - before;
+            self.source_spans
+                .splice(at..at, std::iter::repeat_n(span, added));
+        }
+    }
+
+    /// Append `inst`.
+    pub fn push_inst(&mut self, inst: Instruction, span: Span) {
+        let at = self.instructions.len();
+        self.insert_inst(at, inst, span);
+    }
+
+    /// Append every instruction of `insts`, each with `span`.
+    pub fn extend_insts(&mut self, insts: impl IntoIterator<Item = Instruction>, span: Span) {
+        let tracked = self.tracks_insertion(span);
+        let before = self.instructions.len();
+        self.instructions.extend(insts);
+        if tracked {
+            let added = self.instructions.len() - before;
+            self.source_spans.extend(std::iter::repeat_n(span, added));
+        }
+    }
+
+    /// Remove and return instruction `at` (and its span).
+    pub fn remove_inst(&mut self, at: usize) -> Instruction {
+        if self.spans_parallel() {
+            self.source_spans.remove(at);
+        }
+        self.instructions.remove(at)
+    }
+
+    /// Replace instruction `at` by `insts`; each replacement inherits the
+    /// replaced instruction's span (they implement the same source construct).
+    pub fn splice_inst(&mut self, at: usize, insts: Vec<Instruction>) {
+        let tracked = self.spans_parallel();
+        let span = self.span_at(at);
+        let n = insts.len();
+        self.instructions.splice(at..=at, insts);
+        if tracked {
+            self.source_spans
+                .splice(at..=at, std::iter::repeat_n(span, n));
+        }
+    }
+
+    /// Replace the whole body with synthesized instructions.  A tracked
+    /// block stays tracked (every new instruction gets `Span::dummy()`, so
+    /// it emits no `.loc` of its own); an untracked block stays untracked.
+    pub fn replace_insts_synthesized(&mut self, insts: Vec<Instruction>) {
+        let tracked = !self.source_spans.is_empty();
+        self.source_spans.clear();
+        if tracked {
+            self.source_spans.resize(insts.len(), Span::dummy());
+        }
+        self.instructions = insts;
+    }
+
+    /// Remove the instructions in `range` (and their spans, when parallel).
+    pub fn remove_insts(&mut self, range: std::ops::Range<usize>) {
+        if self.spans_parallel() {
+            self.source_spans.drain(range.clone());
+        }
+        self.instructions.drain(range);
+    }
+
+    /// Append another block body (`insts` with its own `spans`, parallel or
+    /// empty), e.g. when merging blocks.  Locations survive whenever both
+    /// sides track; an untracked side contributes dummy spans to a tracked
+    /// one, and an untracked non-empty `self` stays untracked.
+    pub fn append_spanned(&mut self, insts: Vec<Instruction>, spans: Vec<Span>) {
+        let incoming_tracked = !spans.is_empty() && spans.len() == insts.len();
+        let self_empty = self.instructions.is_empty() && self.source_spans.is_empty();
+        if self.spans_parallel() || (self_empty && incoming_tracked) {
+            if incoming_tracked {
+                self.source_spans.extend(spans);
+            } else {
+                self.source_spans
+                    .extend(std::iter::repeat_n(Span::dummy(), insts.len()));
+            }
+        }
+        self.instructions.extend(insts);
+    }
+
+    /// Remove every instruction (and span).
+    pub fn clear_insts(&mut self) {
+        self.instructions.clear();
+        self.source_spans.clear();
+    }
+
+    /// Keep the instructions for which `keep` holds, with their spans.
+    pub fn retain_insts(&mut self, mut keep: impl FnMut(&Instruction) -> bool) {
+        if !self.spans_parallel() {
+            self.instructions.retain(keep);
+            return;
+        }
+        let mut flags = Vec::with_capacity(self.instructions.len());
+        self.instructions.retain(|inst| {
+            let k = keep(inst);
+            flags.push(k);
+            k
+        });
+        let mut it = flags.into_iter();
+        self.source_spans.retain(|_| it.next().unwrap_or(false));
+    }
+
+    /// Replace the whole instruction list by `insts` with `spans` computed in
+    /// parallel (empty when the block is untracked). Rebuilding passes take
+    /// the old spans with [`BasicBlock::take_parallel_spans`], map them along
+    /// with the instructions, and hand both back here.
+    pub fn replace_insts(&mut self, insts: Vec<Instruction>, spans: Vec<Span>) {
+        let paired = spans.is_empty() || spans.len() == insts.len();
+        debug_assert!(
+            paired,
+            "replace_insts: {} spans for {} instructions",
+            spans.len(),
+            insts.len()
+        );
+        self.instructions = insts;
+        // A caller bug must not become an ICE over line-table metadata: an
+        // unpaired list degrades to untracked, which the verifier accepts.
+        self.source_spans = if paired { spans } else { Vec::new() };
+    }
+
+    /// Take the spans for a rebuild: the parallel list, or empty when the
+    /// block is untracked or already drifted (a rebuild cannot know which
+    /// instruction a drifted span belonged to; the drift was reported after
+    /// the pass that caused it).
+    pub fn take_parallel_spans(&mut self) -> Vec<Span> {
+        if self.spans_parallel() {
+            std::mem::take(&mut self.source_spans)
+        } else {
+            self.source_spans.clear();
+            Vec::new()
+        }
+    }
+}
+
+/// Shared call metadata for both direct and indirect function calls.
+///
+/// This struct consolidates the fields that are common to `Instruction::Call` and
+/// `Instruction::CallIndirect`, avoiding duplication across match arms and making
+/// it easier to add new call-related fields in the future.
+#[derive(Debug, Clone, Default)]
+pub struct CallInfo {
+    /// Destination value for the return, or None for void calls.
+    pub dest: Option<Value>,
+    /// Argument operands.
+    pub args: Vec<Operand>,
+    /// Type of each argument (parallel to `args`).
+    pub arg_types: Vec<IrType>,
+    /// Return type of the callee.
+    pub return_type: IrType,
+    /// Whether the callee is variadic.
+    pub is_variadic: bool,
+    /// Number of named (non-variadic) parameters in the callee's prototype.
+    /// For non-variadic calls, this equals args.len().
+    pub num_fixed_args: usize,
+    /// Which args are struct/union by-value: Some(size) for struct args, None otherwise.
+    pub struct_arg_sizes: Vec<Option<usize>>,
+    /// Struct alignment: Some(align) for struct args, None otherwise.
+    /// Used on RISC-V to even-align register pairs for 2×XLEN-aligned structs.
+    pub struct_arg_aligns: Vec<Option<usize>>,
+    /// Per-eightbyte SysV ABI classification for struct args (for x86-64 SSE-class passing).
+    /// A singleton `[NoClass]` with no `struct_arg_sizes` entry marks an i686
+    /// ExtVector lane that must stay on the stack under regparm/fastcall.
+    pub struct_arg_classes: Vec<Vec<EightbyteClass>>,
+    /// RISC-V LP64D float field classification for struct args.
+    pub struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>>,
+    /// True for args that are _Float128: ONE 16-byte XMM register (SysV psABI).
+    pub struct_arg_is_f128_sse: Vec<bool>,
+    /// True if the return value is _Float128 (ONE 16-byte XMM register).
+    pub ret_is_f128_sse: bool,
+    /// True if the call uses a hidden pointer argument for struct returns (i386 SysV ABI).
+    pub is_sret: bool,
+    /// True if the callee uses the fastcall calling convention.
+    pub is_fastcall: bool,
+    /// i686: `__attribute__((regparm(N)))` on the callee — per-function
+    /// override of the global -mregparm flag. None = attribute absent.
+    pub regparm: Option<u8>,
+    /// True if the callee is marked pure (no memory writes outside local allocas, no side effects).
+    pub is_pure: bool,
+    /// True if the callee is marked const (no memory reads or writes outside local allocas, no side effects).
+    pub is_const: bool,
+    /// Return carrier classes. SysV AMD64 uses one entry per eightbyte for
+    /// aggregate returns; on i686, three INTEGER entries mark a Clang integer
+    /// ExtVector result carried in EAX:EDX:ECX.
+    pub ret_eightbyte_classes: Vec<EightbyteClass>,
+    /// The callee may be treated as the standard library function of that
+    /// name: folded (`printf` -> `puts`) or expanded inline (constant-size
+    /// `memcpy`/`memset`).  Set by lowering for `__builtin_*` spellings and
+    /// for the compiler's own struct-copy / zero-init calls, by
+    /// `passes::builtin_policy::apply` for plain calls the function's
+    /// [`crate::common::pass_policy::BuiltinPolicy`] permits, and by the
+    /// passes that synthesize library calls.  `false` (the default) means
+    /// "call it as written": never folded, never expanded.
+    pub assume_library: bool,
+    /// The call sits on a rarely executed path (e.g. the errno slow path of
+    /// an inlined `sqrt`).  The x86-64 register allocator may then keep
+    /// scalar FP values live across it in caller-saved XMM homes and save/
+    /// restore them around this call only, instead of demoting them to a
+    /// stack home on the hot path.  A pure placement hint: `false` is always
+    /// correct.
+    pub cold: bool,
+}
+
+/// An IR instruction.
+#[derive(Debug, Clone)]
+pub enum Instruction {
+    /// Allocate stack space: %dest = alloca ty
+    /// `align` is the alignment override (0 means use default platform alignment).
+    /// `volatile` prevents mem2reg from promoting this alloca to an SSA register.
+    /// It is also used for compiler-internal stack homes whose memory identity must
+    /// survive SSA promotion (for example, the saved old value of `i++`).
+    ///
+    /// `semantic_volatile` is true only for storage originating from a C
+    /// volatile-qualified object.  Backend memory optimizers must preserve every
+    /// access to such storage; an internal non-promotable stack home does not have
+    /// those externally observable volatile-access semantics.
+    Alloca {
+        dest: Value,
+        ty: IrType,
+        size: usize,
+        align: usize,
+        volatile: bool,
+        semantic_volatile: bool,
+    },
+
+    /// Dynamic stack allocation: %dest = dynalloca size_operand, align
+    /// Used for __builtin_alloca - adjusts stack pointer at runtime.
+    DynAlloca {
+        dest: Value,
+        size: Operand,
+        align: usize,
+    },
+
+    /// Store to memory: store val, ptr (type indicates size of store)
+    /// seg_override: segment register override for x86 (%gs:/%fs:) from named address spaces.
+    Store {
+        val: Operand,
+        ptr: Value,
+        ty: IrType,
+        seg_override: AddressSpace,
+        /// C `volatile` store: the write itself is an observable side effect
+        /// (C11 5.1.2.3).  Optimizations must not eliminate, forward, sink,
+        /// or merge it.
+        volatile: bool,
+    },
+
+    /// Load from memory: %dest = load ptr
+    /// seg_override: segment register override for x86 (%gs:/%fs:) from named address spaces.
+    Load {
+        dest: Value,
+        ptr: Value,
+        ty: IrType,
+        seg_override: AddressSpace,
+        /// C `volatile` load: the read itself is an observable side effect
+        /// (C11 5.1.2.3).  Optimizations must not eliminate, forward, hoist,
+        /// or CSE it, even when the result is unused.
+        volatile: bool,
+    },
+
+    /// Binary operation: %dest = op lhs, rhs
+    BinOp {
+        dest: Value,
+        op: IrBinOp,
+        lhs: Operand,
+        rhs: Operand,
+        ty: IrType,
+    },
+
+    /// Unary operation: %dest = op src
+    UnaryOp {
+        dest: Value,
+        op: IrUnaryOp,
+        src: Operand,
+        ty: IrType,
+    },
+
+    /// Comparison: %dest = cmp op lhs, rhs
+    Cmp {
+        dest: Value,
+        op: IrCmpOp,
+        lhs: Operand,
+        rhs: Operand,
+        ty: IrType,
+    },
+
+    /// Direct function call: %dest = call func(args...)
+    Call { func: String, info: CallInfo },
+
+    /// Indirect function call through a pointer: %dest = call_indirect ptr(args...)
+    CallIndirect { func_ptr: Operand, info: CallInfo },
+
+    /// Get element pointer (for arrays/structs)
+    GetElementPtr {
+        dest: Value,
+        base: Value,
+        offset: Operand,
+        ty: IrType,
+    },
+
+    /// Type cast/conversion
+    Cast {
+        dest: Value,
+        src: Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    },
+
+    /// Copy a value
+    Copy { dest: Value, src: Operand },
+
+    /// Get address of a global
+    GlobalAddr { dest: Value, name: String },
+
+    /// Memory copy: memcpy(dest, src, size)
+    Memcpy {
+        dest: Value,
+        src: Value,
+        size: usize,
+    },
+
+    /// va_arg: extract the next variadic argument from a va_list.
+    /// va_list_ptr is a pointer to the va_list struct/pointer.
+    /// result_ty is the type of the argument being extracted.
+    VaArg {
+        dest: Value,
+        va_list_ptr: Value,
+        result_ty: IrType,
+    },
+
+    /// va_arg for struct/union types: read a struct from the va_list into a
+    /// pre-allocated buffer. `dest_ptr` is a pointer to the buffer (an alloca),
+    /// `size` is the struct size in bytes. The backend reads the appropriate
+    /// number of bytes from the va_list (registers or overflow area) and stores
+    /// them at `dest_ptr`, advancing the va_list state appropriately.
+    ///
+    /// `eightbyte_classes` carries the SysV AMD64 ABI eightbyte classification
+    /// for small structs (<=16 bytes). When non-empty, the x86 backend uses this
+    /// to check if all required register slots (GP and/or FP) are available:
+    ///
+    /// - If sufficient registers exist, each eightbyte is read from the register
+    ///   save area (GP or FP depending on classification).
+    /// - If not, the ENTIRE struct is read from the overflow area.
+    ///
+    /// This ensures the ABI rule that multi-eightbyte structs must be entirely
+    /// in registers or entirely on the stack is respected.
+    ///
+    /// `align` is the struct's alignment in bytes. When the struct is fetched
+    /// from the overflow area and `align > 8`, the overflow pointer must be
+    /// aligned up to a multiple of 16 first (psABI §3.5.7).
+    VaArgStruct {
+        dest_ptr: Value,
+        va_list_ptr: Value,
+        size: usize,
+        align: usize,
+        eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    },
+
+    /// va_arg of a vector-shaped type on x86-64 (`va_arg(ap, T)` with T a
+    /// `vector_size` or `ext_vector_type`).
+    ///
+    /// Unlike a struct with equal eightbyte classes, a vector occupies ONE
+    /// SSE register (both its eightbytes live in the single XMM slot at
+    /// reg_save_area + fp_offset) or one 16-aligned overflow slot, and
+    /// fp_offset advances by exactly 16 — the per-eightbyte VaArgStruct
+    /// fetch would read two consecutive slots and mis-fetch every argument
+    /// that follows (measured against GCC 16). `size` is the vector's
+    /// storage size (<= 16 for the register path; larger vectors and the
+    /// tracked >16-byte shapes take the overflow path, byte-identical to
+    /// GCC's memory-class va_arg).
+    VaArgVector {
+        dest_ptr: Value,
+        va_list_ptr: Value,
+        size: usize,
+        align: usize,
+        /// SysV carrier classification from `CType::sysv_vector_carrier`:
+        /// empty = memory (overflow fetch), `[Integer]` = one GP slot,
+        /// `[Sse]` = the low half of one XMM slot, `[Sse, Sse]` = still ONE
+        /// XMM slot (a vector never spans two registers, unlike a struct
+        /// with the same classification).
+        eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    },
+
+    /// va_start: initialize a va_list. last_named_param is the pointer to the last named parameter.
+    VaStart { va_list_ptr: Value },
+
+    /// va_end: cleanup a va_list (typically a no-op).
+    VaEnd { va_list_ptr: Value },
+
+    /// va_copy: copy one va_list to another.
+    VaCopy { dest_ptr: Value, src_ptr: Value },
+
+    /// Atomic read-modify-write: %dest = atomicrmw op ptr, val
+    /// Performs: old = *ptr; *ptr = op(old, val); dest = old (fetch_and_*) or dest = op(old, val) (*_and_fetch)
+    AtomicRmw {
+        dest: Value,
+        op: AtomicRmwOp,
+        ptr: Operand,
+        val: Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    },
+
+    /// Atomic increment with no SSA result.  This is intentionally separate
+    /// from AtomicRmw: PGO counters do not need the old value, and inventing a
+    /// dead destination stresses register allocation and spill-slot liveness.
+    AtomicInc {
+        ptr: Operand,
+        /// Constant byte offset from the base pointer; zero for a scalar.
+        offset: i64,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    },
+
+    /// Atomic compare-exchange: %dest = cmpxchg ptr, expected, desired
+    /// Returns whether the exchange succeeded (as a boolean i8 for __atomic_compare_exchange_n)
+    /// or the old value (for __sync_val_compare_and_swap).
+    AtomicCmpxchg {
+        dest: Value,
+        ptr: Operand,
+        expected: Operand,
+        desired: Operand,
+        ty: IrType,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        /// If true, dest gets the success/failure boolean; if false, dest gets the old value.
+        returns_bool: bool,
+    },
+
+    /// Atomic load: %dest = atomic_load ptr
+    AtomicLoad {
+        dest: Value,
+        ptr: Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    },
+
+    /// Atomic store: atomic_store ptr, val
+    AtomicStore {
+        ptr: Operand,
+        val: Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    },
+
+    /// PGO counter increment: `[lock] incq sym+off(%rip)` in one instruction.
+    /// Inserted by the PGO instrumentation pass AFTER all optimization
+    /// passes. Carries no values and no destination, so it cannot perturb
+    /// register allocation or value numbering.
+    PgoCounterInc {
+        name: String,
+        offset: i64,
+        atomic: bool,
+    },
+
+    /// Memory fence
+    Fence { ordering: AtomicOrdering },
+
+    /// SSA Phi node: merges values from different predecessor blocks.
+    /// Each entry in `incoming` is (value, block_id) indicating which value
+    /// flows in from which predecessor block.
+    Phi {
+        dest: Value,
+        ty: IrType,
+        incoming: Vec<(Operand, BlockId)>,
+    },
+
+    /// Get the address of a label (GCC computed goto extension: &&label)
+    LabelAddr { dest: Value, label: BlockId },
+
+    /// Get the second F64 return value from a function call (for _Complex double returns).
+    /// On x86-64: reads xmm1, on ARM64: reads d1, on RISC-V: reads fa1.
+    /// Must appear immediately after a Call/CallIndirect instruction.
+    GetReturnF64Second { dest: Value },
+
+    /// Set the second F64 return value before a return (for _Complex double returns).
+    /// On x86-64: writes xmm1, on ARM64: writes d1, on RISC-V: writes fa1.
+    /// Must appear immediately before a Return terminator.
+    SetReturnF64Second { src: Operand },
+
+    /// Get the second F32 return value from a function call (for _Complex float returns on ARM/RISC-V).
+    /// On ARM64: reads s1, on RISC-V: reads fa1 as float.
+    /// Must appear immediately after a Call/CallIndirect instruction.
+    GetReturnF32Second { dest: Value },
+
+    /// Set the second F32 return value before a return (for _Complex float returns on ARM/RISC-V).
+    /// On ARM64: writes s1, on RISC-V: writes fa1 as float.
+    /// Must appear immediately before a Return terminator.
+    SetReturnF32Second { src: Operand },
+
+    /// Get the second F128 return value from a function call (for _Complex long double returns on x86-64).
+    /// On x86-64: reads st(0) after the first fstpt has already popped the real part.
+    /// Must appear immediately after a Call/CallIndirect instruction.
+    GetReturnF128Second { dest: Value },
+
+    /// Set the second F128 return value before a return (for _Complex long double returns on x86-64).
+    /// On x86-64: loads an additional value onto the x87 FPU stack as st(1).
+    /// Must appear immediately before a Return terminator.
+    SetReturnF128Second { src: Operand },
+
+    /// Read the incoming static-chain register (%r10 on x86-64 SysV nested
+    /// functions) into `dest`. Emitted at the entry of a GNU C nested
+    /// function whose body references enclosing-function state. The caller
+    /// (parent or trampoline) loads %r10 with a pointer to the enclosing
+    /// function's frame struct immediately before the call/jump.
+    GetStaticChain { dest: Value },
+
+    /// Load `src` into the static-chain register (%r10) before a direct call
+    /// to a nested function that uses its chain.
+    SetStaticChain { src: Operand },
+
+    /// Build a trampoline for taking the address of a nested function
+    /// (GCC semantics): writes a small code sequence into the 16-byte
+    /// `buffer` alloca that loads the static-chain register with `chain`
+    /// and jumps to `func`. `buffer`'s address is the resulting function
+    /// pointer value. Requires an executable stack (marked in the output
+    /// object when any trampoline is emitted).
+    InitTrampoline {
+        buffer: Value,
+        chain: Operand,
+        func: String,
+    },
+
+    /// Save the frame/stack pointer pair into the non-local-goto save area
+    /// of this function's frame struct (at `rbp_off`/`rsp_off`), so that a
+    /// nested function executing `NonlocalGoto` can restore this frame.
+    /// Emitted once at function entry when any descendant nested function
+    /// performs a non-local goto into this function.
+    NonlocalGotoSave {
+        frame: Value,
+        rbp_off: i64,
+        rsp_off: i64,
+    },
+
+    /// Non-local goto: restore the frame and stack pointers of an enclosing
+    /// function from its frame-struct save area, then jump to its label.
+    /// `label` is a NAMED assembly label: block IDs are renumbered
+    /// per-function during optimization, so a cross-function reference by
+    /// BlockId would hit an unrelated block in THIS function's label space.
+    /// The enclosing function emits `label:` as an alias at the target
+    /// block (see IrFunction::nonlocal_goto_aliases).
+    NonlocalGoto {
+        chain: Operand,
+        up: usize,
+        rbp_off: i64,
+        rsp_off: i64,
+        label: String,
+    },
+
+    /// Inline assembly statement
+    InlineAsm {
+        /// Assembly template string (with \n\t separators)
+        template: String,
+        /// Output operands: (constraint, value_ptr, optional_name)
+        outputs: Vec<(String, Value, Option<String>)>,
+        /// Input operands: (constraint, operand, optional_name)
+        inputs: Vec<(String, Operand, Option<String>)>,
+        /// Clobber list (register names and "memory", "cc")
+        clobbers: Vec<String>,
+        /// Types of operands (outputs first, then inputs) for register size selection
+        operand_types: Vec<IrType>,
+        /// Goto labels for asm goto: (C label name, resolved block ID)
+        goto_labels: Vec<(String, BlockId)>,
+        /// Symbol names for input operands with "i" constraints (e.g., function names).
+        /// One entry per input; None if the input is not a symbol reference.
+        /// Used by %P and %a modifiers to emit raw symbol names in inline asm.
+        input_symbols: Vec<Option<String>>,
+        /// Per-operand address space overrides (outputs first, then inputs).
+        /// Non-Default entries cause segment prefix on memory operands (e.g., %gs:).
+        seg_overrides: Vec<AddressSpace>,
+    },
+
+    /// Target-independent intrinsic operation (fences, SIMD, CRC32, etc.).
+    /// Each backend emits the appropriate native instructions for these operations.
+    Intrinsic {
+        dest: Option<Value>,
+        op: IntrinsicOp,
+        /// For store ops: destination pointer
+        dest_ptr: Option<Value>,
+        /// Operand arguments (varies by op)
+        args: Vec<Operand>,
+    },
+
+    /// Conditional select: %dest = select cond, true_val, false_val
+    /// Equivalent to: cond != 0 ? true_val : false_val
+    /// Lowered to cmov on x86, csel on ARM, branch-based on RISC-V.
+    /// Unlike a branch diamond, both operands are always evaluated.
+    Select {
+        dest: Value,
+        cond: Operand,
+        true_val: Operand,
+        false_val: Operand,
+        ty: IrType,
+    },
+
+    /// Save the current stack pointer: %dest = stacksave
+    /// Used to capture the SP before VLA allocations so it can be restored later.
+    StackSave { dest: Value },
+
+    /// Restore the stack pointer: stackrestore %ptr
+    /// Used to reclaim VLA stack space when jumping backward past VLA declarations.
+    StackRestore { ptr: Value },
+
+    /// Reference to a function parameter value: %dest = paramref param_idx
+    /// Represents the incoming value of the function's `param_idx`-th parameter.
+    /// Emitted in the entry block alongside param alloca + store to make parameter
+    /// initial values visible in the IR, allowing mem2reg to promote param allocas
+    /// to SSA and enabling constant propagation through reassigned parameters.
+    /// The backend translates this to a load from the appropriate argument register
+    /// or stack slot according to the calling convention.
+    ParamRef {
+        dest: Value,
+        param_idx: usize,
+        ty: IrType,
+    },
+}
+
+/// Block terminator.
+#[derive(Debug, Clone)]
+pub enum Terminator {
+    /// Return from function
+    Return(Option<Operand>),
+
+    /// Unconditional branch
+    Branch(BlockId),
+
+    /// Conditional branch
+    CondBranch {
+        cond: Operand,
+        true_label: BlockId,
+        false_label: BlockId,
+    },
+
+    /// Indirect branch (computed goto): goto *addr
+    /// possible_targets lists all labels that could be jumped to (for optimization/validation)
+    IndirectBranch {
+        target: Operand,
+        possible_targets: Vec<BlockId>,
+    },
+
+    /// Switch dispatch via jump table.
+    /// Implements dense switch statements efficiently: the backend emits a jump table
+    /// instead of a chain of compare-and-branch instructions.
+    /// `val` is the switch expression (must be integer type).
+    /// `cases` maps case values to target block IDs.
+    /// `default` is the fallback block.
+    Switch {
+        val: Operand,
+        cases: Vec<(i64, BlockId)>,
+        default: BlockId,
+        ty: IrType,
+    },
+
+    /// Unreachable (e.g., after noreturn call)
+    Unreachable,
+}
+
+// === Instruction impl: dest, result_type, value visitors ===
+
+impl Instruction {
+    /// Get the destination value defined by this instruction, if any.
+    /// Instructions like Store, Memcpy, VaStart, VaEnd, VaCopy, AtomicStore,
+    /// Fence, and InlineAsm produce no value.
+    pub fn dest(&self) -> Option<Value> {
+        match self {
+            Instruction::Alloca { dest, .. }
+            | Instruction::DynAlloca { dest, .. }
+            | Instruction::Load { dest, .. }
+            | Instruction::BinOp { dest, .. }
+            | Instruction::UnaryOp { dest, .. }
+            | Instruction::Cmp { dest, .. }
+            | Instruction::GetElementPtr { dest, .. }
+            | Instruction::Cast { dest, .. }
+            | Instruction::Copy { dest, .. }
+            | Instruction::GlobalAddr { dest, .. }
+            | Instruction::VaArg { dest, .. }
+            | Instruction::AtomicRmw { dest, .. }
+            | Instruction::AtomicCmpxchg { dest, .. }
+            | Instruction::AtomicLoad { dest, .. }
+            | Instruction::Phi { dest, .. }
+            | Instruction::LabelAddr { dest, .. }
+            | Instruction::GetReturnF64Second { dest }
+            | Instruction::GetReturnF32Second { dest }
+            | Instruction::GetReturnF128Second { dest }
+            | Instruction::GetStaticChain { dest }
+            | Instruction::Select { dest, .. }
+            | Instruction::StackSave { dest }
+            | Instruction::ParamRef { dest, .. } => Some(*dest),
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info.dest,
+            Instruction::Intrinsic { dest, .. } => *dest,
+            Instruction::Store { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::VaStart { .. }
+            | Instruction::VaEnd { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::VaArgStruct { .. }
+            | Instruction::VaArgVector { .. }
+            | Instruction::AtomicStore { .. }
+            | Instruction::AtomicInc { .. }
+            | Instruction::PgoCounterInc { .. }
+            | Instruction::Fence { .. }
+            | Instruction::SetReturnF64Second { .. }
+            | Instruction::SetReturnF32Second { .. }
+            | Instruction::SetReturnF128Second { .. }
+            | Instruction::SetStaticChain { .. }
+            | Instruction::InitTrampoline { .. }
+            | Instruction::NonlocalGotoSave { .. }
+            | Instruction::NonlocalGoto { .. }
+            | Instruction::InlineAsm { .. }
+            | Instruction::StackRestore { .. } => None,
+        }
+    }
+
+    /// Canonical classification: can this instruction write (or observably
+    /// modify) program memory?
+    ///
+    /// This is the single source of truth for memory-barrier reasoning in
+    /// the optimizer. It is an **exhaustive** match with no wildcard arm on
+    /// purpose: adding a new `Instruction` variant must fail to compile
+    /// until it is classified here. The dangerous default is "a new opcode
+    /// looks pure to every consumer of this predicate" — that exact drift
+    /// is how `VaArgStruct`, the `dest_ptr` store intrinsics, `AtomicInc`,
+    /// `PgoCounterInc`, `InitTrampoline` and `NonlocalGotoSave` once
+    /// escaped every hand-copied barrier list in the optimizer.
+    ///
+    /// Scope: "writes memory" covers writes through any pointer, va_list
+    /// state, profile-counter updates, and trampoline/nonlocal-goto buffer
+    /// initialization. It deliberately does **not** cover register-only
+    /// effects (`SetReturn*`, `SetStaticChain`), stack-pointer movement
+    /// (`DynAlloca`, `StackRestore`), or memory-ordering primitives
+    /// (`Fence`, `AtomicLoad`) — they order or move things without writing
+    /// memory bytes. Consumers that need those as relocation barriers add
+    /// them on top of this answer (see `passes::expr_sink::
+    /// is_memory_barrier`); consumers that need call refinement
+    /// (`is_pure`/`is_const`) refine upward, never below this answer.
+    pub fn may_write_memory(&self) -> bool {
+        match self {
+            // --- Value producers that never touch memory. ---
+            Instruction::Alloca { .. }
+            | Instruction::Load { .. }
+            | Instruction::BinOp { .. }
+            | Instruction::UnaryOp { .. }
+            | Instruction::Cmp { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::Phi { .. }
+            | Instruction::Select { .. }
+            | Instruction::ParamRef { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::GetReturnF64Second { .. }
+            | Instruction::GetReturnF32Second { .. }
+            | Instruction::GetReturnF128Second { .. }
+            | Instruction::GetStaticChain { .. }
+            | Instruction::SetReturnF64Second { .. }
+            | Instruction::SetReturnF32Second { .. }
+            | Instruction::SetReturnF128Second { .. }
+            | Instruction::SetStaticChain { .. }
+            // --- Stack-pointer movement: no memory bytes written. ---
+            | Instruction::DynAlloca { .. }
+            | Instruction::StackRestore { .. }
+            // --- Ordering primitives: no bytes written. ---
+            | Instruction::Fence { .. }
+            | Instruction::AtomicLoad { .. } => false,
+            // --- Direct memory writes. ---
+            Instruction::Store { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::AtomicStore { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicInc { .. }
+            | Instruction::AtomicCmpxchg { .. }
+            // --- Calls: conservative. Even a callee marked pure/const can
+            // write its own stack scratch, and a plain call can write
+            // anywhere reachable. `is_pure`/`is_const` refinement belongs
+            // to the consumer, layered ABOVE this answer.
+            | Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            // --- Inline asm: arbitrary effects. ---
+            | Instruction::InlineAsm { .. }
+            // --- va_list state lives in memory. ---
+            | Instruction::VaStart { .. }
+            | Instruction::VaEnd { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::VaArg { .. }
+            | Instruction::VaArgStruct { .. }
+            | Instruction::VaArgVector { .. }
+            // --- Profile counters are global memory. ---
+            | Instruction::PgoCounterInc { .. }
+            // --- Trampoline / saved-frame buffers are written. ---
+            | Instruction::InitTrampoline { .. }
+            | Instruction::NonlocalGotoSave { .. }
+            // --- Restores a saved frame and transfers control out of the
+            // current function; conservatively a barrier-class write. ---
+            | Instruction::NonlocalGoto { .. } => true,
+            // --- Intrinsics: the store class (VecStore*, Movnt*,
+            // Storedqu, SaveApplyArgs, ...) writes through `dest_ptr`.
+            // A small set writes through `args[0]` instead: the jump-buffer
+            // and apply-area ops. The `VecStore*` family may equally carry
+            // its destination in `args[1]` (the BB-SLP construction form),
+            // so `writes_memory_via_args()` is consulted as well.
+            // CONTRACT: a new memory-writing intrinsic op MUST be
+            // constructed with `dest_ptr: Some(..)` (or added to one of
+            // the args-writing lists) — that is the construction-site
+            // discipline this predicate keys on.
+            Instruction::Intrinsic { dest_ptr, op, .. } => {
+                dest_ptr.is_some()
+                    || op.writes_memory_via_args()
+                    || matches!(
+                        op,
+                        IntrinsicOp::BuiltinSetjmp
+                            | IntrinsicOp::BuiltinLongjmp
+                            | IntrinsicOp::DoBuiltinApply
+                            | IntrinsicOp::RestoreApplyResult
+                    )
+            }
+        }
+    }
+
+    /// Returns the result IR type of this instruction, if any.
+    /// Used to determine stack slot sizes for 128-bit values.
+    pub fn result_type(&self) -> Option<IrType> {
+        match self {
+            Instruction::Load { ty, .. } => Some(*ty),
+            Instruction::BinOp { ty, .. } => Some(*ty),
+            Instruction::UnaryOp { ty, .. } => Some(*ty),
+            Instruction::Cmp { .. } => Some(IrType::I8), // comparisons produce i8
+            Instruction::Cast { to_ty, .. } => Some(*to_ty),
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                Some(info.return_type)
+            }
+            Instruction::VaArg { result_ty, .. } => Some(*result_ty),
+            Instruction::AtomicRmw { ty, .. } => Some(*ty),
+            Instruction::AtomicCmpxchg {
+                ty, returns_bool, ..
+            } => {
+                if *returns_bool {
+                    Some(IrType::I8)
+                } else {
+                    Some(*ty)
+                }
+            }
+            Instruction::AtomicLoad { ty, .. } => Some(*ty),
+            // Alloca, GEP, GlobalAddr, Copy, DynAlloca, LabelAddr, StackSave produce pointers or copy types
+            Instruction::Alloca { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::GetElementPtr { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::StackSave { .. } => Some(IrType::Ptr),
+            Instruction::Copy { .. } => None, // unknown without tracking
+            Instruction::Phi { ty, .. } => Some(*ty),
+            Instruction::Select { ty, .. } => Some(*ty),
+            Instruction::Intrinsic { op, .. } => match op {
+                IntrinsicOp::SqrtF32
+                | IntrinsicOp::FabsF32
+                | IntrinsicOp::FmaScalarF32
+                | IntrinsicOp::FmaScalarF32Signed(..)
+                | IntrinsicOp::RoundScalarF32(_)
+                // Scalar lane extracts report their REAL scalar type. This arm
+                // is unconditional (not behind `CCC_FP_EXTRACT_HOMES`), so every
+                // `result_type()` consumer sees it.
+                //
+                // PROVENANCE, because a squashed commit message once claimed this
+                // arm as a new behaviour: the F32/F64 returns shipped in
+                // `dd012799`; `c3259492` added only this audit (34 insertions,
+                // 0 deletions, no code change). Nothing about `result_type()`'s
+                // value changed in the later commit.
+                //
+                // CENSUS, re-verified 2026-10-07. The command filters its own
+                // line, because a comment that quotes a grep pattern matches it —
+                // without the filter this line is the 19th hit in the 11th file
+                // and the census contradicts itself:
+                //   grep -RIn '\.result_type()' src | grep -v CENSUS
+                // -> **18 call sites in 10 files** — 8 in
+                // backend/stack_layout/slot_assignment.rs, 2 in
+                // backend/regalloc.rs, and one each in backend/common.rs,
+                // backend/generation.rs, backend/i686/codegen/prologue.rs,
+                // ir/provenance.rs, passes/iv_widen.rs,
+                // passes/loop_carried_forward.rs, passes/reassoc_latency.rs (the
+                // nine production files itemised below) plus one TEST-ONLY site
+                // in passes/iv_strength_reduce.rs. Audited 2026-10-06:
+                //   backend/common.rs compute_value_type_map — seeds F32/F64;
+                //     wide_typed_values only keeps size>4, so F32 lanes stop
+                //     being "wide" and F64 lanes start being recorded as wide.
+                //   backend/generation.rs val_ty — SIB index peeling inspects
+                //     integer/pointer types only; a float entry is inert.
+                //   backend/i686/codegen/prologue.rs — `size()>4 => false`, so
+                //     F64 lanes now veto the 32-bit compaction they previously
+                //     slipped through as `None`; strictly more conservative.
+                //   stack_layout/slot_assignment.rs — (a) compact_i686_values
+                //     admits F32 (4-byte) lanes; (b) `is_small` gives an F32
+                //     lane a width-partitioned 4-byte slot instead of the
+                //     8-byte fallback; (c) is_wide_on_32bit / propagate_wide
+                //     mark F64 lanes wide so i686 uses the 8-byte path.
+                //     Pinned by `scalar_lane_slot_tests` (four overlapping live
+                //     lanes, non-overlapping spans, byte-exact reload across an
+                //     adjacent 4-byte boundary) and by
+                //     tests/regression/fp_extract_slot_boundary.c on x86-64,
+                //     x86-64-v3 and i686, with and without small slots.
+                //   ir/provenance.rs produces_pointer — compares against Ptr;
+                //     `None` and `Some(F32)` are both false. No change.
+                //   passes/iv_widen.rs defining_type — only reached for phi and
+                //     cmp operands of integer IVs; a float type selects Se/64
+                //     and is rejected by the widening candidate filter.
+                //   passes/loop_carried_forward.rs — the fallback arm maps
+                //     Ptr/pointer-width-int and everything else to `None`,
+                //     which is what `None` already produced. No change.
+                //   passes/reassoc_latency.rs gpr_weight — a float weighs 0
+                //     GPRs instead of the `None` default 1; that is the
+                //     correct residency weight for an XMM value.
+                //   backend/regalloc.rs collect_f64_values/collect_non_gpr —
+                //     the only two sites gated by `CCC_FP_EXTRACT_HOMES`.
+                | IntrinsicOp::CopysignF32
+                | IntrinsicOp::VecExtractLaneF32x4
+                | IntrinsicOp::VecExtractLaneF32x8 => Some(IrType::F32),
+                IntrinsicOp::SqrtF64
+                | IntrinsicOp::FabsF64
+                | IntrinsicOp::FmaScalarF64
+                | IntrinsicOp::FmaScalarF64Signed(..)
+                | IntrinsicOp::RoundScalarF64(_)
+                | IntrinsicOp::CopysignF64
+                | IntrinsicOp::VecExtractLaneF64x2
+                | IntrinsicOp::VecExtractLaneF64x4
+                | IntrinsicOp::StrictRecipMulAddF64x4
+                | IntrinsicOp::StrictRecipMulAddPackedF64x4 => Some(IrType::F64),
+                // The bit-op F128 builtins produce a full _Float128. Their
+                // codegen stores 16 bytes (movdqu) to the dest's home; a
+                // None here made the slot allocator reserve only 8 bytes,
+                // so the store overflowed into the adjacent slot and
+                // corrupted the neighbouring value (glibc_f128_builtins:
+                // copysign's result temp at 0x18 overwrote the operand's
+                // slot at 0x20, mis-decoding every later operation that
+                // read the operand).
+                IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign => {
+                    Some(IrType::F128)
+                }
+                // 64-bit scalar results: the intrinsic returns `long long` /
+                // `unsigned long long` — on i686 that is an eax:edx pair
+                // living in an 8-byte slot. A None here made the slot
+                // allocator reserve only 4 bytes, so the pair store
+                // (emit_store_acc_pair) spilled the high dword into the
+                // neighbouring slot and every 64-bit consumer read a
+                // sign-extended low dword (simd_insert_extract pextrq0/
+                // pextrq1).
+                IntrinsicOp::LoadStackGuard => Some(IrType::Ptr),
+                IntrinsicOp::Pextrq128 | IntrinsicOp::Cvtsi128Si64 | IntrinsicOp::Cvtsd2Si64 | IntrinsicOp::Cvtss2Si64 => Some(IrType::I64),
+                _ => None,
+            },
+            Instruction::GetReturnF128Second { .. } => Some(IrType::F128),
+            Instruction::GetStaticChain { .. } => Some(IrType::Ptr),
+            Instruction::ParamRef { ty, .. } => Some(*ty),
+            _ => None,
+        }
+    }
+
+    /// Call `f(value_id)` for every Value ID used as an operand in this instruction.
+    ///
+    /// This is the canonical value visitor. All passes that need to enumerate
+    /// instruction operands should use this method to avoid duplicating the
+    /// match block.
+    #[inline]
+    pub fn for_each_used_value(&self, mut f: impl FnMut(u32)) {
+        #[inline(always)]
+        fn visit_op(op: &Operand, f: &mut impl FnMut(u32)) {
+            if let Operand::Value(v) = op {
+                f(v.0);
+            }
+        }
+        match self {
+            Instruction::Alloca { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::Fence { .. }
+            | Instruction::GetReturnF64Second { .. }
+            | Instruction::GetReturnF32Second { .. }
+            | Instruction::GetReturnF128Second { .. }
+            | Instruction::GetStaticChain { .. }
+            | Instruction::ParamRef { .. }
+            | Instruction::PgoCounterInc { .. } => {}
+
+            Instruction::Load { ptr, .. } => f(ptr.0),
+            Instruction::Store { val, ptr, .. } => {
+                visit_op(val, &mut f);
+                f(ptr.0);
+            }
+            Instruction::DynAlloca { size, .. } => visit_op(size, &mut f),
+            Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
+                visit_op(lhs, &mut f);
+                visit_op(rhs, &mut f);
+            }
+            Instruction::UnaryOp { src, .. }
+            | Instruction::Cast { src, .. }
+            | Instruction::Copy { src, .. } => visit_op(src, &mut f),
+            Instruction::Call { info, .. } => {
+                for arg in &info.args {
+                    visit_op(arg, &mut f);
+                }
+            }
+            Instruction::CallIndirect { func_ptr, info } => {
+                visit_op(func_ptr, &mut f);
+                for arg in &info.args {
+                    visit_op(arg, &mut f);
+                }
+            }
+            Instruction::GetElementPtr { base, offset, .. } => {
+                f(base.0);
+                visit_op(offset, &mut f);
+            }
+            Instruction::Memcpy { dest, src, .. } => {
+                f(dest.0);
+                f(src.0);
+            }
+            Instruction::VaArg { va_list_ptr, .. }
+            | Instruction::VaStart { va_list_ptr }
+            | Instruction::VaEnd { va_list_ptr } => f(va_list_ptr.0),
+            Instruction::VaCopy { dest_ptr, src_ptr } => {
+                f(dest_ptr.0);
+                f(src_ptr.0);
+            }
+            Instruction::VaArgStruct {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            }
+            | Instruction::VaArgVector {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            } => {
+                f(dest_ptr.0);
+                f(va_list_ptr.0);
+            }
+            Instruction::AtomicRmw { ptr, val, .. } => {
+                visit_op(ptr, &mut f);
+                visit_op(val, &mut f);
+            }
+            Instruction::AtomicCmpxchg {
+                ptr,
+                expected,
+                desired,
+                ..
+            } => {
+                visit_op(ptr, &mut f);
+                visit_op(expected, &mut f);
+                visit_op(desired, &mut f);
+            }
+            Instruction::AtomicLoad { ptr, .. } => visit_op(ptr, &mut f),
+            Instruction::AtomicStore { ptr, val, .. } => {
+                visit_op(ptr, &mut f);
+                visit_op(val, &mut f);
+            }
+            Instruction::AtomicInc { ptr, .. } => visit_op(ptr, &mut f),
+            Instruction::Phi { incoming, .. } => {
+                for (op, _) in incoming {
+                    visit_op(op, &mut f);
+                }
+            }
+            Instruction::SetReturnF64Second { src }
+            | Instruction::SetReturnF32Second { src }
+            | Instruction::SetReturnF128Second { src }
+            | Instruction::SetStaticChain { src } => visit_op(src, &mut f),
+            Instruction::NonlocalGoto { chain, .. } => visit_op(chain, &mut f),
+            Instruction::InitTrampoline { buffer, chain, .. } => {
+                f(buffer.0);
+                visit_op(chain, &mut f);
+            }
+            Instruction::NonlocalGotoSave { frame, .. } => f(frame.0),
+            Instruction::InlineAsm {
+                outputs, inputs, ..
+            } => {
+                for (_, ptr, _) in outputs {
+                    f(ptr.0);
+                }
+                for (_, op, _) in inputs {
+                    visit_op(op, &mut f);
+                }
+            }
+            Instruction::Intrinsic { dest_ptr, args, .. } => {
+                if let Some(ptr) = dest_ptr {
+                    f(ptr.0);
+                }
+                for arg in args {
+                    visit_op(arg, &mut f);
+                }
+            }
+            Instruction::Select {
+                cond,
+                true_val,
+                false_val,
+                ..
+            } => {
+                visit_op(cond, &mut f);
+                visit_op(true_val, &mut f);
+                visit_op(false_val, &mut f);
+            }
+            Instruction::StackRestore { ptr } => f(ptr.0),
+        }
+    }
+
+    /// Mutably visit every direct `Value` use that is not wrapped in an
+    /// [`Operand`]. Together with [`Instruction::for_each_operand_mut`], this
+    /// is the complete mutable counterpart of `for_each_used_value`.
+    ///
+    /// Keeping pointer/base/destination uses here prevents transformation
+    /// passes from rewriting only scalar operands while leaving an intrinsic
+    /// `dest_ptr` or memcpy endpoint bound to a removed SSA definition.
+    #[inline]
+    pub fn for_each_value_use_mut(&mut self, mut f: impl FnMut(&mut Value)) {
+        match self {
+            Instruction::Store { ptr, .. }
+            | Instruction::Load { ptr, .. }
+            | Instruction::StackRestore { ptr } => f(ptr),
+            Instruction::GetElementPtr { base, .. } => f(base),
+            Instruction::Memcpy { dest, src, .. } => {
+                f(dest);
+                f(src);
+            }
+            Instruction::VaArg { va_list_ptr, .. }
+            | Instruction::VaStart { va_list_ptr }
+            | Instruction::VaEnd { va_list_ptr } => f(va_list_ptr),
+            Instruction::VaCopy { dest_ptr, src_ptr } => {
+                f(dest_ptr);
+                f(src_ptr);
+            }
+            Instruction::VaArgStruct {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            }
+            | Instruction::VaArgVector {
+                dest_ptr,
+                va_list_ptr,
+                ..
+            } => {
+                f(dest_ptr);
+                f(va_list_ptr);
+            }
+            Instruction::InlineAsm { outputs, .. } => {
+                for (_, value, _) in outputs {
+                    f(value);
+                }
+            }
+            Instruction::InitTrampoline { buffer, .. } => f(buffer),
+            Instruction::NonlocalGotoSave { frame, .. } => f(frame),
+            Instruction::Intrinsic { dest_ptr, .. } => {
+                if let Some(ptr) = dest_ptr {
+                    f(ptr);
+                }
+            }
+            // Exhaustive list of remaining variants without direct Value uses.
+            // No wildcard is used intentionally so that adding a new IR variant
+            // with a direct Value field triggers a compile error.
+            Instruction::Alloca { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::BinOp { .. }
+            | Instruction::UnaryOp { .. }
+            | Instruction::Cmp { .. }
+            | Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::Fence { .. }
+            | Instruction::AtomicRmw { .. }
+            | Instruction::AtomicCmpxchg { .. }
+            | Instruction::AtomicLoad { .. }
+            | Instruction::AtomicStore { .. }
+            | Instruction::AtomicInc { .. }
+            | Instruction::PgoCounterInc { .. }
+            | Instruction::Phi { .. }
+            | Instruction::Select { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::ParamRef { .. }
+            | Instruction::GetReturnF64Second { .. }
+            | Instruction::SetReturnF64Second { .. }
+            | Instruction::GetReturnF32Second { .. }
+            | Instruction::SetReturnF32Second { .. }
+            | Instruction::GetReturnF128Second { .. }
+            | Instruction::SetReturnF128Second { .. }
+            | Instruction::GetStaticChain { .. }
+            | Instruction::SetStaticChain { .. }
+            | Instruction::NonlocalGoto { .. } => {}
+        }
+    }
+
+    /// Mutably visit every Operand stored in this instruction.
+    ///
+    /// This is the mutation counterpart to `for_each_used_value`. Keeping the
+    /// traversal canonical prevents optimization passes from forgetting less
+    /// common operand-bearing forms such as atomics, inline asm inputs, or
+    /// intrinsic argument lists.
+    #[inline]
+    pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
+        match self {
+            Instruction::DynAlloca { size, .. }
+            | Instruction::UnaryOp { src: size, .. }
+            | Instruction::Cast { src: size, .. }
+            | Instruction::Copy { src: size, .. }
+            | Instruction::AtomicLoad { ptr: size, .. }
+            | Instruction::AtomicInc { ptr: size, .. } => f(size),
+            Instruction::PgoCounterInc { .. } => {}
+            Instruction::Store { val, .. } => f(val),
+            Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            Instruction::Call { info, .. } => {
+                for arg in &mut info.args {
+                    f(arg);
+                }
+            }
+            Instruction::CallIndirect { func_ptr, info } => {
+                f(func_ptr);
+                for arg in &mut info.args {
+                    f(arg);
+                }
+            }
+            Instruction::GetElementPtr { offset, .. } => f(offset),
+            Instruction::AtomicRmw { ptr, val, .. } => {
+                f(ptr);
+                f(val);
+            }
+            Instruction::AtomicCmpxchg {
+                ptr,
+                expected,
+                desired,
+                ..
+            } => {
+                f(ptr);
+                f(expected);
+                f(desired);
+            }
+            Instruction::AtomicStore { ptr, val, .. } => {
+                f(ptr);
+                f(val);
+            }
+            Instruction::Phi { incoming, .. } => {
+                for (op, _) in incoming {
+                    f(op);
+                }
+            }
+            Instruction::SetReturnF64Second { src }
+            | Instruction::SetReturnF32Second { src }
+            | Instruction::SetReturnF128Second { src }
+            | Instruction::SetStaticChain { src } => f(src),
+            Instruction::NonlocalGoto { chain, .. } => f(chain),
+            Instruction::InitTrampoline { chain, .. } => f(chain),
+            Instruction::InlineAsm { inputs, .. } => {
+                for (_, op, _) in inputs {
+                    f(op);
+                }
+            }
+            Instruction::Intrinsic { args, .. } => {
+                for arg in args {
+                    f(arg);
+                }
+            }
+            Instruction::Select {
+                cond,
+                true_val,
+                false_val,
+                ..
+            } => {
+                f(cond);
+                f(true_val);
+                f(false_val);
+            }
+            // These variants contain Value fields, not Operand fields, or no
+            // source operands at all. Their values require a distinct remap.
+            Instruction::Alloca { .. }
+            | Instruction::Load { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::VaArg { .. }
+            | Instruction::VaArgStruct { .. }
+            | Instruction::VaArgVector { .. }
+            | Instruction::VaStart { .. }
+            | Instruction::VaEnd { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::Fence { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::GetReturnF64Second { .. }
+            | Instruction::GetReturnF32Second { .. }
+            | Instruction::GetReturnF128Second { .. }
+            | Instruction::StackSave { .. }
+            | Instruction::StackRestore { .. }
+            | Instruction::ParamRef { .. }
+            | Instruction::GetStaticChain { .. }
+            | Instruction::NonlocalGotoSave { .. } => {}
+        }
+    }
+
+    /// Collect all Value IDs used (as operands, not defined) by this instruction.
+    pub fn used_values(&self) -> Vec<u32> {
+        let mut used = Vec::new();
+        self.for_each_used_value(|id| used.push(id));
+        used
+    }
+}
+
+/// Replace every read of `old` in `inst` with `new_op`.
+///
+/// Both visitor kinds are required and neither is redundant:
+/// [`Instruction::for_each_operand_mut`] covers the `Operand` slots (binary and
+/// unary operands, GEP offsets, store values, call and intrinsic arguments),
+/// while [`Instruction::for_each_value_use_mut`] covers the bare `Value` slots
+/// (`GetElementPtr.base`, `Load.ptr`, `dest_ptr`, ...) that a pass substituting
+/// a *value* must redirect as well.  Hand-rolled `match` arms over the
+/// instruction enum are how the two get out of sync: a shape nobody remembered
+/// to list keeps reading the replaced value, and the resulting IR still
+/// validates because the stale read is a value that is still defined.
+///
+/// Returns the number of slots rewritten, so a caller that has to decide
+/// whether its transformation fired can use the count directly.  The return
+/// is deliberately **not** `#[must_use]`: most callers only want the effect.
+///
+/// The reach rules a caller must respect (a rewrite may not put the replacement behind itself) are
+/// in `docs/SESSION_FOLLOWUP_CANON_REWRITERS.md`; the vectorizer's outside-the-loop rewriters
+/// implement them in `rewrite_uses_where_available`.
+///
+/// This pair is the canonical form of the two-walk rewrite.  The passes that
+/// rewrite induction-variable uses route through it instead of keeping private
+/// copies (`iv_widen`, `iv_strength_reduce`, `quadratic_sr`,
+/// `loop_unroll`/`loop_rotate`, `range_check`, `nested_functions`, `vectorize`,
+/// `loop_memory_promote`); the map-valued form is
+/// [`replace_values_in_inst_map`].  The one deliberate exception is
+/// `split_ranges`, whose table must suppress phi-incoming rewrites
+/// (`rewrite_phi = false`), which a generic visitor cannot express — it carries
+/// that note beside the table, and `value_replacement_tests` pins the coverage
+/// both forms must have in common.
+#[inline]
+pub fn replace_operand_value(inst: &mut Instruction, old: Value, new_op: Operand) -> usize {
+    let mut rewritten = 0usize;
+    let new_val = match new_op {
+        Operand::Value(v) => Some(v),
+        Operand::Const(_) => None,
+    };
+    inst.for_each_operand_mut(|op| {
+        if matches!(op, Operand::Value(v) if *v == old) {
+            *op = new_op;
+            rewritten += 1;
+        }
+    });
+    // A constant cannot stand in a bare `Value` slot, so those slots are left
+    // alone: replacing `base` with a constant would need a materialization this
+    // helper has nowhere to put.
+    if let Some(nv) = new_val {
+        inst.for_each_value_use_mut(|field| {
+            if *field == old {
+                *field = nv;
+                rewritten += 1;
+            }
+        });
+    }
+    rewritten
+}
+
+/// The map-valued form of [`replace_operand_value`]: every read of
+/// a value present as a key in `map` is redirected to that key's replacement.
+/// Both walks, for the reason above; destinations are never rewritten.
+#[inline]
+pub fn replace_values_in_inst_map(inst: &mut Instruction, map: &FxHashMap<u32, u32>) -> usize {
+    let mut rewritten = 0usize;
+    inst.for_each_operand_mut(|op| {
+        if let Operand::Value(v) = op {
+            if let Some(&to) = map.get(&v.0) {
+                *op = Operand::Value(Value(to));
+                rewritten += 1;
+            }
+        }
+    });
+    inst.for_each_value_use_mut(|field| {
+        if let Some(&to) = map.get(&field.0) {
+            field.0 = to;
+            rewritten += 1;
+        }
+    });
+    rewritten
+}
+
+/// Replace every read of `old` in a terminator with `new_op`.
+#[inline]
+pub fn replace_terminator_value(term: &mut Terminator, old: Value, new_op: Operand) -> usize {
+    let mut rewritten = 0usize;
+    term.for_each_operand_mut(|op| {
+        if matches!(op, Operand::Value(v) if *v == old) {
+            *op = new_op;
+            rewritten += 1;
+        }
+    });
+    rewritten
+}
+
+/// The map-valued form of [`replace_terminator_value`].
+#[inline]
+pub fn replace_values_in_terminator_map(term: &mut Terminator, map: &FxHashMap<u32, u32>) -> usize {
+    let mut rewritten = 0usize;
+    term.for_each_operand_mut(|op| {
+        if let Operand::Value(v) = op {
+            if let Some(&to) = map.get(&v.0) {
+                *op = Operand::Value(Value(to));
+                rewritten += 1;
+            }
+        }
+    });
+    rewritten
+}
+
+impl Terminator {
+    /// Mutably visit every Operand stored in this terminator.
+    #[inline]
+    pub fn for_each_operand_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
+        match self {
+            Terminator::Return(value) => {
+                if let Some(op) = value {
+                    f(op);
+                }
+            }
+            Terminator::CondBranch { cond, .. }
+            | Terminator::IndirectBranch { target: cond, .. }
+            | Terminator::Switch { val: cond, .. } => f(cond),
+            Terminator::Branch(_) | Terminator::Unreachable => {}
+        }
+    }
+
+    /// Call `f(value_id)` for every Value ID used as an operand in this terminator.
+    #[inline]
+    pub fn for_each_used_value(&self, mut f: impl FnMut(u32)) {
+        match self {
+            Terminator::Return(Some(Operand::Value(v))) => f(v.0),
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            } => f(v.0),
+            Terminator::IndirectBranch {
+                target: Operand::Value(v),
+                ..
+            } => f(v.0),
+            Terminator::Switch {
+                val: Operand::Value(v),
+                ..
+            } => f(v.0),
+            _ => {}
+        }
+    }
+
+    /// Collect all Value IDs used by this terminator.
+    pub fn used_values(&self) -> Vec<u32> {
+        let mut used = Vec::new();
+        self.for_each_used_value(|id| used.push(id));
+        used
+    }
+}
+
+#[cfg(test)]
+mod value_replacement_tests {
+    use super::*;
+
+    fn gep(dest: u32, base: u32, offset: u32) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset: Operand::Value(Value(offset)),
+            ty: IrType::I8,
+        }
+    }
+
+    #[test]
+    fn replaces_operand_and_bare_value_slots_together() {
+        // The GEP reads the old value in BOTH shapes: `offset` is an Operand
+        // slot, `base` is a bare Value field.  A replacement that handles only
+        // one of them leaves the instruction reading the old value.
+        let mut inst = gep(1, 7, 7);
+        replace_operand_value(&mut inst, Value(7), Operand::Value(Value(42)));
+        match inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(42), "bare Value slot must be redirected");
+                assert_eq!(
+                    offset,
+                    Operand::Value(Value(42)),
+                    "Operand slot must be redirected"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn leaves_unrelated_values_alone() {
+        let mut inst = gep(1, 7, 8);
+        replace_operand_value(&mut inst, Value(9), Operand::Value(Value(42)));
+        match inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(7));
+                assert_eq!(offset, Operand::Value(Value(8)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn constant_replacement_leaves_bare_value_slots_untouched() {
+        // `Operand::Const` has no `Value` form, so the bare slots must survive
+        // unchanged -- rewriting them to a placeholder would invert the pass's
+        // intent (and would not be a value at all).
+        let mut inst = gep(1, 7, 7);
+        replace_operand_value(&mut inst, Value(7), Operand::Const(IrConst::I64(3)));
+        match inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(7));
+                assert_eq!(offset, Operand::Const(IrConst::I64(3)));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn terminator_operands_are_replaced() {
+        let mut term = Terminator::Return(Some(Operand::Value(Value(5))));
+        replace_terminator_value(&mut term, Value(5), Operand::Value(Value(6)));
+        match term {
+            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v, Value(6)),
+            _ => panic!("return operand must be redirected"),
+        }
+    }
+
+    #[test]
+    fn returns_the_number_of_slots_rewritten() {
+        // GEP reads the old value twice (offset + base) plus once in the
+        // terminator: the count is what a caller uses to decide it fired.
+        let mut inst = gep(1, 7, 7);
+        assert_eq!(
+            replace_operand_value(&mut inst, Value(7), Operand::Value(Value(42))),
+            2
+        );
+        let mut term = Terminator::Switch {
+            val: Operand::Value(Value(42)),
+            cases: vec![],
+            default: BlockId(0),
+            ty: IrType::I32,
+        };
+        assert_eq!(
+            replace_terminator_value(&mut term, Value(42), Operand::Value(Value(9))),
+            1
+        );
+        // A value the instruction does not read is reported as zero rewrites.
+        let mut other = gep(1, 3, 3);
+        assert_eq!(
+            replace_operand_value(&mut other, Value(7), Operand::Value(Value(42))),
+            0
+        );
+    }
+
+    /// The bare-`Value` slots that the hand-rolled tables historically forgot.
+    /// `VaEnd`, `VaStart`, `VaCopy`, `Memcpy`, `StackRestore`, `InlineAsm`
+    /// outputs and `Intrinsic::dest_ptr` all hold a `Value` that is *not* an
+    /// `Operand`, so only the second walk reaches them; a table that groups them
+    /// with the field-less variants (`VaEnd { .. } => {}`) silently keeps the old
+    /// value.  Two such tables were found in the tree and fixed.
+    #[test]
+    fn bare_value_slots_are_covered_by_the_canonical_walk() {
+        let cases: Vec<Instruction> = vec![
+            Instruction::VaEnd {
+                va_list_ptr: Value(7),
+            },
+            Instruction::VaStart {
+                va_list_ptr: Value(7),
+            },
+            Instruction::VaCopy {
+                dest_ptr: Value(7),
+                src_ptr: Value(7),
+            },
+            Instruction::Memcpy {
+                dest: Value(9),
+                src: Value(7),
+                size: 8,
+            },
+            Instruction::StackRestore { ptr: Value(7) },
+            Instruction::InlineAsm {
+                template: String::new(),
+                inputs: vec![],
+                outputs: vec![("=r".to_string(), Value(7), None)],
+                clobbers: vec![],
+                operand_types: vec![IrType::I64],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            },
+            Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::Storedqu,
+                dest_ptr: Some(Value(7)),
+                args: vec![],
+            },
+        ];
+        for mut inst in cases {
+            let name = format!("{inst:?}");
+            let n = replace_operand_value(&mut inst, Value(7), Operand::Value(Value(70)));
+            assert!(n >= 1, "canonical walk missed a bare Value slot: {name}");
+            assert!(
+                !format!("{inst:?}").contains("Value(7)"),
+                "stale Value(7) survived the rewrite: {inst:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_form_matches_the_single_value_form() {
+        let mut map = FxHashMap::default();
+        map.insert(7u32, 70u32);
+        map.insert(8u32, 80u32);
+        let mut gep_inst = gep(1, 7, 8);
+        assert_eq!(replace_values_in_inst_map(&mut gep_inst, &map), 2);
+        match gep_inst {
+            Instruction::GetElementPtr { base, offset, .. } => {
+                assert_eq!(base, Value(70));
+                assert_eq!(offset, Operand::Value(Value(80)));
+            }
+            _ => unreachable!(),
+        }
+        let mut ender = Instruction::VaEnd {
+            va_list_ptr: Value(8),
+        };
+        assert_eq!(replace_values_in_inst_map(&mut ender, &map), 1);
+        let mut term = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(1),
+            false_label: BlockId(2),
+        };
+        assert_eq!(replace_values_in_terminator_map(&mut term, &map), 1);
+        match term {
+            Terminator::CondBranch { cond, .. } => {
+                assert_eq!(cond, Operand::Value(Value(70)));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_value_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn mutates_intrinsic_destination_pointer_without_touching_operand_args() {
+        let mut inst = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::Storedqu,
+            dest_ptr: Some(Value(7)),
+            args: vec![Operand::Value(Value(8))],
+        };
+        inst.for_each_value_use_mut(|value| {
+            if value.0 == 7 {
+                *value = Value(70);
+            }
+        });
+        match inst {
+            Instruction::Intrinsic { dest_ptr, args, .. } => {
+                assert_eq!(dest_ptr, Some(Value(70)));
+                assert!(matches!(args[0], Operand::Value(Value(8))));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod span_edit_tests {
+    //! The `BasicBlock` span primitives against a reference model: after every
+    //! edit, instruction order and each instruction's span must match exactly
+    //! (not merely the lengths), so a moved or surviving instruction keeps its
+    //! source line through arbitrary edit sequences.
+    use super::*;
+
+    fn inst(id: u32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(id),
+            src: Operand::Const(IrConst::I32(0)),
+        }
+    }
+    fn sp(id: u32) -> Span {
+        Span::new(id, id + 1, 1)
+    }
+    fn ids(b: &BasicBlock) -> Vec<u32> {
+        b.instructions.iter().map(|i| i.dest().unwrap().0).collect()
+    }
+    fn block(ids: &[u32], tracked: bool) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(0),
+            instructions: ids.iter().map(|&i| inst(i)).collect(),
+            source_spans: if tracked {
+                ids.iter().map(|&i| sp(i)).collect()
+            } else {
+                Vec::new()
+            },
+            terminator: Terminator::Return(None),
+        }
+    }
+
+    #[test]
+    fn real_span_starts_tracking_only_in_an_empty_block() {
+        let mut b = block(&[], false);
+        b.push_inst(inst(1), sp(1));
+        assert_eq!(b.source_spans, vec![sp(1)]);
+        // A non-empty untracked block stays untracked: the existing
+        // instructions have no spans to pair with.
+        let mut b = block(&[1], false);
+        b.push_inst(inst(2), sp(2));
+        assert!(b.source_spans.is_empty());
+        let mut b = block(&[1], false);
+        b.insert_insts(0, [inst(2), inst(3)], sp(2));
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn dummy_span_never_starts_tracking() {
+        let mut b = block(&[], false);
+        b.push_inst(inst(1), Span::dummy());
+        b.extend_insts([inst(2)], Span::dummy());
+        b.insert_insts(0, [inst(3)], Span::dummy());
+        assert_eq!(ids(&b), vec![3, 1, 2]);
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn empty_insertion_into_an_empty_block_stays_untracked() {
+        let mut b = block(&[], false);
+        b.insert_insts(0, std::iter::empty(), sp(9));
+        b.extend_insts(std::iter::empty(), sp(9));
+        assert!(b.instructions.is_empty() && b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn drifted_block_is_neither_panicked_on_nor_repaired_by_local_edits() {
+        // 2 spans for 3 instructions: what a broken pass leaves behind.  Local
+        // edits must not index the short list (no panic) and must not touch
+        // it (the verifier reports the drift against the pass that caused it).
+        let mut b = block(&[1, 2, 3], true);
+        b.source_spans.pop();
+        let drift = b.source_spans.clone();
+        b.insert_inst(3, inst(4), sp(4));
+        b.push_inst(inst(5), sp(5));
+        b.insert_insts(0, [inst(6)], sp(6));
+        b.extend_insts([inst(7)], sp(7));
+        assert_eq!(b.remove_inst(5).dest(), Some(Value(5)));
+        b.splice_inst(4, vec![inst(8), inst(9)]);
+        b.retain_insts(|i| i.dest() != Some(Value(2)));
+        b.remove_insts(0..1);
+        assert_eq!(b.span_at(2), Span::dummy());
+        assert_eq!(ids(&b), vec![1, 3, 8, 9, 7]);
+        assert_eq!(b.source_spans, drift);
+        // A rebuild cannot map drifted spans; it gets none and the block
+        // becomes untracked.
+        assert!(b.take_parallel_spans().is_empty());
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[test]
+    fn splice_replacements_inherit_the_replaced_span() {
+        let mut b = block(&[1, 2, 3], true);
+        b.splice_inst(1, vec![inst(7), inst(8), inst(9)]);
+        assert_eq!(ids(&b), vec![1, 7, 8, 9, 3]);
+        assert_eq!(b.source_spans, vec![sp(1), sp(2), sp(2), sp(2), sp(3)]);
+        // Splicing in nothing is a removal.
+        b.splice_inst(0, Vec::new());
+        assert_eq!(b.source_spans, vec![sp(2), sp(2), sp(2), sp(3)]);
+    }
+
+    #[test]
+    fn append_spanned_covers_all_four_tracking_combinations() {
+        let mut both = block(&[1], true);
+        both.append_spanned(vec![inst(2)], vec![sp(2)]);
+        assert_eq!(both.source_spans, vec![sp(1), sp(2)]);
+        let mut only_self = block(&[1], true);
+        only_self.append_spanned(vec![inst(2)], Vec::new());
+        assert_eq!(only_self.source_spans, vec![sp(1), Span::dummy()]);
+        let mut only_incoming = block(&[1], false);
+        only_incoming.append_spanned(vec![inst(2)], vec![sp(2)]);
+        assert!(only_incoming.source_spans.is_empty());
+        let mut empty_self = block(&[], false);
+        empty_self.append_spanned(vec![inst(2)], vec![sp(2)]);
+        assert_eq!(empty_self.source_spans, vec![sp(2)]);
+        // A drifted incoming list is not trusted.
+        let mut drifted_incoming = block(&[1], true);
+        drifted_incoming.append_spanned(vec![inst(2), inst(3)], vec![sp(2)]);
+        assert_eq!(
+            drifted_incoming.source_spans,
+            vec![sp(1), Span::dummy(), Span::dummy()]
+        );
+    }
+
+    #[test]
+    fn synthesized_replacement_keeps_tracking_state() {
+        let mut t = block(&[1, 2], true);
+        t.replace_insts_synthesized(vec![inst(5), inst(6), inst(7)]);
+        assert_eq!(t.source_spans, vec![Span::dummy(); 3]);
+        let mut u = block(&[1, 2], false);
+        u.replace_insts_synthesized(vec![inst(5)]);
+        assert!(u.source_spans.is_empty());
+    }
+
+    #[test]
+    fn replace_insts_accepts_paired_or_untracked_lists() {
+        let mut b = block(&[1, 2], true);
+        let spans = b.take_parallel_spans();
+        assert_eq!(spans, vec![sp(1), sp(2)]);
+        assert!(b.source_spans.is_empty());
+        b.replace_insts(vec![inst(2), inst(1)], vec![sp(2), sp(1)]);
+        assert_eq!(b.source_spans, vec![sp(2), sp(1)]);
+        b.replace_insts(vec![inst(3)], Vec::new());
+        assert!(b.source_spans.is_empty());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "replace_insts: 1 spans for 2 instructions")]
+    fn replace_insts_rejects_unpaired_lists_in_debug_builds() {
+        block(&[], false).replace_insts(vec![inst(1), inst(2)], vec![sp(1)]);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn replace_insts_degrades_unpaired_lists_to_untracked_in_release() {
+        let mut b = block(&[], false);
+        b.replace_insts(vec![inst(1), inst(2)], vec![sp(1)]);
+        assert_eq!(ids(&b), vec![1, 2]);
+        assert!(b.source_spans.is_empty());
+    }
+
+    /// Seeded random edit sequences, checked after every step against a model
+    /// that applies the documented rules: a block is tracked iff its spans
+    /// are parallel; an emptied block is untracked; only a real span inserted
+    /// into an empty untracked block starts tracking.
+    #[test]
+    fn random_edit_sequences_match_the_reference_model() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let mut restarted = 0usize;
+        for case in 0..400 {
+            let start_tracked = case % 4 != 0;
+            let mut b = block(&[1, 2, 3], start_tracked);
+            let mut model: Vec<(u32, Span)> = (1..=3).map(|i| (i, sp(i))).collect();
+            let mut tracked = start_tracked;
+            let mut next = 100u32;
+            for _step in 0..40 {
+                let len = model.len();
+                // Tracking state an insertion of `added` instructions with `s` leaves.
+                let starts = |tracked: bool, empty: bool, s: Span, added: usize| {
+                    tracked || (empty && s != Span::dummy() && added > 0)
+                };
+                let mut fresh = |n: usize| -> Vec<u32> {
+                    (0..n)
+                        .map(|_| {
+                            next += 1;
+                            next
+                        })
+                        .collect()
+                };
+                match rnd(10) {
+                    0 => {
+                        let at = rnd(len + 1);
+                        let id = fresh(1)[0];
+                        let s = if rnd(2) == 0 { Span::dummy() } else { sp(id) };
+                        if !tracked && starts(false, len == 0, s, 1) {
+                            restarted += 1;
+                        }
+                        tracked = starts(tracked, len == 0, s, 1);
+                        b.insert_inst(at, inst(id), s);
+                        model.insert(at, (id, s));
+                    }
+                    1 => {
+                        let at = rnd(len + 1);
+                        let new = fresh(rnd(4));
+                        let s = if rnd(3) == 0 { Span::dummy() } else { sp(7) };
+                        tracked = starts(tracked, len == 0, s, new.len());
+                        b.insert_insts(at, new.iter().map(|&i| inst(i)), s);
+                        model.splice(at..at, new.iter().map(|&i| (i, s)));
+                    }
+                    2 => {
+                        let id = fresh(1)[0];
+                        b.push_inst(inst(id), Span::dummy());
+                        model.push((id, Span::dummy()));
+                    }
+                    3 => {
+                        let new = fresh(rnd(3));
+                        tracked = starts(tracked, len == 0, sp(9), new.len());
+                        b.extend_insts(new.iter().map(|&i| inst(i)), sp(9));
+                        model.extend(new.iter().map(|&i| (i, sp(9))));
+                    }
+                    4 if len > 0 => {
+                        let at = rnd(len);
+                        assert_eq!(b.remove_inst(at).dest(), Some(Value(model.remove(at).0)));
+                    }
+                    5 if len > 0 => {
+                        let at = rnd(len);
+                        let inherited = if tracked { model[at].1 } else { Span::dummy() };
+                        let new = fresh(rnd(3));
+                        b.splice_inst(at, new.iter().map(|&i| inst(i)).collect());
+                        model.splice(at..=at, new.iter().map(|&i| (i, inherited)));
+                    }
+                    6 => {
+                        let m = 2 + rnd(3) as u32;
+                        b.retain_insts(|i| i.dest().unwrap().0 % m != 0);
+                        model.retain(|&(id, _)| id % m != 0);
+                    }
+                    7 => {
+                        let lo = rnd(len + 1);
+                        let hi = lo + rnd(len - lo + 1);
+                        b.remove_insts(lo..hi);
+                        model.drain(lo..hi);
+                    }
+                    8 => {
+                        let new = fresh(rnd(3));
+                        let tracked_in = rnd(2) == 0 && !new.is_empty();
+                        let spans: Vec<Span> = if tracked_in {
+                            new.iter().map(|&i| sp(i)).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        tracked = tracked || (len == 0 && tracked_in);
+                        b.append_spanned(new.iter().map(|&i| inst(i)).collect(), spans);
+                        model.extend(
+                            new.iter()
+                                .map(|&i| (i, if tracked_in { sp(i) } else { Span::dummy() })),
+                        );
+                    }
+                    _ => {
+                        // Rebuild round trip: reverse the body with its spans.
+                        let mut spans = b.take_parallel_spans();
+                        let mut insts = std::mem::take(&mut b.instructions);
+                        insts.reverse();
+                        spans.reverse();
+                        b.replace_insts(insts, spans);
+                        model.reverse();
+                    }
+                }
+                if model.is_empty() {
+                    tracked = false;
+                }
+                assert_eq!(ids(&b), model.iter().map(|m| m.0).collect::<Vec<_>>());
+                if tracked {
+                    assert_eq!(
+                        b.source_spans,
+                        model.iter().map(|m| m.1).collect::<Vec<_>>()
+                    );
+                } else {
+                    assert!(b.source_spans.is_empty(), "untracked block grew spans");
+                }
+            }
+        }
+        // The empty-block restart rule must actually be exercised.
+        assert!(restarted > 0);
+    }
+}

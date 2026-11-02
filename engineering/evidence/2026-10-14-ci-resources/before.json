@@ -1,0 +1,14 @@
+[
+  {
+    "arm": "fresh",
+    "returncode": 0,
+    "stdout": "clippy-policy jobs=1\n",
+    "stderr": ""
+  },
+  {
+    "arm": "after-test",
+    "returncode": 0,
+    "stdout": "cargo test --profile fastbuild --all-targets --locked -j 1\nclippy-policy jobs=2\n",
+    "stderr": ""
+  }
+]

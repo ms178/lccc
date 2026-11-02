@@ -1,0 +1,60 @@
+{
+  "metric": "harness contract reproduction; NOT compiler speed or compiler-correctness score",
+  "bounded_warmup_and_timed_states": 1296,
+  "runners": {
+    "supplied": {
+      "runner_sha256": "9fc7e6b147b34b7971ed73346303f78788c0b120fba22b5ad4fb7f22f71fdd74",
+      "tests": 11,
+      "fully_passing_methods": 2,
+      "failing_methods": [
+        "test_all_bounded_warmup_and_sample_states_fail_closed",
+        "test_best_reference_is_selected_only_from_correct_compilers",
+        "test_candidate_warmup_output_cannot_be_discarded",
+        "test_control_warmup_instability_cannot_certify_a_candidate",
+        "test_failed_sample_cannot_be_hidden_by_successful_samples",
+        "test_failed_warmup_cannot_certify_retained_successes",
+        "test_gcc_aggregate_requires_a_correct_reference",
+        "test_missing_gcc_never_promotes_the_candidate_to_its_own_oracle",
+        "test_unstable_gcc_cannot_certify_a_matching_first_output"
+      ],
+      "subtest_failures": 469,
+      "errors": 0,
+      "source_commit": "3671c7c9a088226b2962ff9712c178da79e7b9d4"
+    },
+    "pr835": {
+      "runner_sha256": "72fdd40804558e51e04a8ed8379592d28eb137e78f924ad8261d4bdb5d4b9b37",
+      "tests": 11,
+      "fully_passing_methods": 2,
+      "failing_methods": [
+        "test_all_bounded_warmup_and_sample_states_fail_closed",
+        "test_best_reference_is_selected_only_from_correct_compilers",
+        "test_candidate_warmup_output_cannot_be_discarded",
+        "test_control_warmup_instability_cannot_certify_a_candidate",
+        "test_failed_sample_cannot_be_hidden_by_successful_samples",
+        "test_failed_warmup_cannot_certify_retained_successes",
+        "test_gcc_aggregate_requires_a_correct_reference",
+        "test_missing_gcc_never_promotes_the_candidate_to_its_own_oracle",
+        "test_unstable_gcc_cannot_certify_a_matching_first_output"
+      ],
+      "subtest_failures": 469,
+      "errors": 0,
+      "source_commit": "4216f897460be1eef08cc0f24e8b6016cd738283",
+      "api_verified_git_blob": "8292714e8d49f581f64caa9797ed9ccc00ade35c"
+    },
+    "corrected": {
+      "runner_sha256": "b2bc4f840986c8e13474257f1f4cca88fa0b6c07226158ec1de6ec8402b62f94",
+      "tests": 11,
+      "fully_passing_methods": 11,
+      "failing_methods": [],
+      "subtest_failures": 0,
+      "errors": 0
+    }
+  },
+  "protocol": {
+    "test_module": "tests.corpus.test_benchmark_comparison_safety",
+    "test_class": "ComparisonSafety",
+    "regression_sha256": "84e71df6ce8e34c5d34ab7bc7034c66e1d0559f448431f1fe429259a0087f1bc",
+    "regression_git_blob": "82ed7cd35174ceafb66310079be7b945e1b67444",
+    "replay": "Load each exact runner file with importlib.util.spec_from_file_location after registering its name in sys.modules; assign it to the test module bench; run all ComparisonSafety tests with unittest.defaultTestLoader. Each bounded-state iteration is a subtest, not a distinct compiler defect."
+  }
+}

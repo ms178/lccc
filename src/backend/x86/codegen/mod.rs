@@ -1,0 +1,28 @@
+mod alu;
+mod asm_emitter;
+pub(crate) use asm_emitter::strip_duplicate_modifier;
+mod atomics;
+mod calls;
+mod cast_ops;
+mod comparison;
+pub(crate) mod emit;
+mod f128;
+mod float_ops;
+mod globals;
+mod i128_ops;
+mod inline_asm;
+mod intrinsics;
+mod intrinsics_simd;
+pub(crate) mod ipa_ra;
+pub(crate) mod isel;
+pub(crate) mod machinst;
+pub(crate) mod machinst_alloc;
+pub(crate) mod machinst_emit;
+#[cfg(test)]
+mod machinst_tests;
+mod memory;
+mod nested_fn;
+pub(crate) mod peephole;
+mod prologue;
+mod returns;
+mod variadic;

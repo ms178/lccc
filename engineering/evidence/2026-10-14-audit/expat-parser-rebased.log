@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/opt/lccc-audit-cache/lccc/tests/workloads/expat-2.8.5/junit_check.py", line 408, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/opt/lccc-audit-cache/lccc/tests/workloads/expat-2.8.5/junit_check.py", line 380, in main
+    reference = parse_junit(args.reference)
+  File "/opt/lccc-audit-cache/lccc/tests/workloads/expat-2.8.5/junit_check.py", line 173, in parse_junit
+    _status_of(element)))  # ReportError propagates: unknown is fatal
+    ~~~~~~~~~~^^^^^^^^^
+  File "/opt/lccc-audit-cache/lccc/tests/workloads/expat-2.8.5/junit_check.py", line 145, in _status_of
+    raise ReportError(f"unrecognised {attribute}={value!r} on a <testcase>; "
+                      f"refusing to read an unknown status as a pass")
+ReportError: unrecognised status='run' on a <testcase>; refusing to read an unknown status as a pass

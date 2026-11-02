@@ -1,0 +1,41 @@
+[
+  {
+    "compiler": "lccc",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O2",
+      "tests/regression/implicit_muldiv16.c",
+      "-o",
+      "/home/user/.cache/pr824-static/muldiv16-lccc"
+    ],
+    "native": 0,
+    "memcheck": 0,
+    "log": "==620722== Memcheck, a memory error detector\n==620722== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==620722== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==620722== Command: /home/user/.cache/pr824-static/muldiv16-lccc\n==620722== \n==620722== \n==620722== HEAP SUMMARY:\n==620722==     in use at exit: 0 bytes in 0 blocks\n==620722==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==620722== \n==620722== All heap blocks were freed -- no leaks are possible\n==620722== \n==620722== For lists of detected and suppressed errors, rerun with: -s\n==620722== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+  },
+  {
+    "compiler": "gcc16",
+    "command": [
+      "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+      "-O2",
+      "tests/regression/implicit_muldiv16.c",
+      "-o",
+      "/home/user/.cache/pr824-static/muldiv16-gcc16"
+    ],
+    "native": 0,
+    "memcheck": 0,
+    "log": "==620729== Memcheck, a memory error detector\n==620729== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==620729== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==620729== Command: /home/user/.cache/pr824-static/muldiv16-gcc16\n==620729== \n==620729== \n==620729== HEAP SUMMARY:\n==620729==     in use at exit: 0 bytes in 0 blocks\n==620729==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==620729== \n==620729== All heap blocks were freed -- no leaks are possible\n==620729== \n==620729== For lists of detected and suppressed errors, rerun with: -s\n==620729== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+  },
+  {
+    "compiler": "clang23",
+    "command": [
+      "/home/user/.cache/oracles/clang-23.1.0/bin/clang",
+      "-O2",
+      "tests/regression/implicit_muldiv16.c",
+      "-o",
+      "/home/user/.cache/pr824-static/muldiv16-clang23"
+    ],
+    "native": 0,
+    "memcheck": 0,
+    "log": "==620734== Memcheck, a memory error detector\n==620734== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.\n==620734== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info\n==620734== Command: /home/user/.cache/pr824-static/muldiv16-clang23\n==620734== \n==620734== \n==620734== HEAP SUMMARY:\n==620734==     in use at exit: 0 bytes in 0 blocks\n==620734==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==620734== \n==620734== All heap blocks were freed -- no leaks are possible\n==620734== \n==620734== For lists of detected and suppressed errors, rerun with: -s\n==620734== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+  }
+]

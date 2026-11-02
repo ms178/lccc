@@ -1,0 +1,39 @@
+/* CCC compiler bundled fmaintrin.h - FMA3 intrinsics */
+#ifndef _FMAINTRIN_H_INCLUDED
+#define _FMAINTRIN_H_INCLUDED
+
+#include <avxintrin.h>
+
+/* === 128-bit FMA === */
+
+/* _mm_fmadd_ps: a*b + c (single-precision, 128-bit) */
+
+/* _mm_fmadd_pd: a*b + c (double-precision, 128-bit) */
+
+/* === 256-bit FMA === */
+
+/* _mm256_fmadd_ps: a*b + c (single-precision, 256-bit) */
+
+/* _mm256_fmadd_pd: a*b + c (double-precision, 256-bit) */
+
+/* _mm256_fmsub_ps: a*b - c (single-precision, 256-bit) */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_fmsub_ps(__m256 __a, __m256 __b, __m256 __c)
+{
+    __m256 __r;
+    for (int __i = 0; __i < 8; __i++)
+        __r[__i] = __a[__i] * __b[__i] - __c[__i];
+    return __r;
+}
+
+/* _mm256_fnmadd_ps: -(a*b) + c (single-precision, 256-bit) */
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_fnmadd_ps(__m256 __a, __m256 __b, __m256 __c)
+{
+    __m256 __r;
+    for (int __i = 0; __i < 8; __i++)
+        __r[__i] = -(__a[__i] * __b[__i]) + __c[__i];
+    return __r;
+}
+
+#endif /* _FMAINTRIN_H_INCLUDED */

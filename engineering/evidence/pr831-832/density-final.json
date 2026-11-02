@@ -1,0 +1,79 @@
+{
+  "schema": 1,
+  "semantic_loop_equivalence_verified": false,
+  "flags": "-O2 -march=haswell -fwrapv -fno-fast-math -ffp-contract=off -lm",
+  "local_flags": "-O2 -march=haswell -fwrapv -fno-fast-math -ffp-contract=off -lm -I/usr/lib/gcc/x86_64-linux-gnu/16/include",
+  "oracles": [
+    "gcc16.2",
+    "clang",
+    "icx",
+    "icc"
+  ],
+  "effective_oracle_flags": {
+    "gcc16.2": "-O2 -march=haswell -fwrapv -fno-fast-math -ffp-contract=off -lm",
+    "clang": "-O2 -march=haswell -fwrapv -fno-fast-math -ffp-contract=off -lm",
+    "icx": "-O2 -march=haswell -fwrapv -fno-fast-math -ffp-contract=off -lm",
+    "icc": "-O2 -xCORE-AVX2 -fwrapv -fp-model precise -no-fma -lm"
+  },
+  "ranked": [
+    {
+      "benchmark": "spectral_norm",
+      "symbol": "main",
+      "lccc_insns": 5,
+      "lccc_bytes_per_trip": 8,
+      "lccc_density": 0.625,
+      "lccc_vector_bits": 128,
+      "lccc_loop": ".LBB21",
+      "best_oracle": "clang",
+      "best_density": 0.0359375,
+      "ratio": 17.39130434782609,
+      "oracles": {
+        "gcc16.2": 0.078125,
+        "clang": 0.0359375,
+        "icx": 0.040625,
+        "icc": 0.9375
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "nbody",
+      "symbol": "main",
+      "lccc_insns": 23,
+      "lccc_bytes_per_trip": 16,
+      "lccc_density": 1.4375,
+      "lccc_vector_bits": 128,
+      "lccc_loop": ".LBB4",
+      "best_oracle": "gcc16.2",
+      "best_density": 0.1875,
+      "ratio": 7.666666666666667,
+      "oracles": {
+        "gcc16.2": 0.1875,
+        "clang": 0.22321428571428573,
+        "icx": 32.875,
+        "icc": 25.1875
+      },
+      "note": ""
+    }
+  ],
+  "unranked": [
+    {
+      "benchmark": "spectral_norm",
+      "symbol": "mul_AtAv",
+      "lccc_insns": 14,
+      "lccc_bytes_per_trip": 8,
+      "lccc_density": 1.75,
+      "lccc_vector_bits": 128,
+      "lccc_loop": ".LBB6",
+      "best_oracle": null,
+      "best_density": null,
+      "ratio": null,
+      "oracles": {
+        "gcc16.2": null,
+        "clang": null,
+        "icx": null,
+        "icc": null
+      },
+      "note": "only 0 oracle(s) emit a comparable 'mul_AtAv' (inlining differs): not ranked"
+    }
+  ]
+}

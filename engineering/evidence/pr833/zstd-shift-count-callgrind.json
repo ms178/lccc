@@ -1,0 +1,73 @@
+{
+  "description": "zstd 1.5.7 libzstd.a, -O3 -march=x86-64-v3 -fno-lto, common GCC-built driver (tests/benchmark/zstd_driver.c); Callgrind Ir of ONE timed API call (instrumentation toggled around the timed loop, --instr-atstart=no); inputs are 1 MiB prefixes of Silesia xml/dickens; 'on' = lccc with the shift-count pass, 'off' = same binary with CCC_NO_SHIFT_COUNT_DEMAND=1; c=compress, d=decompress of the GCC-produced frame at that level. Instruction counts, not time.",
+  "lccc_sha256": "f3ae864e5c1ac47685b7820e5f7f789f71dda737db9d6b26c913e244e9b18212",
+  "gcc": "gcc (Debian 14.2.0-19) 14.2.0",
+  "inputs": {
+    "xml1m": "f0e6a94c2cda4d451675ced3fb34ddc6a9186a210df053eee123905f7119c1af",
+    "dickens1m": "afd479dd0e0339643530bf4ee3d10423265c515a06e7994bbe26ccba39aea9ab"
+  },
+  "libraries": {
+    "gcc": "b04440bd27d13ef013a02b680d22bdd59ef2b92ca2f9e6daf30a0b7986792477",
+    "on": "796e4c761dd9bbdb8d23c241c8a536752c0f015963f61358383232a94310c6b1",
+    "off": "eb81153d873af65a65eb829e7c906fe4e7698b77f03fd1db9e085e6c3ac517ba"
+  },
+  "command": "valgrind --tool=callgrind --instr-atstart=no ARM/zstd-driver INPUT INPUT.lL.zst - L c|d 1",
+  "rows": {
+    "xml1m:c1": {
+      "gcc": 15958310,
+      "on": 29735659,
+      "off": 29846937,
+      "on_vs_off": -0.00373,
+      "on_vs_gcc": 1.8633
+    },
+    "xml1m:c3": {
+      "gcc": 18959750,
+      "on": 35776031,
+      "off": 35864129,
+      "on_vs_off": -0.00246,
+      "on_vs_gcc": 1.8869
+    },
+    "xml1m:d1": {
+      "gcc": 6503150,
+      "on": 9285246,
+      "off": 9613877,
+      "on_vs_off": -0.03418,
+      "on_vs_gcc": 1.4278
+    },
+    "xml1m:d3": {
+      "gcc": 7942086,
+      "on": 11516138,
+      "off": 11954105,
+      "on_vs_off": -0.03664,
+      "on_vs_gcc": 1.45
+    },
+    "dickens1m:c1": {
+      "gcc": 35949226,
+      "on": 68966260,
+      "off": 69296448,
+      "on_vs_off": -0.00476,
+      "on_vs_gcc": 1.9184
+    },
+    "dickens1m:c3": {
+      "gcc": 41649750,
+      "on": 80686292,
+      "off": 80866376,
+      "on_vs_off": -0.00223,
+      "on_vs_gcc": 1.9373
+    },
+    "dickens1m:d1": {
+      "gcc": 13198802,
+      "on": 18458895,
+      "off": 19095424,
+      "on_vs_off": -0.03333,
+      "on_vs_gcc": 1.3985
+    },
+    "dickens1m:d3": {
+      "gcc": 17733187,
+      "on": 25680804,
+      "off": 26664996,
+      "on_vs_off": -0.03691,
+      "on_vs_gcc": 1.4482
+    }
+  }
+}

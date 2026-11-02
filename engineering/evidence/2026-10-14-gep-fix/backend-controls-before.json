@@ -1,0 +1,34 @@
+[
+  [
+    "CCC_NO_PEEPHOLE",
+    false
+  ],
+  [
+    "CCC_NO_PEEPHOLE_PHASE1",
+    false
+  ],
+  [
+    "CCC_NO_PEEPHOLE_PHASE2",
+    false
+  ],
+  [
+    "CCC_NO_PEEPHOLE_PHASE3",
+    false
+  ],
+  [
+    "CCC_NO_PEEPHOLE_PHASE5",
+    false
+  ],
+  [
+    "CCC_NO_PEEPHOLE_PHASE6",
+    false
+  ],
+  [
+    "CCC_NO_PEEPHOLE_PHASE7",
+    false
+  ],
+  [
+    "CCC_NO_PEEPHOLE_RERUN",
+    false
+  ]
+]

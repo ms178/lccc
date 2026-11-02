@@ -1,0 +1,1148 @@
+//! Expression lowering: converts AST Expr nodes to IR instructions.
+//!
+//! The main entry point is `lower_expr()`, which dispatches to focused helpers
+//! for each expression category. Large subsystems are split into submodules:
+//! - `expr_ops`: binary/unary ops, conditional, short-circuit, inc/dec
+//! - `expr_access`: cast, compound literals, sizeof, address-of, member access, va_arg
+//! - `expr_builtins`: __builtin_* intrinsics and FP classification
+//! - `expr_atomics`: __atomic_* and __sync_* operations
+//! - `expr_calls`: function call lowering, arguments, dispatch
+//! - `expr_assign`: assignment, compound assignment, bitfield helpers
+
+use super::definitions::GlobalInfo;
+use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType};
+use crate::frontend::parser::ast::{BinOp, Expr, PostfixOp, UnaryOp};
+use crate::ir::reexports::{
+    BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, Operand, Terminator, Value,
+};
+
+/// Pointer/integer reinterpretation is free only at equal widths. Keep the
+/// source integer's signedness on widening and truncate on narrowing; neither
+/// a later consumer's storage type nor the incoming register's upper bits can
+/// substitute for this conversion. `pointer_size` keeps the rule testable for
+/// LP64 and ILP32 without changing thread-local target configuration.
+pub(super) fn pointer_integer_cast_changes_width(
+    from: IrType,
+    to: IrType,
+    pointer_size: usize,
+) -> bool {
+    if from == IrType::Ptr && to.is_integer() {
+        to.size() != pointer_size
+    } else if to == IrType::Ptr && from.is_integer() {
+        from.size() != pointer_size
+    } else {
+        false
+    }
+}
+
+impl Lowerer {
+    /// Mask off the sign bit of a float value for truthiness testing.
+    /// This ensures -0.0 is treated as falsy (same as +0.0) while NaN remains truthy.
+    /// For F128 (long double), uses a proper float comparison against zero instead of
+    /// bit-masking, because x87 80-bit values can't be reliably tested via integer AND.
+    pub(super) fn mask_float_sign_for_truthiness(
+        &mut self,
+        val: Operand,
+        float_ty: IrType,
+    ) -> Operand {
+        if !matches!(float_ty, IrType::F32 | IrType::F64 | IrType::F128) {
+            return val;
+        }
+        if float_ty == IrType::F128 {
+            // For F128 (long double), we cannot use bit-masking because the value
+            // is stored as 80-bit x87 and the low 8 bytes are the mantissa (not f64 bits).
+            // Instead, emit a proper F128 comparison against zero which uses x87 fucomip.
+            let zero = Operand::Const(IrConst::long_double(0.0));
+            let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, IrType::F128);
+            return Operand::Value(result);
+        }
+        if crate::common::types::target_is_32bit() {
+            // On i686 (ILP32), the I64 bit-masking approach doesn't work for
+            // EITHER float width: the F64 case because the 64-bit masked
+            // result is truncated when tested in 32-bit conditionals, and
+            // the F32 case (20080529-1) because materializing the I64 bit
+            // pattern of a 4-byte F32 param writes a synthesized zero high
+            // half at param_slot+4 — past the parameter, over the return
+            // address — turning `!!c` into a jump to zero. Use a proper
+            // float comparison against zero for both widths: it handles
+            // -0.0 correctly (IEEE 754: +0.0 == -0.0) and NaN (unordered →
+            // truthy via setp), matching the x86-64 bit-trick's semantics.
+            let (zero, ty) = if float_ty == IrType::F64 {
+                (Operand::Const(IrConst::F64(0.0)), IrType::F64)
+            } else {
+                (Operand::Const(IrConst::F32(0.0)), IrType::F32)
+            };
+            let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, ty);
+            return Operand::Value(result);
+        }
+        let (abs_mask, _, _, _, _) =
+            Self::fp_masks_for(float_ty, &crate::common::types::CType::Double);
+        let masked = self.emit_binop_val(
+            IrBinOp::And,
+            val,
+            Operand::Const(IrConst::I64(abs_mask)),
+            IrType::I64,
+        );
+        if crate::common::types::target_is_32bit() {
+            // On 32-bit targets, the masked result is typed as I64 but needs to
+            // be reduced to a boolean for the conditional branch, since the
+            // backend's branch-on-nonzero only tests the low 32 bits.
+            let result = self.emit_cmp_val(
+                IrCmpOp::Ne,
+                Operand::Value(masked),
+                Operand::Const(IrConst::I64(0)),
+                IrType::I64,
+            );
+            Operand::Value(result)
+        } else {
+            Operand::Value(masked)
+        }
+    }
+
+    /// Lower a condition expression into a direct conditional branch on
+    /// `(true_label, false_label)` WITHOUT materializing a boolean value.
+    ///
+    /// `a && b` / `a || b` chains become branch trees: each operand is lowered
+    /// as its own `Cmp` followed by `CondBranch`, which the backend fuses into
+    /// a bare `cmp; jcc`. This eliminates the setcc/movzbl/(store/load)/test
+    /// round-trips that condition-VALUE lowering produces per comparison in
+    /// branch-heavy hot code (gzip's `longest_match`, deflate hot loops).
+    ///
+    /// Semantics are identical to `lower_condition_expr` + `CondBranch`:
+    ///  - `a || b`: branch to `true_label` if `a` is true, else test `b`.
+    ///  - `a && b`: branch to `false_label` if `a` is false, else test `b`.
+    ///  - Evaluation order and short-circuit side effects are preserved.
+    ///  - When either side of a logical operator is a compile-time constant,
+    ///    control falls back to the value-based path so dead-branch functions
+    ///    are never referenced (IS_ENABLED-style patterns keep working).
+    pub(super) fn lower_condition_branch(
+        &mut self,
+        expr: &Expr,
+        true_label: BlockId,
+        false_label: BlockId,
+    ) {
+        if let Expr::BinaryOp(op @ (BinOp::LogicalAnd | BinOp::LogicalOr), lhs, rhs, _) = expr {
+            if let Some(value) =
+                super::expr_ops::fold_comparison_pair(lhs, rhs, *op == BinOp::LogicalAnd)
+            {
+                self.terminate(Terminator::Branch(if value {
+                    true_label
+                } else {
+                    false_label
+                }));
+                return;
+            }
+        }
+        let const_side = |e: &Expr| self.eval_const_expr(e).is_some();
+        match expr {
+            Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
+                self.lower_condition_branch(inner, false_label, true_label);
+            }
+            Expr::BinaryOp(BinOp::LogicalAnd, lhs, rhs, _) => {
+                if const_side(lhs) || const_side(rhs) {
+                    let cond_val = self.lower_condition_expr(expr);
+                    self.terminate(Terminator::CondBranch {
+                        cond: cond_val,
+                        true_label,
+                        false_label,
+                    });
+                    return;
+                }
+                let rhs_label = self.fresh_label();
+                self.lower_condition_branch(lhs, rhs_label, false_label);
+                self.start_block(rhs_label);
+                self.lower_condition_branch(rhs, true_label, false_label);
+            }
+            Expr::BinaryOp(BinOp::LogicalOr, lhs, rhs, _) => {
+                if const_side(lhs) || const_side(rhs) {
+                    let cond_val = self.lower_condition_expr(expr);
+                    self.terminate(Terminator::CondBranch {
+                        cond: cond_val,
+                        true_label,
+                        false_label,
+                    });
+                    return;
+                }
+                let rhs_label = self.fresh_label();
+                self.lower_condition_branch(lhs, true_label, rhs_label);
+                self.start_block(rhs_label);
+                self.lower_condition_branch(rhs, true_label, false_label);
+            }
+            _ => {
+                let cond_val = self.lower_condition_expr(expr);
+                self.terminate(Terminator::CondBranch {
+                    cond: cond_val,
+                    true_label,
+                    false_label,
+                });
+            }
+        }
+    }
+
+    /// Lower a condition expression, ensuring floating-point values are properly
+    /// tested for truthiness (masking sign bit so -0.0 is falsy).
+    /// For complex types, tests (real != 0) || (imag != 0) per C11 6.3.1.2.
+    pub(super) fn lower_condition_expr(&mut self, expr: &Expr) -> Operand {
+        let expr_ct = self.expr_ctype(expr);
+        if expr_ct.is_soft_float() {
+            // Decimal / _Float128 truthiness: `if (d)` is `(d != 0)` under the
+            // type's semantics (so -0 tests false like +0).
+            let val = self.lower_expr(expr);
+            return self.lower_soft_float_truthiness(val, &expr_ct);
+        }
+        if expr_ct.is_complex() {
+            let val = self.lower_expr(expr);
+            let ptr = self.operand_to_value(val);
+            return self.lower_complex_to_bool(ptr, &expr_ct);
+        }
+        let expr_ty = self.infer_expr_type(expr);
+        let val = self.lower_expr(expr);
+        let val = self.mask_float_sign_for_truthiness(val, expr_ty);
+
+        // On i686 (ILP32), 64-bit integer condition values (I64/U64 from long long
+        // expressions) don't fit in a single 32-bit register. Reduce them to a
+        // boolean (I8) via comparison against zero so that downstream CondBranch
+        // and comparisons in short-circuit evaluation only need 32-bit values.
+        // F64 conditions are already handled above by mask_float_sign_for_truthiness
+        // which emits an F64 != 0.0 comparison on i686.
+        if crate::common::types::target_is_32bit() && matches!(expr_ty, IrType::I64 | IrType::U64) {
+            let zero = Operand::Const(IrConst::I64(0));
+            let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, IrType::I64);
+            return Operand::Value(result);
+        }
+
+        // Sub-int types (U8/I8/U16/I16): the narrow optimization pass may convert
+        // widen-op-narrow patterns into narrow-type BinOps. The codegen only handles
+        // I32/U32 and I64/U64 operand widths, so after a narrow BinOp the upper
+        // register bits may contain stale data. CondBranch tests the full 64-bit
+        // register (`testq %rax, %rax`), which would see those stale bits as nonzero.
+        // Emit a Cast to widen the value to the machine word type, which forces
+        // proper zero/sign-extension (movzbq/movzwq) to clean the upper bits.
+        if matches!(expr_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            let widen_ty = crate::common::types::widened_op_type(expr_ty);
+            let widened = self.emit_cast_val(val, expr_ty, widen_ty);
+            return Operand::Value(widened);
+        }
+
+        val
+    }
+
+    /// Lower an expression whose result is discarded (expression statement,
+    /// for-increment); lets a top-level post-inc/dec skip its old-value spill.
+    pub(super) fn lower_expr_discard(&mut self, expr: &Expr) -> Operand {
+        self.discard_expr_result = true;
+        let r = self.lower_expr(expr);
+        self.discard_expr_result = false;
+        r
+    }
+
+    /// Lower an expression to its value. A `__seg_gs` complex object is copied
+    /// into a generic temporary here, so every arithmetic, conversion and call
+    /// consumer reads ordinary memory. Writers use `lower_expr_unmaterialized`
+    /// (via `lower_complex_lvalue`) to get the object's real address.
+    pub(super) fn lower_expr(&mut self, expr: &Expr) -> Operand {
+        let result = self.lower_expr_unmaterialized(expr);
+        self.materialize_segment_complex(expr, result)
+    }
+
+    /// `lower_expr` without the segment materialization: the result of a
+    /// `__seg_gs` complex lvalue is its storage address.
+    pub(super) fn lower_expr_unmaterialized(&mut self, expr: &Expr) -> Operand {
+        // The discard flag applies only when the expression being lowered IS
+        // the top-level post-increment/decrement. Nested occurrences always
+        // need their result (e.g. `foo(i++)` reads the old value), so clear
+        // the flag for the duration of any other subexpression.
+        let saved_discard = self.discard_expr_result;
+        if !matches!(
+            expr,
+            Expr::PostfixOp(PostfixOp::PostInc | PostfixOp::PostDec, _, _)
+        ) {
+            self.discard_expr_result = false;
+        }
+        self.discard_assign_result =
+            saved_discard && matches!(expr, Expr::Assign(..) | Expr::CompoundAssign(..));
+        let result = self.lower_expr_inner(expr);
+        self.discard_assign_result = false;
+        self.discard_expr_result = saved_discard;
+        result
+    }
+
+    fn lower_expr_inner(&mut self, expr: &Expr) -> Operand {
+        match expr {
+            // Literals
+            Expr::IntLiteral(val, _) => Operand::Const(IrConst::I64(*val)),
+            Expr::UIntLiteral(val, _) => Operand::Const(IrConst::I64(*val as i64)),
+            Expr::LongLiteral(val, _) => Operand::Const(IrConst::I64(*val)),
+            Expr::ULongLiteral(val, _) => Operand::Const(IrConst::I64(*val as i64)),
+            Expr::LongLongLiteral(val, _) => Operand::Const(IrConst::I64(*val)),
+            Expr::ULongLongLiteral(val, _) => Operand::Const(IrConst::I64(*val as i64)),
+            Expr::FloatLiteral(val, _) => Operand::Const(IrConst::F64(*val)),
+            Expr::FloatLiteralF32(val, _) => Operand::Const(IrConst::F32(*val as f32)),
+            Expr::FloatLiteralLongDouble(val, bytes, _) => {
+                Operand::Const(IrConst::long_double_with_bytes(*val, *bytes))
+            }
+            Expr::FloatLiteralF128(_, bytes, _) => {
+                // _Float128 literal: the 16 bytes ARE the IEEE binary128 value;
+                // carried in an I128 constant (bit-exact 16-byte moves). Use the
+                // RAW little-endian bytes (NOT f128_bytes_to_u128, which converts
+                // the floating value to an integer).
+                let v = u128::from_le_bytes(*bytes);
+                Operand::Const(IrConst::I128(v as i128))
+            }
+            Expr::FloatLiteralHalf(_, bits, _) => Operand::Const(IrConst::I16(*bits as i16)),
+            Expr::FloatLiteralDecimal(width, bytes, _) => {
+                // C23 decimal FP literal: the 16 bytes are the raw BID bit
+                // pattern (little-endian). D32/D64 use dedicated IR constant
+                // variants (SSE-class carriers); D128 rides the U128 carrier
+                // exactly like _Float128.
+                match *width {
+                    32 => {
+                        let v = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                        Operand::Const(IrConst::D32(v))
+                    }
+                    64 => {
+                        let v = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                        Operand::Const(IrConst::D64(v))
+                    }
+                    _ => {
+                        let v = u128::from_le_bytes(*bytes);
+                        Operand::Const(IrConst::I128(v as i128))
+                    }
+                }
+            }
+            Expr::CharLiteral(ch, _) => {
+                // A character constant has type int and the value the target's
+                // plain char would hold (C11 6.4.4.4p10): sign-extended when
+                // char is signed (x86), zero-extended when unsigned
+                // (AArch64/RISC-V SysV). '\xEF' is -17 with signed char,
+                // 239 with unsigned char.
+                let val = if crate::common::types::char_is_unsigned() {
+                    *ch as u8 as i32
+                } else {
+                    *ch as u8 as i8 as i32
+                };
+                Operand::Const(IrConst::I32(val))
+            }
+
+            // Imaginary literals
+            Expr::ImaginaryLiteral(val, _) => {
+                self.lower_imaginary_literal(*val, &CType::ComplexDouble)
+            }
+            Expr::ImaginaryLiteralF32(val, _) => {
+                self.lower_imaginary_literal(*val, &CType::ComplexFloat)
+            }
+            Expr::ImaginaryLiteralLongDouble(val, bytes, _) => {
+                self.lower_imaginary_literal_ld(*val, bytes, &CType::ComplexLongDouble)
+            }
+
+            Expr::StringLiteral(s, _) => self.lower_string_literal(s, false),
+            Expr::WideStringLiteral(s, _) => self.lower_string_literal(s, true),
+            Expr::Char16StringLiteral(s, _) => self.lower_char16_string_literal(s),
+            Expr::Identifier(name, _) => match self.identifier_enumerator(expr, name) {
+                Some((value, _)) => Operand::Const(IrConst::I64(value)),
+                None => self.lower_identifier(name),
+            },
+            Expr::BinaryOp(op, lhs, rhs, _) => self.lower_binary_op(op, lhs, rhs),
+            Expr::UnaryOp(op, inner, _) => self.lower_unary_op(*op, inner),
+            Expr::PostfixOp(op, inner, _) => self.lower_post_inc_dec(inner, *op),
+            Expr::Assign(lhs, rhs, _) => self.lower_assign(lhs, rhs),
+            Expr::CompoundAssign(op, lhs, rhs, _) => self.lower_compound_assign(op, lhs, rhs),
+            Expr::FunctionCall(func, args, _) => self.lower_function_call(func, args),
+            Expr::Conditional(cond, then_expr, else_expr, _) => {
+                let value = self.lower_conditional(cond, then_expr, else_expr);
+                self.spill_packed_vector_wrapper(expr, value)
+            }
+            Expr::GnuConditional(cond, else_expr, _) => {
+                let value = self.lower_gnu_conditional(cond, else_expr);
+                self.spill_packed_vector_wrapper(expr, value)
+            }
+            Expr::Cast(target_type, inner, _, _) => self.lower_cast(target_type, inner),
+            Expr::CompoundLiteral(type_spec, init, _, storage) => {
+                self.lower_compound_literal(expr, type_spec, init, storage)
+            }
+            Expr::Sizeof(arg, _) => self.lower_sizeof(arg),
+            Expr::Countof(arg, _) => self.lower_countof(arg),
+            Expr::Alignof(type_spec, _) => {
+                let align = self.c11_alignof_type(type_spec);
+                Operand::Const(IrConst::I64(align as i64))
+            }
+            Expr::AlignofExpr(inner_expr, _) => {
+                let align = self.alignof_expr(inner_expr);
+                Operand::Const(IrConst::I64(align as i64))
+            }
+            Expr::GnuAlignof(type_spec, _) => {
+                let align = self.preferred_alignof_type(type_spec);
+                Operand::Const(IrConst::I64(align as i64))
+            }
+            Expr::GnuAlignofExpr(inner_expr, _) => {
+                let align = self.preferred_alignof_expr(inner_expr);
+                Operand::Const(IrConst::I64(align as i64))
+            }
+            Expr::AddressOf(inner, _) => self.lower_address_of(inner),
+            Expr::Deref(inner, _) => self.lower_deref(inner),
+            Expr::ArraySubscript(base, index, _) => self.lower_array_subscript(expr, base, index),
+            Expr::MemberAccess(base_expr, field_name, _) => {
+                self.lower_member_access(base_expr, field_name)
+            }
+            Expr::PointerMemberAccess(base_expr, field_name, _) => {
+                self.lower_pointer_member_access(base_expr, field_name)
+            }
+            Expr::Comma(lhs, rhs, _) => {
+                // The left operand is a void expression (C23 6.5.18p2).
+                self.lower_expr_discarded(lhs);
+                let value = self.lower_expr(rhs);
+                self.spill_packed_vector_wrapper(expr, value)
+            }
+            Expr::StmtExpr(compound, _) => {
+                let value = self.lower_stmt_expr(compound);
+                self.spill_packed_vector_wrapper(expr, value)
+            }
+            Expr::VaArg(ap_expr, type_spec, _) => self.lower_va_arg(ap_expr, type_spec),
+            Expr::ConvertVector(src_expr, type_spec, _) => {
+                self.lower_convertvector(src_expr, type_spec)
+            }
+            Expr::BitCast(type_spec, src_expr, _) => self.lower_bit_cast(type_spec, src_expr),
+            Expr::GenericSelection(controlling, associations, _) => {
+                self.lower_generic_selection(controlling, associations)
+            }
+            // A type operand has no value: the parser builds one only as the
+            // controlling operand of `_Generic`, which is never evaluated.
+            Expr::TypeOperand(..) => Operand::Const(IrConst::I64(0)),
+            Expr::LabelAddr(label_name, _) => {
+                // GNU C nested functions: &&label of an ENCLOSING function's
+                // label resolves to the parent's named alias (block IDs are
+                // per-function; the child cannot reference them numerically).
+                let alias = self.func().addr_label_aliases.get(label_name).cloned();
+                if let Some(alias) = alias {
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::GlobalAddr { dest, name: alias });
+                    return Operand::Value(dest);
+                }
+                let scoped_label = self.get_or_create_user_label(label_name);
+                let dest = self.fresh_value();
+                self.emit(Instruction::LabelAddr {
+                    dest,
+                    label: scoped_label,
+                });
+                Operand::Value(dest)
+            }
+            Expr::BuiltinTypesCompatibleP(type1, type2, qualifiers1, qualifiers2, _) => {
+                let result = self.eval_types_compatible(type1, type2, qualifiers1, qualifiers2);
+                Operand::Const(IrConst::I64(result as i64))
+            }
+        }
+    }
+
+    /// A vector rvalue is the address of its bytes, except a call whose small
+    /// vector comes back in a register: that yields the packed carrier, and
+    /// each consumer spills it (`rhs_is_small_vector_call`). A conditional,
+    /// comma or statement expression forwards such a carrier unchanged, but
+    /// the consumers recognise only the bare call, so `T r = c ? v : f();`,
+    /// `(c, f())` or `({ f(); })` was dereferenced as an address. Spill the
+    /// carrier here, once, so the wrapper yields an address like every other
+    /// vector rvalue; `expr_produces_packed_struct_data` reports vector-typed
+    /// wrappers as address-producing to match. Struct wrappers keep the
+    /// packed carrier: their consumers handle it.
+    fn spill_packed_vector_wrapper(&mut self, expr: &Expr, value: Operand) -> Operand {
+        let Some(vector_ct) = self.get_expr_ctype(expr).filter(CType::is_vector) else {
+            return value;
+        };
+        if !self.wrapper_forwards_packed_data(expr) {
+            return value;
+        }
+        let size = vector_ct.size();
+        let align = self.ctype_align(&vector_ct);
+        let alloca = self.emit_entry_alloca(IrType::Ptr, size, align, false);
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: value,
+            ptr: alloca,
+            ty: Self::packed_store_type(size),
+            seg_override: AddressSpace::Default,
+        });
+        Operand::Value(alloca)
+    }
+
+    /// Lower an expression in a discarded-value context. Integer postfix
+    /// increments do not need the old-value snapshot. Keep pointer postfix
+    /// operations on the established path: their snapshot currently also
+    /// prevents an unsafe pointer-phi coalescing in the backend.
+    pub(super) fn lower_expr_discarded(&mut self, expr: &Expr) {
+        match expr {
+            Expr::PostfixOp(op, inner, _) if self.get_expr_type(inner) != IrType::Ptr => {
+                self.lower_inc_dec_impl(inner, *op == PostfixOp::PostInc, true);
+            }
+            Expr::Comma(lhs, rhs, _) => {
+                self.lower_expr_discarded(lhs);
+                self.lower_expr_discarded(rhs);
+            }
+            _ => {
+                self.lower_expr(expr);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Literal and identifier helpers
+    // -----------------------------------------------------------------------
+
+    fn lower_string_literal(&mut self, s: &str, wide: bool) -> Operand {
+        let label = if wide {
+            self.intern_wide_string_literal(s)
+        } else {
+            self.intern_string_literal(s)
+        };
+        let dest = self.fresh_value();
+        self.emit(Instruction::GlobalAddr { dest, name: label });
+        Operand::Value(dest)
+    }
+
+    fn lower_char16_string_literal(&mut self, s: &str) -> Operand {
+        let label = self.intern_char16_string_literal(s);
+        let dest = self.fresh_value();
+        self.emit(Instruction::GlobalAddr { dest, name: label });
+        Operand::Value(dest)
+    }
+
+    /// Emit an inline asm to read a global register variable (e.g., `register long x asm("rsp")`).
+    /// Creates a temporary alloca, uses the inline asm output constraint `={regname}` to
+    /// store the register value into the alloca, then loads the result.
+    pub(super) fn read_global_register(&mut self, reg_name: &str, ty: IrType) -> Operand {
+        // Create a temporary alloca for the inline asm output
+        let tmp_alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: tmp_alloca,
+            ty,
+            size: ty.size(),
+            align: ty.align(),
+            // InlineAsm outputs carry destination addresses. Keep this
+            // compiler-generated home out of mem2reg even for a register
+            // constraint (`={rbx}`): promoting it removes the Load but leaves
+            // the asm writing through the old pointer, producing an undefined
+            // SSA result.
+            volatile: true,
+            semantic_volatile: false,
+        });
+        let output_constraint = format!("={{{}}}", reg_name);
+        self.emit(Instruction::InlineAsm {
+            template: String::new(),
+            outputs: vec![(output_constraint, tmp_alloca, None)],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![ty],
+            goto_labels: vec![],
+            input_symbols: vec![],
+            seg_overrides: vec![AddressSpace::Default],
+        });
+        // Load the result from the alloca
+        let result = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: result,
+            ptr: tmp_alloca,
+            ty,
+            seg_override: AddressSpace::Default,
+        });
+        Operand::Value(result)
+    }
+
+    fn load_global_var(&mut self, global_name: String, ginfo: &GlobalInfo) -> Operand {
+        let addr = self.fresh_value();
+        self.emit(Instruction::GlobalAddr {
+            dest: addr,
+            name: global_name,
+        });
+        if ginfo.is_array || ginfo.is_struct {
+            return Operand::Value(addr);
+        }
+        if let Some(ref ct) = ginfo.c_type {
+            if ct.is_complex() || ct.is_vector() {
+                return Operand::Value(addr);
+            }
+            // Function names in expression context decay to function pointers (addresses).
+            // Don't load from the function's address - just return the address itself.
+            if matches!(ct, CType::Function(_)) {
+                return Operand::Value(addr);
+            }
+        }
+        let dest = self.fresh_value();
+        let is_vol = super::definitions::object_access_is_volatile(
+            ginfo.base_type_volatile,
+            ginfo.object_volatile,
+            ginfo.var.c_type.as_ref(),
+        );
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: addr,
+            ty: ginfo.ty,
+            seg_override: ginfo.address_space,
+        });
+        if ginfo.c_type.as_ref().is_some_and(|ct| *ct == CType::Bool) {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), ginfo.ty);
+        }
+        Operand::Value(dest)
+    }
+
+    fn lower_identifier(&mut self, name: &str) -> Operand {
+        if crate::frontend::parser::ast::is_function_name_builtin(name) {
+            let text = crate::frontend::parser::ast::function_name_builtin_text(
+                name,
+                self.func_state.as_ref().map(|fs| fs.source_name()),
+            )
+            .to_string();
+            return self.lower_string_literal(&text, false);
+        }
+        if name == "NULL" {
+            return Operand::Const(IrConst::I64(0));
+        }
+
+        // Check locals first (shadows enum constants).
+        // Extract only the cheap scalar fields we need, avoiding a full LocalInfo clone
+        // (which includes StructLayout, CType, Vecs, and Strings on the heap).
+        if let Some(info) = self.func_mut().locals.get(name) {
+            let alloca = info.alloca;
+            let ty = info.ty;
+            let is_array = info.is_array;
+            let is_struct = info.is_struct;
+            let is_bool = info.is_bool;
+            let is_complex = info.c_type.as_ref().is_some_and(|ct| ct.is_complex());
+            let is_vector = info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
+            let is_vol = super::definitions::object_access_is_volatile(
+                info.base_type_volatile,
+                info.object_volatile,
+                info.var.c_type.as_ref(),
+            );
+            let static_global_name = info.static_global_name.clone();
+            let asm_register = info.asm_register.clone();
+            let asm_register_has_init = info.asm_register_has_init;
+
+            // Local register variable WITHOUT initializer AND not yet written by
+            // inline asm: read the hardware register directly via inline asm.
+            // E.g.:  register unsigned long sp __asm__("rsp"); return sp;
+            //
+            // Local register variables WITH initializer, or that have been written
+            // by an inline asm output, read from their alloca like normal variables.
+            // The register binding only affects inline asm constraint resolution.
+            //
+            // Note: asm_register_has_init is set to true either by the declaration
+            // having an initializer, or by the inline asm lowering when the variable
+            // is used as an output operand (see stmt_asm.rs).
+            if let Some(ref reg_name) = asm_register {
+                if !asm_register_has_init {
+                    return self.read_global_register(reg_name, ty);
+                }
+            }
+
+            if let Some(global_name) = static_global_name {
+                let addr = self.fresh_value();
+                self.emit(Instruction::GlobalAddr {
+                    dest: addr,
+                    name: global_name,
+                });
+                if is_array || is_struct || is_vector {
+                    return Operand::Value(addr);
+                }
+                let dest = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: is_vol,
+                    dest,
+                    ptr: addr,
+                    ty,
+                    seg_override: AddressSpace::Default,
+                });
+                if is_bool {
+                    self.emit_ubsan_bool_load_check(Operand::Value(dest), ty);
+                }
+                return Operand::Value(dest);
+            }
+            if is_array || is_struct {
+                return Operand::Value(alloca);
+            }
+            if is_complex || is_vector {
+                return Operand::Value(alloca);
+            }
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: is_vol,
+                dest,
+                ptr: alloca,
+                ty,
+                seg_override: AddressSpace::Default,
+            });
+            if is_bool {
+                self.emit_ubsan_bool_load_check(Operand::Value(dest), ty);
+            }
+            return Operand::Value(dest);
+        }
+
+        // Enumerators were resolved by the caller (`identifier_enumerator`).
+        if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {
+            if let Some(ginfo) = self.globals.get(&mangled).cloned() {
+                return self.load_global_var(mangled, &ginfo);
+            }
+        }
+
+        // GNU C nested function used as a value (address taken): a
+        // trampoline for chain-using functions, the plain symbol otherwise.
+        // Checked BEFORE globals so a nested function shadows a same-named
+        // global, per lexical scoping.
+        if self.lookup_nested_function(name).is_some() {
+            if let Some(op) = self.lower_nested_function_address(name) {
+                return op;
+            }
+        }
+
+        if let Some(ginfo) = self.globals.get(name).cloned() {
+            // Global register variable: read the register directly via inline
+            // asm — ONLY for real register names. A symbol-rename asm label
+            // (e.g. `extern int dfoo __asm__("abccb")`) goes through the
+            // normal load path with the renamed symbol.
+            if let Some(ref reg_name) = ginfo.asm_register {
+                if crate::ir::lowering::lower::is_x86_register_name(reg_name) {
+                    return self.read_global_register(reg_name, ginfo.ty);
+                }
+            }
+            // Resolve any __asm__("symbol") redirect before emitting the load.
+            let resolved = self.resolve_ref_name(name);
+            return self.load_global_var(resolved, &ginfo);
+        }
+
+        // Note: implicit declaration warnings are emitted during sema, not here.
+        // Apply __asm__("label") linker symbol redirect if present.
+        let resolved_name = self.resolve_ref_name(name);
+        let dest = self.fresh_value();
+        self.emit(Instruction::GlobalAddr {
+            dest,
+            name: resolved_name,
+        });
+        Operand::Value(dest)
+    }
+
+    // -----------------------------------------------------------------------
+    // Utility helpers
+    // -----------------------------------------------------------------------
+
+    /// Convert an Operand to a Value, copying constants to a temp if needed.
+    pub(super) fn operand_to_value(&mut self, op: Operand) -> Value {
+        match op {
+            Operand::Value(v) => v,
+            Operand::Const(_) => {
+                let tmp = self.fresh_value();
+                self.emit(Instruction::Copy { dest: tmp, src: op });
+                tmp
+            }
+        }
+    }
+
+    pub(super) fn maybe_narrow(&mut self, val: Value, ty: IrType) -> Operand {
+        let wt = crate::common::types::widened_op_type(ty);
+        if ty != wt {
+            let narrowed = self.emit_cast_val(Operand::Value(val), wt, ty);
+            Operand::Value(narrowed)
+        } else {
+            Operand::Value(val)
+        }
+    }
+
+    /// Map a byte size to the smallest IR integer type that fits.
+    pub(super) fn ir_type_for_size(size: usize) -> IrType {
+        if size <= 1 {
+            IrType::I8
+        } else if size <= 2 {
+            IrType::I16
+        } else if size <= 4 {
+            IrType::I32
+        } else {
+            IrType::I64
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Type inference for binary operations
+    // -----------------------------------------------------------------------
+
+    /// Infer the C semantic type of an expression for arithmetic conversions.
+    ///
+    /// This differs from `get_expr_type` in that it returns the C-level type
+    /// (e.g., IntLiteral → I32 if it fits, CharLiteral → I8, comparisons → I32)
+    /// whereas `get_expr_type` returns the IR storage type (literals → I64,
+    /// comparisons → I64). Use this for binary operation type selection and
+    /// arithmetic promotion decisions.
+    ///
+    /// For cases that don't differ, delegates to `get_expr_type`.
+    pub(super) fn infer_expr_type(&self, expr: &Expr) -> IrType {
+        match expr {
+            // Literals: use C semantic types (narrower than get_expr_type's I64)
+            Expr::IntLiteral(val, _) => {
+                if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
+            }
+            Expr::UIntLiteral(val, _) => {
+                if *val <= u32::MAX as u64 {
+                    IrType::U32
+                } else {
+                    IrType::U64
+                }
+            }
+            // On ILP32, long is 32-bit; values that overflow promote to long long (64-bit)
+            Expr::LongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() {
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        IrType::I32
+                    } else {
+                        IrType::I64
+                    }
+                } else {
+                    IrType::I64
+                }
+            }
+            Expr::ULongLiteral(val, _) => {
+                if crate::common::types::target_is_32bit() {
+                    if *val <= u32::MAX as u64 {
+                        IrType::U32
+                    } else {
+                        IrType::U64
+                    }
+                } else {
+                    IrType::U64
+                }
+            }
+            // long long is always 64-bit, regardless of target
+            Expr::LongLongLiteral(_, _) => IrType::I64,
+            Expr::ULongLongLiteral(_, _) => IrType::U64,
+            Expr::CharLiteral(_, _) => IrType::I8,
+            // Comparisons and logical ops produce C int (I32), not I64
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                if op.is_comparison() || matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
+                    IrType::I32
+                } else if matches!(op, BinOp::Shl | BinOp::Shr) {
+                    Self::integer_promote(self.infer_expr_type(lhs))
+                } else {
+                    // Iterate left-skewed chains to avoid O(2^n) recursion
+                    let rhs_ty = self.infer_expr_type(rhs);
+                    let mut result = rhs_ty;
+                    let mut cur = lhs.as_ref();
+                    loop {
+                        match cur {
+                            Expr::BinaryOp(op2, inner_lhs, inner_rhs, _)
+                                if !op2.is_comparison()
+                                    && !matches!(
+                                        op2,
+                                        BinOp::LogicalAnd
+                                            | BinOp::LogicalOr
+                                            | BinOp::Shl
+                                            | BinOp::Shr
+                                    ) =>
+                            {
+                                let r_ty = self.infer_expr_type(inner_rhs);
+                                result = Self::common_type(result, r_ty);
+                                cur = inner_lhs.as_ref();
+                            }
+                            _ => {
+                                let l_ty = self.infer_expr_type(cur);
+                                result = Self::common_type(result, l_ty);
+                                break;
+                            }
+                        }
+                    }
+                    result
+                }
+            }
+            Expr::UnaryOp(UnaryOp::LogicalNot, _, _) => IrType::I32,
+            Expr::UnaryOp(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Plus, inner, _) => {
+                let inner_ty = self.infer_expr_type(inner);
+                if inner_ty.is_float() {
+                    inner_ty
+                } else {
+                    Self::integer_promote(inner_ty)
+                }
+            }
+            // Recursive cases that must use infer_expr_type (not get_expr_type)
+            // to propagate narrow literal types through the expression tree
+            // `__real__`/`__imag__` of a complex value have the component type.
+            // The generic arm below would return the complex operand's pointer
+            // type, and -O0 then reads the component as an address.
+            Expr::UnaryOp(UnaryOp::RealPart | UnaryOp::ImagPart, inner, _) => {
+                let inner_ct = self.expr_ctype(inner);
+                if inner_ct.is_complex() {
+                    Self::complex_component_ir_type(&inner_ct)
+                } else {
+                    self.infer_expr_type(inner)
+                }
+            }
+            Expr::UnaryOp(_, inner, _) => self.infer_expr_type(inner),
+            Expr::PostfixOp(_, inner, _) => self.infer_expr_type(inner),
+            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
+                self.infer_expr_type(lhs)
+            }
+            Expr::Conditional(_, then_expr, else_expr, _) => Self::common_type(
+                self.infer_expr_type(then_expr),
+                self.infer_expr_type(else_expr),
+            ),
+            Expr::GnuConditional(cond, else_expr, _) => {
+                Self::common_type(self.infer_expr_type(cond), self.infer_expr_type(else_expr))
+            }
+            Expr::Comma(_, rhs, _) => self.infer_expr_type(rhs),
+            // All other cases: delegate to get_expr_type (same result)
+            _ => self.get_expr_type(expr),
+        }
+    }
+
+    /// Determine common type for usual arithmetic conversions.
+    /// On ILP32 targets, Ptr is equivalent to I32 (4 bytes); on LP64, Ptr maps to I64.
+    pub(super) fn common_type(a: IrType, b: IrType) -> IrType {
+        // Map Ptr to the target-appropriate signed integer type so that all
+        // the size-based ranking below works correctly on both 32-bit and 64-bit.
+        let a = if a == IrType::Ptr {
+            crate::common::types::target_int_ir_type()
+        } else {
+            a
+        };
+        let b = if b == IrType::Ptr {
+            crate::common::types::target_int_ir_type()
+        } else {
+            b
+        };
+
+        if a == IrType::I128 || a == IrType::U128 || b == IrType::I128 || b == IrType::U128 {
+            if a == IrType::U128 || b == IrType::U128 {
+                return IrType::U128;
+            }
+            return IrType::I128;
+        }
+        if a == IrType::F128 || b == IrType::F128 {
+            return IrType::F128;
+        }
+        if a == IrType::F64 || b == IrType::F64 {
+            return IrType::F64;
+        }
+        if a == IrType::F32 || b == IrType::F32 {
+            return IrType::F32;
+        }
+        if a == IrType::I64 || a == IrType::U64 || b == IrType::I64 || b == IrType::U64 {
+            if a == IrType::U64 || b == IrType::U64 {
+                return IrType::U64;
+            }
+            return IrType::I64;
+        }
+        if a == IrType::U32 || b == IrType::U32 {
+            return IrType::U32;
+        }
+        if a == IrType::I32 || b == IrType::I32 {
+            return IrType::I32;
+        }
+        IrType::I32
+    }
+
+    /// Lower expression and cast to target type if needed.
+    pub(super) fn lower_expr_with_type(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
+        let src = self.lower_expr(expr);
+        let src_ty = self.value_ir_type(expr);
+        // C23 decimals: any conversion touching a decimal carrier routes
+        // through the libbid helpers; a raw IR cast would emit a binary
+        // conversion on BID carriers (silent miscompile). This is the choke
+        // point for the decimal-vs-binary binop fallback, which lowers its
+        // operands to a binary float type here.
+        let mut src_ct = self.expr_ctype(expr);
+        if !src_ct.is_decimal() {
+            // Stale-composite insurance: trust the IR carrier when it says
+            // decimal but the CType disagrees (never fires for well-typed
+            // trees; converts a silent miscompile into a correct conversion
+            // when some composite-type query lags behind).
+            src_ct = match src_ty {
+                IrType::D32 => CType::Decimal32,
+                IrType::D64 => CType::Decimal64,
+                // (D128 rides the U128 carrier and is ctype-exact already.)
+                _ => src_ct,
+            };
+        }
+        if src_ct.is_decimal() || target_ty.is_decimal() {
+            if let Some(target_ct) = Self::decimal_conversion_target_ct(target_ty) {
+                return self.convert_scalar_ctype(src, src_ty, &src_ct, &target_ct);
+            }
+        }
+        self.emit_implicit_cast(src, src_ty, target_ty)
+    }
+
+    /// Recover a conversion-target CType from an IR type for decimal-aware
+    /// lowering. Width and signedness (all the libbid helper selection
+    /// needs) round-trip exactly, except for the ambiguous carriers, which
+    /// decline (fall back to the raw cast, i.e. status quo ante):
+    /// - `U128` is shared by `_Float128` and `unsigned __int128`;
+    /// - pointers/void/aggregates never reach decimal conversions.
+    pub(super) fn decimal_conversion_target_ct(target_ty: IrType) -> Option<CType> {
+        Some(match target_ty {
+            IrType::F32 => CType::Float,
+            IrType::F64 => CType::Double,
+            IrType::F128 => CType::LongDouble,
+            IrType::D32 => CType::Decimal32,
+            IrType::D64 => CType::Decimal64,
+            IrType::I8 => CType::Char,
+            IrType::U8 => CType::UChar,
+            IrType::I16 => CType::Short,
+            IrType::U16 => CType::UShort,
+            IrType::I32 => CType::Int,
+            IrType::U32 => CType::UInt,
+            IrType::I64 => CType::Long,
+            IrType::U64 => CType::ULong,
+            IrType::I128 => CType::Int128,
+            _ => return None,
+        })
+    }
+
+    /// Insert an implicit type cast if src_ty differs from target_ty.
+    pub(super) fn emit_implicit_cast(
+        &mut self,
+        src: Operand,
+        src_ty: IrType,
+        target_ty: IrType,
+    ) -> Operand {
+        // Integer constants are lowered at the target-int (I64 on LP64)
+        // representation even when their C type is narrower (e.g. `int`
+        // literals). If the declared source type is narrower than the
+        // constant's storage width (as happens when ternary arms are typed by
+        // C semantics, see Lowerer::ternary_arm_type), narrow the constant to
+        // its declared type first so the value, any subsequent cast, and any
+        // store all use the natural width.
+        let src = match src {
+            Operand::Const(c) if src_ty.is_integer() => {
+                let width = match &c {
+                    IrConst::I8(_) => 1,
+                    IrConst::I16(_) => 2,
+                    IrConst::I32(_) => 4,
+                    IrConst::I64(_) => 8,
+                    _ => 0,
+                };
+                if width > src_ty.size() {
+                    Operand::Const(c.narrowed_to(src_ty))
+                } else {
+                    Operand::Const(c)
+                }
+            }
+            other => other,
+        };
+        if src_ty == target_ty {
+            return src;
+        }
+        if pointer_integer_cast_changes_width(
+            src_ty,
+            target_ty,
+            crate::common::types::target_ptr_size(),
+        ) {
+            return Operand::Value(self.emit_cast_val(src, src_ty, target_ty));
+        }
+        if target_ty == IrType::Ptr || target_ty == IrType::Void {
+            return src;
+        }
+        if src_ty == IrType::Ptr && target_ty.is_integer() {
+            return src;
+        }
+        // Pointer <-> float conversions are invalid in C; skip the cast
+        // (sema should have already emitted an error for this)
+        if src_ty == IrType::Ptr && target_ty.is_float() {
+            return src;
+        }
+        if src_ty.is_float() && target_ty == IrType::Ptr {
+            return src;
+        }
+
+        let needs_cast = (target_ty.is_float() && !src_ty.is_float())
+            || (!target_ty.is_float() && src_ty.is_float())
+            || (target_ty.is_float() && src_ty.is_float() && target_ty != src_ty)
+            || (src_ty.is_integer() && target_ty.is_integer() && src_ty != target_ty);
+
+        if needs_cast {
+            let dest = self.emit_cast_val(src, src_ty, target_ty);
+            return Operand::Value(dest);
+        }
+        src
+    }
+
+    /// Convert `val`, the lowered value of `e` with IR type `ir_ty`, to
+    /// _Bool: `e != 0` (C11 6.3.1.2) as an I32 0/1. Every conversion site
+    /// that still has its source expression must use this rather than
+    /// `emit_bool_normalize_typed`, which sees only the IR type: decimal
+    /// and _Float128 values live in integer carriers that do not encode
+    /// zero uniquely (-0.0Q, BID zeros with any exponent such as 0.00DD),
+    /// so a carrier test is wrong for them. Binary-float carriers skip the
+    /// C type lookup (`IrType::is_float` is not the test: it includes the
+    /// decimal carriers D32/D64).
+    pub(super) fn emit_expr_bool_conversion(
+        &mut self,
+        val: Operand,
+        ir_ty: IrType,
+        e: &Expr,
+    ) -> Operand {
+        if !matches!(ir_ty, IrType::F32 | IrType::F64 | IrType::F128) {
+            let ct = self.expr_ctype(e);
+            if ct.is_soft_float() {
+                return self.lower_soft_float_truthiness(val, &ct);
+            }
+        }
+        self.emit_bool_normalize_typed(val, ir_ty)
+    }
+
+    /// Normalize a value for _Bool storage at the given source type.
+    /// Emits (val != 0) for integers, (val != 0.0) for floats.
+    /// This must be called BEFORE any truncation to avoid losing high bits.
+    pub(super) fn emit_bool_normalize_typed(&mut self, val: Operand, src_ty: IrType) -> Operand {
+        let zero = match src_ty {
+            IrType::F32 => Operand::Const(IrConst::F32(0.0)),
+            IrType::F64 => Operand::Const(IrConst::F64(0.0)),
+            IrType::F128 => Operand::Const(IrConst::long_double(0.0)),
+            _ => Operand::Const(IrConst::I64(0)),
+        };
+        let dest = self.emit_cmp_val(IrCmpOp::Ne, val, zero, src_ty);
+        Operand::Value(dest)
+    }
+}
+
+#[cfg(test)]
+mod pointer_width_cast_tests {
+    use super::*;
+
+    #[test]
+    fn every_integer_width_preserves_conversion_in_both_pointer_directions() {
+        for pointer_size in [4, 8] {
+            for ty in [
+                IrType::I8,
+                IrType::U8,
+                IrType::I16,
+                IrType::U16,
+                IrType::I32,
+                IrType::U32,
+                IrType::I64,
+                IrType::U64,
+                IrType::I128,
+                IrType::U128,
+            ] {
+                for (from, to) in [(ty, IrType::Ptr), (IrType::Ptr, ty)] {
+                    assert_eq!(
+                        pointer_integer_cast_changes_width(from, to, pointer_size),
+                        ty.size() != pointer_size
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_pointer_and_invalid_float_conversions_are_not_reclassified() {
+        for pointer_size in [4, 8] {
+            for (from, to) in [
+                (IrType::Ptr, IrType::Ptr),
+                (IrType::I32, IrType::I64),
+                (IrType::F64, IrType::Ptr),
+                (IrType::Ptr, IrType::F64),
+                (IrType::Void, IrType::Ptr),
+            ] {
+                assert!(!pointer_integer_cast_changes_width(from, to, pointer_size));
+            }
+        }
+    }
+}

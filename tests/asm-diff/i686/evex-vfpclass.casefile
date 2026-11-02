@@ -1,0 +1,95 @@
+;;; vfpclass-i686-registers
+.text
+vfpclassps $0xab, %xmm1, %k2
+vfpclassps $123, %ymm7, %k3{%k6}
+vfpclassps $255, %zmm5, %k7
+vfpclasspd $-1, %xmm6, %k1{%k2}
+vfpclasspd $1, %ymm4, %k4
+vfpclasspd $255, %zmm3, %k0
+vfpclassph $123, %xmm6, %k5
+vfpclassph $123, %ymm5, %k5
+vfpclassph $123, %zmm4, %k5{%k7}
+vfpclassbf16 $123, %xmm5, %k5
+vfpclassbf16 $123, %ymm4, %k5
+vfpclassbf16 $123, %zmm3, %k5{%k7}
+vfpclassss $123, %xmm6, %k5{%k7}
+vfpclasssd $255, %xmm4, %k5
+vfpclasssh $0xab, %xmm3, %k5{%k7}
+
+;;; vfpclass-i686-pinned-memory
+.text
+vfpclasspsx $123, (%eax), %k1
+vfpclasspsy $123, 4064(%ecx), %k2{%k7}
+vfpclasspsz $123, 8128(%esp), %k3
+vfpclasspdx $123, 2032(%edx), %k4
+vfpclasspdy $123, 4064(%ebx), %k5{%k7}
+vfpclasspdz $123, 8128(%esi), %k6
+vfpclassphx $123, 2032(%edi), %k1
+vfpclassphy $123, 4064(%ebp), %k2
+vfpclassphz $123, 8128(%esp,%esi,8), %k3{%k7}
+vfpclassbf16x $123, 2032(%eax), %k4
+vfpclassbf16y $123, 4064(%ecx), %k5{%k7}
+vfpclassbf16z $123, 8128(%edx), %k6
+
+;;; vfpclass-i686-broadcast-memory
+.text
+vfpclassps $123, (%eax){1to4}, %k2
+vfpclassps $123, 508(%ecx){1to8}, %k3{%k7}
+vfpclassps $123, -512(%edx){1to16}, %k4
+vfpclasspd $123, (%eax){1to2}, %k2
+vfpclasspd $123, 1016(%ecx){1to4}, %k3{%k7}
+vfpclasspd $123, -1024(%edx){1to8}, %k4
+vfpclassph $123, (%eax){1to8}, %k2
+vfpclassph $123, 254(%ecx){1to16}, %k3{%k7}
+vfpclassph $123, -256(%edx){1to32}, %k4
+vfpclassbf16 $123, (%eax){1to8}, %k2
+vfpclassbf16 $123, 254(%ecx){1to16}, %k3{%k7}
+vfpclassbf16 $123, -256(%edx){1to32}, %k4
+
+;;; vfpclass-i686-scalar-tuple1
+.text
+vfpclassss $123, %xmm6, %k5{%k7}
+vfpclassss $123, 508(%edx), %k5
+vfpclassss $123, -512(%esp), %k5{%k7}
+vfpclasssd $123, %xmm4, %k5
+vfpclasssd $123, 1016(%ecx), %k5{%k7}
+vfpclasssd $123, -1024(%ebx), %k5
+vfpclasssh $123, %xmm3, %k5{%k7}
+vfpclasssh $123, 254(%esi), %k5
+vfpclasssh $123, -256(%edi), %k5{%k7}
+
+;;; vfpclass-i686-reject-ambiguous-memory reject
+.text
+vfpclassps $123, (%eax), %k2
+
+;;; vfpclass-i686-reject-pinned-width-mismatch reject
+.text
+vfpclasspsx $123, %ymm1, %k2
+
+;;; vfpclass-i686-reject-scalar-wide-vector reject
+.text
+vfpclassss $123, %ymm1, %k2
+
+;;; vfpclass-i686-reject-scalar-broadcast reject
+.text
+vfpclasssh $123, (%eax){1to2}, %k2
+
+;;; vfpclass-i686-reject-bad-broadcast-count reject
+.text
+vfpclassps $123, (%eax){1to2}, %k2
+
+;;; vfpclass-i686-reject-source-mask-placement reject
+.text
+vfpclassps $123, %xmm1{%k3}, %k2
+
+;;; vfpclass-i686-reject-zeroing-k-destination reject
+.text
+vfpclassps $123, %xmm1, %k2{%k4}{z}
+
+;;; vfpclass-i686-reject-imm-high reject
+.text
+vfpclassps $256, %xmm1, %k2
+
+;;; vfpclass-i686-reject-xmm8-unavailable reject
+.text
+vfpclassps $123, %xmm8, %k2

@@ -1,0 +1,27 @@
+{
+  "source_commit": "fd2aba4987136537b9cb5490a3165b0d6c96f4d2",
+  "scope": "isolated exact late-fusion algorithm, native original/transformed assembly; not full C frontend",
+  "tools": {
+    "gcc-16": "gcc-16 (Debian 16.2.0-3) 16.2.0",
+    "valgrind": "valgrind-3.27.1",
+    "/home/user/.cargo/bin/rustc": "rustc 1.99.0 (b940084d7 2026-09-28)"
+  },
+  "files": {
+    "before-compare_branch.rs": "2dc6ea3d7093e9464ea12b92bfe5845eb89bfb1a93549fc44259d927237870be",
+    "before-types.rs": "3e31b90dcce4c1a5ca2b024e082620a66daf90321ae47068d7da759ba78763b8",
+    "driver.c": "b05e368d35f6fac5c8389caa14b37a4080d9f78cdb144cd3e1e7b64970cb03d7",
+    "extract.rs": "adee95b344f245155ced684e2da66782f2ee8bfddc2c1e1e2052187bc3aac897",
+    "live_rax/orig.s": "226ad8e2f91a23affacb0e507f90a2136d7b4f4e93fa7154c058e7fe09408a92",
+    "live_rax/transformed.s": "fccdcac338a3eb160ec6b1171b9ac05917869b134a0d93dbb981703588ac4011",
+    "live_stack_slot/orig.s": "70eb772a3df9fd91d68dfee3a869a9c01802a197e1ea9785d29c62c6cd8e5059",
+    "live_stack_slot/transformed.s": "88b277a150c4d084b3a1cbe5a3a6b2f5d0564f999b886ed54e7a069d85fae412",
+    "live_test_flags/orig.s": "5c8990d4b4adfaa87bcca57c78ed07e68fc9ffd83951d312eaf773ce09998025",
+    "live_test_flags/transformed.s": "084c6be82b4cca65584015e077e619552832ba6eed32a607127aac1ee7e51831",
+    "non_al_setcc/orig.s": "c2f40c8cd70dbbfa9291e27726d6a62c3986d0fb7d90206093055ecd8e4a4957",
+    "non_al_setcc/transformed.s": "c2a23eba8fe423b2b9f5c7a547349e8d86f5cfe0c05b4a04110b29dfba662b0f",
+    "non_stack_store/orig.s": "ae357e39ed2944cb060b285164388e9235c85a465d8cd9dbaf72996b8398e686",
+    "non_stack_store/transformed.s": "6253a78c8e4a04812a213c5cd91de136c86bb92177585a19c6499f6f88ca94c2",
+    "probe.py": "ed78c5126865efcef019e1eeaafb0ddd8eb144fd732080e3aa7f6da9c1bba0f4",
+    "report.json": "d7d40e56b3746183f900df0150510d10cea7d4be7214e8f51a56e1ae49d7ce41"
+  }
+}

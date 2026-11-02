@@ -1,0 +1,451 @@
+{
+  "solver": "5.3.1",
+  "results": [
+    {
+      "law": "u8/231586/mask-implies-different",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/231063/guarded-add",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/231063/guarded-sub",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/230800/modular-range-mask",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/230800/even-two",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/229537/joint-guard-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/229537/signed-zero-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/229332/available-inverse",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/217230/masked-trip",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/214397/range-bit",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/213708/lowbit-zero",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/213708/lowbit-one",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/210131/boolean-or",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u8/reject/trip-nonmultiple",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x8 = 8]"
+    },
+    {
+      "law": "u8/reject/trip-visible-carry",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x8 = 0]"
+    },
+    {
+      "law": "u8/reject/nonboolean-select",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[p8 = True]"
+    },
+    {
+      "law": "u8/230021/shared-divrem",
+      "domain": "bounded unsigned integer / modular output",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/231586/mask-implies-different",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/231063/guarded-add",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/231063/guarded-sub",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/230800/modular-range-mask",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/230800/even-two",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/229537/joint-guard-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/229537/signed-zero-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/229332/available-inverse",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/217230/masked-trip",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/214397/range-bit",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/213708/lowbit-zero",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/213708/lowbit-one",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/210131/boolean-or",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u16/reject/trip-nonmultiple",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x16 = 8]"
+    },
+    {
+      "law": "u16/reject/trip-visible-carry",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x16 = 0]"
+    },
+    {
+      "law": "u16/reject/nonboolean-select",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[p16 = True]"
+    },
+    {
+      "law": "u16/230021/shared-divrem",
+      "domain": "bounded unsigned integer / modular output",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/231586/mask-implies-different",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/231063/guarded-add",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/231063/guarded-sub",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/230800/modular-range-mask",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/230800/even-two",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/229537/joint-guard-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/229537/signed-zero-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/229332/available-inverse",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/217230/masked-trip",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/214397/range-bit",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/213708/lowbit-zero",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/213708/lowbit-one",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/210131/boolean-or",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/reject/trip-nonmultiple",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x32 = 8]"
+    },
+    {
+      "law": "u32/reject/trip-visible-carry",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x32 = 0]"
+    },
+    {
+      "law": "u32/reject/nonboolean-select",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[p32 = True]"
+    },
+    {
+      "law": "u32/230021/shared-divrem",
+      "domain": "bounded unsigned integer / modular output",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/230021/masked-divrem",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u32/reject/masked-divrem",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x32 = 2796205]"
+    },
+    {
+      "law": "u64/231586/mask-implies-different",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/231063/guarded-add",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/231063/guarded-sub",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/230800/modular-range-mask",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/230800/even-two",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/229537/joint-guard-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/229537/signed-zero-select",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/229332/available-inverse",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/217230/masked-trip",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/214397/range-bit",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/213708/lowbit-zero",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/213708/lowbit-one",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/210131/boolean-or",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/reject/trip-nonmultiple",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x64 = 8]"
+    },
+    {
+      "law": "u64/reject/trip-visible-carry",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x64 = 0]"
+    },
+    {
+      "law": "u64/reject/nonboolean-select",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[p64 = True]"
+    },
+    {
+      "law": "u64/230021/shared-divrem",
+      "domain": "bounded unsigned integer / modular output",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/230021/masked-divrem",
+      "domain": "bitvector",
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "law": "u64/reject/masked-divrem",
+      "domain": "bitvector",
+      "expected": "sat",
+      "result": "sat",
+      "counterexample": "[x64 = 29690538186199735]"
+    }
+  ]
+}

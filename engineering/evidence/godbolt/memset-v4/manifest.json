@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "source": "/home/user/work/t/probe.c",
+  "source_sha256": "36638f523f2c7fe3a1d4cfa4d827733afbdea2e1332a88a32e70c51bd3ccc299",
+  "function": "zinit",
+  "remote_flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+  "local_flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+  "oracles": [
+    {
+      "key": "lccc",
+      "id": "target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "instructions": 10
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "instructions": 9
+    },
+    {
+      "key": "clang",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "instructions": 12
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "instructions": 12
+    }
+  ]
+}

@@ -1,0 +1,3521 @@
+{
+  "base": "08f4e1a124d753e9eeddb1c43ce68b54d4d95f68",
+  "candidate_source": "8b6454b28b19c40668b9fc9dcc2146e7202543bc",
+  "flags": "-O2 -march=x86-64-v3",
+  "scope": "whole TU; static instructions, NOT runtime",
+  "nonrecursion": {
+    "n": 51,
+    "geomean": 1.1989731013526923,
+    "arithmetic_mean": 1.2676397459010302,
+    "median": 1.2208436724565757,
+    "min": 0.543010752688172,
+    "max": 4.3076923076923075,
+    "smaller": 13,
+    "equal": 0,
+    "larger": 38
+  },
+  "compiler_identity": [
+    {
+      "key": "lccc",
+      "id": "/var/tmp/lccc-session/lccc/target/fastbuild/lccc",
+      "name": "local LCCC"
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2"
+    },
+    {
+      "key": "clang",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0"
+    },
+    {
+      "key": "icc",
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0"
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)"
+    }
+  ],
+  "rows": [
+    {
+      "workload": "aarch64_select_patterns",
+      "source_sha256": "6359bd459ac5806e318c49bfa8ede04ab50a0611888df1d8250c9a29f11c6a19",
+      "before": {
+        "instructions": 72,
+        "loads": 0,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 72,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "gcc16.2": {
+          "instructions": 48,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 58,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icc": {
+          "instructions": 74,
+          "loads": 3,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "icx": {
+          "instructions": 63,
+          "loads": 2,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 72,
+        "loads": 0,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      }
+    },
+    {
+      "workload": "ackermann",
+      "source_sha256": "c261e807453e1c04a260c2ad21e1bdf1fb19241b06dbad679715cc78f970bcb4",
+      "before": {
+        "instructions": 8,
+        "loads": 0,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 8,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 133,
+          "loads": 3,
+          "stores": 3,
+          "stack_refs": 6,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "clang": {
+          "instructions": 31,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 195,
+          "loads": 3,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 20
+        },
+        "icx": {
+          "instructions": 34,
+          "loads": 2,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 8,
+        "loads": 0,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "adler32_do8_hot",
+      "source_sha256": "4bd630da3503fe383fecab171b4ce60224ac87e82b7c073185f044bc1c123de2",
+      "before": {
+        "instructions": 159,
+        "loads": 17,
+        "stores": 5,
+        "stack_refs": 9,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 159,
+          "loads": 17,
+          "stores": 5,
+          "stack_refs": 9,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 99,
+          "loads": 16,
+          "stores": 7,
+          "stack_refs": 12,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "clang": {
+          "instructions": 149,
+          "loads": 27,
+          "stores": 2,
+          "stack_refs": 10,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 328,
+          "loads": 84,
+          "stores": 11,
+          "stack_refs": 63,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 120,
+          "loads": 19,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 159,
+        "loads": 17,
+        "stores": 5,
+        "stack_refs": 9,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "affine_countdown",
+      "source_sha256": "c6830de1924e7385e822c8e8b669a98e69fe6855744de9486870bc007eb9db1e",
+      "before": {
+        "instructions": 101,
+        "loads": 6,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 101,
+          "loads": 6,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 186,
+          "loads": 9,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 230,
+          "loads": 61,
+          "stores": 8,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 106,
+          "loads": 17,
+          "stores": 12,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 265,
+          "loads": 61,
+          "stores": 11,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 101,
+        "loads": 6,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "arith_loop",
+      "source_sha256": "52de2f1694990a48b162d5f99ba3cce886c68f7d92008eb2d5c4ea016b0ac049",
+      "before": {
+        "instructions": 198,
+        "loads": 86,
+        "stores": 45,
+        "stack_refs": 110,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 198,
+          "loads": 86,
+          "stores": 45,
+          "stack_refs": 110,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 223,
+          "loads": 68,
+          "stores": 50,
+          "stack_refs": 107,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "clang": {
+          "instructions": 236,
+          "loads": 32,
+          "stores": 22,
+          "stack_refs": 44,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icc": {
+          "instructions": 486,
+          "loads": 99,
+          "stores": 99,
+          "stack_refs": 195,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 251,
+          "loads": 61,
+          "stores": 61,
+          "stack_refs": 120,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 198,
+        "loads": 86,
+        "stores": 45,
+        "stack_refs": 110,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "ascii_case_fold",
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "before": {
+        "instructions": 111,
+        "loads": 7,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 111,
+          "loads": 7,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "gcc16.2": {
+          "instructions": 159,
+          "loads": 9,
+          "stores": 6,
+          "stack_refs": 8,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "clang": {
+          "instructions": 107,
+          "loads": 17,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "icc": {
+          "instructions": 172,
+          "loads": 25,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icx": {
+          "instructions": 121,
+          "loads": 15,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 111,
+        "loads": 7,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      }
+    },
+    {
+      "workload": "base64_enc",
+      "source_sha256": "202b02d219d2024a6d3110f8659d61f503447c9319352d38806ddf875f684c2f",
+      "before": {
+        "instructions": 113,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 113,
+          "loads": 8,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 108,
+          "loads": 10,
+          "stores": 5,
+          "stack_refs": 1,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 914,
+          "loads": 334,
+          "stores": 95,
+          "stack_refs": 171,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 93,
+          "loads": 16,
+          "stores": 10,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 120,
+          "loads": 34,
+          "stores": 26,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 113,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "binary_search",
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "before": {
+        "instructions": 71,
+        "loads": 2,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 71,
+          "loads": 2,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "gcc16.2": {
+          "instructions": 51,
+          "loads": 2,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "clang": {
+          "instructions": 87,
+          "loads": 12,
+          "stores": 8,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "icc": {
+          "instructions": 57,
+          "loads": 6,
+          "stores": 7,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icx": {
+          "instructions": 101,
+          "loads": 7,
+          "stores": 7,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 71,
+        "loads": 2,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      }
+    },
+    {
+      "workload": "binary_trees",
+      "source_sha256": "f8c94eefaa86a1eb2cf249663ed3cf517b59d782d0f6fe6ea285e800a14c3a77",
+      "before": {
+        "instructions": 145,
+        "loads": 6,
+        "stores": 5,
+        "stack_refs": 3,
+        "xmm_reg_moves": 0,
+        "calls": 20
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 145,
+          "loads": 6,
+          "stores": 5,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 20
+        },
+        "gcc16.2": {
+          "instructions": 1478,
+          "loads": 300,
+          "stores": 246,
+          "stack_refs": 234,
+          "xmm_reg_moves": 0,
+          "calls": 313
+        },
+        "clang": {
+          "instructions": 147,
+          "loads": 7,
+          "stores": 4,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "calls": 18
+        },
+        "icc": {
+          "instructions": 606,
+          "loads": 90,
+          "stores": 72,
+          "stack_refs": 57,
+          "xmm_reg_moves": 0,
+          "calls": 97
+        },
+        "icx": {
+          "instructions": 134,
+          "loads": 8,
+          "stores": 6,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 18
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 145,
+        "loads": 6,
+        "stores": 5,
+        "stack_refs": 3,
+        "xmm_reg_moves": 0,
+        "calls": 20
+      }
+    },
+    {
+      "workload": "bitops",
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "before": {
+        "instructions": 80,
+        "loads": 0,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 80,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 99,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 90,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 125,
+          "loads": 3,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 112,
+          "loads": 2,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 80,
+        "loads": 0,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "chacha20_block",
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "before": {
+        "instructions": 193,
+        "loads": 19,
+        "stores": 25,
+        "stack_refs": 37,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 193,
+          "loads": 19,
+          "stores": 25,
+          "stack_refs": 37,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "gcc16.2": {
+          "instructions": 269,
+          "loads": 55,
+          "stores": 50,
+          "stack_refs": 94,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "clang": {
+          "instructions": 257,
+          "loads": 53,
+          "stores": 35,
+          "stack_refs": 37,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 2340,
+          "loads": 98,
+          "stores": 97,
+          "stack_refs": 170,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icx": {
+          "instructions": 138,
+          "loads": 22,
+          "stores": 11,
+          "stack_refs": 16,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 193,
+        "loads": 19,
+        "stores": 25,
+        "stack_refs": 37,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      }
+    },
+    {
+      "workload": "constant_recursion",
+      "source_sha256": "80a16fc86076fdda1a2f40f278c179a6a262c8d741ff9f76d20b4ea762163fd5",
+      "before": {
+        "instructions": 10,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 10,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 135,
+          "loads": 4,
+          "stores": 4,
+          "stack_refs": 8,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "clang": {
+          "instructions": 32,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 196,
+          "loads": 4,
+          "stores": 4,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 20
+        },
+        "icx": {
+          "instructions": 35,
+          "loads": 3,
+          "stores": 4,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 10,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "conv_u8_3x3",
+      "source_sha256": "1d98b0992dc113329c7c5dc063281833a8ea490598b6d1fe8f30a29d11506e64",
+      "before": {
+        "instructions": 137,
+        "loads": 20,
+        "stores": 3,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 137,
+          "loads": 20,
+          "stores": 3,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 91,
+          "loads": 7,
+          "stores": 3,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 314,
+          "loads": 40,
+          "stores": 9,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 318,
+          "loads": 44,
+          "stores": 12,
+          "stack_refs": 13,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 280,
+          "loads": 66,
+          "stores": 9,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 137,
+        "loads": 20,
+        "stores": 3,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "crc32_nibble_hot",
+      "source_sha256": "5833dcd32ee3265a7213ac5a4b56207132dbece87ce2b561f7a1085458e74c18",
+      "before": {
+        "instructions": 41,
+        "loads": 2,
+        "stores": 1,
+        "stack_refs": 1,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 41,
+          "loads": 2,
+          "stores": 1,
+          "stack_refs": 1,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 48,
+          "loads": 6,
+          "stores": 2,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 95,
+          "loads": 20,
+          "stores": 2,
+          "stack_refs": 6,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 84,
+          "loads": 15,
+          "stores": 7,
+          "stack_refs": 9,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 134,
+          "loads": 40,
+          "stores": 7,
+          "stack_refs": 15,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 41,
+        "loads": 2,
+        "stores": 1,
+        "stack_refs": 1,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "csv_field_sum",
+      "source_sha256": "b56aadc78e3d1b0108d500ea81b439cedd6094611b2255174cd46cae3201d21f",
+      "before": {
+        "instructions": 214,
+        "loads": 5,
+        "stores": 13,
+        "stack_refs": 12,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 214,
+          "loads": 5,
+          "stores": 13,
+          "stack_refs": 12,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "gcc16.2": {
+          "instructions": 183,
+          "loads": 7,
+          "stores": 8,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 300,
+          "loads": 11,
+          "stores": 12,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 262,
+          "loads": 13,
+          "stores": 12,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 297,
+          "loads": 13,
+          "stores": 13,
+          "stack_refs": 10,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 214,
+        "loads": 5,
+        "stores": 13,
+        "stack_refs": 12,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      }
+    },
+    {
+      "workload": "double_reduction",
+      "source_sha256": "ff939dcabb64e38bfa38b1fa52439ab4eb006fc5cf32811efa85ea1eb92ac21f",
+      "before": {
+        "instructions": 135,
+        "loads": 8,
+        "stores": 7,
+        "stack_refs": 7,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 135,
+          "loads": 8,
+          "stores": 7,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 92,
+          "loads": 5,
+          "stores": 3,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 133,
+          "loads": 28,
+          "stores": 3,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 167,
+          "loads": 18,
+          "stores": 9,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 150,
+          "loads": 16,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 135,
+        "loads": 8,
+        "stores": 7,
+        "stack_refs": 7,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "expat_xml_scan",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "before": {
+        "instructions": 222,
+        "loads": 18,
+        "stores": 10,
+        "stack_refs": 17,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 222,
+          "loads": 18,
+          "stores": 10,
+          "stack_refs": 17,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "gcc16.2": {
+          "instructions": 172,
+          "loads": 15,
+          "stores": 6,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 222,
+          "loads": 15,
+          "stores": 10,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 319,
+          "loads": 21,
+          "stores": 7,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icx": {
+          "instructions": 327,
+          "loads": 21,
+          "stores": 29,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 222,
+        "loads": 18,
+        "stores": 10,
+        "stack_refs": 17,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      }
+    },
+    {
+      "workload": "fannkuch",
+      "source_sha256": "67838020f90c6b7ad1733536cc069801f0b9c28be0887754a7ea0b4d96ac72ce",
+      "before": {
+        "instructions": 152,
+        "loads": 15,
+        "stores": 27,
+        "stack_refs": 7,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 152,
+          "loads": 15,
+          "stores": 27,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 135,
+          "loads": 19,
+          "stores": 25,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 226,
+          "loads": 31,
+          "stores": 28,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icc": {
+          "instructions": 207,
+          "loads": 24,
+          "stores": 28,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icx": {
+          "instructions": 109,
+          "loads": 13,
+          "stores": 15,
+          "stack_refs": 6,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 152,
+        "loads": 15,
+        "stores": 27,
+        "stack_refs": 7,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "fib",
+      "source_sha256": "a320028fc9dbb98e358ab7dfc35b5210a8d7683cfe5c894df7966fbc9d9c92df",
+      "before": {
+        "instructions": 30,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 30,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 217,
+          "loads": 36,
+          "stores": 29,
+          "stack_refs": 64,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "clang": {
+          "instructions": 31,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 152,
+          "loads": 6,
+          "stores": 6,
+          "stack_refs": 9,
+          "xmm_reg_moves": 0,
+          "calls": 20
+        },
+        "icx": {
+          "instructions": 34,
+          "loads": 3,
+          "stores": 4,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 30,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "fir_filter",
+      "source_sha256": "725064f905a253212e8b7574f8bc928ca23f4ff00f0352cd1b720246295ca03a",
+      "before": {
+        "instructions": 106,
+        "loads": 17,
+        "stores": 10,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 106,
+          "loads": 17,
+          "stores": 10,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 83,
+          "loads": 6,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 117,
+          "loads": 35,
+          "stores": 18,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 191,
+          "loads": 37,
+          "stores": 16,
+          "stack_refs": 21,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 159,
+          "loads": 36,
+          "stores": 29,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 106,
+        "loads": 17,
+        "stores": 10,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "fp_memfold_stencil5",
+      "source_sha256": "dd3c611692e92953bed1630a07f3946b4b0b6c72933eeb6fab8f7d50c45f5ea4",
+      "before": {
+        "instructions": 119,
+        "loads": 19,
+        "stores": 5,
+        "stack_refs": 7,
+        "xmm_reg_moves": 1,
+        "calls": 3
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 119,
+          "loads": 19,
+          "stores": 5,
+          "stack_refs": 7,
+          "xmm_reg_moves": 1,
+          "calls": 3
+        },
+        "gcc16.2": {
+          "instructions": 121,
+          "loads": 18,
+          "stores": 4,
+          "stack_refs": 2,
+          "xmm_reg_moves": 4,
+          "calls": 5
+        },
+        "clang": {
+          "instructions": 154,
+          "loads": 40,
+          "stores": 15,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 283,
+          "loads": 68,
+          "stores": 19,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icx": {
+          "instructions": 116,
+          "loads": 33,
+          "stores": 11,
+          "stack_refs": 5,
+          "xmm_reg_moves": 6,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 119,
+        "loads": 19,
+        "stores": 5,
+        "stack_refs": 7,
+        "xmm_reg_moves": 1,
+        "calls": 3
+      }
+    },
+    {
+      "workload": "glibc_memcmp",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "before": {
+        "instructions": 203,
+        "loads": 17,
+        "stores": 15,
+        "stack_refs": 15,
+        "xmm_reg_moves": 0,
+        "calls": 9
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 203,
+          "loads": 17,
+          "stores": 15,
+          "stack_refs": 15,
+          "xmm_reg_moves": 0,
+          "calls": 9
+        },
+        "gcc16.2": {
+          "instructions": 157,
+          "loads": 18,
+          "stores": 15,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 227,
+          "loads": 14,
+          "stores": 11,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icc": {
+          "instructions": 322,
+          "loads": 72,
+          "stores": 40,
+          "stack_refs": 76,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "icx": {
+          "instructions": 311,
+          "loads": 18,
+          "stores": 24,
+          "stack_refs": 6,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 203,
+        "loads": 17,
+        "stores": 15,
+        "stack_refs": 15,
+        "xmm_reg_moves": 0,
+        "calls": 9
+      }
+    },
+    {
+      "workload": "glibc_strstr",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "before": {
+        "instructions": 194,
+        "loads": 14,
+        "stores": 11,
+        "stack_refs": 17,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 194,
+          "loads": 14,
+          "stores": 11,
+          "stack_refs": 17,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 182,
+          "loads": 12,
+          "stores": 21,
+          "stack_refs": 19,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "clang": {
+          "instructions": 319,
+          "loads": 29,
+          "stores": 42,
+          "stack_refs": 51,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 197,
+          "loads": 13,
+          "stores": 21,
+          "stack_refs": 23,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 261,
+          "loads": 19,
+          "stores": 23,
+          "stack_refs": 18,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 194,
+        "loads": 14,
+        "stores": 11,
+        "stack_refs": 17,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "global_addr_pressure",
+      "source_sha256": "5bbcd15a2766d435ac721076608224ddc1d5c6253256ab539173d8e4ad991bc7",
+      "before": {
+        "instructions": 100,
+        "loads": 4,
+        "stores": 4,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 6
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 100,
+          "loads": 4,
+          "stores": 4,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        },
+        "gcc16.2": {
+          "instructions": 80,
+          "loads": 5,
+          "stores": 4,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        },
+        "clang": {
+          "instructions": 109,
+          "loads": 19,
+          "stores": 7,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        },
+        "icc": {
+          "instructions": 207,
+          "loads": 20,
+          "stores": 34,
+          "stack_refs": 13,
+          "xmm_reg_moves": 0,
+          "calls": 7
+        },
+        "icx": {
+          "instructions": 131,
+          "loads": 20,
+          "stores": 11,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 100,
+        "loads": 4,
+        "stores": 4,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 6
+      }
+    },
+    {
+      "workload": "gzip_crc32",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "before": {
+        "instructions": 73,
+        "loads": 3,
+        "stores": 2,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 73,
+          "loads": 3,
+          "stores": 2,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "gcc16.2": {
+          "instructions": 50,
+          "loads": 5,
+          "stores": 2,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 82,
+          "loads": 9,
+          "stores": 9,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 60,
+          "loads": 8,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 100,
+          "loads": 20,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 73,
+        "loads": 3,
+        "stores": 2,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      }
+    },
+    {
+      "workload": "hash_table",
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "before": {
+        "instructions": 141,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 6
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 141,
+          "loads": 8,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        },
+        "gcc16.2": {
+          "instructions": 116,
+          "loads": 11,
+          "stores": 9,
+          "stack_refs": 8,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        },
+        "clang": {
+          "instructions": 140,
+          "loads": 13,
+          "stores": 10,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 158,
+          "loads": 17,
+          "stores": 13,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icx": {
+          "instructions": 142,
+          "loads": 15,
+          "stores": 13,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 141,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 6
+      }
+    },
+    {
+      "workload": "histogram",
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "before": {
+        "instructions": 59,
+        "loads": 9,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 59,
+          "loads": 9,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "gcc16.2": {
+          "instructions": 76,
+          "loads": 4,
+          "stores": 2,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "clang": {
+          "instructions": 107,
+          "loads": 23,
+          "stores": 6,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "icc": {
+          "instructions": 125,
+          "loads": 19,
+          "stores": 7,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icx": {
+          "instructions": 124,
+          "loads": 28,
+          "stores": 15,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 59,
+        "loads": 9,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      }
+    },
+    {
+      "workload": "i686_alu_chains",
+      "source_sha256": "287d6e3793d6d41401abe9dae81e2b0fcfa88e456e5c9539acebcb436e39bbdc",
+      "before": {
+        "instructions": 492,
+        "loads": 17,
+        "stores": 60,
+        "stack_refs": 69,
+        "xmm_reg_moves": 2,
+        "calls": 7
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 492,
+          "loads": 17,
+          "stores": 60,
+          "stack_refs": 69,
+          "xmm_reg_moves": 2,
+          "calls": 7
+        },
+        "gcc16.2": {
+          "instructions": 403,
+          "loads": 12,
+          "stores": 52,
+          "stack_refs": 57,
+          "xmm_reg_moves": 0,
+          "calls": 7
+        },
+        "clang": {
+          "instructions": 1528,
+          "loads": 55,
+          "stores": 32,
+          "stack_refs": 73,
+          "xmm_reg_moves": 0,
+          "calls": 12
+        },
+        "icc": {
+          "instructions": 374,
+          "loads": 28,
+          "stores": 15,
+          "stack_refs": 29,
+          "xmm_reg_moves": 0,
+          "calls": 8
+        },
+        "icx": {
+          "instructions": 2784,
+          "loads": 207,
+          "stores": 92,
+          "stack_refs": 259,
+          "xmm_reg_moves": 0,
+          "calls": 87
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 492,
+        "loads": 17,
+        "stores": 60,
+        "stack_refs": 69,
+        "xmm_reg_moves": 2,
+        "calls": 7
+      }
+    },
+    {
+      "workload": "libm_round_family",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "before": {
+        "instructions": 167,
+        "loads": 50,
+        "stores": 4,
+        "stack_refs": 4,
+        "xmm_reg_moves": 10,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 167,
+          "loads": 50,
+          "stores": 4,
+          "stack_refs": 4,
+          "xmm_reg_moves": 10,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 173,
+          "loads": 19,
+          "stores": 3,
+          "stack_refs": 0,
+          "xmm_reg_moves": 5,
+          "calls": 2
+        },
+        "clang": {
+          "instructions": 183,
+          "loads": 37,
+          "stores": 7,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icc": {
+          "instructions": 206,
+          "loads": 46,
+          "stores": 18,
+          "stack_refs": 29,
+          "xmm_reg_moves": 0,
+          "calls": 10
+        },
+        "icx": {
+          "instructions": 125,
+          "loads": 12,
+          "stores": 9,
+          "stack_refs": 5,
+          "xmm_reg_moves": 1,
+          "calls": 2
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 167,
+        "loads": 50,
+        "stores": 4,
+        "stack_refs": 4,
+        "xmm_reg_moves": 10,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "linux_find_bit",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "before": {
+        "instructions": 147,
+        "loads": 5,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 147,
+          "loads": 5,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "gcc16.2": {
+          "instructions": 156,
+          "loads": 13,
+          "stores": 12,
+          "stack_refs": 13,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 118,
+          "loads": 12,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 205,
+          "loads": 19,
+          "stores": 12,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 121,
+          "loads": 12,
+          "stores": 8,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 147,
+        "loads": 5,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      }
+    },
+    {
+      "workload": "linux_rbtree",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "before": {
+        "instructions": 237,
+        "loads": 33,
+        "stores": 41,
+        "stack_refs": 9,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 237,
+          "loads": 33,
+          "stores": 41,
+          "stack_refs": 9,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 173,
+          "loads": 25,
+          "stores": 32,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 189,
+          "loads": 27,
+          "stores": 30,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 189,
+          "loads": 37,
+          "stores": 35,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 274,
+          "loads": 45,
+          "stores": 34,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 237,
+        "loads": 33,
+        "stores": 41,
+        "stack_refs": 9,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "loop_patterns",
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "before": {
+        "instructions": 231,
+        "loads": 18,
+        "stores": 7,
+        "stack_refs": 5,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 231,
+          "loads": 18,
+          "stores": 7,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 179,
+          "loads": 15,
+          "stores": 4,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 361,
+          "loads": 85,
+          "stores": 33,
+          "stack_refs": 25,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 283,
+          "loads": 43,
+          "stores": 13,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 245,
+          "loads": 44,
+          "stores": 23,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 231,
+        "loads": 18,
+        "stores": 7,
+        "stack_refs": 5,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "lz4_compress",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "before": {
+        "instructions": 351,
+        "loads": 70,
+        "stores": 46,
+        "stack_refs": 81,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 351,
+          "loads": 70,
+          "stores": 46,
+          "stack_refs": 81,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "gcc16.2": {
+          "instructions": 292,
+          "loads": 27,
+          "stores": 24,
+          "stack_refs": 14,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 421,
+          "loads": 47,
+          "stores": 46,
+          "stack_refs": 15,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icc": {
+          "instructions": 361,
+          "loads": 38,
+          "stores": 40,
+          "stack_refs": 37,
+          "xmm_reg_moves": 0,
+          "calls": 7
+        },
+        "icx": {
+          "instructions": 361,
+          "loads": 30,
+          "stores": 26,
+          "stack_refs": 23,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 351,
+        "loads": 70,
+        "stores": 46,
+        "stack_refs": 81,
+        "xmm_reg_moves": 0,
+        "calls": 4
+      }
+    },
+    {
+      "workload": "mandelbrot",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "before": {
+        "instructions": 55,
+        "loads": 5,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 1,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 55,
+          "loads": 5,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 1,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 47,
+          "loads": 4,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 4,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 59,
+          "loads": 4,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 2,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 64,
+          "loads": 7,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 64,
+          "loads": 7,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 3,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 55,
+        "loads": 5,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 1,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "matmul",
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "before": {
+        "instructions": 85,
+        "loads": 12,
+        "stores": 7,
+        "stack_refs": 2,
+        "xmm_reg_moves": 1,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 85,
+          "loads": 12,
+          "stores": 7,
+          "stack_refs": 2,
+          "xmm_reg_moves": 1,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 82,
+          "loads": 8,
+          "stores": 6,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "clang": {
+          "instructions": 164,
+          "loads": 46,
+          "stores": 22,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 149,
+          "loads": 28,
+          "stores": 16,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 131,
+          "loads": 24,
+          "stores": 16,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 85,
+        "loads": 12,
+        "stores": 7,
+        "stack_refs": 2,
+        "xmm_reg_moves": 1,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "moving_stats",
+      "source_sha256": "9c561d5f1cca457fc108316bf792c752cc47496c2fc7432a4e1c48a3a1b2ab6b",
+      "before": {
+        "instructions": 217,
+        "loads": 22,
+        "stores": 6,
+        "stack_refs": 5,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 217,
+          "loads": 22,
+          "stores": 6,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 131,
+          "loads": 8,
+          "stores": 8,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 291,
+          "loads": 38,
+          "stores": 8,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 143,
+          "loads": 22,
+          "stores": 8,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icx": {
+          "instructions": 250,
+          "loads": 32,
+          "stores": 14,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 217,
+        "loads": 22,
+        "stores": 6,
+        "stack_refs": 5,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "nbody",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "before": {
+        "instructions": 302,
+        "loads": 91,
+        "stores": 32,
+        "stack_refs": 30,
+        "xmm_reg_moves": 7,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 296,
+          "loads": 89,
+          "stores": 30,
+          "stack_refs": 26,
+          "xmm_reg_moves": 5,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 215,
+          "loads": 59,
+          "stores": 12,
+          "stack_refs": 0,
+          "xmm_reg_moves": 4,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 266,
+          "loads": 93,
+          "stores": 20,
+          "stack_refs": 8,
+          "xmm_reg_moves": 2,
+          "calls": 2
+        },
+        "icc": {
+          "instructions": 1192,
+          "loads": 301,
+          "stores": 116,
+          "stack_refs": 240,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icx": {
+          "instructions": 531,
+          "loads": 144,
+          "stores": 83,
+          "stack_refs": 139,
+          "xmm_reg_moves": 12,
+          "calls": 4
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 302,
+        "loads": 91,
+        "stores": 32,
+        "stack_refs": 30,
+        "xmm_reg_moves": 7,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "prefix_scan",
+      "source_sha256": "098464459611ee32c44a42dab185d33bb2d30e9e16e156ec21ac43f499cbe15f",
+      "before": {
+        "instructions": 72,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 72,
+          "loads": 8,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 55,
+          "loads": 6,
+          "stores": 2,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 96,
+          "loads": 24,
+          "stores": 12,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 67,
+          "loads": 13,
+          "stores": 9,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 117,
+          "loads": 25,
+          "stores": 15,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 72,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "qsort",
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "before": {
+        "instructions": 31,
+        "loads": 3,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 31,
+          "loads": 3,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 26,
+          "loads": 3,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "clang": {
+          "instructions": 43,
+          "loads": 3,
+          "stores": 5,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icc": {
+          "instructions": 41,
+          "loads": 6,
+          "stores": 5,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icx": {
+          "instructions": 52,
+          "loads": 6,
+          "stores": 4,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 31,
+        "loads": 3,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "reduction_vecreg",
+      "source_sha256": "201e2e2145675b2c9950a43fca6f8dc28c76b8d83913fcacd01035563264d769",
+      "before": {
+        "instructions": 99,
+        "loads": 10,
+        "stores": 4,
+        "stack_refs": 0,
+        "xmm_reg_moves": 3,
+        "calls": 4
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 99,
+          "loads": 10,
+          "stores": 4,
+          "stack_refs": 0,
+          "xmm_reg_moves": 3,
+          "calls": 4
+        },
+        "gcc16.2": {
+          "instructions": 107,
+          "loads": 19,
+          "stores": 4,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 105,
+          "loads": 37,
+          "stores": 11,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icc": {
+          "instructions": 282,
+          "loads": 47,
+          "stores": 9,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "icx": {
+          "instructions": 125,
+          "loads": 44,
+          "stores": 9,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 99,
+        "loads": 10,
+        "stores": 4,
+        "stack_refs": 0,
+        "xmm_reg_moves": 3,
+        "calls": 4
+      }
+    },
+    {
+      "workload": "ring_fifo",
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "before": {
+        "instructions": 56,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 56,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "gcc16.2": {
+          "instructions": 13,
+          "loads": 0,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "clang": {
+          "instructions": 57,
+          "loads": 2,
+          "stores": 2,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        },
+        "icc": {
+          "instructions": 68,
+          "loads": 5,
+          "stores": 5,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icx": {
+          "instructions": 90,
+          "loads": 6,
+          "stores": 7,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 0
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 56,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 0
+      }
+    },
+    {
+      "workload": "sha256_transform",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "before": {
+        "instructions": 279,
+        "loads": 43,
+        "stores": 41,
+        "stack_refs": 60,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 279,
+          "loads": 43,
+          "stores": 41,
+          "stack_refs": 60,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "gcc16.2": {
+          "instructions": 231,
+          "loads": 32,
+          "stores": 31,
+          "stack_refs": 37,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "clang": {
+          "instructions": 232,
+          "loads": 38,
+          "stores": 24,
+          "stack_refs": 40,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 438,
+          "loads": 65,
+          "stores": 46,
+          "stack_refs": 86,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 862,
+          "loads": 93,
+          "stores": 45,
+          "stack_refs": 103,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 279,
+        "loads": 43,
+        "stores": 41,
+        "stack_refs": 60,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      }
+    },
+    {
+      "workload": "sieve",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "before": {
+        "instructions": 51,
+        "loads": 3,
+        "stores": 4,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 51,
+          "loads": 3,
+          "stores": 4,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "gcc16.2": {
+          "instructions": 45,
+          "loads": 3,
+          "stores": 3,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "clang": {
+          "instructions": 337,
+          "loads": 45,
+          "stores": 7,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 215,
+          "loads": 22,
+          "stores": 10,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icx": {
+          "instructions": 376,
+          "loads": 21,
+          "stores": 28,
+          "stack_refs": 17,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 51,
+        "loads": 3,
+        "stores": 4,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      }
+    },
+    {
+      "workload": "spectral_norm",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "before": {
+        "instructions": 284,
+        "loads": 12,
+        "stores": 5,
+        "stack_refs": 8,
+        "xmm_reg_moves": 3,
+        "calls": 3
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 284,
+          "loads": 12,
+          "stores": 5,
+          "stack_refs": 8,
+          "xmm_reg_moves": 3,
+          "calls": 3
+        },
+        "gcc16.2": {
+          "instructions": 174,
+          "loads": 12,
+          "stores": 4,
+          "stack_refs": 1,
+          "xmm_reg_moves": 1,
+          "calls": 6
+        },
+        "clang": {
+          "instructions": 365,
+          "loads": 55,
+          "stores": 45,
+          "stack_refs": 98,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icc": {
+          "instructions": 274,
+          "loads": 19,
+          "stores": 11,
+          "stack_refs": 23,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 253,
+          "loads": 23,
+          "stores": 17,
+          "stack_refs": 35,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 284,
+        "loads": 12,
+        "stores": 5,
+        "stack_refs": 8,
+        "xmm_reg_moves": 3,
+        "calls": 3
+      }
+    },
+    {
+      "workload": "sqlite_varint",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "before": {
+        "instructions": 398,
+        "loads": 32,
+        "stores": 32,
+        "stack_refs": 22,
+        "xmm_reg_moves": 0,
+        "calls": 5
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 398,
+          "loads": 32,
+          "stores": 32,
+          "stack_refs": 22,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "gcc16.2": {
+          "instructions": 325,
+          "loads": 28,
+          "stores": 24,
+          "stack_refs": 20,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "clang": {
+          "instructions": 373,
+          "loads": 24,
+          "stores": 22,
+          "stack_refs": 7,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "icc": {
+          "instructions": 461,
+          "loads": 33,
+          "stores": 52,
+          "stack_refs": 27,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icx": {
+          "instructions": 421,
+          "loads": 35,
+          "stores": 40,
+          "stack_refs": 21,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 398,
+        "loads": 32,
+        "stores": 32,
+        "stack_refs": 22,
+        "xmm_reg_moves": 0,
+        "calls": 5
+      }
+    },
+    {
+      "workload": "strlen_bench",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "before": {
+        "instructions": 196,
+        "loads": 11,
+        "stores": 10,
+        "stack_refs": 13,
+        "xmm_reg_moves": 0,
+        "calls": 5
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 196,
+          "loads": 11,
+          "stores": 10,
+          "stack_refs": 13,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "gcc16.2": {
+          "instructions": 134,
+          "loads": 7,
+          "stores": 5,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "clang": {
+          "instructions": 226,
+          "loads": 14,
+          "stores": 10,
+          "stack_refs": 12,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "icc": {
+          "instructions": 201,
+          "loads": 22,
+          "stores": 11,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "calls": 5
+        },
+        "icx": {
+          "instructions": 481,
+          "loads": 37,
+          "stores": 24,
+          "stack_refs": 48,
+          "xmm_reg_moves": 0,
+          "calls": 40
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 196,
+        "loads": 11,
+        "stores": 10,
+        "stack_refs": 13,
+        "xmm_reg_moves": 0,
+        "calls": 5
+      }
+    },
+    {
+      "workload": "struct_copy",
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "before": {
+        "instructions": 136,
+        "loads": 32,
+        "stores": 31,
+        "stack_refs": 60,
+        "xmm_reg_moves": 4,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 136,
+          "loads": 32,
+          "stores": 31,
+          "stack_refs": 60,
+          "xmm_reg_moves": 4,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 100,
+          "loads": 18,
+          "stores": 8,
+          "stack_refs": 11,
+          "xmm_reg_moves": 1,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 76,
+          "loads": 4,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 213,
+          "loads": 45,
+          "stores": 50,
+          "stack_refs": 83,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 82,
+          "loads": 6,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 9,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 136,
+        "loads": 32,
+        "stores": 31,
+        "stack_refs": 60,
+        "xmm_reg_moves": 4,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "switch_dispatch",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "before": {
+        "instructions": 88,
+        "loads": 1,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 88,
+          "loads": 1,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 70,
+          "loads": 1,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 80,
+          "loads": 2,
+          "stores": 0,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 80,
+          "loads": 4,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 87,
+          "loads": 4,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 88,
+        "loads": 1,
+        "stores": 0,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "tce_sum",
+      "source_sha256": "57ddb14e5fd945998d614fbe2bba64a9861b8a0f5153ce4fcd84a15348991eee",
+      "before": {
+        "instructions": 11,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 11,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 10,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 10,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 39,
+          "loads": 4,
+          "stores": 4,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icx": {
+          "instructions": 13,
+          "loads": 3,
+          "stores": 4,
+          "stack_refs": 5,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 11,
+        "loads": 1,
+        "stores": 1,
+        "stack_refs": 2,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "tls_seg_access",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "before": {
+        "instructions": 56,
+        "loads": 2,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 56,
+          "loads": 2,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "gcc16.2": {
+          "instructions": 36,
+          "loads": 1,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "clang": {
+          "instructions": 55,
+          "loads": 6,
+          "stores": 3,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icc": {
+          "instructions": 59,
+          "loads": 6,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icx": {
+          "instructions": 64,
+          "loads": 6,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 56,
+        "loads": 2,
+        "stores": 1,
+        "stack_refs": 0,
+        "xmm_reg_moves": 0,
+        "calls": 2
+      }
+    },
+    {
+      "workload": "vecreg_new_ops",
+      "source_sha256": "d74d24bfa793ee221c456b7f2218201b52b1b35836b560dfd6a8816b12eb9e0e",
+      "before": {
+        "instructions": 78,
+        "loads": 7,
+        "stores": 3,
+        "stack_refs": 3,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 78,
+          "loads": 7,
+          "stores": 3,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "gcc16.2": {
+          "instructions": 49,
+          "loads": 7,
+          "stores": 4,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "clang": {
+          "instructions": 85,
+          "loads": 19,
+          "stores": 8,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        },
+        "icc": {
+          "instructions": 72,
+          "loads": 12,
+          "stores": 7,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icx": {
+          "instructions": 67,
+          "loads": 10,
+          "stores": 8,
+          "stack_refs": 6,
+          "xmm_reg_moves": 0,
+          "calls": 3
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 78,
+        "loads": 7,
+        "stores": 3,
+        "stack_refs": 3,
+        "xmm_reg_moves": 0,
+        "calls": 3
+      }
+    },
+    {
+      "workload": "vector_remainder",
+      "source_sha256": "e50af6249830013f174046617b65804ef08aaee3a3c5e015dff393b1f4e2acc4",
+      "before": {
+        "instructions": 98,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 6,
+        "xmm_reg_moves": 4,
+        "calls": 4
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 98,
+          "loads": 8,
+          "stores": 5,
+          "stack_refs": 6,
+          "xmm_reg_moves": 4,
+          "calls": 4
+        },
+        "gcc16.2": {
+          "instructions": 139,
+          "loads": 14,
+          "stores": 7,
+          "stack_refs": 2,
+          "xmm_reg_moves": 1,
+          "calls": 4
+        },
+        "clang": {
+          "instructions": 204,
+          "loads": 63,
+          "stores": 36,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icc": {
+          "instructions": 268,
+          "loads": 39,
+          "stores": 21,
+          "stack_refs": 17,
+          "xmm_reg_moves": 0,
+          "calls": 7
+        },
+        "icx": {
+          "instructions": 281,
+          "loads": 46,
+          "stores": 44,
+          "stack_refs": 73,
+          "xmm_reg_moves": 1,
+          "calls": 38
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 98,
+        "loads": 8,
+        "stores": 5,
+        "stack_refs": 6,
+        "xmm_reg_moves": 4,
+        "calls": 4
+      }
+    },
+    {
+      "workload": "zlib_ng_adler32",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "before": {
+        "instructions": 276,
+        "loads": 31,
+        "stores": 9,
+        "stack_refs": 15,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 276,
+          "loads": 31,
+          "stores": 9,
+          "stack_refs": 15,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 156,
+          "loads": 19,
+          "stores": 3,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 148,
+          "loads": 17,
+          "stores": 9,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 248,
+          "loads": 36,
+          "stores": 10,
+          "stack_refs": 11,
+          "xmm_reg_moves": 0,
+          "calls": 4
+        },
+        "icx": {
+          "instructions": 147,
+          "loads": 22,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 276,
+        "loads": 31,
+        "stores": 9,
+        "stack_refs": 15,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    },
+    {
+      "workload": "zlib_ng_adler32_combine",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "before": {
+        "instructions": 293,
+        "loads": 6,
+        "stores": 4,
+        "stack_refs": 4,
+        "xmm_reg_moves": 0,
+        "calls": 8
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 293,
+          "loads": 6,
+          "stores": 4,
+          "stack_refs": 4,
+          "xmm_reg_moves": 0,
+          "calls": 8
+        },
+        "gcc16.2": {
+          "instructions": 316,
+          "loads": 9,
+          "stores": 6,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        },
+        "clang": {
+          "instructions": 495,
+          "loads": 27,
+          "stores": 33,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 11
+        },
+        "icc": {
+          "instructions": 271,
+          "loads": 24,
+          "stores": 14,
+          "stack_refs": 22,
+          "xmm_reg_moves": 0,
+          "calls": 6
+        },
+        "icx": {
+          "instructions": 646,
+          "loads": 38,
+          "stores": 8,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 11
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 293,
+        "loads": 6,
+        "stores": 4,
+        "stack_refs": 4,
+        "xmm_reg_moves": 0,
+        "calls": 8
+      }
+    },
+    {
+      "workload": "zstd_count",
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "before": {
+        "instructions": 166,
+        "loads": 12,
+        "stores": 4,
+        "stack_refs": 8,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      },
+      "compilers": {
+        "lccc": {
+          "instructions": 166,
+          "loads": 12,
+          "stores": 4,
+          "stack_refs": 8,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "gcc16.2": {
+          "instructions": 91,
+          "loads": 5,
+          "stores": 1,
+          "stack_refs": 0,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "clang": {
+          "instructions": 121,
+          "loads": 7,
+          "stores": 3,
+          "stack_refs": 2,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        },
+        "icc": {
+          "instructions": 106,
+          "loads": 8,
+          "stores": 5,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 2
+        },
+        "icx": {
+          "instructions": 152,
+          "loads": 10,
+          "stores": 7,
+          "stack_refs": 3,
+          "xmm_reg_moves": 0,
+          "calls": 1
+        }
+      },
+      "errors": [],
+      "final_default": {
+        "instructions": 166,
+        "loads": 12,
+        "stores": 4,
+        "stack_refs": 8,
+        "xmm_reg_moves": 0,
+        "calls": 1
+      }
+    }
+  ],
+  "candidate_status": "FP lane home allocation candidate; quarantined opt-in after default-link-layout regression. Not final default codegen.",
+  "final_default_nonrecursion": {
+    "n": 51,
+    "median": 1.2208436724565757,
+    "geomean": 1.199444968070431
+  }
+}

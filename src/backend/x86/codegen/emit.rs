@@ -1,0 +1,12739 @@
+use super::machinst::{AluOp, MachInst, MachOperand, MachReg, OpSize};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, ParamClass};
+use crate::backend::cast::FloatOp;
+use crate::backend::common::PtrDirective;
+use crate::backend::inline_asm::emit_inline_asm_common;
+use crate::backend::regalloc::{PhysReg, RaConfig};
+use crate::backend::state::{CodegenState, StackSlot};
+use crate::backend::traits::{
+    ArchCodegen, MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT,
+};
+use crate::common::fp_contract::FpContract;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::{AddressSpace, IrType};
+use crate::delegate_to_impl;
+use crate::ir::reexports::{
+    AtomicOrdering, AtomicRmwOp, BlockId, CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp,
+    IrConst, IrFunction, IrUnaryOp, Operand, Value,
+};
+use std::sync::Arc;
+
+/// x86-64 callee-saved registers available for register allocation.
+/// System V AMD64 ABI callee-saved: rbx, r12, r13, r14, r15.
+/// rbp is the frame pointer and cannot be allocated (unless FPO mode).
+/// PhysReg encoding: 1=rbx, 2=r12, 3=r13, 4=r14, 5=r15.
+pub(super) const X86_CALLEE_SAVED: [PhysReg; 5] =
+    [PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)];
+
+/// Extended callee-saved list including rbp (used when frame pointer is omitted).
+/// PhysReg(6) = rbp.
+pub(super) const X86_CALLEE_SAVED_WITH_RBP: [PhysReg; 6] = [
+    PhysReg(1),
+    PhysReg(2),
+    PhysReg(3),
+    PhysReg(4),
+    PhysReg(5),
+    PhysReg(6),
+];
+
+/// x86-64 caller-saved registers available for allocation to values that
+/// do NOT span function calls. These registers are destroyed by calls, so
+/// they can only hold values between calls. No prologue/epilogue save is needed.
+///
+/// PhysReg encoding: 10=r11, 11=r10, 12=r8, 13=r9, 14=rdi, 15=rsi
+/// (IDs 10+ to avoid overlap with callee-saved 1-5)
+///
+/// rdi and rsi are included because the SysV ABI makes them caller-saved.
+/// After the prologue stores incoming parameters from rdi/rsi to their stack
+/// slots, these registers are free for use within the function body.
+/// Memcpy (rep movsb) and VaArg operations that clobber rdi/rsi are treated
+/// as call points by the liveness analysis, so values allocated to rdi/rsi
+/// will never have live ranges spanning those operations.
+pub(super) const X86_CALLER_SAVED: [PhysReg; 6] = [
+    PhysReg(10),
+    PhysReg(11),
+    PhysReg(12),
+    PhysReg(13),
+    PhysReg(14),
+    PhysReg(15),
+];
+
+/// APX extra GPRs `%r16`–`%r31`. SysV treats them as caller-saved (volatile).
+/// PhysReg encoding 40..=55 so they never collide with the XMM bank (18..=33)
+/// or the legacy GPR file (0..=16). Only added to the allocator pool when
+/// `-mapx`/`-mapxf` is set — otherwise the encodings are #UD.
+pub(super) const X86_APX_EGPRS: [PhysReg; 16] = [
+    PhysReg(40),
+    PhysReg(41),
+    PhysReg(42),
+    PhysReg(43),
+    PhysReg(44),
+    PhysReg(45),
+    PhysReg(46),
+    PhysReg(47),
+    PhysReg(48),
+    PhysReg(49),
+    PhysReg(50),
+    PhysReg(51),
+    PhysReg(52),
+    PhysReg(53),
+    PhysReg(54),
+    PhysReg(55),
+];
+
+pub(super) const EGPR64: [&str; 16] = [
+    "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23", "r24", "r25", "r26", "r27", "r28",
+    "r29", "r30", "r31",
+];
+
+/// Reverse of the home tables: which allocated home [`PhysReg`] (if any) does
+/// an inline-asm clobber name refer to?
+///
+/// Only registers allocatable as value homes matter to
+/// [`X86Codegen::note_reg_clobbered`] — `rax`/`rcx`/`xmm0`/`xmm1` (codegen
+/// scratch, never homes) and the pseudo-clobbers `cc`/`memory` have no homes
+/// to evict, so they map to `None` and the caller skips the note (which
+/// would be a no-op anyway).  Width suffixes resolve to the same physical
+/// home: clobbering `%dl` clobbers the value homed in `rdx`.
+pub(super) fn home_phys_by_asm_name(clobber: &str) -> Option<u8> {
+    let name = clobber.trim();
+    // The canonical home names, with their PhysReg numbering (mirrors
+    // `phys_reg_name` and the EGPR/XMM windows below it).
+    const HOMES: &[(&str, u8)] = &[
+        ("rbx", 1),
+        ("r12", 2),
+        ("r13", 3),
+        ("r14", 4),
+        ("r15", 5),
+        ("rbp", 6),
+        ("r11", 10),
+        ("r10", 11),
+        ("r8", 12),
+        ("r9", 13),
+        ("rdi", 14),
+        ("rsi", 15),
+        ("rdx", 16),
+        ("xmm2", 20),
+        ("xmm3", 21),
+        ("xmm4", 22),
+        ("xmm5", 23),
+        ("xmm6", 24),
+        ("xmm7", 25),
+        ("xmm8", 26),
+        ("xmm9", 27),
+        ("xmm10", 28),
+        ("xmm11", 29),
+        ("xmm12", 30),
+        ("xmm13", 31),
+        ("xmm14", 32),
+        ("xmm15", 33),
+    ];
+    if let Some((_, phys)) = HOMES.iter().find(|(n, _)| *n == name) {
+        return Some(*phys);
+    }
+    // EGPR homes r16..r31 in any width (r16/r16d/r16w/r16b).
+    let stem = name.trim_end_matches(['d', 'w', 'b']);
+    if let Some(num) = stem.strip_prefix('r') {
+        if let Ok(n) = num.parse::<usize>() {
+            if (16..=31).contains(&n) {
+                return Some(40 + (n - 16) as u8);
+            }
+        }
+    }
+    // 32-bit AT&T spellings of the GP homes (ebx, r12d, edi, esi, edx, ...).
+    // Width spellings of the GP homes: an asm write to any sub-register
+    // rewrites the whole home's physical register.
+    const GP_ALIASES: &[(&str, u8)] = &[
+        ("ebx", 1),
+        ("bx", 1),
+        ("bl", 1),
+        ("r12d", 2),
+        ("r12w", 2),
+        ("r12b", 2),
+        ("r13d", 3),
+        ("r13w", 3),
+        ("r13b", 3),
+        ("r14d", 4),
+        ("r14w", 4),
+        ("r14b", 4),
+        ("r15d", 5),
+        ("r15w", 5),
+        ("r15b", 5),
+        ("ebp", 6),
+        ("bp", 6),
+        ("bpl", 6),
+        ("r11d", 10),
+        ("r11w", 10),
+        ("r11b", 10),
+        ("r10d", 11),
+        ("r10w", 10),
+        ("r10b", 10),
+        ("r8d", 12),
+        ("r8w", 12),
+        ("r8b", 12),
+        ("r9d", 13),
+        ("r9w", 13),
+        ("r9b", 13),
+        ("edi", 14),
+        ("di", 14),
+        ("dil", 14),
+        ("esi", 15),
+        ("si", 15),
+        ("sil", 15),
+        ("edx", 16),
+        ("dx", 16),
+        ("dl", 16),
+    ];
+    GP_ALIASES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, phys)| *phys)
+}
+pub(super) const EGPR32: [&str; 16] = [
+    "r16d", "r17d", "r18d", "r19d", "r20d", "r21d", "r22d", "r23d", "r24d", "r25d", "r26d", "r27d",
+    "r28d", "r29d", "r30d", "r31d",
+];
+pub(super) const EGPR16: [&str; 16] = [
+    "r16w", "r17w", "r18w", "r19w", "r20w", "r21w", "r22w", "r23w", "r24w", "r25w", "r26w", "r27w",
+    "r28w", "r29w", "r30w", "r31w",
+];
+pub(super) const EGPR8: [&str; 16] = [
+    "r16b", "r17b", "r18b", "r19b", "r20b", "r21b", "r22b", "r23b", "r24b", "r25b", "r26b", "r27b",
+    "r28b", "r29b", "r30b", "r31b",
+];
+
+/// x86-64 XMM registers available for F64 allocation.
+/// Caller-saved (SysV ABI), only for values that don't span calls.
+/// xmm0/xmm1 are reserved for the accumulator pattern and FP return values.
+pub(super) const X86_XMM_REGS: [PhysReg; 14] = [
+    PhysReg(20),
+    PhysReg(21),
+    PhysReg(22),
+    PhysReg(23),
+    PhysReg(24),
+    PhysReg(25),
+    PhysReg(26),
+    PhysReg(27),
+    PhysReg(28),
+    PhysReg(29),
+    PhysReg(30),
+    PhysReg(31),
+    PhysReg(32),
+    PhysReg(33),
+];
+
+/// Convert a 64-bit register name string to its 32-bit sub-register name.
+/// Used for `xorl %eXX, %eXX` zeroing idiom (shorter encoding, breaks dependencies).
+pub(super) fn reg_name_to_32(name: &str) -> &'static str {
+    match name {
+        "rax" => "eax",
+        "rbx" => "ebx",
+        "rcx" => "ecx",
+        "rdx" => "edx",
+        "rsi" => "esi",
+        "rdi" => "edi",
+        "rsp" => "esp",
+        "rbp" => "ebp",
+        "r8" => "r8d",
+        "r9" => "r9d",
+        "r10" => "r10d",
+        "r11" => "r11d",
+        "r12" => "r12d",
+        "r13" => "r13d",
+        "r14" => "r14d",
+        "r15" => "r15d",
+        "r16" => "r16d",
+        "r17" => "r17d",
+        "r18" => "r18d",
+        "r19" => "r19d",
+        "r20" => "r20d",
+        "r21" => "r21d",
+        "r22" => "r22d",
+        "r23" => "r23d",
+        "r24" => "r24d",
+        "r25" => "r25d",
+        "r26" => "r26d",
+        "r27" => "r27d",
+        "r28" => "r28d",
+        "r29" => "r29d",
+        "r30" => "r30d",
+        "r31" => "r31d",
+        _ => unreachable!("invalid 64-bit register name: {}", name),
+    }
+}
+
+/// Map a PhysReg index to its x86-64 register name.
+/// Handles both callee-saved (1-5) and caller-saved (10-15) registers.
+/// One possible last-write into a physical register (see `home_write_state`).
+///
+/// `Copy` by design: an 8-byte value-type event record that the dataflow
+/// clones wholesale at every branch edge — value semantics keep the
+/// snapshot/merge code free of borrow friction and double-indirection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HomeWrite {
+    /// The register's last write was the definition of this value.
+    Def(u32),
+    /// The register's last write was not any home's definition.
+    Clobber,
+}
+
+#[inline]
+pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        // Function scratch, NOT allocatable homes in the accumulator model —
+        // but the MachInst window allocator's pool contains them (see
+        // `MACHINST_ALLOCATABLE_GPRS`), and every consumer that maps a
+        // `reg_assignments` entry through this function must be total over the
+        // ids that can appear there. 0/7 are spelled out here rather than left
+        // to the catch-all so a name query can never turn into a compiler
+        // abort on a pool this table does not own.
+        0 => "rax",
+        1 => "rbx",
+        2 => "r12",
+        3 => "r13",
+        4 => "r14",
+        5 => "r15",
+        6 => "rbp",
+        7 => "rcx",
+        10 => "r11",
+        11 => "r10",
+        12 => "r8",
+        13 => "r9",
+        14 => "rdi",
+        15 => "rsi",
+        16 => "rdx",
+        n if (40..=55).contains(&n) => EGPR64[(n - 40) as usize],
+        // XMM registers for F64 allocation
+        20 => "xmm2",
+        21 => "xmm3",
+        22 => "xmm4",
+        23 => "xmm5",
+        24 => "xmm6",
+        25 => "xmm7",
+        // xmm8-xmm15 are additional caller-saved F64 homes. Codegen
+        // scratch only ever touches xmm0/xmm1 (and xmm2 for pblendvb/VNNI),
+        // so the upper bank is a safe, stable home; the assembler already
+        // encodes them (REX.R/X/B extension bits).
+        26 => "xmm8",
+        27 => "xmm9",
+        28 => "xmm10",
+        29 => "xmm11",
+        30 => "xmm12",
+        31 => "xmm13",
+        32 => "xmm14",
+        33 => "xmm15",
+        _ => unreachable!("invalid x86 register index {}", reg.0),
+    }
+}
+
+/// Check if a PhysReg is an XMM register (used for F64 values).
+#[inline]
+pub(super) fn is_xmm_reg(reg: PhysReg) -> bool {
+    (20..=33).contains(&reg.0)
+}
+
+/// Classify an immediate for the x86-64 direct `pushq $imm` stack-argument
+/// form, returning the push immediate when sign-extension is
+/// value-preserving for this slot.
+///
+/// ENCODING LAW (`push imm32`, opcode 68 id / FF /6 id):
+///
+/// ```text
+///   imm in [-128,127]   pushq $imm8   = 2 B   (vs 6 B for movl+pushq %rax)
+///   imm in imm32        pushq $imm32  = 5 B   (vs 6 B)
+///   zero                pushq $0      = 2 B   (vs 3 B for xorl+pushq %rax)
+/// ```
+///
+/// SOUNDNESS: `pushq $imm32` writes all eight slot bytes as
+/// `sign_extend(imm)`.  For an eight-byte scalar container (I64, F64/D64
+/// bit patterns) that equals the original value only when the value fits a
+/// signed 32-bit integer — the fit test below.  For scalars of at most
+/// four bytes the SysV AMD64 ABI leaves the upper bytes of the eightbyte
+/// unspecified and every reader (lccc callees read `movl`/`movslq`, GCC
+/// and Clang likewise) consumes only the low lane, so any imm32 is exact
+/// for I8/I16/I32/F32/D32.  I128 is refused outright (never a MEMORY-class
+/// scalar; fail closed), as is any eight-byte value outside the imm32
+/// window — those keep the `movabsq`+push fallback.
+pub(super) fn x64_stack_arg_push_imm(c: &IrConst) -> Option<i64> {
+    let fits_imm32 = |v: i64| v >= i32::MIN as i64 && v <= i32::MAX as i64;
+    match c {
+        IrConst::Zero => Some(0),
+        // Narrow scalars: the four bytes pushed land in the slot's low
+        // lane; sign extension into the upper lane is unspecified padding.
+        IrConst::I8(v) => Some(*v as i64),
+        IrConst::I16(v) => Some(*v as i64),
+        IrConst::I32(v) => Some(*v as i64),
+        IrConst::F32(v) => Some(v.to_bits() as i32 as i64),
+        IrConst::D32(v) => Some(*v as i32 as i64),
+        // Eight-byte containers: the sign-extended imm must reproduce the
+        // full 64-bit pattern, so the value must already fit imm32.
+        IrConst::I64(v) if fits_imm32(*v) => Some(*v),
+        IrConst::F64(v) => {
+            let bits = v.to_bits() as i64;
+            fits_imm32(bits).then_some(bits)
+        }
+        IrConst::D64(v) => {
+            let bits = *v as i64;
+            fits_imm32(bits).then_some(bits)
+        }
+        // LongDouble at computation level is treated as F64 (see
+        // operand_to_rax); same container law applies.
+        IrConst::LongDouble(v, _) => {
+            let bits = v.to_bits() as i64;
+            fits_imm32(bits).then_some(bits)
+        }
+        _ => None,
+    }
+}
+
+/// Integer GPR the allocator / emitters may name: legacy file plus APX EGPRs.
+/// XMM scratch (18/19) and the XMM bank (20..=33) are excluded.
+#[inline]
+pub(super) fn is_gpr_reg(reg: PhysReg) -> bool {
+    reg.0 <= 16 || (40..=55).contains(&reg.0)
+}
+
+/// Map an XMM allocator register to the corresponding 256-bit AVX name.
+/// PhysReg identity is shared across XMM/YMM widths; the vector intrinsic
+/// itself supplies the width, so width-specific emission belongs here rather
+/// than in the allocator.
+#[inline]
+pub(super) fn phys_reg_name_256(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        20 => "ymm2",
+        21 => "ymm3",
+        22 => "ymm4",
+        23 => "ymm5",
+        24 => "ymm6",
+        25 => "ymm7",
+        26 => "ymm8",
+        27 => "ymm9",
+        28 => "ymm10",
+        29 => "ymm11",
+        30 => "ymm12",
+        31 => "ymm13",
+        32 => "ymm14",
+        33 => "ymm15",
+        _ => unreachable!("invalid x86 SIMD register index {}", reg.0),
+    }
+}
+
+/// Map a PhysReg index to its x86-64 32-bit sub-register name.
+/// Handles both callee-saved (1-5) and caller-saved (10-15) registers.
+#[inline]
+pub(super) fn phys_reg_name_32(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        1 => "ebx",
+        2 => "r12d",
+        3 => "r13d",
+        4 => "r14d",
+        5 => "r15d",
+        6 => "ebp",
+        10 => "r11d",
+        11 => "r10d",
+        12 => "r8d",
+        13 => "r9d",
+        14 => "edi",
+        15 => "esi",
+        16 => "edx",
+        n if (40..=55).contains(&n) => EGPR32[(n - 40) as usize],
+        _ => unreachable!("invalid x86 register index {}", reg.0),
+    }
+}
+
+/// `%rax`: the accumulator, and the first register of the divide/remainder
+/// pair. Every 64-bit consumer that reads it reads the *whole* register, which
+/// is why narrow values are canonicalized when they are staged here.
+pub(super) const R_RAX: PhysReg = PhysReg(0);
+/// `%rcx`: the secondary staging register (`operand_to_rcx`) and the divisor of
+/// `divq`/`idivq`. Its home may equally hold only a 32-bit-canonical value.
+pub(super) const R_RCX: PhysReg = PhysReg(7);
+
+/// Get the typed register name for a PhysReg at a given IrType width.
+/// E.g., PhysReg(1)=rbx → for I32 returns "ebx", for I8 returns "bl".
+pub(super) fn typed_phys_reg_name(reg: PhysReg, ty: IrType) -> &'static str {
+    match ty {
+        IrType::I64 | IrType::U64 | IrType::Ptr => phys_reg_name(reg),
+        IrType::I32 | IrType::U32 | IrType::F32 => phys_reg_name_32(reg),
+        IrType::I16 | IrType::U16 => match reg.0 {
+            0 => "ax",
+            1 => "bx",
+            7 => "cx",
+            2 => "r12w",
+            3 => "r13w",
+            4 => "r14w",
+            5 => "r15w",
+            6 => "bp",
+            10 => "r11w",
+            11 => "r10w",
+            12 => "r8w",
+            13 => "r9w",
+            14 => "di",
+            15 => "si",
+            16 => "dx",
+            n if (40..=55).contains(&n) => EGPR16[(n - 40) as usize],
+            _ => phys_reg_name(reg),
+        },
+        IrType::I8 | IrType::U8 => match reg.0 {
+            0 => "al",
+            1 => "bl",
+            7 => "cl",
+            2 => "r12b",
+            3 => "r13b",
+            4 => "r14b",
+            5 => "r15b",
+            6 => "bpl",
+            10 => "r11b",
+            11 => "r10b",
+            12 => "r8b",
+            13 => "r9b",
+            14 => "dil",
+            15 => "sil",
+            16 => "dl",
+            n if (40..=55).contains(&n) => EGPR8[(n - 40) as usize],
+            _ => phys_reg_name(reg),
+        },
+        _ => phys_reg_name(reg),
+    }
+}
+
+/// Width info for an integer compare at `ty`: (cmp mnemonic, test mnemonic,
+/// accumulator register). Sub-word types use their native byte/word width so a
+/// narrowed comparison (`c < 0x80` on a promoted byte) emits `cmpb`/`testb`
+/// instead of widening through a 32/64-bit compare — GCC/ICX's byte-compare
+/// shape. I32/U32 use 32-bit ops; everything else stays 64-bit (unchanged).
+pub(super) fn cmp_width_info(ty: IrType) -> (&'static str, &'static str, &'static str) {
+    match ty {
+        IrType::I8 | IrType::U8 => ("cmpb", "testb", "al"),
+        IrType::I16 | IrType::U16 => ("cmpw", "testw", "ax"),
+        IrType::I32 | IrType::U32 => ("cmpl", "testl", "eax"),
+        _ => ("cmpq", "testq", "rax"),
+    }
+}
+
+/// Return the `%rcx` sub-register matching an integer comparison width.
+///
+/// The classic comparison emitter stages non-register operands through the
+/// full `%rcx` scratch register.  The staging move intentionally remains a
+/// full-width move — it preserves the low byte/word of every source — but the
+/// subsequent `cmp` must name the corresponding sub-register.  Using `%rcx`
+/// with `cmpb`/`cmpw` is rejected by GAS and is not repaired by text
+/// peepholes.  Keep this mapping adjacent to `cmp_width_info` so every
+/// scratch-backed comparison uses the same width contract as `%rax`.
+#[inline]
+pub(super) fn cmp_secondary_reg(ty: IrType) -> &'static str {
+    match ty {
+        IrType::I8 | IrType::U8 => "cl",
+        IrType::I16 | IrType::U16 => "cx",
+        IrType::I32 | IrType::U32 => "ecx",
+        _ => "rcx",
+    }
+}
+
+/// Scan inline asm instructions in a function and collect any callee-saved
+/// registers that are used via specific constraints or listed in clobbers.
+/// These must be saved/restored in the function prologue/epilogue.
+///
+/// On x86-64, the scratch register pool has 8 caller-saved GP registers
+/// (rcx, rdx, rsi, rdi, r8-r11). When an inline asm block needs more than
+/// 8 generic "r" operands, the scratch allocator overflows into callee-saved
+/// registers (r12-r15). We use `_with_overflow` to detect this and
+/// conservatively mark all callee-saved registers as clobbered only when
+/// overflow is likely, avoiding unnecessary save/restore in common cases.
+pub(super) fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut Vec<PhysReg>) {
+    fn caller_scratch_slot_by_name(name: &str) -> Option<usize> {
+        let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
+        match name {
+            "rcx" | "ecx" | "cx" | "cl" | "ch" => Some(0),
+            "rdx" | "edx" | "dx" | "dl" | "dh" => Some(1),
+            "rsi" | "esi" | "si" | "sil" => Some(2),
+            "rdi" | "edi" | "di" | "dil" => Some(3),
+            "r8" | "r8d" | "r8w" | "r8b" => Some(4),
+            "r9" | "r9d" | "r9w" | "r9b" => Some(5),
+            "r10" | "r10d" | "r10w" | "r10b" => Some(6),
+            "r11" | "r11d" | "r11w" | "r11b" => Some(7),
+            _ => None,
+        }
+    }
+    fn constraint_to_caller_scratch(c: &str) -> Option<usize> {
+        if c.starts_with('{') && c.ends_with('}') {
+            return caller_scratch_slot_by_name(&c[1..c.len() - 1]);
+        }
+        match c {
+            "c" => Some(0),
+            "d" => Some(1),
+            "S" => Some(2),
+            "D" => Some(3),
+            _ => None,
+        }
+    }
+    fn clobber_to_phys(name: &str) -> Option<PhysReg> {
+        let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
+        match name {
+            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
+            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
+            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
+            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
+            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
+            _ => None,
+        }
+    }
+    crate::backend::stack_layout::collect_inline_asm_callee_saved_with_overflow(
+        func,
+        used,
+        constraint_to_callee_saved_x86,
+        clobber_to_phys,
+        constraint_to_caller_scratch,
+        caller_scratch_slot_by_name,
+        |c| c == "a" || c == "A",
+        &X86_CALLEE_SAVED,
+        8,
+    );
+}
+
+/// Check if a constraint string refers to a specific x86-64 callee-saved register.
+fn constraint_to_callee_saved_x86(constraint: &str) -> Option<PhysReg> {
+    // Handle explicit register constraint: {regname}
+    if constraint.starts_with('{') && constraint.ends_with('}') {
+        let reg = &constraint[1..constraint.len() - 1];
+        return match reg {
+            "rbx" | "ebx" | "bx" | "bl" | "bh" => Some(PhysReg(1)),
+            "r12" | "r12d" | "r12w" | "r12b" => Some(PhysReg(2)),
+            "r13" | "r13d" | "r13w" | "r13b" => Some(PhysReg(3)),
+            "r14" | "r14d" | "r14w" | "r14b" => Some(PhysReg(4)),
+            "r15" | "r15d" | "r15w" | "r15b" => Some(PhysReg(5)),
+            _ => None,
+        };
+    }
+    // Check single-character constraint letters
+    // Note: 'a','c','d','S','D' are caller-saved, no save needed
+    for ch in constraint.chars() {
+        if ch == 'b' {
+            return Some(PhysReg(1)); // rbx
+        }
+    }
+    None
+}
+
+/// Map an ALU binary op (Add/Sub/And/Or/Xor) to its x86 mnemonic base.
+pub(super) fn alu_mnemonic(op: IrBinOp) -> &'static str {
+    match op {
+        IrBinOp::Add => "add",
+        IrBinOp::Sub => "sub",
+        IrBinOp::And => "and",
+        IrBinOp::Or => "or",
+        IrBinOp::Xor => "xor",
+        _ => unreachable!("not a simple ALU op"),
+    }
+}
+
+/// Map a shift op to its x86 32-bit and 64-bit mnemonic.
+pub(super) fn shift_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
+    match op {
+        IrBinOp::Shl => ("shll", "shlq"),
+        IrBinOp::AShr => ("sarl", "sarq"),
+        IrBinOp::LShr => ("shrl", "shrq"),
+        _ => unreachable!("not a shift op"),
+    }
+}
+
+/// Map a rotate op to its x86 32-bit and 64-bit mnemonic.
+///
+/// `rol`/`ror` are baseline x86 (8086 onwards), so — unlike `shlx`/`shrx`,
+/// which need BMI2, or `lzcnt`, which silently decodes as `bsr`/`bsf` on
+/// older parts — a rotate needs no feature gate and no `-march`.  On Intel
+/// the immediate form is a single µop with 1-cycle latency (uops.info
+/// ROL_R32_IMM: Skylake/Raptor Lake 1/1, 4-per-cycle throughput), replacing
+/// the shift/or triple's three µops and its two dependent ALU results.
+///
+/// The count is masked by hardware to 5 bits (32-bit operands) or 6 bits
+/// (64-bit), which is exactly the `amount mod W` reduction `IrBinOp`'s rotate
+/// semantics define — so the IR and the encoding agree without a fixup.
+/// Narrower operands (8/16-bit) would mask mod 32 instead and are therefore
+/// never lowered here; `bit_idioms` only recognizes 32- and 64-bit rotates.
+pub(super) fn rotate_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
+    match op {
+        IrBinOp::RotateLeft => ("roll", "rolq"),
+        IrBinOp::RotateRight => ("rorl", "rorq"),
+        _ => unreachable!("not a rotate op"),
+    }
+}
+
+/// Rotate mnemonic at an explicit operand width: `rolb`/`rolw`/`roll`/`rolq`
+/// (and the `ror` family).  Sub-word rotates are exact on x86: the hardware
+/// count for 8/16-bit operands is `(count & 31) mod width`, so `rolw` by 16
+/// is the identity and by 17 a rotate of one (measured on SKL/ADL/Zen
+/// behaviour, and what GCC relies on when it emits bare `rolw %cl`).
+pub(super) fn rotate_mnemonic_width(op: IrBinOp, width: u32) -> &'static str {
+    match (op, width) {
+        (IrBinOp::RotateLeft, 8) => "rolb",
+        (IrBinOp::RotateLeft, 16) => "rolw",
+        (IrBinOp::RotateLeft, 32) => "roll",
+        (IrBinOp::RotateLeft, 64) => "rolq",
+        (IrBinOp::RotateRight, 8) => "rorb",
+        (IrBinOp::RotateRight, 16) => "rorw",
+        (IrBinOp::RotateRight, 32) => "rorl",
+        (IrBinOp::RotateRight, 64) => "rorq",
+        _ => unreachable!("not a rotate op"),
+    }
+}
+
+/// BMI2 three-operand shift mnemonics (`shlx count, src, dst`).  One µop on
+/// every core that has BMI2 (uops.info SHLX_R64_R64_R64), count in any GPR,
+/// non-destructive; flags are left untouched, which no consumer of a
+/// variable shift relies on (a count of zero already leaves them undefined
+/// for the legacy form).
+pub(super) fn shiftx_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
+    match op {
+        IrBinOp::Shl => ("shlxl", "shlxq"),
+        IrBinOp::AShr => ("sarxl", "sarxq"),
+        IrBinOp::LShr => ("shrxl", "shrxq"),
+        _ => unreachable!("not a shift op"),
+    }
+}
+
+/// x86-64 code generator. Implements the ArchCodegen trait for the shared framework.
+/// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
+
+/// A value's live program points: sorted, disjoint, non-adjacent inclusive
+/// ranges, so a point query is one binary search.  Built from the RA's
+/// hole-aware segments; normalisation preserves the covered point set,
+/// which is all `note_reg_clobbered` asks about.  (A linear scan per sharer
+/// per clobber was O(clobbers x sharers x segments): values live across a
+/// long branch chain carry one segment per block, and it dominated -O2
+/// codegen of gcc.c-torture/compile 20001226-1.)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct LiveSpans(Vec<(u32, u32)>);
+
+impl LiveSpans {
+    pub(super) fn from_ranges(mut ranges: Vec<(u32, u32)>) -> Self {
+        ranges.retain(|&(s, e)| s <= e); // an inverted range covers nothing
+        ranges.sort_unstable();
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+        for (s, e) in ranges {
+            match out.last_mut() {
+                Some(last) if s <= last.1.saturating_add(1) => last.1 = last.1.max(e),
+                _ => out.push((s, e)),
+            }
+        }
+        LiveSpans(out)
+    }
+
+    pub(super) fn contains(&self, point: u32) -> bool {
+        let i = self.0.partition_point(|&(s, _)| s <= point);
+        i > 0 && self.0[i - 1].1 >= point
+    }
+}
+
+/// One liveness-gated eviction of a value that is dead after `point`
+/// ([`X86Codegen::note_reg_clobbered`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TransientEviction {
+    value: u32,
+    point: u32,
+    was_fresh: bool,
+}
+
+/// Stabbing index over the live spans of every value homed in one register:
+/// `stab(p)` lists the sharers live at `p` in O((1 + answers) log spans)
+/// instead of testing every sharer (a register can home thousands of
+/// values in a large function and every clobber asked about all of them).
+/// Spans are sorted by start; `max_end` is a max segment tree over their
+/// ends, so a subtree whose spans all end before `p` is skipped whole.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SharerLiveIndex {
+    starts: Vec<u32>,
+    owner: Vec<u32>,
+    /// Implicit binary tree, leaves at `cap..cap + len`.
+    max_end: Vec<u32>,
+    cap: usize,
+}
+
+impl SharerLiveIndex {
+    fn build(mut spans: Vec<(u32, u32, u32)>) -> Self {
+        spans.sort_unstable();
+        let cap = spans.len().next_power_of_two();
+        let mut max_end = vec![0u32; 2 * cap];
+        for (i, &(_, e, _)) in spans.iter().enumerate() {
+            max_end[cap + i] = e;
+        }
+        for node in (1..cap).rev() {
+            max_end[node] = max_end[2 * node].max(max_end[2 * node + 1]);
+        }
+        SharerLiveIndex {
+            starts: spans.iter().map(|&(s, _, _)| s).collect(),
+            owner: spans.iter().map(|&(_, _, v)| v).collect(),
+            max_end,
+            cap,
+        }
+    }
+
+    /// Append every owner with a span `s <= point <= e` to `out` (each
+    /// owner at most once: one value's spans are disjoint).
+    fn stab(&self, point: u32, out: &mut Vec<u32>) {
+        // Only spans starting at or before `point` qualify: leaves `0..k`.
+        let k = self.starts.partition_point(|&s| s <= point);
+        if k == 0 {
+            return;
+        }
+        let mut stack = vec![(1usize, 0usize, self.cap)];
+        while let Some((node, lo, hi)) = stack.pop() {
+            if lo >= k || self.max_end[node] < point {
+                continue;
+            }
+            if hi - lo == 1 {
+                out.push(self.owner[lo]);
+                continue;
+            }
+            let mid = (lo + hi) / 2;
+            stack.push((2 * node + 1, mid, hi));
+            stack.push((2 * node, lo, mid));
+        }
+    }
+}
+
+/// `X86Codegen::def_index`: the function the index was built for, and the
+/// def matcher's answer per value id (`Some((block, inst))` = the unique
+/// definition, `None` = defined more than once).
+pub(super) type DefIndex = (*const IrFunction, FxHashMap<u32, Option<(usize, usize)>>);
+
+/// Home-freshness-filtered view of `reg_assignments` for the MachInst
+/// lowering (isel). isel pre-colors any value present in this view to its
+/// `MachReg::Phys` home -- including as a SOURCE operand, which is only
+/// sound while the register provably still holds that value. The
+/// accumulator emitter reuses destination registers in place for derived
+/// values, so a stale home must NOT be pre-colored: passing it as a Vreg
+/// lets the MachInst allocator reload it from its slot (kernel 6.18.50
+/// free_area_init_node zone-pointer-as-index panic). Values not yet noted
+/// fresh fall back to the classic path or to a MachInst-local reload --
+/// both sound.
+///
+/// Answers per lookup what the former per-instruction filtered COPY of the
+/// map answered per entry: the emitter is borrowed for the whole lowering,
+/// so no home can change between the two.
+pub(super) struct FreshHomes<'a>(pub(super) &'a X86Codegen);
+
+impl super::isel::HomeMap for FreshHomes<'_> {
+    fn get(&self, id: &u32) -> Option<&PhysReg> {
+        let cg = self.0;
+        cg.reg_assignments
+            .get(id)
+            .filter(|_| !cg.home_clobbered.contains(id) || cg.home_readable_via_alias(*id))
+    }
+
+    fn any_home(&self, pred: &dyn Fn(PhysReg) -> bool) -> bool {
+        self.0
+            .reg_assignments
+            .iter()
+            .any(|(id, &r)| pred(r) && self.get(id).is_some())
+    }
+
+    fn is_rorx_masked_shift(&self, id: u32) -> bool {
+        self.0.rorx_masked_shifts.contains(&id)
+    }
+}
+
+pub struct X86Codegen {
+    pub(crate) state: CodegenState,
+    pub(super) current_return_type: IrType,
+    /// SysV ABI eightbyte classification for the current function's return struct.
+    /// Set in prologue, used in emit_return_i128_to_regs for the function's own return.
+    pub(super) func_ret_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True once this function emitted an explicit `SetReturnF64Second`.
+    /// For [Sse, Sse] two-eightbyte returns whose lowering routes the high
+    /// half through SetReturnF64Second (IS-02), the primary I128 return must
+    /// only write xmm0 — writing xmm1 from %rdx would clobber the explicit
+    /// second-half value.
+    pub(super) func_set_second_ret: bool,
+    /// True when the current function returns _Float128 (ONE 16-byte XMM, xmm0).
+    pub(super) func_ret_is_f128_sse: bool,
+    /// SysV ABI eightbyte classification for the most recent call-site's return struct.
+    /// Set before processing a call's result, used in emit_call_store_result.
+    pub(super) call_ret_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True when the current call returns _Float128 (ONE 16-byte XMM, xmm0).
+    pub(super) call_ret_is_f128_sse: bool,
+    /// For variadic functions: number of named integer/pointer parameters (excluding long double)
+    pub(super) num_named_int_params: usize,
+    /// For variadic functions: number of named float/double parameters (excluding long double)
+    pub(super) num_named_fp_params: usize,
+    /// For variadic functions: total bytes of named parameters that are always stack-passed
+    /// (e.g. long double = 16 bytes each, struct params passed by value on stack)
+    pub(super) num_named_stack_bytes: usize,
+    /// For variadic functions: stack offset of the register save area (negative from rbp)
+    pub(super) reg_save_area_offset: i64,
+    /// The current function returns its aggregate in ONE `%ymm0` / `%zmm0`
+    /// (`call_abi::hidden_vector_return_bytes`): the byte width, and the
+    /// frame offset (negative from the frame base) of the private buffer
+    /// that homes the hidden return pointer. `0` when not applicable.
+    pub(super) vector_ret_buffer_bytes: usize,
+    pub(super) vector_ret_buffer_offset: i64,
+    /// Set by `emit_post_call_restore_caller_regs`, cleared by the matching
+    /// pre-call save: the restore runs at most once per call site.
+    pub(super) caller_regs_restored: bool,
+    /// Whether the current function is variadic
+    pub(super) is_variadic: bool,
+    /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+    /// X86_64 target): dest value-ids of TAIL instructions — they emit
+    /// nothing because the HEAD's dual-store wrote their result.
+    pub(super) divrem_tail_dests: FxHashSet<u32>,
+    /// Head dest value-id -> (partner tail dest, partner result is the
+    /// quotient in %rax). `false` means the partner wants the remainder
+    /// in %rdx.
+    pub(super) divrem_head_partners: FxHashMap<u32, (u32, bool)>,
+    /// Tails whose pair was broken at head-emission time (pathological home
+    /// combination): they must emit their own standalone division.
+    pub(super) divrem_broken_tails: FxHashSet<u32>,
+    /// Whether the register save area must preserve GP argument registers:
+    /// true when any va_arg in the body reads INTEGER class, or the va_list
+    /// escapes to a callee (which may read any class).
+    pub(super) vararg_gp_save: bool,
+    /// Whether the register save area must preserve SSE argument registers:
+    /// true when any va_arg in the body reads SSE class, or the va_list escapes.
+    pub(super) vararg_fp_save: bool,
+    /// True between emit_call_stack_args_impl and emit_call_cleanup_impl
+    /// when the outgoing area was dynamically realigned (a stack argument
+    /// requires alignment > 16): the cleanup must restore %rsp exactly from
+    /// the 16-byte save slot above the argument area instead of a static
+    /// `addq` (the realignment delta is runtime-dependent).
+    pub(super) dyn_align_cleanup: bool,
+    /// Defense-in-depth for mature `CallIndirect`: true when an indirect
+    /// call's argument is homed in `%r10` (`PhysReg(11)`), so Phase 0 parked
+    /// the callee pointer in a 16-byte transient stack slot instead of
+    /// clobbering `%r10` before argument staging.
+    pub(super) indirect_fptr_on_stack: bool,
+    /// Scratch register index for inline asm allocation (GP registers)
+    pub(super) asm_scratch_idx: usize,
+    /// Scratch register index for inline asm allocation (XMM registers)
+    pub(super) asm_xmm_scratch_idx: usize,
+    /// Register allocation results for the current function.
+    /// Maps value ID -> callee-saved register assignment.
+    pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
+    /// Home-register freshness (SOUNDNESS): value IDs whose assigned home
+    /// register PROVABLY still holds their value right now. The static
+    /// `reg_assignments` map is written once per function, but the
+    /// accumulator emitter stages operands into destination registers in
+    /// place (`imulq $K, %r, %r`, `leaq d(%r), %r`), overwriting a home's
+    /// content with a DERIVED value. Consulting the static map alone then
+    /// skips a needed reload and feeds the derived value to a later use of
+    /// the original one — the kernel 6.18.50 free_area_init_node boot panic
+    /// (`pgdat->node_zones + i` computed the second time from the ZONE
+    /// POINTER left in %r11, CR2 garbage). `note_dest_defined` maintains
+    /// this set; read-side staging consults it.
+    pub(super) home_fresh: FxHashSet<u32>,
+    /// Values whose home register was CLOBBERED (staging / in-place derived
+    /// compute / window scratch / call) since their last recorded definition
+    /// — the register content is NOT theirs. Distinct from "not in
+    /// home_fresh": a value not yet defined in EMISSION order (back-edge
+    /// phi-cycle values whose def block comes later in the block array)
+    /// is neither fresh nor clobbered, and reading its home is sound — the
+    /// RA homed it for exactly that purpose and the def-writes-home
+    /// invariant holds at runtime (the def precedes every runtime consumer).
+    pub(super) home_clobbered: FxHashSet<u32>,
+    /// WHY each value in [`Self::home_clobbered`] lost its home: `(program
+    /// point, site tag)`. Recorded unconditionally — one hash insert on a
+    /// path that already performs at least one, and clobbers are per
+    /// (register, block) rather than per instruction — because the
+    /// `operand_to_rax` refusal is the one place where "stale" without a
+    /// culprit costs an afternoon: the message has to name the site that
+    /// wrote the register, not just the value that lost it.
+    pub(super) home_clobber_cause: FxHashMap<u32, (u32, &'static str)>,
+    /// Forward register-write state — the EXACT alias-freshness law
+    /// (audit-of-#603 H1): for each home-carrying physical register, WHAT
+    /// the last write along every path reaching the current emission point
+    /// was.  `Def(v)`: the register provably holds v's value (entry-seeded
+    /// for parameters established by the prologue; recorded at every
+    /// emitted definition, in-place chain update, staging self-write,
+    /// MachInst-window pre-colored destination and call-save restore).
+    /// `Clobber`: a non-definition write (staging into a foreign home,
+    /// derived compute, call, inline-asm clobber, window bookkeeping
+    /// eviction).  Absent: unknown (never written, merged disagreement,
+    /// dynamic control).  Branch edges snapshot the state; block entries
+    /// intersect per register — a def survives a join only where ALL
+    /// incoming edges agree, which is exactly this predicate's soundness
+    /// condition on diamonds and switches.
+    pub(super) home_write_state: FxHashMap<u8, HomeWrite>,
+    /// Per-target-label snapshots recorded at terminator emission
+    /// (label id → one snapshot per incoming branch edge).
+    pub(super) home_branch_snapshots: FxHashMap<u32, Vec<FxHashMap<u8, HomeWrite>>>,
+    /// Diagnostic: the emitting block id of each recorded edge snapshot
+    /// (parallel to `home_branch_snapshots[label]`), printed by [WS-m].
+    pub(super) home_branch_edge_srcs: FxHashMap<u32, Vec<u32>>,
+    /// Whether the textually previous block falls through into the current
+    /// one (false after unconditional branches, returns, indirect branches,
+    /// switch dispatchers, and before the entry block).
+    pub(super) home_fallthrough: bool,
+    /// True while the current state is the function-entry seed (the entry
+    /// block's merge intersects incoming snapshots with it instead of
+    /// discarding it for lack of a fallthrough predecessor).
+    pub(super) home_entry_pending: bool,
+    /// A computed Goto was emitted: every label is a potential edge target,
+    /// so block-entry merges must treat every register as unknown.
+    pub(super) home_indirect_seen: bool,
+    /// Debug-only: the current block's begin label (refusal diagnostics).
+    pub(super) home_dbg_block: u32,
+
+    /// The RA's blessed same-value classes (RegAllocResult::phi_chain):
+    /// member value id → class representative. Two ids in one class denote
+    /// the same value at every program point where both are live — slot
+    /// coalescing webs, applied phi destructive updates, FP webs. A stale
+    /// home of member v is readable whenever a NON-stale class sibling
+    /// shares the register: the register provably holds the class value.
+    /// Empty on targets without alias-aware freshness (behavior unchanged).
+    pub(super) phi_chain: FxHashMap<u32, u32>,
+    /// Hole-aware live segments per value (start, end) in program-point
+    /// numbering, from the RA's liveness. `note_reg_clobbered` consults them
+    /// to mark ONLY the sharers that are actually LIVE at the clobber point —
+    /// a dead sharer's consumers are unreachable from the clobber, so its
+    /// home stays readable (RA interference keeps the register's next
+    /// real holder's def on a path where this value is already dead).
+    pub(super) value_live_segments: FxHashMap<u32, LiveSpans>,
+    /// Per home register, the stabbing index over its sharers'
+    /// `value_live_segments` ([`Self::index_home_liveness`]); the clobber
+    /// eviction's liveness gate reads it.
+    pub(super) home_live_index: FxHashMap<u8, SharerLiveIndex>,
+    /// Liveness-gated evictions whose value is dead AFTER the clobbering
+    /// point, pending settlement ([`Self::settle_transient_home_evictions`]).
+    pub(super) home_transient_evictions: Vec<TransientEviction>,
+    /// Sorted terminator program points (liveness `block_ends`): a value
+    /// live out across a non-contiguous edge also ends its segment there,
+    /// so an eviction at one of these points is never transient.
+    pub(super) home_block_end_points: Vec<u32>,
+    /// Every value in a same-value class (`phi_chain` keys and
+    /// representatives). A member's clobber mark is evidence for its
+    /// siblings' alias reads, so it is never settled.
+    pub(super) home_class_members: FxHashSet<u32>,
+    /// Inverse of `reg_assignments`: physical register id -> value IDs homed
+    /// there. Lets `note_dest_defined` evict every OTHER sharer of a
+    /// destination's home in O(sharers) instead of scanning the whole map.
+    pub(super) home_sharers: FxHashMap<u8, Vec<u32>>,
+    /// Freshness snapshot taken by emit_pre_call_save_caller_regs for the
+    /// registers it actually saves, replayed by emit_post_call_restore_
+    /// caller_regs: the call clobbers caller-saved homes, but the save and
+    /// restore preserve the content that was live at the call, so exactly
+    /// the snapshot set becomes fresh again after the restore.
+    pub(super) call_fresh_snapshot: Vec<u32>,
+    /// Which callee-saved registers are used and need save/restore.
+    pub(super) used_callee_saved: Vec<PhysReg>,
+    /// Whether SSE is disabled (-mno-sse). When true, variadic prologues skip
+    /// XMM saves and va_start sets fp_offset to overflow immediately.
+    pub(super) function_alignment: u32,
+    pub(super) skip_rax_setup: bool,
+    /// The current function contains a Call/CallIndirect. With frame-pointer
+    /// omission a frame-less (raw_space == 0) function still needs an 8-byte
+    /// pad so %rsp is 16-byte aligned at each call (entry %rsp ≡ 8 mod 16).
+    /// Set by calculate_stack_space_impl, read by aligned_frame_size_impl.
+    pub(super) func_has_calls: bool,
+    /// `func_has_calls` minus the calls that become sibling calls
+    /// (`<epilogue>; jmp`): no `call` instruction then runs on this frame,
+    /// so the frame planner owes no call-alignment pad. Only the two frame
+    /// decisions read it (`aligned_frame_size_impl`, the empty-frame
+    /// elision); red-zone and register policy keep `func_has_calls`.
+    pub(super) func_has_non_tail_calls: bool,
+    /// Module-scoped interprocedural register allocation state (summaries,
+    /// caller records); see `ipa_ra`.
+    pub(crate) ipa: super::ipa_ra::IpaRaState,
+    /// Caller-saved GP families (peephole bits) the current function keeps
+    /// live across some of its calls; 0 when IPA-RA does not apply. The
+    /// function-wide union, recorded for the module verifier.
+    pub(super) ipa_keep: u16,
+    /// Per IPA-homed value: (family bit, FAT interval). A call at point `c`
+    /// publishes, as `# LCCC_IPA_KEEP`, exactly the families of the values
+    /// live ACROSS it (`start < c < end`); see [`Self::ipa_keep_at`].
+    pub(super) ipa_keep_spans: Vec<(u16, u32, u32)>,
+    /// The callees the current function's keep set was computed against.
+    pub(super) ipa_keep_callees: Vec<String>,
+    /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
+    /// scalar mul+add -> vfmadd231 fusion.
+    pub(super) fp_contract: crate::common::fp_contract::FpContract,
+    /// FMA3 ISA availability (-mfma / -march=x86-64-v3+). vfmadd231s{s,d} is
+    /// not in the baseline SSE2 ISA: contraction alone must not emit it.
+    pub(super) fma_enabled: bool,
+    pub(super) no_sse: bool,
+    /// Per-function vector-constant pool: (value, byte_width) -> label.
+    /// _mm256_set1_* with a constant argument lowers to a single
+    /// vpbroadcast{w,d,q} .LvcN(%rip), %ymm0 (1 uop on the load port) instead
+    /// of movl+vmovd+vpbroadcastd (3 uops, two of them port-5). Entries are
+    /// flushed to .rodata by emit_vector_const_rodata after the function body.
+    pub(super) vec_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8), String>,
+    pub(super) vec_const_counter: u32,
+    /// Repeated-lane full-width vector constants: (lane_value, lane_bytes,
+    /// total_bytes) -> label. Used directly as memory operands (e.g. the
+    /// 0x80000000 sign bias of the unsigned packed compare, consumed by
+    /// vpxor/pxor — each entry is 16-byte aligned at flush time, which the
+    /// legacy-SSE consumers require). Shares the label counter and the
+    /// .rodata flush with `vec_const_labels`.
+    pub(super) lane_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8, u8), String>,
+    /// True when the target has BMI1; enables scalar ANDN fusion and TZCNT
+    /// (Ctz). Without it Ctz lowers to BSF with an explicit zero fixup.
+    pub(super) bmi1_enabled: bool,
+    /// The TU's scalar integer ISA (`-mbmi`/`-mbmi2`/`-mlzcnt`/`-mpopcnt`
+    /// after `-march` resolution), captured by `apply_options`. Per-function
+    /// `target("...")` features are OR-ed onto this and the live
+    /// `*_enabled` bits are restored from it after every function.
+    module_scalar_isa: ScalarIsa,
+    /// The TU's vector/SIMD ISA (`opts.isa`), captured by `apply_options`
+    /// and restored after every per-function `target("...")` override.
+    module_isa: super::super::isa::X86Isa,
+    /// The meet of `module_isa` and every emitted function's `target("...")`
+    /// ISA. The module-wide text peephole reads `isa::current()` for whole-
+    /// file rewrites (MOVBE fusion, SSE store forwarding); it must run under
+    /// a permission legal in EVERY function, or a `target("no-movbe")` /
+    /// `target("general-regs-only")` function in a `-march=haswell` TU is
+    /// rewritten with instructions it forbids. Published by
+    /// [`Self::publish_peephole_isa`] once emission is done.
+    peephole_isa: super::super::isa::X86Isa,
+    /// The TU's baseline `no_sse`, `avx512`, and `avx512vl` bits for restoring
+    /// per-function `target("...")` overrides.
+    module_no_sse: bool,
+    module_avx512: bool,
+    /// The current function has AVX-VNNI (CPUID, VEX): the dual-encoded dot
+    /// products get `{vex}`, the only form Alder Lake-class CPUs (no
+    /// AVX-512) execute. Otherwise they were permitted through AVX512-VNNI
+    /// + VL and keep the assembler's default EVEX form, the only one
+    /// Cascade Lake and Ice Lake execute.
+    pub(super) vex_vnni: bool,
+    module_avx512vl: bool,
+    /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
+    /// When false, Clz lowers to a BSR sequence with an explicit zero fixup:
+    /// F3-prefixed LZCNT decodes as BSR on CPUs without the feature and
+    /// silently returns a wrong count. (Ctz/TZCNT is BMI1: `bmi1_enabled`.)
+    pub(super) lzcnt_enabled: bool,
+    /// True when the target has POPCNT (-mpopcnt or an enabling -march).
+    /// When false, Popcount lowers to an shr/adc bit loop.
+    pub(super) popcnt_enabled: bool,
+    /// `IntrinsicOp::Prefetch` lowering permissions; `None` under
+    /// `CCC_NO_PREFETCH` (see `CodegenOptions::no_prefetch`).
+    pub(super) prefetch_isa: Option<crate::backend::x86_common::X86PrefetchIsa>,
+    /// True when the target has BMI2 (`-mbmi2` or an enabling -march).
+    pub(super) bmi2_enabled: bool,
+    /// True when the target has APX Foundation (`-mapx` / `-mapxf`).
+    /// Gates `%r16`–`%r31` allocation and NDD 3-operand integer ALU.
+    pub(super) apx_enabled: bool,
+    /// Measured tuning row for the selected `-mtune`/`-march` core.
+    pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
+    /// True when the target has AVX2; gates YMM constant-size copies.
+    pub(super) avx2_enabled: bool,
+    /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
+    /// FMA3 / ymm).  Every text emitter consults this instead of assuming a
+    /// baseline; the x86-64 default is SSE2 — see `backend::x86::isa`.
+    pub(super) isa: super::super::isa::X86Isa,
+    /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
+    pub(super) avx512_enabled: bool,
+    /// Per-function measured copy policy: only audited wide conversion/cast
+    /// webs use ZMM aggregate copies. Plain memcpy loops retain YMM.
+    pub(super) wide_simd_copies: bool,
+    /// AVX-512VL *with* the F base (see `CodegenOptions::avx512vl`): the
+    /// 128/256-bit EVEX permission.  Gates the xmm/ymm `vprold` rotate —
+    /// one µop where the AVX2 form needs vpslld+vpsrld+vpor.
+    pub(super) avx512vl_enabled: bool,
+    /// -Os/-Oz: prefer the shorter sequence over the faster one (codegen-side
+    /// strength reduction for constant mul/div is skipped in favour of imul/idiv).
+    pub(super) optimize_for_size: bool,
+    /// Current function being generated (needed for indexed addressing detection).
+    pub(super) current_func: Option<*const IrFunction>,
+    /// `find_defining_instruction`'s answers for `current_func`, built on the
+    /// first `get_defining_instruction` of the function (see there) and reset
+    /// wherever `current_func` changes.
+    pub(super) def_index: std::cell::OnceCell<DefIndex>,
+    /// When true, skip movslq sign-extension after 32-bit ALU ops on registers
+    /// for values NOT in needs_sext_values. Set when no GEPs and no widening casts.
+    pub(super) skip_i32_sext: bool,
+    /// Set of value IDs that need sign-extension because they're used in 64-bit
+    /// contexts (Cast to I64, GEP operands). Values NOT in this set can skip movslq.
+    pub(super) needs_sext_values: FxHashSet<u32>,
+    /// Signed homes consumed wide WITHOUT an explicit widening Cast.
+    pub(super) implicit_sext_values: FxHashSet<u32>,
+    /// Actual signed I32 definitions, independent of home/storage width.
+    /// `value_types` is widened by consumers (a GEP turns an I32 result's
+    /// storage type into Ptr), so it cannot decide def-side signedness.
+    pub(super) signed_i32_defs: FxHashSet<u32>,
+    /// Values whose low-32 form is PROVABLY NON-NEGATIVE because they are
+    /// the result of a Clz/Ctz/Popcount on a type of at most 32 bits
+    /// (PF-16b). Any 32-bit register write zeroes bits 32..63 on x86-64,
+    /// and these results are <= their bit width, so bits 31..63 are all
+    /// zero: ZERO-extension of the 32-bit form equals the required
+    /// SIGN-extension. Widening casts of such values take the cheaper
+    /// unsigned path (movl, no REX-prefixed movs) instead of cltq/movslq.
+    /// Membership is per-definition — derived values (adds etc. on top of
+    /// a bitop result can wrap negative) are deliberately NOT propagated.
+    pub(super) bitop_nonneg_values: FxHashSet<u32>,
+    /// Single-use 32/64-bit right shifts whose sole consumer masks off the
+    /// rotated-in high bits, enabling non-destructive BMI2 `rorxl`/`rorxq`.
+    pub(super) rorx_masked_shifts: FxHashSet<u32>,
+    /// Values whose GPR home was written by a 32-bit zero-extending indexed load
+    /// (`movzbl`, `movzwl`, `movl`), leaving bits 8..63 / 16..63 / 32..63 zeroed.
+    pub(super) zext_loaded_values: FxHashSet<u32>,
+    /// Cmp destinations whose result is consumed ONLY by the immediately
+    /// following Select/CondBranch (same block, possibly after a flag-neutral
+    /// Copy chain): maps the Cmp dest to the chain-end value the consumer
+    /// references. For these, the Cmp emitter skips the boolean
+    /// materialization (setcc/movzbl/store) and the consumer uses the live
+    /// flags directly (jcc/cmovcc).
+    pub(super) fused_cmp_dests: FxHashMap<u32, u32>,
+    /// Destinations of the flag-neutral forwarding Copy/Cast instructions in a
+    /// fused Cmp chain. Their value is never materialized (the consumer uses
+    /// the live flags), so their emitters must skip them — emitting them would
+    /// read the never-written stale register (a dead, wasted instruction).
+    pub(super) fused_forward_dests: FxHashSet<u32>,
+    /// Cmp destinations eligible for compare-replay: the Cmp's single use is
+    /// a Select or CondBranch that is NOT adjacent to the Cmp (flags would be
+    /// clobbered in between), so the consumer re-emits `cmp` from the
+    /// recorded operands and uses cmovcc/jcc directly instead of testing the
+    /// materialized boolean (setcc/movzbl/testq chain). Keyed by Cmp dest.
+    pub(super) cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    pub(super) cmp_replay_multi: FxHashMap<u32, u32>,
+    /// De Morgan branch records (post-prune): And/Or dest → record. The
+    /// CondBranch consumes the record and re-emits both comparisons with a
+    /// short-circuit jump. Cleared per function; survivors only.
+    pub(super) demorgan_branch: FxHashMap<u32, super::comparison::DemorganRec>,
+    /// And/Or + Cmp dests skipped at their own positions by the De Morgan
+    /// split (machinst claim, alu And/Or gate, Cmp gate). Post-prune only.
+    pub(super) demorgan_skip: FxHashSet<u32>,
+    /// CMP-REPLAY operand -> consumer links built with `cmp_replay` (IS-09):
+    /// merged into the RA's folded_index_uses so register-homed replay
+    /// operands keep their homes until the consumer re-emits the compare.
+    /// Cleared after the merge; exists only to bridge the pre-RA scan and
+    /// the RA invocation inside this very large prepare function.
+    pub(super) cmp_replay_operand_links: FxHashMap<u32, Vec<u32>>,
+    /// Replay-family emission gaps from the scan (Cmp dest -> (block_idx,
+    /// cmp_idx, last_consumer_idx)). Consumed by the post-RA prune in
+    /// calculate_stack_space_impl to audit register-homed operands for
+    /// home rewrites inside the gap (coalesce-sibling definitions, calls
+    /// on caller-saved homes); see CmpReplayScan::replay_gaps.
+    pub(super) cmp_replay_gaps: FxHashMap<u32, (usize, usize, usize)>,
+    /// FP-SELECT (S05): float Cmps whose single use is a Select. The Cmp
+    /// emitter skips the ucomisd/setcc boolean entirely; every select
+    /// re-derives a vcmpsd/vcmpss VEX blend mask from the recorded operands
+    /// and blends the FP arms (vblendvpd/vblendvps) — the gcc shape
+    /// (`vcmpnltsd + vblendvpd`), killing the
+    /// ucomisd/setcc/movzbl/testq/cmov + GPR-shuttle chain per select.
+    /// Keyed by Cmp dest; pruned post-RA in prologue.rs (readability).
+    pub(super) fp_select_cmps: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    /// Number of uses of each SSA value (instructions + terminators).
+    pub(super) value_use_counts: FxHashMap<u32, u32>,
+    /// W2 Load->Cast fold (2026-08-10): load dest value id -> the register of
+    /// its single consumer Cast's dest. The load emits directly into that
+    /// register and the Cast emits nothing — kills the `movzbl (%p),%rX;
+    /// mov %rX,%rYd` staging pair that was 33% of gzip-9 runtime cycles in
+    /// longest_match's first-match-check blocks.
+    pub(super) load_cast_fold: FxHashMap<u32, (PhysReg, u32)>,
+    pub(super) folded_cast_dests: FxHashSet<u32>,
+    /// Runtime handshake for the Load->Cast fold: set to the cast dest when a
+    /// load ACTUALLY emitted the redirected register load; the adjacent Cast
+    /// skips itself only when this matches (sound by construction: the cast is
+    /// never skipped unless the load truly delivered the value). Cleared by
+    /// every non-redirecting load and by every emitted cast.
+    pub(super) fold_skip_cast: Option<u32>,
+    /// Storage-width type of each value, widened by consuming contexts.
+    /// NOT the definition's semantic type; see signed_i32_defs.
+    pub(super) value_types: FxHashMap<u32, IrType>,
+    /// Hoisted preheader guard splats: values defined by a
+    /// `VecBroadcastI32x4`/`VecBroadcastI32x8` that feed the guard slot
+    /// (`IntrinsicOp::masked_guard_arg_index`) of a masked reduction step.
+    /// The masked emitters read such a guard as a vector (home or slot);
+    /// every other guard operand is a scalar to splat. Per function.
+    pub(super) masked_guard_splats: FxHashSet<u32>,
+    /// The subset of `masked_guard_splats` defined by a broadcast of the
+    /// constant 0: a register-homed one lets the AVX masked steps fold their
+    /// lane load into `vpmaxsd MEM, %zero, %dst`.
+    pub(super) masked_guard_zero_splats: FxHashSet<u32>,
+    /// Value ids whose 16-byte i128 slot home is written eagerly at their
+    /// definition (i128 ParamRefs, 128-bit call results) — the only
+    /// slot-homed i128 values the typed store route may read. See the
+    /// prologue scan that fills it.
+    pub(super) coherent_i128_homes: crate::common::fx_hash::FxHashSet<u32>,
+    /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
+    /// Set by the Cmp emitter when the consumer is the next instruction.
+    pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
+    /// PF-15 deferred narrowing widen (2026-08-29): a single-use widening
+    /// Cast from a byte/half type whose result feeds an integer compare
+    /// DEFERS its extending move and records itself here (two slots: both
+    /// operands of a compare may be widening casts). The next Cmp consumes
+    /// the pair and emits one `cmpb`/`cmpw` on the ORIGINAL sources --
+    /// exactly GCC's shape -- instead of two extends plus a 32/64-bit
+    /// compare (PF-15: `a < b` on signed chars widened both operands three
+    /// times). Any other instruction flushes the deferred moves unchanged,
+    /// so the transform is invisible to every non-matching consumer.
+    /// Soundness rests on the record-time conflict rule in
+    /// `try_record_pending_widen`: a second cast whose destination home
+    /// equals the first cast's source register home is refused (the RA may
+    /// reuse the first source's home for the second destination once the
+    /// source's only modelled use -- the deferred move -- leaves its live
+    /// range), and the reversed aliasing (first dest == second source) is
+    /// impossible because the two SSA ranges overlap by construction.
+    pub(super) pending_widen: [Option<super::cast_ops::PendingWiden>; 2],
+    /// Pending FP condition flags from a fused float Cmp: (cmp dest value,
+    /// pre-computed jcc). FP ucomisd sets EFLAGS with different semantics
+    /// than integer cmp (ordered via CF/ZF/PF; `ja`/`jae`/`jb`/`jbe` map to
+    /// the relational ops, NOT `jg`/`jge`/`jl`/`jle`), so the consumer must
+    /// use a float-specific jcc. Set by `emit_float_cmp_impl` when the
+    /// result is consumed only by an adjacent Select/CondBranch; the live
+    /// flags survive to the consumer (no flag-clobbering instruction between
+    /// them — same adjacency guarantee as the integer fusion).
+    pub(super) pending_fp_cmp: Option<(u32, &'static str)>,
+    /// IVSR pointer detection results: maps pointer phi value ID to its metadata
+    pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
+    /// Maps IVSR pointer phi to original loop counter value ID
+    pub(super) pointer_to_counter: FxHashMap<u32, u32>,
+    /// Tracks which callee-saved register was loaded from which ABI arg register
+    /// during parameter storage. Used to avoid register-direct round-trips
+    /// (e.g., rdi→rbx→rdi) that the peephole would eliminate.
+    /// Maps PhysReg ID → arg register name (e.g., PhysReg(1) → "rdi").
+    pub(super) param_source_regs: FxHashMap<u8, &'static str>,
+    /// Phase 2b: caller-saved registers with call-spanning values.
+    /// Maps PhysReg ID → dedicated spill slot for save/restore at call sites.
+    pub(super) caller_save_spill_slots: FxHashMap<u8, crate::backend::state::StackSlot>,
+    /// Phase 2b: live intervals for each caller-saved-spanning register.
+    /// Maps PhysReg ID → list of (start, end) program points.
+    /// At each call, only save registers with an interval containing the call point.
+    pub(super) caller_save_intervals: FxHashMap<u8, Vec<(u32, u32)>>,
+    /// Main-RA GPR homes × liveness spans (reg id → inclusive program-point
+    /// ranges of the values homed there). The MachInst window allocator
+    /// consults it so a window scratch register can never clobber the home of
+    /// a value live across the window but not referenced inside it — exactly
+    /// the class operand-level interference cannot see.
+    pub(super) machine_reg_busy: FxHashMap<u8, Vec<(u32, u32)>>,
+    /// MachInst buffer for virtual register ISel. Instructions are accumulated
+    /// here by try_lower_machinst and flushed (allocated + emitted) by flush_machinst.
+    pub(super) machinst_buf: Vec<super::machinst::MachInst>,
+    /// Shadow of the IR instructions currently in `machinst_buf`, in the same
+    /// order. Used by the fallback path: if the MachInst buffer cannot be fully
+    /// resolved (a value on the stack in a register-only position), the
+    /// buffered IR instructions are re-emitted through the default codegen
+    /// path instead of being silently deleted (which miscompiled gzip:
+    /// missing loads/ALU -> segfault).
+    pub(super) machinst_buf_ir: Vec<crate::ir::reexports::Instruction>,
+    /// Whether MachInst ISel is globally enabled. Default-on after gzip and
+    /// SQLite correctness bring-up; CCC_NO_MACHINST=1 is the fail-safe switch.
+    pub(super) machinst_enabled: bool,
+    /// Per-function profitability decision. Large loop bodies stay on the
+    /// mature backend until MachInst has loop-aware scheduling.
+    pub(super) machinst_function_enabled: bool,
+    /// Diagnostic/profitability mask from CCC_MI_DISABLE_KINDS. Each bit
+    /// disables one IR instruction family without disabling whole functions.
+    pub(super) machinst_disabled_kinds: u32,
+}
+
+/// Mature codegen canonicalizes signed I32 definitions used at pointer width.
+/// Machine ALU operations currently describe only their 32-bit result, not
+/// that extra def-side obligation. Keep those producers on the mature path
+/// until machine IR can represent the required sign-extended home explicitly.
+/// This is a per-value boundary, not a function-wide MachInst disable, and is
+/// required even without -fwrapv (a non-overflowing result can be negative).
+fn machinst_result_needs_sext(inst: &Instruction, needs_sext: &FxHashSet<u32>) -> bool {
+    inst.result_type() == Some(IrType::I32)
+        && inst.dest().is_some_and(|dest| needs_sext.contains(&dest.0))
+}
+
+const MI_BINOP: u32 = 1 << 0;
+const MI_LOAD: u32 = 1 << 1;
+const MI_STORE: u32 = 1 << 2;
+const MI_COPY: u32 = 1 << 3;
+const MI_CMP: u32 = 1 << 4;
+const MI_CAST: u32 = 1 << 5;
+const MI_UNARY: u32 = 1 << 6;
+const MI_SELECT: u32 = 1 << 7;
+const MI_GEP: u32 = 1 << 8;
+const MI_ALLOCA: u32 = 1 << 9;
+const MI_CAST_WIDEN: u32 = 1 << 10;
+const MI_CAST_NARROW: u32 = 1 << 11;
+const MI_CAST_SAME: u32 = 1 << 12;
+const MI_CAST_SIGNED_SOURCE: u32 = 1 << 13;
+const MI_CAST_UNSIGNED_SOURCE: u32 = 1 << 14;
+/// Scalar float moves (FMov): float Store/Load/Copy lowered to movss/movsd.
+/// Separate bit so float lowering can be bisected without losing integer
+/// coverage of the same instruction kinds.
+const MI_FLOAT_MOV: u32 = 1 << 15;
+/// Scalar float arithmetic (FAlu): float Add/Sub/Mul/Div lowered to the VEX
+/// three-operand vadd/vsub/vmul/vdiv forms.
+const MI_FLOAT_ALU: u32 = 1 << 16;
+/// Typed direct calls (CallTyped): SysV integer-register calls lowered as one
+/// atomic machine instruction (caller-save spills + argument moves + call +
+/// return home + restores), replacing the accumulator-staged text sequence.
+const MI_CALL_TYPED: u32 = 1 << 17;
+
+fn parse_machinst_disabled_kinds(raw: &str) -> u32 {
+    raw.split(',').fold(0, |mask, name| {
+        mask | match name.trim() {
+            "binop" => MI_BINOP,
+            "load" => MI_LOAD,
+            "store" => MI_STORE,
+            "copy" => MI_COPY,
+            "cmp" => MI_CMP,
+            "cast" => MI_CAST,
+            "unary" => MI_UNARY,
+            "select" => MI_SELECT,
+            "gep" => MI_GEP,
+            "alloca" => MI_ALLOCA,
+            "cast-widen" => MI_CAST_WIDEN,
+            "cast-narrow" => MI_CAST_NARROW,
+            "cast-same" => MI_CAST_SAME,
+            "cast-signed-source" => MI_CAST_SIGNED_SOURCE,
+            "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
+            "float-mov" => MI_FLOAT_MOV,
+            "float-alu" => MI_FLOAT_ALU,
+            "call-typed" => MI_CALL_TYPED,
+            "all" => u32::MAX,
+            _ => 0,
+        }
+    })
+}
+
+fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u32 {
+    use crate::ir::reexports::Instruction;
+    match inst {
+        Instruction::BinOp { .. } => MI_BINOP,
+        Instruction::Load { .. } => MI_LOAD,
+        Instruction::Store { .. } => MI_STORE,
+        Instruction::Copy { .. } => MI_COPY,
+        Instruction::Cmp { .. } => MI_CMP,
+        Instruction::Cast { .. } => MI_CAST,
+        Instruction::UnaryOp { .. } => MI_UNARY,
+        Instruction::Select { .. } => MI_SELECT,
+        Instruction::GetElementPtr { .. } => MI_GEP,
+        Instruction::Alloca { .. } => MI_ALLOCA,
+        Instruction::Call { .. } | Instruction::CallIndirect { .. } => MI_CALL_TYPED,
+        _ => 0,
+    }
+}
+
+/// Information about an IVSR-transformed pointer induction variable
+#[derive(Debug, Clone)]
+pub(super) struct IvsrPointerInfo {
+    pub phi_val: Value,          // The pointer phi node
+    pub base_ptr: Value,         // Original array base
+    pub stride: i64,             // Element size in bytes
+    pub init_offset: i64,        // Initial offset (usually 0)
+    pub header_block: BlockId,   // Loop header containing phi
+    pub backedge_block: BlockId, // Block with pointer increment
+}
+
+/// `CCC_TRACE_NOTES` gates the home-register note trace
+/// (`[INS]`/`[CLOB]`) emitted by [`X86Codegen::note_home_written`] and
+/// [`X86Codegen::note_reg_clobbered`].
+///
+/// Read once and cached.  `note_home_written` runs per homed definition —
+/// effectively per emitted instruction — and an uncached lookup there is a
+/// `getenv` plus an `OsString` clone of the value on the codegen hot path,
+/// i.e. a compile-time regression paid by every build that never sets the
+/// variable.  Same convention as `i686::codegen::emit::const_stack_arg_disabled`
+/// and `split_ranges::split_debug_enabled`; the environment cannot change
+/// mid-process in the driver, so caching is exact, not an approximation.
+fn trace_notes_enabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_TRACE_NOTES").is_some());
+    *FLAG
+}
+
+/// The `CCC_MI_STREAM` gate, cached once (checked once per window flush).
+fn mi_stream_dbg() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_MI_STREAM").is_some());
+    *FLAG
+}
+
+/// The `LCCC_DEBUG_WS_REG` watch register, cached once: the environment
+/// cannot change mid-process in the driver (same exactness argument as
+/// `trace_notes_enabled`), and the write-state tracers sit on per-event
+/// paths (`note_reg_clobbered` fires several times per basic block), where
+/// a raw `env::var` lookup per event is measurable compile-time overhead.
+pub(super) fn ws_watch_reg() -> Option<u8> {
+    static WATCH: std::sync::LazyLock<Option<u8>> = std::sync::LazyLock::new(|| {
+        std::env::var("LCCC_DEBUG_WS_REG")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+    });
+    *WATCH
+}
+
+/// True when the write-state tracers are watching register `reg`.
+fn ws_watch(reg: u8) -> bool {
+    ws_watch_reg() == Some(reg)
+}
+
+/// The `LCCC_DEBUG_ALIAS_REFUSE` gate, cached once (fires on every
+/// refinement evaluation — hot).
+fn alias_refuse_dbg() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LCCC_DEBUG_ALIAS_REFUSE").is_some());
+    *FLAG
+}
+
+impl X86Codegen {
+    /// IPA-RA keep mask for a call at program point `pp`: the families
+    /// holding a value that is live across the call. Exact rather than the
+    /// function-wide union, so at a call no IPA value survives the peephole
+    /// keeps its ordinary clobber model (an argument staged through a dead
+    /// kept register still forwards; sf_inverse lost `movl %r12d,%edi` to a
+    /// union marker).
+    pub(super) fn ipa_keep_at(&self, pp: u32) -> u16 {
+        self.ipa_keep_spans
+            .iter()
+            .filter(|&&(_, start, end)| start < pp && pp < end)
+            .fold(0, |mask, &(fam, _, _)| mask | fam)
+    }
+
+    /// Compare the low 64-bit half of a 128-bit switch value (already in
+    /// %rax) against `case_val` and branch to `label` on equality.  The sign
+    /// class of the case has already been verified against the high half.
+    fn emit_switch_case_branch_128_low(&mut self, case_val: i64, label: &str) {
+        if case_val == 0 {
+            self.state.emit("    testq %rax, %rax");
+        } else if case_val >= i32::MIN as i64 && case_val <= i32::MAX as i64 {
+            self.state
+                .out
+                .emit_instr_imm_reg("    cmpq", case_val, "rax");
+        } else {
+            self.state
+                .out
+                .emit_instr_imm_reg("    movabsq", case_val, "rcx");
+            self.state.emit("    cmpq %rcx, %rax");
+        }
+        self.state.out.emit_jcc_label("    je", label);
+    }
+
+    /// Density-based switch lowering for native-width values: the trait
+    /// default's logic (jump table with PGO case hoisting, or a sparse
+    /// compare chain), reproduced here so the 128-bit path can coexist in
+    /// the override above.
+    fn emit_switch_native(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        let hint = crate::pgo::take_switch_hint();
+        let force_chain = hint.map(|h| h.force_chain).unwrap_or(false);
+        let use_jump_table = if self.state_ref().no_jump_tables || force_chain {
+            false
+        } else if cases.len() >= MIN_JUMP_TABLE_CASES {
+            let min_val = cases
+                .iter()
+                .map(|&(v, _)| v)
+                .min()
+                .expect("switch must have cases");
+            let max_val = cases
+                .iter()
+                .map(|&(v, _)| v)
+                .max()
+                .expect("switch must have cases");
+            let range_i128 = max_val as i128 - min_val as i128 + 1;
+            let range_ok = range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128;
+            range_ok && cases.len() * 100 / (range_i128 as usize) >= MIN_JUMP_TABLE_DENSITY_PERCENT
+        } else {
+            false
+        };
+
+        if use_jump_table {
+            let mut cases2: Vec<(i64, BlockId)> = cases.to_vec();
+            let mut hoist: Option<(i64, BlockId)> = None;
+            if let Some(h) = hint {
+                if let Some((hv, ht)) = h.hot_case {
+                    if let Some(pos) = cases2.iter().position(|&(v, t)| v == hv && t.0 == ht) {
+                        hoist = Some(cases2.remove(pos));
+                    }
+                }
+            }
+            if let Some((hv, ht)) = hoist {
+                self.emit_load_operand(val);
+                self.emit_switch_case_branch(hv, &ht.as_label(), ty);
+            }
+            self.emit_switch_jump_table(val, &cases2, default, ty);
+        } else {
+            self.emit_load_operand(val);
+            for &(case_val, target) in cases {
+                let label = target.as_label();
+                self.emit_switch_case_branch(case_val, &label, ty);
+            }
+            self.emit_branch_to_block(*default);
+        }
+    }
+
+    /// Emit a retpoline-protected indirect CALL through `reg`.
+    ///
+    /// thunk-inline (kernel vDSO: userspace code that cannot reference the
+    /// kernel's __x86_indirect_thunk_* symbols) expands the full retpoline
+    /// at the call site — byte-equivalent to GCC's
+    /// -mindirect-branch=thunk-inline output (verified against gcc -O2 on
+    /// the fp-call reproducer):
+    ///     jmp .Louter
+    ///   .Linner: call .Lset
+    ///   .Lspec:  pause; lfence; jmp .Lspec   ; speculation trap
+    ///   .Lset:   mov %reg,(%rsp); ret        ; RSB-safe dispatch
+    ///   .Louter: call .Linner                ; pushes the REAL return addr
+    /// thunk-extern emits `call __x86_indirect_thunk_<reg>` (kernel proper,
+    /// resolved at link time and patchable by objtool --retpoline).
+    pub(super) fn emit_retpoline_call(&mut self, reg: &str) {
+        if self.state.indirect_branch_thunk_inline {
+            let id = self.state.next_label_id();
+            self.state
+                .emit_fmt(format_args!("    jmp .Lrpl_outer_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_inner_{}:", id));
+            self.state
+                .emit_fmt(format_args!("    call .Lrpl_set_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_spec_{}:", id));
+            self.state.emit("    pause");
+            self.state.emit("    lfence");
+            self.state
+                .emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_set_{}:", id));
+            self.state
+                .emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
+            self.state.emit("    ret");
+            self.state.emit_fmt(format_args!(".Lrpl_outer_{}:", id));
+            self.state
+                .emit_fmt(format_args!("    call .Lrpl_inner_{}", id));
+        } else if self.state.indirect_branch_thunk {
+            self.state
+                .emit_fmt(format_args!("    call __x86_indirect_thunk_{}", reg));
+        } else {
+            self.state.emit_fmt(format_args!("    call *%{}", reg));
+        }
+    }
+
+    /// Emit a retpoline-protected indirect JMP through `reg` (tail calls,
+    /// computed goto, switch tables). GCC's jump form:
+    ///     call .Lset          ; pushes .Lspec as the "return" address
+    ///   .Lspec: pause; lfence; jmp .Lspec
+    ///   .Lset:  mov %reg,(%rsp); ret   ; ret consumes the rewritten slot
+    pub(super) fn emit_retpoline_jump(&mut self, reg: &str) {
+        if self.state.indirect_branch_thunk_inline {
+            let id = self.state.next_label_id();
+            self.state
+                .emit_fmt(format_args!("    call .Lrpl_set_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_spec_{}:", id));
+            self.state.emit("    pause");
+            self.state.emit("    lfence");
+            self.state
+                .emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
+            self.state.emit_fmt(format_args!(".Lrpl_set_{}:", id));
+            self.state
+                .emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
+            self.state.emit("    ret");
+        } else if self.state.indirect_branch_thunk {
+            self.state
+                .emit_fmt(format_args!("    jmp __x86_indirect_thunk_{}", reg));
+        } else {
+            self.state.emit_fmt(format_args!("    jmpq *%{}", reg));
+        }
+    }
+
+    pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(RaConfig::from_process_env()))
+    }
+
+    pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
+        let machinst_enabled = !ra_config.no_machinst;
+        let machinst_disabled_kinds = parse_machinst_disabled_kinds(&ra_config.mi_disable_kinds);
+        let mut state = CodegenState::new_with_ra_config(ra_config);
+        // x86-64 tracks the %rax accumulator through the shared generic
+        // passes: arm the sink's shadow-epoch validator for this target.
+        state.enable_rax_epoch_discipline();
+        state.frame_gep_direct = std::env::var_os("CCC_NO_FRAME_GEP_DIRECT").is_none();
+        Self {
+            state,
+            current_return_type: IrType::I64,
+            func_ret_classes: Vec::new(),
+            func_set_second_ret: false,
+            call_ret_is_f128_sse: false,
+            call_ret_classes: Vec::new(),
+            func_ret_is_f128_sse: false,
+            num_named_int_params: 0,
+            num_named_fp_params: 0,
+            num_named_stack_bytes: 0,
+            reg_save_area_offset: 0,
+            vector_ret_buffer_bytes: 0,
+            vector_ret_buffer_offset: 0,
+            caller_regs_restored: false,
+            is_variadic: false,
+            divrem_tail_dests: FxHashSet::default(),
+            divrem_head_partners: FxHashMap::default(),
+            divrem_broken_tails: FxHashSet::default(),
+            vararg_gp_save: true,
+            vararg_fp_save: true,
+            dyn_align_cleanup: false,
+            indirect_fptr_on_stack: false,
+            asm_scratch_idx: 0,
+            asm_xmm_scratch_idx: 0,
+            reg_assignments: FxHashMap::default(),
+            home_fresh: FxHashSet::default(),
+            home_clobbered: FxHashSet::default(),
+            home_clobber_cause: FxHashMap::default(),
+            home_write_state: FxHashMap::default(),
+            home_branch_snapshots: FxHashMap::default(),
+            home_branch_edge_srcs: FxHashMap::default(),
+            home_fallthrough: false,
+            home_entry_pending: false,
+            home_indirect_seen: false,
+            home_dbg_block: u32::MAX,
+            phi_chain: FxHashMap::default(),
+            value_live_segments: FxHashMap::default(),
+            home_live_index: FxHashMap::default(),
+            home_transient_evictions: Vec::new(),
+            home_block_end_points: Vec::new(),
+            home_class_members: FxHashSet::default(),
+            home_sharers: FxHashMap::default(),
+            call_fresh_snapshot: Vec::new(),
+            used_callee_saved: Vec::new(),
+            function_alignment: 0,
+            skip_rax_setup: false,
+            func_has_calls: false,
+            func_has_non_tail_calls: false,
+            ipa: super::ipa_ra::IpaRaState::default(),
+            ipa_keep: 0,
+            ipa_keep_spans: Vec::new(),
+            ipa_keep_callees: Vec::new(),
+            fp_contract: crate::common::fp_contract::FpContract::default(),
+            fma_enabled: false,
+            no_sse: false,
+            vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
+            vec_const_counter: 0,
+            lane_const_labels: crate::common::fx_hash::FxHashMap::default(),
+            bmi1_enabled: false,
+            module_scalar_isa: ScalarIsa::default(),
+            module_isa: super::super::isa::X86Isa::default(),
+            peephole_isa: super::super::isa::X86Isa::default(),
+            module_no_sse: false,
+            module_avx512: false,
+            vex_vnni: false,
+            module_avx512vl: false,
+            lzcnt_enabled: false,
+            popcnt_enabled: false,
+            prefetch_isa: None,
+            bmi2_enabled: false,
+            apx_enabled: false,
+            tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
+            avx2_enabled: false,
+            isa: super::super::isa::X86Isa::default(),
+            avx512_enabled: false,
+            wide_simd_copies: false,
+            avx512vl_enabled: false,
+            optimize_for_size: false,
+            skip_i32_sext: false,
+            needs_sext_values: FxHashSet::default(),
+            implicit_sext_values: FxHashSet::default(),
+            signed_i32_defs: FxHashSet::default(),
+            bitop_nonneg_values: FxHashSet::default(),
+            rorx_masked_shifts: FxHashSet::default(),
+            zext_loaded_values: FxHashSet::default(),
+            fused_cmp_dests: FxHashMap::default(),
+            fused_forward_dests: FxHashSet::default(),
+            cmp_replay: FxHashMap::default(),
+            cmp_replay_multi: FxHashMap::default(),
+            demorgan_branch: FxHashMap::default(),
+            demorgan_skip: FxHashSet::default(),
+            cmp_replay_operand_links: FxHashMap::default(),
+            cmp_replay_gaps: FxHashMap::default(),
+            fp_select_cmps: FxHashMap::default(),
+            value_use_counts: FxHashMap::default(),
+            load_cast_fold: FxHashMap::default(),
+            folded_cast_dests: FxHashSet::default(),
+            fold_skip_cast: None,
+            value_types: FxHashMap::default(),
+            masked_guard_splats: FxHashSet::default(),
+            masked_guard_zero_splats: FxHashSet::default(),
+            coherent_i128_homes: crate::common::fx_hash::FxHashSet::default(),
+            pending_cmp: None,
+            pending_widen: [None, None],
+            pending_fp_cmp: None,
+            current_func: None,
+            def_index: std::cell::OnceCell::new(),
+            ivsr_pointers: FxHashMap::default(),
+            pointer_to_counter: FxHashMap::default(),
+            param_source_regs: FxHashMap::default(),
+            caller_save_spill_slots: FxHashMap::default(),
+            caller_save_intervals: FxHashMap::default(),
+            machine_reg_busy: FxHashMap::default(),
+            machinst_buf: Vec::new(),
+            machinst_buf_ir: Vec::new(),
+            machinst_enabled,
+            machinst_function_enabled: false,
+            machinst_disabled_kinds,
+        }
+    }
+
+    /// Enable position-independent code generation.
+    pub fn set_pic(&mut self, pic: bool) {
+        self.state.pic_mode = pic;
+    }
+
+    /// Record shared-object output. Distinct from PIC: a PIE executable may
+    /// use Local-Exec TLS, a shared object may not.
+    pub fn set_shared_lib(&mut self, shared: bool) {
+        self.state.shared_lib = shared;
+    }
+
+    /// Enable function return thunk (-mfunction-return=thunk-extern).
+    pub fn set_function_return_thunk(&mut self, enabled: bool) {
+        self.state.function_return_thunk = enabled;
+    }
+
+    /// Enable indirect branch thunk (-mindirect-branch=thunk-extern).
+    pub fn set_indirect_branch_thunk(&mut self, enabled: bool) {
+        self.state.indirect_branch_thunk = enabled;
+    }
+
+    /// Enable inline retpoline expansion (-mindirect-branch=thunk-inline).
+    pub fn set_indirect_branch_thunk_inline(&mut self, enabled: bool) {
+        self.state.indirect_branch_thunk_inline = enabled;
+    }
+
+    /// Set patchable function entry configuration (-fpatchable-function-entry=N,M).
+    pub fn set_patchable_function_entry(&mut self, entry: Option<(u32, u32)>) {
+        self.state.patchable_function_entry = entry;
+    }
+
+    /// Set function-entry mcount instrumentation (-pg / -mfentry /
+    /// -mrecord-mcount / -mnop-mcount). When set, codegen emits a 5-byte call
+    /// (or NOP) at function entry, optionally recorded in __mcount_loc.
+    pub fn set_mcount(&mut self, m: Option<crate::backend::McountInstrumentation>) {
+        self.state.mcount = m;
+    }
+
+    /// Enable CF protection branch (-fcf-protection=branch) to emit endbr64.
+    pub fn set_cf_protection_branch(&mut self, enabled: bool) {
+        self.state.cf_protection_branch = enabled;
+    }
+
+    /// Enable kernel code model (-mcmodel=kernel). All symbols are assumed
+    /// to be in the negative 2GB of the virtual address space.
+    pub fn set_code_model_kernel(&mut self, enabled: bool) {
+        self.state.code_model_kernel = enabled;
+    }
+
+    /// Disable jump table emission (-fno-jump-tables). All switch statements
+    /// use compare-and-branch chains instead of indirect jumps.
+    pub fn set_no_jump_tables(&mut self, enabled: bool) {
+        self.state.no_jump_tables = enabled;
+    }
+
+    /// Disable SSE (-mno-sse). Prevents emission of any SSE/XMM instructions.
+    pub fn set_no_sse(&mut self, enabled: bool) {
+        self.no_sse = enabled;
+        // The MachInst typed route must follow the same ISA contract as the
+        // text emitters: no xmm-relayed 16-byte integer moves under -mno-sse.
+        super::isel::set_sse_integer_moves(!enabled);
+    }
+
+    /// Apply all relevant options from a `CodegenOptions` struct.
+    pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
+        self.state.disable_regalloc = opts.disable_regalloc;
+        self.state.apply_tls_options(opts);
+        self.set_pic(opts.pic || opts.pie);
+        self.state.pie_mode = opts.pie;
+        self.state.no_plt = opts.no_plt;
+        self.state.fixed_exec_link = opts.fixed_exec_link;
+        self.set_function_return_thunk(opts.function_return_thunk);
+        self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
+        self.set_indirect_branch_thunk_inline(opts.indirect_branch_thunk_inline);
+        self.set_patchable_function_entry(opts.patchable_function_entry);
+        self.set_mcount(opts.mcount);
+        self.set_cf_protection_branch(opts.cf_protection_branch);
+        self.function_alignment = opts.function_alignment;
+        self.skip_rax_setup = opts.skip_rax_setup;
+        self.set_no_sse(opts.no_sse);
+        self.set_code_model_kernel(opts.code_model_kernel);
+        self.set_no_jump_tables(opts.no_jump_tables);
+        self.bmi1_enabled = opts.bmi1;
+        self.lzcnt_enabled = opts.lzcnt;
+        self.popcnt_enabled = opts.popcnt;
+        // The SSE prefetch family is x86-64 baseline (GCC emits it even
+        // under `-mno-sse`), so only PRFCHW is a per-target decision here.
+        self.prefetch_isa =
+            (!opts.no_prefetch).then_some(crate::backend::x86_common::X86PrefetchIsa {
+                sse: true,
+                prfchw: opts.x86_prefetch.prfchw,
+            });
+        self.bmi2_enabled = opts.bmi2;
+        self.apx_enabled = opts.apx;
+        super::isel::set_apx_enabled(opts.apx);
+        self.tune = opts.tune;
+        self.module_scalar_isa = ScalarIsa {
+            bmi1: opts.bmi1,
+            bmi2: opts.bmi2,
+            lzcnt: opts.lzcnt,
+            popcnt: opts.popcnt,
+        };
+        self.publish_shlx_mode();
+        // VEX.256 / VEX.128 permission follows the NORMALIZED ISA, not the
+        // raw request bit — the `fma_enabled` discipline two lines below.
+        // The project's default -march is x86-64-v3, which grants AVX2 in
+        // `opts.isa.ymm` while the raw CLI flag stays false; keying on the
+        // request bit split the pass world (set_x86_simd_isa, which forms
+        // 256-bit packs from the same isa.ymm) from the emitter world
+        // (legacy 128-bit fallbacks) — the FP-Neg wide family then staged
+        // its 256-bit source through movdqa/xorps and silently dropped the
+        // upper lanes under VEX.256 loads/stores.
+        self.avx2_enabled = opts.isa.ymm;
+        self.avx512_enabled = opts.avx512 && opts.isa.ymm;
+        // VL carries the same ymm precondition as F here: the ARX rotator
+        // only ever lowers a 128-bit xmm form, and the option already
+        // encodes the F base (GCC semantics).  Keep the single gate.
+        self.avx512vl_enabled = opts.avx512vl && opts.isa.ymm;
+        self.isa = opts.isa;
+        self.module_isa = opts.isa;
+        self.peephole_isa = opts.isa;
+        self.module_no_sse = self.no_sse;
+        self.module_avx512 = self.avx512_enabled;
+        self.module_avx512vl = self.avx512vl_enabled;
+        // Publish for the emitters without `&self` (MachInst, peepholes).
+        super::super::isa::set_current(opts.isa);
+        self.state.emit_cfi = opts.emit_cfi;
+        // The peephole needs function delimiters regardless of unwind
+        // tables; Target::generate_assembly_with_opts_and_debug strips them
+        // after the peephole when emit_cfi is off.
+        self.state.fn_boundary_markers = true;
+        self.fp_contract = opts.fp_contract;
+        // FMA3 contraction follows the permission, not the request bit: it is
+        // granted by `-mfma` or an `-march=` profile carrying it, and
+        // `-mno-fma`/`-mno-avx`/`-march=x86-64` deny it (vfmadd* is VEX-only).
+        self.fma_enabled = opts.isa.fma;
+        self.optimize_for_size = opts.optimize_for_size;
+    }
+
+    /// Reserve (or reuse) a .rodata label holding `value` as `width` bytes for a
+    /// vpbroadcast* splat, and return "label(%rip)" for the RIP-relative operand.
+    pub(super) fn vec_const_rip_operand(&mut self, value: u64, width: u8) -> String {
+        let label = match self.vec_const_labels.get(&(value, width)) {
+            Some(l) => l.clone(),
+            None => {
+                let id = self.vec_const_counter;
+                self.vec_const_counter += 1;
+                let l = format!(".Lvc{}", id);
+                self.vec_const_labels.insert((value, width), l.clone());
+                l
+            }
+        };
+        format!("{}(%rip)", label)
+    }
+
+    /// Reserve (or reuse) a .rodata label holding `lane_value` repeated
+    /// `total_bytes / lane_bytes` times — a FULL-WIDTH vector constant for
+    /// direct memory-operand use (vpxor BIAS(%rip), %ymm0, %ymm0), as
+    /// opposed to the broadcast scalars of `vec_const_rip_operand`.
+    /// Every entry is emitted 16-byte aligned (see the flush below), which
+    /// is what makes the legacy-SSE `pxor mem, %xmm` consumers safe — only
+    /// the VEX forms tolerate unaligned memory.
+    pub(super) fn lane_const_rip_operand(
+        &mut self,
+        lane_value: u64,
+        lane_bytes: u8,
+        total_bytes: u8,
+    ) -> String {
+        debug_assert!(
+            total_bytes % lane_bytes == 0 && lane_bytes <= 8,
+            "lane const must tile the vector exactly"
+        );
+        let label = match self
+            .lane_const_labels
+            .get(&(lane_value, lane_bytes, total_bytes))
+        {
+            Some(l) => l.clone(),
+            None => {
+                let id = self.vec_const_counter;
+                self.vec_const_counter += 1;
+                let l = format!(".Lvc{}", id);
+                self.lane_const_labels
+                    .insert((lane_value, lane_bytes, total_bytes), l.clone());
+                l
+            }
+        };
+        format!("{}(%rip)", label)
+    }
+
+    /// Emit the per-function vector-constant pool entries to .rodata.
+    pub(super) fn emit_vector_const_rodata_impl(&mut self) {
+        if self.vec_const_labels.is_empty() && self.lane_const_labels.is_empty() {
+            return;
+        }
+        self.state.emit(".section .rodata");
+        self.state.emit(".align 4");
+        let mut entries: Vec<(&(u64, u8), &String)> = self.vec_const_labels.iter().collect();
+        entries.sort_by_key(|(k, _)| (k.1, k.0));
+        for ((value, width), label) in entries {
+            self.state.out.emit_named_label(label);
+            match width {
+                1 => self
+                    .state
+                    .emit_fmt(format_args!("    .byte {}", *value as u8)),
+                2 => self
+                    .state
+                    .emit_fmt(format_args!("    .short {}", *value as u16)),
+                8 => self
+                    .state
+                    .emit_fmt(format_args!("    .quad {}", *value as i64)),
+                _ => self
+                    .state
+                    .emit_fmt(format_args!("    .long {}", *value as i32)),
+            }
+        }
+        // Lane constants are emitted AFTER the scalar broadcast entries, and
+        // each gets its own 16-byte alignment: the 128-bit lane constants are
+        // consumed by LEGACY-SSE memory forms (`pxor mem, %xmm`) which fault
+        // on unaligned operands, and the mixed-width scalar entries above
+        // would otherwise leave the pool off the 16-byte grid. (The 256-bit
+        // lane constants are only read by VEX forms — alignment unnecessary
+        // there — but aligning them too costs at most a few bytes of .rodata
+        // and keeps the policy uniform.)
+        let mut lanes: Vec<(&(u64, u8, u8), &String)> = self.lane_const_labels.iter().collect();
+        lanes.sort_by_key(|(k, _)| (k.2, k.1, k.0));
+        for ((value, lane_bytes, total_bytes), label) in lanes {
+            // `.p2align 4`, NOT `.align 4`: on x86 ELF `.align N` is an
+            // N-BYTE requirement (not a power-of-two exponent), and 4 would
+            // leave legacy-SSE `pxor mem, %xmm` consumers faulting.
+            self.state.emit(".p2align 4");
+            self.state.out.emit_named_label(label);
+            let count = total_bytes / lane_bytes;
+            let directive = match lane_bytes {
+                1 => ".byte",
+                2 => ".short",
+                8 => ".quad",
+                _ => ".long",
+            };
+            let v = match lane_bytes {
+                1 => *value as u8 as i64,
+                2 => *value as u16 as i64,
+                8 => *value as i64,
+                _ => *value as u32 as i64,
+            };
+            for _ in 0..count {
+                self.state.emit_fmt(format_args!("    {} {}", directive, v));
+            }
+        }
+        self.state.restore_current_text_section();
+        // Keep the counter monotonic across functions so every .LvcN label is
+        // unique module-wide (dedup only happens within one function's pool,
+        // which is flushed together). Resetting per function would emit
+        // duplicate .rodata labels that resolve to the wrong width.
+        self.vec_const_labels.clear();
+        self.lane_const_labels.clear();
+    }
+
+    /// Format a stack slot reference as "offset(%rbp)" or "offset(%rsp)" depending
+    /// on whether the frame pointer is omitted. Used by format! strings throughout
+    /// the codegen that need to reference stack slots directly.
+    pub(super) fn slot_ref(&self, rbp_offset: i64) -> String {
+        if self.state.out.use_rsp_addressing {
+            format!("{}(%rsp)", self.state.out.rsp_frame_size + rbp_offset)
+        } else {
+            format!("{}(%rbp)", rbp_offset)
+        }
+    }
+
+    // --- x86 helper methods ---
+
+    /// Get the callee-saved register assigned to an operand, if any.
+    pub(super) fn operand_reg(&self, op: &Operand) -> Option<PhysReg> {
+        match op {
+            Operand::Value(v) => self.fresh_home_of(v.0),
+            _ => None,
+        }
+    }
+
+    /// A value's assigned home register, but ONLY when that register's
+    /// current content is still the value (see `home_fresh`). Stale homes
+    /// return None so read-side consumers fall back to a reload instead of
+    /// consuming whatever derived value the accumulator emitter last left
+    /// in the register.
+    pub(super) fn fresh_home_of(&self, val_id: u32) -> Option<PhysReg> {
+        let reg = self.reg_assignments.get(&val_id).copied()?;
+        if !self.home_clobbered.contains(&val_id) {
+            return Some(reg);
+        }
+        if self.home_readable_via_alias(val_id) {
+            return Some(reg);
+        }
+        None
+    }
+
+    /// chain_rep: the blessed same-value class representative of `v`, or `v`
+    /// itself when it has no class.
+    fn chain_rep(&self, v: u32) -> u32 {
+        *self.phi_chain.get(&v).unwrap_or(&v)
+    }
+
+    /// SOUNDNESS (alias-aware freshness — the COMPOSED law, audit-of-#603
+    /// H1): the predicate is the CONJUNCTION of two layers.
+    ///
+    /// Layer 1 — the calibrated sibling scan (the pre-dataflow model,
+    /// battle-tested across the whole kernel/corpus surface): some
+    /// same-class sibling of `val_id` shares the register with an
+    /// un-clobbered note mark. This layer answers everywhere the exact
+    /// write-state has no complete view (unmodeled raw intra-block control
+    /// flow, joins whose edges the note layer did not observe).
+    ///
+    /// Layer 2 — the exact write-state refinement (S11): where the
+    /// per-register last-write state holds a DEFINITE opinion — `Def(w)`
+    /// agreed on every path reaching this point, or `Clobber` — it can
+    /// only NARROW the calibrated answer, never widen it. A definite
+    /// Clobber is precisely the audit-H1 refutation: the liveness-gated
+    /// eviction leaves dead siblings' note marks stale-true exactly where
+    /// a foreign write rewrote the register, and the join law (any
+    /// clobber edge survives the merge as Clobber) catches that shape at
+    /// join granularity. A definite Def(w) of a value OUTSIDE the
+    /// register's sharing group narrows the same way. An absent entry
+    /// abstains: the calibrated answer stands.
+    ///
+    /// A computed Goto poisons the whole state (every label is a potential
+    /// edge); that poison is authoritative: no blessing survives dynamic
+    /// control flow this layer cannot enumerate.
+    ///
+    pub(super) fn home_readable_via_alias(&self, val_id: u32) -> bool {
+        if self.phi_chain.is_empty() {
+            return false;
+        }
+        let Some(&reg) = self.reg_assignments.get(&val_id) else {
+            return false;
+        };
+        let rep = self.chain_rep(val_id);
+        if self.home_indirect_seen {
+            // Definite global unknown: the refinement narrows to a refusal.
+            return false;
+        }
+        // Layer 1: the calibrated sibling scan.
+        if !self.home_sharers.get(&reg.0).is_some_and(|sharers| {
+            sharers.iter().any(|&s| {
+                s != val_id && !self.home_clobbered.contains(&s) && self.chain_rep(s) == rep
+            })
+        }) {
+            return false;
+        }
+        // Layer 2: the exact write-state refinement (definite opinions only).
+        match self.home_write_state.get(&reg.0) {
+            Some(HomeWrite::Def(w)) => {
+                // The register's last write on every path was the
+                // definition of a member of this register's sharing group:
+                // group-lineage content, sound for any later-live member
+                // (the RA's disjoint-live-range invariant).
+                let group_ok = self.home_sharers.get(&reg.0).is_some_and(|g| g.contains(w));
+                if alias_refuse_dbg() && !group_ok {
+                    eprintln!(
+                        "[alias-refine] blk={} val={} w={} reg={} w_not_in_group",
+                        self.home_dbg_block, val_id, w, reg.0
+                    );
+                }
+                group_ok
+            }
+            Some(HomeWrite::Clobber) => {
+                if alias_refuse_dbg() {
+                    eprintln!(
+                        "[alias-refine] blk={} val={} reg={} state=Clobber (calibrated blessing narrowed)",
+                        self.home_dbg_block, val_id, reg.0
+                    );
+                }
+                false
+            }
+            // No definite opinion: abstain — the calibrated answer stands.
+            None => true,
+        }
+    }
+
+    /// Block-entry merge: intersect the recorded branch-edge snapshots for
+    /// `label` per register (agreement keeps a def, anything else drops to
+    /// unknown), intersecting the fallthrough state as one more incoming
+    /// edge when the previous block falls through.  A label with no
+    /// snapshots keeps the current state — the entry block (whose state is
+    /// the prologue seeds) or unreachable code after an unconditional jump.
+    fn begin_home_write_block_impl(&mut self, label: BlockId) {
+        self.home_dbg_block = label.0;
+        if self.home_indirect_seen {
+            // Computed Goto: every label is a potential edge; nothing is
+            // provable past a dynamic jump.
+            self.home_write_state.clear();
+            self.home_branch_snapshots.remove(&label.0);
+            self.home_branch_edge_srcs.remove(&label.0);
+            self.home_fallthrough = false;
+            return;
+        }
+        let edge_srcs = self.home_branch_edge_srcs.remove(&label.0);
+        if let Some(snaps) = self.home_branch_snapshots.remove(&label.0) {
+            // Join law — three outcomes per register.  The storage-level
+            // identity for a shared home register is GROUP membership
+            // (`home_sharers[R]`): the RA's interference guarantee makes a
+            // member's definition write the group slot's next lineage
+            // incarnation (a definition can only happen where the previous
+            // member is dead), so a Def of ANY group member is sound
+            // content for a later-live member's consumer.  A Clobber is a
+            // write of non-member content — the audit-H1 killer.
+            //
+            //   DEFINITE Def     — every edge ends with Defs, all of them
+            //                      group members: the register holds the
+            //                      group lineage on every path.
+            //   DEFINITE Clobber — ANY edge ends with a Clobber (or with
+            //                      Defs of a foreign group): on that path
+            //                      the register provably does NOT hold the
+            //                      group's value; the join poisons.
+            //   ABSTAIN          — no Clobber anywhere but some edge has
+            //                      no opinion: the entry drops the register
+            //                      and the refinement abstains, leaving
+            //                      the answer to the calibrated layer.
+            let mut all_edges: Vec<&FxHashMap<u8, HomeWrite>> = snaps.iter().collect();
+            if self.home_fallthrough || self.home_entry_pending {
+                all_edges.push(&self.home_write_state);
+            }
+            let regs: Vec<u8> = all_edges
+                .iter()
+                .flat_map(|m| m.keys().copied().collect::<Vec<_>>())
+                .collect::<FxHashSet<_>>()
+                .into_iter()
+                .collect();
+            let mut merged: FxHashMap<u8, HomeWrite> = FxHashMap::default();
+            for reg in regs {
+                let group = self.home_sharers.get(&reg);
+                let mut views: Vec<HomeWrite> = Vec::new();
+                let mut any_absent = false;
+                for m in &all_edges {
+                    match m.get(&reg) {
+                        Some(k) => views.push(*k),
+                        None => any_absent = true,
+                    }
+                }
+                if views.iter().any(|k| matches!(k, HomeWrite::Clobber)) {
+                    // A definite foreign write on some path poisons the
+                    // register for the whole joined region.
+                    merged.insert(reg, HomeWrite::Clobber);
+                } else if any_absent {
+                    // Definite Defs on some edges, unknown on others:
+                    // abstain — the calibrated layer answers.
+                    continue;
+                } else if views.iter().all(|k| {
+                    matches!(k, HomeWrite::Def(w)
+                        if group.is_some_and(|g| g.contains(w)))
+                }) {
+                    // Group-lineage Def on every path.
+                    merged.insert(reg, views[0]);
+                } else {
+                    // Defs of foreign groups: each path provably wrote
+                    // non-member content — poison for any member's consumer.
+                    merged.insert(reg, HomeWrite::Clobber);
+                }
+            }
+            if let Some(wr) = ws_watch_reg() {
+                let srcs = edge_srcs.as_ref();
+                for (i, m) in all_edges.iter().enumerate() {
+                    let src = srcs.and_then(|v| v.get(i));
+                    eprintln!(
+                        "[WS-m] blk={} e{}(from blk {:?}) r{}={:?}",
+                        label.0,
+                        i,
+                        src,
+                        wr,
+                        m.get(&wr)
+                    );
+                }
+                eprintln!("[WS-m] blk={} res r{}={:?}", label.0, wr, merged.get(&wr));
+            }
+            self.home_write_state = merged;
+        } else if !self.home_fallthrough && !self.home_entry_pending {
+            // No recorded incoming edge of any kind: the block is entered
+            // by an UNHOOKED edge (a raw jump the terminator hooks do not
+            // see, peephole-threaded text) or is unreachable after an
+            // unconditional jump.  The carried state belongs to an
+            // unrelated path — carrying it here would let facts from one
+            // path answer for another.  The refinement ABSTAINS (empty
+            // state); the calibrated layer answers exactly as it did
+            // before the dataflow existed.
+            self.home_write_state.clear();
+        }
+        self.home_fallthrough = false;
+        self.home_entry_pending = false;
+    }
+
+    /// Record one incoming branch edge's snapshot for `label`.
+    fn record_branch_edge_impl(&mut self, label: BlockId) {
+        self.home_branch_snapshots
+            .entry(label.0)
+            .or_default()
+            .push(self.home_write_state.clone());
+        self.home_branch_edge_srcs
+            .entry(label.0)
+            .or_default()
+            .push(self.home_dbg_block);
+    }
+
+    fn set_home_fallthrough_impl(&mut self, falls_through: bool) {
+        self.home_fallthrough = falls_through;
+    }
+
+    fn poison_home_write_state_impl(&mut self) {
+        self.home_write_state.clear();
+        self.home_indirect_seen = true;
+    }
+
+    /// Record that `dest_id` was just defined into its home register: the
+    /// emitters' standing invariant is "a homed value's definition writes its
+    /// home" (store_rax_to's register arm, register-direct loads, in-place
+    /// computes into the dest's own home). RA interference guarantees that a
+    /// sibling sharing this register has a DISJOINT live range — a sibling's
+    /// definition can only happen where THIS value is dead, and (SSA) a dead
+    /// point can never reach a later consumer — so a normal definition NEVER
+    /// evicts sharers. Only clobbering writes into a register that is NOT the
+    /// written value's own home (staging, in-place derived computes, window
+    /// scratch, calls) violate the invariant; those go through
+    /// `note_reg_clobbered`.
+    pub(super) fn note_home_written(&mut self, dest_id: u32) {
+        if let Some(&home) = self.reg_assignments.get(&dest_id) {
+            if ws_watch(home.0) {
+                eprintln!(
+                    "[WS-ev] blk={} pp={} r{}=Def({})",
+                    self.home_dbg_block, self.state.current_program_point, home.0, dest_id
+                );
+            }
+            if trace_notes_enabled() {
+                eprintln!("[INS] fn={} v={}", self.state.current_func_name, dest_id);
+            }
+            self.home_fresh.insert(dest_id);
+            self.clear_home_clobbered(dest_id);
+            // Write-state law: this definition is the register's last write.
+            self.home_write_state
+                .insert(home.0, HomeWrite::Def(dest_id));
+        }
+    }
+
+    /// SOUNDNESS: register `phys` was just written with something that is NOT
+    /// the home-registered value of one of its sharers (staged operand,
+    /// in-place derived compute, window scratch assignment, call clobber).
+    /// Every value homed there is now stale: later consumers must reload from
+    /// slot / rematerialize / accumulator instead of reading the register
+    /// (kernel 6.18.50 free_area_init_node: `imulq $1216, %r11, %r11` left the
+    /// ZONE POINTER in the loop index's home and the fused mul-add consumed
+    /// it as the index).
+    /// Rebuild `home_live_index` from `home_sharers` and
+    /// `value_live_segments`; call after changing either.
+    pub(super) fn index_home_liveness(&mut self) {
+        self.home_live_index = self
+            .home_sharers
+            .iter()
+            .map(|(&phys, sharers)| {
+                let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+                for &v in sharers {
+                    if let Some(live) = self.value_live_segments.get(&v) {
+                        spans.extend(live.0.iter().map(|&(s, e)| (s, e, v)));
+                    }
+                }
+                (phys, SharerLiveIndex::build(spans))
+            })
+            .collect();
+    }
+
+    pub(super) fn note_reg_clobbered(&mut self, phys: u8) {
+        // Write-state law: whatever the eviction outcome, the register's
+        // last write is now a non-definition write.
+        self.home_write_state.insert(phys, HomeWrite::Clobber);
+        if ws_watch(phys) {
+            eprintln!(
+                "[WS-ev] blk={} pp={} r{}=Clobber",
+                self.home_dbg_block, self.state.current_program_point, phys
+            );
+        }
+        if let Some(index) = self.home_live_index.get(&phys) {
+            let point = self.state.current_program_point;
+            // Liveness gate: only sharers LIVE at the clobber point lose
+            // their home. A dead sharer has no reachable consumer past this
+            // point (segments are hole-aware, so a value live on ANOTHER
+            // branch path is not live HERE) and its home content is
+            // irrelevant until its own redefinition re-marks it.
+            let mut stale: Vec<u32> = Vec::new();
+            index.stab(point, &mut stale);
+            // The stab is closed: a sharer whose LAST use is the clobbering
+            // instruction itself (an in-place `addq %off, %home` deriving
+            // a new value from it) is live at `point` and must be evicted
+            // for any read later in this same instruction. Past `point` the
+            // mark is vacuous — every path out of `point` runs through
+            // `point + 1`, where it is dead — yet the sticky set would carry
+            // it into blocks reached from paths where its home is intact,
+            // and a homed-only value then has no recovery (zstd_fast,
+            // zstd_lazy, zstdmt: "stale home with no slot/remat/acc
+            // recovery"). Such evictions are recorded and settled once
+            // emission leaves `point`.
+            let terminator_point = self.home_block_end_points.binary_search(&point).is_ok();
+            // Cheap test first: the eviction list is empty for the vast
+            // majority of clobbers, and only a non-empty one can trace.
+            if !stale.is_empty() && trace_notes_enabled() {
+                eprintln!(
+                    "[CLOB] fn={} phys={} pp={} evicts={:?}",
+                    self.state.current_func_name, phys, point, stale
+                );
+            }
+            for v in stale {
+                if !terminator_point
+                    && !self.home_clobbered.contains(&v)
+                    && !self.home_class_members.contains(&v)
+                    && self
+                        .value_live_segments
+                        .get(&v)
+                        .is_some_and(|live| !live.contains(point.saturating_add(1)))
+                {
+                    self.home_transient_evictions.push(TransientEviction {
+                        value: v,
+                        point,
+                        was_fresh: self.home_fresh.contains(&v),
+                    });
+                }
+                self.home_fresh.remove(&v);
+                self.mark_home_clobbered(v, "reg-clobber");
+            }
+        }
+    }
+
+    /// Settle the transient evictions recorded at an earlier program point:
+    /// restore each value's exact pre-eviction state. Sound because such a
+    /// value is dead after its eviction point (no read past it can observe
+    /// the write) and is in no same-value class (its mark answers only for
+    /// its own reads). Evictions at the current point stay: a read later in
+    /// the same instruction must still see them. A missed settlement only
+    /// leaves the conservative sticky mark.
+    pub(super) fn settle_transient_home_evictions(&mut self) {
+        if self.home_transient_evictions.is_empty() {
+            return;
+        }
+        let point = self.state.current_program_point;
+        let mut pending = std::mem::take(&mut self.home_transient_evictions);
+        pending.retain(|e| {
+            if e.point == point {
+                return true;
+            }
+            self.clear_home_clobbered(e.value);
+            if e.was_fresh {
+                self.home_fresh.insert(e.value);
+            }
+            false
+        });
+        self.home_transient_evictions = pending;
+    }
+
+    /// Staging-write accounting for [`Self::operand_to_callee_reg`]/register
+    /// staging generally: the caller is about to write `target` with the
+    /// operand's content. If the operand is the value HOMED at `target`, this
+    /// re-establishes that home (mark fresh). Otherwise the write may
+    /// overwrite ANOTHER value's home register — invalidate every sharer so
+    /// later consumers reload instead of reading the staged content.
+    pub(super) fn note_staging_target(&mut self, op: &Operand, target: PhysReg) {
+        if let Operand::Value(v) = op {
+            if self
+                .reg_assignments
+                .get(&v.0)
+                .is_some_and(|r| r.0 == target.0)
+            {
+                self.home_fresh.insert(v.0);
+                self.clear_home_clobbered(v.0);
+                // The staging write re-establishes this value's own home.
+                self.home_write_state.insert(target.0, HomeWrite::Def(v.0));
+                return;
+            }
+        }
+        self.note_reg_clobbered(target.0);
+    }
+
+    /// Rematerialize a value whose home register is stale AND whose stack
+    /// slot was never written (homed-only accumulator values — the emitter
+    /// skips the slot store for register-allocated results). Chases the def
+    /// chain through Copy and integer Casts to a source with a real slot,
+    /// staging the source into @target and re-establishing the extension.
+    /// Returns false when the def shape is not rematerializable this way;
+    /// the caller then falls back to the slot load, which is exactly the
+    /// pre-fix behavior for that shape.
+    ///
+    /// Kernel 6.18.50 free_area_init_node: the sign-extended loop index
+    /// (`movslq -80(%rbp), %r11`) was homed in %r11 with no slot store; the
+    /// in-place GEP chain `imulq $1216, %r11, %r11; leaq base(, %r11), %r11`
+    /// overwrote it, and the second `pgdat->node_zones + i` computation
+    /// consumed the ZONE POINTER as the index. This remat re-emits the
+    /// extension from the loop counter's slot.
+    fn rematerialize_stale_into(&mut self, v: &Value, target: PhysReg, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(inst) = self.get_defining_instruction(v.0).cloned() else {
+            return false;
+        };
+        match inst {
+            crate::ir::reexports::Instruction::Copy { src, .. } => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                self.operand_to_callee_reg(&Operand::Value(sv), target);
+                true
+            }
+            crate::ir::reexports::Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                let from_sz = from_ty.size();
+                let to_sz = to_ty.size();
+                if from_sz >= to_sz {
+                    // Truncation or same-width reinterpret: staging the
+                    // source at its own width leaves exactly the needed
+                    // low bits in @target.
+                    self.operand_to_callee_reg(&Operand::Value(sv), target);
+                    return true;
+                }
+                if from_sz < 4 {
+                    // Sub-4-byte extensions depend on slot neighbour bits
+                    // that a full-width staging would drag in; not safe to
+                    // re-derive here.
+                    return false;
+                }
+                // Stage the source: for a 4-byte slot this is a zeroing
+                // `movl`, for 8 bytes a `movq` — either way the source's
+                // own materialisation path supplies the ground truth.
+                self.operand_to_callee_reg(&Operand::Value(sv), target);
+                if from_ty.is_signed() && to_sz == 8 {
+                    // Signed 32→64: re-establish the sign extension in
+                    // place (the staging's zero-extension is wrong for
+                    // negative values).
+                    let t32 = phys_reg_name_32(target);
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movslq", t32, phys_reg_name(target));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Rax-targeted variant of [`Self::rematerialize_stale_into`] for the
+    /// accumulator paths: %rax has no PhysReg id in the emitter's register
+    /// numbering (it is never a home), so the extension move is emitted by
+    /// name. Rebuilds a stale-homed Cast/Copy-defined value into %rax from
+    /// its source; returns false when the def shape is not rematerializable.
+    fn rematerialize_stale_into_rax(&mut self, v: &Value, is_alloca: bool, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let Some(inst) = self.get_defining_instruction(v.0).cloned() else {
+            return false;
+        };
+        match inst {
+            crate::ir::reexports::Instruction::Copy { src, .. } => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                if !self.rematerialize_stale_into_rax(&sv, is_alloca, depth - 1) {
+                    self.operand_to_rax(&Operand::Value(sv));
+                }
+                self.state.park_acc(v.0, is_alloca);
+                true
+            }
+            crate::ir::reexports::Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() => {
+                let Operand::Value(sv) = src else {
+                    return false;
+                };
+                let from_sz = from_ty.size();
+                let to_sz = to_ty.size();
+                if from_sz < 4 || from_sz >= to_sz {
+                    // Same-width reinterpret or truncation: staging the
+                    // source at its own width suffices. Sub-4-byte sources
+                    // depend on slot neighbour bits; refuse (pre-fix
+                    // behavior then applies).
+                    if from_sz >= to_sz {
+                        self.operand_to_rax(&Operand::Value(sv));
+                        self.state.park_acc(v.0, is_alloca);
+                        return true;
+                    }
+                    return false;
+                }
+                // Stage the source (its slot write is the ground truth),
+                // then re-establish the extension in %rax.
+                self.operand_to_rax(&Operand::Value(sv));
+                if from_ty.is_signed() && to_sz == 8 {
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movslq", "eax", "rax");
+                }
+                self.state.park_acc(v.0, is_alloca);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Get the callee-saved register assigned to a destination value, if any.
+    pub(super) fn dest_reg(&self, dest: &Value) -> Option<PhysReg> {
+        self.reg_assignments.get(&dest.0).copied()
+    }
+
+    /// Physical registers safe to use directly as an addressing base for
+    /// vector loads/stores: the register-allocatable GPR set MINUS
+    /// rdi/rsi/rdx (PhysReg 14/15/16), which the vector-intrinsic handlers use
+    /// as scratch (FmaF64x4/FmaF64x4SIB, movnt, crc32, ...) and may clobber
+    /// mid-live-range even though the allocator sees them as non-call-spanning.
+    /// r11/r10/r8/r9/rbx/r12-r15 are never touched by intrinsic scratch.
+    pub(super) const VEC_BASE_SAFE_REGS: [u8; 9] = [1, 2, 3, 4, 5, 10, 11, 12, 13];
+
+    /// If `val_id`'s ADDRESS can be used directly as a memory operand for a
+    /// vector access, return the operand string:
+    /// - register-allocated GPR pointer  -> "(%r10)"   (no movq-to-rax round trip)
+    /// - alloca with a direct slot       -> "slot(%rbp)"  (data IS at the slot)
+    /// Returns None for over-aligned allocas (runtime-alignment dance needed),
+    /// indirect temp pointers (slot holds a pointer), XMM-assigned values,
+    /// and constants.
+    pub(super) fn value_ptr_mem_operand(&self, val_id: u32) -> Option<String> {
+        use crate::backend::state::SlotAddr;
+        // Freshness-gated: a home whose register currently holds a derived
+        // value must not be used as a memory-operand base.
+        if let Some(reg) = self.fresh_home_of(val_id) {
+            if !is_xmm_reg(reg) && Self::VEC_BASE_SAFE_REGS.contains(&reg.0) {
+                let name = phys_reg_name(reg);
+                return Some(format!("(%{})", name));
+            }
+            return None;
+        }
+        if self.reg_assignments.contains_key(&val_id) {
+            // Homed but stale: not usable as a register base.
+            return None;
+        }
+        if let Some(addr) = self.state.resolve_slot_addr(val_id) {
+            if let SlotAddr::Direct(slot) = addr {
+                return Some(self.slot_ref(slot.0));
+            }
+            return None;
+        }
+        None
+    }
+
+    /// `value_ptr_mem_operand` for an Operand.
+    pub(super) fn operand_ptr_mem_operand(&self, op: &Operand) -> Option<String> {
+        match op {
+            Operand::Value(v) => self.value_ptr_mem_operand(v.0),
+            _ => None,
+        }
+    }
+
+    /// CCC_ENABLE_VECREG: at the end of a block, flush every register-held
+    /// vector value that is LIVE OUT (used outside this block) to its home
+    /// slot, so any consumer that reads it through memory (memcpy src, call
+    /// arg, alias store, sret copy) sees the data. The register still holds
+    /// the value afterwards (nothing clobbers the xmm3-xmm7 pool except the
+    /// value's own producer), so `vec_live_regs` is intentionally KEPT.
+    /// Bit-preserving 128-bit moves. SSE1 has MOVAPS/MOVUPS, not MOVDQA/U.
+    /// Keep the established SSE2 spelling when that class is available.
+    pub(super) fn xmm_move(&self, aligned: bool) -> &'static str {
+        match (self.isa.simd, aligned) {
+            (true, true) => "movdqa",
+            (true, false) => "movdqu",
+            (false, true) => "movaps",
+            (false, false) => "movups",
+        }
+    }
+
+    pub(super) fn flush_vecreg_liveout_impl(&mut self) {
+        if self.state.vec_live_regs.is_empty() {
+            return;
+        }
+        let total = &self.state.value_use_counts;
+        let block = &self.state.block_use_counts;
+        let mut flush: Vec<(u32, &'static str)> = Vec::new();
+        for (&v, &reg_name) in &self.state.vec_live_regs {
+            let total_uses = total.get(v as usize).copied().unwrap_or(0);
+            let block_uses = block.get(&v).copied().unwrap_or(0);
+            if block_uses < total_uses {
+                flush.push((v, reg_name));
+            }
+        }
+        for (v, reg_name) in flush {
+            // Compute the alloca's effective address directly (leaq, plus the
+            // runtime-alignment dance for over-aligned slots). Must NOT go
+            // through value_to_reg: for an XMM-assigned value that would load
+            // the vector DATA (`movq %xmmN, %rax`) instead of the address.
+            if let Some(slot) = self.state.get_slot(v) {
+                if let Some(align) = self.state.alloca_over_align(v) {
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    addq", (align - 1) as i64, "rax");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    andq", -(align as i64), "rax");
+                } else {
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                }
+                // Width-correct store: vec_live_regs can hold xmm (128-bit),
+                // ymm (256-bit) or zmm (512-bit) names; movdqu is the SSE
+                // 128-bit form and is ILLEGAL for the wider registers (the
+                // internal assembler rightly rejected `movdqu %zmm0, (%rax)`
+                // in zlib-ng's adler32_avx512).
+                let mov = if reg_name.starts_with("zmm") {
+                    "vmovdqu64"
+                } else if reg_name.starts_with("ymm") {
+                    "vmovdqu"
+                } else {
+                    self.xmm_move(false)
+                };
+                self.state
+                    .emit_fmt(format_args!("    {} %{}, (%rax)", mov, reg_name));
+            }
+        }
+    }
+
+    /// Emit sign-extension from 32-bit to 64-bit register if the type is signed.
+    /// Used after 32-bit ALU operations on callee-saved registers.
+    pub(super) fn emit_sext32_if_needed(
+        &mut self,
+        name_32: &str,
+        name_64: &str,
+        is_unsigned: bool,
+    ) {
+        if !is_unsigned {
+            self.state
+                .out
+                .emit_instr_reg_reg("    movslq", name_32, name_64);
+        }
+    }
+
+    /// Like emit_sext32_if_needed but skips movslq when the destination value
+    /// has no 64-bit uses (not in needs_sext_values).
+    pub(super) fn emit_sext32_for_value(
+        &mut self,
+        name_32: &str,
+        name_64: &str,
+        is_unsigned: bool,
+        dest_id: u32,
+    ) {
+        if is_unsigned || self.bitop_nonneg_values.contains(&dest_id) {
+            return;
+        }
+        // Per-value check: if we computed the set and this value isn't in it, skip
+        if !self.needs_sext_values.is_empty() && !self.needs_sext_values.contains(&dest_id) {
+            return;
+        }
+        // Function-level fallback: skip if no values need sext at all
+        if self.skip_i32_sext {
+            return;
+        }
+        self.state
+            .out
+            .emit_instr_reg_reg("    movslq", name_32, name_64);
+    }
+
+    /// Accumulator results need canonical upper bits only for implicit wide
+    /// readers. Explicit widening Casts perform their own extension; adding
+    /// one here too makes adjacent movslq pairs and longer live ranges.
+    pub(super) fn emit_implicit_sext32_for_value(
+        &mut self,
+        name_32: &str,
+        name_64: &str,
+        is_unsigned: bool,
+        dest_id: u32,
+    ) {
+        if self.implicit_sext_values.contains(&dest_id) {
+            self.emit_sext32_for_value(name_32, name_64, is_unsigned, dest_id);
+        }
+    }
+
+    /// Emit a comparison instruction, optionally using 32-bit form for I32/U32 types.
+    /// When `use_32bit` is true, emits `cmpl` with 32-bit register names instead of `cmpq`.
+    /// COMPARE-REPLAY re-emission: like emit_int_cmp_insn_typed, but loads
+    /// both operands from their CANONICAL STACK SLOTS instead of trusting
+    /// register assignments. The replay runs at the consumer (Select /
+    /// CondBranch) position, after intervening instructions: a register that
+    /// held the operand at the original Cmp may since have been reassigned to
+    /// a later-defined value (the register allocator sized live ranges
+    /// against the original Cmp position). Slots are written for every
+    /// non-register-allocated value, and the replay candidates are filtered
+    /// to slot-resident operands at build time — so the slot is always the
+    /// correct, stable source here.
+    pub(super) fn emit_int_cmp_replay_insn(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        // DIRECT-HOME FAST PATH. Staging both operands through %rax/%rcx is
+        // only necessary when an operand has no register home to read. When it
+        // does, that home is already valid here: `operand_links` extends a
+        // register-homed operand's interval to this consumer position (see the
+        // IS-09 block in prologue.rs), and the redefinition guard in
+        // `compute_cmp_replay_scan` guarantees no instruction between the Cmp
+        // and here rewrote the value. Comparing in place is therefore sound and
+        // removes one move per operand per execution -- and it removes the
+        // orphaned `mov %rdx,%rax` that a later peephole left behind when it
+        // rewrote the staged compare back onto the operand homes.
+        let lhs_homed = self.operand_reg(lhs).is_some_and(|r| !is_xmm_reg(r));
+        let rhs_homed = matches!(rhs, Operand::Const(_))
+            || self.operand_reg(rhs).is_some_and(|r| !is_xmm_reg(r));
+        if lhs_homed && rhs_homed {
+            self.emit_int_cmp_insn_typed(lhs, rhs, ty);
+            return;
+        }
+        let (cmp_instr, _test_instr, acc_reg) = cmp_width_info(ty);
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        // Load lhs from its slot with the TYPE-AWARE width. A raw `movq` slot
+        // load is unsound for narrow values: the slot stores are 8-byte
+        // (movq) but only the low N bytes hold the value; the upper bytes are
+        // stale (slot reuse / sign-extension residue). value_to_reg emits
+        // movzbl/movzwl/movsbq/movswq/movslq/movl/movq matched to the value
+        // type, exactly like every other load path — comparing a U16 stateno
+        // (sqlite3 yy_shift `state > 599 ? state+415 : state`) with 64-bit
+        // garbage would branch wrongly and corrupt the parser stack.
+        match lhs {
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                self.value_to_reg(v, "rax");
+            }
+            _ => {
+                self.operand_to_rax(lhs);
+            }
+        }
+        // Prefer the immediate form whenever rhs is an encodable constant,
+        // matching emit_int_cmp_insn_typed (cmp $imm, %al/%eax/%rax).
+        if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
+            return;
+        }
+        // Slot-direct fold (the discipline of emit_int_cmp_insn_typed arms
+        // 1/4): a slotted non-alloca RHS compares straight from its slot —
+        // `cmpq N(%rsp), %rax` — with zero staging instructions. The replay
+        // path used to stage it through %rcx unconditionally, which made a
+        // spilled compare RHS MORE expensive than the inline path for the
+        // same value; the allocator's slot-operand economics (the
+        // cost-ratio escape refuses steals on behalf of values whose every
+        // use is such a fold) require both paths to agree. The width is
+        // the compare's own (cmp_width_info gives the matching mnemonic
+        // and accumulator sub-register); the alloca guard matches the
+        // inline arms — an alloca's home slot holds the object's bytes,
+        // not the address value.
+        if let Operand::Value(rv) = rhs {
+            if self.dest_reg(rv).is_none() && !self.state.is_alloca(rv.0) {
+                if let Some(slot) = self.state.get_slot(rv.0) {
+                    let sref = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, acc_reg));
+                    return;
+                }
+            }
+        }
+        match rhs {
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                self.value_to_reg(v, "rcx");
+            }
+            _ => {
+                self.operand_to_rcx(rhs);
+            }
+        }
+        let rreg = cmp_secondary_reg(ty);
+        self.state
+            .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, acc_reg));
+    }
+
+    pub(super) fn emit_int_cmp_insn_typed(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        let (cmp_instr, test_instr, acc_reg) = cmp_width_info(ty);
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        // An INTEGER compare of a value homed in an XMM register (bit-punned
+        // float words: GET_FLOAT_WORD in glibc's flt-32 kernels after the
+        // hidden_proto wrappers inline) has no typed GPR sub-register name —
+        // typed_phys_reg_name would hit unreachable!("invalid x86 register
+        // index"). Route XMM-homed operands through the accumulator
+        // fallbacks below, whose operand_to_rax already handles the
+        // xmm→GPR move.
+        let lhs_phys = self.operand_reg(lhs).filter(|r| !is_xmm_reg(*r));
+        let rhs_phys = self.operand_reg(rhs).filter(|r| !is_xmm_reg(*r));
+        // Prefer the immediate form whenever rhs is an encodable constant —
+        // BEFORE checking register pairs, so `mask == 0xFFFFFFFF` becomes
+        // `cmpl $-1, %eax` instead of movabs+cmpq.
+        if rhs_phys.is_none() || matches!(rhs, Operand::Const(_)) {
+            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                if imm == 0 {
+                    if let Some(lhs_r) = lhs_phys {
+                        let lhs_name = typed_phys_reg_name(lhs_r, ty);
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            test_instr, lhs_name, lhs_name
+                        ));
+                    } else {
+                        self.operand_to_rax(lhs);
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            test_instr, acc_reg, acc_reg
+                        ));
+                    }
+                } else if let Some(lhs_r) = lhs_phys {
+                    let lhs_name = typed_phys_reg_name(lhs_r, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, lhs_name));
+                } else {
+                    self.operand_to_rax(lhs);
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
+                }
+                return;
+            }
+        }
+        if let (Some(lhs_r), Some(rhs_r)) = (lhs_phys, rhs_phys) {
+            // Both in registers: compare directly
+            let lhs_name = typed_phys_reg_name(lhs_r, ty);
+            let rhs_name = typed_phys_reg_name(rhs_r, ty);
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                cmp_instr, rhs_name, lhs_name
+            ));
+        } else if let Some(lhs_r) = lhs_phys {
+            let lhs_name = typed_phys_reg_name(lhs_r, ty);
+            // Memory-operand: cmp N(%rsp), %lhs_reg directly
+            if let Operand::Value(rv) = rhs {
+                if self.dest_reg(rv).is_none() {
+                    if let Some(slot) = self.state.get_slot(rv.0) {
+                        if !self.state.is_alloca(rv.0) {
+                            let sref = self.slot_ref(slot.0);
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, %{}",
+                                cmp_instr, sref, lhs_name
+                            ));
+                            return;
+                        }
+                    }
+                }
+            }
+            self.operand_to_rcx(rhs);
+            let rcx = cmp_secondary_reg(ty);
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, lhs_name));
+        } else if let Some(rhs_r) = rhs_phys {
+            let rhs_name = typed_phys_reg_name(rhs_r, ty);
+            self.operand_to_rax(lhs);
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                cmp_instr, rhs_name, acc_reg
+            ));
+        } else {
+            // Neither operand has a register. Load lhs to %rax.
+            self.operand_to_rax(lhs);
+            // Memory-operand: cmp N(%rsp), %rax directly for rhs
+            if let Operand::Value(rv) = rhs {
+                if let Some(slot) = self.state.get_slot(rv.0) {
+                    if !self.state.is_alloca(rv.0) {
+                        let sref = self.slot_ref(slot.0);
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}", cmp_instr, sref, acc_reg));
+                        return;
+                    }
+                }
+            }
+            self.operand_to_rcx(rhs);
+            let rcx = cmp_secondary_reg(ty);
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rcx, acc_reg));
+        }
+    }
+
+    /// Handles constants, register-allocated values, and stack values.
+    ///
+    /// MIRROR WARNING: `fused_madd_acc_stages_without_rax` (alu.rs) mirrors
+    /// every arm's %rax behavior ("stages without writing %rax") by hand —
+    /// any new %rax-relaying staging shape added here must update that
+    /// predicate the same day, or the fused madd silently miscompiles.
+    pub(super) fn operand_to_callee_reg(&mut self, op: &Operand, target: PhysReg) {
+        // Staging-write accounting (SOUNDNESS, see note_staging_target): this
+        // call writes `target` with the operand's content. Registering the
+        // write here keeps every consumer of a home register that a staging
+        // path overwrites honest (reload instead of reading the staged
+        // content). Arms that end up not writing `target` only make this
+        // conservative.
+        self.note_staging_target(op, target);
+        let target_name = phys_reg_name(target);
+        match op {
+            Operand::Const(c) => {
+                match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit_fmt(format_args!(
+                        "    xorl %{0}, %{0}",
+                        phys_reg_name_32(target)
+                    )),
+                    IrConst::I16(v) if *v == 0 => self.state.emit_fmt(format_args!(
+                        "    xorl %{0}, %{0}",
+                        phys_reg_name_32(target)
+                    )),
+                    IrConst::I32(v) if *v == 0 => self.state.emit_fmt(format_args!(
+                        "    xorl %{0}, %{0}",
+                        phys_reg_name_32(target)
+                    )),
+                    IrConst::I64(0) => self.state.emit_fmt(format_args!(
+                        "    xorl %{0}, %{0}",
+                        phys_reg_name_32(target)
+                    )),
+                    // PF-16: non-negative immediates write the 32-bit name
+                    // with movl — the 32-bit write zero-extends to the same
+                    // 64-bit value a `movq $imm32` sign-extension would
+                    // produce, saving the REX prefix and two bytes. Negative
+                    // immediates sign-extend; movl would zero-extend instead
+                    // — they keep the q-form.
+                    IrConst::I8(v) => {
+                        let x = *v as i64;
+                        if x >= 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    movl ${}, %{}",
+                                x,
+                                phys_reg_name_32(target)
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
+                        }
+                    }
+                    IrConst::I16(v) => {
+                        let x = *v as i64;
+                        if x >= 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    movl ${}, %{}",
+                                x,
+                                phys_reg_name_32(target)
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
+                        }
+                    }
+                    IrConst::I32(v) => {
+                        let x = *v as i64;
+                        if x >= 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    movl ${}, %{}",
+                                x,
+                                phys_reg_name_32(target)
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
+                        }
+                    }
+                    IrConst::I64(v) => {
+                        if *v >= 0 && *v <= i32::MAX as i64 {
+                            // PF-16: fits and non-negative — 5-byte movl,
+                            // zero-extension equals the sign-extended q-form.
+                            self.state.out.emit_instr_imm_reg(
+                                "    movl",
+                                *v,
+                                phys_reg_name_32(target),
+                            );
+                        } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movq", *v, target_name);
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", *v, target_name);
+                        }
+                    }
+                    IrConst::Zero => self.state.emit_fmt(format_args!(
+                        "    xorl %{0}, %{0}",
+                        phys_reg_name_32(target)
+                    )),
+                    _ => {
+                        // For float/i128 constants, fall back to loading to rax and moving
+                        self.operand_to_rax(op);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", "rax", target_name);
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                // SOUNDNESS (home freshness): the static reg_assignments map
+                // says where a value is HOMED, not what the register holds
+                // RIGHT NOW. The accumulator emitter reuses destination
+                // registers in place for derived values (`imulq $K, %r, %r`
+                // then `leaq d(%r), %r`), so a home can hold a completely
+                // different value by the time the original is consumed
+                // again. Only a FRESH home may satisfy staging without a
+                // reload; a stale one falls through to the slot/accumulator
+                // materialisation paths (kernel 6.18.50 free_area_init_node:
+                // the second `pgdat->node_zones + i` consumed the zone
+                // POINTER as the index and panicked the boot).
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    // Alias-aware freshness: a clobbered mark on a member of
+                    // a blessed same-value class is readable through a fresh
+                    // sibling (chain_update semantics); see
+                    // home_readable_via_alias for the workqueue.c proof.
+                    if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
+                        if reg.0 != target.0 {
+                            if is_xmm_reg(reg) {
+                                // XMM → GPR (SSE1-only code has no MOVQ form).
+                                let xmm_name = phys_reg_name(reg);
+                                self.emit_scalar_xmm_to_gpr(xmm_name, target_name, None);
+                            } else {
+                                let src_name = phys_reg_name(reg);
+                                self.state.out.emit_instr_reg_reg(
+                                    "    movq",
+                                    src_name,
+                                    target_name,
+                                );
+                            }
+                        }
+                        // If same register, nothing to do
+                    } else if self.rematerialize_stale_into(v, target, 3) {
+                        // Stale home, unwritten slot: the def chain was
+                        // re-emitted into @target (e.g. a sign-extended
+                        // index re-extended from its narrow source slot).
+                    } else if self.state.acc_has_verified(v.0, false)
+                        || self.state.acc_has_verified(v.0, true)
+                    {
+                        // ACC-RESIDENT FIRST (exposed-forward fix): a value
+                        // parked in %eax must be read from %eax, not reloaded
+                        // from its slot — the reload would store-to-load
+                        // forward the park the very next instruction (the
+                        // sha256 MAJ-chain pathology, measured ~5%).
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", "rax", target_name);
+                    } else if self.state.get_slot(v.0).is_some() {
+                        // Stale home: reload the value from its slot.
+                        self.value_to_reg(v, target_name);
+                    } else {
+                        // Stale home with no slot/remat/acc path. Reading the
+                        // home register would feed the consumer whatever
+                        // clobbering write (staging / in-place compute /
+                        // window / call) left there — the free_area_init_node
+                        // bug class. Fail loudly instead: a value whose home
+                        // was provably clobbered must have a recovery path.
+                        panic!(
+                            "x86 codegen: operand_to_callee_reg: value {} in function '{}' \
+                             has a stale home with no slot/remat/acc recovery — refusing to \
+                             read the clobbered register",
+                            v.0, self.state.current_func_name
+                        );
+                    }
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
+                {
+                    // ACC-RESIDENT FIRST (exposed-forward fix, mirroring the
+                    // stale-home chain): %rax holds the value right now; the
+                    // slot below is a memory read — and right after a park it
+                    // is an exposed store-to-load forward.
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movq", "rax", target_name);
+                } else if let Some(_slot) = self.state.get_slot(v.0) {
+                    // Delegate to value_to_reg: it handles allocas (leaq with
+                    // over-alignment), vector values, and — critically — loads
+                    // small (4-byte) slots with `movl` instead of `movq`.
+                    // Loading a 32-bit-stored value with `movq` reads 4 stale
+                    // bytes past the store, producing garbage in the upper
+                    // half that shows up in later 64-bit operations (xorq,
+                    // addq, ...).
+                    self.value_to_reg(v, target_name);
+                } else {
+                    // Value not in any register, stack slot, or accumulator cache.
+                    // A rematerialisable GlobalAddr stages straight into
+                    // @target (`leaq sym,%target`, GOT/TLS/absolute-aware):
+                    // the %rax relay below wastes a move and — worse —
+                    // clobbers %rax for callers with live content there (the
+                    // fused integer madd holds the product in %rax across
+                    // acc staging; torture strlen-4). The direct form must
+                    // not target %rax itself (value_to_reg leaves the
+                    // acc-cache untouched, which would strand a stale
+                    // entry); every other homeless value still relays
+                    // through the accumulator path (which fails loudly if
+                    // genuinely unmaterialisable).
+                    let direct_global_addr = target_name != "rax"
+                        && self.get_defining_instruction(v.0).is_some_and(|inst| {
+                            matches!(inst, crate::ir::reexports::Instruction::GlobalAddr { .. })
+                        });
+                    if direct_global_addr {
+                        self.value_to_reg(v, target_name);
+                    } else {
+                        self.operand_to_rax(op);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", "rax", target_name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load an operand into a target register using 32-bit movl (for I32/U32).
+    /// Uses movl instead of movq for both register-to-register and stack loads,
+    /// reducing memory bandwidth and breaking false dependencies.
+    pub(super) fn operand_to_reg_32(&mut self, op: &Operand, target: PhysReg) {
+        let target_name = phys_reg_name(target);
+        let target_32 = phys_reg_name_32(target);
+        match op {
+            Operand::Const(c) => match c {
+                IrConst::I8(0)
+                | IrConst::I16(0)
+                | IrConst::I32(0)
+                | IrConst::I64(0)
+                | IrConst::Zero => self
+                    .state
+                    .emit_fmt(format_args!("    xorl %{0}, %{0}", target_32)),
+                IrConst::I8(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", *v as i64, target_name)
+                }
+                IrConst::I16(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", *v as i64, target_name)
+                }
+                IrConst::I32(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", *v as i64, target_name)
+                }
+                _ => {
+                    self.operand_to_callee_reg(op, target);
+                    return;
+                }
+            },
+            Operand::Value(v) => {
+                // Home-freshness gate (see operand_to_callee_reg): a homed
+                // value whose register now holds a derived value must reload
+                // instead of copying the stale content with movq.
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    // Alias-aware freshness: a clobbered mark on a member of
+                    // a blessed same-value class is readable through a fresh
+                    // sibling (chain_update semantics); see
+                    // home_readable_via_alias for the workqueue.c proof.
+                    if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
+                        if reg.0 != target.0 {
+                            if is_xmm_reg(reg) {
+                                // SSE1-only code has no MOVQ form.
+                                let xmm_name = phys_reg_name(reg);
+                                self.emit_scalar_xmm_to_gpr(xmm_name, target_name, None);
+                            } else {
+                                // Use movq for register-to-register to preserve sign bits.
+                                // movl zero-extends upper 32 bits, losing sign information
+                                // for I32 values that later flow into 64-bit operations.
+                                let src_name = phys_reg_name(reg);
+                                self.state.out.emit_instr_reg_reg(
+                                    "    movq",
+                                    src_name,
+                                    target_name,
+                                );
+                            }
+                        }
+                        // Same fresh register: already staged.
+                    } else if let Some(slot) = self.state.get_slot(v.0) {
+                        if self.state.is_alloca(v.0) {
+                            // Allocas are addresses, use 64-bit
+                            self.operand_to_callee_reg(op, target);
+                            return;
+                        } else {
+                            // Stale home: reload from the slot.
+                            // Use movq to preserve sign bits in upper 32 bits.
+                            // movl zero-extends, which corrupts negative I32 values
+                            // that later flow into 64-bit operations.
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movq", slot.0, target_name);
+                        }
+                    } else if self.state.acc_has_verified(v.0, false)
+                        || self.state.acc_has_verified(v.0, true)
+                    {
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", "rax", target_name);
+                    } else {
+                        self.operand_to_callee_reg(op, target);
+                        return;
+                    }
+                } else if let Some(slot) = self.state.get_slot(v.0) {
+                    if self.state.is_alloca(v.0) {
+                        // Allocas are addresses, use 64-bit
+                        self.operand_to_callee_reg(op, target);
+                        return;
+                    } else {
+                        // Use movq to preserve sign bits in upper 32 bits.
+                        // movl zero-extends, which corrupts negative I32 values
+                        // that later flow into 64-bit operations.
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movq", slot.0, target_name);
+                    }
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
+                {
+                    self.state
+                        .out
+                        .emit_instr_reg_reg("    movq", "rax", target_name);
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    xorl %{0}, %{0}", target_32));
+                }
+            }
+        }
+    }
+
+    /// Integer narrow homes are permitted to contain only the producer's
+    /// narrow/sign-extended-to-32 representation (a 16-bit signed producer may
+    /// have written with `movswl`, which zeroes the high half of its GPR).
+    /// Normalize the low 8/16 bits whenever such a value crosses into the
+    /// backend's 64-bit accumulator domain. `operand_to_rax` and
+    /// `operand_to_rcx` are used by 64-bit divide lowering even for narrow IR
+    /// types, so blindly copying a home with `movq` changes -1 into 0x0000ffff.
+    fn emit_narrow_integer_extend(
+        &mut self,
+        ty: IrType,
+        source: &str,
+        dest64: &str,
+        dest32: &str,
+    ) -> bool {
+        let mnemonic = match ty {
+            IrType::I8 => "movsbq",
+            IrType::U8 => "movzbl",
+            IrType::I16 => "movswq",
+            IrType::U16 => "movzwl",
+            _ => return false,
+        };
+        let dest = if matches!(ty, IrType::U8 | IrType::U16) {
+            dest32
+        } else {
+            dest64
+        };
+        self.state
+            .emit_fmt(format_args!("    {mnemonic} %{source}, %{dest}"));
+        true
+    }
+
+    /// Normalize a narrow integer already staged in an accumulator scratch
+    /// register. The typed aliases are centralized in `typed_phys_reg_name`
+    /// so this works for both legacy and REX byte registers.
+    fn extend_narrow_scratch(&mut self, value_id: u32, scratch: &str) {
+        let Some(ty) = self.value_types.get(&value_id).copied() else {
+            return;
+        };
+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            return;
+        }
+        let (reg, dest64, dest32, already) = match scratch {
+            "rax" => (
+                R_RAX,
+                "rax",
+                "eax",
+                self.state.reg_cache.acc_is_canonical64(value_id),
+            ),
+            "rcx" => (
+                R_RCX,
+                "rcx",
+                "ecx",
+                self.state.reg_cache.sec_is_canonical64(value_id),
+            ),
+            _ => return,
+        };
+        // The scratch already holds the value's full 64-bit form (it was
+        // loaded by a width-extending slot load, produced by an extend this
+        // file emitted, or zero-extended by an unsigned narrow load).
+        // Re-extending it is a wasted µop in the hot narrow-store path, and
+        // it used to cost the memory-RMW fold its shape.
+        if already {
+            return;
+        }
+        let source = typed_phys_reg_name(reg, ty);
+        self.emit_narrow_integer_extend(ty, source, dest64, dest32);
+    }
+
+    /// Record that `%rax`/`%rcx` now holds the 64-bit canonical form of
+    /// `value_id`, so a later [`Self::extend_narrow_scratch`] can skip the
+    /// extend. Only narrow integer types are tracked; wide values never need
+    /// the marker.
+    fn note_narrow_canonical(&mut self, value_id: u32, in_acc: bool) {
+        let narrow = matches!(
+            self.value_types.get(&value_id).copied(),
+            Some(IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
+        );
+        if !narrow {
+            return;
+        }
+        if in_acc {
+            self.state.reg_cache.mark_acc_canonical64(value_id);
+        } else {
+            self.state.reg_cache.mark_sec_canonical64(value_id);
+        }
+    }
+
+    /// Extend a narrow integer directly from its assigned GPR home into a
+    /// scratch register. Returns false for values whose representation is
+    /// already handled by the ordinary full-width move path.
+    fn extend_narrow_home_to(
+        &mut self,
+        value_id: u32,
+        source: PhysReg,
+        dest64: &str,
+        dest32: &str,
+    ) -> bool {
+        let Some(ty) = self.value_types.get(&value_id).copied() else {
+            return false;
+        };
+        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            return false;
+        }
+        let source = typed_phys_reg_name(source, ty);
+        self.emit_narrow_integer_extend(ty, source, dest64, dest32)
+    }
+
+    /// Load an operand into %rax. Uses the register cache to skip the load
+    /// if the value is already in %rax.
+    pub(super) fn operand_to_rax(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                self.state.reg_cache.invalidate_acc();
+                match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I64(0) => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I8(v) => self.emit_imm_to_gpr(*v as i64, "rax", "eax"),
+                    IrConst::I16(v) => self.emit_imm_to_gpr(*v as i64, "rax", "eax"),
+                    IrConst::I32(v) => self.emit_imm_to_gpr(*v as i64, "rax", "eax"),
+                    IrConst::I64(v) => self.emit_imm_to_gpr(*v, "rax", "eax"),
+                    IrConst::F32(v) => {
+                        let bits = v.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg(
+                                "    movl",
+                                bits as i32 as i64,
+                                "eax",
+                            );
+                        }
+                    }
+                    IrConst::F64(v) => {
+                        let bits = v.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", bits as i64, "rax");
+                        }
+                    }
+                    // LongDouble at computation level is treated as F64
+                    IrConst::LongDouble(v, _) => {
+                        let bits = v.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", bits as i64, "rax");
+                        }
+                    }
+                    // Decimal FP bit containers materialize like 64-bit
+                    // integer immediates (BID patterns are opaque bits).
+                    IrConst::D32(v) => {
+                        let bits = *v as u64;
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movl", *v as i64, "eax");
+                        }
+                    }
+                    IrConst::D64(v) => {
+                        if *v == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", *v as i64, "rax");
+                        }
+                    }
+                    IrConst::I128(v) => {
+                        // Truncate to low 64 bits for rax-only path
+                        let low = *v as i64;
+                        if low == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                            self.state.out.emit_instr_imm_reg("    movq", low, "rax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
+                        }
+                    }
+                    IrConst::Zero => self.state.emit("    xorl %eax, %eax"),
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                // Check cache: skip load if value is already in %rax
+                if self.state.acc_has_verified(v.0, is_alloca) {
+                    self.extend_narrow_scratch(v.0, "rax");
+                    return;
+                }
+                // Check secondary cache: if value is in %rcx, use movq %rcx, %rax
+                // (3 bytes) instead of loading from stack (7-8 bytes). Normalize
+                // narrow integer values after the copy; a cached home can have
+                // only 8/16/32-bit canonical producer bits.
+                if self.state.sec_has_verified(v.0, is_alloca) {
+                    // Narrow values are extended straight out of the cache
+                    // register (`movswq %cx, %rax`): one instruction instead of
+                    // "copy, then extend the copy", and the plain copy alone is
+                    // what made a 32-bit-canonical home reach 64-bit consumers.
+                    if !self.extend_narrow_home_to(v.0, R_RCX, "rax", "eax") {
+                        self.state.out.emit_instr_reg_reg("    movq", "rcx", "rax");
+                    }
+                    self.state.park_acc(v.0, is_alloca);
+                    self.note_narrow_canonical(v.0, true);
+                    return;
+                }
+                // Check register allocation: load from assigned register
+                // (freshness-gated: a stale home falls to the slot path).
+                if let Some(reg) = self.fresh_home_of(v.0) {
+                    if is_xmm_reg(reg) {
+                        let reg_name = phys_reg_name(reg);
+                        self.emit_scalar_xmm_to_gpr(reg_name, "rax", None);
+                        self.extend_narrow_scratch(v.0, "rax");
+                    } else if !self.extend_narrow_home_to(v.0, reg, "rax", "eax") {
+                        let reg_name = phys_reg_name(reg);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", reg_name, "rax");
+                    }
+                    self.state.park_acc(v.0, false);
+                    self.note_narrow_canonical(v.0, true);
+                } else if self.state.get_slot(v.0).is_some() {
+                    // A narrow slot load is width-consistent (`movsbq`/
+                    // `movswq` for signed, zero-extending `movzbl`/`movzwl`
+                    // for unsigned), so the accumulator ends up holding the
+                    // value's full 64-bit form.
+                    self.value_to_reg(v, "rax");
+                    self.state.park_acc(v.0, is_alloca);
+                    self.note_narrow_canonical(v.0, true);
+                } else {
+                    // A rematerialisable GlobalAddr deliberately has no home:
+                    // its address computation is omitted at the definition and
+                    // "every consumer is expected to rebuild it" (the contract
+                    // documented at value_to_reg_inner).  operand_to_rax is a
+                    // consumer like any other — the call-argument staging
+                    // highway reaches it — so rebuild the address here instead
+                    // of failing a handoff that the def side is entitled to
+                    // produce (fresh GlobalAddr definitions spliced in by IR
+                    // passes, e.g. fortify_fold's stripped puts literals, may
+                    // legitimately stay slot-less in variadic frames where the
+                    // packed-slot tiers skip them).  value_to_reg still fails
+                    // loudly if the value is genuinely unmaterialisable, so
+                    // the session-26 gate's soundness guarantee is preserved.
+                    let is_global_addr = self.get_defining_instruction(v.0).is_some_and(|inst| {
+                        matches!(inst, crate::ir::reexports::Instruction::GlobalAddr { .. })
+                    });
+                    if is_global_addr {
+                        self.value_to_reg(v, "rax");
+                        self.state.park_acc(v.0, is_alloca);
+                        return;
+                    }
+                    // Fallback for coalescing failures: if the value is defined
+                    // by a same-size Cast (U64<->I64, etc) or a Copy, and its
+                    // source HAS a home, materialize the source instead. This
+                    // handles the kernel's print_cfs_group_stats where a U64
+                    // Load is cast to I64 for a Cmp Slt — the cast had no home
+                    // due to RA coalesce miss, but its source does.
+                    // Clone def info to avoid borrow conflicts.
+                    //
+                    // Float-involving casts are NOT bit-identical: (long
+                    // long)3.0 must cvttsd2si to 3, not re-publish the raw
+                    // bits 0x4008000000000000; (double)ptr is cvtsi2sdq, not
+                    // a movq bitcast (check_ptr_to_float_cast precedent).
+                    // cast_is_bitidentical_nop is the shared predicate every
+                    // other same-size-cast fold in this repo already honors;
+                    // anything it rejects still reaches the loud HARD GATE
+                    // below rather than silently fabricating wrong values.
+                    let fallback_src = {
+                        if let Some(def_inst) = self.get_defining_instruction(v.0) {
+                            match def_inst {
+                                crate::ir::reexports::Instruction::Cast {
+                                    src,
+                                    from_ty,
+                                    to_ty,
+                                    ..
+                                } => {
+                                    if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) {
+                                        Some(src.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                crate::ir::reexports::Instruction::Copy { src, .. } => {
+                                    Some(src.clone())
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(src_op) = fallback_src {
+                        // Check if src has a home
+                        let src_has_home = match &src_op {
+                            crate::ir::reexports::Operand::Value(src_v) => {
+                                self.reg_assignments.contains_key(&src_v.0)
+                                    || self.state.get_slot(src_v.0).is_some()
+                                    || self
+                                        .state
+                                        .acc_has_verified(src_v.0, self.state.is_alloca(src_v.0))
+                                    || self
+                                        .state
+                                        .sec_has_verified(src_v.0, self.state.is_alloca(src_v.0))
+                            }
+                            crate::ir::reexports::Operand::Const(_) => true,
+                        };
+                        if src_has_home {
+                            self.operand_to_rax(&src_op);
+                            self.state.park_acc(v.0, is_alloca);
+                            return;
+                        }
+                    }
+                    // HARD GATE (session 26): a live operand value with no
+                    // register home, no stack slot and no accumulator-cache
+                    // entry cannot be materialised — this spot used to emit a
+                    // silent `xorl %eax,%eax`, fabricating zero and corrupting
+                    // whatever consumed it (sqlite -O2 sqlite3KeyInfoAlloc:
+                    // p->aSortFlags stored as NULL → SIGSEGV in
+                    // sqlite3KeyInfoFromExprList).  Reaching here means a
+                    // producer/consumer handoff is broken; fail loudly.
+                    //
+                    // Stale-home remat first: a Cast/Copy-defined value is
+                    // rebuilt exactly from its source (a sign-extended loop
+                    // index re-extended from its narrow source slot) — the
+                    // sound path for homes clobbered by MachInst windows or
+                    // in-place accumulator chains after the definition.
+                    if self.rematerialize_stale_into_rax(v, is_alloca, 3) {
+                        return;
+                    }
+                    //
+                    // Include the tail of the asm emitted so far: the
+                    // instruction context around the failure is exactly what a
+                    // soundness hunt needs, and it is otherwise lost because
+                    // the panic aborts before the .s file is written.
+                    let tail: Vec<&str> = {
+                        let lines: Vec<&str> = self.state.out.buf.lines().collect();
+                        let n = lines.len();
+                        lines[n.saturating_sub(30)..].to_vec()
+                    };
+                    self.dump_nohome_diagnostics(v.0);
+                    panic!(
+                        "x86 codegen: operand_to_rax: value {} in function '{}' \
+                         cannot be materialised — {} — refusing to fabricate a value\n\
+                         --- last {} asm lines ---\n{}",
+                        v.0,
+                        self.state.current_func_name,
+                        if self.reg_assignments.contains_key(&v.0) {
+                            "its register home is stale (clobbered) with no \
+                             slot/remat/acc recovery"
+                        } else {
+                            "it has no register home, no stack slot and no \
+                             acc-cache entry"
+                        },
+                        tail.len(),
+                        tail.join("\n")
+                    );
+                }
+            }
+        }
+    }
+
+    /// Load an integer operand into zero-extended %eax using 32-bit moves.
+    /// Used by small integer returns where %rax's upper half must be zero but
+    /// the value itself is only 32 bits.  Register and stack homes are loaded
+    /// with `movl`, which is shorter than `movq` and avoids a 64-bit dependency.
+    pub(super) fn operand_to_rax_i32(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                self.state.reg_cache.invalidate_acc();
+                if c.to_i64() == Some(0) {
+                    self.state.emit("    xorl %eax, %eax");
+                } else if let Some(v) = c.to_i64() {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movl", v as i32 as i64, "eax");
+                } else {
+                    self.operand_to_rax(op);
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.acc_has_verified(v.0, is_alloca) {
+                    return;
+                }
+                if self.state.sec_has_verified(v.0, is_alloca) {
+                    self.state.emit("    movl %ecx, %eax");
+                    self.state.park_acc(v.0, is_alloca);
+                    return;
+                }
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    let name = phys_reg_name(reg);
+                    if is_xmm_reg(reg) {
+                        self.emit_scalar_xmm_to_gpr(name, "rax", Some("eax"));
+                    } else if self.value_types.get(&v.0).is_some_and(|t| t.size() <= 4) {
+                        let name32 = phys_reg_name_32(reg);
+                        // Identity `movl %eax, %eax` is a 2-byte no-op (and a
+                        // false dependency). Skip it when the value is already
+                        // in the return register.
+                        if name32 != "eax" {
+                            self.state
+                                .emit_fmt(format_args!("    movl %{name32}, %eax"));
+                        }
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
+                    }
+                } else if let Some(slot) = self.state.get_slot(v.0) {
+                    // value_to_reg is a 64-bit loader and historically calls
+                    // emitted `movq slot, %eax` when passed a 32-bit register.
+                    // For a small integer return use a width-consistent load:
+                    // the sign extensions name %rax, as their `q` suffix
+                    // requires (GNU as rejects `movswq m, %eax`; the integrated
+                    // assembler already encoded REX.W, so the bytes are
+                    // unchanged), the zero extensions write %eax and so clear
+                    // the upper half.
+                    match self.value_types.get(&v.0).copied().unwrap_or(IrType::I64) {
+                        IrType::I8 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movsbq", slot.0, "rax")
+                        }
+                        IrType::U8 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movzbl", slot.0, "eax")
+                        }
+                        IrType::I16 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movswq", slot.0, "rax")
+                        }
+                        IrType::U16 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movzwl", slot.0, "eax")
+                        }
+                        IrType::I32 if self.needs_sext_values.contains(&v.0) => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movslq", slot.0, "rax"),
+                        _ => self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax"),
+                    }
+                } else {
+                    self.operand_to_rax(op);
+                    return;
+                }
+                self.state.park_acc(v.0, false);
+            }
+        }
+    }
+
+    /// Transfer scalar carrier bits without granting SSE2 to SSE1 code.
+    /// SSE1 has no GPR/XMM bit-move instruction. Use a balanced, flag-preserving
+    /// stack bridge; scalar consumers do not observe the upper XMM lanes.
+    /// The bridge's `%rsp` motion is described by `cfi_synth`, which derives
+    /// the CFI from the final text; a directive emitted here would reach the
+    /// peephole and make its output depend on `-fasynchronous-unwind-tables`
+    /// (the FPO callee-save elimination refuses `.cfi_adjust_cfa_offset`).
+    pub(super) fn emit_scalar_gpr_to_xmm(
+        &mut self,
+        gpr64: &str,
+        gpr32: &str,
+        xmm: &str,
+        f32ish: bool,
+    ) {
+        if self.isa.simd {
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                if f32ish { "movd" } else { "movq" },
+                if f32ish { gpr32 } else { gpr64 },
+                xmm
+            ));
+        } else {
+            self.state.emit_fmt(format_args!("    pushq %{}", gpr64));
+            self.state.emit_fmt(format_args!(
+                "    {} (%rsp), %{}",
+                if f32ish { "movss" } else { "movlps" },
+                xmm
+            ));
+            self.state.emit("    leaq 8(%rsp), %rsp");
+        }
+    }
+
+    /// Reverse scalar bit bridge. A 32-bit destination must retain MOVD's
+    /// zero-extension; an eightbyte carrier preserves all of its low 64 bits.
+    pub(super) fn emit_scalar_xmm_to_gpr(&mut self, xmm: &str, gpr64: &str, gpr32: Option<&str>) {
+        if self.isa.simd {
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                if gpr32.is_some() { "movd" } else { "movq" },
+                xmm,
+                gpr32.unwrap_or(gpr64)
+            ));
+        } else {
+            self.state.emit("    leaq -8(%rsp), %rsp");
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, (%rsp)",
+                if gpr32.is_some() { "movss" } else { "movlps" },
+                xmm
+            ));
+            self.state.emit_fmt(format_args!(
+                "    {} (%rsp), %{}",
+                if gpr32.is_some() { "movl" } else { "movq" },
+                gpr32.unwrap_or(gpr64)
+            ));
+            self.state.emit("    leaq 8(%rsp), %rsp");
+        }
+    }
+
+    /// Store %rax to a value's location (register or stack slot).
+    /// Register-only strategy: if the value has a register assignment (callee-saved or caller-saved),
+    /// store ONLY to the register (skip the stack write). This eliminates redundant
+    /// memory stores for register-allocated values. Values without a register
+    /// assignment are stored to their stack slot as before.
+    pub(super) fn store_rax_to(&mut self, dest: &Value) {
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            self.state.park_acc(dest.0, false);
+            return;
+        }
+        // Every accumulator producer shares this boundary. Memory-source
+        // ALU shortcuts and unary operations can leave only the low 32 bits
+        // valid even on the mature path. A wide consumer must never observe
+        // the zero/stale upper half of a negative signed result.
+        if self.signed_i32_defs.contains(&dest.0) {
+            self.emit_sext32_for_value("eax", "rax", false, dest.0);
+        }
+        // Use movl (4 bytes) for small-slot values instead of movq (8 bytes).
+        // This saves 1 byte per instruction (no REX prefix) and halves memory bandwidth.
+        // Only safe when all loads of this value also use 32-bit form.
+        let use_small = self.state.is_small_slot(dest.0);
+
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_xmm_reg(reg) {
+                let reg_name = phys_reg_name(reg);
+                if self.isa.simd {
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", reg_name, false);
+                } else if let Some(slot) = self.state.get_slot(dest.0) {
+                    // This SSA value owns the slot: refreshing it is cheaper
+                    // than reserving a temporary and cannot overwrite a peer.
+                    let (store, source, load) = if use_small {
+                        ("    movl", "eax", "    movss")
+                    } else {
+                        ("    movq", "rax", "    movlps")
+                    };
+                    self.state.out.emit_instr_reg_rbp(store, source, slot.0);
+                    self.state.out.emit_instr_rbp_reg(load, slot.0, reg_name);
+                } else {
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", reg_name, use_small);
+                }
+            } else {
+                // Always use movq for register stores, even for I32/U32 values.
+                // movl zero-extends the upper 32 bits, which corrupts negative I32
+                // values that later flow into 64-bit operations (pointer arithmetic,
+                // imul) through callee-saved registers.
+                let reg_name = phys_reg_name(reg);
+                self.state
+                    .out
+                    .emit_instr_reg_reg("    movq", "rax", reg_name);
+            }
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            if use_small {
+                self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+            } else {
+                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            }
+        } else if self.state.is_accumulator_location(dest.0) {
+            // Value is consumed by the very next instruction — skip the store.
+            // The accumulator cache (set below) ensures the consumer finds it in %rax.
+        } else {
+            panic!(
+                "x86 codegen: live value {} has no assigned location",
+                dest.0
+            );
+        }
+        self.state.park_acc(dest.0, false);
+    }
+
+    /// Store an XMM register holding a scalar F64/F32 value to a value's
+    /// location, keeping the value in the SSE domain: `movsd`/`movss` for
+    /// XMM-allocated destinations and stack slots, `movq`/`movd` for
+    /// GPR-allocated destinations. Falls back to a move through %rax only
+    /// when the destination has neither a register nor a slot (e.g.
+    /// immediately-consumed values that must live in the accumulator).
+    ///
+    /// The direct paths do not touch %rax, so the accumulator cache is left
+    /// untouched (matching the register-direct load/store paths); only the
+    /// %rax fallback invalidates it (via store_rax_to).
+    pub(super) fn store_xmm_to(&mut self, dest: &Value, src_xmm: &str, ty: IrType) {
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            let reg_name = phys_reg_name(reg);
+            if is_xmm_reg(reg) {
+                if reg_name != src_xmm {
+                    // movapd (not movsd/movss): the reg-reg scalar forms
+                    // preserve the destination's upper bits, creating a false
+                    // dependency on its old value. movapd copies all 128 bits
+                    // (dead above bit 63 for scalars) with no false dependency.
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}",
+                        if self.isa.simd { "movapd" } else { "movaps" },
+                        src_xmm,
+                        reg_name
+                    ));
+                }
+            } else if ty == IrType::F32 || ty == IrType::D32 {
+                self.emit_scalar_xmm_to_gpr(src_xmm, reg_name, Some(phys_reg_name_32(reg)));
+            } else {
+                self.emit_scalar_xmm_to_gpr(src_xmm, reg_name, None);
+            }
+            return;
+        }
+        if !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                // MOVSD xmm->m64 is SSE2; MOVLPS stores the same low eight
+                // bytes with SSE1 (an x86-64 8-byte vector call result under
+                // `-mno-sse2 -msse`).
+                let instr = if matches!(ty, IrType::F32 | IrType::D32) {
+                    "    movss"
+                } else if self.isa.simd {
+                    "    movsd"
+                } else {
+                    "    movlps"
+                };
+                self.state.out.emit_instr_reg_rbp(instr, src_xmm, slot.0);
+                return;
+            }
+        }
+        // Fallback: route through %rax like store_rax_to does.
+        self.emit_scalar_xmm_to_gpr(
+            src_xmm,
+            "rax",
+            matches!(ty, IrType::F32 | IrType::D32).then_some("eax"),
+        );
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
+    /// Store a low-32-bit result with the destination's canonical home width.
+    /// Both entry points must share sign-extension and small-slot handling:
+    /// a bare movq preserves upper bits but cannot manufacture a missing sext.
+    pub(super) fn store_eax_to(&mut self, dest: &Value) {
+        self.store_rax_to(dest);
+    }
+
+    /// Load a value to %eax using movl (32-bit) from stack, or movl %regd, %eax
+    /// from a register. Pairs with store_eax_to for consistent 32-bit spill/reload.
+    pub(super) fn operand_to_eax(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                self.state.reg_cache.invalidate_acc();
+                match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I64(0) => self.state.emit("    xorl %eax, %eax"),
+                    IrConst::I8(v) => self
+                        .state
+                        .out
+                        .emit_instr_imm_reg("    movl", *v as i64, "eax"),
+                    IrConst::I16(v) => self
+                        .state
+                        .out
+                        .emit_instr_imm_reg("    movl", *v as i64, "eax"),
+                    IrConst::I32(v) => self
+                        .state
+                        .out
+                        .emit_instr_imm_reg("    movl", *v as i64, "eax"),
+                    IrConst::Zero => self.state.emit("    xorl %eax, %eax"),
+                    _ => {
+                        // Fallback to 64-bit for other const types
+                        self.operand_to_rax(op);
+                        return;
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.acc_has_verified(v.0, is_alloca) {
+                    return; // cache hit
+                }
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if is_xmm_reg(reg) {
+                        let reg_name = phys_reg_name(reg);
+                        self.emit_scalar_xmm_to_gpr(reg_name, "rax", None);
+                    } else {
+                        // GPR: movl %regd, %eax (32-bit)
+                        let reg_name_32 = phys_reg_name_32(reg);
+                        self.state
+                            .emit_fmt(format_args!("    movl %{}, %eax", reg_name_32));
+                    }
+                    self.state.park_acc(v.0, false);
+                } else if self.state.get_slot(v.0).is_some() {
+                    // Load from stack using movl (32-bit)
+                    let slot = self.state.get_slot(v.0).unwrap();
+                    self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax");
+                    self.state.park_acc(v.0, is_alloca);
+                } else {
+                    self.state.emit("    xorl %eax, %eax");
+                    self.state.reg_cache.invalidate_acc();
+                }
+            }
+        }
+    }
+
+    /// Check if a scale value is valid for x86-64 SIB (Scale-Index-Base) encoding.
+    /// Valid scales are 1, 2, 4, or 8 (encoded in 2 bits).
+    pub(super) fn is_valid_sib_scale(scale: i64) -> bool {
+        matches!(scale, 1 | 2 | 4 | 8)
+    }
+
+    /// Helper function to get the instruction that defines a value.
+    /// Returns None if the value isn't defined by an instruction in the current function.
+    ///
+    /// Answered from a per-function index: the matcher must scan the whole
+    /// function (a second definition voids the first), and its consumers ask
+    /// per access -- the TLS resolver for every load and store, remat and
+    /// the call-argument chains per use -- which made emission quadratic in
+    /// the function size.  The index is built on the first question of a
+    /// function (functions that never ask pay nothing) and records exactly
+    /// the matcher's answer per value.  It remembers the function it was
+    /// built for; were `current_func` ever re-pointed without the prologue's
+    /// reset, the question falls back to the scan instead of answering for
+    /// another function.
+    pub(super) fn get_defining_instruction(
+        &self,
+        val_id: u32,
+    ) -> Option<&crate::ir::reexports::Instruction> {
+        let func_ptr = self.current_func?;
+        let func = unsafe { &*func_ptr };
+        let (built_for, index) = self
+            .def_index
+            .get_or_init(|| (func_ptr, Self::build_def_index(func)));
+        if !std::ptr::eq(*built_for, func_ptr) {
+            return Self::find_defining_instruction(func, val_id);
+        }
+        Self::indexed_definition(func, index, val_id)
+    }
+
+    /// Every value's `find_defining_instruction` answer for `func`, as block
+    /// and instruction positions: `Some` for a unique definition, `None` for
+    /// a value defined more than once (the AMBIGUITY LAW below).  Values
+    /// absent from the map have no definition.
+    pub(super) fn build_def_index(
+        func: &crate::ir::reexports::IrFunction,
+    ) -> FxHashMap<u32, Option<(usize, usize)>> {
+        let mut index: FxHashMap<u32, Option<(usize, usize)>> = FxHashMap::default();
+        for (b, block) in func.blocks.iter().enumerate() {
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if let Some(v) = Self::matched_definition(inst) {
+                    index
+                        .entry(v)
+                        .and_modify(|slot| *slot = None)
+                        .or_insert(Some((b, i)));
+                }
+            }
+        }
+        index
+    }
+
+    /// The instruction `index` (from [`X86Codegen::build_def_index`] of
+    /// `func`) records as `val_id`'s unique definition.
+    pub(super) fn indexed_definition<'f>(
+        func: &'f crate::ir::reexports::IrFunction,
+        index: &FxHashMap<u32, Option<(usize, usize)>>,
+        val_id: u32,
+    ) -> Option<&'f crate::ir::reexports::Instruction> {
+        let (b, i) = (*index.get(&val_id)?)?;
+        func.blocks.get(b)?.instructions.get(i)
+    }
+
+    /// The def-matcher walk, factored out of the emitter so the unit test can
+    /// drive it without an emitter/frame ([`crate::ir::reexports::IrFunction`] in,
+    /// defining instruction out).  The dest-classification list IS the contract:
+    /// every rebuild consumer (remat, const-chain, global-addr-chain) can only
+    /// recover values whose defs this matcher reports.
+    pub(super) fn find_defining_instruction(
+        func: &crate::ir::reexports::IrFunction,
+        val_id: u32,
+    ) -> Option<&crate::ir::reexports::Instruction> {
+        // AMBIGUITY LAW: a value defined MORE THAN ONCE in the function
+        // (phi-elimination residue: loop-carried induction copies keep the
+        // phi's dest id, one Copy per predecessor) has NO single static
+        // definition, so it is NOT re-derivable and must be reported as
+        // undefined to every consumer.  Answering first-def here made the
+        // global-addr resolver treat a loop-induction pointer as the
+        // constant global its ENTRY copy held: cpu_model_memset_inline's
+        // `call *pr->z(p)` folded to the loop-invariant
+        // `call *probes+8(%rip)` while the induction advanced — every
+        // iteration ≥ 1 called row 0 (memset tests byte-0 failures), and
+        // the same reasoning would corrupt any multi-def remat target.
+        // Consumers that only re-derive VALUES need a unique def; none of
+        // them benefit from a witness that may be the wrong one.
+        let mut found: Option<&crate::ir::reexports::Instruction> = None;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if Self::matched_definition(inst) == Some(val_id) {
+                    if found.is_some() {
+                        // Second definition: ambiguous, NOT re-derivable.
+                        return None;
+                    }
+                    found = Some(inst);
+                }
+            }
+        }
+        found
+    }
+
+    /// The value `inst` defines, as far as the def matcher is concerned.
+    /// The dest-classification list IS the contract (see
+    /// `find_defining_instruction`); the index and the scan share it.
+    fn matched_definition(inst: &crate::ir::reexports::Instruction) -> Option<u32> {
+        use crate::ir::reexports::Instruction;
+        match inst {
+            Instruction::BinOp { dest, .. } => Some(dest.0),
+            Instruction::UnaryOp { dest, .. } => Some(dest.0),
+            Instruction::Cast { dest, .. } => Some(dest.0),
+            Instruction::GetElementPtr { dest, .. } => Some(dest.0),
+            Instruction::Load { dest, .. } => Some(dest.0),
+            Instruction::Cmp { dest, .. } => Some(dest.0),
+            Instruction::Phi { dest, .. } => Some(dest.0),
+            // GlobalAddr dests must be found: rematerialisable
+            // addresses have deliberately no home, so every
+            // consumer-side rebuild (value_to_reg / operand_to_rax)
+            // depends on this lookup locating the definition.  The
+            // missing arm made the documented rebuild contract dead
+            // code and forced slot assignment for every spliced
+            // GlobalAddr (fortify_fold's stripped puts literals in
+            // variadic frames hit exactly that wall).
+            Instruction::GlobalAddr { dest, .. } => Some(dest.0),
+            // Copy dests must be found for the same reason: Copy is
+            // the identity, so a Copy-defined value is recoverable
+            // from its source exactly as it was recoverable at the
+            // definition — rematerialize_stale_into_rax re-derives
+            // the source with the ordinary freshness/slot discipline
+            // at the CONSUMPTION point (no history assumption, no
+            // re-execution hazard: the "re-executed" Copy is a mov
+            // from an operand proven materialisable *now*).  The arm
+            // had been missing since the matcher was written, which
+            // left the Copy branch of the stale-home recovery dead
+            // and iced kernel arp_create (v=1408: Copy-defined, home
+            // clobbered by call-arg staging, no slot, recovery
+            // chain severed before it started).  The other Copy-
+            // following consumers (calls.rs const-chain and
+            // global-addr-chain resolvers) carry explicit Copy arms
+            // that were equally dead; GlobalAddr-only classifiers
+            // see the same None they saw before.
+            Instruction::Copy { dest, .. } => Some(dest.0),
+            _ => None,
+        }
+    }
+
+    /// Analyze function to detect IVSR pointer patterns.
+    /// Called once before codegen starts.
+    ///
+    /// NOTE: This analysis currently does not find any patterns because phi nodes
+    /// are eliminated before codegen runs. For Phase 9b to work properly, this
+    /// detection would need to run as an IR transformation pass BEFORE phi elimination.
+    /// See docs/phase9b_implementation_notes.md for details.
+    pub(super) fn analyze_ivsr_pointers(&mut self, _func: &IrFunction) {
+        // Disabled: Phi nodes are eliminated before codegen, so this detection
+        // cannot find IVSR patterns. Left in place as infrastructure for future
+        // implementation via IR transformation pass.
+    }
+
+    /// Detect if a phi node matches the IVSR pointer pattern:
+    /// %ptr = Phi(%init_ptr from preheader, %ptr_next from backedge)
+    /// where %ptr_next = GEP(%ptr, const_stride)
+    fn detect_ivsr_pattern(
+        &self,
+        dest: &Value,
+        incoming: &[(Operand, BlockId)],
+        func: &IrFunction,
+        header_block: BlockId,
+    ) -> Option<IvsrPointerInfo> {
+        use crate::ir::reexports::Instruction;
+
+        // Extract the two incoming edges
+        let (init_op, _init_block) = &incoming[0];
+        let (backedge_op, backedge_block) = &incoming[1];
+
+        // Backedge value should be defined by a GEP
+        let backedge_val = match backedge_op {
+            Operand::Value(v) => v,
+            _ => return None,
+        };
+
+        // Find the GEP instruction that defines the backedge value
+        let (gep_base, stride) = self.find_gep_for_ivsr(backedge_val.0, func)?;
+
+        // Verify GEP base is the phi itself (recursive pattern)
+        if gep_base.0 != dest.0 {
+            return None;
+        }
+
+        // Extract base pointer from init value
+        let (base_ptr, init_offset) = self.extract_base_from_init(init_op, func)?;
+
+        Some(IvsrPointerInfo {
+            phi_val: *dest,
+            base_ptr,
+            stride,
+            init_offset,
+            header_block,
+            backedge_block: *backedge_block,
+        })
+    }
+
+    /// Find a GEP instruction that defines a value and extract its base and offset.
+    /// Returns (base, stride) where stride is a constant offset.
+    fn find_gep_for_ivsr(&self, val_id: u32, func: &IrFunction) -> Option<(Value, i64)> {
+        use crate::ir::reexports::Instruction;
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } = inst
+                {
+                    if dest.0 == val_id {
+                        // Extract constant offset
+                        let stride = match offset {
+                            Operand::Const(c) => c.to_i64()?,
+                            _ => return None,
+                        };
+                        return Some((*base, stride));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the base pointer from the init value of an IVSR phi.
+    /// Handles both direct base pointers and GEP-computed init values.
+    fn extract_base_from_init(&self, init_op: &Operand, func: &IrFunction) -> Option<(Value, i64)> {
+        use crate::ir::reexports::Instruction;
+
+        match init_op {
+            Operand::Value(v) => {
+                // Check if init value is a GEP (handles cases like %init = GEP(%arr, 0))
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::GetElementPtr {
+                            dest, base, offset, ..
+                        } = inst
+                        {
+                            if dest.0 == v.0 {
+                                let init_offset = match offset {
+                                    Operand::Const(c) => c.to_i64().unwrap_or(0),
+                                    _ => 0,
+                                };
+                                return Some((*base, init_offset));
+                            }
+                        }
+                    }
+                }
+                // Not a GEP - just a direct pointer value
+                Some((*v, 0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Associate IVSR pointer phis with their corresponding loop counter IVs.
+    fn associate_pointers_with_counters(&mut self, func: &IrFunction) {
+        let ptr_phis: Vec<(u32, BlockId)> = self
+            .ivsr_pointers
+            .iter()
+            .map(|(&id, info)| (id, info.header_block))
+            .collect();
+
+        for (ptr_phi_id, header_block) in ptr_phis {
+            // Find integer IV phi in same header block
+            if let Some(counter_iv) = self.find_counter_in_header(header_block, func) {
+                self.pointer_to_counter.insert(ptr_phi_id, counter_iv.0);
+            }
+        }
+    }
+
+    /// Find an integer induction variable phi in the given header block.
+    fn find_counter_in_header(&self, header: BlockId, func: &IrFunction) -> Option<Value> {
+        use crate::ir::reexports::Instruction;
+
+        let header_block = &func.blocks[header.0 as usize];
+
+        for inst in &header_block.instructions {
+            if let Instruction::Phi { dest, ty, incoming } = inst {
+                // Look for integer phis (I32, I64, U32, U64)
+                if !matches!(ty, IrType::I32 | IrType::I64 | IrType::U32 | IrType::U64) {
+                    continue;
+                }
+
+                // Check if it's incremented in the backedge (simple heuristic)
+                if self.is_induction_variable(dest, incoming, func) {
+                    return Some(*dest);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Check if a phi node is an induction variable (incremented by a constant).
+    fn is_induction_variable(
+        &self,
+        dest: &Value,
+        incoming: &[(Operand, BlockId)],
+        func: &IrFunction,
+    ) -> bool {
+        use crate::ir::reexports::Instruction;
+
+        if incoming.len() != 2 {
+            return false;
+        }
+
+        // Get the backedge value (typically the second incoming edge)
+        let backedge_val = match &incoming[1].0 {
+            Operand::Value(v) => v,
+            _ => return false,
+        };
+
+        // Check if backedge value is defined by Add/Sub with the phi itself
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::BinOp {
+                        dest: bd,
+                        op,
+                        lhs,
+                        rhs,
+                        ..
+                    } if bd.0 == backedge_val.0 => {
+                        // Check for %i_next = Add(%i, const) or Add(const, %i)
+                        let is_add_or_sub = matches!(op, IrBinOp::Add | IrBinOp::Sub);
+                        if !is_add_or_sub {
+                            return false;
+                        }
+
+                        let has_phi = match (lhs, rhs) {
+                            (Operand::Value(v), Operand::Const(_)) => v.0 == dest.0,
+                            (Operand::Const(_), Operand::Value(v)) => v.0 == dest.0,
+                            _ => false,
+                        };
+
+                        return has_phi;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Load an operand directly into %rcx, avoiding the push/pop pattern.
+    /// This is the key optimization: instead of loading to rax, pushing, loading
+    /// the other operand to rax, moving rax->rcx, then popping rax, we load
+    /// directly to rcx with a single instruction.
+    /// Stage a variable shift/rotate count into `%ecx`, low 32 bits only.
+    ///
+    /// x86 consumes run-time counts from `%cl` and masks them at the operand
+    /// width (`(count & 31) mod width` below 64 bits, `count & 63` at 64), so
+    /// count bits above bit 5 can never affect the result — whatever the
+    /// count's type.  A 32-bit move of the count's low word is therefore
+    /// always exact and replaces the generic 64-bit staging (which for an
+    /// I64-typed count rematerialises it with a sign-extending load into a
+    /// scratch and then copies: `movslq %esi,%rdx; mov %edx,%ecx` — two
+    /// moves and an intermediate register) with a single `movl`.
+    ///
+    /// Unlike `operand_to_rcx`, this must NOT record the value in the `%rcx`
+    /// register cache: the register holds only the count's low word, not the
+    /// full 64-bit value a later `operand_to_rcx` consumer would expect.
+    /// The previous `%rcx` cache entry (if any) is invalidated instead.
+    pub(super) fn operand_to_cl(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(_) => {
+                // Immediates have no staging cost; the const path of
+                // operand_to_rcx is already minimal and keeps its cache
+                // bookkeeping.
+                self.operand_to_rcx(op);
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.sec_has_verified(v.0, is_alloca) {
+                    // Already staged in %rcx by an earlier consumer; %cl is
+                    // ready regardless of which bits the cache entry claims.
+                    return;
+                }
+                // Register home: one 32-bit move. XMM homes (bit-punned
+                // counts) fall through to the generic path.
+                if let Some(reg) = self.fresh_home_of(v.0).filter(|&r| !is_xmm_reg(r)) {
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, %ecx", phys_reg_name_32(reg)));
+                    self.state.reg_cache.invalidate_sec();
+                    return;
+                }
+                // Stack home: every value slot is at least four bytes, and a
+                // 4-byte load captures the count's low word exactly. Allocas
+                // are excluded: their slot holds the storage, not the value
+                // (the address), so folding would read the first element.
+                if !is_alloca && let Some(slot) = self.state.get_slot(v.0) {
+                    let sref = self.slot_ref(slot.0);
+                    self.state.emit_fmt(format_args!("    movl {}, %ecx", sref));
+                    self.state.reg_cache.invalidate_sec();
+                    return;
+                }
+                // No home and no slot of its own. A count only needs its low
+                // bits — `(count & 31) mod width` below 64 bits, `count & 63`
+                // at 64 — and every integer cast (zext/sext/trunc/bitcast)
+                // preserves them. Chase the def chain through Copy and
+                // integer casts to a value with a home or slot and move THAT
+                // low word; this turns the generic remat of an I64-typed
+                // count (`movslq %esi,%rdx; mov %edx,%rcx`) into one
+                // `movl %esi,%ecx`.
+                let mut cur = *v;
+                for _ in 0..32 {
+                    let next = self
+                        .get_defining_instruction(cur.0)
+                        .and_then(|inst| match inst {
+                            crate::ir::reexports::Instruction::Copy { src, .. } => {
+                                Some(src.clone())
+                            }
+                            crate::ir::reexports::Instruction::Cast {
+                                src,
+                                from_ty,
+                                to_ty,
+                                ..
+                            } if from_ty.is_integer() && to_ty.is_integer() => Some(src.clone()),
+                            _ => None,
+                        });
+                    match next {
+                        Some(Operand::Value(next_v)) => {
+                            if let Some(reg) = self
+                                .reg_assignments
+                                .get(&next_v.0)
+                                .copied()
+                                .filter(|&r| !is_xmm_reg(r))
+                            {
+                                self.state.emit_fmt(format_args!(
+                                    "    movl %{}, %ecx",
+                                    phys_reg_name_32(reg)
+                                ));
+                                self.state.reg_cache.invalidate_sec();
+                                return;
+                            }
+                            if !self.state.is_alloca(next_v.0)
+                                && let Some(slot) = self.state.get_slot(next_v.0)
+                            {
+                                let sref = self.slot_ref(slot.0);
+                                self.state.emit_fmt(format_args!("    movl {}, %ecx", sref));
+                                self.state.reg_cache.invalidate_sec();
+                                return;
+                            }
+                            cur = next_v;
+                        }
+                        Some(Operand::Const(c)) => {
+                            // A constant reached through casts: reuse the
+                            // const staging (its cache bookkeeping is fine).
+                            self.operand_to_rcx(&Operand::Const(c));
+                            return;
+                        }
+                        _ => break,
+                    }
+                }
+                // Rematerialisable values (GlobalAddr) and anything else
+                // exotic: the generic path loads the value's low word into
+                // %rcx, which is exact for count purposes.
+                self.operand_to_rcx(op);
+            }
+        }
+    }
+
+    /// Load a sub-word (I8/U8/I16/U16) operand into `target` at its own
+    /// width, zero-extended into the 32-bit register — the canonical home
+    /// form the narrow-value discipline uses (`CastKind::IntNarrow` emits
+    /// `movzwl`/`movzbl` for exactly this invariant).  Wider operands take
+    /// the generic 64-bit path.
+    ///
+    /// `rolw`/`rolb` only write the low 16/8 bits of the register, so a
+    /// zero-extended input keeps the home zero-extended after the rotate —
+    /// no normalisation is ever needed after this staging.
+    pub(super) fn operand_to_callee_reg_narrow(
+        &mut self,
+        op: &Operand,
+        target: PhysReg,
+        ty: IrType,
+    ) {
+        let (load, target_typed) = match ty {
+            IrType::I8 | IrType::U8 => ("movzbl", typed_phys_reg_name(target, ty)),
+            IrType::I16 | IrType::U16 => ("movzwl", typed_phys_reg_name(target, ty)),
+            _ => {
+                self.operand_to_callee_reg(op, target);
+                return;
+            }
+        };
+        let target_32 = phys_reg_name_32(target);
+        match op {
+            Operand::Const(_) => {
+                // Narrow constants materialise zero-extended at their own
+                // width: mask the sign-extended i64 view of the const down
+                // to the type's bits (an I16 const of -1 stages as 0xffff,
+                // not 0xffffffff).
+                if let Some(val) = Self::const_as_imm32(op) {
+                    let masked = if matches!(ty, IrType::I8 | IrType::U8) {
+                        val as u8 as i64
+                    } else {
+                        val as u16 as i64
+                    };
+                    self.emit_imm_to_gpr(masked, phys_reg_name(target), target_32);
+                } else {
+                    self.operand_to_callee_reg(op, target);
+                }
+            }
+            Operand::Value(v) => {
+                // Home-freshness gate (see operand_to_callee_reg): only a
+                // register that provably still holds v may feed the
+                // zero-extending narrow load; a stale home reloads.
+                if let Some(reg) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|&r| !is_xmm_reg(r))
+                    .filter(|_| {
+                        !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0)
+                    })
+                {
+                    let src_typed = typed_phys_reg_name(reg, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", load, src_typed, target_32));
+                } else if !self.state.is_alloca(v.0)
+                    && let Some(slot) = self.state.get_slot(v.0)
+                {
+                    let sref = self.slot_ref(slot.0);
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", load, sref, target_32));
+                } else {
+                    // Exotic source (accumulator-staged, rematerialisable,
+                    // XMM-homed): generic 64-bit staging, then re-establish
+                    // the zero-extension invariant in place.
+                    self.operand_to_callee_reg(op, target);
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}",
+                        load, target_typed, target_32
+                    ));
+                }
+            }
+        }
+    }
+
+    pub(super) fn operand_to_rcx(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                self.state.reg_cache.invalidate_sec();
+                match c {
+                    IrConst::I8(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
+                    IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
+                    IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
+                    IrConst::I64(0) => self.state.emit("    xorl %ecx, %ecx"),
+                    IrConst::I8(v) => self.emit_imm_to_gpr(*v as i64, "rcx", "ecx"),
+                    IrConst::I16(v) => self.emit_imm_to_gpr(*v as i64, "rcx", "ecx"),
+                    IrConst::I32(v) => self.emit_imm_to_gpr(*v as i64, "rcx", "ecx"),
+                    IrConst::I64(v) => self.emit_imm_to_gpr(*v, "rcx", "ecx"),
+                    IrConst::F32(v) => {
+                        let bits = v.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg(
+                                "    movl",
+                                bits as i32 as i64,
+                                "ecx",
+                            );
+                        }
+                    }
+                    IrConst::F64(v) => {
+                        let bits = v.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", bits as i64, "rcx");
+                        }
+                    }
+                    IrConst::LongDouble(v, _) => {
+                        let bits = v.to_bits();
+                        if bits == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", bits as i64, "rcx");
+                        }
+                    }
+                    IrConst::I128(v) => {
+                        let low = *v as i64;
+                        if low == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                            self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
+                        }
+                    }
+                    // Decimal FP bit containers materialize like integer
+                    // immediates (BID patterns are opaque bits).
+                    IrConst::D32(v) => {
+                        if *v == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movl", *v as i64, "ecx");
+                        }
+                    }
+                    IrConst::D64(v) => {
+                        if *v == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", *v as i64, "rcx");
+                        }
+                    }
+                    IrConst::Zero => self.state.emit("    xorl %ecx, %ecx"),
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                // Check if already in %rcx (sec cache hit)
+                if self.state.sec_has_verified(v.0, is_alloca) {
+                    // Already in %rcx. Normalize only narrow integer values;
+                    // the typed move is idempotent for their low bits and
+                    // prevents zero-extended producer homes from being used
+                    // as signed 64-bit operands.
+                    self.extend_narrow_scratch(v.0, "rcx");
+                    return;
+                }
+                // Check register allocation: load from callee-saved register
+                // (freshness-gated: a stale home falls to the slot path).
+                if let Some(reg) = self.fresh_home_of(v.0) {
+                    let reg_name = phys_reg_name(reg);
+                    if is_xmm_reg(reg) {
+                        // SSE1-only code has no MOVQ form.
+                        self.emit_scalar_xmm_to_gpr(reg_name, "rcx", None);
+                        self.extend_narrow_scratch(v.0, "rcx");
+                    } else if !self.extend_narrow_home_to(v.0, reg, "rcx", "ecx") {
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", reg_name, "rcx");
+                    }
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
+                {
+                    // ACC-RESIDENT FIRST (exposed-forward fix): read the
+                    // %rax copy before touching the slot. Narrow values are
+                    // extended directly out of %rax for the same reason as the
+                    // secondary-cache path above.
+                    if !self.extend_narrow_home_to(v.0, R_RAX, "rcx", "ecx") {
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
+                    }
+                } else if self.state.get_slot(v.0).is_some() {
+                    self.value_to_reg(v, "rcx");
+                } else {
+                    // value_to_reg rebuilds a rematerialisable GlobalAddr (a
+                    // value with deliberately no home) and otherwise fails
+                    // loudly. The old `xorl %ecx,%ecx` silently fabricated 0
+                    // for `&buf[k]` and corrupted the address base — the same
+                    // disease class as the operand_to_rax hard gate
+                    // (torture execute/20000412-6.c: `buf+3` decoded as `6`).
+                    // Credit: Agent C torture triage T01-family.
+                    self.value_to_reg(v, "rcx");
+                }
+                // Record what's now in %rcx
+                self.state.park_sec(v.0, is_alloca);
+                self.note_narrow_canonical(v.0, false);
+            }
+        }
+    }
+
+    /// PF-16: materialise a GPR immediate. Non-negative values in `[0, i32::MAX]`
+    /// use `movl` (zero-extends, two bytes shorter than `movq $imm32`); negative
+    /// values keep `movq` (sign-extend); values outside imm32 use `movabsq`.
+    pub(super) fn emit_imm_to_gpr(&mut self, val: i64, name64: &str, name32: &str) {
+        if val == 0 {
+            self.state
+                .emit_fmt(format_args!("    xorl %{0}, %{0}", name32));
+        } else if val >= 0 && val <= i32::MAX as i64 {
+            self.state
+                .emit_fmt(format_args!("    movl ${}, %{}", val, name32));
+        } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+            self.state.out.emit_instr_imm_reg("    movq", val, name64);
+        } else {
+            self.state
+                .out
+                .emit_instr_imm_reg("    movabsq", val, name64);
+        }
+    }
+
+    /// Check if an operand is a small constant that fits in a 32-bit immediate.
+    /// Returns the immediate value if it fits, None otherwise.
+    pub(super) fn const_as_imm32(op: &Operand) -> Option<i64> {
+        Self::const_as_imm32_typed(op, false)
+    }
+
+    /// Immediate-32 encoding of a constant operand.
+    ///
+    /// 64-bit instructions sign-extend imm32, so only values in the signed
+    /// i32 range are representable there. 32-bit instructions use the imm32
+    /// bit pattern verbatim, so any value in [0, u32::MAX] is encodable
+    /// (unsigned constants live in I64: `mask == 0xFFFFFFFF` now emits
+    /// `cmpl $4294967295, %eax` instead of movabs+cmp).
+    pub(super) fn const_as_imm32_typed(op: &Operand, is_32bit_op: bool) -> Option<i64> {
+        match op {
+            Operand::Const(c) => {
+                let val = match c {
+                    IrConst::I8(v) => *v as i64,
+                    IrConst::I16(v) => *v as i64,
+                    IrConst::I32(v) => *v as i64,
+                    IrConst::I64(v) => *v,
+                    IrConst::Zero => 0,
+                    _ => return None,
+                };
+                if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+                    return Some(val);
+                }
+                if is_32bit_op && val >= 0 && val <= u32::MAX as i64 {
+                    // Exact 32-bit bit pattern for a 32-bit operation.
+                    return Some(val);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Load a Value into a named register. For allocas, loads the address (leaq);
+    /// for register-allocated values, copies from the callee-saved register;
+    /// for regular values, loads the full 8 bytes from the stack slot with movq.
+    ///
+    /// The prologue ensures that sub-64-bit parameters are sign/zero-extended
+    /// to 64 bits before being stored, so movq always reads valid data.
+    pub(super) fn value_to_reg(&mut self, val: &Value, reg: &str) {
+        self.value_to_reg_inner(val, reg, 0);
+    }
+
+    fn value_to_reg_inner(&mut self, val: &Value, reg: &str, depth: u8) {
+        if depth >= 32 {
+            panic!(
+                "x86 codegen: cyclic or excessive Copy chain for value {}",
+                val.0
+            );
+        }
+        // Every materialisation below is a 64-bit `movq`/`leaq` into `reg`, so
+        // `reg` must name a 64-bit register. Passing a 32-bit name produced
+        // `movq %r8, %eax`, which is not encodable; the integrated assembler
+        // rejected it and zlib-ng's slide_hash_avx2.c failed to build. Catch
+        // the mistake at its source instead of in the assembler.
+        debug_assert!(
+            reg.starts_with('r') && !reg.ends_with('d'),
+            "value_to_reg expects a 64-bit register name, got %{reg}"
+        );
+        // Check register allocation first (allocas are never register-allocated)
+        if let Some(&phys_reg) = self.reg_assignments.get(&val.0) {
+            if is_xmm_reg(phys_reg) {
+                // XMM → GPR: movq %xmmN, %reg
+                let xmm_name = phys_reg_name(phys_reg);
+                self.emit_scalar_xmm_to_gpr(xmm_name, reg, None);
+                return;
+            }
+            if !self.home_clobbered.contains(&val.0) || self.home_readable_via_alias(val.0) {
+                let reg_name = phys_reg_name(phys_reg);
+                if reg_name != reg {
+                    self.state.out.emit_instr_reg_reg("    movq", reg_name, reg);
+                }
+                return;
+            }
+            // Stale GPR home (content reused by a derived value): fall
+            // through to the slot materialisation below (the operand staging
+            // paths in operand_to_callee_reg carry the def-chain remat).
+        }
+        if let Some(slot) = self.state.get_slot(val.0) {
+            if self.state.is_alloca(val.0) {
+                if let Some(align) = self.state.alloca_over_align(val.0) {
+                    // Over-aligned alloca: compute aligned address within the
+                    // oversized stack slot. The slot has (align - 1) extra bytes
+                    // to guarantee we can find an aligned address within it.
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    addq", (align - 1) as i64, reg);
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    andq", -(align as i64), reg);
+                } else {
+                    self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+                }
+            } else if self.state.vector_values.contains(&val.0) {
+                // Vector value: use leaq to get address (vectors are stored directly at slot)
+                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, reg);
+            } else if matches!(
+                self.value_types.get(&val.0),
+                Some(IrType::I8)
+                    | Some(IrType::U8)
+                    | Some(IrType::I16)
+                    | Some(IrType::U16)
+                    | Some(IrType::I32)
+                    | Some(IrType::U32)
+                    | Some(IrType::F32)
+            ) {
+                // Small-typed value: load it WIDTH-CONSISTENTLY with the
+                // type-aware stores that wrote it. The slot is always 8
+                // bytes (stores write movq OR the type-aware movb/movw/movl),
+                // so reading the low N bytes with the matching extension is
+                // correct in both cases. A plain `movq` load of a value that
+                // was stored with movb/movw/movl would pull stale bytes out
+                // of the slot's upper half and corrupt any later 64-bit
+                // consumer.
+                //   * I8:  movsbq (signed) / movzbl (unsigned)
+                //   * I16: movswq (signed) / movzwl (unsigned)
+                //   * I32: movslq when the value is consumed in a 64-bit
+                //          context (needs-sext analysis), else movl
+                //   * U32/F32: movl (zero-extends implicitly)
+                let ty = self.value_types.get(&val.0).copied().unwrap_or(IrType::I64);
+                let needs_sext = ty == IrType::I32
+                    && !self.needs_sext_values.is_empty()
+                    && self.needs_sext_values.contains(&val.0);
+                match ty {
+                    IrType::I8 => self.state.out.emit_instr_rbp_reg("    movsbq", slot.0, reg),
+                    IrType::U8 => {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movzbl", slot.0, reg_name_to_32(reg))
+                    }
+                    IrType::I16 => self.state.out.emit_instr_rbp_reg("    movswq", slot.0, reg),
+                    IrType::U16 => {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movzwl", slot.0, reg_name_to_32(reg))
+                    }
+                    _ if needs_sext => self.state.out.emit_instr_rbp_reg("    movslq", slot.0, reg),
+                    _ => {
+                        let reg32 = reg_name_to_32(reg);
+                        self.state.out.emit_instr_rbp_reg("    movl", slot.0, reg32);
+                    }
+                }
+            } else if self.state.f128_direct_slots.contains(&val.0)
+                || self.value_types.get(&val.0) == Some(&IrType::F128)
+            {
+                // F128 (long double) value: its 16-byte slot holds the
+                // canonical 80-bit x87 image, whose low quad is the MANTISSA,
+                // not an IEEE double bit pattern. The GP-register view of an
+                // F128 value is its truncated f64 copy (the convention every
+                // producer establishes with fstpl into %rax), so materialise
+                // it by a REAL conversion — fldt + fstpl — instead of a
+                // movq bit-copy of the mantissa. The bit-copy made
+                // 41.0L's low quad 0xa400000000000000 read back as a
+                // negative denormal double: `v5 != ld` misfired and the
+                // (double) print of an intact 41.0L showed -0.0
+                // (va-arg-pack-1, both levels >= O1).
+                self.state.out.emit_instr_rbp("    fldt", slot.0);
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    fstpl (%rsp)");
+                if reg == "rax" {
+                    self.state.emit("    popq %rax");
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movq (%rsp), %{}", reg));
+                    self.state.emit("    addq $8, %rsp");
+                }
+                // Only claim the accumulator cache when the value actually
+                // landed in %rax: the non-rax path leaves %rax untouched,
+                // so an unconditional claim strands a stale entry a later
+                // acc-consult would read as this value. (The previous
+                // cache entry, if any, stays valid — the non-rax
+                // materialization wrote neither home.)
+                if reg == "rax" {
+                    self.state.park_acc(val.0, false);
+                }
+            } else {
+                self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
+            }
+        } else {
+            // Try to resolve through Copy or same-size Cast (U64<->I64 no-op).
+            // Float-involving same-size casts are value conversions, never
+            // bitcasts — cast_is_bitidentical_nop is the shared predicate
+            // (see operand_to_rax's fallback for the full rationale).
+            let source = self
+                .get_defining_instruction(val.0)
+                .and_then(|inst| match inst {
+                    crate::ir::reexports::Instruction::Copy { src, .. } => Some(src.clone()),
+                    crate::ir::reexports::Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) => Some(src.clone()),
+                    _ => None,
+                });
+            match source {
+                Some(crate::ir::reexports::Operand::Value(src)) => {
+                    self.value_to_reg_inner(&src, reg, depth + 1);
+                }
+                Some(constant @ crate::ir::reexports::Operand::Const(_)) => {
+                    self.operand_to_reg(&constant, reg);
+                }
+                None => {
+                    // A rematerialisable GlobalAddr deliberately has no home:
+                    // its address computation was omitted at the definition
+                    // and every consumer is expected to rebuild it. The
+                    // audited-Add interception in generation.rs is NOT the
+                    // only consumer shape — emit_gep bases, fused int-madd
+                    // operands and operand_to_rcx all reach this generic
+                    // loader (torture execute/20000412-6.c). Rebuild the
+                    // address here; anything else still fails loudly.
+                    // Credit: Agent C torture triage.
+                    let gaddr_name = self.get_defining_instruction(val.0).and_then(|inst| {
+                        if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(name) = gaddr_name {
+                        self.emit_global_addr_into_reg(&name, reg);
+                        return;
+                    }
+                    // Coalescing-chain member with no allocation of its
+                    // own: the class representative's storage IS this
+                    // value's storage (the coalescer only unites values it
+                    // proved interchangeable — same home, same slot
+                    // image).  Read the representative's home/slot under
+                    // the same freshness law as any home read; anything
+                    // else falls through to the loud gate.
+                    let rep = self.chain_rep(val.0);
+                    if rep != val.0 {
+                        if let Some(&rep_phys) = self.reg_assignments.get(&rep) {
+                            if !is_xmm_reg(rep_phys)
+                                && (!self.home_clobbered.contains(&rep)
+                                    || self.home_readable_via_alias(rep))
+                            {
+                                let rep_name = phys_reg_name(rep_phys);
+                                if rep_name != reg {
+                                    self.state.out.emit_instr_reg_reg("    movq", rep_name, reg);
+                                }
+                                return;
+                            }
+                        }
+                        if let Some(rep_slot) = self.state.get_slot(rep) {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movq", rep_slot.0, reg);
+                            return;
+                        }
+                    }
+                    // Last resort: the accumulator cache (rax holds this
+                    // value). This mirrors operand_to_callee_reg's fallback —
+                    // a value can be acc-resident with no slot, home, or Copy
+                    // definition (e.g. inline-asm inputs consumed straight
+                    // after a computation staged through rax). Without this,
+                    // materialising such a value for an asm operand panicked
+                    // even though the data was live in rax.
+                    if self.state.acc_has_verified(val.0, false)
+                        || self.state.acc_has_verified(val.0, true)
+                    {
+                        self.state.out.emit_instr_reg_reg("    movq", "rax", reg);
+                        return;
+                    }
+                    panic!(
+                        "x86 codegen: value {} has no register, stack slot, Copy, or \
+                         GlobalAddr definition",
+                        val.0
+                    );
+                }
+            }
+        }
+    }
+
+    // --- 128-bit integer helpers ---
+    // Convention: 128-bit values use %rax (low 64 bits) and %rdx (high 64 bits).
+    // Stack slots for 128-bit values are 16 bytes: slot(%rbp) = low, slot+8(%rbp) = high.
+
+    /// Load a 128-bit operand into %rax (low) and %rdx (high).
+    pub(super) fn operand_to_rax_rdx(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => {
+                match c {
+                    IrConst::I128(v) => {
+                        let low = *v as u64 as i64;
+                        let high = (*v >> 64) as u64 as i64;
+                        if low == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
+                            self.state.out.emit_instr_imm_reg("    movq", low, "rax");
+                        } else {
+                            self.state.out.emit_instr_imm_reg("    movabsq", low, "rax");
+                        }
+                        if high == 0 {
+                            self.state.emit("    xorl %edx, %edx");
+                        } else if high >= i32::MIN as i64 && high <= i32::MAX as i64 {
+                            self.state.out.emit_instr_imm_reg("    movq", high, "rdx");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", high, "rdx");
+                        }
+                    }
+                    IrConst::Zero => {
+                        self.state.emit("    xorl %eax, %eax");
+                        self.state.emit("    xorl %edx, %edx");
+                    }
+                    _ => {
+                        // Smaller constant: load into rax, zero/sign-extend to rdx
+                        self.operand_to_rax(op);
+                        self.state.emit("    xorl %edx, %edx");
+                    }
+                }
+            }
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    if self.state.is_alloca(v.0) {
+                        // Alloca: load the address (not a 128-bit value itself)
+                        if let Some(align) = self.state.alloca_over_align(v.0) {
+                            // Over-aligned alloca: compute aligned address
+                            self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                            self.state.out.emit_instr_imm_reg(
+                                "    addq",
+                                (align - 1) as i64,
+                                "rax",
+                            );
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    andq", -(align as i64), "rax");
+                        } else {
+                            self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rax");
+                        }
+                        self.state.emit("    xorl %edx, %edx");
+                    } else if self.state.is_i128_value(v.0) {
+                        // 128-bit value in 16-byte stack slot
+                        if crate::backend::traits::trace_i128_enabled() {
+                            eprintln!(
+                                "[I128] load_acc_pair value {} slot {} rsp_frame_size={}",
+                                v.0, slot.0, self.state.out.rsp_frame_size
+                            );
+                        }
+                        self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movq", slot.0 + 8, "rdx");
+                    } else {
+                        // Non-i128 value (e.g. shift amount): load width-typed,
+                        // zero-extend into rax, clear rdx.
+                        // Check register allocation first, since register-allocated
+                        // values may not have their stack slot written.
+                        if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                            let reg_name = phys_reg_name(reg);
+                            self.state
+                                .out
+                                .emit_instr_reg_reg("    movq", reg_name, "rax");
+                        } else if matches!(
+                            self.value_types.get(&v.0),
+                            Some(IrType::I8)
+                                | Some(IrType::U8)
+                                | Some(IrType::I16)
+                                | Some(IrType::U16)
+                                | Some(IrType::I32)
+                                | Some(IrType::U32)
+                                | Some(IrType::F32)
+                        ) {
+                            // Width-consistent load (see value_to_reg): the
+                            // store wrote movb/movw/movl or movq; loading the
+                            // matching width is correct in both cases.
+                            let ty = self.value_types.get(&v.0).copied().unwrap_or(IrType::I64);
+                            let needs_sext = ty == IrType::I32
+                                && !self.needs_sext_values.is_empty()
+                                && self.needs_sext_values.contains(&v.0);
+                            match ty {
+                                IrType::I8 => {
+                                    self.state
+                                        .out
+                                        .emit_instr_rbp_reg("    movsbq", slot.0, "rax")
+                                }
+                                IrType::U8 => {
+                                    self.state
+                                        .out
+                                        .emit_instr_rbp_reg("    movzbl", slot.0, "eax")
+                                }
+                                IrType::I16 => {
+                                    self.state
+                                        .out
+                                        .emit_instr_rbp_reg("    movswq", slot.0, "rax")
+                                }
+                                IrType::U16 => {
+                                    self.state
+                                        .out
+                                        .emit_instr_rbp_reg("    movzwl", slot.0, "eax")
+                                }
+                                _ if needs_sext => {
+                                    self.state
+                                        .out
+                                        .emit_instr_rbp_reg("    movslq", slot.0, "rax")
+                                }
+                                _ => self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax"),
+                            }
+                        } else {
+                            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+                        }
+                        self.state.emit("    xorl %edx, %edx");
+                    }
+                } else {
+                    // No stack slot: check register allocation
+                    if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                        let reg_name = phys_reg_name(reg);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", reg_name, "rax");
+                        self.state.emit("    xorl %edx, %edx");
+                    } else {
+                        self.state.emit("    xorl %eax, %eax");
+                        self.state.emit("    xorl %edx, %edx");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Store %rax:%rdx (128-bit) to a value's 16-byte stack slot.
+    pub(super) fn store_rax_rdx_to(&mut self, dest: &Value) {
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            if crate::backend::traits::trace_i128_enabled() {
+                eprintln!(
+                    "[I128] store_rax_rdx_to: value {} -> slot {}",
+                    dest.0, slot.0
+                );
+            }
+            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            self.state
+                .out
+                .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
+        } else if crate::backend::traits::trace_i128_enabled() {
+            eprintln!(
+                "[I128] store_rax_rdx_to: value {} has NO slot — pair left in rax:rdx (may be clobbered)",
+                dest.0
+            );
+        }
+        // rax holds only the low 64 bits of an i128, not a valid scalar IR value.
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    /// Get the store instruction mnemonic for a given type.
+    pub(super) fn mov_store_for_type(ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 | IrType::U8 => "movb",
+            IrType::I16 | IrType::U16 => "movw",
+            IrType::I32 | IrType::U32 | IrType::F32 => "movl",
+            _ => "movq",
+        }
+    }
+
+    /// Get the load instruction mnemonic for a given type.
+    pub(super) fn mov_load_for_type(ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 => "movsbq",
+            IrType::U8 => "movzbl", // movzbl zero-extends to 64-bit implicitly (saves REX vs movzbq)
+            IrType::I16 => "movswq",
+            IrType::U16 => "movzwl", // movzwl zero-extends to 64-bit implicitly (saves REX vs movzwq)
+            IrType::I32 => "movslq",
+            IrType::U32 | IrType::F32 => "movl", // movl zero-extends to 64-bit implicitly
+            _ => "movq",
+        }
+    }
+
+    /// Load instruction for a value, using movl instead of movslq for I32 when
+    /// the value doesn't need sign extension (not in needs_sext_values).
+    pub(super) fn mov_load_for_value(&self, ty: IrType, dest_id: u32) -> &'static str {
+        if ty == IrType::I32
+            && !self.needs_sext_values.is_empty()
+            && !self.needs_sext_values.contains(&dest_id)
+        {
+            return "movl";
+        }
+        if ty == IrType::I32 && self.skip_i32_sext {
+            return "movl";
+        }
+        Self::mov_load_for_type(ty)
+    }
+
+    /// Destination register for a value load. When using movl (I32 without sext),
+    /// uses the 32-bit register name (eax) for implicit zero-extension.
+    pub(super) fn load_dest_reg_for_value(&self, ty: IrType, dest_id: u32) -> &'static str {
+        if ty == IrType::I32 && self.mov_load_for_value(ty, dest_id) == "movl" {
+            return "eax";
+        }
+        Self::load_dest_reg(ty)
+    }
+
+    /// Destination register for loads. The width must match the mnemonic
+    /// chosen by `mov_load_for_type`, not the source type:
+    ///
+    ///   * I8   -> `movsbq` (sign-extend 8 -> 64) takes a 64-bit dest (`%rax`);
+    ///   * U8   -> `movzbl` (zero-extend 8 -> 32) takes a 32-bit dest (`%eax`);
+    ///   * I16  -> `movswq` (sign-extend 16 -> 64) takes a 64-bit dest (`%rax`);
+    ///   * U16  -> `movzwl` (zero-extend 16 -> 32) takes a 32-bit dest (`%eax`);
+    ///   * U32/F32 -> `movl` zero-extends to 64 implicitly -> 32-bit dest (`%eax`);
+    ///   * else  -> `movq` -> 64-bit dest (`%rax`).
+    ///
+    /// GNU as rejects `movzbl %sil, %al` / `movsbq %sil, %al` ("incorrect
+    /// register ... used with suffix"); this is the same mnemonic-driven
+    /// width contract as `asm_load_dest_reg` in inline_asm.rs. It also keeps
+    /// `%rax` zero/sign-extended for the `store_rax_to` spill that follows.
+    pub(super) fn load_dest_reg(ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 | IrType::I16 => "%rax", // movsbq/movswq -> 64-bit dest
+            IrType::U8 | IrType::U16 => "%eax", // movzbl/movzwl -> 32-bit dest
+            IrType::U32 | IrType::F32 => "%eax",
+            _ => "%rax",
+        }
+    }
+
+    /// Map base register name + type to sized sub-register.
+    pub(super) fn reg_for_type(base_reg: &str, ty: IrType) -> &'static str {
+        let (r8, r16, r32, r64) = match base_reg {
+            "rax" => ("al", "ax", "eax", "rax"),
+            "rcx" => ("cl", "cx", "ecx", "rcx"),
+            "rdx" => ("dl", "dx", "edx", "rdx"),
+            "rdi" => ("dil", "di", "edi", "rdi"),
+            "rsi" => ("sil", "si", "esi", "rsi"),
+            "r8" => ("r8b", "r8w", "r8d", "r8"),
+            "r9" => ("r9b", "r9w", "r9d", "r9"),
+            _ => return "rax",
+        };
+        match ty {
+            IrType::I8 | IrType::U8 => r8,
+            IrType::I16 | IrType::U16 => r16,
+            IrType::I32 | IrType::U32 | IrType::F32 => r32,
+            _ => r64,
+        }
+    }
+
+    /// Get the type suffix for lock-prefixed instructions (b, w, l, q).
+    pub(super) fn type_suffix(ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 | IrType::U8 => "b",
+            IrType::I16 | IrType::U16 => "w",
+            IrType::I32 | IrType::U32 => "l",
+            _ => "q",
+        }
+    }
+
+    /// Emit a CMPXCHG loop for atomic AND/OR/XOR/NAND.
+    /// `addr` names the address register and `src` the operand as an ALU
+    /// source; neither is %rax or %rdx (`src` is an imm32, a register, or
+    /// `(%rsp)`).  Returns the old value in RAX; clobbers only %rax and %rdx.
+    pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str, src: &str, addr: &str) {
+        debug_assert!(
+            !matches!(src, "%rax" | "%rdx") && !matches!(addr, "rax" | "rdx"),
+            "loop register as operand: {src} / {addr}"
+        );
+        let load = Self::mov_load_for_type(ty);
+        let load_dest = Self::load_dest_reg(ty);
+        self.state
+            .emit_fmt(format_args!("    {load} (%{addr}), {load_dest}"));
+
+        let loop_label = format!(".Latomic_loop_{}", self.state.next_label_id());
+        self.state.out.emit_named_label(&loop_label);
+        self.state.emit("    movq %rax, %rdx");
+
+        // Truncation commutes with these bitwise operations. Compute in full
+        // registers to avoid partial-register writes and operand-size prefixes;
+        // only CMPXCHG accesses the user's object at its declared width.
+        match op {
+            "and" => self.state.emit_fmt(format_args!("    andq {src}, %rdx")),
+            "or" => self.state.emit_fmt(format_args!("    orq {src}, %rdx")),
+            "xor" => self.state.emit_fmt(format_args!("    xorq {src}, %rdx")),
+            "nand" => {
+                self.state.emit_fmt(format_args!("    andq {src}, %rdx"));
+                self.state.emit("    notq %rdx");
+            }
+            _ => unreachable!("unsupported x86 atomic loop operation: {op}"),
+        }
+
+        let suffix = Self::type_suffix(ty);
+        let candidate = Self::reg_for_type("rdx", ty);
+        self.state.emit_fmt(format_args!(
+            "    lock cmpxchg{suffix} %{candidate}, (%{addr})"
+        ));
+        self.state.out.emit_jcc_label("    jne", &loop_label);
+    }
+
+    /// Load i128 operands for binary ops: lhs → rax:rdx, rhs → rcx:rsi.
+    pub(super) fn prep_i128_binop(&mut self, lhs: &Operand, rhs: &Operand) {
+        self.operand_to_rax_rdx(lhs);
+        self.state.emit("    pushq %rdx");
+        self.state.emit("    pushq %rax");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 16;
+        }
+        self.operand_to_rax_rdx(rhs);
+        self.state.emit("    movq %rax, %rcx");
+        self.state.emit("    movq %rdx, %rsi");
+        self.state.emit("    popq %rax");
+        self.state.emit("    popq %rdx");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= 16;
+        }
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    /// Load an operand value into any GP register (returned as string).
+    /// Uses rcx as the scratch register.
+    pub(super) fn operand_to_reg(&mut self, op: &Operand, reg: &str) {
+        if reg == "rcx" {
+            if let Operand::Value(v) = op {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.sec_has_verified(v.0, is_alloca) {
+                    return;
+                }
+            }
+            // Unlike operand_to_rcx, this generic loader does not park the
+            // newly staged value. It must not leave an older secondary-cache
+            // claim alive after overwriting %rcx; later users can then only
+            // reload or explicitly re-park, never consume the dead register.
+            self.state.reg_cache.invalidate_sec();
+        }
+        match op {
+            Operand::Const(c) => match c {
+                IrConst::I8(v) if *v == 0 => self
+                    .state
+                    .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                IrConst::I16(v) if *v == 0 => self
+                    .state
+                    .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                IrConst::I32(v) if *v == 0 => self
+                    .state
+                    .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                IrConst::I64(0) => self
+                    .state
+                    .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+                // PF-16: non-negative immediates via movl (see site above).
+                IrConst::I8(v) => {
+                    let x = *v as i64;
+                    if x >= 0 {
+                        self.state.emit_fmt(format_args!(
+                            "    movl ${}, %{}",
+                            x,
+                            reg_name_to_32(reg)
+                        ));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movq ${}, %{}", x, reg));
+                    }
+                }
+                IrConst::I16(v) => {
+                    let x = *v as i64;
+                    if x >= 0 {
+                        self.state.emit_fmt(format_args!(
+                            "    movl ${}, %{}",
+                            x,
+                            reg_name_to_32(reg)
+                        ));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movq ${}, %{}", x, reg));
+                    }
+                }
+                IrConst::I32(v) => {
+                    let x = *v as i64;
+                    if x >= 0 {
+                        self.state.emit_fmt(format_args!(
+                            "    movl ${}, %{}",
+                            x,
+                            reg_name_to_32(reg)
+                        ));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movq ${}, %{}", x, reg));
+                    }
+                }
+                IrConst::I64(v) => {
+                    if *v >= 0 && *v <= i32::MAX as i64 {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movl", *v, reg_name_to_32(reg));
+                    } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                        self.state.out.emit_instr_imm_reg("    movq", *v, reg);
+                    } else {
+                        self.state.out.emit_instr_imm_reg("    movabsq", *v, reg);
+                    }
+                }
+                _ => self
+                    .state
+                    .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
+            },
+            Operand::Value(v) => {
+                self.value_to_reg(v, reg);
+            }
+        }
+    }
+
+    /// Extract an immediate integer value from an operand.
+    /// Used for SSE/AES instructions that require compile-time immediate operands.
+    pub(super) fn operand_to_imm_i64(&self, op: &Operand) -> i64 {
+        match op {
+            Operand::Const(c) => match c {
+                IrConst::I8(v) => *v as i64,
+                IrConst::I16(v) => *v as i64,
+                IrConst::I32(v) => *v as i64,
+                IrConst::I64(v) => *v,
+                _ => 0,
+            },
+            Operand::Value(_) => {
+                // TODO: this shouldn't happen for compile-time immediate arguments;
+                // the frontend should always fold these to constants.
+                0
+            }
+        }
+    }
+
+    /// Emit comment annotations for callee-saved registers listed in inline asm
+    /// clobber lists. The peephole pass's `eliminate_unused_callee_saves` scans
+    /// function bodies for textual register references (e.g., "%rbx") to decide
+    /// whether a callee-saved register save/restore can be eliminated. Without
+    /// these annotations, an inline asm that clobbers a callee-saved register
+    /// (but doesn't mention it in the emitted assembly text) would have its
+    /// save/restore incorrectly removed.
+    pub(super) fn emit_callee_saved_clobber_annotations(&mut self, clobbers: &[String]) {
+        for clobber in clobbers {
+            let clobber = crate::backend::inline_asm::normalize_inline_asm_reg_name(clobber);
+            let reg_name = match clobber {
+                "rbx" | "ebx" | "bx" | "bl" | "bh" => Some("%rbx"),
+                "r12" | "r12d" | "r12w" | "r12b" => Some("%r12"),
+                "r13" | "r13d" | "r13w" | "r13b" => Some("%r13"),
+                "r14" | "r14d" | "r14w" | "r14b" => Some("%r14"),
+                "r15" | "r15d" | "r15w" | "r15b" => Some("%r15"),
+                _ => None,
+            };
+            if let Some(reg) = reg_name {
+                self.state
+                    .emit_fmt(format_args!("    # asm clobber {}", reg));
+            }
+        }
+    }
+
+    /// LEA scale factor for multiply strength reduction.
+    /// Returns the LEA scale factor for multipliers 3, 5, 9 (which decompose
+    /// as reg + reg*2, reg + reg*4, reg + reg*8 respectively).
+    pub(super) fn lea_scale_for_mul(imm: i64) -> Option<u8> {
+        match imm {
+            3 => Some(2),
+            5 => Some(4),
+            9 => Some(8),
+            _ => None,
+        }
+    }
+
+    /// Register-direct path for simple ALU ops (add/sub/and/or/xor/mul).
+    /// APX NDD 3-operand ALU: `op src, src1, dst` writes dst without
+    /// clobbering src1. Taken only when `-mapx` is on AND dest is a different
+    /// GPR from the lhs home — otherwise the 2-address form is shorter and
+    /// legal on every x86-64. Never fires on a non-APX TU (the encodings
+    /// are #UD on Raptor Lake / Zen 5).
+    fn try_emit_ndd_alu(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        is_unsigned: bool,
+        dest_value_id: u32,
+    ) -> bool {
+        if !self.apx_enabled {
+            return false;
+        }
+        if !matches!(
+            op,
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul
+        ) {
+            return false;
+        }
+        if is_xmm_reg(dest_phys) {
+            return false;
+        }
+        let Some(lhs_phys) = self.operand_reg(lhs).filter(|&r| is_gpr_reg(r)) else {
+            return false;
+        };
+        // Two-address is shorter when dest already holds lhs.
+        if lhs_phys == dest_phys {
+            return false;
+        }
+        // Immediate IMUL is the legacy 3-operand form *and* the strength-
+        // reduction plan (`mul_const_plan`) lives in the caller. Stealing
+        // `imul $k, %src, %dst` here would hide LEA/SHL chains that beat
+        // IMUL on every shipping core.
+        if op == IrBinOp::Mul && Self::const_as_imm32(rhs).is_some() {
+            return false;
+        }
+        let mnemonic = if op == IrBinOp::Mul {
+            "imul"
+        } else {
+            alu_mnemonic(op)
+        };
+        let (dest_n, lhs_n, sfx) = if use_32bit {
+            (phys_reg_name_32(dest_phys), phys_reg_name_32(lhs_phys), "l")
+        } else {
+            (phys_reg_name(dest_phys), phys_reg_name(lhs_phys), "q")
+        };
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            self.state.emit_fmt(format_args!(
+                "    {}{} ${}, %{}, %{}",
+                mnemonic, sfx, imm, lhs_n, dest_n
+            ));
+        } else if let Some(rhs_phys) = self.operand_reg(rhs).filter(|&r| is_gpr_reg(r)) {
+            if rhs_phys == dest_phys {
+                // dest already holds rhs: two-address `op %lhs, %dest` is
+                // 3 bytes vs EVEX NDD 6. Commutative or not, the short
+                // form wins; Sub cannot commute into NDD anyway.
+                return false;
+            }
+            let rhs_n = if use_32bit {
+                phys_reg_name_32(rhs_phys)
+            } else {
+                phys_reg_name(rhs_phys)
+            };
+            self.state.emit_fmt(format_args!(
+                "    {}{} %{}, %{}, %{}",
+                mnemonic, sfx, rhs_n, lhs_n, dest_n
+            ));
+        } else {
+            return false;
+        }
+        if use_32bit {
+            self.emit_sext32_for_value(
+                phys_reg_name_32(dest_phys),
+                phys_reg_name(dest_phys),
+                is_unsigned,
+                dest_value_id,
+            );
+        }
+        self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (SOUNDNESS): the NDD form just wrote
+        // dest_phys with the derived result. Register the write so any
+        // OTHER live value homed there is reloaded by its next consumer
+        // instead of reading the derived content (note_staging_target/
+        // note_reg_clobbered).
+        self.note_inplace_compute(dest_phys, dest_value_id);
+        true
+    }
+
+    /// In-place compute bookkeeping: `written` now holds the derived value of
+    /// `dest_id` (2-operand `op %r, %r`, LEA/shift chains, NDD 3-operand). If
+    /// `written` IS dest's home, the definition invariant marks it fresh;
+    /// every OTHER sharer of `written` is stale either way.
+    pub(super) fn note_inplace_compute(&mut self, written: PhysReg, dest_id: u32) {
+        self.note_reg_clobbered(written.0);
+        if let Some(&home) = self.reg_assignments.get(&dest_id) {
+            if home.0 == written.0 {
+                self.home_fresh.insert(dest_id);
+                self.clear_home_clobbered(dest_id);
+                // The in-place write IS this definition (the chain-update
+                // freshen the alias law blesses through).
+                self.home_write_state
+                    .insert(written.0, HomeWrite::Def(dest_id));
+            }
+        }
+    }
+
+    pub(super) fn emit_alu_reg_direct(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        is_unsigned: bool,
+        dest_value_id: u32,
+    ) {
+        if self.try_emit_ndd_alu(
+            op,
+            lhs,
+            rhs,
+            dest_phys,
+            use_32bit,
+            is_unsigned,
+            dest_value_id,
+        ) {
+            return;
+        }
+        let dest_name = phys_reg_name(dest_phys);
+        // Safety: verify the 32-bit name is valid. The "rbpd" bug appears to be
+        // caused by some codegen path concatenating the 64-bit name with "d" suffix
+        // instead of using the proper 32-bit register name.
+        let dest_name_32 = phys_reg_name_32(dest_phys);
+        debug_assert!(
+            !dest_name_32.contains("rbp") || dest_name_32 == "ebp",
+            "unexpected 32-bit name for rbp: {}",
+            dest_name_32
+        );
+
+        // Immediate form
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            self.operand_to_callee_reg(lhs, dest_phys);
+            if op == IrBinOp::Mul {
+                // Strength reduction through the CPU tuning model
+                // (`X86Tune::mul_const_plan`): a LEA/SHL/ADD/SUB/NEG chain
+                // replaces `imul $k` when the chain's MEASURED latency
+                // (steps cost `lea_scaled_latency` for LEA — 2 ticks on
+                // Golden/Raptor Cove scaled-index LEA — and 1 for ALU/shs
+                // steps) is strictly below IMUL's: budget `imul_latency − 1`
+                // in cost units (2 on every P-core and Zen, 4 on Gracemont
+                // whose IMUL is 5 cycles).  ×3/×5/×9 stay a single LEA
+                // (2 < 3); 2-step LEA chains such as ×45's `lea (r,r,4); lea
+                // (r,r,8)` cost 4 and lose to `imull $45` (3) — as GCC
+                // 16.2 emits it — while LEA-free plans like `x15 = (x<<4)−x`
+                // (2) survive.  Gracemont still runs 3–4 step chains.
+                let plan_k = if use_32bit { imm as i32 as i64 } else { imm };
+                let plan = self.tune.mul_const_plan(plan_k);
+                let lhs_src_reg = self
+                    .operand_reg(lhs)
+                    .filter(|r| !is_xmm_reg(*r) && *r != dest_phys);
+                let plan = plan.filter(|p| !p.needs_distinct_src || lhs_src_reg.is_some());
+                if let Some(plan) = plan {
+                    use crate::backend::x86::cpu_model::MulStep;
+                    let (dst, src, sfx) = if use_32bit {
+                        (
+                            dest_name_32.to_string(),
+                            lhs_src_reg
+                                .map(phys_reg_name_32)
+                                .unwrap_or(dest_name_32)
+                                .to_string(),
+                            "l",
+                        )
+                    } else {
+                        (
+                            dest_name.to_string(),
+                            lhs_src_reg
+                                .map(phys_reg_name)
+                                .unwrap_or(dest_name)
+                                .to_string(),
+                            "q",
+                        )
+                    };
+                    for step in plan.steps() {
+                        match *step {
+                            MulStep::LeaScale(sc) => self.state.emit_fmt(format_args!(
+                                "    lea{} (, %{}, {}), %{}",
+                                sfx, src, sc, dst
+                            )),
+                            MulStep::LeaMul(sc) => self.state.emit_fmt(format_args!(
+                                "    lea{} (%{}, %{}, {}), %{}",
+                                sfx, dst, dst, sc, dst
+                            )),
+                            MulStep::Shl(k) => self
+                                .state
+                                .emit_fmt(format_args!("    shl{} ${}, %{}", sfx, k, dst)),
+                            MulStep::AddSrc => self
+                                .state
+                                .emit_fmt(format_args!("    add{} %{}, %{}", sfx, src, dst)),
+                            MulStep::SubSrc => self
+                                .state
+                                .emit_fmt(format_args!("    sub{} %{}, %{}", sfx, src, dst)),
+                            MulStep::Neg => {
+                                self.state.emit_fmt(format_args!("    neg{} %{}", sfx, dst))
+                            }
+                        }
+                    }
+                    if use_32bit {
+                        self.emit_sext32_for_value(
+                            dest_name_32,
+                            dest_name,
+                            is_unsigned,
+                            dest_value_id,
+                        );
+                    }
+                } else if use_32bit {
+                    // Encode u32 constants as signed imm32 (same bits).
+                    let imm32 = imm as i32 as i64;
+                    self.state.emit_fmt(format_args!(
+                        "    imull ${}, %{}, %{}",
+                        imm32, dest_name_32, dest_name_32
+                    ));
+                    self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    imulq ${}, %{}, %{}",
+                        imm, dest_name, dest_name
+                    ));
+                }
+            } else {
+                let mnemonic = alu_mnemonic(op);
+                let nonneg_and = op == IrBinOp::And && imm >= 0 && imm <= i32::MAX as i64;
+                if use_32bit || nonneg_and {
+                    self.state.emit_fmt(format_args!(
+                        "    {}l ${}, %{}",
+                        mnemonic, imm, dest_name_32
+                    ));
+                    if !nonneg_and {
+                        self.emit_sext32_for_value(
+                            dest_name_32,
+                            dest_name,
+                            is_unsigned,
+                            dest_value_id,
+                        );
+                    }
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {}q ${}, %{}", mnemonic, imm, dest_name));
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+            // In-place compute accounting (SOUNDNESS, see
+            // note_inplace_compute): the immediate form staged the LHS into
+            // dest_phys and derived the result in place — the two-operand
+            // chain (`addq $imm, %dest`) IS the dest's definition. Missing
+            // this note left mulacc-chain tails permanently home_clobbered
+            // (their only write) and consumers hit the stale-home refusal
+            // (CI PR #487: differential-fuzz-smoke crash_synth_20260906).
+            self.note_inplace_compute(dest_phys, dest_value_id);
+            return;
+        }
+
+        // Register-register form
+        // Integer ALU reg-direct requires GPR names; an XMM-homed operand
+        // (bit-punned float words after hidden_proto math wrappers inline)
+        // must take the accumulator fallback, which handles the xmm->GPR
+        // move (phys_reg_name_32(xmm) is unreachable!()).
+        let rhs_phys = self.operand_reg(rhs).filter(|r| !is_xmm_reg(*r));
+        let rhs_conflicts = rhs_phys.is_some_and(|r| r.0 == dest_phys.0);
+        let (rhs_reg_name, rhs_reg_name_32): (String, String) = if rhs_conflicts {
+            // rhs is in dest register — we need to save rhs to %rax before loading lhs.
+            // But if lhs is in the accumulator cache, we must save it to dest first,
+            // because operand_to_rax(rhs) would clobber %rax.
+            let lhs_in_acc = match lhs {
+                Operand::Value(v) => {
+                    let is_alloca = self.state.is_alloca(v.0);
+                    self.state.acc_has_verified(v.0, is_alloca)
+                }
+                _ => false,
+            };
+            if lhs_in_acc {
+                // RA-09: lhs is in %rax and rhs's home IS the dest register.
+                // The old code saved lhs into dest (`movq %rax,%dest`) and then
+                // re-read "rhs" from dest (`movq %dest,%rax`) — but that first
+                // move clobbered rhs's value, so the re-read returned lhs, and
+                // `op %rax,%dest` computed `lhs op lhs` (a self-op / miscompile,
+                // e.g. base.c `xorl %ebx,%ebx` when 131/128/132 all homed rbx).
+                // Both operands are already staged correctly: lhs in %rax, rhs
+                // in dest. The common tail `op %rax, %dest` then computes
+                // `rhs op lhs` into dest, which equals `lhs op rhs` for every
+                // commutative ALU op (Add/And/Or/Xor/Mul). Sub is non-commutative
+                // and must preserve operand order (lhs - rhs), so it is staged
+                // through %rax below before the tail.
+                if op == IrBinOp::Sub {
+                    let rhs_name = phys_reg_name(rhs_phys.unwrap());
+                    let rhs_name_32 = phys_reg_name_32(rhs_phys.unwrap());
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    subl %{}, %eax", rhs_name_32));
+                        self.state
+                            .emit_fmt(format_args!("    movl %eax, %{}", dest_name_32));
+                        self.emit_sext32_for_value(
+                            dest_name_32,
+                            dest_name,
+                            is_unsigned,
+                            dest_value_id,
+                        );
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    subq %{}, %rax", rhs_name));
+                        self.state
+                            .emit_fmt(format_args!("    movq %rax, %{}", dest_name));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.note_inplace_compute(dest_phys, dest_value_id);
+                    return;
+                }
+                // Commutative: leave lhs in %rax, rhs in dest. The tail emits
+                // `op %rax, %dest`.
+            } else {
+                self.operand_to_rax(rhs);
+                self.operand_to_callee_reg(lhs, dest_phys);
+            }
+            ("rax".to_string(), "eax".to_string())
+        } else if op != IrBinOp::Sub
+            && rhs_phys.is_none()
+            && matches!(rhs, Operand::Value(v) if self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)))
+            && let Some(lreg) = self
+                .operand_reg(lhs)
+                .filter(|r| !is_xmm_reg(*r) && r.0 != dest_phys.0)
+        {
+            self.note_staging_target(rhs, dest_phys);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", "rax", dest_name);
+            (
+                phys_reg_name(lreg).to_string(),
+                phys_reg_name_32(lreg).to_string(),
+            )
+        } else {
+            self.operand_to_callee_reg(lhs, dest_phys);
+            if let Some(rhs_phys) = rhs_phys {
+                (
+                    phys_reg_name(rhs_phys).to_string(),
+                    phys_reg_name_32(rhs_phys).to_string(),
+                )
+            } else {
+                self.operand_to_rax(rhs);
+                ("rax".to_string(), "eax".to_string())
+            }
+        };
+
+        if op == IrBinOp::Mul {
+            if use_32bit {
+                self.state
+                    .out
+                    .emit_instr_reg_reg("    imull", &rhs_reg_name_32, dest_name_32);
+                self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
+            } else {
+                self.state
+                    .out
+                    .emit_instr_reg_reg("    imulq", &rhs_reg_name, dest_name);
+            }
+        } else {
+            let mnemonic = alu_mnemonic(op);
+            if use_32bit {
+                // 32-bit ALU ops (addl/andl/xorl/...) are shorter and faster than
+                // their 64-bit forms. Add/Sub already took this path; And/Or/Xor/Mul
+                // previously emitted `q`-suffix ops on zero/sign-extended homes,
+                // which is semantically correct but wasteful. All simple ALU ops
+                // have identical low-32-bit results, and the per-value
+                // sign-extension discipline (emit_sext32_for_value) keeps the
+                // 64-bit home correctly extended for signed I32 values.
+                self.state.emit_fmt(format_args!(
+                    "    {}l %{}, %{}",
+                    mnemonic, rhs_reg_name_32, dest_name_32
+                ));
+                self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
+            } else {
+                self.state.emit_fmt(format_args!(
+                    "    {}q %{}, %{}",
+                    mnemonic, rhs_reg_name, dest_name
+                ));
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (SOUNDNESS, see note_inplace_compute):
+        // the 2-operand forms just wrote the derived result into dest_phys.
+        self.note_inplace_compute(dest_phys, dest_value_id);
+    }
+
+    /// Register-direct path for shift operations.
+    pub(super) fn emit_shift_reg_direct(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        is_unsigned: bool,
+        dest_value_id: u32,
+    ) {
+        let dest_name = phys_reg_name(dest_phys);
+        let dest_name_32 = phys_reg_name_32(dest_phys);
+        let (mnem32, mnem64) = shift_mnemonic(op);
+
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            if self.rorx_masked_shifts.contains(&dest_value_id) {
+                let direct_src = match lhs {
+                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied().filter(|r| {
+                        !is_xmm_reg(*r)
+                            && (!self.home_clobbered.contains(&v.0)
+                                || self.home_readable_via_alias(v.0))
+                    }),
+                    _ => None,
+                };
+                if let Some(src) = direct_src {
+                    if use_32bit {
+                        let shift_amount = (imm as u32) & 31;
+                        let src32 = phys_reg_name_32(src);
+                        self.state.emit_fmt(format_args!(
+                            "    rorxl ${}, %{}, %{}",
+                            shift_amount, src32, dest_name_32
+                        ));
+                    } else {
+                        let shift_amount = (imm as u64) & 63;
+                        let src64 = phys_reg_name(src);
+                        self.state.emit_fmt(format_args!(
+                            "    rorxq ${}, %{}, %{}",
+                            shift_amount, src64, dest_name
+                        ));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.note_inplace_compute(dest_phys, dest_value_id);
+                    return;
+                }
+            }
+            self.operand_to_callee_reg(lhs, dest_phys);
+            if use_32bit {
+                let shift_amount = (imm as u32) & 31;
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, %{}",
+                    mnem32, shift_amount, dest_name_32
+                ));
+                if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                }
+            } else {
+                let shift_amount = (imm as u64) & 63;
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, %{}",
+                    mnem64, shift_amount, dest_name
+                ));
+            }
+        } else if self.bmi2_enabled {
+            // BMI2 three-operand form.  Both sources are read straight from
+            // their register homes when they have one, so `x << k` with x
+            // and k in argument registers is a single `shlxq %rsi,%rdi,%rax`
+            // (GCC 16.2 / Clang 23.1 / ICX emit exactly this); the legacy
+            // form below needs `mov`+`mov`+`shl %cl` and pins %rcx.  On
+            // Intel the legacy `shl r,cl` is additionally 3 µops (SNB..CLX)
+            // or 2 µops (ICL..RPL) against 1 for shlx (uops.info), so it is
+            // taken whenever a home is missing as well; on Zen (1 µop each)
+            // the VEX form is only used when it saves the copy, otherwise
+            // the 2–3 byte shorter legacy encoding wins.
+            let (xmnem32, xmnem64) = shiftx_mnemonic(op);
+            let gpr_home = |r: Option<PhysReg>| r.filter(|r| !is_xmm_reg(*r));
+            let count_home = gpr_home(self.operand_reg(rhs));
+            let lhs_home = gpr_home(self.operand_reg(lhs));
+            let saves_move = count_home.is_some() || lhs_home.is_some();
+            if self.tune.prefer_shlx(true) || (saves_move && self.tune.shlx_saves_move(true)) {
+                // Count operand: its own home, else staged in %rcx.  Stage
+                // BEFORE the lhs load when the lhs must land in the count's
+                // home register (dest == count home, lhs not homed).
+                let count_name: &str = match count_home {
+                    Some(r) if lhs_home.is_some() || r.0 != dest_phys.0 => phys_reg_name(r),
+                    _ => {
+                        self.operand_to_rcx(rhs);
+                        "rcx"
+                    }
+                };
+                let count_name = if use_32bit {
+                    match count_name {
+                        "rcx" => "ecx".to_string(),
+                        _ => phys_reg_name_32(count_home.unwrap()).to_string(),
+                    }
+                } else {
+                    count_name.to_string()
+                };
+                let src_name: String = match lhs_home {
+                    Some(r) => {
+                        if use_32bit {
+                            phys_reg_name_32(r).to_string()
+                        } else {
+                            phys_reg_name(r).to_string()
+                        }
+                    }
+                    None => {
+                        self.operand_to_callee_reg(lhs, dest_phys);
+                        if use_32bit {
+                            dest_name_32.to_string()
+                        } else {
+                            dest_name.to_string()
+                        }
+                    }
+                };
+                if use_32bit {
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}, %{}",
+                        xmnem32, count_name, src_name, dest_name_32
+                    ));
+                    if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}, %{}",
+                        xmnem64, count_name, src_name, dest_name
+                    ));
+                }
+            } else {
+                self.emit_shift_cl_legacy(
+                    op,
+                    lhs,
+                    rhs,
+                    dest_phys,
+                    use_32bit,
+                    is_unsigned,
+                    dest_value_id,
+                );
+            }
+        } else {
+            self.emit_shift_cl_legacy(
+                op,
+                lhs,
+                rhs,
+                dest_phys,
+                use_32bit,
+                is_unsigned,
+                dest_value_id,
+            );
+        }
+        self.state.reg_cache.invalidate_acc();
+        // In-place compute accounting (SOUNDNESS, see note_inplace_compute):
+        // every form above wrote the derived shift result into dest_phys.
+        self.note_inplace_compute(dest_phys, dest_value_id);
+    }
+
+    /// Register-direct rotate: `rol/ror $imm, %dest` for a constant count,
+    /// `rol/ror %cl, %dest` for a variable one.
+    ///
+    /// Mirrors `emit_shift_reg_direct`'s staging discipline (lhs into the
+    /// destination register, count staged so neither load clobbers the other's
+    /// source) but has no BMI2 form to prefer: `rorx` is immediate-only and
+    /// right-only, so the legacy two-operand encoding is already the best
+    /// generally available one — and unlike `shl %cl`, which costs 2–3 µops on
+    /// Intel, `rol %cl` is a single µop, so there is no throughput case for a
+    /// VEX alternative either.
+    ///
+    /// Callers must only route 32- and 64-bit rotates here: `rol`/`ror` mask
+    /// the count to 5 bits for 8/16/32-bit operands and 6 bits for 64-bit, so
+    /// an 8- or 16-bit rotate would wrap at the wrong width. `bit_idioms`
+    /// recognizes only I32/U32/I64/U64 rotates for exactly this reason.
+    pub(super) fn emit_rotate_reg_direct(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        ty: IrType,
+        dest_value_id: u32,
+    ) {
+        let dest_name = phys_reg_name(dest_phys);
+        let dest_name_32 = phys_reg_name_32(dest_phys);
+        let width: i64 = match ty {
+            IrType::I8 | IrType::U8 => 8,
+            IrType::I16 | IrType::U16 => 16,
+            IrType::I32 | IrType::U32 => 32,
+            IrType::I64 | IrType::U64 | IrType::Ptr => 64,
+            _ => unreachable!("rotate of non-integer type"),
+        };
+        let mnem = rotate_mnemonic_width(op, width as u32);
+        let dest_typed = typed_phys_reg_name(dest_phys, ty);
+
+        if let Some(imm) = Self::const_as_imm32(rhs) {
+            // Reduce explicitly instead of leaning on the hardware mask: the
+            // emitted immediate then documents the real rotation, and a count
+            // of 0 (or any multiple of the width) folds away to the copy that
+            // already produced the value, rather than emitting a flag-writing
+            // no-op.
+            let amount = (imm as i64).rem_euclid(width);
+            // Direct 3-operand rorx: RORX is NON-DESTRUCTIVE (BMI2's whole
+            // point), so a lhs that is provably fresh in a register home can
+            // be read in place — no staging move into the destination first.
+            // sha256's sigma functions homed their inputs in callee-saved
+            // registers and staged `movq %r14, %rbp` before EVERY
+            // `rorxl $k, %ebp, %ebp` — three dead 64-bit moves per round,
+            // ~192 per transform call (measured on the benchmark corpus:
+            // sha256_transform at 1.20x gcc). The typed view is enough:
+            // `rorxl $k, %r14d, %ebp` reads the low 32 bits of the home and
+            // fully defines the destination (the write zero-extends into
+            // the upper half, which the sext32 normalization below then
+            // adjusts for signed results exactly as the staged form did).
+            if amount != 0
+                && self.bmi2_enabled
+                && super::isel::rorx_allowed()
+                && (width == 32 || width == 64)
+            {
+                let direct_src = match lhs {
+                    Operand::Value(v) => {
+                        // Home-freshness gate (operand_to_callee_reg's
+                        // discipline): only a register that provably still
+                        // holds the value may be read directly.
+                        self.reg_assignments
+                            .get(&v.0)
+                            .copied()
+                            .filter(|&r| !is_xmm_reg(r))
+                            .filter(|_| {
+                                !self.home_clobbered.contains(&v.0)
+                                    || self.home_readable_via_alias(v.0)
+                            })
+                    }
+                    _ => None,
+                };
+                if let Some(src) = direct_src {
+                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
+                    let ror_amount = match op {
+                        IrBinOp::RotateLeft => (width - amount) % width,
+                        IrBinOp::RotateRight => amount,
+                        _ => amount,
+                    };
+                    debug_assert!(ror_amount != 0);
+                    let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                    let src_typed = typed_phys_reg_name(src, ty);
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %{}, %{}",
+                        ror_mnem, ror_amount, src_typed, dest_typed
+                    ));
+                    if width == 32 {
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.note_inplace_compute(dest_phys, dest_value_id);
+                    return;
+                }
+            }
+            // Sub-word sources load with their typed form so the home stays
+            // zero-extended; 32/64-bit sources keep the generic staging.
+            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+            if amount != 0 {
+                if self.bmi2_enabled && super::isel::rorx_allowed() && (width == 32 || width == 64)
+                {
+                    // Prefer BMI2 rorx: non-destructive, flag-preserving.
+                    let ror_amount = match op {
+                        IrBinOp::RotateLeft => (width - amount) % width,
+                        IrBinOp::RotateRight => amount,
+                        _ => amount,
+                    };
+                    // amount != 0 above proves ror_amount != 0 (and a
+                    // hypothetical 0 is still a correct no-op: `rorx $0`
+                    // is the identity on the already-moved value).
+                    debug_assert!(ror_amount != 0);
+                    let ror_mnem = if width == 32 { "rorxl" } else { "rorxq" };
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %{}, %{}",
+                        ror_mnem, ror_amount, dest_typed, dest_typed
+                    ));
+                    if width == 32 {
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %{}", mnem, amount, dest_typed));
+                    if width == 32 {
+                        // A rotate can move any bit into bit 31, so a signed I32
+                        // result needs the same upper-half normalization a signed
+                        // `shl` does. No-op for the unsigned types rotate idioms
+                        // actually use. Sub-word results keep their zero-extended
+                        // homes: `rolw`/`rolb` only write the low bits.
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                }
+            }
+            self.state.reg_cache.invalidate_acc();
+            // Definition-writes-home accounting: the staged lhs (identity
+            // rotate-by-0 included) plus the rotate derived the dest into
+            // dest_phys.
+            self.note_inplace_compute(dest_phys, dest_value_id);
+            return;
+        }
+
+        // Variable count: x86 pins it to %cl. Stage the count first when its
+        // home is the destination register, so the lhs load cannot overwrite
+        // it (the same hazard `emit_shift_cl_legacy` guards).
+        let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
+        if rhs_conflicts {
+            self.operand_to_cl(rhs);
+            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+        } else {
+            self.operand_to_callee_reg_narrow(lhs, dest_phys, ty);
+            self.operand_to_cl(rhs);
+        }
+        self.state
+            .emit_fmt(format_args!("    {} %cl, %{}", mnem, dest_typed));
+        if width == 32 {
+            self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+        }
+        self.state.reg_cache.invalidate_acc();
+        // Definition-writes-home accounting (variable-count arm).
+        self.note_inplace_compute(dest_phys, dest_value_id);
+    }
+
+    /// Legacy `shl/shr/sar %cl, %dest` for a variable count: lhs staged in
+    /// `dest`, count staged in `%rcx` (order chosen so neither load clobbers
+    /// the other's source).
+    fn emit_shift_cl_legacy(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        is_unsigned: bool,
+        dest_value_id: u32,
+    ) {
+        let dest_name = phys_reg_name(dest_phys);
+        let dest_name_32 = phys_reg_name_32(dest_phys);
+        let (mnem32, mnem64) = shift_mnemonic(op);
+        let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
+        if rhs_conflicts {
+            self.operand_to_cl(rhs);
+            self.operand_to_callee_reg(lhs, dest_phys);
+        } else {
+            self.operand_to_callee_reg(lhs, dest_phys);
+            self.operand_to_cl(rhs);
+        }
+        if use_32bit {
+            self.state
+                .emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
+            if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+                self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+            }
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
+        }
+    }
+
+    /// Accumulator-based path: try immediate optimizations first.
+    /// Returns true if handled.
+    pub(super) fn try_emit_acc_immediate(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        use_32bit: bool,
+        is_unsigned: bool,
+    ) -> bool {
+        // Immediate ALU ops
+        if matches!(
+            op,
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+        ) {
+            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                self.operand_to_rax(lhs);
+                let mnemonic = alu_mnemonic(op);
+                // The l-form is REQUIRED (not just preferred) when the
+                // immediate only exists as a 32-bit bit pattern
+                // (i32::MAX < imm <= u32::MAX): the q-form sign-extends its
+                // imm32, so `xorq $0x80000000` is unencodable — the old
+                // assembler silently turned it into XOR with
+                // 0xFFFFFFFF80000000 (wrong 33 bits). After the l-form the
+                // canonical 64-bit slot value is restored exactly like the
+                // Add/Sub path: cltq for signed, implicit zero-extension for
+                // unsigned.
+                let needs_l_form = imm > i32::MAX as i64;
+                let nonneg_and = op == IrBinOp::And && imm >= 0 && imm <= i32::MAX as i64;
+                if (use_32bit && (matches!(op, IrBinOp::Add | IrBinOp::Sub) || needs_l_form))
+                    || nonneg_and
+                {
+                    self.state
+                        .emit_fmt(format_args!("    {}l ${}, %eax", mnemonic, imm));
+                    if !nonneg_and && !is_unsigned {
+                        // Same needs_sext refinement as the general ALU path
+                        // (emit_sext32_for_value): a value with no 64-bit
+                        // consumer keeps the zero-extended form; the cltq
+                        // exists only to restore the canonical SEXT form.
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                    }
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {}q ${}, %rax", mnemonic, imm));
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(dest);
+                return true;
+            }
+        }
+
+        // Immediate multiply
+        if op == IrBinOp::Mul {
+            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                // Register-homed non-scratch lhs: emit straight from the
+                // home register (`leal (%r11,%r11,2), %eax` /
+                // `imull $7, %r11d, %eax`) instead of staging into the
+                // accumulator first — the staging copy was pure overhead
+                // (csv main: `movq %r11,%rax; leal (%eax,%eax,2), %eax`
+                // where GCC emits one instruction). Same non-scratch
+                // discipline as the alu shortcut: rax/rcx/rdx homes are
+                // point-insensitive and can be clobbered between the
+                // source's def and this use.
+                let src_home = match lhs {
+                    Operand::Value(v) => self
+                        .reg_assignments
+                        .get(&v.0)
+                        .copied()
+                        .filter(|&r| {
+                            let name = phys_reg_name(r);
+                            !is_xmm_reg(r) && name != "rax" && name != "rcx" && name != "rdx"
+                        })
+                        .map(|r| {
+                            let op = if use_32bit {
+                                phys_reg_name_32(r)
+                            } else {
+                                phys_reg_name(r)
+                            };
+                            (op.to_string(), phys_reg_name(r))
+                        }),
+                    _ => None,
+                };
+                if let Some((src, src64)) = src_home {
+                    let scale = Self::lea_scale_for_mul(imm);
+                    if let Some(scale) = scale {
+                        if use_32bit {
+                            // 64-bit address registers: `leal` reads only the
+                            // low 32 bits of the sum either way, and 32-bit
+                            // address registers cost an addr32 (0x67) prefix.
+                            self.state.emit_fmt(format_args!(
+                                "    leal (%{a},%{a},{}), %eax",
+                                scale,
+                                a = src64
+                            ));
+                        } else {
+                            self.state.emit_fmt(format_args!(
+                                "    leaq (%{s},%{s},{}), %rax",
+                                scale,
+                                s = src
+                            ));
+                        }
+                    } else if use_32bit {
+                        let imm32 = imm as i32 as i64;
+                        self.state
+                            .emit_fmt(format_args!("    imull ${}, %{}, %eax", imm32, src));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    imulq ${}, %{}, %rax", imm, src));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    if use_32bit && !is_unsigned {
+                        // The dest's canonical 64-bit slot value keeps the
+                        // sign-extended product (same contract as below),
+                        // gated on the value actually having a 64-bit
+                        // consumer (needs_sext refinement — the general ALU
+                        // path's emit_sext32_for_value contract).
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                    }
+                    self.store_rax_to(dest);
+                    return true;
+                }
+                self.operand_to_rax(lhs);
+                // LEA strength reduction: x*3/5/9 → lea (%rax, %rax, scale), %rax.
+                // lea has 1-cycle latency vs 3 cycles for imul on modern x86.
+                if let Some(scale) = Self::lea_scale_for_mul(imm) {
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    leal (%rax, %rax, {}), %eax", scale));
+                        if !is_unsigned {
+                            self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                        }
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    leaq (%rax, %rax, {}), %rax", scale));
+                    }
+                } else if use_32bit {
+                    let imm32 = imm as i32 as i64;
+                    self.state
+                        .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm32));
+                    if !is_unsigned {
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                    }
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(dest);
+                return true;
+            }
+        }
+
+        // Immediate shift
+        if matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
+            if let Some(imm) = Self::const_as_imm32(rhs) {
+                if self.rorx_masked_shifts.contains(&dest.0) {
+                    let src_home = match lhs {
+                        Operand::Value(v) => self.reg_assignments.get(&v.0).copied().filter(|&r| {
+                            let name = phys_reg_name(r);
+                            !is_xmm_reg(r)
+                                && name != "rax"
+                                && name != "rcx"
+                                && name != "rdx"
+                                && (!self.home_clobbered.contains(&v.0)
+                                    || self.home_readable_via_alias(v.0))
+                        }),
+                        _ => None,
+                    };
+                    if let Some(src) = src_home {
+                        if use_32bit {
+                            let shift_amount = (imm as u32) & 31;
+                            let src32 = phys_reg_name_32(src);
+                            self.state.emit_fmt(format_args!(
+                                "    rorxl ${}, %{}, %eax",
+                                shift_amount, src32
+                            ));
+                        } else {
+                            let shift_amount = (imm as u64) & 63;
+                            let src64 = phys_reg_name(src);
+                            self.state.emit_fmt(format_args!(
+                                "    rorxq ${}, %{}, %rax",
+                                shift_amount, src64
+                            ));
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                        self.store_rax_to(dest);
+                        return true;
+                    }
+                }
+                self.operand_to_rax(lhs);
+                let (mnem32, mnem64) = shift_mnemonic(op);
+                if use_32bit {
+                    let shift_amount = (imm as u32) & 31;
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %eax", mnem32, shift_amount));
+                    // A 32-bit shift zero-fills the upper half; the canonical
+                    // sign-extended home is needed only when some consumer
+                    // reads it wide (`needs_sext_values`, as for the imul
+                    // path above).  The unconditional `cltq` here predated
+                    // that demand analysis and stacked onto every explicit
+                    // widening Cast of the result (`sarl; cltq; movslq`,
+                    // the byte-sum vector-end computation).
+                    if matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
+                    }
+                } else {
+                    let shift_amount = (imm as u64) & 63;
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %rax", mnem64, shift_amount));
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(dest);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Helper to load va_list pointer into %rcx for va_arg operations.
+    pub(super) fn load_va_list_ptr_to_rcx(&mut self, va_list_ptr: &Value) {
+        if let Some(&reg) = self.reg_assignments.get(&va_list_ptr.0) {
+            let reg_name = phys_reg_name(reg);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", reg_name, "rcx");
+        } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
+            if self.state.is_alloca(va_list_ptr.0) {
+                self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rcx");
+            } else {
+                self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+            }
+        }
+    }
+}
+
+pub(super) const X86_ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+
+// The vreg def/use scanner and the store/reload peephole that used to live
+// here were dead scaffolding for a MachInst-local register allocator that was
+// never wired up (and the peephole was unsound if it ever had been: folding a
+// store→reload pair drops the store, and nothing proved the slot had no later
+// reader). Both are superseded — properly — by `machinst_alloc.rs`, whose
+// scanner is def/use-aware across every variant and whose reload/store
+// insertion is driven by SSA-exact window liveness instead of adjacency.
+
+/// Resolve stack-only vregs in a MachInst: replace MachReg::Vreg(id) with the
+/// value's stack slot as a memory operand — EXCEPT for vregs the window
+/// register allocator will handle (`reg_classified`): those keep their
+/// register positions so the allocator rewrites every occurrence uniformly
+/// (mixing a slot-substituted read with a register-held def of the same SSA
+/// value inside one window would read a stale slot image).
+///
+/// For instructions where the vreg is a dst (two-address ALU), we need to use
+/// rax as scratch: load→operate→store (or, now, the window allocator's
+/// reload/operate/store).
+/// Fail-closed %rax-touch scan over a MachInst window.
+///
+/// A window is eligible for the acc-resident substitution only when NO
+/// instruction in it can touch %rax — explicitly (a `Phys(RAX)` operand
+/// anywhere, including memory bases) or implicitly (division's rax:rdx
+/// pair, call/return clobbers, the `Raw` escape hatch whose register
+/// effects are invisible). Anything uncertain fails closed: the window
+/// keeps its slot reads, which are always correct.
+/// Every IR value id a MachInst window DEFINES (a Vreg destination).
+///
+/// The acc-resident substitution may only fire for values the window does
+/// not redefine: a read AFTER an in-window definition must observe the
+/// definition's result (the slot write for a spilled Vreg, the home for a
+/// pre-colored one), never the pre-window image still sitting in %rax.
+/// The rotated-latch shape (phi elimination + loop rotation) puts the
+/// `Copy v_phi <- v_next` and the duplicated exit test in ONE window —
+/// the compare must see the copy's new value, not the previous
+/// iteration's park (latch_dead_at_boundaries_segment:
+/// rounds=4214233 instead of 41).
+fn machinst_window_defs(
+    buf: &[super::machinst::MachInst],
+) -> crate::common::fx_hash::FxHashSet<u32> {
+    use super::machinst::{MachInst, MachOperand, MachReg};
+    fn vreg_ids(op: &MachOperand, out: &mut crate::common::fx_hash::FxHashSet<u32>) {
+        if let MachOperand::Reg(MachReg::Vreg(id)) = op {
+            out.insert(*id);
+        }
+    }
+    fn reg_id(r: &MachReg, out: &mut crate::common::fx_hash::FxHashSet<u32>) {
+        if let MachReg::Vreg(id) = r {
+            out.insert(*id);
+        }
+    }
+    let mut defs = crate::common::fx_hash::FxHashSet::default();
+    for inst in buf {
+        match inst {
+            MachInst::Mov { src, dst, .. } | MachInst::FMov { src, dst, .. } => {
+                vreg_ids(src, &mut defs);
+                vreg_ids(dst, &mut defs);
+            }
+            MachInst::Cmov { src, dst, .. } => {
+                vreg_ids(src, &mut defs);
+                reg_id(dst, &mut defs);
+            }
+            MachInst::Movzx { dst, .. } | MachInst::Movsx { dst, .. } => reg_id(dst, &mut defs),
+            MachInst::SetCC { dst, .. } => reg_id(dst, &mut defs),
+            MachInst::Alu { dst, .. }
+            | MachInst::Imul3 { dst, .. }
+            | MachInst::Neg { dst, .. }
+            | MachInst::Not { dst, .. }
+            | MachInst::Shift { dst, .. }
+            | MachInst::ShiftX { dst, .. }
+            | MachInst::Rorx { dst, .. }
+            | MachInst::LeaSym { dst, .. }
+            | MachInst::LeaSlot { dst, .. } => reg_id(dst, &mut defs),
+            MachInst::Lea {
+                base: _,
+                index,
+                dst,
+                ..
+            } => {
+                reg_id(dst, &mut defs);
+                if let Some((i, _)) = index {
+                    reg_id(i, &mut defs);
+                }
+            }
+            // Fail-closed kinds never coexist with an eligible window
+            // (rax-touch scan rejects them); no def extraction needed.
+            //
+            // MAINTENANCE CONTRACT (audit P2-10): this catch-all and
+            // `machinst_window_rax_free`'s exhaustive match have OPPOSITE
+            // semantics by design — the rax scan must enumerate every
+            // variant (a new MachInst is a COMPILE ERROR there), while
+            // this one may stay silent because any variant the rax scan
+            // admits but this match misses merely makes the substitution
+            // conservatively decline (a perf slip, never a miscompile —
+            // the acc substitution only fires for values absent from the
+            // def set).  When MachInst grows a NEW Vreg-DEFINING variant,
+            // review BOTH matches together; the machinst_window_tests
+            // module pins the def arms that exist today.
+            _ => {}
+        }
+    }
+    defs
+}
+
+fn machinst_window_rax_free(buf: &[super::machinst::MachInst]) -> bool {
+    use super::machinst::{MachInst, MachOperand, MachReg};
+    let is_rax = |r: &MachReg| matches!(r, MachReg::Phys(p) if p.0 == super::machinst::RAX.0);
+    let op_rax = |op: &MachOperand| -> bool {
+        match op {
+            MachOperand::Reg(r) => is_rax(r),
+            MachOperand::Mem { base, .. } => is_rax(base),
+            MachOperand::MemIndex { base, index, .. } => is_rax(base) || is_rax(index),
+            _ => false,
+        }
+    };
+    for inst in buf {
+        let touches = match inst {
+            // Implicit rax contracts: fail closed.
+            MachInst::Cqto { .. }
+            | MachInst::Div { .. }
+            | MachInst::Call { .. }
+            | MachInst::CallTyped { .. }
+            | MachInst::Ret
+            | MachInst::Raw(_) => true,
+            MachInst::Mov { src, dst, .. } => op_rax(src) || op_rax(dst),
+            MachInst::FMov { src, dst, .. } => op_rax(src) || op_rax(dst),
+            MachInst::FAlu {
+                src2, src1, dst, ..
+            } => op_rax(src2) || is_rax(src1) || is_rax(dst),
+            MachInst::Mov128 { src, dst } => op_rax(src) || op_rax(dst),
+            MachInst::Movzx { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Movsx { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Alu { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Imul3 { src, dst, .. } => is_rax(src) || is_rax(dst),
+            MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => is_rax(dst),
+            MachInst::Shift { amount, dst, .. } => op_rax(amount) || is_rax(dst),
+            MachInst::ShiftX {
+                count, src, dst, ..
+            } => is_rax(count) || is_rax(src) || is_rax(dst),
+            MachInst::Rorx { src, dst, .. } => is_rax(src) || is_rax(dst),
+            MachInst::Lea {
+                base, index, dst, ..
+            } => is_rax(base) || index.is_some_and(|(i, _)| is_rax(&i)) || is_rax(dst),
+            MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => is_rax(dst),
+            MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+                op_rax(lhs) || op_rax(rhs)
+            }
+            MachInst::SetCC { dst, .. } => is_rax(dst),
+            MachInst::Cmov { src, dst, .. } => op_rax(src) || is_rax(dst),
+            MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => false,
+            MachInst::XorRdx => false,
+        };
+        if touches {
+            return false;
+        }
+    }
+    true
+}
+
+fn resolve_stack_vregs(
+    inst: &super::machinst::MachInst,
+    ra: &FxHashMap<u32, PhysReg>,
+    state: &CodegenState,
+    reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
+    acc_subst: bool,
+    window_defs: &crate::common::fx_hash::FxHashSet<u32>,
+) -> super::machinst::MachInst {
+    use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
+
+    // (a `resolve_reg` no-op helper was here; the window allocator owns
+    // register-form resolution now, so only operand substitution remains)
+
+    // WIDTH SOUNDNESS: a spilled vreg's slot is 4 bytes (small slot) or 8
+    // bytes. Substituting it into an instruction whose size is WIDER than
+    // the slot makes the emitter read bytes past the slot — e.g.
+    // `cmpq $0, 28(%rsp)` on a 4-byte slot pulls the adjacent slot's
+    // garbage into the high 32 bits (kernel lib/zstd
+    // ZSTD_decodeLiteralsBlock: the 64-bit `!lhlCode` predicate read
+    // `flags` from the neighboring slot and took the wrong HUF dispatch).
+    // A register-form consumer is safe — a `movl` reload zero-extends —
+    // but memory-operand substitution silently loses that extension.
+    // Refuse the substitution when the instruction size exceeds the slot
+    // width: the leftover Vreg trips has_unresolvable_vreg and the
+    // buffered window falls back to the default (accumulator) path, which
+    // loads every value at its true width.
+    // The width rule is single-sourced (slot_fits_width); see its doc for
+    // why a too-wide substitution must be refused, not widened.
+    let slot_fits =
+        |id: &u32, inst_size: OpSize| -> bool { slot_fits_width(state, *id, inst_size) };
+
+    // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
+    // Vregs the window allocator owns (reg_classified) are never substituted.
+    //
+    // ACC-RESIDENT SUBSTITUTION (acc_subst): when the whole window is
+    // provably %rax-free (see machinst_window_rax_free) and owns no
+    // scratch registers, a Vreg the accumulator cache holds may be read
+    // as %rax directly instead of its slot — the slot read right after a
+    // park is an exposed store-to-load forward (the sha256 loop-counter
+    // compare: `movq %rax, 72(%rsp); movq %rbp, %r11; movq 72(%rsp),
+    // %rax; cmpl $8, %eax`). The value's def executed on the text path
+    // BEFORE the window (only that path maintains the cache), so every
+    // window reference to it is a use of the pre-window image %rax holds.
+    // The slot_fits width discipline is shared with the memory form: a
+    // read wider than the slot never substitutes (the leftover Vreg
+    // trips the fallback, which loads at the true width).
+    let resolve_op = |op: &MachOperand, inst_size: OpSize, is_read: bool| -> MachOperand {
+        match op {
+            MachOperand::Reg(MachReg::Vreg(id))
+                if !ra.contains_key(id) && !reg_classified.contains(id) =>
+            {
+                // READS ONLY. A write position redirected into %rax would
+                // store the result into the accumulator instead of the
+                // value's slot — and for the phi-elimination copies (the
+                // one multi-def shape in the stream) the acc entry can
+                // still name the value from a PREDECESSOR block's text
+                // park, so the slot would keep the stale incoming value
+                // and every later slot reader would see the wrong
+                // iteration's data (latch_dead_at_boundaries_segment:
+                // rounds=4214233 instead of 41).
+                // Register-class guard (audit P2-9): %rax is an INTEGER
+                // accumulator — the substitution is blind to register
+                // classes, so a vector/FP-class value ever named by the
+                // acc cache would be rewritten to read a GPR.  Today the
+                // cache is written exclusively by integer paths
+                // (set_acc / store_eax_to / store_rax_to), so this is a
+                // fail-closed belt, not an active filter — keep it if a
+                // future path ever caches xmm-class values.
+                if is_read
+                    && acc_subst
+                    && !window_defs.contains(id)
+                    && slot_fits(id, inst_size)
+                    && !state.vector_values.contains(id)
+                    && state.acc_has_verified(*id, false)
+                {
+                    return MachOperand::Reg(MachReg::Phys(super::machinst::RAX));
+                }
+                if let Some(slot) = state.get_slot(*id) {
+                    if slot_fits(id, inst_size) {
+                        MachOperand::StackSlot(slot.0)
+                    } else {
+                        op.clone()
+                    }
+                } else {
+                    op.clone()
+                }
+            }
+            MachOperand::Mem {
+                base: MachReg::Vreg(id),
+                offset,
+            } if !ra.contains_key(id) => {
+                // Can't have a stack-slot-based-memory operand. Keep as vreg
+                // for the window allocator to home; without a slot it trips
+                // the final unresolvable check.
+                op.clone()
+            }
+            _ => op.clone(),
+        }
+    };
+
+    match inst {
+        MachInst::Mov {
+            src: MachOperand::AllocaAddr(id),
+            dst,
+            size,
+        } => {
+            // AllocaAddr: the ADDRESS of the alloca's stack slot. Typed as a
+            // LeaSlot (frame-mode-aware in the emitter) instead of the old
+            // Raw("leaq …") text: a Raw escape hatch hides its register
+            // effects from the window allocator's scan and forced it to
+            // conservatively block the entire scratch pool. The dst stays
+            // whatever it was — a Phys, or a Vreg the window allocator owns.
+            if let Some(slot) = state.get_slot(*id) {
+                match dst {
+                    MachOperand::Reg(r) => {
+                        return MachInst::LeaSlot {
+                            slot: slot.0,
+                            dst: *r,
+                        };
+                    }
+                    _ => {
+                        // A non-register destination for an address is not a
+                        // shape the lowering produces; keep the Mov so the
+                        // final gate can reject it.
+                    }
+                }
+            }
+            MachInst::Mov {
+                src: MachOperand::AllocaAddr(*id),
+                dst: resolve_op(dst, *size, false),
+                size: *size,
+            }
+        }
+        MachInst::Mov { src, dst, size } => MachInst::Mov {
+            src: resolve_op(src, *size, true),
+            dst: resolve_op(dst, *size, false),
+            size: *size,
+        },
+        // FMov never carries vregs: the lowering admits only xmm-homed
+        // values and GPR/slot addressing, all pre-colored. Resolve an FMov
+        // to itself; should a Vreg ever slip in, has_unresolvable_vreg
+        // rejects the window and the default path replays it. (Resolving to
+        // StackSlot here could create the mem-to-mem shape the SSE encoder
+        // cannot express.)
+        MachInst::FMov { .. } => inst.clone(),
+        // FAlu's src2 may legitimately be a slot-homed Vreg: resolve it to
+        // the StackSlot memory operand (the VEX form folds one memory
+        // source). src1/dst are xmm homes by construction; a Vreg there
+        // survives and trips the fallback.
+        MachInst::FAlu {
+            op,
+            src2,
+            src1,
+            dst,
+            size,
+        } => MachInst::FAlu {
+            op: *op,
+            src2: resolve_op(src2, *size, true),
+            src1: *src1,
+            dst: *dst,
+            size: *size,
+        },
+        MachInst::Alu { op, src, dst, size } => {
+            if let MachReg::Vreg(id) = dst {
+                if !ra.contains_key(id) {
+                    // dst is on the stack — can't do two-address ALU with stack dest.
+                    // Keep as-is; the has_unresolvable_vreg check will reject
+                    // and fall back to existing accumulator codegen.
+                    return inst.clone();
+                }
+            }
+            MachInst::Alu {
+                op: *op,
+                src: resolve_op(src, *size, true),
+                dst: *dst,
+                size: *size,
+            }
+        }
+        MachInst::Movzx {
+            src,
+            dst,
+            from_size,
+            to_size,
+        } => {
+            // movzx/movsx accept a memory source: a slot-backed (spilled) src
+            // vreg can be resolved to StackSlot directly (unless the window
+            // allocator owns it — see resolve_op). The memory read is
+            // `from_size` bytes wide, which never exceeds the slot.
+            // A slot-backed dst stays a vreg and is caught by
+            // has_unresolvable_vreg -> window allocator (or fallback).
+            let src_resolved = resolve_reg_or_slot(
+                src,
+                ra,
+                state,
+                reg_classified,
+                *from_size,
+                acc_subst,
+                &window_defs,
+            );
+            MachInst::Movzx {
+                src: src_resolved,
+                dst: *dst,
+                from_size: *from_size,
+                to_size: *to_size,
+            }
+        }
+        MachInst::Movsx {
+            src,
+            dst,
+            from_size,
+            to_size,
+        } => {
+            let src_resolved = resolve_reg_or_slot(
+                src,
+                ra,
+                state,
+                reg_classified,
+                *from_size,
+                acc_subst,
+                &window_defs,
+            );
+            MachInst::Movsx {
+                src: src_resolved,
+                dst: *dst,
+                from_size: *from_size,
+                to_size: *to_size,
+            }
+        }
+        MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
+            lhs: resolve_op(lhs, *size, true),
+            rhs: resolve_op(rhs, *size, true),
+            size: *size,
+        },
+        MachInst::Test { lhs, rhs, size } => MachInst::Test {
+            lhs: resolve_op(lhs, *size, true),
+            rhs: resolve_op(rhs, *size, true),
+            size: *size,
+        },
+        MachInst::Cmov { cc, src, dst, size } => MachInst::Cmov {
+            cc: *cc,
+            src: resolve_op(src, *size, true),
+            dst: *dst,
+            size: *size,
+        },
+        MachInst::Shift {
+            op,
+            amount,
+            dst,
+            size,
+        } => MachInst::Shift {
+            op: *op,
+            // The emitter's variable-shift form is %cl-only: a Vreg amount
+            // must NEVER be rewritten to a StackSlot (the historical bug:
+            // the resolver silently substituted it and the emitter then
+            // ignored the operand, dropping the count). Leave it as-is: a
+            // Vreg amount trips the final unresolvable gate and replays the
+            // window; the window allocator likewise refuses it.
+            amount: amount.clone(),
+            dst: *dst,
+            size: *size,
+        },
+        MachInst::ShiftX {
+            op,
+            count,
+            src,
+            dst,
+            size,
+        } => MachInst::ShiftX {
+            op: *op,
+            count: *count,
+            src: *src,
+            dst: *dst,
+            size: *size,
+        },
+        MachInst::Div {
+            divisor,
+            signed,
+            size,
+        } => MachInst::Div {
+            divisor: resolve_op(divisor, *size, true),
+            signed: *signed,
+            size: *size,
+        },
+        // For instructions where the vreg is always a register (dst of SetCC,
+        // Movzx, etc.), we can't replace with stack slot. Keep as-is.
+        _ => inst.clone(),
+    }
+}
+
+/// Resolve a single operand that may substitute to a memory form, honoring
+/// Width discipline shared by every vreg→stack-slot substitution
+/// (`resolve_stack_vregs` and `resolve_reg_or_slot`), gated on the window
+/// allocator's `reg_classified` skip set. Shared by the extending
+/// moves (movzx/movsx), whose source width is `from_size`, not the inst size.
+/// The slot-width discipline shared by BOTH vreg-resolution paths (audit
+/// work order P0-4: was spelled twice — here and as a closure inside
+/// `resolve_stack_vregs` — and the two spellings must never drift): a
+/// 4-byte ("small") slot only admits 8/16/32-bit reads in-bounds; an
+/// 8-byte slot admits every instruction width.  A wider read must NOT
+/// substitute the slot — the leftover Vreg trips `has_unresolvable_vreg`
+/// and the window falls back to the default path, which loads at the true
+/// width (a `movl` reload zero-extends; a silent memory operand would not).
+pub(super) fn slot_fits_width(
+    state: &CodegenState,
+    id: u32,
+    inst_size: super::machinst::OpSize,
+) -> bool {
+    if state.is_small_slot(id) {
+        // 4-byte slot: only 8/16/32-bit reads are in-bounds.
+        matches!(
+            inst_size,
+            super::machinst::OpSize::S8
+                | super::machinst::OpSize::S16
+                | super::machinst::OpSize::S32
+        )
+    } else {
+        // 8-byte slot: every instruction width reads in-bounds.
+        true
+    }
+}
+
+fn resolve_reg_or_slot(
+    op: &MachOperand,
+    ra: &FxHashMap<u32, PhysReg>,
+    state: &CodegenState,
+    reg_classified: &crate::common::fx_hash::FxHashSet<u32>,
+    size: super::machinst::OpSize,
+    acc_subst: bool,
+    window_defs: &crate::common::fx_hash::FxHashSet<u32>,
+) -> MachOperand {
+    use super::machinst::MachOperand;
+    match op {
+        MachOperand::Reg(super::machinst::MachReg::Vreg(id))
+            if !ra.contains_key(id) && !reg_classified.contains(id) =>
+        {
+            // ACC-RESIDENT (reads only — this helper is only ever applied
+            // to source operands): see resolve_stack_vregs.  The
+            // vector-class exclusion mirrors resolve_op's (audit P2-9):
+            // the acc cache only ever names integer-class values today.
+            if acc_subst
+                && !window_defs.contains(id)
+                && slot_fits_width(state, *id, size)
+                && !state.vector_values.contains(id)
+                && state.acc_has_verified(*id, false)
+            {
+                return MachOperand::Reg(super::machinst::MachReg::Phys(super::machinst::RAX));
+            }
+            if let Some(slot) = state.get_slot(*id) {
+                if slot_fits_width(state, *id, size) {
+                    MachOperand::StackSlot(slot.0)
+                } else {
+                    op.clone()
+                }
+            } else {
+                op.clone()
+            }
+        }
+        _ => op.clone(),
+    }
+}
+
+/// Check whether a MachInst still contains any virtual register.
+///
+/// Instruction selection converts every usable main-allocator GPR assignment
+/// to `MachReg::Phys`. A remaining `Vreg` is therefore unresolved even when the
+/// main assignment map contains the value (notably when that assignment is an
+/// XMM register, which integer MachInst deliberately maps back to a Vreg).
+/// Treating `ra.contains_key(id)` as resolution allowed `%vregN` to reach the
+/// assembler and caused SQLite's MachInst build to fail on unary operations.
+fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, PhysReg>) -> bool {
+    use super::machinst::{MachInst, MachOperand, MachReg};
+    let check_reg = |r: &MachReg| -> bool { matches!(r, MachReg::Vreg(_)) };
+    let check_op = |o: &MachOperand| -> bool {
+        match o {
+            MachOperand::Reg(r) => check_reg(r),
+            MachOperand::Mem { base, .. } => check_reg(base),
+            MachOperand::MemIndex { base, index, .. } => check_reg(base) || check_reg(index),
+            // AllocaAddr is resolved to a Raw leaq only when a slot exists;
+            // without one the emitter prints an error comment and the address
+            // computation silently vanishes. Fall back instead.
+            MachOperand::AllocaAddr(_) => true,
+            _ => false,
+        }
+    };
+    match inst {
+        MachInst::Mov { src, dst, .. } => check_op(src) || check_op(dst),
+        MachInst::FMov { src, dst, .. } => check_op(src) || check_op(dst),
+        MachInst::FAlu {
+            src2, src1, dst, ..
+        } => check_op(src2) || check_reg(src1) || check_reg(dst),
+        MachInst::Alu { src, dst, .. } => check_op(src) || check_reg(dst),
+        MachInst::Imul3 { src, dst, .. } => check_reg(src) || check_reg(dst),
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => check_reg(dst),
+        MachInst::Shift { amount, dst, .. } => check_op(amount) || check_reg(dst),
+        MachInst::ShiftX {
+            count, src, dst, ..
+        } => check_reg(count) || check_reg(src) || check_reg(dst),
+        MachInst::Lea {
+            base, index, dst, ..
+        } => check_reg(base) || index.as_ref().is_some_and(|(r, _)| check_reg(r)) || check_reg(dst),
+        MachInst::Div { divisor, .. } => check_op(divisor),
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+            check_op(lhs) || check_op(rhs)
+        }
+        MachInst::SetCC { dst, .. } => check_reg(dst),
+        MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => check_reg(dst),
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+            check_op(src) || check_reg(dst)
+        }
+        MachInst::Cmov { src, dst, .. } => check_op(src) || check_reg(dst),
+        _ => false,
+    }
+}
+
+/// A value is MachInst-unsafe when it lives outside the GPR domain:
+/// floats/XMM, vectors, i128/wide, or long double. MachInst's
+/// lower_copy/lower_cast assume 64-bit GPR moves; touching such values
+/// there miscompiles (float bit-copies read stale slots, i128 copies drop
+/// the high half, vector slots get GPR-clobbered).
+/// Destination home resolved for a [`Instruction::ParamRef`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamDst {
+    /// Register-allocated GPR home (never rax/rcx/rbp/xmm — the
+    /// umbrella guard plus the explicit id check reject those).
+    Reg(PhysReg),
+    /// Stack-slot home (spill or dedicated value slot).
+    Slot(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamRefLoad {
+    /// `movzbl`/`movzwl` — zero-extending load (8/16-bit sources).
+    Zext(OpSize),
+    /// `movsbq`/`movswq`/`movslq` — sign-extending load.
+    Sext(OpSize),
+    /// `movl` — raw 32-bit move (implicit zero-extend into the reg).
+    Raw32,
+    /// `movq` — raw 64-bit move.
+    Raw64,
+}
+
+fn is_mi_unsafe_value(
+    v: u32,
+    reg_assignments: &FxHashMap<u32, PhysReg>,
+    state: &CodegenState,
+    value_types: &FxHashMap<u32, crate::common::types::IrType>,
+) -> bool {
+    // Accumulator assignments are point-constrained allocator locations. The
+    // mature path consumes them directly; MachInst must not buffer them across
+    // another instruction until its emitter models def/consume points.
+    if state.is_accumulator_location(v)
+        || state.is_i128_value(v)
+        || state.vector_values.contains(&v)
+    {
+        return true;
+    }
+    if let Some(r) = reg_assignments.get(&v) {
+        if is_xmm_reg(*r) {
+            return true; // XMM-assigned
+        }
+    }
+    if let Some(ty) = value_types.get(&v) {
+        if ty.is_float() || ty.is_long_double() || ty.is_128bit() {
+            return true;
+        }
+    }
+    false
+}
+
+impl X86Codegen {
+    /// Validate the scalar-float typed subsets: FMov (Store/Load/Copy on
+    /// F32/F64/D32/D64 whose values are all xmm-homed (xmm2..xmm15) and
+    /// whose addressing is a direct alloca slot or a GPR-held pointer) and
+    /// FAlu (Add/Sub/Mul/Div with an xmm-homed dest and xmm/slot-homed
+    /// sources in the shapes the VEX three-operand form accepts).
+    ///
+    /// This is the emit-side twin of the isel float arms; both sides check
+    /// the same subset so the typed lowering can never see a shape it does
+    /// not model. Everything else (slot-homed floats needing the xmm scratch
+    /// relay, constants, xmm-based pointers, folded GEP/global addressing,
+    /// F128/x87) returns false and keeps the mature text path.
+    /// Exact admission predicate for the typed i128 Load/Store route.
+    ///
+    /// The subset the isel arms accept, mirrored here so the generic
+    /// operand scan never sees these instructions: an i128 value is
+    /// slot-homed (the allocator never assigns one), so the generic
+    /// no-register rules reject the Load dest / Store val before the isel
+    /// could offer its typed forms. The predicate is the admission
+    /// contract; the isel arm re-checks everything (belt and suspenders —
+    /// a decline here falls back to the mature path unchanged).
+    ///
+    /// Subset: `ty.is_128bit()` (I128/U128 — F128/x87 long double stays on
+    /// the mature x87 path), non-volatile (the volatile access granularity
+    /// stays the oracle-matching two 8-byte halves), default address space,
+    /// pointer = direct alloca slot or GPR-homed pointer value (never a
+    /// folded address or an over-aligned alloca — the raw slot would be
+    /// the wrong address), and the value side either an I128/Zero constant
+    /// or a slot-homed non-small i128 value.
+    fn i128_typed_candidate(
+        &self,
+        inst: &crate::ir::reexports::Instruction,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
+        let (ty, ptr, val, volatile, seg_override) = match inst {
+            crate::ir::reexports::Instruction::Load {
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+                ..
+            } => (ty, ptr, None, *volatile, seg_override),
+            crate::ir::reexports::Instruction::Store {
+                val,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+            } => (ty, ptr, Some(val), *volatile, seg_override),
+            _ => return false,
+        };
+        if !ty.is_128bit() || volatile || *seg_override != AddressSpace::Default {
+            return false;
+        }
+        let ptr_ok = (self.state.is_alloca(ptr.0)
+            && !matches!(
+                self.state.resolve_slot_addr(ptr.0),
+                Some(crate::backend::state::SlotAddr::OverAligned(_, _))
+            ))
+            || self.fresh_home_of(ptr.0).is_some_and(|r| is_gpr_reg(r));
+        if !ptr_ok
+            || folded_global_addrs.contains(&ptr.0)
+            || self.state.folded_gep_values.contains(&ptr.0)
+        {
+            return false;
+        }
+        match val {
+            None => {
+                let dest = match inst {
+                    crate::ir::reexports::Instruction::Load { dest, .. } => dest.0,
+                    _ => unreachable!(),
+                };
+                // Genuine-i128-carrier requirement only (mirrors the
+                // Store val's first check). Coherence does NOT apply to a
+                // load dest: the load itself is the dest's defining write,
+                // so the slot cannot be stale. Vector carriers (which also
+                // ride the I128 type) are safe here too — writing the
+                // loaded 16 bytes to the vector's spill slot eagerly is
+                // data-identical to the vec machinery's own lazy spill.
+                self.state.is_i128_value(dest)
+                    && !self.reg_assignments.contains_key(&dest)
+                    && self.state.get_slot(dest).is_some()
+                    && !self.state.small_slot_values.contains(&dest)
+            }
+            Some(operand) => match operand {
+                crate::ir::reexports::Operand::Const(c) => matches!(
+                    c,
+                    crate::ir::reexports::IrConst::I128(_) | crate::ir::reexports::IrConst::Zero
+                ),
+                crate::ir::reexports::Operand::Value(v) => {
+                    // A GENUINE i128 carrier, not a 16-byte value that
+                    // merely carries the I128 type in the IR: the vector
+                    // path reuses I128 as the v4sf/v4si carrier type, and
+                    // a vector value's spill slot is lazily written by the
+                    // vec machinery (flush_pending_vec_store) — reading it
+                    // here would load stale bytes.  The state's i128
+                    // registry is the type truth; the builtin_ia32_
+                    // vector_value regression pins the distinction.
+                    // ...and its slot home must be COHERENT: written
+                    // eagerly at the value's definition. A value computed
+                    // into the accumulator pair has a stale slot (its only
+                    // writer would be the very store being lowered).
+                    self.state.is_i128_value(v.0)
+                        && self.coherent_i128_homes.contains(&v.0)
+                        && !self.reg_assignments.contains_key(&v.0)
+                        && self.state.get_slot(v.0).is_some()
+                        && !self.state.small_slot_values.contains(&v.0)
+                }
+            },
+        }
+    }
+
+    fn float_typed_candidate(
+        &self,
+        inst: &crate::ir::reexports::Instruction,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
+        use crate::common::types::{AddressSpace, IrType};
+        use crate::ir::reexports::{Instruction, Operand};
+
+        if self.machinst_disabled_kinds & MI_FLOAT_MOV != 0 {
+            return false;
+        }
+        let ra = &self.reg_assignments;
+        // Same value-domain exclusions as is_mi_unsafe_value minus the float
+        // type check: accumulator locations, i128 carriers, and vectorizer
+        // values may all be xmm-homed and F32/F64-typed in the IR while the
+        // mature path treats them as packed/wide -- a scalar movsd would
+        // truncate or stale their upper lanes.
+        let xmm_homed = |v: u32| {
+            ra.get(&v).is_some_and(|r| r.0 >= 20 && r.0 <= 33)
+                && !self.state.is_accumulator_location(v)
+                && !self.state.is_i128_value(v)
+                && !self.state.vector_values.contains(&v)
+        };
+        // Spill-slot-homed float value: relayed through the pre-colored xmm0
+        // scratch (PhysReg 18 — the allocator pool starts at xmm2, so the
+        // scratch can never collide with an allocated home). Same value-domain
+        // exclusions as xmm_homed: a vectorizer/i128/accumulator value that
+        // happens to be slot-homed is packed/wide in the mature path's eyes
+        // and must not be moved by a scalar relay.
+        let float_slot_homed = |v: u32| {
+            ra.get(&v).is_none()
+                && self.state.get_slot(v).is_some()
+                && !self.state.is_accumulator_location(v)
+                && !self.state.is_i128_value(v)
+                && !self.state.vector_values.contains(&v)
+        };
+        // Pointer admission mirrors the integer Load/Store ptr gate exactly:
+        // folded GEP/global addresses have NO materialized register (the
+        // producer was skipped -- reading its home is a segfault), and
+        // over-aligned alloca slots need the aligned address the default
+        // path computes.
+        let gpr_ptr = |v: u32| {
+            if folded_global_addrs.contains(&v) || self.state.folded_gep_values.contains(&v) {
+                return false;
+            }
+            if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
+                self.state.resolve_slot_addr(v)
+            {
+                return false;
+            }
+            self.state.is_alloca(v) || ra.get(&v).is_some_and(|r| is_gpr_reg(*r))
+        };
+        match inst {
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                seg_override,
+                ..
+            } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
+                *seg_override == AddressSpace::Default
+                    && matches!(val, Operand::Value(v) if xmm_homed(v.0) || float_slot_homed(v.0))
+                    && gpr_ptr(ptr.0)
+            }
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+                ..
+            } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
+                *seg_override == AddressSpace::Default
+                    && (xmm_homed(dest.0) || float_slot_homed(dest.0))
+                    && gpr_ptr(ptr.0)
+            }
+            Instruction::Copy { dest, src } => {
+                let Operand::Value(src_v) = src else {
+                    return false;
+                };
+                let ty_is_scalar_float = self
+                    .value_types
+                    .get(&src_v.0)
+                    .or_else(|| self.value_types.get(&dest.0))
+                    .is_some_and(|ty| {
+                        matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
+                    });
+                ty_is_scalar_float && xmm_homed(src_v.0) && xmm_homed(dest.0)
+            }
+            Instruction::BinOp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } if self.machinst_disabled_kinds & MI_FLOAT_ALU == 0
+                && matches!(ty, IrType::F32 | IrType::F64)
+                && matches!(
+                    op,
+                    crate::ir::reexports::IrBinOp::Add
+                        | crate::ir::reexports::IrBinOp::Sub
+                        | crate::ir::reexports::IrBinOp::Mul
+                        | crate::ir::reexports::IrBinOp::SDiv
+                ) =>
+            {
+                // Dest must be xmm-homed; then either lhs is xmm-homed (rhs
+                // xmm or slot), or -- commutative ops only -- rhs is
+                // xmm-homed and lhs slot-homed. Mirrors the isel arm.
+                let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) else {
+                    return false;
+                };
+                if !xmm_homed(dest.0) {
+                    return false;
+                }
+                let has_slot = |v: u32| self.state.get_slot(v).is_some();
+                if xmm_homed(l.0) {
+                    return xmm_homed(r.0) || has_slot(r.0);
+                }
+                let commutative = matches!(
+                    op,
+                    crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Mul
+                );
+                commutative && xmm_homed(r.0) && has_slot(l.0)
+            }
+            _ => false,
+        }
+    }
+    /// Typed direct-call lowering: the SysV integer-register subset as one
+    /// atomic [`MachInst::CallTyped`].
+    ///
+    /// Admission contract (everything else keeps the mature path):
+    /// - direct call to a named, non-empty symbol; not variadic, not sret;
+    /// - no struct/i128/F128/x87 arguments; at most six integer/pointer
+    ///   arguments of ABI width 4 or 8 (narrow C arguments are moved at
+    ///   their canonical 32-bit promotion width, per the same convention
+    ///   the load path's `narrow_defined_load` establishes);
+    /// - integer/pointer return (or void) whose destination home is a GPR
+    ///   or a spill slot; dead/accumulator/xmm destinations stay behind; a
+    ///   register-returned aggregate only when all its eightbytes are
+    ///   INTEGER (an `[Sse]` aggregate comes back in %xmm0);
+    /// - inline-memcpy candidates keep their interception in the dispatch
+    ///   loop (an inlined fixed-size memcpy beats any call sequence);
+    /// - the pure builder must produce an acyclic move plan.
+    ///
+    /// Flushing discipline: the preceding run is drained first, the call is
+    /// buffered as its own run, and that run is flushed immediately. This
+    /// reproduces the mature path's program-point semantics exactly — the
+    /// caller-save interval check runs at the call's own point — and keeps
+    /// the pre-colored argument/return registers conflict-free, since no
+    /// allocated vreg can coexist with the call in the buffer. The flush's
+    /// tail (invalidate_all + pending-vec-store flush + vec-peephole
+    /// invalidation) is precisely `clobber_after_call_like`.
+    fn try_lower_call_typed(
+        &mut self,
+        inst: &crate::ir::reexports::Instruction,
+        direct_sym: Option<&str>,
+        func_ptr: Option<&crate::ir::reexports::Operand>,
+        info: &crate::ir::reexports::CallInfo,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
+        use super::isel::{TypedCallSrc, build_typed_call, build_typed_call_ex};
+        use super::machinst::{CallArgMove, CallTarget, MachInst, MachOperand, MachReg, OpSize};
+
+        let _ = folded_global_addrs; // subset needs no fold-map interaction
+
+        if self.machinst_disabled_kinds & MI_CALL_TYPED != 0 {
+            return false;
+        }
+        // AUD-VABI-3: the typed-call plan homes a 64-bit integer return in a
+        // general-purpose register (it builds `CallRetMove` from the
+        // allocator's home). An 8-byte value whose single eightbyte
+        // classifies as SSE does NOT arrive there: SysV carries it in the low
+        // half of %xmm0, which only the mature call path reads
+        // (`emit_call_store_result_impl`). Measured at -O2: `V foo(void)`
+        // returned its value in %xmm0 while the caller read %rax, which is
+        // how tests/regression/vec_incdec_elementwise.c came to abort.
+        if info.ret_eightbyte_classes.len() == 1
+            && info.ret_eightbyte_classes[0] == crate::common::types::EightbyteClass::Sse
+            && matches!(
+                info.return_type,
+                crate::common::types::IrType::I64 | crate::common::types::IrType::U64
+            )
+        {
+            return false;
+        }
+        // Static-chain calls stay on the mature path. The preceding
+        // SetStaticChain emission armed `state.chain_call`, and only
+        // `emit_call_instruction_impl` discharges that flag by publishing
+        // `# LCCC_CHAIN_CALL` after the call text. Lowering the call here
+        // instead would (a) emit the call WITHOUT the marker, entitling the
+        // text-liveness oracles to retire the chain staging as a dead write
+        // -- silently dropping the nested callee's static chain -- and
+        // (b) for indirect calls stage the callee pointer into r10/r11,
+        // clobbering the armed chain outright. (Reproduced live: the
+        // nested-chain corpus segfaulted exactly this way.)
+        if self.state.chain_call {
+            return false;
+        }
+        // Inline fixed-size memcpy/__memcpy_chk must keep winning over any
+        // call sequence (dispatch-loop interception, mirrored gate).
+        if crate::backend::generation::inline_memcpy_len(direct_sym.unwrap_or(""), info).is_some() {
+            return false;
+        }
+        // Same mirrored gate for the fixed-size memset expansion.
+        if self
+            .inline_memset_len(direct_sym.unwrap_or(""), info)
+            .is_some()
+        {
+            return false;
+        }
+        // Non-variadic, no sret. Direct calls need a named symbol; indirect
+        // calls are admitted through the callee-pointer resolution below.
+        if info.is_variadic || info.is_sret {
+            return false;
+        }
+        if direct_sym.is_none() && func_ptr.is_none() {
+            return false;
+        }
+        // No struct/by-value aggregates (the classification would leave the
+        // integer-register subset).
+        if info.struct_arg_sizes.iter().any(|s| s.is_some()) {
+            return false;
+        }
+        if info.args.len() > super::machinst::SYSCALL_ARG_REGS.len() {
+            return false;
+        }
+        // Integer/pointer domain for every argument and the return.
+        let width_ok = |ty: IrType| {
+            !ty.is_128bit() && !ty.is_float() && !ty.is_long_double() && ty.size() <= 8
+        };
+        if !width_ok(info.return_type) || info.arg_types.iter().any(|t| !width_ok(*t)) {
+            return false;
+        }
+        // An aggregate returned in registers is admitted only when every
+        // eightbyte is INTEGER (it comes back in %rax like a scalar). A
+        // `struct { float x, y; }` or 8-byte FP vector also travels as
+        // integer-width IR data, but its bits are in %xmm0 (`[Sse]`), and a
+        // one-XMM / x87 result has its own staging; those stay on the mature
+        // path, which honours `ret_eightbyte_classes`.
+        if info.ret_is_f128_sse
+            || info.struct_arg_is_f128_sse.iter().any(|&b| b)
+            || info
+                .ret_eightbyte_classes
+                .iter()
+                .any(|c| *c != crate::common::types::EightbyteClass::Integer)
+        {
+            return false;
+        }
+
+        // Canonical move width: never narrower than 32 bits. Narrow C
+        // arguments are passed at their promoted width (the ABI reads the
+        // 32-bit register; a byte/word move would leave the upper bits of
+        // the argument register undefined).
+        let move_width = |ty: IrType| match OpSize::from_ir_type(ty) {
+            OpSize::S8 | OpSize::S16 => OpSize::S32,
+            s => s,
+        };
+
+        let ra = &self.reg_assignments;
+        let state = &self.state;
+        let value_types = &self.value_types;
+
+        // Resolve an argument operand to a typed source. None = the mature
+        // path stages it (accumulator/xmm/alloca-address/rbp homes, dead
+        // values, non-integer constants).
+        let arg_src = |op: &crate::ir::reexports::Operand| -> Option<TypedCallSrc> {
+            match op {
+                crate::ir::reexports::Operand::Const(c) => c.to_i64().map(TypedCallSrc::Imm),
+                crate::ir::reexports::Operand::Value(v) => {
+                    // Address-of-local arguments (`&x`): a pre-move places
+                    // the address into the ABI register before the call —
+                    // a single LeaSlot for a normal alloca, or the
+                    // leaq+addq+andq align-up sequence staged INTO the ABI
+                    // register itself for an over-aligned (>16) alloca
+                    // (the pre-move loop below picks the form; every
+                    // consumer of a padded slot must target the EFFECTIVE
+                    // align_up'd address). The slot must exist.
+                    if state.is_alloca(v.0) {
+                        return state.get_slot(v.0).map(|_| TypedCallSrc::AllocaAddr(v.0));
+                    }
+                    if is_mi_unsafe_value(v.0, ra, state, value_types) {
+                        return None;
+                    }
+                    if let Some(&r) = ra.get(&v.0) {
+                        if is_xmm_reg(r) || r.0 == 0 || r.0 == 6 || r.0 == 7 {
+                            return None; // xmm / rax / rbp / rcx homes
+                        }
+                        return Some(TypedCallSrc::Reg(r));
+                    }
+                    state.get_slot(v.0).map(|slot| TypedCallSrc::Slot(slot.0))
+                }
+            }
+        };
+
+        let arg_srcs: Vec<Option<TypedCallSrc>> = info.args.iter().map(arg_src).collect();
+        let arg_sizes: Vec<OpSize> = info.arg_types.iter().map(|t| move_width(*t)).collect();
+
+        // Return home (None = void call; a dead destination defers to the
+        // mature path rather than dropping the store).
+        let ret_plan = match &info.dest {
+            None => None,
+            Some(d) => {
+                if state.is_alloca(d.0) || is_mi_unsafe_value(d.0, ra, state, value_types) {
+                    return false;
+                }
+                let src = if let Some(&r) = ra.get(&d.0) {
+                    if is_xmm_reg(r) || r.0 == 0 || r.0 == 6 {
+                        return false;
+                    }
+                    TypedCallSrc::Reg(r)
+                } else if let Some(slot) = state.get_slot(d.0) {
+                    TypedCallSrc::Slot(slot.0)
+                } else {
+                    return false;
+                };
+                Some((Some(src), move_width(info.return_type)))
+            }
+        };
+
+        // Decide the call form and build the move plan together.
+        //
+        // Direct target: symbol naming mirrors emit_call_instruction_impl —
+        // versioned symbols use the base name in @PLT references (GAS 2.47
+        // rejects `sym@ver@PLT`; the linker resolves the version).
+        //
+        // Indirect target: the callee pointer is staged into a scratch
+        // register by one of the instruction's own moves (see
+        // build_typed_call_ex). Candidate registers are r10 then r11 —
+        // never ABI argument registers, so no argument move can write
+        // them. Under an EXTERNAL retpoline thunk the call form is
+        // `call __x86_indirect_thunk_r10`, whose name encodes the register
+        // and whose patching contract the mature path owns: reject the
+        // typed path for indirect calls in both thunk modes instead of
+        // approximating it. The paravirt fast-path (callee resolves to
+        // global+offset) must likewise keep the mature path: it emits the
+        // patchable `call *sym+off(%rip)` the kernel alternatives
+        // machinery rewrites at boot.
+        let (plan, target): (super::isel::TypedCallPlan, CallTarget) = if let Some(sym) = direct_sym
+        {
+            if self.state.needs_got_call(sym) {
+                return false;
+            }
+            let target = if self.state.needs_plt(sym) {
+                let n = sym.split('@').next().unwrap_or(sym);
+                CallTarget::Direct(format!("{}@PLT", n))
+            } else {
+                CallTarget::Direct(sym.to_string())
+            };
+            match build_typed_call(&arg_srcs, &arg_sizes, ret_plan) {
+                Ok(p) => (p, target),
+                Err(reason) => {
+                    super::isel::stats::note_reject_named(reason.label());
+                    return false;
+                }
+            }
+        } else {
+            let fp = func_ptr.expect("indirect call without func_ptr");
+            if self.state.indirect_branch_thunk || self.state.indirect_branch_thunk_inline {
+                return false;
+            }
+            if self.try_resolve_indirect_call_global(fp).is_some() {
+                return false; // patchable `call *sym(%rip)` form is load-bearing
+            }
+            let callee_src = match arg_src(fp) {
+                Some(s) => s,
+                None => {
+                    // Accumulator-homed callees are the dominant shape here
+                    // (a GOT load with no allocator home leaves the pointer
+                    // in %rax and the mature path relays it into r10).
+                    // Visible rejection, not a silent fallback: the census
+                    // must rank this or the next round cannot target it.
+                    super::isel::stats::note_reject_named("CallIndirect(callee-unrepresentable)");
+                    return false;
+                }
+            };
+            let mut built: Option<(super::isel::TypedCallPlan, CallTarget)> = None;
+            for candidate in [super::machinst::R10, super::machinst::R11] {
+                if let Ok(p) = build_typed_call_ex(
+                    &arg_srcs,
+                    &arg_sizes,
+                    ret_plan,
+                    Some((callee_src, candidate)),
+                ) {
+                    built = Some((p, CallTarget::Indirect(candidate)));
+                    break;
+                }
+            }
+            match built {
+                Some(pair) => pair,
+                None => {
+                    // Both scratch candidates dead (e.g. a register-exchange
+                    // cycle involving r10 and r11): the text path owns the
+                    // hazard-spill machinery for that shape.
+                    super::isel::stats::note_reject_named("CallIndirect(no-scratch)");
+                    return false;
+                }
+            }
+        };
+
+        // Caller-save spills at the call's program point — the same data
+        // and the same point semantics as the mature path's Phase 2b.
+        let point = self.state.current_program_point;
+        let mut caller_saves: Vec<(PhysReg, i64)> = Vec::new();
+        for (&reg_id, &slot) in &self.caller_save_spill_slots {
+            if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+                if intervals
+                    .iter()
+                    .any(|&(start, end)| start <= point && point <= end)
+                {
+                    caller_saves.push((PhysReg(reg_id), slot.0));
+                }
+            }
+        }
+        // `MachInst::CallTyped` renders its saves as GPR `movq`s; a cold-
+        // call XMM save (regalloc `add_cold_call_xmm_saves`) takes the
+        // mature path, whose name-based `movq %xmmN, slot` is exact.
+        if caller_saves.iter().any(|&(reg, _)| is_xmm_reg(reg)) {
+            super::isel::stats::note_reject_named("CallTyped(xmm-caller-save)");
+            return false;
+        }
+
+        // Split alloca-address arguments into pre-moves. The pre-move
+        // writes the ABI register BEFORE the caller-save spills run, so a
+        // register in the save set would be spilled after being clobbered —
+        // reject that shape (the mature path orders saves before staging).
+        // The builder already guaranteed no other argument sources from the
+        // register, so hoisting all pre-moves to the front of the run is
+        // order-equivalent.
+        let mut pre_moves: Vec<MachInst> = Vec::new();
+        let mut typed_args: Vec<CallArgMove> = Vec::new();
+        for m in plan.args {
+            match &m.src {
+                MachOperand::AllocaAddr(id) => {
+                    if caller_saves.iter().any(|(r, _)| *r == m.dst_reg) {
+                        return false;
+                    }
+                    let Some(slot) = state.get_slot(*id) else {
+                        return false; // no slot: the leaq cannot render
+                    };
+                    let dst = MachReg::Phys(m.dst_reg);
+                    if let Some(align) = state.alloca_over_align(*id) {
+                        // Over-aligned (>16) alloca: the callee must receive
+                        // the EFFECTIVE align_up'd address, never the pad
+                        // base. Stage the computation in the ABI register
+                        // itself — leaq slot(%rbp), %r; addq $align-1, %r;
+                        // andq $-align, %r — no scratch, the run stays
+                        // unsplit (byte-identical to the mature path's
+                        // emit_alloca_aligned_addr sequence).
+                        pre_moves.push(MachInst::LeaSlot { slot: slot.0, dst });
+                        pre_moves.push(MachInst::Alu {
+                            op: AluOp::Add,
+                            src: MachOperand::Imm((align - 1) as i64),
+                            dst,
+                            size: OpSize::S64,
+                        });
+                        pre_moves.push(MachInst::Alu {
+                            op: AluOp::And,
+                            src: MachOperand::Imm(-(align as i64)),
+                            dst,
+                            size: OpSize::S64,
+                        });
+                    } else {
+                        pre_moves.push(MachInst::Mov {
+                            src: MachOperand::AllocaAddr(*id),
+                            dst: MachOperand::Reg(dst),
+                            size: OpSize::S64,
+                        });
+                    }
+                }
+                _ => typed_args.push(m),
+            }
+        }
+
+        // Drain the preceding run, buffer the call as its own run, flush it.
+        self.flush_machinst();
+        self.machinst_buf.extend(pre_moves);
+        self.machinst_buf.push(MachInst::CallTyped {
+            caller_saves,
+            args: typed_args,
+            target,
+            ret: plan.ret,
+            gp_arg_count: Some(plan.gp_arg_count),
+            ipa_keep: self.ipa_keep_at(self.state.current_program_point),
+        });
+        self.machinst_buf_ir.push(inst.clone());
+        self.flush_machinst();
+        super::isel::stats::note_lowered();
+        true
+    }
+
+    // ── Typed ParamRef materialization ───────────────────────────────
+    //
+    // The census's `ParamRef(needs-code)` class: parameters whose body-side
+    // materialization the text path performs at the price of flushing the
+    // buffered MachInst run around them. Three of the four
+    // `emit_param_ref_impl` cases are single moves, which MachInst expresses
+    // exactly — the admission below mirrors the text path instruction for
+    // instruction, so the final machine state (destination register or slot
+    // contents) is byte-identical in every admitted shape while the run
+    // stays unsplit.
+
+    /// The single-instruction load form that materializes a value of type
+    /// `load_ty` into a 64-bit GPR with a final register state byte-identical
+    /// to the text path's `mov_load_for_type(load_ty)` + `store_rax_to` pair.
+    ///
+    /// The text path loads into %rax at the mnemonic's width and then
+    /// `movq`s the FULL 64-bit register into the destination (see
+    /// `store_rax_to`: "movl zero-extends the upper 32 bits, which corrupts
+    /// negative I32 values"), so the admitted forms must reproduce the same
+    /// 64-bit destination state in one instruction:
+    ///   * signed narrow loads sign-extend all the way (`movsbq/movswq/movslq`);
+    ///   * unsigned 8/16-bit loads zero-extend (`movzbl/movzwl` — the
+    ///     MachInst emitter renders them with a 32-bit dest name, which
+    ///     zero-extends into the full register implicitly);
+    ///   * U32 loads are plain `movl` (zero-extends into the full register);
+    ///   * 64-bit loads are plain `movq`.
+    /// `None` = no admitted form (float/decimal/F128/wide — those stay on
+    /// the text path, which owns the SSE and x87 domains).
+    fn paramref_reg_load_form(load_ty: IrType) -> Option<ParamRefLoad> {
+        Some(match load_ty {
+            IrType::U8 => ParamRefLoad::Zext(OpSize::S8),
+            IrType::U16 => ParamRefLoad::Zext(OpSize::S16),
+            IrType::I8 => ParamRefLoad::Sext(OpSize::S8),
+            IrType::I16 => ParamRefLoad::Sext(OpSize::S16),
+            IrType::I32 => ParamRefLoad::Sext(OpSize::S32),
+            IrType::U32 => ParamRefLoad::Raw32,
+            IrType::I64 | IrType::U64 | IrType::Ptr => ParamRefLoad::Raw64,
+            _ => return None,
+        })
+    }
+
+    /// Push the extending/plain load `mov {src} → {MachReg}` for a form.
+    fn push_paramref_reg_load(&mut self, form: ParamRefLoad, src: MachOperand, dst: MachReg) {
+        let inst = match form {
+            ParamRefLoad::Zext(from) => MachInst::Movzx {
+                src,
+                dst,
+                from_size: from,
+                to_size: OpSize::S64,
+            },
+            ParamRefLoad::Sext(from) => MachInst::Movsx {
+                src,
+                dst,
+                from_size: from,
+                to_size: OpSize::S64,
+            },
+            ParamRefLoad::Raw32 => MachInst::Mov {
+                src,
+                dst: MachOperand::Reg(dst),
+                size: OpSize::S32,
+            },
+            ParamRefLoad::Raw64 => MachInst::Mov {
+                src,
+                dst: MachOperand::Reg(dst),
+                size: OpSize::S64,
+            },
+        };
+        self.machinst_buf.push(inst);
+    }
+
+    /// Admit a slot-homed destination for a slot-sourced load: ONLY the
+    /// shapes whose stored bytes are byte-identical to the text path's
+    /// relay (`mov_load_for_type` into %rax, then `store_rax_to`).
+    ///
+    /// The emitter lowers a Mov with two memory operands as an %rax relay at
+    /// the instruction's width, so the admitted widths are exactly the ones
+    /// where the text relay's width equals the MachInst relay's width:
+    ///   * 64-bit types into an 8-byte slot: `movq`/`movq` both ways;
+    ///   * I32/U32 into a 4-byte (small) slot: the text path stores the low
+    ///     4 bytes either way (`movl %eax, slot` after movslq/movl staging)
+    ///     — the relay's raw 4-byte copy writes the identical bytes.
+    /// Everything else (narrow types whose relay would store fewer bytes
+    /// than the text path's full-width store, I32 into an 8-byte slot whose
+    /// sign extension the text path materializes) stays on the text path.
+    fn paramref_slot_relay_ok(load_ty: IrType, small_dest: bool) -> Option<OpSize> {
+        match load_ty {
+            IrType::I64 | IrType::U64 | IrType::Ptr if !small_dest => Some(OpSize::S64),
+            IrType::I32 | IrType::U32 if small_dest => Some(OpSize::S32),
+            _ => None,
+        }
+    }
+
+    /// Lower one ParamRef materialization into the MachInst buffer.
+    ///
+    /// `Ok(())` = lowered (possibly zero instructions: dead destination,
+    /// pre-stored parameter, already-in-place register, or a class the text
+    /// path emits nothing for). `Err(label)` = reject; the label feeds the
+    /// census so the residual classes stay individually counted.
+    ///
+    /// Admission mirrors `emit_param_ref_impl` (prologue.rs) case for case:
+    /// pre-stored parameters win over the alloca slot; the alloca slot wins
+    /// over the ABI class; the pinned `# LCCC_PARAM_ABI_READ` marker
+    /// accompanies every incoming-register read (the text peephole's
+    /// `pin_param_abi_reads` runs on the final text, where MachInst output
+    /// is already flushed, so the marker reaches it unchanged).
+    fn try_lower_paramref_typed(
+        &mut self,
+        dest: &Value,
+        param_idx: usize,
+        ty: IrType,
+    ) -> Result<(), &'static str> {
+        use super::machinst::{MachOperand, MachReg, SYSCALL_ARG_REGS};
+
+        // A dead destination gets no code on the text path either
+        // (`store_rax_to` early-outs on zero use counts); lowering it as a
+        // no-op keeps the run unsplit at zero cost.
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return Ok(());
+        }
+        // Homing-elision mirror: a dest whose ONLY use was the elided
+        // homing store also gets no code on the text path
+        // (`emit_param_ref_impl` early-outs via `dead_param_ref_dests`).
+        // The store still counts in `value_use_counts` above, so this is a
+        // separate check — and it must come first: for an over-aligned
+        // alloca a materialized load would read the alignment PAD, which
+        // is uninitialized memory, not the captured value.
+        if self.state.dead_param_ref_dests.contains(&dest.0) {
+            return Ok(());
+        }
+        // Pre-stored parameters are already in their destination register;
+        // `emit_store_params` placed them during the prologue. This takes
+        // priority over the alloca slot exactly as on the text path.
+        if self.state.param_pre_stored.contains(&param_idx) {
+            return Ok(());
+        }
+        // Umbrella home-safety guard — the same one the typed calls use:
+        // accumulator/i128/vector/xmm-homed destinations and float/decimal/
+        // F128/wide destination types keep the mature path.
+        if is_mi_unsafe_value(
+            dest.0,
+            &self.reg_assignments,
+            &self.state,
+            &self.value_types,
+        ) {
+            return Err("ParamRef(unsafe-home)");
+        }
+        // Resolve the destination home.
+        let dst = if let Some(&r) = self.reg_assignments.get(&dest.0) {
+            if is_xmm_reg(r) || r.0 == 0 || r.0 == 6 || r.0 == 7 {
+                return Err("ParamRef(unsafe-home)"); // xmm / rax / rbp / rcx
+            }
+            ParamDst::Reg(r)
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            ParamDst::Slot(slot.0)
+        } else {
+            return Err("ParamRef(unsafe-home)"); // no home: text path owns
+        };
+        let small_dest = self.state.is_small_slot(dest.0);
+
+        // Case 1 (text path's first materializing case): the parameter's
+        // alloca slot holds the staged value — one load.
+        if param_idx < self.state.param_alloca_slots.len() {
+            if let Some((slot, alloca_ty, alloca_id)) = self.state.param_alloca_slots[param_idx] {
+                let over_align = self.state.alloca_over_align(alloca_id);
+                // Over-aligned (>16) param allocas: the capture wrote the
+                // EFFECTIVE align_up'd address inside the padded slot, and
+                // every read must resolve that same effective address — a
+                // raw StackSlot operand would read the alignment pad. For a
+                // register-homed destination the address computation is
+                // staged IN the destination register itself
+                // (leaq+addq+andq, then a load through it): no scratch,
+                // the run stays unsplit, byte-identical to the mature
+                // path's emit_alloca_aligned_addr sequence. A slot-homed
+                // destination needs a two-memory relay through a scratch
+                // register, which the typed census deliberately does not
+                // own — that shape stays on the text path.
+                if let Some(align) = over_align {
+                    return match dst {
+                        ParamDst::Reg(r) => {
+                            let form = Self::paramref_reg_load_form(alloca_ty)
+                                .ok_or("ParamRef(float-domain)")?;
+                            let d = MachReg::Phys(r);
+                            self.machinst_buf.push(MachInst::LeaSlot {
+                                slot: slot.0,
+                                dst: d,
+                            });
+                            self.machinst_buf.push(MachInst::Alu {
+                                op: AluOp::Add,
+                                src: MachOperand::Imm((align - 1) as i64),
+                                dst: d,
+                                size: OpSize::S64,
+                            });
+                            self.machinst_buf.push(MachInst::Alu {
+                                op: AluOp::And,
+                                src: MachOperand::Imm(-(align as i64)),
+                                dst: d,
+                                size: OpSize::S64,
+                            });
+                            self.push_paramref_reg_load(
+                                form,
+                                MachOperand::Mem { base: d, offset: 0 },
+                                d,
+                            );
+                            Ok(())
+                        }
+                        ParamDst::Slot(_) => Err("ParamRef(over-aligned-slot-home)"),
+                    };
+                }
+                return match dst {
+                    ParamDst::Reg(r) => {
+                        let form = Self::paramref_reg_load_form(alloca_ty)
+                            .ok_or("ParamRef(float-domain)")?;
+                        self.push_paramref_reg_load(
+                            form,
+                            MachOperand::StackSlot(slot.0),
+                            MachReg::Phys(r),
+                        );
+                        Ok(())
+                    }
+                    ParamDst::Slot(dslot) => {
+                        let size = Self::paramref_slot_relay_ok(alloca_ty, small_dest)
+                            .ok_or("ParamRef(slot-width)")?;
+                        self.machinst_buf.push(MachInst::Mov {
+                            src: MachOperand::StackSlot(slot.0),
+                            dst: MachOperand::StackSlot(dslot),
+                            size,
+                        });
+                        Ok(())
+                    }
+                };
+            }
+        }
+        if param_idx >= self.state.param_classes.len() {
+            // Unreachable through the gate (which no-codes out-of-bounds
+            // indices first), but the match below indexes the vector.
+            return Err("ParamRef(unsafe-home)");
+        }
+        let class = self.state.param_classes[param_idx];
+        match class {
+            // Case 2: the parameter arrived in an ABI register and must be
+            // copied to its (different) home. Every emitted read carries the
+            // pinned-ABI-read marker; the pin pass on the final text pins
+            // the very next instruction line, which is exactly the move
+            // pushed here (single-line forms only: reg→reg and reg→slot
+            // render as one line each).
+            ParamClass::IntReg { reg_idx } => {
+                if reg_idx >= SYSCALL_ARG_REGS.len() {
+                    return Err("ParamRef(unsafe-home)");
+                }
+                let abi = SYSCALL_ARG_REGS[reg_idx];
+                if let ParamDst::Reg(r) = dst {
+                    if r == abi {
+                        // The destination IS the incoming register: the
+                        // value is already in place. Only a 64-bit type is
+                        // truly in place — a narrower type needs the
+                        // extending move, and the emitter's size-blind
+                        // self-move elision would drop it, so those stay on
+                        // the text path (whose round trip materializes the
+                        // extension).
+                        if OpSize::from_ir_type(ty) == OpSize::S64 {
+                            return Ok(());
+                        }
+                        return Err("ParamRef(narrow-self)");
+                    }
+                }
+                // The marker names the sized incoming register, spelled
+                // exactly as the text path spells it (`reg_for_type`).
+                let src_name = Self::reg_for_type(X86_ARG_REGS[reg_idx], ty);
+                self.machinst_buf.push(MachInst::Raw(format!(
+                    "    # LCCC_PARAM_ABI_READ {}",
+                    src_name
+                )));
+                match dst {
+                    ParamDst::Reg(r) => {
+                        let form =
+                            Self::paramref_reg_load_form(ty).ok_or("ParamRef(float-domain)")?;
+                        self.push_paramref_reg_load(
+                            form,
+                            MachOperand::Reg(MachReg::Phys(abi)),
+                            MachReg::Phys(r),
+                        );
+                    }
+                    ParamDst::Slot(dslot) => {
+                        // reg→slot is a single encodable store; admit the
+                        // same byte-identical widths as the relay case.
+                        let size = Self::paramref_slot_relay_ok(ty, small_dest)
+                            .ok_or("ParamRef(slot-width)")?;
+                        self.machinst_buf.push(MachInst::Mov {
+                            src: MachOperand::Reg(MachReg::Phys(abi)),
+                            dst: MachOperand::StackSlot(dslot),
+                            size,
+                        });
+                    }
+                }
+                Ok(())
+            }
+            // Case 3: stack-passed scalar. The incoming-argument area is
+            // addressed through the same slot-offset formula the text path
+            // uses (`slot_ref(stack_base + offset)`), and the MachOperand::
+            // StackSlot formatter applies the identical rbp/rsp-mode rule —
+            // the rendered operand is byte-identical.
+            ParamClass::StackScalar { offset } => {
+                let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
+                let src_off = stack_base + offset;
+                match dst {
+                    ParamDst::Reg(r) => {
+                        let form =
+                            Self::paramref_reg_load_form(ty).ok_or("ParamRef(float-domain)")?;
+                        self.push_paramref_reg_load(
+                            form,
+                            MachOperand::StackSlot(src_off),
+                            MachReg::Phys(r),
+                        );
+                        Ok(())
+                    }
+                    ParamDst::Slot(dslot) => {
+                        let size = Self::paramref_slot_relay_ok(ty, small_dest)
+                            .ok_or("ParamRef(slot-width)")?;
+                        self.machinst_buf.push(MachInst::Mov {
+                            src: MachOperand::StackSlot(src_off),
+                            dst: MachOperand::StackSlot(dslot),
+                            size,
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            // GPR↔XMM relays stay on the text path by design (the MachInst
+            // float layer is xmm-domain only).
+            ParamClass::FloatReg { .. } => Err("ParamRef(float-domain)"),
+            // i128 pairs, by-value structs, F128, stack structs, …: the
+            // text path's default arm emits NOTHING for these (their
+            // prologue staging is the whole story), so a no-op lowering is
+            // semantically identical — and keeps the run unsplit.
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The scalar integer extensions that only change instruction selection
+/// (no new register classes, types, ABI or `vzeroupper` obligations), and
+/// therefore can be switched per function by `target("...")`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ScalarIsa {
+    pub(super) bmi1: bool,
+    pub(super) bmi2: bool,
+    pub(super) lzcnt: bool,
+    pub(super) popcnt: bool,
+}
+
+impl ScalarIsa {
+    /// `bits` with each extension set to this selection's choice.
+    fn overlay(self, bits: u64) -> u64 {
+        use super::super::isa::with_feature;
+        use crate::common::x86_features::X86Feature as F;
+        [
+            (self.bmi1, F::Bmi),
+            (self.bmi2, F::Bmi2),
+            (self.lzcnt, F::Lzcnt),
+            (self.popcnt, F::Popcnt),
+        ]
+        .into_iter()
+        .fold(bits, |bits, (on, feature)| with_feature(bits, feature, on))
+    }
+
+    /// The extensions of a feature set.
+    fn of(features: crate::common::x86_features::EffectiveFeatures) -> Self {
+        use crate::common::x86_features::X86Feature as F;
+        ScalarIsa {
+            bmi1: features.contains(F::Bmi),
+            bmi2: features.contains(F::Bmi2),
+            lzcnt: features.contains(F::Lzcnt),
+            popcnt: features.contains(F::Popcnt),
+        }
+    }
+}
+
+/// One function's feature set: the TU's features `tu` with the module's
+/// selections (which `CCC_NO_*` knobs may narrow), then the function's
+/// `target("...")` options in GCC's semantics
+/// ([`super::super::isa::fold_target_features`]): `sse4.2` brings POPCNT,
+/// `abm` LZCNT and POPCNT, `no-abm` removes neither, and an `arch=`
+/// replaces the TU's selection with the CPU's (`target("arch=x86-64")`
+/// under `-march=haswell` is the baseline path of a runtime dispatch and
+/// must not use BMI2).
+fn function_feature_set(
+    tu: u64,
+    isa: super::super::isa::X86Isa,
+    scalar: ScalarIsa,
+    avx512: bool,
+    avx512vl: bool,
+    features: &[String],
+) -> crate::common::x86_features::EffectiveFeatures {
+    use super::super::isa::{fold_target_features, with_feature};
+    use crate::common::x86_features::X86Feature as F;
+    let module = isa.overlay(scalar.overlay(tu));
+    let module = with_feature(module, F::Avx512F, avx512);
+    let module = with_feature(module, F::Avx512Vl, avx512vl);
+    crate::common::x86_features::EffectiveFeatures::from_raw(if features.is_empty() {
+        module
+    } else {
+        fold_target_features(module, features)
+    })
+}
+
+impl X86Codegen {
+    /// Recompute isel's BMI2 shift policy from the live `bmi2_enabled`.
+    fn publish_shlx_mode(&self) {
+        let bmi2 = self.bmi2_enabled;
+        super::isel::set_shlx_mode(if self.tune.prefer_shlx(bmi2) {
+            super::isel::ShlxMode::Always
+        } else if self.tune.shlx_saves_move(bmi2) {
+            super::isel::ShlxMode::WhenItSavesAMove
+        } else {
+            super::isel::ShlxMode::Never
+        });
+    }
+
+    /// Publish the meet of the TU's and every emitted function's ISA for the
+    /// module-wide text peephole. Call once every function is emitted:
+    /// during emission each function's own ISA is current (MachInst picks
+    /// VEX vs legacy encodings from it, and mixing them inside an AVX
+    /// function would cost SSE/AVX transitions).
+    pub fn publish_peephole_isa(&self) {
+        super::super::isa::set_current(self.peephole_isa);
+    }
+}
+
+impl X86Codegen {
+    /// Record that `v`'s home register no longer holds `v`, and which site
+    /// destroyed it.
+    ///
+    /// `site` is a compile-time tag (`"reg-clobber"`, `"asm-window"`, …), so
+    /// recording it is allocation-free, and the program point distinguishes
+    /// repeated clobbers of one value in different blocks. Consumers: the
+    /// `CCC_DEBUG_NOHOME` dump and the `operand_to_rax` refusal text.
+    pub(super) fn mark_home_clobbered(&mut self, v: u32, site: &'static str) {
+        self.home_clobbered.insert(v);
+        self.home_clobber_cause
+            .insert(v, (self.state.current_program_point, site));
+    }
+
+    #[inline]
+    pub(super) fn clear_home_clobbered(&mut self, v: u32) {
+        self.home_clobbered.remove(&v);
+        self.home_clobber_cause.remove(&v);
+    }
+
+    /// Print the `CCC_DEBUG_NOHOME` forensics for a value whose home cannot
+    /// be recovered: its home register, its mark, the exact site that
+    /// destroyed the home ([`Self::mark_home_clobbered`]), its hole-aware
+    /// live segments against the current program point, and the same for
+    /// every value sharing the register.
+    ///
+    /// Cold by construction — it only runs on the refusal path — which is why
+    /// it lives outside `operand_to_rax`'s hot body.
+    #[cold]
+    fn dump_nohome_diagnostics(&self, v: u32) {
+        if std::env::var_os("CCC_DEBUG_NOHOME").is_none() {
+            return;
+        }
+        let home = self.reg_assignments.get(&v).map(|r| r.0);
+        let fresh = self.home_fresh.contains(&v);
+        let sharers = home.and_then(|h| self.home_sharers.get(&h).cloned());
+        eprintln!(
+            "[NOHOME] fn={} value={} home={:?} fresh={} sharers={:?} defined_by={:?} \
+             in_ir_shadow={}",
+            self.state.current_func_name,
+            v,
+            home,
+            fresh,
+            sharers,
+            self.get_defining_instruction(v).map(|i| format!("{i:?}")),
+            self.machinst_buf_ir
+                .iter()
+                .any(|i| i.dest().map(|d| d.0) == Some(v))
+        );
+        // Per-sibling mark audit (H1 blind-spot triage): for each group
+        // sibling, its clobber mark, chain rep, and live segments against the
+        // current point.
+        let point = self.state.current_program_point;
+        let home_state = home.map(|h| self.home_write_state.get(&h).copied());
+        let caller_spilled = home.is_some_and(|h| self.caller_save_spill_slots.contains_key(&h));
+        let caller_interval = home.is_some_and(|h| {
+            self.caller_save_intervals
+                .get(&h)
+                .is_some_and(|iv| iv.iter().any(|&(s, e)| s <= point && point <= e))
+        });
+        eprintln!(
+            "[NOHOME-home] v={} write_state={:?} caller_spilled={} \
+             caller_interval_covers_now={}",
+            v, home_state, caller_spilled, caller_interval
+        );
+        eprintln!(
+            "[NOHOME-cause] v={} cause={:?}",
+            v,
+            self.home_clobber_cause.get(&v)
+        );
+        eprintln!(
+            "[NOHOME-self] v={} clobbered={} fresh={} rep={} segs={:?} now={} use={:?}",
+            v,
+            self.home_clobbered.contains(&v),
+            self.home_fresh.contains(&v),
+            self.chain_rep(v),
+            self.value_live_segments.get(&v),
+            point,
+            self.value_use_counts.get(&v)
+        );
+        let Some(sharers) = sharers else {
+            return;
+        };
+        for s in sharers {
+            if s == v {
+                continue;
+            }
+            eprintln!(
+                "[NOHOME-sib] s={} clobbered={} fresh={} rep={} segs={:?} now={}",
+                s,
+                self.home_clobbered.contains(&s),
+                self.home_fresh.contains(&s),
+                self.chain_rep(s),
+                self.value_live_segments.get(&s),
+                point
+            );
+        }
+    }
+
+    /// Is the jump table indexed by the value's low 32 bits?
+    ///
+    /// `build_jump_table`'s index arithmetic is the switch type's own
+    /// wraparound, so every 32-bit (and narrower) class qualifies for the
+    /// unsigned 32-bit `(v - min) mod 2^32 < range` test. Any subsequent
+    /// 64-bit address use must first canonicalize the register home; the IR
+    /// type alone does not guarantee clean upper bits.
+    fn switch_index_is_32bit(ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8
+        )
+    }
+
+    /// The `(value, physical reg, 64-bit reg, 32-bit reg)` an in-place 32-bit
+    /// switch dispatch may use, or `None` for the canonical `%rax` path.
+    ///
+    /// Only 32-bit switch types qualify — the table index is the value's low
+    /// word — and only when the value is already resident in a GPR that can
+    /// appear as a scale-8 SIB index: `rsp` cannot (#UD), and an xmm home
+    /// would need a move anyway. The clobber of that home is the price of the
+    /// path, so it is charged to [`Self::value_home_is_expendable`].
+    fn direct32_switch_index(
+        &mut self,
+        val: &Operand,
+        ty: IrType,
+    ) -> Option<(u32, PhysReg, &'static str, &'static str)> {
+        let Operand::Value(v) = val else {
+            return None;
+        };
+        if !Self::switch_index_is_32bit(ty) {
+            return None;
+        }
+        self.fresh_home_of(v.0)
+            .filter(|&reg| !is_xmm_reg(reg) && phys_reg_name(reg) != "rsp")
+            .filter(|_| self.value_home_is_expendable(v.0))
+            .map(|reg| (v.0, reg, phys_reg_name(reg), phys_reg_name_32(reg)))
+    }
+
+    /// May [`Self::emit_switch_jump_table`]'s direct 32-bit path destroy the
+    /// home register of `v`?
+    ///
+    /// The path rewrites the register in place (`subl $min, %r32`) to build
+    /// the in-range index and marks the home clobbered, after which the
+    /// emitter's readers refuse it (`fresh_home_of`). That is a saving only
+    /// while the register's old content is worth nothing: one of the recovery
+    /// rungs documented at `operand_to_rax` must be able to rebuild the value
+    /// afterwards — a stack slot, a bit-identical `Cast`/`Copy` source, or a
+    /// `GlobalAddr` recomputation. Anything else takes the canonical `%rax`
+    /// path, which leaves the home intact at the cost of one load.
+    ///
+    /// The liveness test must be *any later segment*, not "live at the next
+    /// program point": the segments are hole-aware, and the clobber mark is
+    /// not path-sensitive, so a hole between this dispatch and the value's
+    /// next segment is not ours to spend. Linux 6.18.58 `vc_handle_mmio`
+    /// homed a parameter in `%r14` with segments `[(7,9) (11,21) (23,23)
+    /// (119,127)]`; the switch sits at point 23, `contains(24)` is false
+    /// because 24..118 is a hole, the fast path destroyed the register, and
+    /// the read at 119 then had no slot, no remat and no accumulator left —
+    /// the `operand_to_rax` refusal that ended the translation unit.
+    fn value_home_is_expendable(&self, v: u32) -> bool {
+        let point = self.state.current_program_point;
+        // Fail closed when live-segment metadata is absent: without it we
+        // cannot prove the home has no future readers.
+        let Some(live) = self.value_live_segments.get(&v) else {
+            return false;
+        };
+        if !live.0.iter().any(|&(_start, end)| end > point) {
+            return true;
+        }
+        if self.state.get_slot(v).is_some() {
+            return true;
+        }
+        // Boundedly walk Copy / bit-identical Cast chains (matching
+        // `rematerialize_stale_into_rax`'s 3-hop bound) and accept ONLY when
+        // an ancestor has a clobber-immune recovery source: a stack slot, a
+        // Constant, or a `GlobalAddr` rematerialisation. An unslotted source
+        // value whose own home already died (or was coalesced into the very
+        // register we are about to destroy) would fail `operand_to_rax` at
+        // `v`'s later read.
+        let mut cur = v;
+        for _ in 0..3 {
+            match self.get_defining_instruction(cur) {
+                Some(Instruction::GlobalAddr { .. })
+                | Some(Instruction::Copy {
+                    src: Operand::Const(_),
+                    ..
+                }) => return true,
+                Some(Instruction::Cast {
+                    src: Operand::Const(_),
+                    from_ty,
+                    to_ty,
+                    ..
+                }) if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) => {
+                    return true;
+                }
+                Some(Instruction::Copy {
+                    src: Operand::Value(sv),
+                    ..
+                }) => {
+                    if self.state.get_slot(sv.0).is_some() {
+                        return true;
+                    }
+                    if sv.0 == cur {
+                        return false;
+                    }
+                    cur = sv.0;
+                }
+                Some(Instruction::Cast {
+                    src: Operand::Value(sv),
+                    from_ty,
+                    to_ty,
+                    ..
+                }) if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) => {
+                    if self.state.get_slot(sv.0).is_some() {
+                        return true;
+                    }
+                    if sv.0 == cur {
+                        return false;
+                    }
+                    cur = sv.0;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+}
+
+impl ArchCodegen for X86Codegen {
+    fn set_function_target_features(&mut self, features: &[String]) {
+        use super::super::isa::{X86Isa, features_permit};
+        use crate::common::x86_features::{X86Feature as F, effective};
+        // One feature set for the whole function.
+        let set = function_feature_set(
+            effective().raw(),
+            self.module_isa,
+            self.module_scalar_isa,
+            self.module_avx512,
+            self.module_avx512vl,
+            features,
+        );
+        self.vex_vnni = features_permit(set, F::AvxVnni);
+        let scalar_isa = if features.is_empty() {
+            self.module_scalar_isa
+        } else {
+            ScalarIsa::of(set)
+        };
+        let live_scalar = ScalarIsa {
+            bmi1: self.bmi1_enabled,
+            bmi2: self.bmi2_enabled,
+            lzcnt: self.lzcnt_enabled,
+            popcnt: self.popcnt_enabled,
+        };
+        if scalar_isa != live_scalar {
+            self.bmi1_enabled = scalar_isa.bmi1;
+            self.bmi2_enabled = scalar_isa.bmi2;
+            self.lzcnt_enabled = scalar_isa.lzcnt;
+            self.popcnt_enabled = scalar_isa.popcnt;
+            self.publish_shlx_mode();
+        }
+        let vec_isa = if features.is_empty() {
+            self.module_isa
+        } else {
+            X86Isa::from_feature_bits(set.raw())
+        };
+        // AVX-512 needs the 256-bit class lccc's EVEX emitters build on;
+        // AVX512BW/DQ/CD imply AVX512F and none implies VL (GCC's graph).
+        let want_avx512 = set.contains(F::Avx512F) && vec_isa.ymm;
+        let want_avx512vl = want_avx512 && set.contains(F::Avx512Vl);
+        self.peephole_isa = self.peephole_isa.meet(vec_isa);
+        let want_no_sse = if features.is_empty() {
+            self.module_no_sse
+        } else {
+            !vec_isa.simd
+        };
+        if vec_isa != self.isa
+            || want_avx512 != self.avx512_enabled
+            || want_avx512vl != self.avx512vl_enabled
+            || want_no_sse != self.no_sse
+        {
+            self.isa = vec_isa;
+            self.no_sse = want_no_sse;
+            self.avx2_enabled = vec_isa.ymm;
+            self.fma_enabled = vec_isa.fma;
+            self.avx512_enabled = want_avx512;
+            self.avx512vl_enabled = want_avx512vl;
+            super::super::isa::set_current(vec_isa);
+        }
+    }
+
+    /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
+    /// `#` starts a comment in this target's GAS syntax, so the markers are
+    /// invisible to the assembler, to objdump, and to this backend's text
+    /// peephole alike; downstream scanners (the -mno-sse /
+    /// -mgeneral-regs-only SIMD guard) use them to exempt user-authored
+    /// text from the compiler-generated code policy.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
+    fn supports_asm_cc_branch_fusion(&self) -> bool {
+        true
+    }
+
+    fn supports_switch_bounds(&self) -> bool {
+        true
+    }
+
+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
+        self.reg_assignments.contains_key(&vid)
+    }
+
+    fn emit_acc_save(&mut self) -> i64 {
+        // push/pop are the cheapest flags-neutral accumulator save on x86 and
+        // are a single instruction each way. 8 bytes in 64-bit mode.
+        self.state.emit("    pushq %rax");
+        8
+    }
+
+    fn emit_acc_restore(&mut self) {
+        self.state.emit("    popq %rax");
+    }
+
+    /// x86 override: stage `dest`/`src` into `%rdi`/`%rsi` as a parallel
+    /// copy (the generic default routes both through `%rcx` sequentially and
+    /// swaps them when the homes cross — regression `memcpy_param_home_swap`).
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        self.emit_memcpy_ir_impl(dest, src, size);
+    }
+
+    fn flush_pending_widen(&mut self) {
+        self.flush_pending_widen_impl();
+    }
+
+    fn mark_volatile_access(&mut self, begin: bool) {
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_VOLATILE_{}",
+            if begin { "BEGIN" } else { "END" }
+        ));
+    }
+
+    fn narrow_cmp_operands(
+        &mut self,
+        dest: u32,
+        op: crate::ir::reexports::IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> Option<(Operand, Operand, IrType, crate::ir::reexports::IrCmpOp)> {
+        self.narrow_cmp_operands_impl(dest, op, lhs, rhs)
+    }
+
+    fn state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
+    fn state_ref(&self) -> &CodegenState {
+        &self.state
+    }
+    fn ptr_directive(&self) -> PtrDirective {
+        PtrDirective::Quad
+    }
+
+    fn supports_mcount(&self) -> bool {
+        true
+    }
+
+    fn supports_classic_mcount(&self) -> bool {
+        true
+    }
+
+    fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
+        // Freshness-gated (see home_fresh): the static map only says where a
+        // value is HOMED; the GEP/LEA/SIB paths that consult this helper
+        // emit the register as an address BASE or INDEX — a stale home would
+        // feed a derived value into the address computation (the kernel
+        // 6.18.50 free_area_init_node zone-pointer-as-index panic).
+        self.fresh_home_of(val_id)
+    }
+
+    fn is_machinst_enabled(&self) -> bool {
+        self.machinst_enabled && self.machinst_function_enabled
+    }
+
+    fn supports_inline_memcpy_call(&self) -> bool {
+        true
+    }
+
+    /// Fixed-size `memset` expansion policy (docs/CPU_MODEL_AUDIT.md §4,
+    /// follow-up item "memset lowering").  The shape test is shared with
+    /// the MachInst typed-call gate (`inline_memset_const_len`); the
+    /// profitability test is the tuning row's `memset_strategy`, evaluated
+    /// with the vector width the `-march` contract allows.  `LibCall` (size
+    /// above ¼ L3 on ERMS rows / 8 KiB otherwise) keeps the libc call, whose
+    /// non-temporal path wins there.  Under `-mno-sse` every size that is
+    /// not a libcall is still expanded (scalar stores / `rep stosb`), which
+    /// is also what the kernel build requires (no libc).
+    fn inline_memset_len(&self, func: &str, info: &CallInfo) -> Option<usize> {
+        crate::backend::generation::x86_inline_memset_len(func, info)
+    }
+
+    fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
+        self.fp_contract
+    }
+
+    fn supports_fused_float_mul_add(&self) -> bool {
+        // FP contraction changes results (single rounding). Only fuse under
+        // the explicit contract; integer mul+add fusion is unaffected (the
+        // generation-side detector calls this only for float types).
+        // FMA3 is additionally gated on the target ISA: vfmadd231s{s,d} is
+        // illegal on baseline (SSE2) x86-64, matching GCC, which requires
+        // `-mfma` (or an enabling -march) even under -ffp-contract=fast.
+        self.fp_contract != FpContract::Off && self.fma_enabled
+    }
+
+    fn supports_fused_float_mul_sub(&self) -> bool {
+        // vfmsub231/vfnmadd231 need the same contraction contract *and* the
+        // same FMA3 ISA gate as vfmadd231.
+        self.fp_contract != FpContract::Off && self.fma_enabled
+    }
+
+    fn emit_fused_mul_sub(
+        &mut self,
+        _mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        sub_dest: &Value,
+        ty: IrType,
+        mul_is_lhs: bool,
+    ) {
+        debug_assert!(matches!(ty, IrType::F32 | IrType::F64));
+        self.emit_scalar_fms231(mul_lhs, mul_rhs, acc, sub_dest, ty, mul_is_lhs);
+    }
+
+    fn supports_and_not(&self) -> bool {
+        self.bmi1_enabled && crate::backend::generation::andn_fusion_env_enabled()
+    }
+
+    fn supports_fused_bit_test_branch(&self) -> bool {
+        // BT + JC consumes CF directly: no setc/movzx/test materialization.
+        // Kill switch for bisection parity with the other branch fusions.
+        std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
+    }
+
+    fn emit_and_not(
+        &mut self,
+        _not_dest: &Value,
+        not_src: &Operand,
+        other: &Operand,
+        dest: &Value,
+        ty: IrType,
+        direct_return: bool,
+    ) {
+        self.emit_and_not_impl(not_src, other, dest, ty, direct_return);
+    }
+
+    fn try_lower_machinst(
+        &mut self,
+        inst: &crate::ir::reexports::Instruction,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
+        // A volatile load or store is one observable access and is emitted in
+        // place inside its marked region; the MachInst buffer defers emission,
+        // which would move the access out of its region.
+        if matches!(
+            inst,
+            crate::ir::reexports::Instruction::Load { volatile: true, .. }
+                | crate::ir::reexports::Instruction::Store { volatile: true, .. }
+        ) {
+            return false;
+        }
+        if !self.machinst_enabled
+            || !self.machinst_function_enabled
+            || self.machinst_disabled_kinds & machinst_kind_bit(inst) != 0
+        {
+            return false;
+        }
+        if machinst_result_needs_sext(inst, &self.needs_sext_values) {
+            return false;
+        }
+        // DE MORGAN SPLIT: And/Or + Cmp dests claimed by the branch split
+        // must NOT take the MachInst fast path — the branch re-emits both
+        // comparisons from the recorded operands, and the And/Or emits
+        // nothing at all. Claiming them here would materialize booleans the
+        // split was built to kill (and strand the skip-set: the text-path
+        // gates below would see an already-lowered instruction).
+        if let crate::ir::reexports::Instruction::BinOp { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
+        if let crate::ir::reexports::Instruction::Cmp { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
+        // Same for the Copy/Cast passthru (`bool c = a&&b; if (c)`): it is
+        // skipped by the text-path gates below, never MachInst-claimed.
+        if let crate::ir::reexports::Instruction::Copy { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
+        if let crate::ir::reexports::Instruction::Cast { dest, .. } = inst {
+            if self.demorgan_skip.contains(&dest.0) {
+                return false;
+            }
+        }
+        // A Copy whose SOURCE is a skipped producer (rematerializable
+        // GlobalAddr root or a folded GEP) must keep the text path: the
+        // MachInst lowering would resolve the source through its home,
+        // which the skipped producer never wrote — the same contract the
+        // `gpr_ptr` gate enforces for Load/Store pointers ("reading its
+        // home is a segfault"). The text path's Copy arm rematerializes
+        // remat roots (`leaq sym(%rip), dest`) and folds GEP sources.
+        if let crate::ir::reexports::Instruction::Copy { src, .. } = inst {
+            if let crate::ir::reexports::Operand::Value(v) = src {
+                if folded_global_addrs.contains(&v.0) || self.state.folded_gep_values.contains(&v.0)
+                {
+                    return false;
+                }
+            }
+        }
+        // TLS symbols must NOT take the MachInst LeaSym fast path: it lowers
+        // GlobalAddr to a plain `leaq sym(%rip)`, which for a __thread symbol
+        // computes the address of the .tdata TEMPLATE, not the calling
+        // thread's instance — `tls_var = 7;` then wrote the initializer image
+        // while the earlier %fs-based read still saw the old value
+        // (regression glibc_gottpoff, second read returned 42).  The text
+        // path (emit_tls_global_addr_impl) selects the right TLS model, so
+        // keep TLS addresses off the fast path.
+        if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
+            if self.state.tls_symbols.contains(name) {
+                return false;
+            }
+        }
+        // PF-TLS-1: a Load/Store the text path folds into ONE Local-Exec
+        // instruction (`%fs:sym@TPOFF+N`) must not be claimed here — the
+        // MachInst lowering would emit the two-instruction base
+        // materialization plus an indirect access. The gate is the same
+        // resolution the fold itself uses, so the two can never disagree.
+        if let crate::ir::reexports::Instruction::Load { ptr, ty, .. } = inst {
+            if Self::tls_direct_type_ok(*ty) && self.tls_local_exec_access(ptr.0, 0).is_some() {
+                return false;
+            }
+        }
+        if let crate::ir::reexports::Instruction::Store { ptr, ty, .. } = inst {
+            if Self::tls_direct_type_ok(*ty) && self.tls_local_exec_access(ptr.0, 0).is_some() {
+                return false;
+            }
+        }
+        // PF-15 hazard closure: a Cast admitted to the MachInst queue never
+        // runs the mature cast emitter, so it neither records a pending
+        // widening move nor honours try_record_pending_widen's refusal
+        // contract ("any refusal flushes the deferred moves FIRST"). Every
+        // other instruction kind flushes at the per-instruction loop head;
+        // a Cmp folds-or-flushes in its dispatch arm. A Cast is therefore
+        // the ONLY instruction that can be lowered while a pending-widen
+        // record is alive, and its register writes are invisible to the
+        // record's soundness model.
+        //
+        // Why that is a miscompile: the recorded source's only modelled use
+        // is its own deferred move, so RA legally reuses the source's home
+        // for a later cast's destination. Queueing that cast emits the
+        // clobbering move while the record still promises the consuming
+        // compare an intact source home
+        // (stress reproducer: `cmp((int)p2, (uint16)p1)` after
+        // `movzwl %esi, %edx` — both operands collapsed to %rdx, lccc
+        // returned 1 for 58142 <= 0).
+        //
+        // Ordering: the record-creating cast went through the classic path,
+        // which flushed the MachInst run first, so every buffered
+        // instruction POSTDATES the record. Emitting the deferred widening
+        // moves before that buffered run restores exact program order: the
+        // moves read their source homes at the record point, ahead of any
+        // queued clobber. The flushed run is pure performance state — the
+        // buffer reforms behind the widening moves.
+        if matches!(inst, crate::ir::reexports::Instruction::Cast { .. })
+            && (self.pending_widen[0].is_some() || self.pending_widen[1].is_some())
+        {
+            self.flush_pending_widen_impl();
+            self.flush_machinst();
+        }
+        // ParamRef: lower the no-code subset AND the single-move
+        // materializations through MachInst.
+        //
+        // A ParamRef is not a no-op in general -- `emit_param_ref_impl` has
+        // four cases: pre-stored (nothing to do), a parameter homed in an
+        // alloca slot (a load), an incoming ABI register that must be copied
+        // to a different home, and a stack-passed argument loaded from
+        // `16(%rbp)`/`8(%rsp)`. A previous attempt returned `true` for all of
+        // them and broke four corpus tests, every one parameter-related --
+        // those cases genuinely materialize, so the typed path below lowers
+        // them as moves (mirroring the text path instruction for
+        // instruction) instead of no-opping them.
+        //
+        // The pre-stored subset is different in kind: `emit_store_params`
+        // already placed the value in the destination's register during the
+        // prologue, so the body emits literally nothing. Buffering it costs
+        // nothing and, crucially, does NOT flush the MachInst run -- which is
+        // the whole point, because a ParamRef sitting between two lowerable
+        // instructions used to split them onto separate paths. Parameters are
+        // 10.8% of all instructions in the corpus.
+        //
+        // Whatever the typed path refuses keeps the text path, where the ABI
+        // contract (including the pinned "read the *incoming* register even
+        // if another pre-store aliased that name" rule) is already
+        // implemented; the typed path emits that same marker for its own
+        // incoming-register reads.
+        if let crate::ir::reexports::Instruction::ParamRef {
+            dest,
+            param_idx,
+            ty,
+        } = inst
+        {
+            let no_code = *param_idx >= self.state.param_classes.len()
+                || (self.state.param_pre_stored.contains(param_idx)
+                    && self
+                        .state
+                        .param_alloca_slots
+                        .get(*param_idx)
+                        .copied()
+                        .flatten()
+                        .is_none());
+            if no_code {
+                super::isel::stats::note_lowered();
+                return true;
+            }
+            match self.try_lower_paramref_typed(dest, *param_idx, *ty) {
+                Ok(()) => {
+                    super::isel::stats::note_lowered();
+                    return true;
+                }
+                Err(label) => {
+                    super::isel::stats::note_reject_named(label);
+                    return false;
+                }
+            }
+        }
+
+        // Typed calls (CallTyped): the SysV integer-register subset — direct
+        // AND indirect — lowered as one atomic machine instruction. Indirect
+        // calls stage the callee pointer into r10/r11 inside the same move
+        // list. Everything else — variadic/sret/struct/i128/F128 calls,
+        // stack-overflow arguments, register-exchange hazard cycles, inline-
+        // memcpy candidates, retpoline/paravirt indirect forms — keeps the
+        // mature path, which owns the general contract. See
+        // try_lower_call_typed for the full admission contract.
+        if let crate::ir::reexports::Instruction::Call { func, info } = inst {
+            // Sibling call (TODO-3 / §5b): a site the driver matched to the
+            // block-tail shape stays on the MATURE call path — the sibcall
+            // conversion lives in `emit_call_instruction_impl`/`emit_return_impl`
+            // (call suppression + `<epilogue>; jmp`), which the MachInst
+            // buffering bypasses entirely.
+            if self.state.sibcall_hint.is_some() {
+                return false;
+            }
+            return self.try_lower_call_typed(inst, Some(func), None, info, folded_global_addrs);
+        }
+        if let crate::ir::reexports::Instruction::CallIndirect { func_ptr, info } = inst {
+            if self.state.sibcall_hint.is_some() {
+                return false;
+            }
+            return self.try_lower_call_typed(
+                inst,
+                None,
+                Some(func_ptr),
+                info,
+                folded_global_addrs,
+            );
+        }
+
+        // Div/rem pair heads and tails must stay on the classic emitter path:
+        // the fusion (emit_divrem_pair_head) lives there and the MachInst
+        // lowering emits standalone divisions for each side, which would both
+        // duplicate the divide and skip the tail elimination.
+        if let crate::ir::reexports::Instruction::BinOp {
+            dest,
+            op:
+                crate::ir::reexports::IrBinOp::SDiv
+                | crate::ir::reexports::IrBinOp::UDiv
+                | crate::ir::reexports::IrBinOp::SRem
+                | crate::ir::reexports::IrBinOp::URem,
+            ..
+        } = inst
+        {
+            if self.divrem_tail_dests.contains(&dest.0)
+                || self.divrem_head_partners.contains_key(&dest.0)
+                || self.divrem_broken_tails.contains(&dest.0)
+            {
+                return false;
+            }
+        }
+        // W2 Load->Cast folding is a two-instruction runtime handshake: the
+        // default Load emitter redirects into the Cast destination and arms
+        // fold_skip_cast; the default Cast emitter consumes that handshake.
+        // Lowering the Cast through MachInst bypasses the consumer and emits a
+        // second conversion from the load's stale original home. This corrupted
+        // gzip's gzip_deflate/compress_block byte loads. Keep candidate Casts on
+        // the default path; if a particular Load could not redirect, the default
+        // Cast simply emits normally.
+        if let crate::ir::reexports::Instruction::Cast {
+            dest,
+            from_ty,
+            to_ty,
+            ..
+        } = inst
+        {
+            if self.folded_cast_dests.contains(&dest.0) {
+                return false;
+            }
+            // Float casts (and F128) stay on the mature path. The MachInst
+            // lower_cast only knows integer size-moves: a same-size
+            // Ptr(8) -> F64 cast would be emitted as `movq %reg, %xmm0` — a
+            // BITCAST of the address, not a cvtsi2sdq value conversion
+            // (`(double)ptr` printed 0.0 for a 0x55… address). Mirrors
+            // isel::can_lower, which already excludes floats; this gate used
+            // a coarser size/sign classification and missed them.
+            if from_ty.is_float() || to_ty.is_float() {
+                return false;
+            }
+            // Signed widening remains on the mature path. Although the raw
+            // movsx selection is straightforward, SQLite's optimized VDBE has
+            // overlapping allocator locations where the mature cast emitter's
+            // type-aware relay/liveness handling is required; MachInst corrupted
+            // an UnpackedRecord pointer before sqlite3BtreeIndexMoveto. Category
+            // bisection proved this exact class, while unsigned widening,
+            // narrowing, and same-width casts pass. This guard is narrow and
+            // preserves all measured-safe MachInst coverage.
+            if to_ty.size() > from_ty.size() && !from_ty.is_unsigned() {
+                return false;
+            }
+            let shape_bit = match to_ty.size().cmp(&from_ty.size()) {
+                std::cmp::Ordering::Greater => MI_CAST_WIDEN,
+                std::cmp::Ordering::Less => MI_CAST_NARROW,
+                std::cmp::Ordering::Equal => MI_CAST_SAME,
+            };
+            let sign_bit = if from_ty.is_unsigned() {
+                MI_CAST_UNSIGNED_SOURCE
+            } else {
+                MI_CAST_SIGNED_SOURCE
+            };
+            if self.machinst_disabled_kinds & (shape_bit | sign_bit) != 0 {
+                return false;
+            }
+        }
+        // Keep Select on the mature path. MachInst's current lowering reserves
+        // rax for the true value, but resolving a stack-backed condition also
+        // uses rax as a relay, clobbering that true value before cmov. The mature
+        // path additionally consumes pending Cmp flags directly and is both
+        // smaller and faster. Keep the preceding fused Cmp there as well so the
+        // boolean is never needlessly materialized (gzip huft_build regression).
+        match inst {
+            crate::ir::reexports::Instruction::Select { .. } => return false,
+            // MachInst's `LeaSym` is a bare `leaq sym(%rip)`: only valid
+            // for a symbol the output binds locally.  An interposable one
+            // (default-visibility data under -fPIC, a weak or function
+            // import under PIE) must take the mature emitter's GOTPCREL
+            // load.  Without this gate every -O1+ -fPIC access to a global
+            // variable bypassed the GOT: a shared library read its own copy
+            // while the executable's copy relocation held the real one (and
+            // the result could not even be linked: bfd and lccc-ld refuse
+            // the R_X86_64_PC32 against a preemptible symbol).
+            crate::ir::reexports::Instruction::GlobalAddr { name, .. }
+                if self.state.needs_got_for_addr(name) =>
+            {
+                return false;
+            }
+            // PF-15: single-use widening casts from byte/half types stay on
+            // the mature path, where try_record_pending_widen can defer them
+            // into a narrow compare. MachInst would emit the extending move
+            // eagerly, which forecloses the fold. Eligibility mirrors
+            // try_record_pending_widen (the record path re-checks everything
+            // and emits normally on any mismatch, so a lenient gate here is
+            // merely an optimization hint, never a correctness input).
+            crate::ir::reexports::Instruction::Cast {
+                dest,
+                from_ty,
+                to_ty,
+                ..
+            } if matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
+                && !to_ty.is_float()
+                && (to_ty.size() == 4 || to_ty.size() == 8)
+                && self.value_use_counts.get(&dest.0).copied() == Some(1) =>
+            {
+                return false;
+            }
+            // PF-16b: widening casts of provably-nonnegative bitop results
+            // reclassify to the unsigned path in the mature emitter; MachInst
+            // would sign-extend eagerly (cltq/movslq) and foreclose that.
+            crate::ir::reexports::Instruction::Cast {
+                src: Operand::Value(sv),
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_signed()
+                && from_ty.size() <= 4
+                && to_ty.size() == 8
+                && self.bitop_nonneg_values.contains(&sv.0) =>
+            {
+                return false;
+            }
+            crate::ir::reexports::Instruction::Cmp { dest, .. }
+                if self.fused_cmp_dests.contains_key(&dest.0)
+                    || self.cmp_replay.contains_key(&dest.0) =>
+            {
+                // Fused candidates keep their flags for the adjacent consumer;
+                // REPLAY candidates are emitted by the mature path's Cmp
+                // emitter, which skips the boolean materialization entirely
+                // (the consumer re-emits the compare). Sending either through
+                // MachInst would materialize setcc/movzbl AND leave the
+                // consumer to replay — a doubled compare per select.
+                return false;
+            }
+            _ => {}
+        }
+        // Debug knob: CCC_MI_SKIP_FUNC=name1,name2 disables the MachInst path
+        // for whole functions (diagnostic bisection aid).
+        if let Some(skip) = std::env::var("CCC_MI_SKIP_FUNC").ok() {
+            if skip
+                .split(',')
+                .any(|n| n == self.state.current_func_name.as_str())
+            {
+                return false;
+            }
+        }
+
+        // Scalar float FMov bypass. The generic operand scan below rejects
+        // every XMM-domain value (is_mi_unsafe_value), so the validated
+        // float subset routes straight to the typed lowering. The candidate
+        // check is the exact admission predicate for the isel float arms;
+        // if the lowering still declines (belt and suspenders), the text
+        // path takes over unchanged.
+        if self.float_typed_candidate(inst, folded_global_addrs) {
+            let mut float_alloca_slots = crate::common::fx_hash::FxHashMap::default();
+            // The float arms read the VALUE's spill slot (relay source) and
+            // the DEST's spill slot (relay target) from the same map as the
+            // pointer slot — insert all three shapes the instruction has.
+            match inst {
+                crate::ir::reexports::Instruction::Load { dest, ptr, .. } => {
+                    for v in [ptr.0, dest.0] {
+                        if self.state.is_alloca(v) {
+                            if let Some(slot) = self.state.get_slot(v) {
+                                float_alloca_slots.insert(v, slot.0);
+                            }
+                        }
+                    }
+                    if !self.reg_assignments.contains_key(&dest.0) {
+                        if let Some(slot) = self.state.get_slot(dest.0) {
+                            float_alloca_slots.insert(dest.0, slot.0);
+                        }
+                    }
+                }
+                crate::ir::reexports::Instruction::Store { val, ptr, .. } => {
+                    if self.state.is_alloca(ptr.0) {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            float_alloca_slots.insert(ptr.0, slot.0);
+                        }
+                    }
+                    if let crate::ir::reexports::Operand::Value(v) = val {
+                        if !self.reg_assignments.contains_key(&v.0) {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                float_alloca_slots.insert(v.0, slot.0);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let mut buf = std::mem::take(&mut self.machinst_buf);
+            let lowered = super::isel::lower_instruction_typed_ss(
+                inst,
+                &FreshHomes(self),
+                &float_alloca_slots,
+                Some(&self.value_types),
+                Some(&self.state.small_slot_values),
+                &mut buf,
+            );
+            self.machinst_buf = buf;
+            if lowered {
+                self.machinst_buf_ir.push(inst.clone());
+            }
+            return lowered;
+        }
+
+        // Typed i128 route (the Store(other) / Load(other) census classes).
+        // Mirrors the float route: an early, exact admission gate plus a
+        // slot map that includes the VALUE home — the 16-byte i128 slot,
+        // which the generic scan below would reject outright (i128 values
+        // are never register-assigned, so a Load dest / Store val with no
+        // RA entry trips the no-register rule before the isel could speak).
+        if self.i128_typed_candidate(inst, folded_global_addrs) {
+            let mut i128_slots = crate::common::fx_hash::FxHashMap::default();
+            match inst {
+                crate::ir::reexports::Instruction::Load { dest, ptr, .. } => {
+                    if self.state.is_alloca(ptr.0) {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            i128_slots.insert(ptr.0, slot.0);
+                        }
+                    }
+                    if let Some(slot) = self.state.get_slot(dest.0) {
+                        i128_slots.insert(dest.0, slot.0);
+                    }
+                }
+                crate::ir::reexports::Instruction::Store { val, ptr, .. } => {
+                    if self.state.is_alloca(ptr.0) {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            i128_slots.insert(ptr.0, slot.0);
+                        }
+                    }
+                    if let crate::ir::reexports::Operand::Value(v) = val {
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            i128_slots.insert(v.0, slot.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let mut buf = std::mem::take(&mut self.machinst_buf);
+            let lowered = super::isel::lower_instruction_typed_ss(
+                inst,
+                &FreshHomes(self),
+                &i128_slots,
+                Some(&self.value_types),
+                Some(&self.state.small_slot_values),
+                &mut buf,
+            );
+            self.machinst_buf = buf;
+            if lowered {
+                self.machinst_buf_ir.push(inst.clone());
+            }
+            return lowered;
+        }
+
+        // Reject instructions involving values we can't handle.
+        // Allocas are allowed for Load/Store ptr (ISel handles via StackSlot).
+        use crate::backend::liveness::for_each_operand_in_instruction;
+        let ra = &self.reg_assignments;
+        let state = &self.state;
+        let mut reject = false;
+        for_each_operand_in_instruction(inst, |op| {
+            if let crate::ir::reexports::Operand::Value(v) = op {
+                // Alloca operand VALUES (not ptrs) are still rejected
+                if state.is_alloca(v.0) {
+                    reject = true;
+                    return;
+                }
+                if is_mi_unsafe_value(v.0, ra, state, &self.value_types) {
+                    reject = true;
+                    return;
+                }
+                if let Some(r) = ra.get(&v.0) {
+                    if is_xmm_reg(*r) {
+                        reject = true;
+                        return;
+                    }
+                }
+                if !ra.contains_key(&v.0) && state.get_slot(v.0).is_none() {
+                    reject = true;
+                }
+            }
+        });
+        // Load/Store ptr: allow allocas (ISel handles via StackSlot) and register ptrs.
+        // Reject folded GEP ptrs, XMM ptrs, and ptrs with no register and no alloca.
+        match inst {
+            crate::ir::reexports::Instruction::Load { ptr, .. }
+            | crate::ir::reexports::Instruction::Store { ptr, .. } => {
+                // A pointer whose address is folded into a direct symbol(%rip)
+                // operand by the default path has NO materialized address: the
+                // GlobalAddr instruction was skipped. MachInst would emit a
+                // memory operand through a register that is never loaded
+                // (gzip: `movq %r15, (%r13)` with r13 never set -> SEGV).
+                if folded_global_addrs.contains(&ptr.0) {
+                    reject = true;
+                }
+                if state.folded_gep_values.contains(&ptr.0) {
+                    reject = true;
+                }
+                // Over-aligned allocas (e.g. _Alignas(32) SIMD buffers): the
+                // runtime address is (slot+align-1)&~(align-1), not the raw
+                // slot. MachInst's lower_load/lower_store use the raw slot
+                // address and would write to the WRONG location. The default
+                // path handles OverAligned via emit_alloca_aligned_addr.
+                if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
+                    state.resolve_slot_addr(ptr.0)
+                {
+                    reject = true;
+                }
+                if let Some(r) = ra.get(&ptr.0) {
+                    if is_xmm_reg(*r) {
+                        reject = true;
+                    }
+                }
+                // Ptr must be: alloca, register, or stack slot (ISel loads to rcx)
+                if !state.is_alloca(ptr.0)
+                    && !ra.contains_key(&ptr.0)
+                    && state.get_slot(ptr.0).is_none()
+                {
+                    reject = true;
+                }
+            }
+            crate::ir::reexports::Instruction::GetElementPtr { base, offset, .. } => {
+                // GetElementPtr does not encode the variable index's effective
+                // signed width. Feeding an I32 -1 directly to 64-bit LEA turns
+                // it into +0xffffffff (SQLite FTS5 porter Step1B2 crash).
+                // Constant offsets remain MachInst-safe; variable offsets stay
+                // on mature codegen until machine IR carries a typed index.
+                if matches!(offset, crate::ir::reexports::Operand::Value(_)) {
+                    reject = true;
+                }
+                // Over-aligned alloca bases need the aligned address; the
+                // default path computes it, MachInst would use the raw slot.
+                if state.is_alloca(base.0) {
+                    if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
+                        state.resolve_slot_addr(base.0)
+                    {
+                        reject = true;
+                    }
+                }
+                // Allow alloca bases (ISel handles via AllocaAddr + leaq).
+                // Non-alloca bases must be register-homed: ISel emits
+                // `Lea { base: Vreg }` for a stack-homed pointer, and
+                // resolve_stack_vregs cannot rewrite that to a SIB off the
+                // slot — the slot holds the POINTER VALUE, not an address
+                // to index. Fallback then re-emits with empty fold maps.
+                if !state.is_alloca(base.0) && !ra.contains_key(&base.0) {
+                    reject = true;
+                }
+                if let Some(r) = ra.get(&base.0) {
+                    if is_xmm_reg(*r) {
+                        reject = true;
+                    }
+                }
+            }
+            // 64-bit Add is selected as Lea (base + index). A stack-homed
+            // operand becomes MachReg::Vreg; Lea cannot encode it, and
+            // substituting the slot as the Lea base would compute
+            // `&slot + index` instead of `*slot + index`. The unresolvable
+            // Vreg forces a default-path replay with empty GEP/global-addr
+            // fold maps, which ICEs on values the skipped producers never
+            // homed (kernel tracing_iter_reset: RELOC_HIDE ptr +
+            // `__per_cpu_offset[cpu]` after an indexed-sym load).
+            crate::ir::reexports::Instruction::BinOp {
+                op: crate::ir::reexports::IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if ty.size() == 8 && !ty.is_float() => {
+                let add_op_is_phys = |op: &crate::ir::reexports::Operand| match op {
+                    crate::ir::reexports::Operand::Const(_) => true,
+                    crate::ir::reexports::Operand::Value(v) => {
+                        ra.get(&v.0).is_some_and(|r| r.0 < 20)
+                    }
+                };
+                if !add_op_is_phys(lhs) || !add_op_is_phys(rhs) {
+                    reject = true;
+                }
+            }
+            _ => {}
+        }
+        // Dest must have a register for ALU/Shift/Neg/Not (two-address instructions).
+        // Cmp/SetCC don't write to a GPR dest in a useful way (flags only).
+        // Copy dest can be a stack slot (resolved to Mov with StackSlot).
+        if let Some(dest) = inst.dest() {
+            if state.is_alloca(dest.0) {
+                reject = true;
+            }
+            if is_mi_unsafe_value(dest.0, ra, state, &self.value_types) {
+                reject = true;
+            }
+            if let Some(r) = ra.get(&dest.0) {
+                if is_xmm_reg(*r) {
+                    reject = true;
+                }
+                // Workaround: skip rbp-dest BinOps to avoid triggering a register
+                // name bug in the existing codegen after MachInst cache invalidation.
+                if r.0 == 6 {
+                    reject = true;
+                }
+            }
+            if !ra.contains_key(&dest.0) {
+                match inst {
+                    crate::ir::reexports::Instruction::Copy { .. } => {
+                        if state.get_slot(dest.0).is_none() {
+                            reject = true;
+                        }
+                    }
+                    _ => {
+                        reject = true;
+                    }
+                }
+            }
+        }
+        if reject {
+            return false;
+        }
+
+        // Build alloca slot map for Load/Store/GEP ISel
+        let mut alloca_slots = crate::common::fx_hash::FxHashMap::default();
+        match inst {
+            crate::ir::reexports::Instruction::Load { ptr, .. }
+            | crate::ir::reexports::Instruction::Store { ptr, .. } => {
+                if self.state.is_alloca(ptr.0) {
+                    if let Some(slot) = self.state.get_slot(ptr.0) {
+                        alloca_slots.insert(ptr.0, slot.0);
+                    }
+                }
+            }
+            crate::ir::reexports::Instruction::GetElementPtr { base, .. } => {
+                if self.state.is_alloca(base.0) {
+                    if let Some(slot) = self.state.get_slot(base.0) {
+                        alloca_slots.insert(base.0, slot.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut buf = std::mem::take(&mut self.machinst_buf);
+        let lowered = super::isel::lower_instruction_typed_ss(
+            inst,
+            &FreshHomes(self),
+            &alloca_slots,
+            Some(&self.value_types),
+            Some(&self.state.small_slot_values),
+            &mut buf,
+        );
+        self.machinst_buf = buf;
+        if lowered {
+            // Typed S32 ALU/load/select writes zero the upper register half.
+            // The IR permits implicit wide consumers (notably pointer-index
+            // products), so preserve the same canonical signed-home contract
+            // as the classic emitter. Copy/Phi closure is already represented
+            // in implicit_sext_values. Narrow-only and unsigned results need no
+            // extra instruction; explicit Cast lowering already canonicalizes.
+            use crate::ir::reexports::Instruction;
+            let signed_dest = match inst {
+                Instruction::BinOp {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                }
+                | Instruction::UnaryOp {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                }
+                | Instruction::Load {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                }
+                | Instruction::Select {
+                    dest,
+                    ty: IrType::I32,
+                    ..
+                } => Some(*dest),
+                _ => None,
+            };
+            if let Some(dest) = signed_dest
+                && self.implicit_sext_values.contains(&dest.0)
+            {
+                use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
+                // Nothing but `machinst_buf` changed since the lowering: the
+                // view answers exactly what the lowering saw.
+                let dst = super::isel::HomeMap::get(&FreshHomes(self), &dest.0)
+                    .copied()
+                    .map(MachReg::Phys)
+                    .unwrap_or(MachReg::Vreg(dest.0));
+                self.machinst_buf.push(MachInst::Movsx {
+                    src: MachOperand::Reg(dst),
+                    dst,
+                    from_size: OpSize::S32,
+                    to_size: OpSize::S64,
+                });
+            }
+            self.machinst_buf_ir.push(inst.clone());
+        }
+        lowered
+    }
+
+    fn flush_machinst(&mut self) {
+        if self.machinst_buf.is_empty() {
+            // No machine instructions pending: nothing to emit. The IR shadow
+            // (`machinst_buf_ir`) may still hold entries from no-op lowerings
+            // — a coalesced Copy whose src and dest resolve to the same home
+            // (value_to_reg(src) == value_to_reg(dest)) emits zero MachInsts
+            // but is still recorded in the shadow. Drop the shadow too:
+            // leaving it behind lets a later flush — possibly in a *different
+            // function* after the boundary — replay stale IR whose values
+            // have no homes there, tripping the operand_to_rax hard gate
+            // (kernel drivers/tty/tty_io.c: tty_tiocmget replayed
+            // tty_get_tiocm's tail `Copy v19 = v12`). A no-op window needs no
+            // replay: the values are already at their destinations.
+            self.machinst_buf_ir.clear();
+            return;
+        }
+
+        use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
+
+        if mi_stream_dbg() {
+            eprintln!(
+                "### MI-STREAM fn={} n={}",
+                self.state.current_func_name,
+                self.machinst_buf.len()
+            );
+            for mi in &self.machinst_buf {
+                eprintln!("  {mi:?}");
+            }
+        }
+
+        // ── Window register allocation pipeline ─────────────────────────
+        // (1) Classify which vregs must get window registers (BEFORE
+        //     resolution, so the resolver can skip substituting exactly
+        //     those — mixing a slot-substituted read with a register-held
+        //     def of the same SSA value in one window would read a stale
+        //     slot image).
+        // (2) Resolve memory-form vreg positions to stack-slot operands
+        //     (the optimal folded-memory access, unchanged behavior).
+        // (3) Allocate window scratch registers for the classified vregs,
+        //     inserting reloads (arriving values) and stores (live-out
+        //     defs) — SSA-exact within the window.
+        // (4) A vreg that survives all three stages still trips the
+        //     unresolvable gate and replays the window through the default
+        //     path: the fail-safe, now the exception instead of the cliff.
+        let window_last_writes_fast: Option<FxHashMap<u8, super::machinst_alloc::WindowWriteKind>>;
+        let mut window_vreg_writers: FxHashMap<u8, u32> = FxHashMap::default();
+        let reg_classified = super::machinst_alloc::classify_window(
+            &self.machinst_buf,
+            Some(&self.state.small_slot_values),
+        );
+        // ACC-RESIDENT SUBSTITUTION eligibility, fail-closed on both
+        // axes: the window owns no scratch registers (an owned window may
+        // assign %rax to a vreg behind the substitution's back), and no
+        // instruction in the window touches %rax in any way.
+        let window_rax_free =
+            reg_classified.is_empty() && machinst_window_rax_free(&self.machinst_buf);
+        let acc_subst = window_rax_free;
+        let window_defs = if acc_subst {
+            machinst_window_defs(&self.machinst_buf)
+        } else {
+            crate::common::fx_hash::FxHashSet::default()
+        };
+        let resolved: Vec<MachInst> = self
+            .machinst_buf
+            .iter()
+            .map(|inst| {
+                resolve_stack_vregs(
+                    inst,
+                    &self.reg_assignments,
+                    &self.state,
+                    &reg_classified,
+                    acc_subst,
+                    &window_defs,
+                )
+            })
+            .collect();
+        let final_insts = if reg_classified.is_empty() {
+            // Fast path: nothing needs a window register — the resolution
+            // result is the emission input, exactly as before.
+            window_last_writes_fast =
+                Some(super::machinst_alloc::window_last_writes_core(&resolved));
+            window_vreg_writers.clear();
+            resolved
+        } else {
+            let ir_len = self.machinst_buf_ir.len() as u32;
+            let pp_end = self.state.current_program_point;
+            let window_span = (pp_end.saturating_sub(ir_len), pp_end.saturating_sub(1));
+            let ctx = super::machinst_alloc::WindowCtx {
+                slots: &self.state.value_locations,
+                small_slots: &self.state.small_slot_values,
+                types: &self.value_types,
+                total_uses: &self.value_use_counts,
+                alloca_values: &self.state.alloca_values,
+                reg_busy: &self.machine_reg_busy,
+                window_span,
+            };
+            let (insts, writes, vreg_writers) =
+                match super::machinst_alloc::allocate_window(resolved, &ctx) {
+                    Some(v) => v,
+                    None => {
+                        // Allocation refused (XMM domain, SSA discipline, pool
+                        // exhaustion, …): the skip-set vregs never got
+                        // substituted, so re-resolve WITHOUT the skip set —
+                        // giving the memory-operand path its chance before the
+                        // replay decides. The re-resolved sequence (when it
+                        // fully resolves, no replay) is what gets emitted, so
+                        // its writes must be classified by the core
+                        // classifier — an empty map here would let the
+                        // overlay skip the window entirely and leave stale
+                        // write-state facts pinned across it.
+                        let re_resolved: Vec<MachInst> = self
+                            .machinst_buf
+                            .iter()
+                            .map(|inst| {
+                                resolve_stack_vregs(
+                                    inst,
+                                    &self.reg_assignments,
+                                    &self.state,
+                                    &crate::common::fx_hash::FxHashSet::default(),
+                                    false,
+                                    &crate::common::fx_hash::FxHashSet::default(),
+                                )
+                            })
+                            .collect();
+                        let core_writes =
+                            super::machinst_alloc::window_last_writes_core(&re_resolved);
+                        (re_resolved, core_writes, FxHashMap::default())
+                    }
+                };
+            window_last_writes_fast = Some(writes);
+            window_vreg_writers = vreg_writers;
+            insts
+        };
+
+        let has_bad = final_insts
+            .iter()
+            .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
+        if has_bad {
+            if self.state.ra_config.mi_debug {
+                eprintln!(
+                    "[MI-FALLBACK] {} instructions -> default path",
+                    self.machinst_buf_ir.len()
+                );
+                for mi in &final_insts {
+                    if has_unresolvable_vreg(mi, &self.reg_assignments) {
+                        eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
+                    }
+                }
+                for inst in &self.machinst_buf_ir {
+                    eprintln!("[MI-FALLBACK]   ir: {inst:?}");
+                }
+            }
+            // CORRECTNESS: never delete instructions. Re-emit the buffered IR
+            // through the default (accumulator) codegen path, which handles
+            // stack-backed values in every position. The buffer is a
+            // straight-line sequence (flushed before calls and at block ends),
+            // the register cache is still valid for the pre-buffer state, and
+            // GEP folding is a pure optimization — an empty fold map keeps the
+            // default path semantics-identical.
+            let ir = std::mem::take(&mut self.machinst_buf_ir);
+            // The main dispatch loop already advanced once for each buffered
+            // instruction. Replay at those original points, then finish at
+            // exactly the same point; advancing from the current endpoint
+            // would double-count the whole fallback window and misalign later
+            // call-spanning save/restore intervals.
+            let replay_endpoint = self.state.current_program_point;
+            let replay_len = u32::try_from(ir.len())
+                .expect("MachInst replay window exceeds u32 program-point space");
+            self.state.current_program_point = replay_endpoint
+                .checked_sub(replay_len)
+                .expect("MachInst replay exceeds emitted IR program points");
+            for inst in ir {
+                crate::backend::generation::generate_instruction(
+                    self,
+                    &inst,
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashSet::default(),
+                    &crate::common::fx_hash::FxHashMap::default(),
+                );
+                self.state.current_program_point += 1;
+            }
+            assert_eq!(
+                self.state.current_program_point, replay_endpoint,
+                "MachInst replay changed the IR program-point endpoint"
+            );
+            self.machinst_buf.clear();
+            return;
+        }
+
+        super::machinst_emit::emit_machinsts_with_tune(
+            &final_insts,
+            &mut self.state.out,
+            &self.tune,
+            crate::backend::x86::cpu_model::div64_bypass_killed(),
+        );
+
+        // Register-cache coherence (SOUNDNESS): the window's instructions
+        // may write %rax/%rcx (pre-colored div staging, Phys destinations)
+        // without the text-path cache ever seeing it. A stale acc/sec
+        // entry after the window would hand a later text consumer the
+        // wrong register content. The replay path above needs no such
+        // invalidation — it IS text emission, cache-maintained throughout.
+        self.state.reg_cache.invalidate_all();
+
+        // Home-freshness bookkeeping (SOUNDNESS): MachInst-buffered
+        // instructions bypass generate_instruction, so their destinations
+        // never passed through note_dest_defined at their own position. The
+        // whole window has now been emitted at this program point. Only a
+        // dest that was PRE-COLORED to its (then-fresh) home is actually in
+        // that home now — mark it. Every other homed dest was written to a
+        // window scratch register and/or its slot: invalidate its home so
+        // later consumers reload instead of reading whatever the window or
+        // an earlier in-place chain left there (kernel 6.18.50
+        // free_area_init_node: the fused mul-add consumed the zone POINTER
+        // as the loop index after the MachInst chain reused %r11 in place).
+        {
+            let ir_shadow = std::mem::take(&mut self.machinst_buf_ir);
+            // Invalidate EVERY shadow dest's freshness: a pre-colored dest's
+            // home may have been overwritten afterwards by a window scratch
+            // assignment to the same register (the window allocator does not
+            // model pre-colored operands as interference), and a Vreg dest
+            // landed in a scratch register whose identity is not tracked
+            // here. Consumers after the window rebuild the value through
+            // the slot/reload/remat paths (kernel 6.18.50
+            // free_area_init_node: a MachInst [Cast→%r11][Mul %r11,%r11]
+            // window left the sign-extended loop index marked fresh in %r11
+            // after the multiply had already replaced it, so the following
+            // fused mul-add consumed the ZONE POINTER as the index).
+            for inst in &ir_shadow {
+                let Some(dest) = inst.dest() else { continue };
+                if !self.reg_assignments.contains_key(&dest.0) {
+                    continue;
+                }
+                // Typed calls are emitted with their return move explicitly
+                // targeted at the allocator's home register (try_lower_call_
+                // typed builds CallRetMove from reg_assignments).  That home
+                // may already be marked clobbered by an earlier instruction
+                // in the same function; using home_clobbered as the sole
+                // "was this pre-colored?" test would then leave the freshly
+                // returned value falsely stale.  A call result is a new
+                // definition, so it re-establishes its home unconditionally.
+                let typed_call_home_def = matches!(
+                    inst,
+                    crate::ir::reexports::Instruction::Call { info, .. }
+                        | crate::ir::reexports::Instruction::CallIndirect { info, .. }
+                        if info.dest.as_ref().is_some_and(|d| d.0 == dest.0)
+                );
+                if typed_call_home_def || !self.home_clobbered.contains(&dest.0) {
+                    // Pre-colored destination (or a typed call return): the
+                    // window wrote the value into its home. Mark it fresh so
+                    // later consumers may read the home.
+                    self.note_home_written(dest.0);
+                } else {
+                    // Not pre-colored: the window's result went to scratch
+                    // and/or a slot; the home holds whatever preceded it.
+                    self.home_fresh.remove(&dest.0);
+                    self.mark_home_clobbered(dest.0, "asm-window");
+                }
+            }
+            // ── S11 write-state overlay (EXACT window accounting) ────────
+            // The note-bit loop above keeps the coarse freshness bits, but
+            // the write-state law needs the register-truth: which home
+            // registers did the EMITTED window actually write last, and
+            // was that write a pre-colored definition (Def) or scratch/
+            // clobber traffic (Clobber)? The classifier derives this from
+            // the post-allocation instruction sequence, so a pre-colored
+            // def is recognized even when an OLD clobber mark made the
+            // heuristic above believe the home was not written (the
+            // replay-min/max shape: `cmoval %esi, %r14d` targets the
+            // accumulator's home regardless of earlier marks).
+            let Some(last_writes) = &window_last_writes_fast else {
+                self.machinst_buf_ir = ir_shadow;
+                return;
+            };
+            for (reg_id, kind) in last_writes.iter() {
+                let home = PhysReg(*reg_id);
+                // `home_sharers` is the inverse of the function's final
+                // `reg_assignments` (built with it in the prologue): an O(1)
+                // answer where filtering the whole assignment map cost
+                // O(values) per written register per window -- quadratic in
+                // call-dense functions, which flush a window per call.
+                if self.home_sharers.get(reg_id).is_none_or(|s| s.is_empty()) {
+                    // Not a home register in this function: nothing to track.
+                    continue;
+                }
+                match kind {
+                    super::machinst_alloc::WindowWriteKind::Precolor => {
+                        // The last shadow dest homed in this register owns
+                        // the surviving pre-colored definition (multiple
+                        // same-home defs in one window are impossible for
+                        // simultaneously-live values; the LAST one is the
+                        // register's content).
+                        let owner = ir_shadow
+                            .iter()
+                            .filter_map(|inst| inst.dest())
+                            .rev()
+                            .find(|d| self.reg_assignments.get(&d.0).is_some_and(|&r| r == home));
+                        match owner {
+                            Some(v) => {
+                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v.0));
+                            }
+                            None => {
+                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
+                            }
+                        }
+                    }
+                    super::machinst_alloc::WindowWriteKind::ScratchOrClobber => {
+                        // A window Vreg dst whose OWN home is this register
+                        // realized the group's next lineage member — a
+                        // definition, not scratch (the allocator may only
+                        // pick a dead-inside-the-window home for it, so
+                        // the disjoint-live-range invariant holds).
+                        match window_vreg_writers.get(reg_id) {
+                            // A Vreg whose own home is this register: a
+                            // group-member definition (the allocator may
+                            // only reuse a dead-inside-the-window home).
+                            Some(&v)
+                                if self.reg_assignments.get(&v).is_some_and(|&r| r == home) =>
+                            {
+                                if ws_watch(*reg_id) {
+                                    eprintln!(
+                                        "[WS-win] blk={} r{} vreg Def({})",
+                                        self.home_dbg_block, reg_id, v
+                                    );
+                                }
+                                self.home_write_state.insert(*reg_id, HomeWrite::Def(v));
+                            }
+                            // Inserted reload into foreign scratch, an
+                            // unnamed-Raw touch, or an unsaved call
+                            // clobber: foreign content.
+                            other => {
+                                if ws_watch(*reg_id) {
+                                    eprintln!(
+                                        "[WS-win] blk={} r{} Clobber writer={:?} kind={:?} state_before={:?}",
+                                        self.home_dbg_block,
+                                        reg_id,
+                                        other,
+                                        window_last_writes_fast
+                                            .as_ref()
+                                            .and_then(|m| m.get(reg_id)),
+                                        self.home_write_state.get(reg_id)
+                                    );
+                                }
+                                self.home_write_state.insert(*reg_id, HomeWrite::Clobber);
+                            }
+                        }
+                    }
+                }
+            }
+            self.machinst_buf_ir = ir_shadow;
+        }
+
+        self.machinst_buf.clear();
+        self.machinst_buf_ir.clear();
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    fn emit_reg_to_reg_move(&mut self, src: PhysReg, dest: PhysReg) {
+        let s_name = phys_reg_name(src);
+        let d_name = phys_reg_name(dest);
+        self.state
+            .out
+            .emit_instr_reg_reg("    movq", s_name, d_name);
+    }
+
+    fn emit_acc_to_phys_reg(&mut self, dest: PhysReg) {
+        let d_name = phys_reg_name(dest);
+        self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
+    }
+
+    fn emit_pre_call_save_caller_regs(&mut self) {
+        // Sibling call (TODO-3): with the `call` suppressed there is no
+        // clobber to protect values across — the save/restore pair would
+        // be dead stores around the epilogue. The argument-setup phases
+        // still run unchanged and read the same homes they always did.
+        if self.state.pending_sibcall.is_some() {
+            return;
+        }
+        self.caller_regs_restored = false;
+        let point = self.state.current_program_point;
+        // Home-freshness snapshot for the registers this call actually saves:
+        // their content is preserved across the call by the save/restore
+        // pair, so exactly these values can be re-marked fresh afterwards.
+        // Every other caller-saved home is clobbered by the callee and is
+        // invalidated in emit_post_call_restore_caller_regs.
+        let mut snapshot: Vec<u32> = Vec::new();
+        for (&reg_id, &slot) in &self.caller_save_spill_slots {
+            if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+                if intervals
+                    .iter()
+                    .any(|&(start, end)| start <= point && point <= end)
+                {
+                    if let Some(sharers) = self.home_sharers.get(&reg_id) {
+                        for &v in sharers {
+                            if self.home_fresh.contains(&v) {
+                                snapshot.push(v);
+                            }
+                        }
+                    }
+                    let reg_name = phys_reg_name(PhysReg(reg_id));
+                    self.state
+                        .out
+                        .emit_instr_reg_rbp("    movq", reg_name, slot.0);
+                }
+            }
+        }
+        self.call_fresh_snapshot = snapshot;
+    }
+
+    fn emit_post_call_restore_caller_regs(&mut self) {
+        // The matching pre-call save was skipped for a sibling call. In
+        // particular, the initial `caller_regs_restored == false` must not
+        // make this site reload stale caller-save slots over the outgoing
+        // argument registers before the tail jump.
+        if self.state.pending_sibcall.is_some() {
+            self.caller_regs_restored = true;
+            self.call_fresh_snapshot.clear();
+            return;
+        }
+        // Idempotent per call site: the vector-register aggregate return
+        // (`emit_call_store_vector_return_impl`) restores early so it can
+        // read the buffer operand, and the generic Phase 2b call that
+        // follows must not reload a second time.
+        if std::mem::replace(&mut self.caller_regs_restored, true) {
+            return;
+        }
+        let point = self.state.current_program_point;
+        let snapshot = std::mem::take(&mut self.call_fresh_snapshot);
+        // Copy the (home, slot) pairs out before the loop: the body records
+        // clobber causes through `&mut self` ([`Self::mark_home_clobbered`]).
+        // The list is one entry per caller-saved home live across a call —
+        // single digits — so the collect is cheaper than an interior-mutability
+        // workaround and keeps the borrow checker honest.
+        let spill_slots: Vec<(u8, crate::backend::state::StackSlot)> = self
+            .caller_save_spill_slots
+            .iter()
+            .map(|(&reg, &slot)| (reg, slot))
+            .collect();
+        for (reg_id, slot) in spill_slots {
+            if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+                if intervals
+                    .iter()
+                    .any(|&(start, end)| start <= point && point <= end)
+                {
+                    // This caller-saved home is about to be rewritten with
+                    // the pre-call content; any OTHER fresh value homed here
+                    // (not covered by the snapshot) is gone. The sharer list
+                    // is copied out first: recording the cause needs
+                    // `&mut self`, and a register shares with a handful of
+                    // values at most.
+                    let sharers = self.home_sharers.get(&reg_id).cloned();
+                    if let Some(sharers) = sharers {
+                        for v in sharers {
+                            self.home_fresh.remove(&v);
+                            self.mark_home_clobbered(v, "caller-restore");
+                        }
+                    }
+                    let reg_name = phys_reg_name(PhysReg(reg_id));
+                    self.state
+                        .out
+                        .emit_instr_rbp_reg("    movq", slot.0, reg_name);
+                }
+            }
+        }
+        // Values whose registers were saved and restored are fresh again.
+        for v in snapshot {
+            self.home_fresh.insert(v);
+            self.clear_home_clobbered(v);
+            // The restore's pop/mov is a real definition write.
+            if let Some(&home) = self.reg_assignments.get(&v) {
+                self.home_write_state.insert(home.0, HomeWrite::Def(v));
+            }
+        }
+    }
+
+    fn jump_mnemonic(&self) -> &'static str {
+        "jmp"
+    }
+    fn trap_instruction(&self) -> &'static str {
+        "ud2"
+    }
+
+    fn note_function_emitted(&mut self, func: &IrFunction, mark: usize) {
+        if !self.ipa.enabled() {
+            return;
+        }
+        // A non-interposable definition: what a direct call reaches is
+        // exactly this text (the matrix and the safe-side argument live on
+        // the predicate itself).
+        let binds_locally = super::ipa_ra::call_binds_locally(
+            func.is_static,
+            func.visibility.as_deref(),
+            self.state.pic_mode,
+            self.state.pie_mode,
+            self.state.shared_lib,
+        );
+        let text = &self.state.out.buf[mark..];
+        let label = format!("{}:", func.name);
+        // The summary is keyed by the IR name; it must be the emitted label
+        // (an asm-label rename would otherwise key the wrong symbol).
+        let labelled = text.lines().any(|l| l == label);
+        self.ipa
+            .note_function_emitted(func, binds_locally && labelled, text);
+        let callees = std::mem::take(&mut self.ipa_keep_callees);
+        self.ipa.record(&func.name, self.ipa_keep, callees);
+        self.ipa_keep = 0;
+    }
+
+    fn peephole_for_metric(&self, text: String) -> String {
+        crate::backend::x86::codegen::peephole::peephole_optimize_with_config(
+            text,
+            self.state_ref().ra_config.as_ref(),
+            self.optimize_for_size,
+        )
+    }
+
+    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
+        crate::backend::x86::codegen::peephole::peephole_optimize_pair_with_config(
+            first,
+            second,
+            self.state_ref().ra_config.as_ref(),
+            self.optimize_for_size,
+        )
+    }
+
+    fn emit_branch_nonzero(&mut self, label: &str) {
+        self.state.emit("    testq %rax, %rax");
+        self.state.out.emit_jcc_label("    jne", label);
+    }
+
+    fn emit_jump_indirect(&mut self) {
+        self.emit_retpoline_jump("rax");
+    }
+
+    fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        // 128-bit switches need an explicit high-half guard: the compare
+        // chain and the jump table below operate on the low 64-bit half only
+        // (%rax), so a case value representable in i64 matches only when the
+        // high half is its sign extension — 0 for non-negative cases, -1 for
+        // negative ones.  Without the guard, ((__int128)1 << 64) matched
+        // `case 0` (gcc.c-torture execute/pr122943.c).
+        if matches!(ty, IrType::I128 | IrType::U128) && !cases.is_empty() {
+            let has_nonneg = cases.iter().any(|&(v, _)| v >= 0);
+            let has_neg = cases.iter().any(|&(v, _)| v < 0);
+            if has_neg && has_nonneg {
+                // Mixed sign classes: two guarded chains.
+                //   high == 0  -> non-negative chain
+                //   high == -1 -> negative chain
+                //   else       -> default
+                self.emit_load_acc_pair(val); // %rax = low, %rdx = high
+                let nonneg_chain = self.state.fresh_label("switch128_nonneg");
+                let neg_chain = self.state.fresh_label("switch128_neg");
+                self.state.out.emit_instr_imm_reg("    cmpq", 0, "rdx");
+                self.state.out.emit_jcc_label("    je", &nonneg_chain);
+                self.state.out.emit_instr_imm_reg("    cmpq", -1, "rdx");
+                self.state.out.emit_jcc_label("    je", &neg_chain);
+                self.emit_branch_to_block(*default);
+                self.state.out.emit_named_label(&nonneg_chain);
+                for &(case_val, target) in cases.iter().filter(|&&(v, _)| v >= 0) {
+                    let label = target.as_label();
+                    self.emit_switch_case_branch_128_low(case_val, &label);
+                }
+                self.emit_branch_to_block(*default);
+                self.state.out.emit_named_label(&neg_chain);
+                for &(case_val, target) in cases.iter().filter(|&&(v, _)| v < 0) {
+                    let label = target.as_label();
+                    self.emit_switch_case_branch_128_low(case_val, &label);
+                }
+                self.emit_branch_to_block(*default);
+            } else {
+                // Single sign class: one guard, then the low-half chain.
+                let required_high: i64 = if has_neg { -1 } else { 0 };
+                self.emit_load_acc_pair(val); // %rax = low, %rdx = high
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    cmpq", required_high, "rdx");
+                self.state
+                    .out
+                    .emit_jcc_label("    jne", &default.as_label());
+                for &(case_val, target) in cases {
+                    let label = target.as_label();
+                    self.emit_switch_case_branch_128_low(case_val, &label);
+                }
+                self.emit_branch_to_block(*default);
+            }
+            return;
+        }
+        self.emit_switch_native(val, cases, default, ty);
+    }
+
+    fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
+        let use_32bit = matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8
+        );
+        if case_val == 0 {
+            if use_32bit {
+                self.state.emit("    testl %eax, %eax");
+            } else {
+                self.state.emit("    testq %rax, %rax");
+            }
+        } else if use_32bit {
+            // Use 32-bit comparison to avoid sign-extension mismatch for int-sized values
+            self.state
+                .out
+                .emit_instr_imm_reg("    cmpl", case_val as i32 as i64, "eax");
+        } else if case_val >= i32::MIN as i64 && case_val <= i32::MAX as i64 {
+            self.state
+                .out
+                .emit_instr_imm_reg("    cmpq", case_val, "rax");
+        } else {
+            self.state
+                .out
+                .emit_instr_imm_reg("    movabsq", case_val, "rcx");
+            self.state.emit("    cmpq %rcx, %rax");
+        }
+        self.state.out.emit_jcc_label("    je", label);
+    }
+
+    fn emit_switch_jump_table(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        use crate::backend::traits::build_jump_table;
+        let (table, min_val, range) = build_jump_table(cases, default);
+        let table_label = self.state.fresh_label("jt");
+        let default_label = default.as_label();
+
+        // For 32-bit switch types, the table index is the value's low 32
+        // bits. Two ways to materialise it:
+        //
+        // (a) CANONICAL RAX PATH (default): load the value into %rax,
+        //     zero/sign-extend for 64-bit arithmetic, subtract min,
+        //     compare range — all in 64-bit form.
+        //
+        // (b) DIRECT 32-BIT REGISTERS (fast path): when the switch value
+        //     is already resident in a GPR, index the table from that
+        //     register's 64-bit view and run the whole sub/cmp sequence
+        //     in 32-bit form. The emitter first establishes the defined
+        //     32-bit value: a plain 32-bit subtract clears the upper word,
+        //     while min == 0 and narrow sources need an explicit extension.
+        //     Without that step an ABI argument's arbitrary upper bits would
+        //     become part of the 64-bit SIB address. The unsigned 32-bit
+        //     wraparound test
+        //         (v - min) mod 2^32 < range   (jae when ≥)
+        //     is exactly the in-range predicate for every i8..u32
+        //     switch: a value below min wraps above 2^31, which is
+        //     always ≥ range (for min == i32::MIN no representable v
+        //     lies below min). This is the canonical `subl $min,%reg;
+        //     cmpl $range,%reg; jae` shape and drops the rax
+        //     materialisation plus the zero/sign extend from the hot
+        //     dispatch path.
+        let direct32 = self
+            .direct32_switch_index(val, ty)
+            .and_then(|(v_id, reg, r64, r32)| {
+                // Select the extension before committing to the fast path.
+                // An unexpected type must use the canonical RAX sequence,
+                // not turn an emitter precondition into a panic.
+                let extend = match ty {
+                    IrType::I32 | IrType::U32 => None,
+                    IrType::U8 => Some("movzbl"),
+                    IrType::U16 => Some("movzwl"),
+                    IrType::I8 => Some("movsbl"),
+                    IrType::I16 => Some("movswl"),
+                    _ => return None,
+                };
+                Some((v_id, reg, r64, r32, extend))
+            });
+
+        let in_range = match val {
+            Operand::Value(v) => {
+                self.state
+                    .switch_unsigned_bounds
+                    .get(&v.0)
+                    .is_some_and(|&bound| {
+                        crate::passes::integer_bounds::covers_switch(bound, ty, min_val, range)
+                    })
+            }
+            _ => false,
+        };
+
+        let index_reg: &'static str = match direct32 {
+            Some((v_id, reg, r64, r32, extend)) => {
+                // A register home does not prove that bits above the IR
+                // value are canonical: external ABI arguments may have
+                // arbitrary upper bits, and narrow producers may only write
+                // their low byte/word. A 64-bit SIB index observes all of
+                // them. Establish the defined 32-bit value before the first
+                // compare/subtract; the subtract itself would otherwise
+                // consume dirty low-word bits for narrow sources.
+                if let Some(extend) = extend {
+                    let source = typed_phys_reg_name(reg, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", extend, source, r32));
+                } else if min_val == 0 {
+                    // Unlike subl, cmpl does not write its destination and
+                    // therefore cannot clear the upper half of the SIB index.
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, %{}", r32, r32));
+                }
+                if min_val != 0 {
+                    // min_val fits i32: every 32-bit-class case value
+                    // does. The 32-bit sub wraps mod 2^32 — exactly the
+                    // index arithmetic the wraparound test expects.
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    subl", min_val as i32 as i64, r32);
+                    // The home now holds v - min; a later consumer of v
+                    // must not read it.
+                    self.mark_home_clobbered(v_id, "switch-sub");
+                }
+                if !in_range && range <= u32::MAX as usize {
+                    // range == 2^32 (full 32-bit span): every 32-bit
+                    // index is in range, so the test is skipped. The raw
+                    // low word of range is the correct imm32 either way.
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    cmpl", range as u32 as i64, r32);
+                    self.state.out.emit_jcc_label("    jae", &default_label);
+                }
+                r64
+            }
+            None => {
+                self.operand_to_rax(val);
+                if Self::switch_index_is_32bit(ty) {
+                    if ty.is_unsigned() {
+                        // Zero-extend: mov %eax, %eax clears upper 32 bits
+                        self.state.emit("    movl %eax, %eax");
+                    } else {
+                        // Sign-extend 32-bit to 64-bit
+                        self.state.emit("    cltq");
+                    }
+                }
+                if min_val != 0 {
+                    if min_val >= i32::MIN as i64 && min_val <= i32::MAX as i64 {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    subq", min_val, "rax");
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movabsq", min_val, "rcx");
+                        self.state.emit("    subq %rcx, %rax");
+                    }
+                }
+                if !in_range {
+                    if (range as i64) >= i32::MIN as i64 && (range as i64) <= i32::MAX as i64 {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    cmpq", range as i64, "rax");
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movabsq", range as i64, "rcx");
+                        self.state.emit("    cmpq %rcx, %rax");
+                    }
+                    self.state.out.emit_jcc_label("    jae", &default_label);
+                }
+                "rax"
+            }
+        };
+
+        // DISPATCH SHAPE — the GCC-canonical ABSOLUTE jump table,
+        // `jmp *tbl(,%reg,8)` (R_X86_64_32S against .rodata) plus `.quad`
+        // entries (R_X86_64_64 with absolute target offsets): ONE
+        // instruction per dispatch, versus the portable form's table-base
+        // load + 4-byte entry load + add + indirect jump (three extra
+        // instructions plus a dependent .rodata load per dispatch; the
+        // base lea cannot be hoisted by the loop pass because it sits
+        // inside the dispatch sequence).
+        //
+        // The direct form's jump instruction carries R_X86_64_32S, which
+        // linkers reject in ET_DYN output ("recompile with -fPIC"), so it
+        // may only be emitted when this translation unit will end up in a
+        // position-fixed executable: non-PIC code, the kernel model, or a
+        // driver-confirmed ET_EXEC link of this very invocation
+        // (`fixed_exec_link`: not -shared, not -r, not -pie). It is also
+        // the ONLY shape the kernel's objtool can validate: its
+        // add_jump_table() reads each entry's RELA addend as an absolute
+        // instruction offset, but PIC-style `.long target - table` entries
+        // carry position-baked addends (the GAS convention adds the entry's
+        // own offset, so S + A - P resolves at link time), which objtool
+        // then resolves mid-instruction and rejects the object with
+        // "can't find switch jump table" (observed on
+        // arch/x86/kernel/platform-quirks.o). GCC avoids that entirely by
+        // using absolute tables under -mcmodel=kernel/-fno-pic, so mirror
+        // that shape here. The .quad entries themselves are resolved at
+        // link time in ET_EXEC — lccc-ld would convert them to
+        // R_X86_64_RELATIVE in ET_DYN output (see emit_shared.rs) — but
+        // the SIB reference is what keeps this form out of
+        // position-dependent code.
+        // A Spectre-v2 retpoline option keeps the portable form, since the
+        // thunk wrapper applies to the indirect-jump sequence rather than
+        // to a SIB reference.
+        let retpoline_on =
+            self.state.indirect_branch_thunk || self.state.indirect_branch_thunk_inline;
+        let absolute_table = self.state.code_model_kernel
+            || !self.state.pic_mode
+            || (self.state.fixed_exec_link && !retpoline_on);
+        if absolute_table {
+            self.state
+                .emit_fmt(format_args!("    jmpq *{}(,%{},8)", table_label, index_reg));
+        } else {
+            // PIC: RIP-relative table base + PC32 differences. Correct for
+            // user-space PIC (no objtool validation there). The entry
+            // load indexes the same register the range test used.
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", &table_label, "rip", "rcx");
+            self.state
+                .emit_fmt(format_args!("    movslq (%rcx,%{},4), %rdx", index_reg));
+            self.state.emit("    addq %rcx, %rdx");
+            // Switch-table dispatch is an indirect branch: it needs the same
+            // retpoline protection as calls (Spectre v2 via the BTB applies to
+            // any indirect JMP; kernel objtool flags naked ones in vDSO too).
+            self.emit_retpoline_jump("rdx");
+        }
+
+        self.state.emit(".section .rodata");
+        self.state.emit(if absolute_table {
+            ".align 8"
+        } else {
+            ".align 4"
+        });
+        self.state.out.emit_named_label(&table_label);
+        for target in &table {
+            let target_label = target.as_label();
+            if absolute_table {
+                self.state
+                    .emit_fmt(format_args!("    .quad {}", target_label));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    .long {} - {}", target_label, table_label));
+            }
+        }
+        self.state.restore_current_text_section();
+
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    // ---- Standard trait methods (kept inline) ----
+    fn emit_load_operand(&mut self, op: &Operand) {
+        self.operand_to_rax(op)
+    }
+    fn emit_store_result(&mut self, dest: &Value) {
+        self.store_rax_to(dest)
+    }
+    fn supports_global_addr_fold(&self) -> bool {
+        true
+    }
+
+    fn supports_tls_direct_load_fold(&self) -> bool {
+        true
+    }
+
+    fn tls_direct_load_type_ok(&self, ty: IrType) -> bool {
+        Self::tls_direct_type_ok(ty)
+    }
+
+    fn tls_direct_store_type_ok(&self, ty: IrType) -> bool {
+        Self::tls_direct_type_ok(ty)
+    }
+
+    fn supports_tls_dynamic_load_fold(&self) -> bool {
+        true
+    }
+
+    fn supports_global_addr_remat(&self) -> bool {
+        true
+    }
+
+    fn emit_rematerialized_global_addr(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        offset: &Operand,
+        subtract: bool,
+    ) -> bool {
+        self.emit_rematerialized_global_addr_impl(dest, sym, offset, subtract)
+    }
+
+    /// Session 28: x86-64 SIB indexed addressing (mirrors session-27 i686):
+    /// `off(%base,%idx,scale)` / `sym(,%idx,scale)` fold variable-offset GEPs
+    /// into one memory operand.  The prologue wires base AND index liveness
+    /// (collect_folded_gep_links_all) so both registers survive to the access.
+    fn supports_indexed_addr(&self) -> bool {
+        std::env::var_os("CCC_NO_X64_SIB").is_none()
+    }
+
+    /// Segment-qualified indexed folds (`%gs:`/`%fs:` SIB operands). The
+    /// `CCC_NO_SEG_SIB` switch disables the mechanism as a whole, RA links
+    /// included, so allocator and emitter stay in agreement.
+    fn supports_seg_indexed_fold(&self) -> bool {
+        std::env::var_os("CCC_NO_SEG_SIB").is_none()
+    }
+
+    fn supports_indexed_sym_base(&self) -> bool {
+        // In PIE/PIC x86 cannot combine RIP-relative addressing and an index
+        // in one memory operand. The symbol hook still supports every legal
+        // direct symbol by rebuilding its base in the reserved address scratch
+        // and retaining the scale in the consuming SIB operand.
+        std::env::var_os("CCC_NO_X64_SIB").is_none()
+    }
+
+    fn supports_indexed_sym_reg_base(&self) -> bool {
+        // `sym+disp(%off,%idx,scale)`: the symbol is the displacement and the
+        // SIB carries BOTH registers, so PIC (which needs a staging register
+        // for the symbol) has no encoding — the deciding arm refuses PIC for
+        // the same reason. Kill switch alongside the other SIB folds.
+        std::env::var_os("CCC_NO_X64_SIB").is_none()
+    }
+
+    /// x86-64 mirror of `emit_load_indexed_common`/`emit_store_indexed_common`'s
+    /// acceptance conditions, consulted by `can_indexed_addr_fold` BEFORE the
+    /// GEP's emission is skipped and its offset chain declared dead.
+    ///
+    /// The trait default accepts every non-128-bit type — true for this
+    /// backend's SCALAR emitters, but the INDEXED emitters answer the FP
+    /// family only with their SSE arms, and until the contract audit those
+    /// two arms were the sole `F32|F64`-only outliers in memory.rs (every
+    /// non-indexed fast path has grouped F64|F32|D64|D32 since 1fdb401a).
+    /// A deciding-side "yes" the emitter later refuses rematerialises the
+    /// folded GEP at the access site — reading an offset chain the
+    /// dead-producer walk already skipped, i.e. a never-written home: the
+    /// exact failure the trait's soundness contract forbids. This override
+    /// mirrors the emitters' type arms exactly, plus their `shift <= 3`
+    /// guard (`resolve_index` already caps the SIB scale at the map build;
+    /// the mirror costs one compare and keeps the override self-contained).
+    ///
+    /// There is deliberately NO register-home/staging check here, although
+    /// the const-offset sibling (`const_offset_fold_reg_base_ok`) excludes
+    /// the emitter's %rdx/%r11 scratch set: that exclusion exists because
+    /// the const-offset trait-default path calls `emit_save_acc` for
+    /// Indirect/OverAligned slot bases. The INDEXED path never touches
+    /// either register — full write inventory of everything a folded
+    /// access can emit:
+    ///
+    /// * SIB formation: `ensure_sib_index_form` extends the index home in
+    ///   place (`movslq %edx,%rdx`); the `sib_mem64*` builders are pure
+    ///   strings; the PIC sym arm rebuilds the base in reserved %rcx; the
+    ///   alloca arm only accepts Direct slots (pure `%rbp/%rsp` strings).
+    /// * Store value staging: immediates go direct (`mov $imm,mem`, no
+    ///   staging); `operand_to_rax` materialises into %rax on every arm
+    ///   (const mov/xor, acc/sec/home moves, slot reloads, the Cast/Copy
+    ///   fallback's recursion, stale-remat's in-place `movslq %eax,%rax`);
+    ///   the FP shuttle lands in xmm0 via %rax/%rcx at most; the
+    ///   pending-vec-store flush writes memory or `(%rax)`.
+    /// * Load destinations land in the dest home or the accumulator.
+    ///
+    /// So a folded access writes only the index/value/dest homes plus
+    /// %rax/%rcx/xmm0 — none of which can host a SIB operand (%rax/%rcx
+    /// are not allocatable homes at all; XMM SIB is refused by the
+    /// emitter). A %rdx/%r11-homed SIB base or index (e.g. sqlite's
+    /// `movb %r9b, 8(%rsp, %rdx)`) is therefore always safe to fold, for
+    /// every value operand; refusing it only forces a redundant LEA
+    /// rematerialisation (+1 insn, +1 stackmem — the golden-gate
+    /// sqlite_varint regression). The i686 override keeps its own
+    /// staging check: i686's accumulator/x87 staging genuinely differs,
+    /// so that mirror is NOT covered by this proof.
+    fn guarantees_indexed_store_fold(&self) -> bool {
+        // The write-confinement proof below applies to BOTH loads and stores:
+        // integer staging writes reserved rax, symbol staging reserved rcx,
+        // FP staging xmm0; none is an allocatable SIB home. The shared operand
+        // builder and indexed_fold_ok enforce the same shape/type constraints.
+        // Home freshness is the existing folded-index RA/liveness contract,
+        // exactly as for a load; stores add no value-dependent refusal.
+        true
+    }
+
+    fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
+        let _ = self;
+        if info.shift > 3 {
+            return false;
+        }
+        info.access_tys.iter().all(|t| {
+            matches!(
+                t,
+                IrType::F64
+                    | IrType::F32
+                    | IrType::D64
+                    | IrType::D32
+                    | IrType::I8
+                    | IrType::U8
+                    | IrType::I16
+                    | IrType::U16
+                    | IrType::I32
+                    | IrType::U32
+                    | IrType::I64
+                    | IrType::U64
+                    | IrType::Ptr
+            )
+        })
+    }
+
+    fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
+        // Register-base const-offset folds consume the base at the Load/Store
+        // position (RA-invisible): sound only with the folded-base liveness
+        // links wired into register allocation (prologue passes
+        // collect_gep_fold_base_links).  When that extension is disabled the
+        // folds must be refused too — the two are one contract.
+        if self.state.ra_config.no_folded_index_liveness {
+            return false;
+        }
+        self.reg_assignments
+            .get(&base.0)
+            .is_some_and(|&phys| x86_const_fold_base_reg(phys))
+    }
+
+    fn seg_const_offset_fold_base_ok(&self, base: &Value) -> bool {
+        // Same liveness contract as the generic fold. The segment forms only
+        // read the base, and the value staging they use (operand_to_rax,
+        // store_rax_to) never writes %rdx or %r11, so those homes are safe here
+        // even though the generic fold excludes them. %rax is excluded because
+        // loads stage their result there.
+        if self.state.ra_config.no_folded_index_liveness {
+            return false;
+        }
+        match self.reg_assignments.get(&base.0) {
+            Some(&phys) if !is_xmm_reg(phys) => phys_reg_name(phys) != "rax",
+            _ => false,
+        }
+    }
+
+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
+        // The trait DEFAULT for this hook is a NO-OP ("backends override").
+        // Without the override, default emit_gep fallbacks that stage a
+        // register-resident base through the accumulator silently emit
+        // nothing and the address math reads a stale scratch (the exact i686
+        // emit_leaq_base_index bug class, fixed there in session 20).
+        let name = phys_reg_name(reg);
+        self.state
+            .emit_fmt(format_args!("    movq %{}, %rax", name));
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    fn emit_reg_to_secondary(&mut self, reg: PhysReg) {
+        // Single home->secondary move for the default emit_gep's general
+        // path: staging a register-resident base must not pass through the
+        // accumulator (which may still hold the live GEP offset).  The
+        // secondary cache cannot be updated (the hook carries no value id),
+        // so invalidate it — matches the conservative emit_reg_to_addr
+        // precedent.
+        let name = phys_reg_name(reg);
+        self.state
+            .emit_fmt(format_args!("    movq %{}, %rcx", name));
+        self.state.reg_cache.invalidate_sec();
+    }
+
+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
+        // Register-resident base + constant offset → `leaq off(%base), %dest`.
+        // Without this hook the default emit_gep silently drops the base for
+        // slot-less bases: both its const and general branches key on
+        // resolve_slot_addr(base), so a rematerialised folded GEP computed
+        // `offset + stale scratch` (zlib-ng gen_bitlen corrupt-pointer crash:
+        // tree/bl_count fields read and written through garbage addresses).
+        let Some(&br) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if is_xmm_reg(br) || offset < i32::MIN as i64 || offset > i32::MAX as i64 {
+            return false;
+        }
+        let b_name = phys_reg_name(br);
+        if let Some(&dr) = self.reg_assignments.get(&dest.0) {
+            if !is_xmm_reg(dr) {
+                let d_name = phys_reg_name(dr);
+                if offset == 0 {
+                    if br != dr {
+                        self.state
+                            .emit_fmt(format_args!("    movq %{}, %{}", b_name, d_name));
+                        self.state.reg_cache.invalidate_acc();
+                        // Definition-writes-home accounting: the zero-offset
+                        // relay is a plain copy into the dest's home.
+                        self.note_inplace_compute(dr, dest.0);
+                    } else {
+                        // Zero-offset in-place (base IS the dest register,
+                        // same value): nothing is emitted and nothing is
+                        // destroyed — bit-preserving no-op, mark fresh only.
+                        self.note_home_written(dest.0);
+                    }
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    leaq {}(%{}), %{}",
+                        offset, b_name, d_name
+                    ));
+                    self.state.reg_cache.invalidate_acc();
+                    // Definition-writes-home accounting: the LEA wrote the
+                    // GEP's dest into its home — including the in-place
+                    // pointer-web advance `leaq 4(%rN), %rN` (the loop-
+                    // carried pointer's def at the latch; missing this note
+                    // left the advanced pointer stale for the next body).
+                    self.note_inplace_compute(dr, dest.0);
+                }
+                return true;
+            }
+        }
+        // Slot-only dest: stage through %rax, then store to the home.
+        if offset == 0 {
+            self.state
+                .emit_fmt(format_args!("    movq %{}, %rax", b_name));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    leaq {}(%{}), %rax", offset, b_name));
+        }
+        self.state.park_acc(dest.0, false);
+        self.emit_store_result(dest);
+        true
+    }
+
+    fn emit_call_store_f128_result(&mut self, _dest: &Value) {
+        unreachable!("x86 uses custom emit_call_store_result for F128")
+    }
+
+    fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        // Flag-fusion forwarding: this copy's destination is never read (the
+        // fused consumer uses the live Cmp flags), and its source is the
+        // never-materialized boolean — emitting it would read a stale register.
+        if self.fused_forward_dests.contains(&dest.0) {
+            return;
+        }
+        // DE MORGAN SPLIT: Copy passthru (`bool c = a&&b; if (c)`) — the
+        // branch replays the original comparisons, so the renamed boolean
+        // is never read; emitting the mov would copy a never-written home.
+        if self.demorgan_skip.contains(&dest.0) {
+            return;
+        }
+        // Handle vector Copy instructions: %dest_vec = copy %src_vec
+        // Vectors are stored directly in stack slots (not as pointers), so we copy
+        // with ymm/xmm registers instead of scalar movq.
+        if let Operand::Value(v) = src {
+            if self.state.vector_values.contains(&v.0) {
+                let debug = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+                let is_128 = self.state.vector128_values.contains(&v.0);
+                if debug {
+                    eprintln!(
+                        "[COPY-VEC] Copying {}-bit vector SSA {} to SSA {}",
+                        if is_128 { 128 } else { 256 },
+                        v.0,
+                        dest.0
+                    );
+                }
+
+                // Coalesced loop-carried vectors already occupy the same
+                // physical SIMD register; their entry/backedge copies vanish.
+                let src_reg = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r));
+                let dest_reg = self
+                    .reg_assignments
+                    .get(&dest.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r));
+                if let (Some(s), Some(d)) = (src_reg, dest_reg) {
+                    let held = if is_128 {
+                        phys_reg_name(s)
+                    } else {
+                        phys_reg_name_256(s)
+                    };
+                    let target = if is_128 {
+                        phys_reg_name(d)
+                    } else {
+                        phys_reg_name_256(d)
+                    };
+                    if s != d {
+                        let mov = if is_128 {
+                            self.xmm_move(true)
+                        } else {
+                            "vmovdqa"
+                        };
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %{}", mov, held, target));
+                    }
+                    self.state.vec_claim_live_reg(dest.0, target);
+                    self.state.vector_values.insert(dest.0);
+                    if is_128 {
+                        self.state.vector128_values.insert(dest.0);
+                    }
+                    return;
+                }
+
+                // Mixed assigned/stack and pure stack copies use the same
+                // width-aware load/store helpers as intrinsic operands. This
+                // avoids interpreting register-held vector bits as an address.
+                if is_128 {
+                    self.sse_load_arg(src, "xmm0");
+                    self.sse_store_dest(dest, "xmm0");
+                } else {
+                    self.avx_load_arg(src);
+                    self.avx_store_dest(dest);
+                }
+                self.state.vector_values.insert(dest.0);
+                if is_128 {
+                    self.state.vector128_values.insert(dest.0);
+                }
+                return;
+            }
+
+            if self.state.f128_direct_slots.contains(&v.0) {
+                if let (Some(src_slot), Some(dest_slot)) =
+                    (self.state.get_slot(v.0), self.state.get_slot(dest.0))
+                {
+                    self.state.out.emit_instr_rbp("    fldt", src_slot.0);
+                    self.state.out.emit_instr_rbp("    fstpt", dest_slot.0);
+                    self.state.out.emit_instr_rbp("    fldt", dest_slot.0);
+                    self.state.emit("    subq $8, %rsp");
+                    self.state.emit("    fstpl (%rsp)");
+                    self.state.emit("    popq %rax");
+                    self.state.park_acc(dest.0, false);
+                    self.state.f128_direct_slots.insert(dest.0);
+                    return;
+                }
+            }
+        }
+
+        let dest_phys = self.dest_reg(dest);
+        let src_phys = self.operand_reg(src);
+
+        match (dest_phys, src_phys) {
+            (Some(d), Some(s)) => {
+                if d.0 != s.0 {
+                    let d_name = phys_reg_name(d);
+                    let s_name = phys_reg_name(s);
+                    if is_xmm_reg(d) && is_xmm_reg(s) {
+                        // XMM → XMM copy: movapd moves all 128 bits (upper 64
+                        // are dead for scalar F64/F32) without the reg-reg
+                        // movsd merge form's false dependency on the old
+                        // destination value.
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            if self.isa.simd { "movapd" } else { "movaps" },
+                            s_name,
+                            d_name
+                        ));
+                    } else if !self.isa.simd && (is_xmm_reg(d) || is_xmm_reg(s)) {
+                        // SSE1-only: GPR<->XMM MOVD/MOVQ are SSE2, so a mixed
+                        // copy goes through the memory bridge at the copy's
+                        // own width.
+                        let f32ish = matches!(
+                            self.value_types.get(&dest.0),
+                            Some(IrType::F32 | IrType::D32)
+                        );
+                        if is_xmm_reg(d) {
+                            self.emit_scalar_gpr_to_xmm(
+                                s_name,
+                                phys_reg_name_32(s),
+                                d_name,
+                                f32ish,
+                            );
+                        } else {
+                            let d32 = f32ish.then(|| phys_reg_name_32(d));
+                            self.emit_scalar_xmm_to_gpr(s_name, d_name, d32);
+                        }
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", s_name, d_name);
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    // Definition-writes-home accounting: the copy wrote the
+                    // dest's home with the dest's value. The SOURCE's home is
+                    // a different register and stays valid.
+                    self.note_inplace_compute(d, dest.0);
+                } else {
+                    // Coalesced copy (phi-web relay, RA assigned both ends
+                    // the same register): NO instruction is emitted, so
+                    // nothing is destroyed. The register already holds the
+                    // source's bits, which ARE the dest's bits. Mark the
+                    // dest fresh WITHOUT evicting sharers — note_inplace_
+                    // compute would evict the SOURCE, whose consumers can
+                    // legitimately follow the relay (rotated-loop latch:
+                    // `v_next = Copy(v_iv)` both homed %r12, then the
+                    // loop-guard Cmp replay reads v_iv AFTER the latch
+                    // copies — evicting it panicked every loop-rotate
+                    // regression). A bit-preserving no-op write must not
+                    // invalidate any value the register still holds.
+                    self.note_home_written(dest.0);
+                    self.state.reg_cache.invalidate_acc();
+                }
+            }
+            (Some(d), None) => {
+                // FP destination: load the operand straight into the XMM
+                // register (rip-relative constant load / movsd from slot)
+                // instead of bouncing the bit pattern through %rax.
+                if is_xmm_reg(d) {
+                    let d_name = phys_reg_name(d);
+                    // Width follows the copy's type, not just the constant
+                    // kind: an F32 Value read as F64 is an 8-byte `movsd`
+                    // over-read of its 4-byte slot (SSE2-only under
+                    // `-mno-sse2`) or a `movapd` register copy.
+                    let ty = match src {
+                        Operand::Const(IrConst::F32(_) | IrConst::D32(_)) => IrType::F32,
+                        Operand::Const(_) => IrType::F64,
+                        Operand::Value(v) => match self
+                            .value_types
+                            .get(&dest.0)
+                            .or_else(|| self.value_types.get(&v.0))
+                        {
+                            Some(IrType::F32 | IrType::D32) => IrType::F32,
+                            _ => IrType::F64,
+                        },
+                    };
+                    self.emit_fp_operand_to_xmm(src, ty, d_name);
+                    self.state.reg_cache.invalidate_acc();
+                    self.note_inplace_compute(d, dest.0);
+                    return;
+                }
+                // A constant copied into a register-allocated dest is emitted
+                // directly (movq $imm, %reg / xorl for zero) instead of the
+                // relay `movq $imm, %rax; movq %rax, %reg` — the short-circuit
+                // merge value (`x = 1`) and loop preambles pay this copy per
+                // execution. Values (slots / accumulator-cached) keep the rax
+                // relay (their width-aware load semantics must be preserved).
+                if matches!(src, Operand::Const(_)) {
+                    self.operand_to_callee_reg(src, d);
+                } else {
+                    self.operand_to_rax(src);
+                    let d_name = phys_reg_name(d);
+                    self.state.out.emit_instr_reg_reg("    movq", "rax", d_name);
+                }
+                self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the const store / rax
+                // relay wrote the dest's home with the dest's value.
+                self.note_inplace_compute(d, dest.0);
+            }
+            _ => {
+                // XMM source → stack-slot dest: movss/movsd directly, no GPR
+                // relay. Both F32 and F64 values can be XMM-allocated
+                // (is_scalar_fp covers both), so the store width follows the
+                // value type. %rax is untouched, so the accumulator cache
+                // stays valid.
+                if let Operand::Value(v) = src {
+                    if let Some(s) = src_phys {
+                        if is_xmm_reg(s)
+                            && !self.state.is_alloca(dest.0)
+                            && !self.state.vector_values.contains(&dest.0)
+                        {
+                            if let Some(slot) = self.state.get_slot(dest.0) {
+                                // Width-consistent store: an XMM-allocated F32
+                                // value must spill with movss (4 bytes) — movsd
+                                // would write 8 bytes and, into a 4-byte small
+                                // slot, clobber the neighbour. F64 keeps movsd.
+                                let ty = self.value_types.get(&v.0).copied().unwrap_or(IrType::F64);
+                                let mov = if ty == IrType::F32 {
+                                    "    movss"
+                                } else {
+                                    "    movsd"
+                                };
+                                self.state
+                                    .out
+                                    .emit_instr_reg_rbp(mov, phys_reg_name(s), slot.0);
+                                return;
+                            }
+                        }
+                    }
+                }
+                self.operand_to_rax(src);
+                self.store_rax_to(dest);
+            }
+        }
+    }
+
+    // ---- Inline asm (kept inline - has extra logic) ----
+    fn emit_inline_asm(
+        &mut self,
+        template: &str,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+        input_symbols: &[Option<String>],
+    ) {
+        // Lazy flush: inline asm may clobber XMM registers or read slots.
+        self.flush_pending_vec_store_impl();
+        let markers = self.asm_block_markers();
+        emit_inline_asm_common(
+            self,
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+            markers,
+        );
+        self.emit_callee_saved_clobber_annotations(clobbers);
+        // SOUNDNESS (audit F5): the asm template may write any register in
+        // the clobber list, which until now left GP homes marked fresh
+        // across the asm block — a later consumer read the register trusting
+        // the pre-asm value.  Evict every home the clobber list names;
+        // `note_reg_clobbered` is a no-op for non-homes, so this stays cheap.
+        for c in clobbers {
+            if let Some(phys) = home_phys_by_asm_name(c) {
+                self.note_reg_clobbered(phys);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    fn emit_inline_asm_with_segs(
+        &mut self,
+        template: &str,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+        input_symbols: &[Option<String>],
+        seg_overrides: &[AddressSpace],
+    ) {
+        // Lazy flush: inline asm may clobber XMM registers or read slots.
+        self.flush_pending_vec_store_impl();
+        let markers = self.asm_block_markers();
+        crate::backend::inline_asm::emit_inline_asm_common_impl(
+            self,
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+            markers,
+            seg_overrides,
+        );
+        self.emit_callee_saved_clobber_annotations(clobbers);
+        // Same clobber accounting as `emit_inline_asm` (audit F5).
+        for c in clobbers {
+            if let Some(phys) = home_phys_by_asm_name(c) {
+                self.note_reg_clobbered(phys);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    fn flush_pending_vec_store(&mut self) {
+        // Boundary hook (block ends, calls, inline asm, non-intrinsic
+        // instructions): a VLFOLD-elided load that has not met its consumer
+        // is materialised first so the mechanism is sound by construction.
+        self.materialize_pending_memfold();
+        self.flush_pending_vec_store_impl();
+    }
+
+    fn note_dest_defined(&mut self, dest: &Value) {
+        self.note_home_written(dest.0);
+    }
+
+    // ---- Intrinsics (kept inline - has extra logic) ----
+    fn emit_intrinsic(
+        &mut self,
+        dest: &Option<Value>,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        self.emit_intrinsic_impl(dest, op, dest_ptr, args);
+        // NOTE: do NOT invalidate the vector peephole here. The flag set by the
+        // final avx_store_dest must survive into the NEXT intrinsic's operand
+        // loads (e.g. movemask right after a compare). It is cleared by every
+        // actual load, call, inline asm, atomic, memcpy, and block boundary.
+        self.state.reg_cache.invalidate_all();
+    }
+
+    fn emit_reg_to_addr(&mut self, reg: PhysReg) {
+        self.state.reg_cache.invalidate_sec();
+        self.state
+            .out
+            .emit_instr_reg_reg("    movq", phys_reg_name(reg), "rcx");
+    }
+
+    fn function_alignment_log2(&self) -> Option<u32> {
+        match self.function_alignment {
+            0 | 1 => None,
+            n => Some(n.trailing_zeros()),
+        }
+    }
+
+    fn optimize_for_size(&self) -> bool {
+        self.optimize_for_size
+    }
+
+    fn ipa_reorder_functions(&self) -> bool {
+        self.ipa.enabled()
+    }
+
+    // All remaining methods delegate to self.method_name_impl(args...)
+    delegate_to_impl! {
+        // CCC_ENABLE_VECREG live-out flush (default no-op on other backends)
+        fn flush_vecreg_liveout(&mut self) => flush_vecreg_liveout_impl;
+        // prologue
+        fn calculate_stack_space(&mut self, func: &IrFunction) -> i64 => calculate_stack_space_impl;
+        fn aligned_frame_size(&self, raw_space: i64) -> i64 => aligned_frame_size_impl;
+        fn emit_prologue(&mut self, func: &IrFunction, frame_size: i64) => emit_prologue_impl;
+        fn emit_epilogue(&mut self, frame_size: i64) => emit_epilogue_impl;
+        fn emit_store_params(&mut self, func: &IrFunction) => emit_store_params_impl;
+        fn emit_param_ref(&mut self, dest: &Value, param_idx: usize, ty: IrType) => emit_param_ref_impl;
+        fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
+        fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;
+        fn load_instr_for_type(&self, ty: IrType) -> &'static str => load_instr_for_type_impl;
+        // memory
+        fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
+        // PF-TLS-1 Local-Exec direct TLS access (`%fs:sym@TPOFF+N`). Default
+        // false on every other backend, so non-x86 ladders are unchanged.
+        fn try_emit_tls_direct_load(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) -> bool => try_emit_tls_direct_load_impl;
+        fn try_emit_tls_direct_store(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) -> bool => try_emit_tls_direct_store_impl;
+        fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
+        fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) => emit_store_with_const_offset_impl;
+        fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) => emit_load_with_const_offset_impl;
+        fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_load_indexed_impl;
+        fn emit_store_indexed(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_store_indexed_impl;
+        fn emit_load_indexed_sym(&mut self, dest: &Value, sym: &str, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_load_indexed_sym_impl;
+        fn emit_store_indexed_sym(&mut self, val: &Operand, sym: &str, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_store_indexed_sym_impl;
+        fn emit_seg_load_indexed(&mut self, dest: &Value, info: &crate::backend::generation::IndexedGepInfo, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_indexed_impl;
+        fn emit_seg_store_indexed(&mut self, val: &Operand, info: &crate::backend::generation::IndexedGepInfo, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_indexed_impl;
+        fn emit_seg_load_indexed_sym(&mut self, dest: &Value, sym: &str, info: &crate::backend::generation::IndexedGepInfo, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_indexed_sym_impl;
+        fn emit_seg_store_indexed_sym(&mut self, val: &Operand, sym: &str, info: &crate::backend::generation::IndexedGepInfo, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_indexed_sym_impl;
+        fn emit_load_indexed_sym_reg_base(&mut self, dest: &Value, sym: &str, off: &Value, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_load_indexed_sym_reg_base_impl;
+        fn emit_store_indexed_sym_reg_base(&mut self, val: &Operand, sym: &str, off: &Value, index: &Value, shift: u8, disp: i64, ty: IrType) -> bool => emit_store_indexed_sym_reg_base_impl;
+        fn emit_typed_store_to_slot(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) => emit_typed_store_to_slot_impl;
+        fn emit_typed_load_from_slot(&mut self, instr: &'static str, slot: StackSlot) => emit_typed_load_from_slot_impl;
+        fn emit_save_acc(&mut self) => emit_save_acc_impl;
+        fn emit_load_ptr_from_slot(&mut self, slot: StackSlot, val_id: u32) => emit_load_ptr_from_slot_impl;
+        fn emit_typed_store_indirect(&mut self, instr: &'static str, ty: IrType) => emit_typed_store_indirect_impl;
+        fn emit_typed_load_indirect(&mut self, instr: &'static str) => emit_typed_load_indirect_impl;
+        fn emit_add_offset_to_addr_reg(&mut self, offset: i64) => emit_add_offset_to_addr_reg_impl;
+        fn emit_slot_addr_to_secondary(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) => emit_slot_addr_to_secondary_impl;
+        fn emit_add_secondary_to_acc(&mut self) => emit_add_secondary_to_acc_impl;
+        fn emit_gep_direct_const(&mut self, slot: StackSlot, offset: i64) => emit_gep_direct_const_impl;
+        fn emit_gep_indirect_const(&mut self, slot: StackSlot, offset: i64, val_id: u32) => emit_gep_indirect_const_impl;
+        fn emit_gep_add_const_to_acc(&mut self, offset: i64) => emit_gep_add_const_to_acc_impl;
+        fn emit_leaq_base_index(&mut self, base_reg: PhysReg, index_reg: PhysReg, dest: &Value, dest_phys: Option<PhysReg>) => emit_leaq_base_index_impl;
+        fn emit_leaq_sym_index(&mut self, dest: &Value, sym: &str, index: &Value, shift: u8, disp: i64) -> bool => emit_leaq_sym_index_impl;
+        fn emit_add_imm_to_acc(&mut self, imm: i64) => emit_add_imm_to_acc_impl;
+        fn emit_round_up_acc_to_16(&mut self) => emit_round_up_acc_to_16_impl;
+        fn emit_sub_sp_by_acc(&mut self) => emit_sub_sp_by_acc_impl;
+        fn emit_mov_sp_to_acc(&mut self) => emit_mov_sp_to_acc_impl;
+        fn emit_mov_acc_to_sp(&mut self) => emit_mov_acc_to_sp_impl;
+        fn emit_align_acc(&mut self, align: usize) => emit_align_acc_impl;
+        fn emit_memcpy_load_dest_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) => emit_memcpy_load_dest_addr_impl;
+        fn emit_memcpy_load_src_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) => emit_memcpy_load_src_addr_impl;
+        fn emit_alloca_aligned_addr(&mut self, slot: StackSlot, val_id: u32) => emit_alloca_aligned_addr_impl;
+        fn emit_alloca_aligned_addr_to_acc(&mut self, slot: StackSlot, val_id: u32) => emit_alloca_aligned_addr_to_acc_impl;
+        fn emit_acc_to_secondary(&mut self) => emit_acc_to_secondary_impl;
+        fn emit_memcpy_store_dest_from_acc(&mut self) => emit_memcpy_store_dest_from_acc_impl;
+        fn emit_memcpy_store_src_from_acc(&mut self) => emit_memcpy_store_src_from_acc_impl;
+        fn emit_memcpy_impl(&mut self, size: usize) => emit_memcpy_impl_impl;
+        fn emit_inline_memcpy_call(&mut self, dest: &Operand, src: &Operand, size: usize, result: Option<&Value>) => emit_inline_memcpy_call_impl;
+        fn emit_inline_memmove_call(&mut self, dest: &Operand, src: &Operand, size: usize, result: Option<&Value>) => emit_inline_memmove_call_impl;
+        fn emit_inline_memset_call(&mut self, dest: &Operand, value: &Operand, size: usize, result: Option<&Value>) => emit_inline_memset_call_impl;
+        fn emit_seg_load(&mut self, dest: &Value, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_load_impl;
+        fn emit_seg_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_with_const_offset_impl;
+        fn emit_seg_load_const_addr(&mut self, dest: &Value, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_const_addr_impl;
+        fn emit_seg_store_const_addr(&mut self, val: &Operand, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_const_addr_impl;
+        fn emit_seg_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_with_const_offset_impl;
+        fn emit_seg_load_symbol(&mut self, dest: &Value, sym: &str, ty: IrType, seg: AddressSpace) => emit_seg_load_symbol_impl;
+        fn emit_seg_store(&mut self, val: &Operand, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_store_impl;
+        fn emit_seg_store_symbol(&mut self, val: &Operand, sym: &str, ty: IrType, seg: AddressSpace) => emit_seg_store_symbol_impl;
+        // alu
+        fn emit_float_neg(&mut self, ty: IrType) => emit_float_neg_impl;
+        fn emit_int_neg(&mut self, ty: IrType) => emit_int_neg_impl;
+        fn emit_int_not(&mut self, ty: IrType) => emit_int_not_impl;
+        fn emit_int_clz(&mut self, ty: IrType) => emit_int_clz_impl;
+        fn emit_int_clz_nonzero(&mut self, ty: IrType) => emit_int_clz_nonzero_impl;
+        fn emit_int_ctz(&mut self, ty: IrType) => emit_int_ctz_impl;
+        fn emit_int_ctz_nonzero(&mut self, ty: IrType) => emit_int_ctz_nonzero_impl;
+        fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
+        fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
+        fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
+        fn emit_fused_mul_add(&mut self, mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand, acc: &Operand, add_dest: &Value, ty: IrType) => emit_fused_mul_add_impl;
+        fn emit_fused_fma(&mut self, mul_lhs: &Operand, mul_rhs: &Operand, acc: &Operand, dest: &Value, ty: IrType, negate_product: bool, negate_addend: bool) => emit_fused_fma_impl;
+        fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) => emit_copy_i128_impl;
+        // comparison
+        fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;
+        fn emit_float_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_float_cmp_impl;
+        fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
+        fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
+        fn emit_fused_cmp_branch_blocks(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_cmp_branch_blocks_impl;
+        fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
+        fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) => emit_cond_branch_blocks_impl;
+        fn begin_home_write_block(&mut self, label: BlockId) => begin_home_write_block_impl;
+        fn begin_ir_point(&mut self) => settle_transient_home_evictions;
+        fn record_branch_edge(&mut self, label: BlockId) => record_branch_edge_impl;
+        fn set_home_fallthrough(&mut self, falls_through: bool) => set_home_fallthrough_impl;
+        fn poison_home_write_state(&mut self) => poison_home_write_state_impl;
+        fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
+        // calls
+        fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
+        fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
+        fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) => emit_call_spill_fptr_impl;
+        fn emit_call_spill_fptr_with_args(&mut self, func_ptr: &Operand, args: &[Operand]) => emit_call_spill_fptr_with_args_impl;
+        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
+        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
+        fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
+        fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
+        fn set_call_ret_eightbyte_classes(&mut self, classes: &[crate::common::types::EightbyteClass]) => set_call_ret_eightbyte_classes_impl;
+        fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
+        fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn emit_call_store_vector_return(&mut self, buffer: &Operand, bytes: usize, dest: Option<&Value>) => emit_call_store_vector_return_impl;
+        fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
+        fn emit_call_move_f32_to_acc(&mut self) => emit_call_move_f32_to_acc_impl;
+        fn emit_call_move_f64_to_acc(&mut self) => emit_call_move_f64_to_acc_impl;
+        // globals
+        fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
+        fn emit_tls_global_addr(&mut self, dest: &Value, name: &str) => emit_tls_global_addr_impl;
+        fn emit_global_addr_absolute(&mut self, dest: &Value, name: &str) => emit_global_addr_absolute_impl;
+        fn emit_vector_const_rodata(&mut self) => emit_vector_const_rodata_impl;
+        fn emit_global_load_rip_rel(&mut self, dest: &Value, sym: &str, ty: IrType) => emit_global_load_rip_rel_impl;
+        fn emit_global_store_rip_rel(&mut self, val: &Operand, sym: &str, ty: IrType) => emit_global_store_rip_rel_impl;
+        fn emit_label_addr(&mut self, dest: &Value, label: &str) => emit_label_addr_impl;
+        // cast
+        fn emit_cast_instrs(&mut self, from_ty: IrType, to_ty: IrType) => emit_cast_instrs_impl;
+        fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) => emit_cast_impl;
+        // variadic
+        fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) => emit_va_arg_impl;
+        fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize) => emit_va_arg_struct_impl;
+        fn emit_va_arg_struct_ex(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, eightbyte_classes: &[crate::common::types::EightbyteClass]) => emit_va_arg_struct_ex_impl;
+        fn emit_va_arg_vector(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, eightbyte_classes: &[crate::common::types::EightbyteClass]) => emit_va_arg_vector_impl;
+        fn emit_va_start(&mut self, va_list_ptr: &Value) => emit_va_start_impl;
+        fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
+        // returns
+        fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) => emit_return_impl;
+        fn arm_sibcall_candidate(&mut self, info: &CallInfo) => arm_sibcall_candidate_impl;
+        fn current_return_type(&self) -> IrType => current_return_type_impl;
+        fn emit_return_f32_to_reg(&mut self) => emit_return_f32_to_reg_impl;
+        fn emit_return_f64_to_reg(&mut self) => emit_return_f64_to_reg_impl;
+        fn emit_return_i128_to_regs(&mut self) => emit_return_i128_to_regs_impl;
+        fn emit_get_return_f64_second(&mut self, dest: &Value) => emit_get_return_f64_second_impl;
+        fn emit_set_return_f64_second(&mut self, src: &Operand) => emit_set_return_f64_second_impl;
+        fn emit_get_static_chain(&mut self, dest: &Value) => emit_get_static_chain_impl;
+        fn emit_set_static_chain(&mut self, src: &Operand) => emit_set_static_chain_impl;
+        fn emit_init_trampoline(&mut self, buffer: &Value, chain: &Operand, func: &str) => emit_init_trampoline_impl;
+        fn emit_nonlocal_goto_save(&mut self, frame: &Value, rbp_off: i64, rsp_off: i64) => emit_nonlocal_goto_save_impl;
+        fn emit_nonlocal_goto(&mut self, chain: &Operand, up: usize, rbp_off: i64, rsp_off: i64, label: &str) => emit_nonlocal_goto_impl;
+        fn emit_get_return_f32_second(&mut self, dest: &Value) => emit_get_return_f32_second_impl;
+        fn emit_set_return_f32_second(&mut self, src: &Operand) => emit_set_return_f32_second_impl;
+        fn emit_return_f128_to_reg(&mut self) => emit_return_f128_to_reg_impl;
+        fn emit_return_int_to_reg(&mut self) => emit_return_int_to_reg_impl;
+        fn emit_get_return_f128_second(&mut self, dest: &Value) => emit_get_return_f128_second_impl;
+        fn emit_set_return_f128_second(&mut self, src: &Operand) => emit_set_return_f128_second_impl;
+        // atomics
+        fn emit_pgo_counter_inc(&mut self, name: &str, offset: i64, atomic: bool) => emit_pgo_counter_inc_impl;
+        fn emit_pgo_counter_nop(&mut self, name: &str, offset: i64, atomic: bool) => emit_pgo_counter_nop_impl;
+        fn emit_atomic_inc(&mut self, ptr: &Operand, offset: i64, ty: IrType, ordering: AtomicOrdering) => emit_atomic_inc_impl;
+        fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_rmw_impl;
+        fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_impl;
+        fn emit_atomic_load(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_load_impl;
+        fn emit_atomic_store(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_store_impl;
+        fn emit_fence(&mut self, ordering: AtomicOrdering) => emit_fence_impl;
+        // float ops
+        fn emit_float_binop_mnemonic(&self, op: FloatOp) -> &'static str => emit_float_binop_mnemonic_impl;
+        fn emit_unaryop(&mut self, dest: &Value, op: IrUnaryOp, src: &Operand, ty: IrType) => emit_unaryop_impl;
+        fn emit_float_binop(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_float_binop_impl;
+        fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) => emit_float_binop_impl_impl;
+        // i128 ops
+        fn emit_sign_extend_acc_high(&mut self) => emit_sign_extend_acc_high_impl;
+        fn emit_zero_acc_high(&mut self) => emit_zero_acc_high_impl;
+        fn emit_load_acc_pair(&mut self, op: &Operand) => emit_load_acc_pair_impl;
+        fn emit_store_acc_pair(&mut self, dest: &Value) => emit_store_acc_pair_impl;
+        fn emit_store_pair_to_slot(&mut self, slot: StackSlot) => emit_store_pair_to_slot_impl;
+        fn emit_load_pair_from_slot(&mut self, slot: StackSlot) => emit_load_pair_from_slot_impl;
+        fn emit_save_acc_pair(&mut self) => emit_save_acc_pair_impl;
+        fn emit_store_pair_indirect(&mut self) => emit_store_pair_indirect_impl;
+        fn emit_load_pair_indirect(&mut self) => emit_load_pair_indirect_impl;
+        fn emit_i128_neg(&mut self) => emit_i128_neg_impl;
+        fn emit_i128_not(&mut self) => emit_i128_not_impl;
+        fn emit_i128_prep_binop(&mut self, lhs: &Operand, rhs: &Operand) => emit_i128_prep_binop_impl;
+        fn emit_i128_add(&mut self) => emit_i128_add_impl;
+        fn emit_i128_sub(&mut self) => emit_i128_sub_impl;
+        fn emit_i128_mul(&mut self) => emit_i128_mul_impl;
+        fn emit_i128_mul_const(&mut self, lhs: &Operand, rhs: &Operand, lo: u64, hi: u64) => emit_i128_mul_const_impl;
+        fn emit_i128_and(&mut self) => emit_i128_and_impl;
+        fn emit_i128_or(&mut self) => emit_i128_or_impl;
+        fn emit_i128_xor(&mut self) => emit_i128_xor_impl;
+        fn emit_i128_shl(&mut self) => emit_i128_shl_impl;
+        fn emit_i128_lshr(&mut self) => emit_i128_lshr_impl;
+        fn emit_i128_ashr(&mut self) => emit_i128_ashr_impl;
+        fn emit_i128_prep_shift_lhs(&mut self, lhs: &Operand) => emit_i128_prep_shift_lhs_impl;
+        fn emit_i128_shl_const(&mut self, amount: u32) => emit_i128_shl_const_impl;
+        fn emit_i128_lshr_const(&mut self, amount: u32) => emit_i128_lshr_const_impl;
+        fn emit_i128_ashr_const(&mut self, amount: u32) => emit_i128_ashr_const_impl;
+        fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) => emit_i128_divrem_call_impl;
+        fn emit_i128_store_result(&mut self, dest: &Value) => emit_i128_store_result_impl;
+        fn emit_i128_to_float_call(&mut self, src: &Operand, from_signed: bool, to_ty: IrType) => emit_i128_to_float_call_impl;
+        fn emit_float_to_i128_call(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) => emit_float_to_i128_call_impl;
+        fn emit_i128_cmp_eq(&mut self, is_ne: bool) => emit_i128_cmp_eq_impl;
+        fn emit_i128_cmp_ordered(&mut self, op: IrCmpOp) => emit_i128_cmp_ordered_impl;
+        fn emit_i128_cmp_store_result(&mut self, dest: &Value) => emit_i128_cmp_store_result_impl;
+    }
+}
+impl Default for X86Codegen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// GPR homes in which a register-base constant-offset fold (`C(%base)`) is
+/// sound on x86-64: every GPR except the emitter's private fold-path scratch
+/// set — %rdx (PhysReg 16, emit_save_acc staging) and %r11 (PhysReg 10,
+/// operand_to_rax staging / indirect-target scratch). %rax/%rcx are never
+/// allocatable homes. The operand staging (operand_to_rax, xmm staging) only
+/// touches that set. Shared by `const_offset_fold_reg_base_ok` and the
+/// allocator's fold-deferral pool so the two cannot drift apart.
+pub(crate) fn x86_const_fold_base_reg(phys: PhysReg) -> bool {
+    !is_xmm_reg(phys) && !matches!(phys.0, 10 | 16)
+}
+
+#[cfg(test)]
+mod alias_freshness_tests {
+    use super::*;
+
+    // ── audit F5: inline-asm clobber accounting ──────────────────────────────
+
+    #[test]
+    fn home_phys_by_asm_name_round_trips_every_home() {
+        let mut homes: Vec<u8> = (1..=6).chain(10..=16).collect();
+        homes.extend(20..=33);
+        homes.extend(40..=55);
+        for phys in homes {
+            let name = phys_reg_name(PhysReg(phys));
+            assert_eq!(
+                home_phys_by_asm_name(name),
+                Some(phys),
+                "clobber {name} must evict its home"
+            );
+        }
+        // Scratch and pseudo-clobbers name no home.
+        for name in [
+            "rax", "rcx", "xmm0", "xmm1", "cc", "memory", "dirflag", "fpsr", "flags",
+        ] {
+            assert_eq!(home_phys_by_asm_name(name), None, "{name} is not a home");
+        }
+        // Width suffixes resolve to the same physical home.
+        for (name, phys) in [
+            ("edx", 16u8),
+            ("dl", 16u8),
+            ("ebx", 1),
+            ("bl", 1),
+            ("edi", 14),
+            ("esi", 15),
+            ("r8d", 12),
+            ("r12d", 2),
+            ("r16d", 40),
+            ("r31b", 55),
+        ] {
+            assert_eq!(home_phys_by_asm_name(name), Some(phys), "{name}");
+        }
+    }
+
+    /// `LiveSpans` normalisation keeps exactly the covered point set of the
+    /// raw hole-aware segments (the linear containment test it replaced).
+    #[test]
+    fn live_spans_match_linear_containment() {
+        let cases: Vec<Vec<(u32, u32)>> = vec![
+            vec![],
+            vec![(5, 5)],
+            vec![(10, 20), (0, 3)],         // unsorted
+            vec![(0, 4), (5, 9)],           // adjacent: merged
+            vec![(0, 10), (2, 3), (4, 12)], // nested and overlapping
+            vec![(7, 3), (1, 1)],           // inverted range covers nothing
+            vec![(u32::MAX - 1, u32::MAX), (0, 0)],
+        ];
+        for raw in cases {
+            let spans = LiveSpans::from_ranges(raw.clone());
+            for w in spans.0.windows(2) {
+                assert!(w[0].1.saturating_add(1) < w[1].0, "{raw:?} -> {spans:?}");
+            }
+            let probes = (0u32..25).chain([u32::MAX - 2, u32::MAX - 1, u32::MAX]);
+            for p in probes {
+                let linear = raw.iter().any(|&(s, e)| s <= p && p <= e);
+                assert_eq!(spans.contains(p), linear, "{raw:?} at {p}");
+            }
+        }
+    }
+
+    /// The sharer stabbing index answers exactly the per-sharer linear
+    /// containment test, for random span sets (overlapping owners, shared
+    /// endpoints, point spans) and every probe point.
+    #[test]
+    fn sharer_live_index_matches_linear_scan() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = |m: u32| -> u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(m)) as u32
+        };
+        for _ in 0..300 {
+            let owners = 1 + rnd(12);
+            let mut per_owner: Vec<(u32, LiveSpans)> = Vec::new();
+            for v in 0..owners {
+                let raw: Vec<(u32, u32)> = (0..rnd(5))
+                    .map(|_| {
+                        let s = rnd(60);
+                        (s, s + rnd(8))
+                    })
+                    .collect();
+                per_owner.push((100 + v, LiveSpans::from_ranges(raw)));
+            }
+            let spans: Vec<(u32, u32, u32)> = per_owner
+                .iter()
+                .flat_map(|(v, l)| l.0.iter().map(move |&(s, e)| (s, e, *v)))
+                .collect();
+            let index = SharerLiveIndex::build(spans);
+            for p in 0..72 {
+                let mut got = Vec::new();
+                index.stab(p, &mut got);
+                got.sort_unstable();
+                let want: Vec<u32> = per_owner
+                    .iter()
+                    .filter(|(_, l)| l.contains(p))
+                    .map(|(v, _)| *v)
+                    .collect();
+                assert_eq!(got, want, "point {p}");
+            }
+        }
+    }
+
+    // ── the exact alias-freshness law (audit-of-#603 H1) ─────────────────────
+
+    /// A two-member same-value class homed in r13, both definitions emitted
+    /// (the class content sits in the register from v104's definition on).
+    fn seeded_codegen() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(103, PhysReg(3));
+        cg.reg_assignments.insert(104, PhysReg(3));
+        cg.home_sharers.insert(3, vec![103, 104]);
+        cg.phi_chain.insert(104, 103);
+        cg.value_live_segments
+            .insert(103, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.value_live_segments
+            .insert(104, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.index_home_liveness();
+        cg.state.current_program_point = 10;
+        // Definitions in emission order, then the workqueue composition: a
+        // clobber evicts both sharers and the in-place chain update
+        // re-defines the newest id.  v103 stays clobber-marked — the alias
+        // path under test is exactly the one its consumer takes.
+        cg.note_home_written(103);
+        cg.note_home_written(104);
+        cg.note_reg_clobbered(3);
+        cg.note_home_written(104);
+        cg
+    }
+
+    #[test]
+    fn fresh_home_reads_directly_and_via_fresh_class_sibling() {
+        let mut cg = seeded_codegen();
+        assert_eq!(cg.fresh_home_of(103), Some(PhysReg(3)));
+        // The kernel-6.18.52 shape: a clobber evicts both sharers, the
+        // in-place chain update re-defines ONLY the newest id, and the
+        // consumer of the older sibling reads the register through the
+        // blessed class.
+        cg.note_reg_clobbered(3);
+        assert_eq!(cg.fresh_home_of(103), None, "clobbered without sibling");
+        cg.note_home_written(104);
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "the class definition that is the register's last write blesses"
+        );
+    }
+
+    #[test]
+    fn dead_class_sibling_clobber_refuses_under_exact_law() {
+        // THE audit-H1 composition, now closed: v104's definition is the
+        // register's last write; then a clobbering write hits r13 while
+        // v104 is DEAD — the liveness-gated eviction leaves v104's bits
+        // untouched (pinned below), but the write state records the
+        // Clobber, and no join resurrects it.  The consumer of v103 must
+        // reload instead of reading whatever the clobber left in r13.
+        let mut cg = seeded_codegen();
+        // v104 dies before the clobber.
+        cg.value_live_segments
+            .insert(104, LiveSpans::from_ranges(vec![(0, 5)]));
+        cg.index_home_liveness();
+        cg.state.current_program_point = 70;
+        cg.note_reg_clobbered(3);
+        assert!(
+            !cg.home_clobbered.contains(&104),
+            "dead sharer survives the eviction (liveness-gate law)"
+        );
+        cg.state.current_program_point = 80;
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "the clobber event poisons the register: no dead-sibling blessing"
+        );
+    }
+
+    // ── transient evictions: a sharer dead after the clobbering point ───────
+
+    /// r12 homes v200 (live [0, 20], and [50, 60] on another path) and v201,
+    /// derived from v200 in place at v200's last use on the first path.
+    fn transient_codegen() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(200, PhysReg(4));
+        cg.reg_assignments.insert(201, PhysReg(4));
+        cg.home_sharers.insert(4, vec![200, 201]);
+        cg.value_live_segments
+            .insert(200, LiveSpans::from_ranges(vec![(0, 20), (50, 60)]));
+        cg.value_live_segments
+            .insert(201, LiveSpans::from_ranges(vec![(20, 40)]));
+        cg.home_block_end_points = vec![30, 45, 70];
+        cg.index_home_liveness();
+        cg.state.current_program_point = 5;
+        cg.note_home_written(200);
+        cg
+    }
+
+    /// zstd_fast's `v4635 = GEP v553, off` computed in place in v553's home
+    /// at v553's last use: the eviction binds the rest of that instruction,
+    /// then the other path's read of v553 sees its intact home.
+    #[test]
+    fn last_use_eviction_holds_within_the_point_and_settles_after() {
+        let mut cg = transient_codegen();
+        cg.state.current_program_point = 20;
+        cg.note_reg_clobbered(4);
+        assert_eq!(
+            cg.fresh_home_of(200),
+            None,
+            "a read later in this instruction reloads"
+        );
+        cg.settle_transient_home_evictions();
+        assert_eq!(
+            cg.fresh_home_of(200),
+            None,
+            "settling at the same point keeps it"
+        );
+        cg.note_home_written(201);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert_eq!(cg.fresh_home_of(200), Some(PhysReg(4)));
+        assert!(
+            cg.home_fresh.contains(&200),
+            "the pre-eviction freshness is restored"
+        );
+        assert!(cg.home_transient_evictions.is_empty());
+    }
+
+    #[test]
+    fn eviction_of_a_value_live_after_the_point_is_permanent() {
+        let mut cg = transient_codegen();
+        cg.state.current_program_point = 10;
+        cg.note_reg_clobbered(4);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert_eq!(cg.fresh_home_of(200), None);
+    }
+
+    /// A value live out of its block ends its segment at the terminator point
+    /// when the successor is not laid out next: no transient treatment there.
+    #[test]
+    fn eviction_at_a_terminator_point_is_permanent() {
+        let mut cg = transient_codegen();
+        cg.value_live_segments
+            .insert(200, LiveSpans::from_ranges(vec![(0, 30), (50, 60)]));
+        cg.index_home_liveness();
+        cg.state.current_program_point = 30;
+        cg.note_reg_clobbered(4);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert_eq!(cg.fresh_home_of(200), None);
+    }
+
+    /// A same-value class member's mark is evidence for its siblings' alias
+    /// reads, so it is never settled.
+    #[test]
+    fn eviction_of_a_class_member_is_permanent() {
+        let mut cg = transient_codegen();
+        cg.home_class_members.insert(200);
+        cg.state.current_program_point = 20;
+        cg.note_reg_clobbered(4);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert!(cg.home_clobbered.contains(&200));
+    }
+
+    #[test]
+    fn branch_disagreement_poisons_the_join() {
+        // Diamond: one arm defines v104 into r13, the other clobbers r13.
+        // The join's merge sees Disagreement — no side may bless.
+        let mut cg = seeded_codegen();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        let mut arm_a = FxHashMap::default();
+        arm_a.insert(3u8, HomeWrite::Def(104));
+        let mut arm_b = FxHashMap::default();
+        arm_b.insert(3u8, HomeWrite::Clobber);
+        cg.home_branch_snapshots.insert(7, vec![arm_a, arm_b]);
+        cg.begin_home_write_block(BlockId(7));
+        assert_eq!(cg.fresh_home_of(103), None, "disagreement poisons the join");
+    }
+
+    #[test]
+    fn branch_agreement_keeps_the_def_at_the_join() {
+        // Both arms carry the same class definition (e.g. an if/else whose
+        // arms each end with the chain update): the join keeps the def and
+        // the consumer reads the register.
+        let mut cg = seeded_codegen();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        let mut arm_a = FxHashMap::default();
+        arm_a.insert(3u8, HomeWrite::Def(104));
+        let mut arm_b = FxHashMap::default();
+        arm_b.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(7, vec![arm_a, arm_b]);
+        cg.begin_home_write_block(BlockId(7));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "unanimous defs survive the join"
+        );
+    }
+
+    #[test]
+    fn fallthrough_edge_participates_in_the_merge() {
+        // Conditional branch: the taken edge is a snapshot, the not-taken
+        // edge is the fallthrough — both must agree for the join to bless.
+        let mut cg = seeded_codegen();
+        let mut snap = FxHashMap::default();
+        snap.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(9, vec![snap]);
+        cg.home_fallthrough = true;
+        cg.home_entry_pending = false;
+        // Current (fallthrough) state agrees: Def(104) from the seed.
+        cg.begin_home_write_block(BlockId(9));
+        assert_eq!(cg.fresh_home_of(103), Some(PhysReg(3)));
+        // Now the fallthrough DISAGREES (a clobber on the way).
+        let mut snap = FxHashMap::default();
+        snap.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(10, vec![snap]);
+        cg.home_write_state.insert(3, HomeWrite::Clobber);
+        cg.home_fallthrough = true;
+        cg.begin_home_write_block(BlockId(10));
+        assert_eq!(cg.fresh_home_of(103), None, "fallthrough clobber poisons");
+    }
+
+    #[test]
+    fn entry_seeds_survive_the_entry_block() {
+        // The entry block has no fallthrough predecessor, but its state is
+        // the prologue's parameter seeds — the merge must keep them.
+        let mut cg = seeded_codegen();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = true;
+        cg.begin_home_write_block(BlockId(0));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "entry seeds are the entry block's incoming state"
+        );
+    }
+
+    #[test]
+    fn computed_goto_poisons_every_label() {
+        let mut cg = seeded_codegen();
+        cg.poison_home_write_state();
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(0));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "after a computed Goto no register is provable"
+        );
+    }
+
+    #[test]
+    fn join_keeps_group_lineage_defs_agreed_across_edges() {
+        // Two paths into a join each define a DIFFERENT member of the
+        // SAME sharing group into the register (a remat re-derivation of
+        // the class rep on one arm, the coalesced member on the other).
+        // Storage-level identity is GROUP membership: the join keeps the
+        // Def — syntactic or chain-class equality would refuse a sound
+        // loop-carrier read (kernel calibrate_delay).
+        let mut cg = seeded_codegen();
+        let mut snap_a = FxHashMap::default();
+        snap_a.insert(3u8, HomeWrite::Def(103));
+        let mut snap_b = FxHashMap::default();
+        snap_b.insert(3u8, HomeWrite::Def(104));
+        cg.home_branch_snapshots.insert(11, vec![snap_a, snap_b]);
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(11));
+        // The consumer of the clobber-marked 103 reads the group slot:
+        // Layer 1 blesses via the fresh sibling, Layer 2 sees the
+        // group-lineage Def the join kept.
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "group-member Defs on every edge agree at the join"
+        );
+    }
+
+    #[test]
+    fn join_poisons_when_any_edge_carries_a_clobber() {
+        // One path ends with a foreign write: the register provably does
+        // NOT hold the group's value on that path — the join poisons, and
+        // the refinement refuses even though the calibrated layer would
+        // bless (the audit-H1 discipline at join granularity).
+        let mut cg = seeded_codegen();
+        cg.note_home_written(104); // edge A: group-lineage Def
+        let edge_a = cg.home_write_state.clone();
+        cg.note_reg_clobbered(3); // edge B: foreign write
+        let edge_b = cg.home_write_state.clone();
+        assert!(matches!(edge_b.get(&3), Some(HomeWrite::Clobber)));
+        // The merge law: any Clobber among the edges => Clobber.
+        let poisoned = matches!(
+            (edge_a.get(&3), edge_b.get(&3)),
+            (_, Some(HomeWrite::Clobber))
+        );
+        assert!(poisoned);
+        cg.home_write_state = edge_b;
+        cg.home_branch_snapshots.clear();
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        assert!(
+            !cg.home_readable_via_alias(103),
+            "a definite Clobber narrows the calibrated blessing to a refusal"
+        );
+    }
+
+    #[test]
+    fn absent_state_abstains_to_the_calibrated_layer() {
+        // Where the write-state has NO definite opinion (the register was
+        // never observed since an unknown point — e.g. after raw
+        // intra-block control flow), the refinement abstains and the
+        // calibrated sibling scan answers: never worse than the
+        // pre-dataflow model.
+        let mut cg = seeded_codegen();
+        cg.note_reg_clobbered(3);
+        cg.note_home_written(104);
+        // Layer 2 alone would bless (Def(104) is the last write); drop the
+        // opinion entirely to exercise the abstain path.
+        cg.home_write_state.clear();
+        assert!(
+            cg.home_readable_via_alias(103),
+            "an absent state entry defers to the calibrated blessing"
+        );
+        // ... and a fully clobbered sibling set refuses (calibrated base).
+        cg.note_reg_clobbered(3);
+        assert!(!cg.home_readable_via_alias(103));
+    }
+
+    #[test]
+    fn computed_goto_poison_is_authoritative() {
+        // After a computed Goto the state is DEFINITELY unknown for every
+        // register — the refinement narrows even a calibrated blessing to
+        // a refusal.
+        let mut cg = seeded_codegen();
+        cg.poison_home_write_state();
+        assert!(
+            !cg.home_readable_via_alias(103),
+            "no calibrated blessing survives the computed-Goto poison"
+        );
+    }
+
+    #[test]
+    fn loop_carried_group_slot_keeps_the_calibrated_blessing() {
+        // The kernel calibrate_delay shape: every edge into a loop header
+        // ends with a Def of a DIFFERENT member of ONE sharing group (the
+        // RA's latch copies/selects write the group's carried slot).  The
+        // join cannot prove member-to-member equivalence (the phi was
+        // if-converted away), so it records the loop-carrier signature and
+        // the calibrated sibling scan answers for exactly this register.
+        let mut cg = seeded_codegen();
+        cg.reg_assignments.insert(105, PhysReg(3));
+        cg.home_sharers.insert(3, vec![103, 104, 105]);
+        cg.value_live_segments
+            .insert(105, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.index_home_liveness();
+        // Edge A ends with Def(103); edge B with Def(105) — same group,
+        // different canonical classes.
+        let mut snap_a = FxHashMap::default();
+        snap_a.insert(3u8, HomeWrite::Def(103));
+        let mut snap_b = FxHashMap::default();
+        snap_b.insert(3u8, HomeWrite::Def(105));
+        cg.home_branch_snapshots.insert(11, vec![snap_a, snap_b]);
+        cg.home_fallthrough = false;
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(11));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            Some(PhysReg(3)),
+            "the group slot's carried value serves its live member"
+        );
+    }
+
+    #[test]
+    fn a_clobbering_edge_defeats_the_loop_carrier_signature() {
+        // H1 discipline: a foreign-class clobber on any edge means the
+        // register provably does NOT hold a group member on all paths —
+        // no carrier signature, exact refusal.
+        let mut cg = seeded_codegen();
+        cg.reg_assignments.insert(105, PhysReg(3));
+        cg.home_sharers.insert(3, vec![103, 104, 105]);
+        cg.value_live_segments
+            .insert(105, LiveSpans::from_ranges(vec![(0, 100)]));
+        cg.index_home_liveness();
+        let mut snap_a = FxHashMap::default();
+        snap_a.insert(3u8, HomeWrite::Def(103));
+        cg.home_branch_snapshots.insert(12, vec![snap_a]);
+        cg.home_write_state.insert(3, HomeWrite::Clobber);
+        cg.home_fallthrough = true;
+        cg.home_entry_pending = false;
+        cg.begin_home_write_block(BlockId(12));
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "a clobber edge is not a group-member Def"
+        );
+    }
+
+    #[test]
+    fn staging_write_of_a_foreign_value_poisons_the_home() {
+        let mut cg = seeded_codegen();
+        // Stage a constant into r13: the register's last write is not any
+        // home's definition.
+        cg.note_staging_target(&Operand::Const(IrConst::I32(1)), PhysReg(3));
+        assert_eq!(cg.fresh_home_of(103), None);
+        assert_eq!(cg.fresh_home_of(104), None);
+        // isel pre-coloring follows the same law.
+        use super::super::isel::HomeMap;
+        let pre = FreshHomes(&cg);
+        assert!(!pre.contains_key(&103) && !pre.contains_key(&104));
+    }
+
+    #[test]
+    fn staging_self_write_reestablishes_the_definition() {
+        let mut cg = seeded_codegen();
+        cg.note_reg_clobbered(3);
+        assert_eq!(cg.fresh_home_of(103), None);
+        // A staging write whose operand IS the homed value re-establishes it.
+        cg.note_staging_target(&Operand::Value(Value(104)), PhysReg(3));
+        assert_eq!(cg.fresh_home_of(103), Some(PhysReg(3)));
+    }
+
+    #[test]
+    fn fresh_sibling_of_a_different_class_never_blesses_the_home() {
+        let mut cg = seeded_codegen();
+        // Break the class: no phi_chain at all (RA-3 regression shape).
+        cg.phi_chain.clear();
+        cg.note_reg_clobbered(3);
+        cg.note_home_written(104);
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "a fresh UNRELATED sharer must not bless a clobbered home"
+        );
+    }
+
+    #[test]
+    fn dead_sharers_survive_a_clobber_until_redefinition() {
+        let mut cg = seeded_codegen();
+        // 105 shares the register but is dead at the clobber point: the
+        // liveness gate must NOT evict it (its next def re-marks it).
+        cg.home_sharers.insert(3, vec![103, 104, 105]);
+        cg.value_live_segments
+            .insert(105, LiveSpans::from_ranges(vec![(50, 60)]));
+        cg.index_home_liveness();
+        cg.note_reg_clobbered(3);
+        assert!(
+            !cg.home_clobbered.contains(&105),
+            "dead sharer keeps its home mark"
+        );
+    }
+
+    #[test]
+    fn inline_asm_clobber_poisons_the_write_state() {
+        let mut cg = seeded_codegen();
+        // The F5 path routes through note_reg_clobbered: the state must
+        // follow, not just the eviction bits.
+        cg.note_reg_clobbered(home_phys_by_asm_name("r13").unwrap());
+        assert_eq!(
+            cg.fresh_home_of(103),
+            None,
+            "asm clobber poisons the register for the alias law"
+        );
+    }
+}
+
+mod machinst_resolution_tests {
+    use super::super::machinst::{MachInst, MachReg, OpSize};
+    use super::*;
+
+    #[test]
+    fn vreg_is_unresolved_even_if_main_map_has_xmm_assignment() {
+        let inst = MachInst::Neg {
+            dst: MachReg::Vreg(7),
+            size: OpSize::S64,
+        };
+        let mut assignments = FxHashMap::default();
+        assignments.insert(7, PhysReg(20));
+        assert!(has_unresolvable_vreg(&inst, &assignments));
+    }
+
+    #[test]
+    fn physical_unary_register_is_resolved() {
+        let inst = MachInst::Not {
+            dst: MachReg::Phys(PhysReg(1)),
+            size: OpSize::S64,
+        };
+        assert!(!has_unresolvable_vreg(&inst, &FxHashMap::default()));
+    }
+
+    #[test]
+    fn cmp_secondary_register_tracks_comparison_width() {
+        assert_eq!(cmp_secondary_reg(IrType::I8), "cl");
+        assert_eq!(cmp_secondary_reg(IrType::U8), "cl");
+        assert_eq!(cmp_secondary_reg(IrType::I16), "cx");
+        assert_eq!(cmp_secondary_reg(IrType::U16), "cx");
+        assert_eq!(cmp_secondary_reg(IrType::I32), "ecx");
+        assert_eq!(cmp_secondary_reg(IrType::U32), "ecx");
+        assert_eq!(cmp_secondary_reg(IrType::I64), "rcx");
+        assert_eq!(cmp_secondary_reg(IrType::U64), "rcx");
+    }
+
+    #[test]
+    fn apx_egpr_names_are_gprs_not_xmm() {
+        assert_eq!(phys_reg_name(PhysReg(40)), "r16");
+        assert_eq!(phys_reg_name(PhysReg(55)), "r31");
+        assert_eq!(phys_reg_name_32(PhysReg(40)), "r16d");
+        assert_eq!(phys_reg_name_32(PhysReg(55)), "r31d");
+        assert_eq!(typed_phys_reg_name(PhysReg(0), IrType::I8), "al");
+        assert_eq!(typed_phys_reg_name(PhysReg(7), IrType::U8), "cl");
+        assert_eq!(typed_phys_reg_name(PhysReg(0), IrType::I16), "ax");
+        assert_eq!(typed_phys_reg_name(PhysReg(7), IrType::U16), "cx");
+        assert_eq!(typed_phys_reg_name(PhysReg(40), IrType::I16), "r16w");
+        assert_eq!(typed_phys_reg_name(PhysReg(55), IrType::U16), "r31w");
+        assert_eq!(typed_phys_reg_name(PhysReg(40), IrType::I8), "r16b");
+        assert!(is_gpr_reg(PhysReg(40)));
+        assert!(is_gpr_reg(PhysReg(16)));
+        assert!(!is_gpr_reg(PhysReg(20)));
+        assert!(!is_xmm_reg(PhysReg(40)));
+        assert!(is_xmm_reg(PhysReg(20)));
+    }
+
+    #[test]
+    fn isel_homes_never_include_egpr_by_default() {
+        // i7-14700KF (Raptor Lake) has no APX: %r16–%r31 / REX2 / NDD EVEX
+        // are #UD. Default ISel (no `-mapx`) must stay in the legacy GP pool.
+        fn assert_not_egpr(n: &str) {
+            let digits: String = n
+                .chars()
+                .skip(1)
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let id = digits.parse::<u32>().unwrap_or(0);
+            assert!(
+                id < 16,
+                "default ISel GP home {n} is an EGPR (APX is #UD on Raptor Lake)"
+            );
+        }
+        for r in X86_CALLEE_SAVED.iter().chain(X86_CALLER_SAVED.iter()) {
+            assert_not_egpr(phys_reg_name(*r));
+        }
+        assert_eq!(phys_reg_name(PhysReg(16)), "rdx");
+        // The pool lookup is total now: every id the MachInst allocator can
+        // hand out has a name, rax/rcx included.
+        for r in super::super::machinst::MACHINST_ALLOCATABLE_GPRS {
+            assert_not_egpr(phys_reg_name(*r));
+        }
+        // The extra file exists for the gated path only.
+        assert_eq!(X86_APX_EGPRS[0], PhysReg(40));
+        assert_eq!(phys_reg_name(X86_APX_EGPRS[0]), "r16");
+    }
+
+    #[test]
+    fn x64_push_imm_classifier_follows_the_slot_sign_extension_law() {
+        use super::x64_stack_arg_push_imm;
+        // Narrow scalars: every bit pattern is pushable (upper lane is
+        // ABI-unspecified padding).
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I8(-1)), Some(-1));
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I16(-16657)), Some(-16657));
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I32(i32::MIN)),
+            Some(i32::MIN as i64)
+        );
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::F32(1.5)),
+            Some(1.5f32.to_bits() as i32 as i64)
+        );
+        // Eight-byte containers: only the imm32 window is exact.
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I64(0)), Some(0));
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I64(i32::MAX as i64)),
+            Some(i32::MAX as i64)
+        );
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I64(i32::MIN as i64 - 1)),
+            None
+        );
+        assert_eq!(
+            x64_stack_arg_push_imm(&IrConst::I64(i32::MAX as i64 + 1)),
+            None
+        );
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I64(1 << 40)), None);
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::I64(-1)), Some(-1)); // sign-extends exactly
+        // 0.0 pushes as $0; other doubles only when their bit pattern fits.
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::F64(0.0)), Some(0));
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::F64(1.0)), None); // 0x3FF00000... > imm32
+        // Fail-closed shapes.
+        assert_eq!(x64_stack_arg_push_imm(&IrConst::Zero), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod machinst_window_tests {
+    //! Unit tests for the two MachInst window predicates the acc-resident
+    //! substitution depends on (audit work order P0-1): the fail-closed
+    //! %rax-touch scan and the vreg-def extraction.  Every arm of both
+    //! matches is pinned here — deleting or weakening an arm fails a test
+    //! instead of silently degrading the substitution's safety net.
+    use super::super::machinst::{
+        AluOp, CallArgMove, CallTarget, CondCode, FAluOp, MachInst, MachOperand, MachReg, OpSize,
+        RAX, ShiftOp,
+    };
+    use super::machinst_window_defs;
+    use super::machinst_window_rax_free;
+    use crate::backend::regalloc::PhysReg;
+
+    fn vreg(id: u32) -> MachReg {
+        MachReg::Vreg(id)
+    }
+    fn phys(id: u8) -> MachReg {
+        MachReg::Phys(PhysReg(id))
+    }
+    fn vop(id: u32) -> MachOperand {
+        MachOperand::Reg(vreg(id))
+    }
+
+    // ── machinst_window_rax_free ────────────────────────────────────
+
+    /// Each of these either reads/writes %rax by architectural contract
+    /// (Cqto, Div) or destroys the caller-saved world incl. %rax
+    /// (Call, CallTyped, Ret) — or is opaque text the scanner cannot
+    /// prove (Raw). One instruction is enough to poison the window.
+    #[test]
+    fn window_rax_free_rejects_implicit_clobbers() {
+        let clobbers = [
+            MachInst::Cqto { size: OpSize::S64 },
+            MachInst::Div {
+                divisor: MachOperand::Reg(vreg(7)),
+                signed: true,
+                size: OpSize::S64,
+            },
+            MachInst::Call { target: "f".into() },
+            MachInst::CallTyped {
+                caller_saves: Vec::new(),
+                args: vec![CallArgMove {
+                    src: MachOperand::Reg(vreg(3)),
+                    dst_reg: PhysReg(7),
+                    size: OpSize::S64,
+                }],
+                target: CallTarget::Direct("f".into()),
+                ret: None,
+                gp_arg_count: None,
+                ipa_keep: 0,
+            },
+            MachInst::Ret,
+            MachInst::Raw("lock cmpxchg16b (%rdi)".into()),
+        ];
+        for inst in clobbers {
+            assert!(
+                !machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "implicit rax contract must fail closed: {inst:?}",
+            );
+        }
+    }
+
+    /// %rax must be seen in EVERY operand position the substitution could
+    /// redirect: plain register, memory base, indexed memory (base and
+    /// index), and in both source and dest slots. A vreg-only window of
+    /// the same shapes stays free.
+    #[test]
+    fn window_rax_free_sees_operand_positions() {
+        let rax = phys(RAX.0);
+        let rcx = phys(7); // another phys reg: must NOT poison
+        let poisons = [
+            MachInst::Mov {
+                src: MachOperand::Reg(rax),
+                dst: MachOperand::Reg(vreg(1)),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Reg(vreg(1)),
+                dst: MachOperand::Reg(rax),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: rax,
+                    offset: 8,
+                },
+                dst: MachOperand::Reg(vreg(1)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: MachOperand::MemIndex {
+                    base: vreg(1),
+                    index: rax,
+                    scale: 4,
+                    offset: 0,
+                },
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: vop(1),
+                dst: MachReg::Phys(RAX),
+                size: OpSize::S64,
+            },
+            MachInst::Cmp {
+                lhs: MachOperand::Reg(rax),
+                rhs: MachOperand::Imm(0),
+                size: OpSize::S64,
+            },
+            MachInst::ShiftX {
+                op: ShiftOp::Shr,
+                count: rax,
+                src: vreg(1),
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+        ];
+        for inst in poisons {
+            assert!(
+                !machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "{inst:?} touches %rax and must poison the window",
+            );
+        }
+        // Same shapes with vregs / a non-rax phys reg: free.
+        let clean = [
+            MachInst::Mov {
+                src: MachOperand::Mem {
+                    base: vreg(1),
+                    offset: 8,
+                },
+                dst: MachOperand::Reg(vreg(2)),
+                size: OpSize::S64,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: MachOperand::Reg(rcx),
+                dst: vreg(2),
+                size: OpSize::S64,
+            },
+            MachInst::SetCC {
+                cc: CondCode::Ne,
+                dst: vreg(3),
+            },
+        ];
+        assert!(
+            machinst_window_rax_free(&clean),
+            "vreg-only / non-rax phys window must be rax-free",
+        );
+    }
+
+    #[test]
+    fn window_rax_free_is_exhaustive_over_new_variants_by_construction() {
+        // Jcc/Jmp/Label/XorRdx are the documented rax-free control forms.
+        let free: Vec<MachInst> = vec![
+            MachInst::Jcc {
+                cc: CondCode::E,
+                target: String::from(".L1"),
+            },
+            MachInst::Jmp {
+                target: String::from(".L1"),
+            },
+            MachInst::Label(String::from(".L1")),
+            MachInst::XorRdx,
+        ];
+        for inst in free {
+            assert!(
+                machinst_window_rax_free(std::slice::from_ref(&inst)),
+                "control/xorrdx forms never touch rax: {inst:?}",
+            );
+        }
+    }
+
+    // ── machinst_window_defs ────────────────────────────────────────
+
+    #[test]
+    fn window_defs_extracts_every_dst_position() {
+        // One instruction per defining variant; the destination vreg id must
+        // always land in the def set (the substitution may never fire for a
+        // value the window redefines).
+        let cases: Vec<(MachInst, u32)> = vec![
+            (
+                MachInst::Mov {
+                    src: vop(90),
+                    dst: vop(10),
+                    size: OpSize::S64,
+                },
+                10,
+            ),
+            (
+                MachInst::FMov {
+                    src: vop(91),
+                    dst: vop(11),
+                    size: OpSize::S64,
+                },
+                11,
+            ),
+            (
+                MachInst::Movzx {
+                    src: vop(92),
+                    dst: vreg(12),
+                    from_size: OpSize::S8,
+                    to_size: OpSize::S64,
+                },
+                12,
+            ),
+            (
+                MachInst::Movsx {
+                    src: vop(93),
+                    dst: vreg(13),
+                    from_size: OpSize::S32,
+                    to_size: OpSize::S64,
+                },
+                13,
+            ),
+            (
+                MachInst::Alu {
+                    op: AluOp::And,
+                    src: vop(94),
+                    dst: vreg(14),
+                    size: OpSize::S64,
+                },
+                14,
+            ),
+            (
+                MachInst::Imul3 {
+                    imm: 5,
+                    src: vreg(95),
+                    dst: vreg(15),
+                    size: OpSize::S64,
+                },
+                15,
+            ),
+            (
+                MachInst::Neg {
+                    dst: vreg(16),
+                    size: OpSize::S64,
+                },
+                16,
+            ),
+            (
+                MachInst::Not {
+                    dst: vreg(17),
+                    size: OpSize::S64,
+                },
+                17,
+            ),
+            (
+                MachInst::Shift {
+                    op: ShiftOp::Shl,
+                    amount: MachOperand::Imm(2),
+                    dst: vreg(18),
+                    size: OpSize::S64,
+                },
+                18,
+            ),
+            (
+                MachInst::ShiftX {
+                    op: ShiftOp::Shl,
+                    count: phys(1),
+                    src: vreg(96),
+                    dst: vreg(19),
+                    size: OpSize::S64,
+                },
+                19,
+            ),
+            (
+                MachInst::Rorx {
+                    amount: 7,
+                    src: vreg(97),
+                    dst: vreg(20),
+                    size: OpSize::S32,
+                },
+                20,
+            ),
+            (
+                MachInst::Lea {
+                    base: vreg(98),
+                    index: Some((vreg(21), 2)),
+                    offset: 0,
+                    dst: vreg(22),
+                    size: OpSize::S64,
+                },
+                22,
+            ),
+            (
+                MachInst::LeaSym {
+                    sym: String::from("s"),
+                    dst: vreg(23),
+                },
+                23,
+            ),
+            (
+                MachInst::LeaSlot {
+                    slot: 8,
+                    dst: vreg(24),
+                },
+                24,
+            ),
+            (
+                MachInst::SetCC {
+                    cc: CondCode::Ne,
+                    dst: vreg(25),
+                },
+                25,
+            ),
+            (
+                MachInst::Cmov {
+                    cc: CondCode::Ne,
+                    src: vop(99),
+                    dst: vreg(26),
+                    size: OpSize::S64,
+                },
+                26,
+            ),
+        ];
+        for (inst, want) in &cases {
+            let defs = machinst_window_defs(std::slice::from_ref(inst));
+            assert!(
+                defs.contains(want),
+                "dst vreg {want} of {inst:?} must be in the def set",
+            );
+        }
+        // Lea's INDEX is also a two-address write (lea (,%idx,2),%dst
+        // semantics never reach here — but the extractor is conservative on
+        // purpose): pin that behavior too.
+        let lea = MachInst::Lea {
+            base: vreg(98),
+            index: Some((vreg(21), 2)),
+            offset: 0,
+            dst: vreg(22),
+            size: OpSize::S64,
+        };
+        assert!(machinst_window_defs(std::slice::from_ref(&lea)).contains(&21));
+        // Mov's SOURCE is deliberately in the set as well: the conservative
+        // over-approximation keeps the substitution from reading a pre-window
+        // image through a same-window move.
+        let mov = MachInst::Mov {
+            src: vop(90),
+            dst: vop(10),
+            size: OpSize::S64,
+        };
+        assert!(machinst_window_defs(std::slice::from_ref(&mov)).contains(&90));
+    }
+
+    /// Position contract (companion to the per-variant table above):
+    /// the SOURCE/base positions that must stay OUT of the def set —
+    /// Movzx's operand src, ShiftX's count/src MachRegs, Lea's base.
+    /// Recording them can only forbid substitutions (fail-safe), but
+    /// the omission is the documented contract and is pinned here.
+    #[test]
+    fn window_defs_omits_source_and_base_positions() {
+        let window = [
+            MachInst::Movzx {
+                src: MachOperand::Reg(vreg(105)),
+                dst: vreg(106),
+                from_size: OpSize::S32,
+                to_size: OpSize::S64,
+            },
+            MachInst::ShiftX {
+                op: ShiftOp::Shl,
+                count: vreg(107),
+                src: vreg(108),
+                dst: vreg(109),
+                size: OpSize::S64,
+            },
+            MachInst::Lea {
+                base: vreg(110),
+                index: Some((vreg(111), 4)),
+                offset: 0,
+                dst: vreg(112),
+                size: OpSize::S64,
+            },
+        ];
+        let defs = machinst_window_defs(&window);
+        for id in [106u32, 109, 111, 112] {
+            assert!(defs.contains(&id), "vreg {id}: dst/index must be recorded");
+        }
+        for id in [105u32, 107, 108, 110] {
+            assert!(
+                !defs.contains(&id),
+                "vreg {id}: source/base/count positions stay out of the def set",
+            );
+        }
+    }
+
+    #[test]
+    fn window_defs_omits_xmm_defs() {
+        // FAlu and Mov128 destinations are XMM-class values; the acc-resident
+        // substitution only rewrites integer-class acc names, so the def
+        // scanner currently (and soundly, given the acc cache only ever names
+        // integer values) skips them.  Pin the present behavior: if a future
+        // MachInst variant starts defining GPR-class values through one of
+        // these shapes, THIS test is the reminder to extend the scan — see
+        // the `_ => {}` arm's comment in machinst_window_defs.
+        let falu = MachInst::FAlu {
+            op: FAluOp::Add,
+            src2: vop(50),
+            src1: phys(20),
+            dst: vreg(51),
+            size: OpSize::S64,
+        };
+        assert!(!machinst_window_defs(std::slice::from_ref(&falu)).contains(&51));
+        let mov128 = MachInst::Mov128 {
+            src: MachOperand::StackSlot(8),
+            dst: MachOperand::StackSlot(24),
+        };
+        assert!(machinst_window_defs(std::slice::from_ref(&mov128)).is_empty());
+        // The XMM-class shapes are rax-free for the sibling scan — and the
+        // rax scan, by contrast, DOES see FAlu operands: the two siblings
+        // have opposite maintenance semantics by design.
+        let fm = MachInst::FMov {
+            src: MachOperand::Reg(vreg(201)),
+            dst: MachOperand::Reg(vreg(202)),
+            size: OpSize::S64,
+        };
+        assert!(machinst_window_rax_free(std::slice::from_ref(&fm)));
+        assert!(machinst_window_rax_free(std::slice::from_ref(&mov128)));
+        let falu_rax = MachInst::FAlu {
+            op: FAluOp::Add,
+            src2: MachOperand::Reg(MachReg::Phys(RAX)),
+            src1: phys(20),
+            dst: vreg(51),
+            size: OpSize::S64,
+        };
+        assert!(!machinst_window_rax_free(std::slice::from_ref(&falu_rax)));
+    }
+}
+
+#[cfg(test)]
+mod def_matcher_tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+    };
+
+    /// Regression lock for the `Copy` arm of the def matcher (kernel
+    /// net/ipv4/arp.c `arp_create`, value 1408): a Copy-defined value whose
+    /// home is clobbered by call-argument staging, with no slot image, MUST
+    /// present its definition to the stale-home recovery —
+    /// `rematerialize_stale_into_rax` re-derives the identity-moved source
+    /// with the ordinary freshness discipline.  With the matcher arm absent
+    /// (the historical state) the recovery chain is severed before it starts
+    /// and the consumer refuses to fabricate the value and ICEs.  The
+    /// GlobalAddr/Cast/BinOp arms are pinned too: the matcher's
+    /// dest-classification list is exactly the set of def shapes every
+    /// rebuild consumer can recover from.
+    #[test]
+    fn def_matcher_reports_copy_defined_values() {
+        let mut func = IrFunction::new("arp_shape".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U64,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        for vid in [0u32, 1, 2, 3] {
+            assert!(
+                X86Codegen::find_defining_instruction(&func, vid).is_some(),
+                "value {vid}: the matcher must report its definition"
+            );
+        }
+        // A value with no definition in the function stays invisible.
+        assert!(X86Codegen::find_defining_instruction(&func, 9).is_none());
+    }
+
+    /// AMBIGUITY LAW: a multiply-defined value (phi-elimination residue —
+    /// loop-carried induction copies share the phi's dest id) must NOT be
+    /// reported.  Answering first-def let the global-addr resolver treat
+    /// the loop induction pointer as the constant global its ENTRY copy
+    /// held: cpu_model_memset_inline's `call *pr->z(p)` folded to the
+    /// loop-invariant `call *probes+8(%rip)` while `r15` advanced 56 bytes
+    /// per iteration — every row ≥ 1 called row 0 (memset n=1 byte-0
+    /// failures).  A single-def value keeps the F10 recovery contract.
+    #[test]
+    fn def_matcher_refuses_multiply_defined_values() {
+        let mut func = IrFunction::new("loopy".to_string(), IrType::Void, vec![], false);
+        // b0: v0 = &probes; v1 = copy v0        (entry predecessor)
+        // b1: v2 = v1 + 56; v1 = copy v2; loop  (latch REDEFINES v1)
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "probes".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(56)),
+                    ty: IrType::U64,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+        // The loop-carried copy has TWO defs: invisible to re-derivation.
+        assert!(X86Codegen::find_defining_instruction(&func, 1).is_none());
+        // Single-def values (the global, the latch increment) stay visible.
+        assert!(X86Codegen::find_defining_instruction(&func, 0).is_some());
+        assert!(X86Codegen::find_defining_instruction(&func, 2).is_some());
+        assert_index_matches_scan(&func, 4);
+    }
+
+    /// The per-function def index answers exactly what the scan answers --
+    /// the same instruction (by identity), the same refusals -- for every
+    /// value id up to `max_vid`, defined, multiply defined or undefined.
+    fn assert_index_matches_scan(func: &IrFunction, max_vid: u32) {
+        let index = X86Codegen::build_def_index(func);
+        for vid in 0..=max_vid {
+            let scanned = X86Codegen::find_defining_instruction(func, vid);
+            let indexed = X86Codegen::indexed_definition(func, &index, vid);
+            assert!(
+                match (scanned, indexed) {
+                    (Some(a), Some(b)) => std::ptr::eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                },
+                "value {vid}: the index must answer like the scan"
+            );
+        }
+    }
+
+    /// The index on the classification fixture: every matcher arm, a
+    /// non-defining instruction kind (`Store`), and undefined ids.
+    #[test]
+    fn def_index_matches_the_scan_on_every_def_shape() {
+        let mut func = IrFunction::new("shapes".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U64,
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(3)),
+                    ptr: Value(0),
+                    ty: IrType::U64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_index_matches_scan(&func, 9);
+    }
+}
+
+#[cfg(test)]
+mod switch_bound_emitter_tests {
+    use super::*;
+
+    fn emit(
+        bound: Option<(u32, u64)>,
+        ty: IrType,
+        minimum: i64,
+        pic: bool,
+        kernel: bool,
+    ) -> String {
+        let mut cg = X86Codegen::new();
+        cg.state.value_locations.insert(0, StackSlot(-8));
+        cg.state.pic_mode = pic;
+        cg.state.code_model_kernel = kernel;
+        if let Some(bound) = bound {
+            cg.state.switch_unsigned_bounds.insert(0, bound);
+        }
+        // A dense table with a real hole: omitting the outer guard must not
+        // omit or redirect the default entry for selector 7.
+        let cases: Vec<_> = (0..16)
+            .filter(|&i| i != 7)
+            .map(|i| (minimum + i, BlockId(100 + i as u32)))
+            .collect();
+        cg.emit_switch_jump_table(&Operand::Value(Value(0)), &cases, &BlockId(99), ty);
+        cg.state.out.buf.clone()
+    }
+
+    #[test]
+    fn proved_tables_keep_normalization_holes_and_code_model() {
+        for (pic, kernel) in [(false, false), (true, false), (true, true)] {
+            for ty in [IrType::I32, IrType::U32] {
+                let out = emit(Some((32, 15)), ty, 0, pic, kernel);
+                assert!(!out.contains("cmpq") && !out.contains("jae"), "{out}");
+                assert!(
+                    out.contains(if ty.is_unsigned() {
+                        "movl %eax, %eax"
+                    } else {
+                        "cltq"
+                    }),
+                    "{out}"
+                );
+                let entry = if pic && !kernel { ".long" } else { ".quad" };
+                assert_eq!(
+                    out.lines()
+                        .filter(|l| l.trim_start().starts_with(entry))
+                        .count(),
+                    16,
+                    "{out}"
+                );
+                assert!(
+                    out.contains(&format!("{entry} .LBB99")),
+                    "hole lost its default: {out}"
+                );
+                if pic && !kernel {
+                    assert!(out.contains("movslq (%rcx,%rax,4), %rdx"), "{out}");
+                } else {
+                    assert!(out.contains("(,%rax,8)"), "{out}");
+                }
+            }
+        }
+    }
+
+    /// Drive the jump-table emitter for a value homed in `%r14` whose
+    /// hole-aware live segments are `segments`, dispatching from `point`.
+    fn emit_direct32_from_home(segments: Vec<(u32, u32)>, point: u32, slotted: bool) -> String {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, PhysReg(4)); // %r14, callee-saved
+        cg.value_live_segments
+            .insert(0, LiveSpans::from_ranges(segments));
+        cg.state.current_program_point = point;
+        if slotted {
+            cg.state.value_locations.insert(0, StackSlot(-8));
+        }
+        let cases = vec![(2i64, BlockId(100)), (3, BlockId(101)), (4, BlockId(102))];
+        cg.emit_switch_jump_table(&Operand::Value(Value(0)), &cases, &BlockId(99), IrType::U32);
+        cg.state.out.buf.clone()
+    }
+
+    /// Linux 6.18.58 `arch/x86/coco/sev/vc-handle.c` `vc_handle_mmio`: the
+    /// switch value sits in a callee-saved home with hole-aware segments
+    /// `[(7,9) (11,21) (23,23) (119,127)]` and no stack slot. The direct
+    /// 32-bit path REWRITES the home in place, so taking it leaves a stale
+    /// home that nothing can rebuild and the read at 119 ended the
+    /// translation unit in `operand_to_rax` ("stale (clobbered) with no
+    /// slot/remat/acc recovery"). Any segment reaching past the dispatch
+    /// keeps the canonical `%rax` path, which only reads the home.
+    #[test]
+    fn switch_fast_path_keeps_a_home_whose_holes_are_not_dead() {
+        let out = emit_direct32_from_home(vec![(7, 9), (11, 21), (23, 23), (119, 127)], 23, false);
+        assert!(
+            !out.contains("subl $2, %r14d"),
+            "destroyed a home that is live later: {out}"
+        );
+        assert!(out.contains("subq $2, %rax"), "{out}");
+        assert!(out.contains("cmpq $3, %rax"), "{out}");
+    }
+
+    /// The same value is dead after the dispatch (`(23,23)` is its last
+    /// segment), so the register's old content is worth nothing and the
+    /// in-place form is exactly the saving it exists for.
+    #[test]
+    fn switch_fast_path_spends_a_dead_home_in_place() {
+        let out = emit_direct32_from_home(vec![(7, 9), (11, 21), (23, 23)], 23, false);
+        assert!(out.contains("subl $2, %r14d"), "{out}");
+        assert!(out.contains("cmpl $3, %r14d"), "{out}");
+    }
+
+    /// A slotted value survives the in-place rewrite — the emitter reloads a
+    /// clobbered home from its stack slot — so a live-later segment does not
+    /// cost the fast path.
+    #[test]
+    fn switch_fast_path_accepts_a_slotted_home_that_is_live_later() {
+        let out = emit_direct32_from_home(vec![(7, 9), (23, 23), (119, 127)], 23, true);
+        assert!(out.contains("subl $2, %r14d"), "{out}");
+    }
+
+    #[test]
+    fn value_home_is_expendable_fails_closed_and_verifies_copy_cast_sources() {
+        use crate::ir::reexports::{BasicBlock, Terminator};
+
+        let mut func = IrFunction::new("expendable_test".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(5)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I32,
+                },
+                Instruction::Copy {
+                    dest: Value(3),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        func.next_value_id = 6;
+
+        let mut cg = X86Codegen::new();
+        cg.current_func = Some(&func as *const IrFunction);
+        cg.state.current_program_point = 10;
+
+        // Missing live segments must fail closed.
+        assert!(!cg.value_home_is_expendable(2));
+
+        // Live past `point`, chained through unslotted `Value(5)` -> NOT expendable.
+        cg.value_live_segments
+            .insert(2, LiveSpans::from_ranges(vec![(5, 10), (20, 25)]));
+        assert!(!cg.value_home_is_expendable(2));
+
+        // Once ancestor `Value(5)` has a stack slot, recovery is guaranteed -> expendable.
+        cg.state.value_locations.insert(5, StackSlot(-16));
+        assert!(cg.value_home_is_expendable(2));
+
+        // Constant-backed Copy is always rematerialisable -> expendable.
+        cg.value_live_segments
+            .insert(3, LiveSpans::from_ranges(vec![(5, 30)]));
+        assert!(cg.value_home_is_expendable(3));
+    }
+
+    #[test]
+    fn home_clobber_cause_tracks_and_clears_with_home_clobbered() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(7, PhysReg(2));
+        cg.state.current_program_point = 42;
+        cg.mark_home_clobbered(7, "switch_jt_direct32");
+        assert!(cg.home_clobbered.contains(&7));
+        assert_eq!(
+            cg.home_clobber_cause.get(&7),
+            Some(&(42, "switch_jt_direct32"))
+        );
+
+        // Re-defining the home must purge both the clobber flag and its cause.
+        cg.note_home_written(7);
+        assert!(!cg.home_clobbered.contains(&7));
+        assert!(!cg.home_clobber_cause.contains_key(&7));
+    }
+
+    #[test]
+    fn unproved_tables_keep_the_default_bounds_branch() {
+        for (bound, ty, minimum) in [
+            (None, IrType::I32, 0),
+            (Some((32, 16)), IrType::I32, 0),
+            (Some((32, 0x8000_0000)), IrType::I32, 0),
+            (Some((8, 15)), IrType::I32, 0),
+            (Some((32, 15)), IrType::I64, 0),
+            (Some((64, u64::MAX)), IrType::U64, 0),
+            (Some((32, 15)), IrType::I32, 1),
+        ] {
+            for pic in [false, true] {
+                let out = emit(bound, ty, minimum, pic, false);
+                assert!(out.contains("cmpq $16, %rax"), "{out}");
+                assert!(out.contains("jae .LBB99"), "{out}");
+                if minimum != 0 {
+                    assert!(out.contains("subq $1, %rax"), "{out}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod signed_result_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn accumulator_stores_share_the_canonical_signed_home_contract() {
+        for eax_entry in [false, true] {
+            for ty in [IrType::I32, IrType::U32, IrType::I64] {
+                for wide_consumer in [false, true] {
+                    let mut cg = X86Codegen::new();
+                    // A pointer-width use deliberately widens the storage
+                    // map, but must not erase the producer's signed type.
+                    cg.value_types
+                        .insert(9, if wide_consumer { IrType::Ptr } else { ty });
+                    if ty == IrType::I32 {
+                        cg.signed_i32_defs.insert(9);
+                    }
+                    cg.reg_assignments.insert(9, PhysReg(1));
+                    cg.state.value_use_counts = vec![1; 10];
+                    cg.skip_i32_sext = !wide_consumer;
+                    if wide_consumer {
+                        cg.needs_sext_values.insert(9);
+                    }
+                    if eax_entry {
+                        cg.store_eax_to(&Value(9));
+                    } else {
+                        cg.store_rax_to(&Value(9));
+                    }
+                    let out = &cg.state.out.buf;
+                    assert_eq!(
+                        out.contains("movslq"),
+                        ty == IrType::I32 && wide_consumer,
+                        "{out}"
+                    );
+                    assert!(out.contains("movq %rax, %rbx"), "{out}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_signed_memory_updates_refresh_the_upper_half() {
+        use crate::backend::state::StackSlot;
+        for wide_consumer in [false, true] {
+            let mut cg = X86Codegen::new();
+            cg.state.value_use_counts = vec![1; 10];
+            cg.state.value_locations.insert(1, StackSlot(-8));
+            cg.state.value_locations.insert(9, StackSlot(-8));
+            cg.reg_assignments.insert(2, PhysReg(1));
+            cg.signed_i32_defs.insert(9);
+            cg.skip_i32_sext = !wide_consumer;
+            if wide_consumer {
+                cg.needs_sext_values.insert(9);
+            }
+            cg.emit_int_binop_impl(
+                &Value(9),
+                IrBinOp::Add,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+            );
+            let out = &cg.state.out.buf;
+            assert_eq!(out.contains("addl %ebx, -8(%rbp)"), !wide_consumer, "{out}");
+            assert_eq!(out.contains("movslq"), wide_consumer, "{out}");
+            if wide_consumer {
+                assert!(out.contains("movq %rax, -8(%rbp)"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn signed_i32_wide_consumers_keep_the_def_side_extension() {
+        let needed: FxHashSet<u32> = [9].into_iter().collect();
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            for op in [IrBinOp::Add, IrBinOp::Sub, IrBinOp::Mul, IrBinOp::Shl] {
+                let inst = Instruction::BinOp {
+                    dest: Value(9),
+                    op,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty,
+                };
+                assert_eq!(
+                    machinst_result_needs_sext(&inst, &needed),
+                    ty == IrType::I32
+                );
+                assert!(!machinst_result_needs_sext(&inst, &FxHashSet::default()));
+            }
+            let load = Instruction::Load {
+                dest: Value(9),
+                ptr: Value(1),
+                ty,
+                seg_override: Default::default(),
+                volatile: false,
+            };
+            assert_eq!(
+                machinst_result_needs_sext(&load, &needed),
+                ty == IrType::I32
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scalar_sse1_bridge_tests {
+    use super::X86Codegen;
+
+    #[test]
+    fn scalar_bit_bridges_preserve_width_flags_and_cfa() {
+        for sse2 in [false, true] {
+            for f32ish in [false, true] {
+                for omit_frame_pointer in [false, true] {
+                    let mut cg = X86Codegen::new();
+                    cg.isa.simd = sse2;
+                    cg.state.emit_cfi = true;
+                    cg.state.omit_frame_pointer = omit_frame_pointer;
+                    cg.emit_scalar_gpr_to_xmm("rax", "eax", "xmm2", f32ish);
+                    cg.emit_scalar_xmm_to_gpr("xmm2", "rax", f32ish.then_some("eax"));
+                    let out = &cg.state.out.buf;
+                    if sse2 {
+                        let op = if f32ish { "movd" } else { "movq" };
+                        let reg = if f32ish { "eax" } else { "rax" };
+                        assert!(out.contains(&format!("{op} %{reg}, %xmm2")), "{out}");
+                        assert!(out.contains(&format!("{op} %xmm2, %{reg}")), "{out}");
+                        assert!(!out.contains("%rsp"), "{out}");
+                    } else {
+                        let op = if f32ish { "movss" } else { "movlps" };
+                        assert!(out.contains(&format!("{op} (%rsp), %xmm2")), "{out}");
+                        assert!(out.contains(&format!("{op} %xmm2, (%rsp)")), "{out}");
+                        assert!(
+                            out.contains(if f32ish {
+                                "movl (%rsp), %eax"
+                            } else {
+                                "movq (%rsp), %rax"
+                            }),
+                            "{out}"
+                        );
+                        assert_eq!(out.matches("leaq 8(%rsp), %rsp").count(), 2, "{out}");
+                        // ADD/SUB would destroy a pending comparison's flags.
+                        assert!(!out.contains("addq") && !out.contains("subq"), "{out}");
+                    }
+                    // CFI is cfi_synth's job, after the peephole.
+                    assert!(!out.contains(".cfi_"), "{out}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod target_feature_isa_tests {
+    use super::*;
+
+    /// The scalar extensions `set_function_target_features` derives for a
+    /// function with the options `names` in a TU whose selection is `tu`
+    /// (no vector ISA, so only the scalar fold is observed).
+    fn scalar(tu: ScalarIsa, names: &[&str]) -> ScalarIsa {
+        let features: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+        let none = super::super::super::isa::X86Isa::from_feature_bits(0);
+        ScalarIsa::of(function_feature_set(0, none, tu, false, false, &features))
+    }
+
+    #[test]
+    fn arch_entries_replace_the_scalar_selection() {
+        let haswell = ScalarIsa {
+            bmi1: true,
+            bmi2: true,
+            lzcnt: true,
+            popcnt: true,
+        };
+        let none = ScalarIsa::default();
+        // GCC 16.2: `target("arch=x86-64")` under `-march=haswell` is the
+        // baseline path of a dispatch; it keeps none of the TU's extensions.
+        assert_eq!(scalar(haswell, &["arch=x86-64"]), none);
+        assert_eq!(
+            scalar(haswell, &["arch=x86-64-v2"]),
+            ScalarIsa {
+                popcnt: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            scalar(haswell, &["arch=x86-64", "bmi2"]),
+            ScalarIsa { bmi2: true, ..none }
+        );
+        assert_eq!(scalar(none, &["arch=haswell"]), haswell);
+        // Without `arch=` the TU's selection stays; denials still apply.
+        assert_eq!(
+            scalar(haswell, &["no-bmi2"]),
+            ScalarIsa {
+                bmi2: false,
+                ..haswell
+            }
+        );
+        // GCC 16.2 defines `__POPCNT__` for `-msse4.2`.
+        assert_eq!(
+            scalar(none, &["sse4.2"]),
+            ScalarIsa {
+                popcnt: true,
+                ..none
+            }
+        );
+        // `abm` grants POPCNT and brings LZCNT; `no-abm` takes neither away
+        // (GCC 16.2 `-march=haswell`, `target("no-abm")`: both macros stay).
+        assert_eq!(
+            scalar(none, &["abm"]),
+            ScalarIsa {
+                lzcnt: true,
+                popcnt: true,
+                ..none
+            }
+        );
+        assert_eq!(scalar(haswell, &["no-abm"]), haswell);
+        assert_eq!(
+            scalar(none, &["abm", "no-lzcnt"]),
+            ScalarIsa {
+                popcnt: true,
+                ..none
+            }
+        );
+    }
+}

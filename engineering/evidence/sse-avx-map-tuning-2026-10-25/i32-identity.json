@@ -1,0 +1,20 @@
+{
+  "sse2": {
+    "gzip_assembly_identical": true,
+    "gzip_sha256": "283e9999efd803078238927b54fb7eec22f1da0e2b6224c8afc84f45367640ce",
+    "regenerated_measured_elf_identical": true,
+    "elf_sha256": "06bebe87a4c963be79fe25d46c0c77a385158cf70468fc4da81c5faabfa165ed"
+  },
+  "sse41": {
+    "gzip_assembly_identical": true,
+    "gzip_sha256": "283e9999efd803078238927b54fb7eec22f1da0e2b6224c8afc84f45367640ce",
+    "regenerated_measured_elf_identical": true,
+    "elf_sha256": "86d6625de9228c8b0b39bb6f419bab4d9c212ca799b64e94d5713944d23496cc"
+  },
+  "avx2": {
+    "gzip_assembly_identical": true,
+    "gzip_sha256": "2b3a27a17fa472de98586650db21be263ffe24f4224e6fad9e0cb3e99c3b2340",
+    "regenerated_measured_elf_identical": true,
+    "elf_sha256": "148d8a0c5e299353327cedc9cc6d580232111139f6aadb0a099a9e047d55223c"
+  }
+}

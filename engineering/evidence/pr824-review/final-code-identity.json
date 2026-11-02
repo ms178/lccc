@@ -1,0 +1,231 @@
+{
+  "compiler_sha256": "51f966cce0443415e87b8735b5e7646d9e7d9a88e9ed41362fcc7ef23f71d5ca",
+  "note": "UTF-8 parser hardening changes the compiler binary but all 45 emitted bounded workload ELFs remain byte-identical to the measured candidate. Raw manifests retain their original compiler fingerprints.",
+  "rows": [
+    {
+      "name": "arith_loop",
+      "generated_elf_sha256": "ebb7f23770c63bfc6ffba32b939674ecbc2726c7e7ca5f85f1ba44d31f6ea0a0",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "fib",
+      "generated_elf_sha256": "aa30fd92b1725f29b725d7bac6abb570a79fd8f371a308d0897c2f8ba6eb897f",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "matmul",
+      "generated_elf_sha256": "ba931f71025625ae83ac8b18af0589ce6a3fb5d1412d4a8227fdcd8e9cbf531f",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "qsort",
+      "generated_elf_sha256": "5c2213c4e54fda28c57681566c5880a6ee1415e8ea8e00dff0126eb55c31136b",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "sieve",
+      "generated_elf_sha256": "eb601b302b8e0be792fa16558d875b4988167d22cc4cf7ec240f9eda1a4fdc9e",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "tce_sum",
+      "generated_elf_sha256": "7ec5911e34b49b0391296f53de640ff2a14c0f46e5ebf601a0b8944d0195f0fb",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "nbody",
+      "generated_elf_sha256": "33084debf4f300a4eaa332b9c99b067e80be8b7a817861381347c643050d1cde",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "binary_trees",
+      "generated_elf_sha256": "e6566a24102b8828dd9c2f2d50e95c4d5763f1c4c16008d519dece79db72af48",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "spectral_norm",
+      "generated_elf_sha256": "a316079b106dcc8e450cc4c71dfd04e2978a1cb59c815581146c9dadceb70dcc",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "mandelbrot",
+      "generated_elf_sha256": "c36f1ea9d627a9034140dffb7ca7ceeb75a4767a8aa5e607ec3819f9a63649f7",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "hash_table",
+      "generated_elf_sha256": "73eda8bd81a3df36b607898efb658779020c9ae5f499dea375879793d3607e5d",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "strlen_bench",
+      "generated_elf_sha256": "118e186a46610f9d4c09fb1d0a40e909a7d33f8500fe4ea4b2392ac5a4496a75",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "switch_dispatch",
+      "generated_elf_sha256": "edc72861526c1a6fb74a984fadf62ba722ff40548dc0a414905c639f28e702a9",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "struct_copy",
+      "generated_elf_sha256": "fc4545924f34a2938eebaaa3233d851dacf8e9a0933ef4b83d1b397bca776513",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "loop_patterns",
+      "generated_elf_sha256": "4a15c2c42ded4790c0ead57e2f744c27dbb2a974454096701dae8bb6bb57f0df",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "fannkuch",
+      "generated_elf_sha256": "0ee9bf562558c79ae9db495e422f47ff194f3f70891b582d767cd9e1afe7c7cd",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "ackermann",
+      "generated_elf_sha256": "09118b55935a07dbaa4b45596ccb0989a89ec9c2b95d7fb738d88e19104757d2",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "constant_recursion",
+      "generated_elf_sha256": "92de3c475fb377c388c3de53bd0efc6140bb955bcdb1349c01ebdb46bf9159bc",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "bitops",
+      "generated_elf_sha256": "9b8858ff5d89ce5fe54e53462a7b461f6b0c08b30bb7e9db46b6e9576e44f901",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "double_reduction",
+      "generated_elf_sha256": "60aa9b9792e9ca007978d7dc8857db7956fe32ce1fcc46adb5844ef53d041144",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "ascii_case_fold",
+      "generated_elf_sha256": "db8dfa20def25159ea84f2b63a4200a4146a9b2082bd698f5f1d97be56b3d0d9",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "binary_search",
+      "generated_elf_sha256": "c648370f1c019b3d16d75fb517e4cd442629719b0ec9e5bb3fc1dbb80b43c45b",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "ring_fifo",
+      "generated_elf_sha256": "2cdb66c05d25688eb2129518ebcbf4a34b727757d0e799556fa8ba4720110d98",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "generated_elf_sha256": "a6566b711e72bb93e9bf63a176ed562ba1b4b8c0078227ee9cf4de2a51419831",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "histogram",
+      "generated_elf_sha256": "f595a96711c5700b3c438346dc17e202108a4daf3ec66af55049307c1c3985f9",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "gzip_crc32",
+      "generated_elf_sha256": "1f71579b8e4dd81df21f2e3595eddcbd6d90b1e0ecfb94f1d32f3f6580dd80a0",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "libm_round_family",
+      "generated_elf_sha256": "5fb61b1c4e47f9c28e87211a1fce420fd10eab80bbf8ca4221f96e04aec70cb2",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "tls_seg_access",
+      "generated_elf_sha256": "8887cf77cd78af1793ea81bfc2c614a105fecbbe25b2fda0ac2bed41532105d8",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "percpu_ptr_walk",
+      "generated_elf_sha256": "76130ec334f850e2bb6d4b97da872549fe8ef1ad80be02937eccedd22d0e51fe",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "byte_load_reassembly",
+      "generated_elf_sha256": "174009d334d2ac982e67180f3134e51ddeb76b55e8f512d82c2036e394a2cd2a",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "generated_elf_sha256": "767d15e54521dba5f5c73637a6860c78e5c2d8244a122886b538532d039ddc8b",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "generated_elf_sha256": "d8e25ca24efda2e868ea92ed3d5e105f619f1e70cbf784d6c1b7c4c1d9888c40",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "expat_xml_scan",
+      "generated_elf_sha256": "4614339dd0a8c25448fcf5c1bad3bb858ff59c8e47054df6a89ed971499756de",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "expat_siphash24",
+      "generated_elf_sha256": "adf2e7ddc4de7149e9086c848cfb6172eb39e1e70562d4602688e77460f1aa07",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "sqlite_varint",
+      "generated_elf_sha256": "c61d5e52e52347c91d5401d661b23a4840038afdb09967429b9738eeb0b7eadc",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "linux_find_bit",
+      "generated_elf_sha256": "d15b246c2f76dcdb68144f9aa3d07beaddfebbe134e05f497bd6b6331402e6dd",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "generated_elf_sha256": "c720f52218dbd87eeba4643dd8f34aa737cfc0d785a8719e607ffa45ca9965e8",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "glibc_memcmp",
+      "generated_elf_sha256": "8684cf0f940b6daec1aefc62991bc4277561cbbe4fd98b08ef6664c3f56a5bc7",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "chacha20_block",
+      "generated_elf_sha256": "84ec0f80fcf59b689c03945460c6b44a43655b22d727a5c2cc3e39fb040d98b8",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "sha256_transform",
+      "generated_elf_sha256": "36994b633fbfb41166a59821735156880f019e14b638df81643d119c02467602",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "linux_rbtree",
+      "generated_elf_sha256": "003c47d231b2153f30759d707b8cd36777fdc44a4f278fb0f32dbbb93c604d25",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "zstd_count",
+      "generated_elf_sha256": "8fdf2e9299890a5ebf1c261ced0bfd84c816db969c771292ec539e8983a71809",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "lz4_compress",
+      "generated_elf_sha256": "ec32237af2914620bf33d1e7439725debe26db521b7de1fe4eb97758cbc1f158",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "lz4_match_extend",
+      "generated_elf_sha256": "5de41369ddd5aa12e813b8083934c3aee62cddab264dcc9b04a4d0c166a23016",
+      "matches_measured_elf": true
+    },
+    {
+      "name": "glibc_strstr",
+      "generated_elf_sha256": "218fb31f34100932f443106e1a3fa285aae7374c33b39066979e1f8a2e7388a2",
+      "matches_measured_elf": true
+    }
+  ]
+}

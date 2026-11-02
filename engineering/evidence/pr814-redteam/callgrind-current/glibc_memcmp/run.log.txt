@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| glibc_memcmp | 691892 | 722848 | 1.04474 | 1365/1365 | 25349/25302 | 4951/4969 | 3367/3475 | 232/239 |
+geomean simulated Ir mine/ref = 1.0447410867592053 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/glibc_memcmp/manifest.json

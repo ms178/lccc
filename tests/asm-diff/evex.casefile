@@ -1,0 +1,377 @@
+;;; evex_dest
+.text
+vpshufd $1, %zmm2, %zmm3
+vpshufd $1, %zmm2, %zmm0
+vpermq $0xe4, %zmm2, %zmm3
+vpternlogd $0xaa, %zmm2, %zmm1, %zmm3
+vpalignr $1, %zmm2, %zmm1, %zmm3
+vpabsd %zmm2, %zmm3
+vpslld $4, %zmm2, %zmm3
+vpbroadcastd %eax, %zmm3
+vpbroadcastd %xmm2, %zmm3
+vinserti32x4 $1, %xmm2, %zmm1, %zmm3
+vextracti32x4 $1, %zmm3, %xmm2
+;;; evex_disp
+.text
+vpxord 64(%rdi), %zmm0, %zmm1
+vpxord 64(%rdi), %xmm0, %xmm1
+vpxord %xmm2, %xmm1, %xmm3
+vpaddd 64(%rdi), %zmm0, %zmm1
+vpbroadcastd 4(%rdi), %zmm1
+vbroadcasti32x4 16(%rdi), %zmm1
+vbroadcasti32x4 (%rdi), %zmm1
+;;; evex_high
+.text
+vaddps %xmm16, %xmm0, %xmm1
+vaddps %xmm0, %xmm16, %xmm1
+vaddps %xmm0, %xmm1, %xmm31
+vpaddd %ymm16, %ymm1, %ymm2
+vpaddd %zmm16, %zmm1, %zmm2
+vmovdqu64 %zmm16, %zmm17
+vandps %xmm16, %xmm0, %xmm1
+vaddss %xmm16, %xmm0, %xmm1
+vmovaps %xmm16, %xmm1
+vpaddd %xmm16, %xmm0, %xmm1
+;;; vphminposuw_xmm
+.text
+vphminposuw %xmm0, %xmm1
+vphminposuw (%rdi), %xmm2
+;;; vphminposuw_ymm reject
+.text
+vphminposuw %ymm0, %ymm1
+;;; vpxor_xmm16 reject
+.text
+vpxor %xmm16, %xmm0, %xmm1
+;;; vmovdqa_xmm16 reject
+.text
+vmovdqa %xmm16, %xmm1
+;;; evex_tuple_sae
+.text
+vpmovzxbw 32(%rdi), %zmm1
+vpmovzxbd 16(%rdi), %zmm1
+vpmovzxbq 8(%rdi), %zmm1
+vpmovzxwd 32(%rdi), %zmm1
+vpmovzxwq 16(%rdi), %zmm1
+vpmovzxdq 32(%rdi), %zmm1
+vpmovsxbw 32(%rdi), %zmm1
+vpabsb 64(%rdi), %zmm1
+vpcmpd $1, (%rdi), %zmm2, %k1
+vpcmpd $1, %zmm1, %zmm2, %k1
+vpcmpb $1, 64(%rdi), %zmm2, %k3
+vpshufbitqmb (%rdi), %zmm2, %k1
+vprold $1, (%rdi), %zmm1
+vprorq $7, 64(%rsi), %zmm3
+vaddps (%rdi){1to16}, %zmm1, %zmm2
+vaddps {rn-sae}, %zmm1, %zmm2, %zmm3
+vaddps {rd-sae}, %zmm1, %zmm2, %zmm3
+vaddps {ru-sae}, %zmm1, %zmm2, %zmm3
+vaddps {rz-sae}, %zmm1, %zmm2, %zmm3
+vmaxps {sae}, %zmm1, %zmm2, %zmm3
+vcmpps $0, {sae}, %zmm1, %zmm2, %k1
+vpaddd (%rdi){1to16}, %zmm1, %zmm2
+vpxord (%rdi){1to16}, %zmm1, %zmm2
+vfmadd132ps {rn-sae}, %zmm1, %zmm2, %zmm3
+vsqrtps {rn-sae}, %zmm1, %zmm2
+vcvtps2dq {rz-sae}, %zmm1, %zmm2
+vaddps 4(%rdi){1to16}, %zmm1, %zmm2
+vaddps (%rdi){1to8}, %ymm1, %ymm2
+vextracti32x4 $1, %zmm1, (%rdi)
+vextracti32x4 $1, %zmm1, 16(%rdi)
+vcmpps $0, %zmm1, %zmm2, %k1
+vcmpps $0, (%rdi), %zmm2, %k1
+vpmovzxbw 32(%rdi), %zmm1{%k1}{z}
+vpaddd (%rdi){1to16}, %zmm1, %zmm2{%k1}{z}
+;;; kmov_all
+.text
+kmovb %k1, %k2
+kmovw %k1, %k2
+kmovd %k1, %k2
+kmovq %k1, %k2
+kmovb %k1, (%rax)
+kmovw %k1, (%rax)
+kmovd %k1, (%rax)
+kmovq %k1, (%rax)
+kmovb (%rax), %k2
+kmovw (%rax), %k2
+kmovd (%rax), %k2
+kmovq (%rax), %k2
+kmovq %r8, %k1
+kmovq %k1, %r15
+kmovd %r8d, %k1
+kmovd %k1, %r15d
+kmovw %r8d, %k1
+kmovb %k1, %r15d
+;;; kopmask_logic
+.text
+kaddb %k1, %k2, %k0
+kaddw %k1, %k2, %k0
+kaddd %k1, %k2, %k0
+kaddq %k1, %k2, %k0
+kandb %k1, %k2, %k0
+kandw %k1, %k2, %k0
+kandd %k1, %k2, %k0
+kandq %k1, %k2, %k0
+kandnb %k1, %k2, %k0
+kandnw %k1, %k2, %k0
+kandnd %k1, %k2, %k0
+kandnq %k1, %k2, %k0
+korb %k1, %k2, %k0
+korw %k1, %k2, %k0
+kord %k1, %k2, %k0
+korq %k1, %k2, %k0
+kxnorb %k1, %k2, %k0
+kxnorw %k1, %k2, %k0
+kxnord %k1, %k2, %k0
+kxnorq %k1, %k2, %k0
+kxorb %k1, %k2, %k0
+kxorw %k1, %k2, %k0
+kxord %k1, %k2, %k0
+kxorq %k1, %k2, %k0
+kunpckbw %k1, %k2, %k0
+kunpckwd %k1, %k2, %k0
+kunpckdq %k1, %k2, %k0
+;;; kopmask_test
+.text
+knotb %k1, %k2
+knotw %k1, %k2
+knotd %k1, %k2
+knotq %k1, %k2
+kortestb %k1, %k2
+kortestw %k1, %k2
+kortestd %k1, %k2
+kortestq %k1, %k2
+ktestb %k1, %k2
+ktestw %k1, %k2
+ktestd %k1, %k2
+ktestq %k1, %k2
+;;; kshift
+.text
+kshiftlb $3, %k6, %k5
+kshiftrb $3, %k6, %k5
+kshiftlw $3, %k6, %k5
+kshiftrw $3, %k6, %k5
+kshiftld $3, %k6, %k5
+kshiftrd $3, %k6, %k5
+kshiftlq $3, %k6, %k5
+kshiftrq $3, %k6, %k5
+;;; kmov_bad_gpr reject
+.text
+kmovb %k1, %xmm2
+;;; kmov_bad_size reject
+.text
+kmovd %k1, %rax
+;;; kopmask_bad_reg reject
+.text
+kaddb %eax, %k2, %k0
+;;; fma_addsub
+.text
+vfmaddsub132pd %zmm4, %zmm5, %zmm6
+vfmaddsub132ps %zmm4, %zmm5, %zmm6
+vfmaddsub213pd %zmm4, %zmm5, %zmm6
+vfmaddsub213ps %zmm4, %zmm5, %zmm6
+vfmaddsub231pd %zmm4, %zmm5, %zmm6
+vfmaddsub231ps %zmm4, %zmm5, %zmm6
+vfmsubadd132pd %zmm4, %zmm5, %zmm6
+vfmsubadd132ps %zmm4, %zmm5, %zmm6
+vfmsubadd213pd %zmm4, %zmm5, %zmm6
+vfmsubadd213ps %zmm4, %zmm5, %zmm6
+vfmsubadd231pd %zmm4, %zmm5, %zmm6
+vfmsubadd231ps %zmm4, %zmm5, %zmm6
+;;; cvt_usi
+.text
+vcvtsd2usi %xmm0, %eax
+vcvtsd2usi %xmm0, %rax
+vcvtsd2usi (%rax), %eax
+vcvtsd2usi (%rax), %rax
+vcvtss2usi %xmm0, %eax
+vcvtss2usi %xmm0, %rax
+vcvtss2usi (%rax), %eax
+vcvtss2usi (%rax), %rax
+vcvttsd2usi %xmm0, %eax
+vcvttsd2usi %xmm0, %rax
+vcvttsd2usi (%rax), %eax
+vcvttsd2usi (%rax), %rax
+vcvttss2usi %xmm0, %eax
+vcvttss2usi %xmm0, %rax
+vcvttss2usi (%rax), %eax
+vcvttss2usi (%rax), %rax
+vcvtusi2sdl %eax, %xmm1, %xmm2
+vcvtusi2sdl (%rax), %xmm1, %xmm2
+vcvtusi2sdq %rax, %xmm1, %xmm2
+vcvtusi2sdq (%rax), %xmm1, %xmm2
+vcvtusi2ssl %eax, %xmm1, %xmm2
+vcvtusi2ssl (%rax), %xmm1, %xmm2
+vcvtusi2ssq %rax, %xmm1, %xmm2
+vcvtusi2ssq (%rax), %xmm1, %xmm2
+vcvtusi2sd %eax, %xmm1, %xmm2
+vcvtusi2sd %rax, %xmm1, %xmm2
+vcvtusi2sd (%rax), %xmm1, %xmm2
+vcvtusi2ss %eax, %xmm1, %xmm2
+vcvtusi2ss %rax, %xmm1, %xmm2
+vcvtusi2ss (%rax), %xmm1, %xmm2
+;;; vpermil
+.text
+vpermilpd $0xab, %zmm5, %zmm6
+vpermilpd $0xab, (%rax), %zmm6
+vpermilpd $0xab, %zmm5, %zmm6{%k7}
+vpermilpd $0xab, %zmm5, %zmm6{%k7}{z}
+vpermilpd $0xab, %ymm5, %ymm6{%k7}
+vpermilps $0xab, %zmm5, %zmm6
+vpermilps $0xab, (%rax), %zmm6
+vpermilps $0xab, %zmm5, %zmm6{%k7}
+vpermilps $0xab, %zmm5, %zmm6{%k7}{z}
+vpermilps $0xab, %ymm5, %ymm6{%k7}
+vpermilpd $0xab, (%rax){1to8}, %zmm6
+vpermilps $0xab, (%rax){1to16}, %zmm6
+;;; vpconflict
+.text
+vpconflictd %zmm5, %zmm6
+vpconflictd (%rax), %zmm6
+vpconflictd %zmm5, %zmm6{%k7}
+vpconflictd %zmm5, %zmm6{%k7}{z}
+vpconflictd (%rax){1to16}, %zmm6
+vpconflictq %zmm5, %zmm6
+vpconflictq (%rax), %zmm6
+vpconflictq %zmm5, %zmm6{%k7}
+vpconflictq %zmm5, %zmm6{%k7}{z}
+vpconflictq (%rax){1to8}, %zmm6
+;;; shift_count
+.text
+vpsllw %xmm4, %zmm5, %zmm6
+vpsllw (%rax), %zmm5, %zmm6
+vpslld %xmm4, %zmm5, %zmm6
+vpslld (%rax), %zmm5, %zmm6
+vpsllq %xmm4, %zmm5, %zmm6
+vpsllq (%rax), %zmm5, %zmm6
+vpsraw %xmm4, %zmm5, %zmm6
+vpsraw (%rax), %zmm5, %zmm6
+vpsrad %xmm4, %zmm5, %zmm6
+vpsrad (%rax), %zmm5, %zmm6
+vpsraq %xmm4, %zmm5, %zmm6
+vpsraq (%rax), %zmm5, %zmm6
+vpsrlw %xmm4, %zmm5, %zmm6
+vpsrlw (%rax), %zmm5, %zmm6
+vpsrld %xmm4, %zmm5, %zmm6
+vpsrld (%rax), %zmm5, %zmm6
+vpsrlq %xmm4, %zmm5, %zmm6
+vpsrlq (%rax), %zmm5, %zmm6
+vpsllw %xmm4, %zmm5, %zmm6{%k7}
+vpsllw %xmm4, %zmm5, %zmm6{%k7}{z}
+vpsraw (%rax), %zmm5, %zmm6{%k2}
+vpsrlq %xmm4, %ymm5, %ymm6{%k1}
+vpsllw %xmm4, %xmm5, %xmm6{%k1}
+vpsllw (%rax), %xmm5, %xmm6{%k1}
+;;; cmp_k_dest_mask
+.text
+vcmppd $0xab, %xmm4, %xmm5, %k5{%k7}
+vcmpps $0xab, %ymm4, %ymm5, %k5{%k7}
+vpcmpb $0xab, %xmm5, %xmm6, %k5{%k7}
+vpcmpd $0xab, %ymm5, %ymm6, %k5{%k7}
+vpcmpeqb %xmm5, %xmm6, %k5{%k7}
+vpcmpeqd %ymm5, %ymm6, %k5{%k7}
+vpcmpeqq %xmm5, %xmm6, %k5{%k7}
+vpcmpgtb %ymm5, %ymm6, %k5{%k7}
+vpcmpgtw %xmm5, %xmm6, %k5{%k7}
+vpshufbitqmb %ymm4, %ymm5, %k5{%k7}
+;;; rotate_mask_zero
+.text
+vprold $0xab, %xmm5, %xmm6{%k7}
+vprold $0xab, %ymm5, %ymm6{%k7}{z}
+vprolq $0xab, %zmm5, %zmm6{%k7}{z}
+vprord $0xab, %xmm29, %xmm30{%k7}{z}
+vprorq $0xab, %ymm5, %ymm6{%k7}
+;;; insert_ymm_src_max_ll
+.text
+vinserti32x8 $0xab, %ymm28, %zmm29, %zmm30{%k7}{z}
+vinserti32x8 $0xab, %ymm4, %zmm5, %zmm6{%k7}
+vinserti64x4 $0xab, %ymm28, %zmm29, %zmm30{%k7}
+vinserti64x4 $0xab, %ymm4, %zmm5, %zmm6{%k7}{z}
+;;; evex_gather_matrix
+.text
+vgatherdps (%rdi,%ymm1,4), %ymm3 {%k1}
+vgatherdps (%rdi,%zmm1,4), %zmm3 {%k1}
+vgatherdpd (%rdi,%xmm1,4), %ymm3 {%k1}
+vgatherdpd (%rdi,%ymm1,4), %zmm3 {%k1}
+vgatherqps (%rdi,%ymm1,4), %xmm3 {%k1}
+vgatherqps (%rdi,%zmm1,4), %ymm3 {%k1}
+vgatherqpd (%rdi,%ymm1,4), %ymm3 {%k1}
+vpgatherdd (%rdi,%xmm1,4), %xmm3 {%k1}
+vpgatherdq (%rdi,%ymm1,4), %zmm3 {%k1}
+vpgatherqd (%rdi,%zmm1,4), %ymm3 {%k1}
+vpgatherqq (%rdi,%zmm1,4), %zmm3 {%k1}
+vgatherdps 8(%r13,%zmm17,4), %zmm29 {%k3}
+vgatherdps 64(%rdi,%ymm1,4), %ymm3 {%k1}
+vgatherdps 128(%rdi,%zmm1,4), %zmm3 {%k1}
+vgatherdpd 64(%rdi,%ymm1,4), %zmm3 {%k1}
+vgatherqps 32(%rdi,%ymm1,4), %xmm3 {%k1}
+vpgatherqq 0x298(,%zmm4,1), %zmm6 {%k7}
+
+;;; evex_gpr_rm_egpr — GPR r/m >= r16 in EVEX mod=3 uses rex2.B (P0 bit3,
+;;; SET, non-inverted) — NOT the vector X bit (P0 bit6 inverted). GAS 2.47
+;;; build_apx_evex_prefix/binutils OP_EX; the vector bit mis-encodes %r21
+;;; as %rbp and %r20d as %esp (silent register corruption).
+vcvtsi2sdq %r21, %xmm29, %xmm30
+vcvtsi2sdq %r29, %xmm29, %xmm30
+vcvtsi2sdq %r16, %xmm1, %xmm2
+vcvtsi2sdq %r31, %xmm16, %xmm17
+vcvtsi2ssq %r25, %xmm1, %xmm2
+vcvtsi2sdl %r20d, %xmm1, %xmm2
+vcvtsi2ssl %r30d, %xmm3, %xmm4
+vextractps $1, %xmm16, %r20d
+vextractps $0, %xmm20, %r16d
+vextractps $3, %xmm31, %r31
+vpextrd $1, %xmm20, %r21d
+vpextrd $2, %xmm16, %r16d
+vpextrq $1, %xmm3, %r22
+vpextrq $3, %xmm31, %r31
+vpinsrd $1, %r22d, %xmm3, %xmm4
+vpinsrd $0, %r16d, %xmm16, %xmm17
+vpinsrq $1, %r22, %xmm3, %xmm4
+vpinsrq $2, %r31, %xmm1, %xmm2
+vmovd %r22d, %xmm3
+vmovd %xmm3, %r22d
+vmovd %r16d, %xmm16
+vmovq %r20, %xmm21
+vmovq %xmm21, %r20
+vmovq %r31, %xmm31
+vpbroadcastd %r21d, %zmm5
+vpbroadcastq %r31, %zmm5
+vpbroadcastq %r20, %ymm6
+vcvtsd2si %xmm29, %r21
+vcvtss2si %xmm16, %r16
+vcvttsd2si %xmm31, %r31
+vcvtsd2siq %xmm16, %r20
+vcvttss2si %xmm20, %r21d
+vcvtsd2usi %xmm29, %r21
+vcvtusi2sdq %r21, %xmm29, %xmm30
+vcvtusi2ssl %r20d, %xmm1, %xmm2
+;;; evex_gpr_rm_r8_15 — control: GPR r/m r8-r15 uses only B3 (P0 bit5)
+vcvtsi2sdq %r9, %xmm1, %xmm2
+vcvtsi2sd %r13d, %xmm1, %xmm2
+vpextrq $1, %xmm3, %r15
+vpinsrq $1, %r8, %xmm3, %xmm4
+vmovq %r14, %xmm15
+vpbroadcastq %r9, %ymm6
+vcvtsi2sdq %r15, %xmm15, %xmm14
+;;; evex_vmovddup_tuple — vmovddup memory tuple: xmm is Tuple1 m64 (N=8),
+;;; ymm/zmm are Full (N=32/64). GAS 2.47: -1024(%rdx) = disp8 0x80 (xmm),
+;;; 0xe0 (ymm); 128(%rdx) xmm{k} = disp8 0x10.
+vmovddup -1024(%rdx), %xmm30
+vmovddup 1016(%rdx), %xmm30
+vmovddup 128(%rdx), %xmm1{%k7}
+vmovddup 8(%rdx), %xmm1{%k7}
+vmovddup -8(%rdx), %xmm1{%k7}
+vmovddup -1024(%rdx), %ymm30
+vmovddup 32(%rdx), %ymm1{%k7}
+vmovddup 64(%rdx), %ymm1{%k7}
+vmovddup 16(%rdx), %ymm1{%k7}
+vmovddup -1024(%rdx), %ymm1{%k7}{z}
+vmovddup 64(%rdx), %zmm1
+vmovddup 576(%rdx), %zmm1{%k1}
+vmovddup -1024(%edx), %xmm6{%k7}
+vmovddup (%rdx), %xmm30
+vmovddup (%rdx), %ymm30{%k3}
+;;; evex_vmovddup_rejects reject
+vmovddup 16(%rdx), %xmm1{1to8}
+;;; enclv_opcode — ENCLV is 0F 01 C0; 0F 01 E0 is SMSW %eax
+enclv

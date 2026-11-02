@@ -1,0 +1,20 @@
+FAIL clzero: got reads=0 writes=0 full=0; expected minimum reads=1 writes=0 full=0
+FAIL rdpru: got reads=0 writes=0 full=0; expected minimum reads=2 writes=5 full=5
+FAIL rdpkru: got reads=2 writes=1 full=1; expected minimum reads=2 writes=5 full=5
+FAIL ins: got reads=4 writes=128 full=128; expected minimum reads=132 writes=128 full=128
+FAIL insb: got reads=4 writes=128 full=128; expected minimum reads=132 writes=128 full=128
+FAIL insw: got reads=4 writes=128 full=128; expected minimum reads=132 writes=128 full=128
+FAIL insl: got reads=4 writes=128 full=128; expected minimum reads=132 writes=128 full=128
+FAIL rep insl: got reads=6 writes=130 full=130; expected minimum reads=134 writes=130 full=130
+FAIL mwaitx: got reads=3 writes=0 full=0; expected minimum reads=11 writes=0 full=0
+FAIL enter $8, $0: got reads=0 writes=48 full=48; expected minimum reads=48 writes=48 full=48
+FAIL sysenter: got reads=0 writes=0 full=0; expected minimum reads=0 writes=16 full=16
+FAIL sysexit: got reads=6 writes=0 full=0; expected minimum reads=6 writes=16 full=16
+FAIL sysexitl: got reads=6 writes=0 full=0; expected minimum reads=6 writes=16 full=16
+FAIL sysexitq: got reads=6 writes=0 full=0; expected minimum reads=6 writes=16 full=16
+FAIL mulw %bx: got reads=5 writes=5 full=5; expected minimum reads=1 writes=5 full=0
+FAIL divw %bx: got reads=5 writes=5 full=5; expected minimum reads=5 writes=5 full=0
+FAIL idivw %bx: got reads=5 writes=5 full=5; expected minimum reads=5 writes=5 full=0
+FAIL imulw %bx: got reads=1 writes=5 full=5; expected minimum reads=1 writes=5 full=0
+FAIL popaw: got reads=16 writes=255 full=255; expected minimum reads=16 writes=255 full=16
+19 failures / 23 cases

@@ -1,0 +1,49 @@
+;;; macro_vararg_irp
+.text
+.macro _emit vecs:vararg
+.irp i, \vecs
+	.byte \i
+.endr
+.endm
+	_emit 10, 20, 30
+;;; macro_vararg_kernel_pattern
+.text
+.set VL, 64
+.macro _aesenc_rounds vecs:vararg
+.irp i, \vecs
+	vaesenc %zmm14, %zmm\i, %zmm\i
+.endr
+.endm
+	_aesenc_rounds 0,1,2,3
+.macro _mix a, rest:vararg
+.irp i, \rest
+	vpxord %zmm\i, %zmm\a, %zmm\i
+.endr
+.endm
+	_mix 13, 0, 1
+;;; macro_vararg_forward
+.text
+.macro inner vals:vararg
+.irp v, \vals
+	.long \v
+.endr
+.endm
+.macro outer vals:vararg
+	inner \vals
+.endm
+	outer 7, 8, 9
+;;; macro_vararg_single_and_empty
+.text
+.macro one vecs:vararg
+.irp i, \vecs
+	.byte \i
+.endr
+.endm
+	one 42
+.macro head_and_rest a, rest:vararg
+	.byte \a
+.irp i, \rest
+	.byte \i
+.endr
+.endm
+	head_and_rest 1, 2, 3

@@ -1,0 +1,22 @@
+{
+  "gzip-x86-64": {
+    "assembly_identical": true,
+    "sha256": "283e9999efd803078238927b54fb7eec22f1da0e2b6224c8afc84f45367640ce"
+  },
+  "gzip-x86-64-v3": {
+    "assembly_identical": true,
+    "sha256": "2b3a27a17fa472de98586650db21be263ffe24f4224e6fad9e0cb3e99c3b2340"
+  },
+  "map-x86-64-v2": {
+    "assembly_identical": true,
+    "sha256": "a35fd679e8c968c6d4085d50dbf334305998b0b7a440890a04fc8dfc002c184a"
+  },
+  "map-x86-64-v3": {
+    "assembly_identical": true,
+    "sha256": "9bd0c2d0176c7e0f6844f4cfedb3fa124a03c2a336612d859a6f131a1119eee6"
+  },
+  "benchmark-before": {
+    "no_illegal_pmulld": true,
+    "sha256": "40d7efbb98b95c9de3ce3f5c05c5663b9aaf280c563cd36543230a531f89ba36"
+  }
+}

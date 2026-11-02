@@ -1,0 +1,1464 @@
+{
+ "flags": "-O2 -march=x86-64-v3",
+ "gaps": {
+  "zlib_ng_adler32:main": 264,
+  "nbody:main": 190,
+  "struct_copy:main": 60,
+  "expat_xml_scan:main": 60,
+  "chacha20_block:chacha20_core": 57,
+  "sha256_transform:main": 54,
+  "sqlite_varint:main": 36,
+  "sha256_transform:sha256_transform": 27,
+  "lz4_compress:main": 22,
+  "linux_find_bit:main": 22,
+  "chacha20_block:main": 22,
+  "mandelbrot:main": 8,
+  "gzip_crc32:main": 6,
+  "sqlite_varint:sqlite_get_varint": 6,
+  "expat_xml_scan:expat_utf8_name_length": -8,
+  "spectral_norm:main": -22,
+  "sqlite_varint:sqlite_put_varint": -24
+ },
+ "detail": [
+  {
+   "file": "tests/benchmark/programs/lz4_compress.c",
+   "compilers": {
+    "lccc": {
+     "src_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "dst_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "hash_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "main": {
+      "insns": 314,
+      "loads": 88,
+      "stores": 43,
+      "spills": 81,
+      "branch": 43,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "main": {
+      "insns": 292,
+      "loads": 46,
+      "stores": 25,
+      "spills": 15,
+      "branch": 43,
+      "vector": 51
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 421,
+      "loads": 120,
+      "stores": 17,
+      "spills": 15,
+      "branch": 60,
+      "vector": 20
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 361,
+      "loads": 52,
+      "stores": 34,
+      "spills": 37,
+      "branch": 59,
+      "vector": 3
+     },
+     "src_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "hash_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "dst_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 361,
+      "loads": 55,
+      "stores": 20,
+      "spills": 23,
+      "branch": 55,
+      "vector": 2
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/mandelbrot.c",
+   "compilers": {
+    "lccc": {
+     "main": {
+      "insns": 55,
+      "loads": 6,
+      "stores": 0,
+      "spills": 0,
+      "branch": 9,
+      "vector": 1
+     }
+    },
+    "gcc": {
+     "main": {
+      "insns": 47,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 7,
+      "vector": 6
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 59,
+      "loads": 7,
+      "stores": 0,
+      "spills": 0,
+      "branch": 10,
+      "vector": 4
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 64,
+      "loads": 6,
+      "stores": 1,
+      "spills": 3,
+      "branch": 7,
+      "vector": 3
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 64,
+      "loads": 9,
+      "stores": 1,
+      "spills": 3,
+      "branch": 10,
+      "vector": 9
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/linux_find_bit.c",
+   "compilers": {
+    "lccc": {
+     "linux_bitmap_a": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "linux_bitmap_b": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "linux_find_next_andnot_bit": {
+      "insns": 45,
+      "loads": 5,
+      "stores": 0,
+      "spills": 0,
+      "branch": 7,
+      "vector": 0
+     },
+     "main": {
+      "insns": 106,
+      "loads": 19,
+      "stores": 0,
+      "spills": 0,
+      "branch": 14,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "linux_find_next_andnot_bit.part.0": {
+      "insns": 72,
+      "loads": 9,
+      "stores": 0,
+      "spills": 0,
+      "branch": 6,
+      "vector": 0
+     },
+     "main": {
+      "insns": 84,
+      "loads": 18,
+      "stores": 7,
+      "spills": 15,
+      "branch": 16,
+      "vector": 4
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 118,
+      "loads": 23,
+      "stores": 0,
+      "spills": 0,
+      "branch": 13,
+      "vector": 15
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 205,
+      "loads": 28,
+      "stores": 8,
+      "spills": 11,
+      "branch": 25,
+      "vector": 19
+     },
+     "linux_bitmap_a": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "linux_bitmap_b": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 121,
+      "loads": 28,
+      "stores": 1,
+      "spills": 3,
+      "branch": 12,
+      "vector": 27
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/sha256_transform.c",
+   "compilers": {
+    "lccc": {
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sha256_transform": {
+      "insns": 153,
+      "loads": 30,
+      "stores": 3,
+      "spills": 5,
+      "branch": 9,
+      "vector": 45
+     },
+     "main": {
+      "insns": 148,
+      "loads": 35,
+      "stores": 37,
+      "spills": 60,
+      "branch": 16,
+      "vector": 19
+     }
+    },
+    "gcc": {
+     "sha256_transform": {
+      "insns": 137,
+      "loads": 27,
+      "stores": 19,
+      "spills": 21,
+      "branch": 4,
+      "vector": 31
+     },
+     "main": {
+      "insns": 94,
+      "loads": 11,
+      "stores": 15,
+      "spills": 23,
+      "branch": 11,
+      "vector": 6
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 106,
+      "loads": 14,
+      "stores": 14,
+      "spills": 22,
+      "branch": 9,
+      "vector": 36
+     },
+     "sha256_transform": {
+      "insns": 126,
+      "loads": 27,
+      "stores": 11,
+      "spills": 20,
+      "branch": 3,
+      "vector": 12
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 438,
+      "loads": 66,
+      "stores": 42,
+      "spills": 86,
+      "branch": 13,
+      "vector": 42
+     },
+     "data.130.0.0.2": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "state.130.0.0.2": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 113,
+      "loads": 18,
+      "stores": 18,
+      "spills": 28,
+      "branch": 10,
+      "vector": 38
+     },
+     "sha256_transform": {
+      "insns": 749,
+      "loads": 74,
+      "stores": 28,
+      "spills": 77,
+      "branch": 2,
+      "vector": 686
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/spectral_norm.c",
+   "compilers": {
+    "lccc": {
+     "mul_AtAv": {
+      "insns": 236,
+      "loads": 46,
+      "stores": 2,
+      "spills": 6,
+      "branch": 17,
+      "vector": 25
+     },
+     "main": {
+      "insns": 50,
+      "loads": 9,
+      "stores": 0,
+      "spills": 7,
+      "branch": 10,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "mul_Atv.constprop.0": {
+      "insns": 51,
+      "loads": 6,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 30
+     },
+     "mul_Av.constprop.0": {
+      "insns": 51,
+      "loads": 6,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 30
+     },
+     "main": {
+      "insns": 72,
+      "loads": 13,
+      "stores": 2,
+      "spills": 9,
+      "branch": 12,
+      "vector": 17
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 365,
+      "loads": 94,
+      "stores": 21,
+      "spills": 98,
+      "branch": 16,
+      "vector": 29
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 274,
+      "loads": 30,
+      "stores": 1,
+      "spills": 23,
+      "branch": 14,
+      "vector": 82
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 253,
+      "loads": 50,
+      "stores": 1,
+      "spills": 35,
+      "branch": 13,
+      "vector": 163
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/nbody.c",
+   "compilers": {
+    "lccc": {
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "main": {
+      "insns": 308,
+      "loads": 127,
+      "stores": 31,
+      "spills": 31,
+      "branch": 17,
+      "vector": 29
+     }
+    },
+    "gcc": {
+     "energy": {
+      "insns": 97,
+      "loads": 26,
+      "stores": 0,
+      "spills": 0,
+      "branch": 8,
+      "vector": 22
+     },
+     "main": {
+      "insns": 118,
+      "loads": 34,
+      "stores": 12,
+      "spills": 0,
+      "branch": 10,
+      "vector": 56
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 266,
+      "loads": 100,
+      "stores": 20,
+      "spills": 8,
+      "branch": 28,
+      "vector": 50
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 1192,
+      "loads": 300,
+      "stores": 114,
+      "spills": 240,
+      "branch": 5,
+      "vector": 0
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 372,
+      "loads": 111,
+      "stores": 78,
+      "spills": 133,
+      "branch": 6,
+      "vector": 311
+     },
+     "energy": {
+      "insns": 159,
+      "loads": 36,
+      "stores": 3,
+      "spills": 6,
+      "branch": 10,
+      "vector": 90
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/struct_copy.c",
+   "compilers": {
+    "lccc": {
+     "main": {
+      "insns": 136,
+      "loads": 36,
+      "stores": 31,
+      "spills": 60,
+      "branch": 4,
+      "vector": 1
+     }
+    },
+    "gcc": {
+     "main": {
+      "insns": 100,
+      "loads": 20,
+      "stores": 8,
+      "spills": 11,
+      "branch": 9,
+      "vector": 55
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 76,
+      "loads": 5,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 47
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 213,
+      "loads": 50,
+      "stores": 48,
+      "spills": 83,
+      "branch": 4,
+      "vector": 2
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 82,
+      "loads": 8,
+      "stores": 1,
+      "spills": 3,
+      "branch": 3,
+      "vector": 16
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/expat_xml_scan.c",
+   "compilers": {
+    "lccc": {
+     "make_xml_corpus.fragment.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "check_name_kernel.ascii_name.1": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "check_name_kernel.utf8_name.2": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "expat_xml_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "expat_utf8_name_length": {
+      "insns": 70,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 24,
+      "vector": 0
+     },
+     "main": {
+      "insns": 154,
+      "loads": 37,
+      "stores": 7,
+      "spills": 17,
+      "branch": 34,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "expat_utf8_name_length": {
+      "insns": 78,
+      "loads": 7,
+      "stores": 0,
+      "spills": 0,
+      "branch": 25,
+      "vector": 0
+     },
+     "main": {
+      "insns": 94,
+      "loads": 9,
+      "stores": 6,
+      "spills": 4,
+      "branch": 25,
+      "vector": 7
+     },
+     "utf8_name.1": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "ascii_name.2": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 222,
+      "loads": 30,
+      "stores": 8,
+      "spills": 0,
+      "branch": 59,
+      "vector": 12
+     },
+     "check_name_kernel.utf8_name": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "make_xml_corpus.fragment": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 319,
+      "loads": 39,
+      "stores": 5,
+      "spills": 3,
+      "branch": 95,
+      "vector": 0
+     },
+     "ascii_name.168.0.6": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "utf8_name.168.0.6": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "fragment.161.0.5": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "expat_xml_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 327,
+      "loads": 23,
+      "stores": 29,
+      "spills": 3,
+      "branch": 107,
+      "vector": 30
+     },
+     "check_name_kernel.ascii_name": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "check_name_kernel.utf8_name": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "make_xml_corpus.fragment": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/chacha20_block.c",
+   "compilers": {
+    "lccc": {
+     "check_known_vector.test_in.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "chacha20_core": {
+      "insns": 120,
+      "loads": 22,
+      "stores": 5,
+      "spills": 6,
+      "branch": 13,
+      "vector": 58
+     },
+     "main": {
+      "insns": 92,
+      "loads": 13,
+      "stores": 18,
+      "spills": 29,
+      "branch": 14,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "chacha20_core": {
+      "insns": 196,
+      "loads": 42,
+      "stores": 37,
+      "spills": 68,
+      "branch": 3,
+      "vector": 3
+     },
+     "main": {
+      "insns": 73,
+      "loads": 15,
+      "stores": 16,
+      "spills": 29,
+      "branch": 12,
+      "vector": 4
+     },
+     "test_in.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 70,
+      "loads": 11,
+      "stores": 6,
+      "spills": 12,
+      "branch": 7,
+      "vector": 12
+     },
+     "chacha20_core": {
+      "insns": 187,
+      "loads": 45,
+      "stores": 29,
+      "spills": 26,
+      "branch": 2,
+      "vector": 0
+     },
+     "check_known_vector.test_in": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 1236,
+      "loads": 65,
+      "stores": 66,
+      "spills": 117,
+      "branch": 11,
+      "vector": 30
+     },
+     "test_in.146.0.2": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "chacha20_core": {
+      "insns": 1104,
+      "loads": 31,
+      "stores": 32,
+      "spills": 55,
+      "branch": 1,
+      "vector": 16
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 75,
+      "loads": 8,
+      "stores": 11,
+      "spills": 17,
+      "branch": 11,
+      "vector": 7
+     },
+     "chacha20_core": {
+      "insns": 63,
+      "loads": 11,
+      "stores": 2,
+      "spills": 0,
+      "branch": 2,
+      "vector": 59
+     },
+     "check_known_vector.test_in": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/zlib_ng_adler32.c",
+   "compilers": {
+    "lccc": {
+     "main.check.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "zlib_ng_adler_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "main": {
+      "insns": 337,
+      "loads": 60,
+      "stores": 14,
+      "spills": 28,
+      "branch": 23,
+      "vector": 72
+     }
+    },
+    "gcc": {
+     "main": {
+      "insns": 156,
+      "loads": 20,
+      "stores": 3,
+      "spills": 2,
+      "branch": 10,
+      "vector": 0
+     },
+     "check.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 148,
+      "loads": 30,
+      "stores": 0,
+      "spills": 0,
+      "branch": 7,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 73,
+      "loads": 8,
+      "stores": 5,
+      "spills": 9,
+      "branch": 9,
+      "vector": 0
+     },
+     "check.173.0.5": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "zlib_ng_adler32_c..1": {
+      "insns": 128,
+      "loads": 22,
+      "stores": 1,
+      "spills": 2,
+      "branch": 11,
+      "vector": 0
+     },
+     "zlib_ng_adler32_c..0": {
+      "insns": 47,
+      "loads": 9,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 0
+     },
+     "zlib_ng_adler_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 147,
+      "loads": 23,
+      "stores": 4,
+      "spills": 3,
+      "branch": 7,
+      "vector": 30
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/gzip_crc32.c",
+   "compilers": {
+    "lccc": {
+     "gzip_crc32_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "main.check.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "gzip_crc_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "gzip_crc32_update": {
+      "insns": 17,
+      "loads": 3,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 0
+     },
+     "main": {
+      "insns": 56,
+      "loads": 8,
+      "stores": 0,
+      "spills": 0,
+      "branch": 10,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "main": {
+      "insns": 50,
+      "loads": 4,
+      "stores": 2,
+      "spills": 0,
+      "branch": 8,
+      "vector": 0
+     },
+     "check.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "gzip_crc32_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 82,
+      "loads": 20,
+      "stores": 0,
+      "spills": 0,
+      "branch": 5,
+      "vector": 0
+     },
+     "gzip_crc32_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 60,
+      "loads": 8,
+      "stores": 2,
+      "spills": 3,
+      "branch": 6,
+      "vector": 0
+     },
+     "gzip_crc_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "gzip_crc32_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 100,
+      "loads": 21,
+      "stores": 4,
+      "spills": 3,
+      "branch": 5,
+      "vector": 15
+     },
+     "gzip_crc32_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/sqlite_varint.c",
+   "compilers": {
+    "lccc": {
+     "check_known_values.values.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sqlite_varint_bytes": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sqlite_varint_offsets": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sqlite_varint_used": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sqlite_put_varint": {
+      "insns": 96,
+      "loads": 5,
+      "stores": 13,
+      "spills": 4,
+      "branch": 12,
+      "vector": 0
+     },
+     "sqlite_get_varint": {
+      "insns": 121,
+      "loads": 10,
+      "stores": 9,
+      "spills": 0,
+      "branch": 17,
+      "vector": 0
+     },
+     "main": {
+      "insns": 174,
+      "loads": 34,
+      "stores": 7,
+      "spills": 22,
+      "branch": 30,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "sqlite_put_varint.part.0": {
+      "insns": 50,
+      "loads": 6,
+      "stores": 6,
+      "spills": 3,
+      "branch": 9,
+      "vector": 3
+     },
+     "sqlite_get_varint.constprop.0": {
+      "insns": 116,
+      "loads": 9,
+      "stores": 2,
+      "spills": 0,
+      "branch": 16,
+      "vector": 0
+     },
+     "main": {
+      "insns": 159,
+      "loads": 23,
+      "stores": 13,
+      "spills": 22,
+      "branch": 30,
+      "vector": 0
+     },
+     "values.0": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 138,
+      "loads": 17,
+      "stores": 3,
+      "spills": 8,
+      "branch": 26,
+      "vector": 0
+     },
+     "sqlite_get_varint": {
+      "insns": 115,
+      "loads": 9,
+      "stores": 9,
+      "spills": 0,
+      "branch": 17,
+      "vector": 0
+     },
+     "sqlite_put_varint": {
+      "insns": 120,
+      "loads": 12,
+      "stores": 6,
+      "spills": 3,
+      "branch": 18,
+      "vector": 20
+     },
+     "check_known_values.values": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 343,
+      "loads": 38,
+      "stores": 32,
+      "spills": 34,
+      "branch": 46,
+      "vector": 0
+     },
+     "values.159.0.5": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sqlite_get_varint": {
+      "insns": 118,
+      "loads": 12,
+      "stores": 11,
+      "spills": 0,
+      "branch": 17,
+      "vector": 0
+     },
+     "sqlite_varint_offsets": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sqlite_varint_bytes": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sqlite_varint_used": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 303,
+      "loads": 43,
+      "stores": 20,
+      "spills": 27,
+      "branch": 42,
+      "vector": 50
+     },
+     "sqlite_get_varint": {
+      "insns": 118,
+      "loads": 9,
+      "stores": 9,
+      "spills": 0,
+      "branch": 17,
+      "vector": 0
+     },
+     "check_known_values.values": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  }
+ ]
+}

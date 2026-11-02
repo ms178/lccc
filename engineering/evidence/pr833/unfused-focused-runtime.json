@@ -1,0 +1,411 @@
+{
+  "complete": true,
+  "identity": {
+    "compilers": {
+      "lccc": {
+        "path": "/home/user/.cache/lccc/target/fastbuild/lccc",
+        "sha256": "c5f812dd238084fd9cd6dd002f1d2d9bb3cad834bc16fd31e82ba15dcb618a32",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "s47": {
+        "path": "/home/user/.cache/lccc-S47/target/fastbuild/lccc",
+        "sha256": "a3d70a582028b4f19b4f25d23e66913a982c95991aba908d15e32ea01a64335c",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "main": {
+        "path": "/home/user/.cache/lccc-main/target/fastbuild/lccc",
+        "sha256": "ed82cf485daf3e2cab35d208e09340bfa119e8520b94c43877fac4ce411024c3",
+        "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+      },
+      "gcc": {
+        "path": "/usr/bin/x86_64-linux-gnu-gcc-16",
+        "sha256": "d85726de39dccd87c573ee63d467caee8e69f56cc2edea710f02d1ba5e0ae477",
+        "version": "x86_64-linux-gnu-gcc-16 (Debian 16.2.0-3) 16.2.0"
+      },
+      "clang": {
+        "path": "/usr/lib/llvm-23/bin/clang",
+        "sha256": "baf97d9e7f31c950ec10f05ebfbea5aaf8df2effb2377d5d899adba3de62c2da",
+        "version": "Debian clang version 23.1.3 (1)"
+      }
+    },
+    "flags": [
+      "-O2",
+      "-march=x86-64-v3",
+      "-fwrapv",
+      "-ffp-contract=off"
+    ],
+    "driver_sha256": "51065a204ba2fd3da870a117cc96fc8efdff000e39c23aedb868f2897a869d37",
+    "object_protocol_sha256": "198eb4dd525eeb3c140f0df858f6ec4c909e89351822542650b8c500dc0047ce",
+    "header_provider": "gcc-16 (Debian 16.2.0-3) 16.2.0",
+    "sources": {
+      "matmul": {
+        "sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+        "flags": []
+      }
+    }
+  },
+  "pinning": {
+    "requested": "auto",
+    "allowed_cpus": [
+      0,
+      1
+    ],
+    "applied": true,
+    "cpu": 0,
+    "reason": "taskset pinning"
+  },
+  "warnings": [],
+  "rows": [
+    {
+      "name": "matmul",
+      "measured_as": {
+        "lccc": "lccc",
+        "s47": "s47",
+        "main": "main",
+        "gcc": "gcc",
+        "clang": "clang"
+      },
+      "tags": [
+        "synthetic",
+        "fp",
+        "loop"
+      ],
+      "iterations": 68,
+      "calibration": {
+        "lccc": {
+          "ns": 23350890,
+          "iterations": 5
+        },
+        "s47": {
+          "ns": 25972442,
+          "iterations": 3
+        },
+        "main": {
+          "ns": 26237340,
+          "iterations": 3
+        },
+        "gcc": {
+          "ns": 20809703,
+          "iterations": 7
+        },
+        "clang": {
+          "ns": 21506653,
+          "iterations": 6
+        }
+      },
+      "target_seconds": 0.2,
+      "max_batch_seconds": 3.0,
+      "samples": [
+        {
+          "order": [
+            "clang",
+            "main",
+            "s47",
+            "gcc",
+            "lccc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 303227697,
+              "iterations": 68
+            },
+            "s47": {
+              "ns": 598418594,
+              "iterations": 68
+            },
+            "main": {
+              "ns": 595367853,
+              "iterations": 68
+            },
+            "gcc": {
+              "ns": 202210558,
+              "iterations": 68
+            },
+            "clang": {
+              "ns": 243945254,
+              "iterations": 68
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "main",
+            "clang",
+            "gcc",
+            "s47"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 307714307,
+              "iterations": 68
+            },
+            "s47": {
+              "ns": 581618121,
+              "iterations": 68
+            },
+            "main": {
+              "ns": 580906372,
+              "iterations": 68
+            },
+            "gcc": {
+              "ns": 198060096,
+              "iterations": 68
+            },
+            "clang": {
+              "ns": 240074833,
+              "iterations": 68
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "s47",
+            "main",
+            "lccc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 303379688,
+              "iterations": 68
+            },
+            "s47": {
+              "ns": 583911273,
+              "iterations": 68
+            },
+            "main": {
+              "ns": 621722549,
+              "iterations": 68
+            },
+            "gcc": {
+              "ns": 198017869,
+              "iterations": 68
+            },
+            "clang": {
+              "ns": 241594817,
+              "iterations": 68
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "main",
+            "lccc",
+            "clang",
+            "s47"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 305205582,
+              "iterations": 68
+            },
+            "s47": {
+              "ns": 582424794,
+              "iterations": 68
+            },
+            "main": {
+              "ns": 587934445,
+              "iterations": 68
+            },
+            "gcc": {
+              "ns": 214165859,
+              "iterations": 68
+            },
+            "clang": {
+              "ns": 242086229,
+              "iterations": 68
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang",
+            "main",
+            "s47"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 309594609,
+              "iterations": 68
+            },
+            "s47": {
+              "ns": 611857278,
+              "iterations": 68
+            },
+            "main": {
+              "ns": 584645641,
+              "iterations": 68
+            },
+            "gcc": {
+              "ns": 194561452,
+              "iterations": 68
+            },
+            "clang": {
+              "ns": 241925607,
+              "iterations": 68
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "main",
+            "lccc",
+            "s47",
+            "gcc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 324827337,
+              "iterations": 68
+            },
+            "s47": {
+              "ns": 587519100,
+              "iterations": 68
+            },
+            "main": {
+              "ns": 585420394,
+              "iterations": 68
+            },
+            "gcc": {
+              "ns": 197169820,
+              "iterations": 68
+            },
+            "clang": {
+              "ns": 242002678,
+              "iterations": 68
+            }
+          }
+        },
+        {
+          "order": [
+            "main",
+            "clang",
+            "s47",
+            "gcc",
+            "lccc"
+          ],
+          "values": {
+            "lccc": {
+              "ns": 316878125,
+              "iterations": 68
+            },
+            "s47": {
+              "ns": 672339824,
+              "iterations": 68
+            },
+            "main": {
+              "ns": 588528922,
+              "iterations": 68
+            },
+            "gcc": {
+              "ns": 196781520,
+              "iterations": 68
+            },
+            "clang": {
+              "ns": 257636051,
+              "iterations": 68
+            }
+          }
+        }
+      ],
+      "comparisons": {
+        "lccc": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.303227697,
+          "median": 1.5536411079998669,
+          "paired_ratios": [
+            1.499564117715357,
+            1.5536411079998669,
+            1.5320823798987555,
+            1.425089803879525,
+            1.5912433106224968,
+            1.6474495792510233,
+            1.6103042856869894
+          ],
+          "exploratory_ci95": [
+            1.499564117715357,
+            1.6103042856869894
+          ]
+        },
+        "s47": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.581618121,
+          "median": 2.9593835253646845,
+          "paired_ratios": [
+            2.9593835253646845,
+            2.936573962884477,
+            2.9487807133203723,
+            2.7195034573647896,
+            3.1448021779771667,
+            2.9797618114171835,
+            3.4166817290566716
+          ],
+          "exploratory_ci95": [
+            2.936573962884477,
+            3.1448021779771667
+          ]
+        },
+        "main": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.580906372,
+          "median": 2.969117657053194,
+          "paired_ratios": [
+            2.9442965732778403,
+            2.9329803616777,
+            3.1397295210767067,
+            2.7452295512703544,
+            3.0049407782997015,
+            2.969117657053194,
+            2.9907733307477247
+          ],
+          "exploratory_ci95": [
+            2.9329803616777,
+            3.0049407782997015
+          ]
+        },
+        "gcc": {
+          "identical_binary_to_reference": true,
+          "minimum_sample_seconds": 0.194561452,
+          "median": 1.0,
+          "paired_ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "exploratory_ci95": null
+        },
+        "clang": {
+          "identical_binary_to_reference": false,
+          "minimum_sample_seconds": 0.240074833,
+          "median": 1.2200657355826812,
+          "paired_ratios": [
+            1.2063922695866356,
+            1.212131256363725,
+            1.2200657355826812,
+            1.1303679780258533,
+            1.2434405917159788,
+            1.2273819492252922,
+            1.3092492171012806
+          ],
+          "exploratory_ci95": [
+            1.2063922695866356,
+            1.2434405917159788
+          ]
+        }
+      }
+    }
+  ],
+  "rounds": 7,
+  "measurement": "fresh fork child per entry; fork/exec/wait excluded; entry page faults included; whole-object identity and every stdout checked; identical binaries explicitly share samples",
+  "harness_sha256": "92572c8528a9b8d0dce67cf24e1abdce64f1b41b67b90eb4921d87b32fa7c4b7"
+}

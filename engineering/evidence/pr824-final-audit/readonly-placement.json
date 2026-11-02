@@ -1,0 +1,42 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "byte_load_reassembly"
+  ],
+  "results": {
+    "byte_load_reassembly": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          23363,
+          23362
+        ],
+        "d1_misses": [
+          1953,
+          1949
+        ],
+        "i1_misses": [
+          1380,
+          1382
+        ],
+        "indirect_mispredicts": [
+          237,
+          237
+        ],
+        "ir_mine": 64371935,
+        "ir_ratio": 0.8926663210837689,
+        "ir_ref": 72111979,
+        "ll_misses": [
+          2987,
+          2990
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/readonly-placement/byte_load_reassembly/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "byte_load_reassembly"
+  ]
+}

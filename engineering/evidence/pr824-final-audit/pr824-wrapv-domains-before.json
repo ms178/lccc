@@ -1,0 +1,221 @@
+[
+  {
+    "name": "pr824",
+    "environment": {},
+    "compile": {
+      "command": [
+        "/home/user/.cache/pr824-measurements/pr824-unmodified-lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/artifacts/inflight/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr824-static/wrapv-domains-pr824"
+      ],
+      "rc": 0,
+      "stderr": ""
+    },
+    "runs": [
+      {
+        "case": 0,
+        "rc": -11,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "case": 1,
+        "rc": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      {
+        "case": 2,
+        "rc": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      {
+        "case": 3,
+        "rc": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      }
+    ]
+  },
+  {
+    "name": "no-iv-widen",
+    "environment": {
+      "CCC_NO_IV_WIDEN": "1"
+    },
+    "compile": {
+      "command": [
+        "/home/user/.cache/pr824-measurements/pr824-unmodified-lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/artifacts/inflight/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr824-static/wrapv-domains-no-iv-widen"
+      ],
+      "rc": 0,
+      "stderr": ""
+    },
+    "runs": [
+      {
+        "case": 0,
+        "rc": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      {
+        "case": 1,
+        "rc": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      {
+        "case": 2,
+        "rc": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      {
+        "case": 3,
+        "rc": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      }
+    ]
+  },
+  {
+    "name": "no-ivsr",
+    "environment": {
+      "CCC_NO_IVSR": "1"
+    },
+    "compile": {
+      "command": [
+        "/home/user/.cache/pr824-measurements/pr824-unmodified-lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/artifacts/inflight/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr824-static/wrapv-domains-no-ivsr"
+      ],
+      "rc": 0,
+      "stderr": ""
+    },
+    "runs": [
+      {
+        "case": 0,
+        "rc": -11,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "case": 1,
+        "rc": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      {
+        "case": 2,
+        "rc": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      {
+        "case": 3,
+        "rc": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      }
+    ]
+  },
+  {
+    "name": "no-assumptions",
+    "environment": {
+      "CCC_NO_IV_WIDEN": "1",
+      "CCC_NO_IVSR": "1",
+      "CCC_NO_QUAD_SR": "1",
+      "CCC_NO_AFFINE_EXIT_FOLD": "1"
+    },
+    "compile": {
+      "command": [
+        "/home/user/.cache/pr824-measurements/pr824-unmodified-lccc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/artifacts/inflight/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr824-static/wrapv-domains-no-assumptions"
+      ],
+      "rc": 0,
+      "stderr": ""
+    },
+    "runs": [
+      {
+        "case": 0,
+        "rc": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      {
+        "case": 1,
+        "rc": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      {
+        "case": 2,
+        "rc": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      {
+        "case": 3,
+        "rc": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      }
+    ]
+  },
+  {
+    "name": "gcc16",
+    "environment": {},
+    "compile": {
+      "command": [
+        "/home/user/.cache/oracles/gcc-16.2.0/bin/gcc",
+        "-O2",
+        "-fwrapv",
+        "/home/user/artifacts/inflight/wrapv_domains.c",
+        "-o",
+        "/home/user/.cache/pr824-static/wrapv-domains-gcc16"
+      ],
+      "rc": 0,
+      "stderr": ""
+    },
+    "runs": [
+      {
+        "case": 0,
+        "rc": 0,
+        "stdout": "28\n",
+        "stderr": ""
+      },
+      {
+        "case": 1,
+        "rc": 0,
+        "stdout": "-1073665362\n",
+        "stderr": ""
+      },
+      {
+        "case": 2,
+        "rc": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      {
+        "case": 3,
+        "rc": 0,
+        "stdout": "10\n",
+        "stderr": ""
+      }
+    ]
+  }
+]

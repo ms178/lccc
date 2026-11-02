@@ -1,0 +1,179 @@
+;;; evex-imm-abs-0-0
+.text
+vpshufd $3, anchor, %zmm1
+
+;;; evex-imm-abs-0-1
+.text
+vpshufd $3, anchor+17, %zmm1
+
+;;; evex-imm-abs-0-2
+.text
+vpshufd $3, anchor-17, %zmm1
+
+;;; evex-imm-abs-1-0
+.text
+vrndscaleps $3, anchor, %zmm1
+
+;;; evex-imm-abs-1-1
+.text
+vrndscaleps $3, anchor+17, %zmm1
+
+;;; evex-imm-abs-1-2
+.text
+vrndscaleps $3, anchor-17, %zmm1
+
+;;; evex-imm-abs-2-0
+.text
+vpslld $3, anchor, %xmm1
+
+;;; evex-imm-abs-2-1
+.text
+vpslld $3, anchor+17, %xmm1
+
+;;; evex-imm-abs-2-2
+.text
+vpslld $3, anchor-17, %xmm1
+
+;;; evex-imm-abs-3-0
+.text
+vpslld $3, anchor, %ymm1
+
+;;; evex-imm-abs-3-1
+.text
+vpslld $3, anchor+17, %ymm1
+
+;;; evex-imm-abs-3-2
+.text
+vpslld $3, anchor-17, %ymm1
+
+;;; evex-imm-abs-4-0
+.text
+vpslld $3, anchor, %zmm1
+
+;;; evex-imm-abs-4-1
+.text
+vpslld $3, anchor+17, %zmm1
+
+;;; evex-imm-abs-4-2
+.text
+vpslld $3, anchor-17, %zmm1
+
+;;; evex-imm-abs-5-0
+.text
+vshufps $3, anchor, %zmm1, %zmm2
+
+;;; evex-imm-abs-5-1
+.text
+vshufps $3, anchor+17, %zmm1, %zmm2
+
+;;; evex-imm-abs-5-2
+.text
+vshufps $3, anchor-17, %zmm1, %zmm2
+
+;;; evex-imm-abs-6-0
+.text
+vcmpps $3, anchor, %zmm1, %k2
+
+;;; evex-imm-abs-6-1
+.text
+vcmpps $3, anchor+17, %zmm1, %k2
+
+;;; evex-imm-abs-6-2
+.text
+vcmpps $3, anchor-17, %zmm1, %k2
+
+;;; evex-imm-abs-7-0
+.text
+vextracti32x4 $3, %zmm1, anchor
+
+;;; evex-imm-abs-7-1
+.text
+vextracti32x4 $3, %zmm1, anchor+17
+
+;;; evex-imm-abs-7-2
+.text
+vextracti32x4 $3, %zmm1, anchor-17
+
+;;; evex-imm-abs-8-0
+.text
+vprold $3, anchor, %zmm1
+
+;;; evex-imm-abs-8-1
+.text
+vprold $3, anchor+17, %zmm1
+
+;;; evex-imm-abs-8-2
+.text
+vprold $3, anchor-17, %zmm1
+
+;;; evex-imm-abs-9-0
+.text
+vmpsadbw $3, anchor, %zmm1, %zmm2
+
+;;; evex-imm-abs-9-1
+.text
+vmpsadbw $3, anchor+17, %zmm1, %zmm2
+
+;;; evex-imm-abs-9-2
+.text
+vmpsadbw $3, anchor-17, %zmm1, %zmm2
+
+;;; evex-imm-abs-10-0
+.text
+vfpclassps $3, anchor{1to16}, %k2
+
+;;; evex-imm-abs-10-1
+.text
+vfpclassps $3, anchor+17{1to16}, %k2
+
+;;; evex-imm-abs-10-2
+.text
+vfpclassps $3, anchor-17{1to16}, %k2
+
+;;; evex-imm-abs-11-0
+.text
+vfpclassss $3, anchor, %k2
+
+;;; evex-imm-abs-11-1
+.text
+vfpclassss $3, anchor+17, %k2
+
+;;; evex-imm-abs-11-2
+.text
+vfpclassss $3, anchor-17, %k2
+
+;;; evex-imm-abs-12-0
+.text
+vcvtps2ph $3, %zmm1, anchor
+
+;;; evex-imm-abs-12-1
+.text
+vcvtps2ph $3, %zmm1, anchor+17
+
+;;; evex-imm-abs-12-2
+.text
+vcvtps2ph $3, %zmm1, anchor-17
+
+;;; evex-imm-abs-13-0
+.text
+vpternlogd $3, anchor, %zmm1, %zmm2
+
+;;; evex-imm-abs-13-1
+.text
+vpternlogd $3, anchor+17, %zmm1, %zmm2
+
+;;; evex-imm-abs-13-2
+.text
+vpternlogd $3, anchor-17, %zmm1, %zmm2
+
+;;; evex-imm-abs-14-0
+.text
+vinsertf32x4 $3, anchor, %zmm1, %zmm2
+
+;;; evex-imm-abs-14-1
+.text
+vinsertf32x4 $3, anchor+17, %zmm1, %zmm2
+
+;;; evex-imm-abs-14-2
+.text
+vinsertf32x4 $3, anchor-17, %zmm1, %zmm2

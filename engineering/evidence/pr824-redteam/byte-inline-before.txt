@@ -1,0 +1,1 @@
+FAIL: compact byte accessor still outlined in the measured workload

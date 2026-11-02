@@ -1,0 +1,10 @@
+{
+  "passed": 797,
+  "failed": 0,
+  "skipped_compare": 13,
+  "skipped_run": 9,
+  "total": 819,
+  "elapsed_s": 124.1,
+  "lccc": "/home/user/lccc/target/fastbuild/lccc",
+  "failures": []
+}

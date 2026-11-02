@@ -1,0 +1,7 @@
+check_static_local_init: PASSED (78 rows vs GCC 16)
+check_designator_init: PASSED (14 rows vs GCC 16)
+check_file_scope_init: PASSED (26 rows vs GCC 16; values match)
+check_typedef_volatile_codegen: PASSED (13 functions, store counts match GCC 16.2)
+check_seg_init_brace_elision: PASSED (4 fixtures, error lines match GCC 16.2)
+check_volatile_member_codegen: PASSED (15 functions, store and memory-reference counts match GCC 16.2)
+check_const_volatile_objects: PASSED (10 functions at -O2 and 4 symbol checks at -O0; volatile reads match GCC 16.2, non-volatile const controls still fold)

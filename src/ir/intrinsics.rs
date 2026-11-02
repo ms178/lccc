@@ -1,0 +1,3912 @@
+/// Target-independent intrinsic operations.
+///
+/// These represent SIMD, crypto, math, and hardware intrinsics that the IR
+/// can express without target-specific details. Each backend emits the
+/// appropriate native instructions for its architecture.
+///
+/// Organized by ISA extension:
+/// - Fences/barriers (Lfence, Mfence, Sfence, Pause)
+/// - Non-temporal stores (Movnti, Movntdq, etc.)
+/// - SSE2 packed integer ops (Pcmpeqb, Paddw, Psubd, etc.)
+/// - SSE2 shuffle/pack/unpack (Pshufd, Packssdw, Punpcklbw, etc.)
+/// - SSE2/SSE4.1 insert/extract (Pinsrw, Pextrw, Pinsrd, etc.)
+/// - AES-NI (Aesenc, Aesdec, etc.)
+/// - CLMUL (Pclmulqdq)
+/// - CRC32
+/// - Scalar math (SqrtF32, SqrtF64, FabsF32, FabsF64)
+/// - Frame/return address builtins
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntrinsicOp {
+    AvxWiden(crate::common::avx_widen::AvxWiden),
+    AvxTest(crate::common::avx_test::AvxTest),
+    /// Memory fence operations (no dest, no args beyond optional ptr)
+    Lfence,
+    Mfence,
+    Sfence,
+    Pause,
+    Vzeroupper,
+    Clflush,
+    /// `__builtin_prefetch(addr, rw, locality)`: an architectural prefetch
+    /// hint for the cache line containing `addr` (args[0]). No result, no
+    /// fault, no memory-ordering effect — but not dead code: the whole point
+    /// of the builtin is the latency it hides, so the instruction must
+    /// survive DCE (it is deliberately NOT in `is_pure`).
+    ///
+    /// The payload is a [`PrefetchHint`] encoding of GCC's hint pair, chosen
+    /// once in the frontend lowering: bits 0-1 hold `locality` (0..=3) and
+    /// bit 2 holds write intent (`rw == 1`). Both facts are kept because
+    /// every target that distinguishes write intent ALSO keeps the locality
+    /// (AArch64 `pst*` has the same four levels as `pld*`), and every target
+    /// that cannot express write intent falls back to the locality table —
+    /// collapsing the pair loses information some backend needs. GCC 15+'s
+    /// `rw == 2` (instruction-fetch intent) is encoded as a read: GCC 16
+    /// lowers it with the read table on both x86 and AArch64
+    /// (`pftype[rw & 1][locality]`).
+    ///
+    /// Backend mapping (GCC 16.2 parity, measured per form):
+    ///
+    /// | locality | x86 read / write without PRFCHW | x86 write with PRFCHW | arm64 read | arm64 write |
+    /// |----------|---------------------------------|-----------------------|------------|-------------|
+    /// | 0        | `prefetchnta`                   | `prefetchw`           | `pldl1strm`| `pstl1strm` |
+    /// | 1        | `prefetcht2`                    | `prefetchw`           | `pldl3keep`| `pstl3keep` |
+    /// | 2        | `prefetcht1`                    | `prefetchw`           | `pldl2keep`| `pstl2keep` |
+    /// | 3        | `prefetcht0`                    | `prefetchw`           | `pldl1keep`| `pstl1keep` |
+    ///
+    /// x86-64 always has the SSE prefetch forms (GCC emits them even under
+    /// `-mno-sse`/`-mgeneral-regs-only`: `0F 18` touches no vector state).
+    /// i686 has them only when SSE or PRFCHW is enabled (GCC's
+    /// `ix86_prefetch_sse`); otherwise the hint is dropped, because the
+    /// i686 baseline is pre-SSE silicon where `0F 18 /0-3` is #UD. RISC-V
+    /// emits nothing without Zicbop (GCC parity for `rv64gc`).
+    Prefetch(u8),
+    /// Non-temporal stores: movnti (32-bit), movnti64 (64-bit), movntdq (128-bit), movntpd (128-bit double),
+    /// movntps (128-bit float; SSE1, so it is legal on an SSE1-only target)
+    Movnti,
+    Movnti64,
+    Movntdq,
+    Movntpd,
+    Movntps,
+    /// Load/store 128-bit unaligned
+    Loaddqu,
+    Storedqu,
+    /// Compare equal packed bytes (16 bytes)
+    Pcmpeqb128,
+    /// Compare equal packed dwords (4x32)
+    Pcmpeqd128,
+    /// Subtract packed unsigned saturated bytes
+    Psubusb128,
+    /// Subtract packed signed saturated bytes
+    Psubsb128,
+    /// Bitwise OR/AND/XOR on 128-bit
+    Por128,
+    Pand128,
+    Pxor128,
+    /// Packed single-precision float ops (addps/subps/mulps).
+    /// xorps/andps/orps reuse the integer Pxor/Pand/Por ops (bitwise identical).
+    AddPs128,
+    SubPs128,
+    MulPs128,
+    /// Packed double-precision float ops (addpd/subpd/mulpd).
+    AddPd128,
+    SubPd128,
+    MulPd128,
+    /// Packed 32x32->64 multiplies: pmuludq (SSE2, unsigned),
+    /// pmuldq (SSE4.1, signed), pmulld (SSE4.1, low 32).
+    Pmuludq128,
+    Pmuldq128,
+    Pmulld128,
+    /// Free 128-bit reinterpret cast: the value is passed through unchanged.
+    CastReinterpret128,
+    /// Move byte mask (pmovmskb) - returns i32
+    Pmovmskb128,
+    /// Set all bytes to value (splat)
+    SetEpi8,
+    /// Set all dwords to value (splat)
+    SetEpi32,
+    /// Scalar 32-bit unsigned saturating subtract: `max(lhs-rhs, 0)`.
+    /// Late canonicalization uses this for exact select/compare/subtract
+    /// graphs after vectorization; both x86 backends lower it without SIMD.
+    UsubSat32,
+    /// BMI2 parallel bit deposit/extract (`args`: source, mask). The x86-64
+    /// backend emits `pdep`/`pext` only where the function may use BMI2 and
+    /// an exact portable loop elsewhere, so the op is legal in any function.
+    Pdep32,
+    Pdep64,
+    Pext32,
+    Pext64,
+    /// CRC32 accumulate
+    Crc32_8,
+    Crc32_16,
+    Crc32_32,
+    Crc32_64,
+    /// __builtin_ia32_rdtsc() - 64-bit timestamp counter (EDX:EAX)
+    Rdtsc,
+    /// __builtin_ia32_rdtscp(&aux) - rdtscp, stores IA32_TSC_AUX (ecx) to aux
+    Rdtscp,
+    /// __builtin_frame_address(0) - returns current frame pointer
+    FrameAddress,
+    /// __builtin_return_address(0) - returns current return address
+    ReturnAddress,
+    /// GCC's local-frame setjmp primitive. Args: user buffer pointer.
+    BuiltinSetjmp,
+    /// GCC's local-frame longjmp primitive. Args: user buffer pointer, value.
+    BuiltinLongjmp,
+    /// __builtin_apply_args support: emits the target-specific save-area size
+    /// in bytes (x86-64: 6 int arg regs + al + 8 XMM arg regs = 184; i686:
+    /// 16-byte incoming-register block + the caller's stack argument area).
+    /// dest = size in bytes.
+    ApplyArgsAreaSize,
+    /// __builtin_apply_args(): snapshot the incoming argument registers (and
+    /// on i686 the caller's stack argument area) into the save area.
+    /// dest_ptr = save area.  Reads arg registers; writes only the area.
+    SaveApplyArgs,
+    /// __builtin_apply(func, args, size): restore argument registers from the
+    /// save area (i686: re-stage `size` bytes of stack arguments), perform the
+    /// indirect call, and capture the result into the result area.
+    /// Args: [func_ptr, save_area, result_area, size].
+    DoBuiltinApply,
+    /// __builtin_return(block): load the current function's return value from
+    /// the result block produced by __builtin_apply and return.
+    /// Args: [result_area].  Terminates the block.
+    RestoreApplyResult,
+    /// __builtin_thread_pointer() - returns thread pointer (TLS base address)
+    ThreadPointer,
+    /// Load target stack-protector guard word (`%fs:40`, `%gs:20`, sysreg, etc.)
+    LoadStackGuard,
+    /// Scalar square root: sqrtsd/sqrtss on x86, fsqrt on ARM/RISC-V
+    /// args[0] = input float value; dest = sqrt result
+    SqrtF32,
+    SqrtF64,
+    /// Scalar absolute value: bitwise AND with sign mask on x86, fabs on ARM/RISC-V
+    /// args[0] = input float value; dest = |x|
+    FabsF32,
+    FabsF64,
+    /// C99 fma()/fmaf(): dest = args[0] * args[1] + args[2] with a SINGLE
+    /// rounding. Must lower to a hardware FMA instruction (vfmadd on x86);
+    /// splitting into Mul+Add would double-round and is a correctness bug,
+    /// not a performance choice (glibc's s_fma.c/s_fmaf.c via the ms178
+    /// math-use-builtins-fma.h are the canonical consumers).
+    FmaScalarF32,
+    FmaScalarF64,
+    /// C99 fma()/fmaf() with operand negations folded into the family
+    /// selection: dest = (negate_product ? -1 : +1) * (args[0] * args[1])
+    ///              + (negate_addend ? -1 : +1) * args[2], single rounding.
+    /// Payload: (negate_product, negate_addend). Produced by the IR
+    /// negation peel (fma_neg_peel.rs) from single-use Neg instructions
+    /// feeding a plain FmaScalarF{32,64}; at least one flag is set in
+    /// practice (two product-side negations cancel back to the plain
+    /// intrinsic), and backends handle the (false, false) spelling as the
+    /// plain family defensively rather than panicking.
+    ///
+    /// Soundness: IEEE negation is an exact sign flip, so
+    /// fma(-a, b, -c) = round((-a)·b + (-c)) = round(-(a·b) - c), and every
+    /// supported rounding mode satisfies round(-x) = -round(x); the signed
+    /// families therefore compute the same VALUE as the negation-then-fuse
+    /// spelling (NaN payload/sign may differ bitwise — the established
+    /// implementation-defined position, same as GCC/Clang). NOT subject to
+    /// -ffp-contract: the C99 builtin semantics are fused regardless.
+    ///
+    /// ISA mapping (oracle-verified against aarch64 gcc 12.4 and x86-64
+    /// gcc -march=x86-64-v3; note the AArch64 quirk that `sub` negates the
+    /// PRODUCT and the `n` prefix the ADDEND — the opposite reading of the
+    /// x86 names):
+    /// ```text
+    /// (np, na)   x86-64/i686     AArch64        RISC-V
+    /// (F, F)     vfmadd231s{d}   fmadd          fmadd
+    /// (F, T)     vfmsub231s{d}   fnmsub         fmsub
+    /// (T, F)     vfnmadd231s{d}  fmsub          fnmsub
+    /// (T, T)     vfnmsub231s{d}  fnmadd         fnmadd
+    /// ```
+    FmaScalarF32Signed(bool, bool),
+    FmaScalarF64Signed(bool, bool),
+    /// SSE4.1/AVX scalar directed rounding, payload = the ROUNDSS/ROUNDSD
+    /// imm8 (GCC-verified at -O2 -march=x86-64-v3):
+    ///   floor = 9, ceil = 10, trunc = 11,
+    ///   rint = 4 (dynamic MXCSR mode, inexact ALLOWED — C99 rint),
+    ///   nearbyint = 12 (dynamic mode, inexact SUPPRESSED — C99 nearbyint),
+    ///   roundeven = 8 (ties-to-even, inexact suppressed — C23 roundeven).
+    /// Inline expansion is a CORRECTNESS requirement for glibc self-hosting:
+    /// its generic s_floor.c/s_trunc.c/... define floor() AS __builtin_floor
+    /// under USE_*_BUILTIN, so lowering to a libm call recurses into the
+    /// function being compiled.
+    RoundScalarF32(u8),
+    RoundScalarF64(u8),
+    /// copysign(x, y)/copysignf: magnitude of x with the sign bit of y,
+    /// pure SSE bit ops (and/andn/or) — never a libm call (glibc's
+    /// s_copysign.c defines copysign() AS __builtin_copysign).
+    CopysignF32,
+    CopysignF64,
+    /// _Float128 fabs: clear sign bit 127 (inline bit ops, no libgcc call).
+    F128Fabs,
+    /// _Float128 negate: toggle sign bit 127 (NOT an integer negation).
+    F128Neg,
+    /// _Float128 copysign: x magnitude combined with y sign bit 127.
+    F128Copysign,
+    /// Hardware IEEE binary16 -> binary32 conversion (`vcvtph2ps` on x86 F16C, `fcvt` on AArch64).
+    F16ToF32,
+    /// Hardware IEEE binary32 -> binary16 RNE conversion (`vcvtps2ph` on x86 F16C, `fcvt` on AArch64).
+    F32ToF16,
+    /// long double (80-bit x87) fabs: clear bit 79 in the 10-byte slot.
+    LDFabs,
+    /// long double (80-bit x87) copysign: x magnitude with y sign bit 79.
+    LDCopysign,
+    /// Packed double FMA for vectorized matmul inner loop.
+    /// Computes: *dest_ptr[0..2] += broadcast(*args[0]) * *args[1][0..2]
+    /// dest_ptr: pointer to 2×F64 accumulator (read+write, 16 bytes)
+    /// args[0]: pointer to scalar F64 (broadcast to both SSE lanes)
+    /// args[1]: pointer to 2×F64 (one SSE register worth)
+    /// NOT pure: modifies memory at dest_ptr.
+    FmaF64x2,
+    /// Two-wide FMA using a broadcast previously loaded by BroadcastLoadF64.
+    /// dest_ptr is C and args[0] is the B vector pointer.
+    FmaF64x2Hoisted,
+    /// Same address/broadcast contract as [`FmaF64x2Hoisted`], but the
+    /// multiply and the add round separately, so no FMA3 unit is required and
+    /// no contraction licence is consumed.
+    ///
+    /// This is what the two-wide matmul arm emits whenever fused arithmetic is
+    /// unavailable or unasked-for: plain x86-64 (SSE2 baseline, no FMA3) and
+    /// `-ffp-contract=off`. Without it the arm had no non-FMA lowering at all
+    /// and silently stayed scalar on the whole baseline profile.
+    ///
+    /// Lowering is `movupd B; mulpd; movupd C; addpd; movupd C` twice per
+    /// four-element group, i.e. `xmm0` for the product, `xmm1` for the hoisted
+    /// broadcast, `xmm2` for the C addend (the allocator must quarantine xmm2
+    /// exactly as for [`FmaF64x2Hoisted`]'s legacy form).
+    MulAddF64x2Hoisted,
+    /// Packed double FMA for AVX2 4-wide vectorized loops.
+    /// Computes: *dest_ptr[0..4] += broadcast(*args[0]) * *args[1][0..4]
+    /// dest_ptr: pointer to 4×F64 accumulator (read+write, 32 bytes)
+    /// args[0]: pointer to scalar F64 (broadcast to all 4 lanes)
+    /// args[1]: pointer to 4×F64 source vector
+    /// NOT pure: modifies memory at dest_ptr.
+    FmaF64x4,
+    /// Like FmaF64x4, but the A[i][k] broadcast has been hoisted out of the
+    /// inner loop. The codegen assumes ymm1 already holds the broadcast value
+    /// (set by a preceding BroadcastLoadF64 instruction).
+    /// dest_ptr = C pointer (read+write, 4×F64)
+    /// args[0] = B pointer (4×F64)  (no A pointer needed)
+    FmaF64x4Hoisted,
+    /// Load a scalar F64 from a pointer and broadcast to all 4 lanes of ymm1.
+    /// Placed before the vectorized j-loop to hoist the A[i][k] broadcast.
+    /// args[0] = pointer to scalar F64
+    BroadcastLoadF64,
+    /// FMA with SIB addressing: uses base + byte_offset for B and C accesses.
+    /// This eliminates the GEP address computation from the inner loop by
+    /// using x86 SIB addressing directly: vmovupd (%base, %offset), %ymm0.
+    /// args[0] = A pointer (scalar F64, broadcast inside)
+    /// args[1] = C base pointer (row base, loop-invariant in j-loop)
+    /// args[2] = B base pointer (row base, loop-invariant in j-loop)
+    /// args[3] = byte offset (the j-loop IV, increments by 32 each iteration)
+    FmaF64x4SIB,
+    /// Like FmaF64x4SIB but with A broadcast hoisted to ymm1.
+    /// Eliminates both GEP address computation AND broadcast load from inner loop.
+    /// args[0] = C base pointer (row base, loop-invariant)
+    /// args[1] = B base pointer (row base, loop-invariant)
+    /// args[2] = byte offset (j-loop IV, shared across chunks)
+    /// args[3] = optional displacement (0,32,64,96) for quad unroll — if present,
+    ///           emits disp(%base,%off) SIB, avoiding extra leaq/addq.
+    ///           If absent, behaves like 3-arg form (offset already includes chunk).
+    /// ymm1 must already hold broadcasted A[i][k] (from BroadcastLoadF64).
+    FmaF64x4HoistedSIB,
+    /// Same address/broadcast contract as FmaF64x4HoistedSIB, but multiply
+    /// and add round separately. x86-64 AVX2 only; no FMA requirement.
+    /// Reads B and C, writes C through args[0], and preserves hoisted ymm1.
+    /// Uses ymm0/ymm2 scratch; the allocator must quarantine xmm2.
+    MulAddF64x4HoistedSIB,
+
+    // --- Vector loads for reduction patterns ---
+    /// Load 4 packed doubles (256-bit unaligned): vmovupd
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (32 bytes, 4×F64)
+    LoadF64x4,
+    /// Load 2 packed doubles (128-bit unaligned): movupd
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (16 bytes, 2×F64)
+    LoadF64x2,
+    /// Load 8 packed 32-bit ints (256-bit unaligned): vmovdqu
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (32 bytes, 8×I32)
+    LoadI32x8,
+    /// Load 4 packed 32-bit ints (128-bit unaligned): movdqu
+    /// args[0] = base pointer, args[1] = byte offset
+    /// dest_ptr = result ptr (16 bytes, 4×I32)
+    LoadI32x4,
+
+    // --- Vector arithmetic for reductions ---
+    /// Packed 4×F64 add (256-bit): vaddpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddF64x4,
+    /// Packed 2×F64 add (128-bit): addpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddF64x2,
+    /// Packed 4×F64 multiply (256-bit): vmulpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    MulF64x4,
+    /// Packed 2×F64 multiply (128-bit): mulpd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    MulF64x2,
+    /// Packed 8×I32 add (256-bit): vpaddd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddI32x8,
+    /// Packed 4×I32 add (128-bit): paddd
+    /// args[0] = src1 ptr, args[1] = src2 ptr; dest_ptr = result ptr
+    AddI32x4,
+
+    // --- Horizontal reduction (vector → scalar) ---
+    /// Horizontal add 4×F64 → 1×F64 (AVX2)
+    /// Reduces {a, b, c, d} to a+b+c+d
+    /// args[0] = src vector ptr (32 bytes); dest = scalar F64
+    HorizontalAddF64x4,
+    /// Horizontal add 2×F64 → 1×F64 (SSE2)
+    /// Reduces {a, b} to a+b
+    /// args[0] = src vector ptr (16 bytes); dest = scalar F64
+    HorizontalAddF64x2,
+    /// Horizontal add 8×I32 → 1×I32 (AVX2)
+    /// Reduces {a,b,c,d,e,f,g,h} to a+b+c+d+e+f+g+h
+    /// args[0] = src vector ptr (32 bytes); dest = scalar I32
+    HorizontalAddI32x8,
+    /// Horizontal add 4×I32 → 1×I32 (SSE2)
+    /// Reduces {a,b,c,d} to a+b+c+d
+    /// args[0] = src vector ptr (16 bytes); dest = scalar I32
+    HorizontalAddI32x4,
+
+    // --- Register-based vector operations for reductions (SSA-friendly) ---
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 4×F64
+    /// Returns vector value in SSA, lives in %ymm register
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF64x4,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64
+    /// Returns vector value in SSA, lives in %xmm register
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF64x2,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 8×I32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadI32x8,
+    /// Read exactly four dwords at offsets 0, 8, 16 and 24 from
+    /// `base + byte_offset + optional_displacement`, placing them in lanes
+    /// 0, 2, 4 and 6 of an I32x8 result; the odd lanes are zero. Unlike a
+    /// full-width load, this does not touch the intervening objects.
+    VecLoadStrided2I32x8,
+    /// Read exactly four dwords at offsets 0, 8, 16 and 24 from
+    /// `base + byte_offset + optional_displacement`, placing them in lanes
+    /// 0, 1, 2 and 3 of an I32x4 result. The intervening bytes are not
+    /// accessed.
+    VecLoadStrided2I32x4,
+    /// Compact four stride-8B dwords from a proven contiguous 32-byte window
+    /// into lanes 0, 1, 2 and 3 of an I32x4 result. Unlike the exact strided
+    /// loads, this form reads the intervening bytes and is therefore emitted
+    /// only after the reducer's private-object/extent proof succeeds.
+    VecLoadStrided2CompactI32x4,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadI32x4,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 8×F32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF32x8,
+    /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×F32
+    /// args[0] = base pointer, args[1] = byte offset; dest = vector value
+    VecLoadF32x4,
+
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 4×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddF64x4,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 2×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddF64x2,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - AVX2 4×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulF64x4,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 2×F64
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulF64x2,
+    /// Fused reduction step over two memory vectors, AVX2 4×F64.
+    /// args = [accumulator, a_base, a_byte_offset, b_base, b_byte_offset].
+    VecFmaF64x4,
+    /// Contract-legal affine map: input * scale + bias, AVX 4×F64.
+    VecMaddF64x4,
+    /// Builtin-semantics packed FMA with the sign algebra (the element-wise
+    /// map counterpart of `FmaScalarF64Signed`): args = [a, b, acc] →
+    /// (np ? −1 : +1)·(a·b) + (na ? −1 : +1)·acc, AVX2 4×F64, single
+    /// rounding per lane. Produced by the map vectorizer's `MapExpr::Fma`
+    /// arm from `__builtin_fma` loops — NOT contract-gated (the C99
+    /// builtin is fused regardless of -ffp-contract, unlike the
+    /// `VecMaddF64x4` contraction above). Mnemonic table (132 family):
+    /// (F,F) vfmadd132pd · (F,T) vfmsub132pd · (T,F) vfnmadd132pd ·
+    /// (T,T) vfnmsub132pd.
+    VecMaddF64x4Signed(bool, bool),
+    /// Same, AVX2 8×F32 (…132ps family).
+    VecMaddF32x8Signed(bool, bool),
+    /// Packed FMA contraction (BB-SLP): args = [a, b, acc] → acc + a·b,
+    /// SSE2-register-width 2×F64 (vfmadd231pd under FMA3). Rounding parity
+    /// with the scalar fused-mul-add path (single rounding of a·b + acc).
+    VecFmaF64x2,
+    /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
+    /// 2×F64 (vfnmadd231pd). Same single-rounding contract.
+    VecFnmaF64x2,
+    /// Packed `a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 2×F64 (vfmsub231pd). Same single-rounding contract.
+    VecFmsF64x2,
+    /// Packed `−a·b − acc` contraction (`vecfma`, the negated-product
+    /// shape `-(a*b) - c`): args = [a, b, acc], 2×F64 (vfnmsub231pd).
+    /// Same single-rounding contract.
+    VecFnmsF64x2,
+    /// Packed FMA contraction (BB-SLP): args = [a, b, acc] → acc + a·b,
+    /// 4×F32 (vfmadd231ps).
+    VecFmaF32x4,
+    /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
+    /// 4×F32 (vfnmadd231ps).
+    VecFnmaF32x4,
+    /// Packed `a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 4×F32 (vfmsub231ps).
+    VecFmsF32x4,
+    /// Packed `−a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 4×F32 (vfnmsub231ps).
+    VecFnmsF32x4,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddI32x8,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecAddI32x4,
+    /// Vector lane rotate: %dest_vec = ROTL(%src_vec, n) per 4×I32 lane,
+    /// with args[1] a CONSTANT rotate amount 1..=31. Lowered to the SSE2
+    /// triple `pslld $n / psrld $(32-n) / por` (x86 has no packed rotate
+    /// before AVX-512 `vprold`). Produced by the lane-parallel ARX pass
+    /// (`passes::vec_arx`) from ChaCha20/Salsa-style quarter-rounds.
+    VecRotlI32x4,
+    /// Vector lane shuffle: %dest_vec = pshufd(%src_vec, imm) — the
+    /// destination lane `l` reads source lane `(imm >> (2*l)) & 3`
+    /// per the SSE2 pshufd immediate encoding (bits [2l+1:2l]). Used by
+    /// the ARX pass to materialize lane-rotated frames for diagonal
+    /// rounds; args[1] is the CONSTANT immediate (0..=255).
+    VecShufdI32x4,
+    /// Vector byte shuffle (ARX): %dest_vec byte i = %src_vec byte
+    /// mask_vec[i] — one pshufb (SSSE3).  Covers whole-byte dword rotates
+    /// and fused rotate+permute masks.  args = [data, mask]; the mask is
+    /// materialised loop-invariant by the ARX passes.
+    VecShufbI32x4,
+    /// Vector scalar pack (ARX): four scalar u32 values into one 4×I32
+    /// vector, args = [x0, x1, x2, x3] (lane order).  Lowered to
+    /// movd/punpckldq/punpcklqdq chains staged through GPR rax/rcx and
+    /// xmm0/xmm1 (arguments are scalars, so the XMM scratch set is safe).
+    VecPackI32x4,
+    /// Vector lane extract (ARX): %dest = %src_vec[Const(lane)] — a
+    /// scalar u32.  pextrd under SSE4.1; pshufd-to-lane-0 + movd on the
+    /// SSE2 baseline.
+    VecExtractLaneI32x4,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×F32
+    VecAddF32x8,
+    /// Vector add: %dest_vec = %src1_vec + %src2_vec - SSE2 4×F32
+    VecAddF32x4,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - AVX2 8×F32
+    VecMulF32x8,
+    /// Fused reduction step over two memory vectors, AVX2 8×F32.
+    /// args = [accumulator, a_base, a_byte_offset, b_base, b_byte_offset].
+    VecFmaF32x8,
+    /// Contract-legal affine map: input * scale + bias, AVX 8×F32.
+    VecMaddF32x8,
+    /// Fixed-width squared distance reduced directly to the scalar FP ABI
+    /// result. args = [a_base, b_base]. Reassociation must be enabled.
+    FixedDistanceF32x8,
+    FixedDistanceF64x4,
+    /// Broadcast scalar f32 to 8 lanes (vbroadcastss).
+    VecBroadcastF32x8,
+    /// Broadcast scalar f32 to 4 lanes.
+    VecBroadcastF32x4,
+    /// Broadcast scalar f64 to 4 lanes (vbroadcastsd).
+    VecBroadcastF64x4,
+    /// Broadcast scalar f64 to 2 lanes.
+    VecBroadcastF64x2,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 4×F32
+    VecMulF32x4,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - AVX2 4×F64.
+    /// args[0] = src1 vector value, args[1] = src2 vector value (non-commutative).
+    VecSubF64x4,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - SSE2 2×F64.
+    VecSubF64x2,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - AVX2 8×F32.
+    VecSubF32x8,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - SSE2 4×F32.
+    VecSubF32x4,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - AVX2 4×F64.
+    /// Elementwise IEEE division; identical per-lane results to scalar div.
+    VecDivF64x4,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - SSE2 2×F64.
+    VecDivF64x2,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - AVX2 8×F32.
+    VecDivF32x8,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - SSE2 4×F32.
+    VecDivF32x4,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - AVX2 4×F64.
+    /// args[0] = source vector value; dest = result vector.
+    VecSqrtF64x4,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 2×F64.
+    VecSqrtF64x2,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - AVX2 8×F32.
+    VecSqrtF32x8,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 4×F32.
+    VecSqrtF32x4,
+    /// Packed directed/dynamic rounding. Register form is `[vector, imm8]`;
+    /// a directly folded stream load is `[base, index, imm8]` or
+    /// `[base, index, displacement, imm8]`.
+    /// The immediate has the same ROUNDPS/ROUNDPD meaning as the scalar
+    /// RoundScalar family, preserving floor/ceil/trunc/rint/nearbyint modes.
+    VecRoundF64x4,
+    VecRoundF64x2,
+    VecRoundF32x8,
+    VecRoundF32x4,
+    /// Packed FP bitwise XOR: %dest_vec = args[0] ^ args[1] per lane BIT
+    /// (`vxorps`). Commutative, pure, and — crucially — NOT an FP compare
+    /// or arithmetic op: it does not signal, canonicalise NaNs, or merge
+    /// signed zeros, so it is the exact packed spelling of every
+    /// bit-manipulation idiom whose scalar form is an integer-domain XOR
+    /// on the FP bit pattern (the FP Negation family: `-x` lowers to a
+    /// sign-bit flip, identical to `x ^ -0.0` for EVERY value including
+    /// NaN payloads and ±0). AVX2 8×F32.
+    VecXorF32x8,
+    /// Packed FP bitwise XOR (see `VecXorF32x8`) - SSE 4×F32 (`xorps`).
+    VecXorF32x4,
+    /// Packed FP bitwise XOR (see `VecXorF32x8`) - AVX2 4×F64 (`vxorpd`).
+    VecXorF64x4,
+    /// Packed FP bitwise XOR (see `VecXorF32x8`) - SSE2 2×F64 (`xorpd`).
+    VecXorF64x2,
+    /// Packed IEEE minimum with x86 `MINPS/MINPD` operand semantics:
+    /// `dest[i] = args[0][i] < args[1][i] ? args[0][i] : args[1][i]`.
+    /// The SECOND operand is returned whenever a lane is unordered (NaN)
+    /// or both lanes are zero of either sign — exactly the C expression
+    /// `a < b ? a : b`, so the vectorizer's exact (non-fast-math) min/max
+    /// recognition is sound only when it preserves this operand order.
+    /// NOT commutative. AVX 8×F32.
+    VecMinF32x8,
+    /// Packed minimum (see `VecMinF32x8`) - SSE 4×F32.
+    VecMinF32x4,
+    /// Packed minimum (see `VecMinF32x8`) - AVX 4×F64.
+    VecMinF64x4,
+    /// Packed minimum (see `VecMinF32x8`) - SSE2 2×F64.
+    VecMinF64x2,
+    /// Packed maximum with `MAXPS/MAXPD` semantics:
+    /// `dest[i] = args[0][i] > args[1][i] ? args[0][i] : args[1][i]`
+    /// (second operand on unordered / both-zero). NOT commutative. AVX 8×F32.
+    VecMaxF32x8,
+    /// Packed maximum (see `VecMaxF32x8`) - SSE 4×F32.
+    VecMaxF32x4,
+    /// Packed maximum (see `VecMaxF32x8`) - AVX 4×F64.
+    VecMaxF64x4,
+    /// Packed maximum (see `VecMaxF32x8`) - SSE2 2×F64.
+    VecMaxF64x2,
+    /// Packed FP compare producing an all-ones/all-zeros lane mask:
+    /// `dest[i] = (args[0][i] PRED args[1][i]) ? ~0 : 0`. `args[2]` is the
+    /// `CMPPS` predicate immediate (0 = EQ_OQ, 1 = LT_OS, 2 = LE_OS,
+    /// 4 = NEQ_UQ; the SSE2-baseline subset, so the 128-bit form never needs
+    /// AVX's extended predicates). AVX 8×F32.
+    VecCmpF32x8,
+    /// Packed FP compare (see `VecCmpF32x8`) - SSE 4×F32.
+    VecCmpF32x4,
+    /// Packed FP compare (see `VecCmpF32x8`) - AVX 4×F64.
+    VecCmpF64x4,
+    /// Packed FP compare (see `VecCmpF32x8`) - SSE2 2×F64.
+    VecCmpF64x2,
+    /// Lane-mask select: `dest[i] = mask[i] ? args[1][i] : args[0][i]` with
+    /// `args = [false_vec, true_vec, mask]` (the `VBLENDVPS src1, src2, mask`
+    /// operand order). The 128-bit forms lower to the SSE2-baseline
+    /// `andps/andnps/orps` triple, so no SSE4.1 dependency is introduced.
+    /// AVX 8×F32.
+    VecBlendvF32x8,
+    /// Lane-mask select (see `VecBlendvF32x8`) - SSE 4×F32.
+    VecBlendvF32x4,
+    /// Lane-mask select (see `VecBlendvF32x8`) - AVX 4×F64.
+    VecBlendvF64x4,
+    /// Lane-mask select (see `VecBlendvF32x8`) - SSE2 2×F64.
+    VecBlendvF64x2,
+    /// Packed INTEGER compare: `dest[i] = (a[i] PRED b[i]) ? -1 : 0` per
+    /// dword lane, with `args = [lhs, rhs, imm]` mirroring the FP compare
+    /// argument shape. The immediate encodes the predicate (and, for the
+    /// unsigned forms, the sign-bias expansion the emitter applies):
+    ///   0 = eq, 1 = lt.s, 2 = le.s, 4 = ne,
+    ///   5 = lt.u, 6 = le.u
+    /// (the numbering echoes the vcmpps immediates; gt/ge never occur —
+    /// the map parser normalizes them by operand swap). Signed lanes lower
+    /// to vpcmpeqd/vpcmpgtd; unsigned lanes bias both operands with
+    /// `xor 0x80000000` (a monotone map on the unsigned order) and then
+    /// use the signed compare. AVX2 8×I32/U32.
+    VecCmpI32x8,
+    /// Packed integer compare (see `VecCmpI32x8`) - SSE2 4×I32/U32
+    /// (pcmpeqd/pcmpgtd; le/ne invert through a self-compare all-ones).
+    VecCmpI32x4,
+    /// Packed integer compare (see `VecCmpI32x8`) on 64-bit lanes - AVX2
+    /// 4×I64/U64 (`vpcmpeqq`/`vpcmpgtq`; the unsigned forms bias with
+    /// `xor 0x8000000000000000`).
+    VecCmpI64x4,
+    /// Packed integer compare (see `VecCmpI32x8`) on 64-bit lanes -
+    /// 2×I64/U64 (`vpcmpeqq` SSE4.1 / `vpcmpgtq` SSE4.2; produced only at
+    /// the AVX2 lowering level).
+    VecCmpI64x2,
+    /// Lane-mask select on integer dword lanes: `dest[i] = mask[i] ?
+    /// true[i] : false[i]` with `args = [false_vec, true_vec, mask]`.
+    /// vblendvps is a BITWISE dword select driven by each mask lane's
+    /// sign bit — the data bits are copied verbatim, so it is exact for
+    /// I32/U32 payloads. AVX2 8×I32/U32.
+    VecBlendvI32x8,
+    /// Lane-mask select (see `VecBlendvI32x8`) - SSE2 4×I32/U32, lowered
+    /// to the integer-domain `pand/pandn/por` triple (no SSE4.1, no
+    /// float-domain bypass delay).
+    VecBlendvI32x4,
+    /// Byte-lane conditional maps (AVX2 only, 32×I8/U8 lanes — the
+    /// `s[i] = cond ? f(s[i]) : s[i]` family over `char`/`signed char`/
+    /// `unsigned char` arrays). The whole family mirrors the dword-lane
+    /// pipeline at one-byte granularity:
+    VecLoadI8x32,
+    /// Store 32×I8/U8 (see `VecLoadI8x32`).
+    VecStoreI8x32,
+    /// 32×I8/U8 lane bitwise — vpand.
+    VecAndI8x32,
+    /// 32×I8/U8 lane bitwise — vpor.
+    VecOrI8x32,
+    /// 32×I8/U8 lane bitwise — vpxor.
+    VecXorI8x32,
+    /// Widening reduction step (AVX2): dest(I64x4 accumulator) +=
+    /// sign-extend of 4×I32 loaded from (base, byte_offset). args =
+    /// [accumulator, base, byte_offset, (constant displacement — the
+    /// vec_interleave slices)]. x86 lowering: `vpmovsxdq m128, %ymm0;
+    /// vpaddq %ymm0, acc, dest` — the load, both widenings and the fold in
+    /// two instructions, `long s += (long)int_arr[i]` at 4 elements per
+    /// step. (The former I64x2 accumulator needed a 128-bit load, two
+    /// vpmovsxdq, a vpunpckhqdq and two paddq for the same four lanes.)
+    VecWidenAddI32x4ToI64x4,
+    /// Masked widening reduction step (AVX2): dest(I64x4 accumulator) +=
+    /// sext of the 4×I32 loaded from (base, byte_offset) WHERE the lane
+    /// satisfies `lane > guard_rhs` (signed). args = [accumulator, base,
+    /// byte_offset, guard_rhs, (constant displacement)]. The lowering masks
+    /// at I32 (`emit_guarded_i32_lanes`: vpcmpgtd + vpand, or one vpmaxsd for
+    /// rhs 0), then `vpmovsxdq %xmm0, %ymm0; vpaddq` — exact because
+    /// sext(a & m) == sext(a) & sext(m) for a 0/-1 mask m. This is the
+    /// per-4-lane body of Clang 23 and ICX 2026.2.
+    VecWidenMaskedAddI32x4ToI64x4,
+    /// Widening reduction step over VALUE operands (SSE2 4-lane form):
+    /// dest(I64x2 accumulator) += sign-extend of the 4×I32 VALUE in
+    /// args[1]. args = [accumulator, vec]. Unlike the memory-shaped
+    /// VecWidenAddI32x4ToI64x4 (AVX2, load fused into the composite) the
+    /// load is a separate VecLoadI32x4 — this op is the (acc, vec)
+    /// widening add the 128-bit register-based transform builds, the same
+    /// shape as NEON's VecSadalpI32x4. x86 lowering (SSE2-only ops):
+    /// dual sign-unpack (psrad $31 + punpckldq/punpckhdq) + paddq×2 into
+    /// the accumulator, scratch confined to the reserved xmm0/xmm1/xmm2
+    /// triple (xmm2 withheld from the vector pool by the clobbers_xmm2
+    /// contract, so it is never a live home).
+    VecWidenAddValueI32x4ToI64x2,
+    /// Masked VALUE-operand widening reduction step (SSE2 4-lane form):
+    /// dest(I64x2 accumulator) += sext of the 4×I32 VALUE in args[1]
+    /// WHERE the lane satisfies `lane > guard_rhs` (signed). args =
+    /// [accumulator, vec, guard_rhs]. The x86 lowering builds the per-lane
+    /// all-ones/zero I32 mask with pcmpgtd, pand zero-masks the I32 value
+    /// BEFORE the dual sign-unpack (masking at I32 with a 0/-1 mask is
+    /// exact: sext(a & m) == sext(a) & sext(m)), then folds both widened
+    /// halves into the accumulator — the SSE2 value-shaped counterpart of
+    /// VecWidenMaskedAddI32x4ToI64x4, scratch confined to the reserved
+    /// xmm0/xmm1/xmm2 triple.
+    VecWidenMaskedAddValueI32x4ToI64x2,
+    /// SSE2 4-lane MASKED equal-width sum step: dest(I32x4 accumulator) =
+    /// accumulator + (vec lane WHERE `lane > guard_rhs` (signed), else 0).
+    /// args = [accumulator, vec, guard_rhs]. The value-shaped 128-bit
+    /// counterpart of VecMaskedAddI32x8 for the default (SSE2) target:
+    /// pcmpgtd builds the all-ones/zero lane mask, pand zero-masks the
+    /// lanes, paddd folds them (`pmaxsd` against zero replaces all three
+    /// for `lane > 0` when SSE4.1 is available: max(lane, 0) is exactly the
+    /// masked lane for every signed value). `guard_rhs` is a constant, a
+    /// loop-invariant scalar, or the vectorizer's hoisted preheader splat
+    /// (a VecBroadcastI32x4 value). Scratch: xmm0/xmm1, plus xmm2 for a
+    /// slot-homed splat (pool-withheld, see `clobbers_xmm2`).
+    VecMaskedAddValueI32x4,
+    /// Masked equal-width reduction step: dest(I32x8 accumulator) +=
+    /// 8×I32 loaded from (base, byte_offset) WHERE the lane satisfies
+    /// `lane > guard_rhs` (signed).  args = [accumulator, base,
+    /// byte_offset, guard_rhs].  The x86 lowering builds the per-lane I32
+    /// mask with vpcmpgtd (lanes > rhs), vpand zero-masks the loaded lanes
+    /// and vpaddd folds them into the accumulator — the equal-width sibling
+    /// of VecWidenMaskedAddI32x4ToI64x4.  Without it the non-widening
+    /// conditional-sum transform silently DROPPED the Select guard
+    /// (`if (a[i] > 0) s += a[i]` summed every element; regression:
+    /// tests/regression/vector_guard_sum.c).
+    VecMaskedAddI32x8,
+    /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
+    /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
+    VecMulI32x4,
+    VecMulI32x8,
+    /// NEON smax: per-lane signed max of two 4xI32 vectors (args[0], args[1]).
+    /// Integer max is associative, commutative, and idempotent, so lane-order
+    /// reduction matches sequential scalar max bit-for-bit (levkropp 8b139820).
+    VecSmaxI32x4,
+    /// Lane-wise signed minimum of two 4×I32 vectors. The SSE4.1
+    /// `pminsd` twin of `VecSmaxI32x4`; x86 producers require SSE4.1.
+    /// The SSE2-only baseline uses a compare/select pack instead.
+    VecSminI32x4,
+    /// Lane-wise unsigned dword min/max; x86 requires SSE4.1.
+    VecMinU32x4,
+    VecMaxU32x4,
+    /// NEON smaxv: horizontal signed max of 4xI32 lanes; dest = scalar I32.
+    VecHorizontalMaxI32x4,
+    /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
+    /// args[0] = scalar I32 value; dest = result vector
+    VecBroadcastI32x4,
+    VecBroadcastI32x8,
+    /// Vector store: store 4×I32 vector to memory.
+    /// dest_ptr = destination pointer; args[0] = source vector value.
+    VecStoreI32x4,
+    VecStoreI32x8,
+    /// Store 8×F32 (vmovups ymm).
+    VecStoreF32x8,
+    /// Store 4×F32.
+    VecStoreF32x4,
+    /// Store 4×F64 (vmovupd ymm).
+    VecStoreF64x4,
+    /// Store 2×F64 (movupd xmm).
+    VecStoreF64x2,
+    /// Load two signed I32 lanes and widen to two I64 lanes.
+    VecLoadWidenI32ToI64x2,
+    /// Load two I64 lanes (movdqu).
+    VecLoadI64x2,
+    VecAddI64x2,
+    VecMulI64x2,
+    /// Integer map-loop lane ops (x86; produced by the vectorizer's map
+    /// analyzer for `d[i] = a[i] OP b[i]` and `d[i] = a[i] OP c`).
+    /// I32/U32: AVX2 `vp{sub,and,or,xor}d` (x8) and SSE2 `p{sub,and,or,xor}`
+    /// (x4). I64/U64: SSE2 `psubq` (x2).
+    ///
+    /// Operand contract, identical to `VecAdd*`/`VecMul*`: args[0] = src1,
+    /// args[1] = src2, dest = result. `Sub` is `src1 - src2` lane-wise and
+    /// **non-commutative** — the emitter passes `commutative = false`, so a
+    /// folded memory operand is only legal in the src2 position
+    /// (`vpsubd mem, %ymm_src1, %ymm_dst`). And/Or/Xor are bit-exact,
+    /// commutative and element-type agnostic; they carry `I32` in the name
+    /// only so the allocator's per-family register classes stay consistent
+    /// with the loads and stores around them.
+    ///
+    /// Two's-complement wraparound of `psubd`/`psubq` matches the scalar IR
+    /// `Sub` for both signednesses: `unsigned` wraps by definition, and
+    /// signed overflow is UB in C so wrapping is a valid refinement.
+    VecSubI32x4,
+    VecSubI32x8,
+    VecSubI64x2,
+    VecAndI32x4,
+    /// AVX2 signed-saturating pack of two I32x8 values into I16x16.
+    /// Independent 128-bit halves, matching vpackssdw lane order.
+    /// args = [first I32x8, second I32x8]; dest = pure 256-bit SSA value.
+    VecPackssdwI16x16,
+    VecAndI32x8,
+    VecOrI32x4,
+    VecOrI32x8,
+    VecXorI32x4,
+    VecXorI32x8,
+    VecStoreI64x2,
+    VecBroadcastI64x2,
+    VecLoadI64x4,
+    VecAddI64x4,
+    VecHorizontalAddI64x4,
+    VecZeroI64x4,
+    /// Store 4×I64/U64 lanes (vmovdqu ymm). BB-SLP sink for 32-byte
+    /// consecutive-field copy chains (the 4×u64 struct-copy epic).
+    /// args = [vector value, base ptr, byte offset] (SIB store form) or
+    /// dest_ptr + args = [vector value].
+    VecStoreI64x4,
+    /// Lane-wise 4×I64 subtract (`vpsubq`, AVX2). Non-commutative:
+    /// args[0] - args[1] per lane, operand order preserved.
+    VecSubI64x4,
+    /// Lane-wise 4×I64 bitwise (vpand/vpor/vpxor, AVX2). Commutative,
+    /// bit-exact, element-type agnostic.
+    VecAndI64x4,
+    VecOrI64x4,
+    VecXorI64x4,
+    /// Broadcast one scalar I64/U64 to all 4 lanes (movq + vpbroadcastq).
+    VecBroadcastI64x4,
+    /// Lane-wise 2×I64/U64 bitwise (pand/por/pxor, SSE2). Commutative.
+    VecAndI64x2,
+    VecOrI64x2,
+    VecXorI64x2,
+    /// Load 8×I16/U16 lanes (movdqu xmm). BB-SLP halfword copy chains.
+    VecLoadI16x8,
+    /// Store 8×I16/U16 lanes (movdqu xmm).
+    VecStoreI16x8,
+    /// Lane-wise 8×I16 bitwise (pand/por/pxor, SSE2).
+    VecAndI16x8,
+    VecOrI16x8,
+    VecXorI16x8,
+    /// Load 16×I8/U8 lanes (movdqu xmm). BB-SLP byte copy chains.
+    VecLoadI8x16,
+    /// Store 16×I8/U8 lanes (movdqu xmm).
+    VecStoreI8x16,
+    /// Lane-wise 16×I8 bitwise (pand/por/pxor, SSE2).
+    VecAndI8x16,
+    VecOrI8x16,
+    VecXorI8x16,
+    /// Gather two scalar I64/U64 GPR values into one 2-lane vector
+    /// (movq + movq + punpcklqdq, SSE2-exact). args = [lo, hi].
+    VecPackI64x2,
+    /// Gather two scalar F64 values into one 2-lane vector (bit-identical
+    /// register choreography to VecPackI64x2). args = [lo, hi].
+    VecPackF64x2,
+    /// HALF-WIDE BB-SLP dword-pair family. The register shape is the full
+    /// I32x4 XMM register (16 bytes — every lane-independent op between
+    /// the endpoints is the ordinary `Vec*I32x4` intrinsic, so the value
+    /// web stays one family); only the MEMORY endpoints are 64-bit:
+    /// `VecLoadI32x4Pair` loads two consecutive dwords into lanes 0/1
+    /// with the upper 64 bits ZEROED (VEX/SSE `movq` xmm, m64 — both
+    /// encodings clear the high half, so the upper lanes hold
+    /// deterministic zeros, never stale register content). Emitted by
+    /// the BB-SLP `PackKind::MemLoad` for 2-lane dword runs — GCC's
+    /// SHA-256 message-schedule form (`vmovq` pair loads feeding
+    /// `vpsrld/vpxor/vpaddd`). args = [base, offset-const] like every
+    /// `VecLoad*`.
+    VecLoadI32x4Pair,
+    /// Read exactly args[4] consecutive bytes (constant 3 or 4), widen
+    /// unsigned bytes to dwords, then permute using args[3]'s PSHUFD immediate.
+    /// args = [base,index,disp,pattern,count]. Three-byte accesses use 2+1
+    /// bytes, never an overreading dword load; physical lane 3 is then zero.
+    VecLoadWidenU8ToI32x4,
+    /// HALF-WIDE store: writes lanes 0/1 of the I32x4-shaped source
+    /// register to memory as 8 bytes (`movq` xmm, m64; the upper lanes
+    /// are never observable). The BB-SLP seed-store sink for 2-lane
+    /// dword runs. args = [vector, base, offset-const] (SIB form) or
+    /// dest_ptr + args = [vector].
+    VecStoreI32x4Pair,
+    /// Joint four-byte store from four dwords proven in [0,255]. Control
+    /// (args[4]) selects the reduction/output lane (bits 0..1) and whether
+    /// it has an independent fourth input (bit 2). Otherwise that lane is
+    /// a duplicate of the first non-reduction lane. args = [vec,base,index,disp,control].
+    /// Write exactly four bytes; never a full vector-width memory access.
+    VecStoreNarrowMaxU8x4,
+    /// Register-result counterpart of the joint byte store: pack four
+    /// byte-bounded dwords, replace the selected byte by their max, return
+    /// the packed U32 in a GPR. args = [vector, control].
+    VecNarrowMaxU8x4,
+    /// Widen four byte fields of one scalar U32, then PSHUFD by args[1].
+    /// args = [scalar,pattern]; result is four zero-extended U32 lanes.
+    VecWidenByteFieldsI32x4,
+    /// HALF-WIDE gather: two scalar dwords into lanes 0/1 with the upper
+    /// 64 bits zeroed (`movd` clears bits 32..127, then `pinsrd $1`).
+    /// args = [lo, hi]. The 2-lane fallback for dword seeds whose lanes
+    /// are not consecutive-address loads (constants, register values).
+    VecPackI32x4Pair,
+    /// Extract one I64/U64 lane as a GPR scalar (movq / pshufd+movq).
+    /// args = [vector, Const(lane)].
+    VecExtractLaneI64x2,
+    /// Extract one I64/U64 lane of a 256-bit I64x4 source as a GPR
+    /// scalar. Lanes 0/1 read the low 128 bits (the XMM alias of the
+    /// YMM home); lanes 2/3 stage the high half with `vextracti128`.
+    /// Unlocks BB-SLP seeds with externally-used lanes on the 4×i64
+    /// copy family.
+    VecExtractLaneI64x4,
+    /// Extract one F64 lane of a 256-bit F64x4 source as an F64 scalar
+    /// (same half-selection choreography).
+    VecExtractLaneF64x4,
+    /// Extract one F32 lane of an F32x4 source as an F32 scalar (lane 0:
+    /// direct `movss`; lanes 1-3: `pshufd` select first). args = [vector,
+    /// Const(lane)].
+    VecExtractLaneF32x4,
+    /// Extract one F32 lane of a 256-bit F32x8 source as an F32 scalar:
+    /// lanes 0-3 read the low half (XMM alias), lanes 4-7 stage the high
+    /// half with `vextractf128`.
+    VecExtractLaneF32x8,
+    /// Extract one I32/U32 lane of a 256-bit I32x8 source as a GPR scalar
+    /// (`pextrd` from the staged half; SSE2 fallback `pshufd`+`movd`).
+    VecExtractLaneI32x8,
+    /// Extract one I16/U16 lane of an I16x8 source as a GPR scalar
+    /// (`pextrw`, SSE2 baseline). args = [vector, Const(lane)].
+    VecExtractLaneI16x8,
+    /// Extract one I16/U16 lane of a 256-bit I16x16 source as a GPR
+    /// scalar (half staging then `pextrw` of the in-half lane).
+    VecExtractLaneI16x16,
+    /// Extract one F64 lane as an XMM scalar (lane 0: movq; lane 1:
+    /// pshufd $0x0E first). args = [vector, Const(lane)].
+    VecExtractLaneF64x2,
+    /// Byte sum-of-absolute-differences: `dest = SAD(args[0], args[1])` —
+    /// for each 8-byte group, the sum of `|a[i] - b[i]|` as a u64 lane
+    /// (4×u64 per YMM; `vpsadbw`).  COMMUTATIVE (sum of absolute
+    /// differences).  The byte-predicate COUNTING reduction uses it against
+    /// an all-zero vector: with lanes in {0, 1} the u64 lanes hold the exact
+    /// per-group counts — the classic strlen/memchr/ctype-classifier
+    /// vectorization (`vpcmpeqb` + `vpand` + `vpsadbw`).  The Adler-32
+    /// loop epic uses it against the zero as the `vs1` partial-sum
+    /// generator (bytes are non-negative, so `|b − 0| = b`).
+    VecSadbwU8x32,
+    /// 128-bit twin of [`Self::VecSadbwU8x32`] (`psadbw`, SSE2 baseline):
+    /// two u64 group sums per XMM.  COMMUTATIVE.  The byte-sum and
+    /// byte-predicate counting reductions use it against an all-zero
+    /// vector on targets without 256-bit integer vectors.
+    VecSadbwU8x16,
+    /// Packed byte×byte pair multiply-add (`vpmaddubsw`, SSSE3/AVX2):
+    /// `dest = Maddubs(args[0], args[1])` — for each byte pair, the
+    /// i16 sum `args[0][2i] * args[1][2i] + args[0][2i+1] * args[1][2i+1]`
+    /// (16×i16 per YMM).  NON-COMMUTATIVE: args[0] is UNSIGNED bytes,
+    /// args[1] is SIGNED bytes (the ISA's operand contract), and the two
+    /// roles are not interchangeable.  The Adler-32 loop epic pairs
+    /// args[0] = the byte stream with args[1] = the .rodata weight table
+    /// `[32, 31, ..., 1]` (folded rip-relative in the src2 slot), which
+    /// computes the exact `(32-l)·b_l` weighted contribution of s2.
+    VecMaddubsU8x32,
+    /// Packed word pair multiply-add (`vpmaddwd`, SSE2/AVX2):
+    /// `dest = Maddwd(args[0], args[1])` — for each adjacent word pair,
+    /// the i32 sum `args[0][2i] * args[1][2i] + args[0][2i+1] * args[1][2i+1]`
+    /// (8×i32 per YMM).  Marked NON-commutative for operand-order
+    /// discipline (the ISA result is symmetric, but keeping the explicit
+    /// order matches the maddubs contract and the fold gate below).  The
+    /// Adler-32 loop epic pairs args[0] = the maddubs word products with
+    /// args[1] = an all-ones vector, horizontal-summing the weighted byte
+    /// pairs into dword lanes.
+    VecMaddwdI16x16,
+    /// 32-byte constant vector from 32 const byte args (Adler-32 weights
+    /// `[32..1]`, the i16 ones table, the lane-0 mask `[~0, 0, 0, 0]`):
+    /// `dest = ConstBytes(args[0..32])`.  Emitted exclusively in preheaders
+    /// by loop epics; the codegen materialises the byte pattern once in
+    /// `.rodata` (`.LCVEC_n`, the v6 FP-neg const pool) and loads or
+    /// register-homes it, so every consumer downstream sees an ordinary
+    /// 256-bit value.  args MUST be 32 `Operand::Const` values — a
+    /// non-constant operand is an invariant violation and fails loudly.
+    VecConstI8x32,
+
+    /// NEON sadalp: sign-extend 4×I32 lanes and accumulate adjacent pairs into
+    /// a 2×I64 accumulator: dest = args[0] + pairwise_sums(args[1]).
+    /// Integer addition is associative, so this matches sequential scalar order.
+    VecSadalpI32x4,
+    /// NEON smlal (low half): dest = args[0] + widen_mul(low2(args[1]), low2(args[2]))
+    /// where args[1]/args[2] are 4×I32 vectors and the accumulator is 2×I64.
+    VecSmlalLoI32x4,
+    /// NEON smlal2 (high half): same as VecSmlalLoI32x4 but for lanes 2-3.
+    VecSmlalHiI32x4,
+
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 4×F64 → F64
+    /// args[0] = source vector value; dest = scalar F64 result
+    VecHorizontalAddF64x4,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 2×F64 → F64
+    /// args[0] = source vector value; dest = scalar F64 result
+    VecHorizontalAddF64x2,
+    /// Strict source-order four-lane reciprocal multiply-add for computed
+    /// integer denominators. Arguments are `[acc, d0, d1, d2, d3, base,
+    /// byte_offset, scratch]`; it evaluates `acc + (1.0/(double)d0)*base[0]`
+    /// through lane 3 in that exact order. Unlike a horizontal reduction, it
+    /// never forms a reassociated FP addition tree. Private 32-byte `scratch`
+    /// stages SSE2 products; AVX2 needs it only without a scalar XMM home.
+    /// x86-64 SSE2 (two packets) or AVX2; emitted solely by the strict
+    /// computed-reduction pass. Scratch needs only 16-byte alignment.
+    StrictRecipMulAddF64x4,
+    /// Same ordered FP contract, with four already-packed signed I32 lanes.
+    /// Args: [acc, packed_denominator, base, byte_offset, scratch]. The vector
+    /// input is exactly 128 bits, never a 256-bit load. Scalar F64 result;
+    /// only xmm0/ymm0 and xmm1/ymm1 are scratch. x86-64 SSE2 or AVX2.
+    /// SSE2 converts two pairs; AVX2 converts all four lanes at once.
+    /// Four products are added in source order, without horizontal reassociation.
+    StrictRecipMulAddPackedF64x4,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
+    /// args[0] = source vector value; dest = scalar I32 result
+    VecHorizontalAddI32x8,
+    /// AVX2 lane-wise signed max: %dest_vec = max(%src1_vec, %src2_vec) per
+    /// lane, 8×I32 (vpmaxsd). args[0] = src1, args[1] = src2; dest = result.
+    /// Signed max is associative, commutative, and idempotent, so lane-wise
+    /// reduction matches the scalar max bit-for-bit (same property NEON's
+    /// smax relies on for the I32x4 path).
+    VecMaxI32x8,
+    /// AVX2 lane-wise signed min: %dest_vec = min(%src1_vec, %src2_vec) per
+    /// lane, 8×I32 (vpminsd). args[0] = src1, args[1] = src2; dest = result.
+    /// The map vectorizer's integer min/max fold produces it from exact
+    /// ternary shapes (`l < r ? l : r` and friends — no FP special cases).
+    VecMinI32x8,
+    /// Lane-wise unsigned dword min/max, AVX2 8xU32.
+    VecMinU32x8,
+    VecMaxU32x8,
+    // ---- Byte-lane (I8/U8) map ops -------------------------------------
+    //
+    // The byte casefold / char-class family (`gzip`, `expat`, `curl`
+    // parsers) computes in 8-bit lanes: 32 elements per YMM instead of the
+    // 8 a promoted `int` tree gets.  Only the ops whose MACHINE ENCODING is
+    // lane-width-specific are given byte variants; the bit-level ops
+    // (`VecAnd/Or/XorI32x*`), the unaligned loads/stores
+    // (`VecLoad/StoreI32x*`) and the zero idiom are BIT-EXACT at every lane
+    // width and are deliberately reused.  Duplicating them under an `I8`
+    // name would add enum surface, allocator table rows and emitter arms
+    // for literally the same instruction.
+    //
+    /// AVX2 lane-wise byte add: 32×I8/U8 (`vpaddb`).  args[0] = src1,
+    /// args[1] = src2.  Two's-complement wraparound per byte, which is
+    /// exactly the semantics the demotion analysis relies on: the low 8
+    /// bits of a wider add depend only on the low 8 bits of its operands.
+    VecAddI8x32,
+    /// SSE2 lane-wise byte add: 16×I8/U8 (`paddb`).
+    VecAddI8x16,
+    /// AVX2 lane-wise byte subtract: 32×I8/U8 (`vpsubb`).  Non-commutative:
+    /// `dest = src1 - src2`.
+    VecSubI8x32,
+    /// SSE2 lane-wise byte subtract: 16×I8/U8 (`psubb`).
+    VecSubI8x16,
+    /// AVX2 packed byte compare, 32 lanes: `dest[i] = (a[i] PRED b[i]) ? -1 : 0`.
+    /// `args = [a, b, imm]` with the SAME predicate vocabulary as
+    /// `VecCmpI32x8` (0=eq, 1=lt.s, 2=le.s, 4=ne, 5=lt.u, 6=le.u), lowered
+    /// to `vpcmpeqb`/`vpcmpgtb` (the unsigned forms bias both operands by
+    /// 0x80 per byte first, exactly as the dword path biases by 0x8000_0000).
+    VecCmpI8x32,
+    /// SSE2 packed byte compare, 16 lanes (`pcmpeqb`/`pcmpgtb`).
+    VecCmpI8x16,
+    /// AVX2 lane-wise UNSIGNED byte min: 32×U8 (`vpminub`).  Unlike the dword
+    /// case, unsigned byte min/max IS in the SSE2 baseline, so the byte clamp
+    /// idiom needs no SSE4.1 and no compare/blend pair at either width.
+    VecMinU8x32,
+    /// SSE2 lane-wise unsigned byte min: 16×U8 (`pminub`).
+    VecMinU8x16,
+    /// AVX2 lane-wise unsigned byte max: 32×U8 (`vpmaxub`).
+    VecMaxU8x32,
+    /// SSE2 lane-wise unsigned byte max: 16×U8 (`pmaxub`).
+    VecMaxU8x16,
+    /// AVX2 per-BYTE lane select keyed on each mask byte's sign bit:
+    /// `vpblendvb`.  args = [false, true, mask]; dest = result.  The dword
+    /// blend (`vblendvps`) cannot serve here — it consults one sign bit per
+    /// 32-bit lane, so it would smear a byte mask across four bytes.
+    VecBlendvI8x32,
+    /// SSE4.1 `pblendvb` when available, otherwise the SSE2 bitwise select
+    /// `(true & mask) | (false & ~mask)`: 16×I8/U8.
+    VecBlendvI8x16,
+    /// AVX2 lane-wise SIGNED byte min: 32×I8 (`vpminsb`).  Unlike the
+    /// unsigned forms this is SSE4.1/AVX2 only, so it is gated on AVX2 and
+    /// has no 128-bit twin -- the SSE2 baseline keeps the compare+blend form.
+    VecMinI8x32,
+    /// AVX2 lane-wise SIGNED byte max: 32×I8 (`vpmaxsb`).
+    VecMaxI8x32,
+    /// AVX2 byte splat from a GPR/XMM lane: 32×I8 (`vpbroadcastb`).
+    ///
+    /// Only needed for RUNTIME byte invariants; a CONSTANT byte reaches all
+    /// 32 lanes for free through `VecBroadcastI32x8` of `b * 0x01010101`
+    /// (see `replicate_byte`), which is why the byte map path went so long
+    /// without this op.
+    VecBroadcastI8x32,
+    /// SSE2 byte splat: 16×I8.  `pshufb` is SSSE3, so the baseline lowering
+    /// is `movd` + `punpcklbw` + `punpcklwd` + `pshufd`, which is exact on
+    /// every x86-64 target.
+    VecBroadcastI8x16,
+    // ---- Word-lane (I16/U16) map ops -----------------------------------
+    //
+    // Same demotion machinery as the byte lanes (OP-05d), one width up: 16
+    // elements per YMM.  Audio samples, 16-bit image channels and the
+    // `unsigned short` tables in codecs all live here.  Again only the ops
+    // whose ENCODING is width-specific get variants; the bitwise ops, the
+    // unaligned load/store and the zero idiom are reused.
+    //
+    /// AVX2 lane-wise word add: 16×I16/U16 (`vpaddw`).
+    VecAddI16x16,
+    /// SSE2 lane-wise word add: 8×I16/U16 (`paddw`).
+    VecAddI16x8,
+    /// AVX2 lane-wise word subtract: 16×I16/U16 (`vpsubw`).
+    VecSubI16x16,
+    /// SSE2 lane-wise word subtract: 8×I16/U16 (`psubw`).
+    VecSubI16x8,
+    /// AVX2 unsigned saturating word subtract: 16×U16 (`vpsubusw`).
+    VecSubSatU16x16,
+    /// SSE2 unsigned saturating word subtract: 8×U16 (`psubusw`).
+    VecSubSatU16x8,
+    /// AVX2 lane-wise word multiply, low half: 16×I16/U16 (`vpmullw`).
+    /// Unlike bytes, words DO have a packed multiply, and it is low-half
+    /// exact for both signednesses.
+    VecMulI16x16,
+    /// SSE2 lane-wise word multiply, low half: 8×I16/U16 (`pmullw`).
+    VecMulI16x8,
+    /// AVX2 word bitwise and: 16×I16/U16 (`vpand`); same register-file
+    /// shape as the dword/byte forms.
+    VecAndI16x16,
+    /// AVX2 word bitwise or: 16×I16/U16 (`vpor`).
+    VecOrI16x16,
+    /// AVX2 word bitwise xor: 16×I16/U16 (`vpxor`).
+    VecXorI16x16,
+    /// AVX2 unaligned word load: 32 contiguous bytes → 16×I16/U16
+    /// (`vmovdqu %ymm`). The BB-SLP halfword-family endpoint.
+    VecLoadI16x16,
+    /// AVX2 unaligned word store: 16×I16/U16 → 32 contiguous bytes
+    /// (`vmovdqu %ymm`).
+    VecStoreI16x16,
+    /// AVX2 packed word compare, 16 lanes (`vpcmpeqw`/`vpcmpgtw`), same
+    /// predicate immediates as `VecCmpI32x8`; the unsigned forms bias both
+    /// operands by 0x8000 per word.
+    VecCmpI16x16,
+    /// SSE2 packed word compare, 8 lanes (`pcmpeqw`/`pcmpgtw`).
+    VecCmpI16x8,
+    /// AVX2 lane-wise SIGNED word min: 16×I16 (`vpminsw`) -- SSE2 baseline.
+    VecMinI16x16,
+    /// SSE2 lane-wise signed word min: 8×I16 (`pminsw`).
+    VecMinI16x8,
+    /// AVX2 lane-wise SIGNED word max: 16×I16 (`vpmaxsw`) -- SSE2 baseline.
+    VecMaxI16x16,
+    /// SSE2 lane-wise signed word max: 8×I16 (`pmaxsw`).
+    VecMaxI16x8,
+    /// AVX2 lane-wise UNSIGNED word min: 16×U16 (`vpminuw`) -- SSE4.1, so
+    /// AVX2-only; the 128-bit path keeps compare+blend.
+    VecMinU16x16,
+    /// AVX2 lane-wise unsigned word max: 16×U16 (`vpmaxuw`) -- SSE4.1.
+    VecMaxU16x16,
+    /// AVX2 per-BYTE lane select used for word masks: `vpblendvb` selects on
+    /// each byte's sign bit, and a word compare sets all 16 bits of a lane,
+    /// so both bytes of every lane carry the same sign bit and the blend is
+    /// exact at word granularity.
+    VecBlendvI16x16,
+    /// SSE2 bitwise select for word masks (per-bit, hence exact).
+    VecBlendvI16x8,
+    /// AVX2 word splat from a GPR lane: 16×I16 (`vpbroadcastw`).
+    VecBroadcastI16x16,
+    /// SSE2 word splat: 8×I16 (`movd` + `punpcklwd` + `pshufd`).
+    VecBroadcastI16x8,
+    // -- BB-SLP packed lane shifts (uniform CONSTANT amount) -------------
+    // `dest[i] = args[0][i] OP amount` for every lane i, with args[1] a
+    // CONSTANT in [1, lane_bits-1] (0 is the identity and folds away; the
+    // range is the defined C domain, so the immediate form is lane-exact
+    // against the scalar lowering by construction). No packed BYTE shift
+    // exists before AVX-512 and no packed I64 arithmetic right shift
+    // exists before AVX-512, so those (type, op) pairs have no intrinsic
+    // and the SLP pack builder rejects the lanes.
+    /// AVX2 word logical shift left: 16×I16 by a constant (`vpsllw $imm`).
+    VecShlI16x16,
+    /// SSE2 word logical shift left: 8×I16 by a constant (`psllw $imm`).
+    VecShlI16x8,
+    /// AVX2 word logical shift right: 16×I16 (`vpsrlw $imm`).
+    VecLShrI16x16,
+    /// SSE2 word logical shift right: 8×I16 (`psrlw $imm`).
+    VecLShrI16x8,
+    /// AVX2 word arithmetic shift right: 16×I16 (`vpsraw $imm`).
+    VecAShrI16x16,
+    /// SSE2 word arithmetic shift right: 8×I16 (`psraw $imm`).
+    VecAShrI16x8,
+    /// AVX2 dword logical shift left: 8×I32 (`vpslld $imm`).
+    VecShlI32x8,
+    /// SSE2 dword logical shift left: 4×I32 (`pslld $imm`).
+    VecShlI32x4,
+    /// AVX2 dword logical shift right: 8×I32 (`vpsrld $imm`).
+    VecLShrI32x8,
+    /// SSE2 dword logical shift right: 4×I32 (`psrld $imm`).
+    VecLShrI32x4,
+    /// AVX2 dword arithmetic shift right: 8×I32 (`vpsrad $imm`).
+    VecAShrI32x8,
+    /// SSE2 dword arithmetic shift right: 4×I32 (`psrad $imm`).
+    VecAShrI32x4,
+    /// AVX2 qword logical shift left: 4×I64 (`vpsllq $imm`).
+    VecShlI64x4,
+    /// SSE2 qword logical shift left: 2×I64 (`psllq $imm`).
+    VecShlI64x2,
+    /// AVX2 qword logical shift right: 4×I64 (`vpsrlq $imm`).
+    VecLShrI64x4,
+    /// SSE2 qword logical shift right: 2×I64 (`vpsrlq $imm`).
+    VecLShrI64x2,
+    /// AVX2 per-lane variable dword shift left: 8×I32 (`vpsllvd`);
+    /// `args[0] << args[1]` lane-wise, counts ≥ 32 yield 0.
+    VecShlvI32x8,
+    /// AVX2 per-lane variable dword logical shift right: 8×I32 (`vpsrlvd`).
+    VecLShrvI32x8,
+    /// AVX2 per-lane variable dword arithmetic shift right: 8×I32
+    /// (`vpsravd`); counts ≥ 32 yield the sign fill.
+    VecAShrvI32x8,
+    /// AVX2 per-lane variable qword shift left: 4×I64 (`vpsllvq`).
+    VecShlvI64x4,
+    /// AVX2 per-lane variable qword logical shift right: 4×I64 (`vpsrlvq`).
+    /// (There is no `vpsravq` below AVX-512VL, so no arithmetic twin.)
+    VecLShrvI64x4,
+    /// AVX2 VEX.128 per-lane variable dword shift left: 4×I32 (`vpsllvd`).
+    VecShlvI32x4,
+    /// AVX2 VEX.128 per-lane variable dword logical shift right: 4×I32.
+    VecLShrvI32x4,
+    /// AVX2 VEX.128 per-lane variable dword arithmetic shift right: 4×I32.
+    VecAShrvI32x4,
+    /// AVX2 VEX.128 per-lane variable qword shift left: 2×I64 (`vpsllvq`).
+    VecShlvI64x2,
+    /// AVX2 VEX.128 per-lane variable qword logical shift right: 2×I64.
+    VecLShrvI64x2,
+    /// AVX2 horizontal signed max: %scalar = max over all 8 I32 lanes of the
+    /// source vector. x86 has no single smaxv; the lowering folds the 8 lanes
+    /// with vextracti128 + vpmaxsd + vpshufd + vpmaxsd pairs, ending in vmovd
+    /// to the dest GPR. args[0] = source vector value; dest = scalar I32.
+    VecHorizontalMaxI32x8,
+    /// AVX2 horizontal signed min: %scalar = min over all 8 I32 lanes of the
+    /// source vector. The mirror of `VecHorizontalMaxI32x8`: three `vpminsd`
+    /// folds (vextracti128 + two vpshufd lane permutes) ending in `vmovd`.
+    /// The lane PERMUTE is load-bearing here too - a zero-filling `vpsrldq`
+    /// would fold in a synthetic lane 0 and turn the min of all-positive
+    /// data into 0, exactly as it turns an all-negative max into 0.
+    VecHorizontalMinI32x8,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
+    /// args[0] = source vector value; dest = scalar I32 result
+    VecHorizontalAddI32x4,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×F32 → F32
+    VecHorizontalAddF32x8,
+    /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×F32 → F32
+    VecHorizontalAddF32x4,
+    VecHorizontalAddI64x2,
+    /// Vector zero: %dest_vec = {0.0, 0.0, 0.0, 0.0} - AVX2 4×F64
+    /// No args; dest = zero vector
+    VecZeroF64x4,
+    /// Vector zero: %dest_vec = {0.0, 0.0} - SSE2 2×F64
+    /// No args; dest = zero vector
+    VecZeroF64x2,
+    /// Vector zero: %dest_vec = {0, 0, 0, 0, 0, 0, 0, 0} - AVX2 8×I32
+    /// No args; dest = zero vector
+    VecZeroI32x8,
+    /// Vector zero: %dest_vec = {0, 0, 0, 0} - SSE2 4×I32
+    /// No args; dest = zero vector
+    VecZeroI32x4,
+    /// Vector zero: AVX2 8×F32
+    VecZeroF32x8,
+    /// Vector zero: SSE2 4×F32
+    VecZeroF32x4,
+    VecZeroI64x2,
+    /// AES-NI: aesenc (single round encrypt)
+    /// args[0] = state ptr, args[1] = round key ptr; dest_ptr = result ptr
+    Aesenc128,
+    /// AES-NI: aesenclast (final round encrypt)
+    Aesenclast128,
+    /// AES-NI: aesdec (single round decrypt)
+    Aesdec128,
+    /// AES-NI: aesdeclast (final round decrypt)
+    Aesdeclast128,
+    /// AES-NI: aesimc (inverse mix columns)
+    /// args[0] = input ptr; dest_ptr = result ptr
+    Aesimc128,
+    /// AES-NI: aeskeygenassist with immediate
+    /// args[0] = input ptr, args[1] = imm8; dest_ptr = result ptr
+    Aeskeygenassist128,
+    /// CLMUL: pclmulqdq with immediate
+    /// args[0] = src1 ptr, args[1] = src2 ptr, args[2] = imm8; dest_ptr = result ptr
+    Pclmulqdq128,
+    /// SSE2 byte shift left (PSLLDQ): shift by imm8 bytes
+    /// args[0] = src ptr, args[1] = imm8; dest_ptr = result ptr
+    Pslldqi128,
+    /// SSE2 byte shift right (PSRLDQ): shift by imm8 bytes
+    Psrldqi128,
+    /// SSE2 bit shift left per 64-bit lane (PSLLQ)
+    /// args[0] = src ptr, args[1] = count; dest_ptr = result ptr
+    Psllqi128,
+    /// SSE2 bit shift right per 64-bit lane (PSRLQ)
+    Psrlqi128,
+    /// SSE2 shuffle 32-bit integers (PSHUFD)
+    /// args[0] = src ptr, args[1] = imm8; dest_ptr = result ptr
+    Pshufd128,
+    /// Load low 64 bits, zero upper (MOVQ)
+    /// args[0] = src ptr; dest_ptr = result ptr
+    Loadldi128,
+
+    // --- SSE2 packed 16-bit integer operations ---
+    /// Packed 16-bit add (PADDW)
+    Paddw128,
+    /// Packed 16-bit subtract (PSUBW)
+    Psubw128,
+    /// Packed 8-bit add (PADDB)
+    Paddb128,
+    /// Packed 8-bit subtract (PSUBB)
+    Psubb128,
+    /// Packed unsigned 16-bit saturating subtract (PSUBUSW)
+    Psubusw128,
+    /// Sum of absolute differences of unsigned bytes (PSADBW)
+    Psadbw128,
+    /// Packed low 16-bit multiply (PMULLW)
+    Pmullw128,
+    /// Packed multiply unsigned/signed bytes, horizontal add pairs (PMADDUBSW, SSSE3)
+    Pmaddubsw128,
+    /// Packed 16-bit horizontal add (PHADDW, SSSE3)
+    Phaddw128,
+    /// Packed 32-bit horizontal add (PHADDD, SSSE3)
+    Phaddd128,
+    Phsubw128,
+    Phsubd128,
+    Phaddsw128,
+    Phsubsw128,
+    Psignb128,
+    Psignw128,
+    Psignd128,
+    Pmulhrsw128,
+    /// Packed byte shuffle (PSHUFB, SSSE3)
+    Pshufb128,
+    /// Packed absolute value bytes (PABSB, SSSE3)
+    Pabsb128,
+    /// Packed absolute value words (PABSW, SSSE3)
+    Pabsw128,
+    /// Packed absolute value dwords (PABSD, SSSE3)
+    Pabsd128,
+    /// Concatenate shift-in bytes (PALIGNR, SSSE3)
+    Palignr128,
+    /// Packed max unsigned bytes (PMAXUB)
+    Pmaxub128,
+    /// Packed min unsigned bytes (PMINUB)
+    Pminub128,
+    /// Packed variable blend bytes (PBLENDVB, SSE4.1)
+    Pblendvb128,
+    /// Packed blend 16-bit words with immediate (PBLENDW, SSE4.1)
+    Pblendw128,
+    /// Packed zero-extend 8-bit to 16-bit (PMOVZXBW, SSE4.1)
+    Pmovzxbw128,
+    /// Packed zero-extend 16-bit to 32-bit (PMOVZXWD, SSE4.1)
+    Pmovzxwd128,
+    /// Packed 16-bit variable shift left (PSLLW)
+    Psllw128,
+    /// Packed 16-bit variable shift right (PSRLW)
+    Psrlw128,
+    /// Packed 16-bit multiply high (PMULHW)
+    Pmulhw128,
+    /// Packed 16-bit multiply-add to 32-bit (PMADDWD)
+    Pmaddwd128,
+    /// Packed 16-bit compare greater-than (PCMPGTW)
+    Pcmpgtw128,
+    /// Packed 8-bit compare greater-than (PCMPGTB)
+    Pcmpgtb128,
+    /// Packed 16-bit shift left by imm (PSLLW)
+    Psllwi128,
+    /// Packed 16-bit shift right logical by imm (PSRLW)
+    Psrlwi128,
+    /// Packed 16-bit shift right arithmetic by imm (PSRAW)
+    Psrawi128,
+    /// Packed 32-bit shift right arithmetic by imm (PSRAD)
+    Psradi128,
+    /// Packed 32-bit shift left by imm (PSLLD)
+    Pslldi128,
+    /// Packed 32-bit shift right logical by imm (PSRLD)
+    Psrldi128,
+
+    // --- SSE2 packed 32-bit integer operations ---
+    /// Packed 32-bit add (PADDD)
+    Paddd128,
+    /// Packed 32-bit subtract (PSUBD)
+    Psubd128,
+
+    // --- SSE2 pack/unpack operations ---
+    /// Pack 32-bit to 16-bit signed saturate (PACKSSDW)
+    Packssdw128,
+    /// Pack 16-bit to 8-bit signed saturate (PACKSSWB)
+    Packsswb128,
+    /// Pack 16-bit to 8-bit unsigned saturate (PACKUSWB)
+    Packuswb128,
+    /// Unpack and interleave low 8-bit (PUNPCKLBW)
+    Punpcklbw128,
+    /// Unpack and interleave high 8-bit (PUNPCKHBW)
+    Punpckhbw128,
+    /// Unpack and interleave low 16-bit (PUNPCKLWD)
+    Punpcklwd128,
+    /// Unpack and interleave high 16-bit (PUNPCKHWD)
+    Punpckhwd128,
+
+    // --- SSE2 set/insert/extract/convert operations ---
+    /// Set all 16-bit lanes to value (splat)
+    SetEpi16,
+    /// Insert 16-bit value at lane (PINSRW)
+    Pinsrw128,
+    /// Extract 16-bit value at lane (PEXTRW) - returns scalar i32
+    Pextrw128,
+    /// Store low 64 bits to memory (MOVQ store)
+    Storeldi128,
+    /// Convert low 32-bit of __m128i to int (MOVD) - returns scalar i32
+    Cvtsi128Si32,
+    /// Convert int to __m128i with zero extension (MOVD)
+    Cvtsi32Si128,
+    /// Convert low 64-bit of __m128i to long long - returns scalar i64
+    Cvtsi128Si64,
+    /// Shuffle low 16-bit integers (PSHUFLW)
+    Pshuflw128,
+    /// Shuffle high 16-bit integers (PSHUFHW)
+    Pshufhw128,
+
+    // --- SSE4.1 insert/extract operations ---
+    /// Insert 32-bit value at lane (PINSRD)
+    Pinsrd128,
+    /// Extract 32-bit value at lane (PEXTRD) - returns scalar i32
+    Pextrd128,
+    /// Insert 8-bit value at lane (PINSRB)
+    Pinsrb128,
+    /// Extract 8-bit value at lane (PEXTRB) - returns scalar i32
+    Pextrb128,
+    /// Insert 64-bit value at lane (PINSRQ)
+    Pinsrq128,
+    /// Extract 64-bit value at lane (PEXTRQ) - returns scalar i64
+    Pextrq128,
+
+    // --- AVX2 256-bit integer operations (lowered to v* ymm instructions) ---
+    Loadu256,
+    Storeu256,
+    Load256,
+    Store256,
+    Paddb256,
+    Paddw256,
+    Paddd256,
+    Psubb256,
+    Psubw256,
+    Psubusw256,
+    Psadbw256,
+    Pmaddubsw256,
+    Pmaddwd256,
+    Pcmpeqb256,
+    Pcmpgtb256,
+    Pmovmskb256,
+    Pshufb256,
+    Pabsb256,
+    Pabsw256,
+    Pmaxub256,
+    Pminub256,
+    Pxor256,
+    Por256,
+    Pand256,
+    Psllidi256,
+    Psrlidi256,
+    Psllwi256,
+    Psrlwi256,
+    Broadcast128to256,
+    Zext128to256,
+    Cast256to128,
+    Insert128to256,
+    SetEpi16_256,
+    SetEpi32_256,
+    SetEpi64x256,
+    SetEpi8_256,
+    /// VPERMD: permute 8 x i32 by variable index (chunkset_avx2)
+    Permutevar8x32,
+
+    // --- AVX-VNNI (VEX, Raptor Lake+) ---
+    Dpbusd128,
+    Dpbusds128,
+    Dpwusd128,
+    Dpwusds128,
+    Dpbusd256,
+    Dpbusds256,
+    Dpwusd256,
+    Dpwusds256,
+    // --- AVX-VNNI-INT8 ---
+    Dpbssd128,
+    Dpbssds128,
+    Dpbsud128,
+    Dpbsuds128,
+    Dpbuud128,
+    Dpbuuds128,
+    Dpbssd256,
+    Dpbssds256,
+    Dpbsud256,
+    Dpbsuds256,
+    Dpbuud256,
+    Dpbuuds256,
+    // --- AVX-VNNI-INT16 (vpdpwusd/s shared with AVX-VNNI) ---
+    Dpwuud128,
+    Dpwuuds128,
+    Dpwssd128,
+    Dpwssds128,
+    Dpwuud256,
+    Dpwuuds256,
+    Dpwssd256,
+    Dpwssds256,
+    // --- GFNI ---
+    Gf2p8mulb128,
+    Gf2p8affineqb128,
+    Gf2p8affineinvqb128,
+    // --- VAES 256-bit + VPCLMULQDQ 256-bit ---
+    Aesenc256,
+    Aesenclast256,
+    Aesdec256,
+    Aesdeclast256,
+    Vpclmulqdq256,
+
+    // --- SSE2 ops previously left as scalar header loops ---
+    Paddusb128,
+    Paddsb128,
+    Paddusw128,
+    Paddsw128,
+    Psubsw128,
+    Pandn128,
+    Pcmpeqw128,
+    Pcmpgtd128,
+    Pavgb128,
+    Pavgw128,
+    Pminsw128,
+    Pmaxsw128,
+    Pmulhuw128,
+    Paddq128,
+    Psubq128,
+    Punpckldq128,
+    Punpckhdq128,
+    Punpcklqdq128,
+    Punpckhqdq128,
+    Setzero128,
+    SetzeroPs128,
+    Testz128,
+
+    // --- AVX / AVX2 ops previously left as scalar header loops ---
+    Pmulld256,
+    Psubd256,
+    Paddq256,
+    Psubq256,
+    Pandn256,
+    Pcmpeqd256,
+    Pcmpeqq256,
+    Pcmpgtd256,
+    Pcmpgtq256,
+    Extracti128,
+    Setzero256,
+    AddPs256,
+    SubPs256,
+    MulPs256,
+    AddPd256,
+    SubPd256,
+    MulPd256,
+    LoaduPs256,
+    StoreuPs256,
+    LoaduPd256,
+    StoreuPd256,
+    Permute2x128,
+    Permute4x64,
+    Pshufd256,
+    Punpcklbw256,
+    Punpckhbw256,
+    Punpcklwd256,
+    Punpckhwd256,
+    Punpckldq256,
+    Punpckhdq256,
+    Punpcklqdq256,
+    Punpckhqdq256,
+    Pslldqi256,
+    Psrldqi256,
+    Psllqi256,
+    Psrlqi256,
+    Pmullw256,
+    Pmulhw256,
+    Pminsd256,
+    Pmaxsd256,
+    Pmovzxbw256,
+    Pmovzxbd256,
+    Pmovzxwd256,
+    Pmovsxbw256,
+    Pmovsxbd256,
+    Pmovsxwd256,
+    Psrawi256,
+    Psradi256,
+    Packssdw256,
+    Packuswb256,
+    Phaddw256,
+    Phaddd256,
+    Pabsd256,
+    Pmuludq256,
+    // === AVX-512 (512-bit) packed integer ops ===
+    Paddb512,
+    Paddw512,
+    Paddd512,
+    Paddq512,
+    Psubb512,
+    Psubw512,
+    Psubd512,
+    Psubq512,
+    Paddsb512,
+    Paddsw512,
+    Paddusb512,
+    Paddusw512,
+    Psubsb512,
+    Psubsw512,
+    Psubusb512,
+    Psubusw512,
+    Pavgb512,
+    Pavgw512,
+    Pmaxub512,
+    Pminub512,
+    Pmaxuw512,
+    Pminuw512,
+    Pmaxsb512,
+    Pminsb512,
+    Pmaxsw512,
+    Pminsw512,
+    Pmaxsd512,
+    Pminsd512,
+    Pmaxud512,
+    Pminud512,
+    Pmaxsq512,
+    Pminsq512,
+    Pmaxuq512,
+    Pminuq512,
+    Pcmpeqd512,
+    Pcmpeqq512,
+    Pcmpgtb512,
+    Pcmpgtw512,
+    Pcmpgtd512,
+    Pcmpgtq512,
+    Psadbw512,
+    Pmaddubsw512,
+    Pmaddwd512,
+    Pmullw512,
+    Pmulhw512,
+    Pmulhuw512,
+    Pmulld512,
+    Pmuludq512,
+    Pxor512,
+    Por512,
+    Pand512,
+    Pandn512,
+    Pshufb512,
+    Pabsb512,
+    Pabsw512,
+    Pabsd512,
+    Pabsq512,
+    Punpcklbw512,
+    Punpcklwd512,
+    Punpckldq512,
+    Punpcklqdq512,
+    Punpckhbw512,
+    Punpckhwd512,
+    Punpckhdq512,
+    Punpckhqdq512,
+    Packsswb512,
+    Packuswb512,
+    Packssdw512,
+    Packusdw512,
+    Pshufd512,
+    Pshuflw512,
+    Pshufhw512,
+    Psllwi512,
+    Psrlwi512,
+    Psrawi512,
+    Psllidi512,
+    Psrlidi512,
+    Psradi512,
+    Psllqi512,
+    Psrlqi512,
+    Psraqi512,
+    Palignr512,
+    Pmovzxbw512,
+    Pmovzxbd512,
+    Pmovzxbq512,
+    Pmovzxwd512,
+    Pmovzxwq512,
+    Pmovzxdq512,
+    Pmovsxbw512,
+    Pmovsxbd512,
+    Pmovsxbq512,
+    Pmovsxwd512,
+    Pmovsxwq512,
+    Pmovsxdq512,
+    Popcntb512,
+    Popcntw512,
+    Popcntd512,
+    Popcntq512,
+    TernaryLogic128,
+    TernaryLogic256,
+    TernaryLogic512,
+    // 512-bit insert/extract/permute
+    InsertI32x4,
+    InsertI64x2,
+    InsertI32x8,
+    InsertI64x4,
+    ExtractI32x4,
+    ExtractI64x2,
+    ExtractI32x8,
+    ExtractI64x4,
+    PermutexvarEp32,
+    PermutexvarEp64,
+    // 512-bit broadcast/set/cast
+    BroadcastI32x4,
+    BroadcastI64x2,
+    BroadcastI32x8,
+    BroadcastI64x4,
+    SetEpi8_512,
+    SetEpi16_512,
+    SetEpi32_512,
+    SetEpi64x512,
+    Zext128to512,
+    Cast512to256,
+    Cast128to512,
+    Cast256to512,
+    // === AVX-512 mask ops (mask = scalar u64 in IR) ===
+    CmpeqEpu8Mask128,
+    CmpeqEpu8Mask256,
+    CmpeqEpu8Mask512,
+    CmpeqEpu16Mask512,
+    CmpeqEpu32Mask512,
+    CmpeqEpu64Mask512,
+    CmpEpi8Mask128,
+    CmpEpi8Mask256,
+    CmpEpi8Mask512,
+    CmpEpu8Mask128,
+    CmpEpu8Mask256,
+    CmpEpu8Mask512,
+    CmpEpi32Mask128,
+    CmpEpi32Mask256,
+    CmpEpi32Mask512,
+    CmpEpu32Mask128,
+    CmpEpu32Mask256,
+    CmpEpu32Mask512,
+    CmpEpi64Mask128,
+    CmpEpi64Mask256,
+    CmpEpi64Mask512,
+    CmpEpu64Mask128,
+    CmpEpu64Mask256,
+    CmpEpu64Mask512,
+    CmpEpi16Mask128,
+    CmpEpi16Mask256,
+    CmpEpi16Mask512,
+    CmpEpu16Mask128,
+    CmpEpu16Mask256,
+    CmpEpu16Mask512,
+    Loadu512,
+    Storeu512,
+    MaskzLoaduEpi8_128,
+    MaskzLoaduEpi8_256,
+    MaskzLoaduEpi8_512,
+    MaskzLoaduEpi32_512,
+    MaskzLoaduEpi64_512,
+    MaskLoaduEpi8_128,
+    MaskLoaduEpi8_256,
+    MaskLoaduEpi8_512,
+    MaskStoreuEpi8_128,
+    MaskStoreuEpi8_256,
+    MaskStoreuEpi8_512,
+    MaskzMaddubsEpi16_512,
+    MaskzSet1Epi16_512,
+    MaskzSet1Epi32_512,
+    MaskzSet1Epi64x512,
+    MaskzInsertI64x2,
+    MaskzInsertI32x4,
+    MaskzExtractI32x4,
+    MaskzExtractI64x4,
+    MaskzExtractI64x2,
+    MaskzShuffleEpi8_128,
+    MaskShuffleEpi8_128,
+    ReduceAddEpu32_512,
+    Vpdpbusd512,
+    Vpdpbusds512,
+    Vpclmulqdq512,
+    // === 128-bit SCALAR FP ops (SSE) ===
+    //
+    // `_mm_add_sd`, `_mm_mul_ss`, ... operate on ONE lane and preserve every
+    // other lane of the first operand — exactly what the hardware `addsd`
+    // family does (`ADDSD` writes the low lane and leaves the rest of the
+    // destination alone), so each is a single instruction.  They were the last
+    // group still written as plain C in the headers
+    // (`__a.__val[0] += __b.__val[0]; return __a;`), which costs a scalar
+    // extract, a scalar op, and a rebuild of the 16-byte struct: measured at
+    // 64 instructions per row in the SSE2 codegen matrix against 6 for the
+    // same kernel using `addpd`.  The result is still a 128-bit value (the
+    // untouched lanes are part of it), so these ops belong to the 128-bit
+    // home-width group like their packed siblings.
+    AddSd128,
+    SubSd128,
+    MulSd128,
+    DivSd128,
+    MinSd128,
+    MaxSd128,
+    SqrtSd128,
+    AddSs128,
+    SubSs128,
+    MulSs128,
+    DivSs128,
+    MinSs128,
+    MaxSs128,
+    SqrtSs128,
+    RcpSs128,
+    RsqrtSs128,
+    // === 128-bit FP ops (SSE) — complements existing AddPs128/AddPd128 etc. ===
+    AndPs128,
+    AndnPs128,
+    OrPs128,
+    XorPs128,
+    AndPd128,
+    AndnPd128,
+    OrPd128,
+    XorPd128,
+    DivPs128,
+    MinPs128,
+    MaxPs128,
+    SqrtPs128,
+    RcpPs128,
+    RsqrtPs128,
+    CmpPs128,
+    ShufPs128,
+    UnpcklPs128,
+    UnpckhPs128,
+    MovemaskPs128,
+    CvtPs2Ep32_128,
+    CvtEp32ToPs128,
+    CvttPs2Ep32_128,
+    CvtPs2Pd128,
+    CvtPd2Ps128,
+    DivPd128,
+    MinPd128,
+    MaxPd128,
+    SqrtPd128,
+    CmpPd128,
+    ShufPd128,
+    UnpcklPd128,
+    UnpckhPd128,
+    MovemaskPd128,
+    CvtPd2Ep32_128,
+    CvtEp32ToPd128,
+    CvttPd2Ep32_128,
+    CvtSs2Si128,
+    /// `_mm_cvttss_si32`: convert the low lane with TRUNCATION. Distinct from
+    /// [`Self::CvtSs2Si128`], which honours MXCSR's rounding mode — using the
+    /// rounding form here is a correctness bug under any non-nearest rounding
+    /// mode, not a code-size choice.
+    CvttSs2Si128,
+    CvtSi2Ss128,
+    CvtSs2Sd128,
+    CvtSd2Ss128,
+    CvtSi2Sd128,
+    CvtSi2Ss64_128,
+    CvtSi2Sd64_128,
+    CvtSd2Si128,
+    /// `_mm_cvttsd_si32`: truncating counterpart of [`Self::CvtSd2Si128`].
+    CvttSd2Si128,
+    /// `cvtsd2si` with a 64-bit destination (`_mm_cvtsd_si64`): rounds the low
+    /// lane per MXCSR into a full GPR. Distinct from [`Self::CvtSd2Si128`],
+    /// which keeps only 32 bits.
+    Cvtsd2Si64,
+    /// `cvtss2si` with a 64-bit destination (`_mm_cvtss_si64`).
+    Cvtss2Si64,
+    Movss128,
+    Movsd128,
+    // === 256-bit FP ops (AVX) ===
+    DivPs256,
+    MinPs256,
+    MaxPs256,
+    SqrtPs256,
+    CmpPs256,
+    ShufPs256,
+    UnpcklPs256,
+    UnpckhPs256,
+    MovemaskPs256,
+    CvtPs2Ep32_256,
+    CvtEp32ToPs256,
+    CvttPs2Ep32_256,
+    CvtPs2Pd256,
+    CvtPd2Ps256,
+    DivPd256,
+    MinPd256,
+    MaxPd256,
+    SqrtPd256,
+    CmpPd256,
+    ShufPd256,
+    UnpcklPd256,
+    UnpckhPd256,
+    MovemaskPd256,
+    CvtPd2Ep32_256,
+    CvtEp32ToPd256,
+    CvttPd2Ep32_256,
+    VpermilPs128,
+    VpermilPs256,
+    VpermilPd256,
+    /// 256-bit variable-index permute: `vpermilps %idx, %src, %dst`.
+    VpermilvarPs256,
+    /// 256-bit variable-index permute (double): `vpermilpd %idx, %src, %dst`.
+    VpermilvarPd256,
+    Vperm2f128,
+    Vinsertf128,
+    Vextractf128,
+    Vbroadcastss,
+    Vbroadcastsd,
+    TestzPs128,
+    TestzPs256,
+    RoundPs128,
+    RoundPs256,
+    RoundPd128,
+    RoundPd256,
+    BlendPs128,
+    BlendPd128,
+    BlendPs256,
+    BlendPd256,
+    BlendvPs128,
+    BlendvPd128,
+    BlendvPs256,
+    BlendvPd256,
+    DpPs128,
+    DpPd128,
+    InsertPs128,
+    ExtractPs128,
+    InsertPd128,
+    ExtractPd128,
+    HaddPs128,
+    HsubPs128,
+    AddsubPs128,
+    HaddPd128,
+    HsubPd128,
+    AddsubPd128,
+    HaddPs256,
+    HsubPs256,
+    AddsubPs256,
+    Movddup128,
+    Movsldup128,
+    Movshdup128,
+    FmaSs,
+    FmaSd,
+    FmaPs132,
+    FmaPs213,
+    FmaPs231,
+    FmaPd132,
+    FmaPd213,
+    FmaPd231,
+    FmaPs132v256,
+    FmaPs213v256,
+    FmaPs231v256,
+    FmaPd132v256,
+    FmaPd213v256,
+    FmaPd231v256,
+    // === 512-bit FP ===
+    AddPs512,
+    SubPs512,
+    MulPs512,
+    DivPs512,
+    MinPs512,
+    MaxPs512,
+    AddPd512,
+    SubPd512,
+    MulPd512,
+    DivPd512,
+    MinPd512,
+    MaxPd512,
+    SqrtPs512,
+    SqrtPd512,
+    CmpPs512,
+    CmpPd512,
+    CvtPs2Pd512,
+    CvtPd2Ps512,
+    CvtEp32_2Ps512,
+    CvtPs2Ep32_512,
+    CvttPs2Ep32_512,
+    CvtEp32_2Pd512,
+    CvtPd2Ep32_512,
+    CvttPd2Ep32_512,
+    FmaPs132v512,
+    FmaPs213v512,
+    FmaPs231v512,
+    FmaPd132v512,
+    FmaPd213v512,
+    FmaPd231v512,
+}
+
+/// Independent test matrix: do not derive this from the predicates under test.
+/// test_intrinsic_store_inventory.py checks completeness against the enum and
+/// write-effect classification, including variants without a lane-shape suffix.
+/// Decoder/encoder for the [`IntrinsicOp::Prefetch`] payload (see that
+/// variant for the encoding and the per-target mapping). Every `u8` decodes
+/// to a valid hint — out-of-range bits are ignored — so a backend can never
+/// turn a payload into a missing or malformed instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefetchHint {
+    /// GCC's temporal-locality level, 0 (none) ..= 3 (keep in all levels).
+    pub locality: u8,
+    /// GCC `rw == 1`: the line is about to be written.
+    pub write: bool,
+}
+
+impl PrefetchHint {
+    /// The payload for a validated GCC hint pair (`locality` is masked to
+    /// its two-bit domain).
+    pub const fn new(write: bool, locality: u8) -> Self {
+        PrefetchHint {
+            locality: locality & 3,
+            write,
+        }
+    }
+
+    pub const fn encode(self) -> u8 {
+        (self.locality & 3) | ((self.write as u8) << 2)
+    }
+
+    pub const fn decode(payload: u8) -> Self {
+        PrefetchHint {
+            locality: payload & 3,
+            write: payload & 4 != 0,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) const VECTOR_STORES: [IntrinsicOp; 14] = [
+    IntrinsicOp::VecStoreI32x4Pair,
+    IntrinsicOp::VecStoreNarrowMaxU8x4,
+    IntrinsicOp::VecStoreI32x4,
+    IntrinsicOp::VecStoreI32x8,
+    IntrinsicOp::VecStoreF32x4,
+    IntrinsicOp::VecStoreF32x8,
+    IntrinsicOp::VecStoreF64x2,
+    IntrinsicOp::VecStoreF64x4,
+    IntrinsicOp::VecStoreI64x2,
+    IntrinsicOp::VecStoreI64x4,
+    IntrinsicOp::VecStoreI16x8,
+    IntrinsicOp::VecStoreI8x16,
+    IntrinsicOp::VecStoreI8x32,
+    IntrinsicOp::VecStoreI16x16,
+];
+
+impl IntrinsicOp {
+    /// Native legacy/VEX SSSE3 binary mnemonic shared by both x86 emitters.
+    pub(crate) fn ssse3_binary_mnemonic(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Phaddw128 => "phaddw",
+            Self::Phaddd128 => "phaddd",
+            Self::Phsubw128 => "phsubw",
+            Self::Phsubd128 => "phsubd",
+            Self::Phaddsw128 => "phaddsw",
+            Self::Phsubsw128 => "phsubsw",
+            Self::Psignb128 => "psignb",
+            Self::Psignw128 => "psignw",
+            Self::Psignd128 => "psignd",
+            Self::Pmulhrsw128 => "pmulhrsw",
+            Self::Palignr128 => "palignr",
+            _ => return None,
+        })
+    }
+
+    /// 128-bit FP ops with the *destructive* two-operand legacy-SSE encoding
+    /// `dst = args[0] op args[1]`: two 16-byte vector operands, one 16-byte
+    /// vector result, and — the property this predicate exists for — the
+    /// destination may share a register with `args[0]`, because that is
+    /// literally what the encoding computes.
+    ///
+    /// This is the single source of truth for the register allocator's
+    /// vector-input candidates (`collect_vecreg_candidates`) and for the
+    /// copy-coalescing two-operand test (`is_two_operand_binary`).  Three
+    /// hand-maintained copies of this list drifted, and `divps`, `divpd`,
+    /// `minps`, `minpd`, `maxps` and `maxpd` were missing from two of them:
+    /// those rows staged both operands through 8-aligned stack slots instead
+    /// of coalescing the destination with `args[0]`, costing 20 instructions
+    /// where the identical `addpd` kernel needed 14.
+    ///
+    /// min/max/div belong here. The flag is about the aliasing contract, not
+    /// about commutativity: emitter-side operand swapping is governed
+    /// separately by `sse128_mnemonic_commutative`, which must never list
+    /// `divps`/`divpd`/`minps`/`minpd`/`maxps`/`maxpd` (FP min/max pick an
+    /// operand by value — NaN and ±0 asymmetry — and division is ordered).
+    /// Non-destructive FP ops that merely read two vectors (`shufps`,
+    /// `unpcklpd`, `haddps`, `movss`, ...) are deliberately absent: for those
+    /// the destination must NOT alias either operand.
+    pub(crate) fn is_sse_fp_128_destructive_binary(self) -> bool {
+        use IntrinsicOp::*;
+        matches!(
+            self,
+            // Packed, float and double arithmetic.
+            AddPs128 | SubPs128 | MulPs128 | DivPs128 | MinPs128 | MaxPs128
+            | AddPd128 | SubPd128 | MulPd128 | DivPd128 | MinPd128 | MaxPd128
+            // Packed FP-domain logical operations use the same destructive
+            // dst=args[0] encoding. ANDN is intentionally not commutative;
+            // the emitter's separate mnemonic table governs operand swaps.
+            | AndPs128 | AndnPs128 | OrPs128 | XorPs128
+            | AndPd128 | AndnPd128 | OrPd128 | XorPd128
+            // Scalar (low-lane) forms: same one-instruction destructive
+            // encoding, the untouched lanes come from `args[0]`.
+            | AddSd128 | SubSd128 | MulSd128 | DivSd128 | MinSd128 | MaxSd128
+            | AddSs128 | SubSs128 | MulSs128 | DivSs128 | MinSs128 | MaxSs128
+            // `_mm_sqrt_sd(a, b)` is the two-operand scalar form: the high half
+            // comes from `a` (the destination) and only the low half from `b`,
+            // exactly the destructive encoding.  `_mm_sqrt_ss(a)` is NOT here:
+            // it takes one operand and preserves the lanes of `a` itself.
+            | SqrtSd128
+        )
+    }
+
+    /// Mnemonic of the legacy-SSE *scalar* (low-lane) FP form: `addsd`/
+    /// `divss`/`sqrtsd`/..., or `None` for every other op.
+    ///
+    /// The emitter's dispatch arm enumerates exactly these variants and uses
+    /// this table instead of a `match ... _ => unreachable!()`: the census
+    /// counts a panic site per `unreachable!`, and a table that simply returns
+    /// `None` cannot turn a future op-list edit into a compiler panic.  A unit
+    /// test pins that the table covers the dispatch arm.
+    ///
+    /// `sqrtss`/`sqrtsd` are included: both are the one-operand destructive
+    /// form whose preserved lanes come from the destination, which is exactly
+    /// the `_mm_sqrt_ss`/`_mm_sqrt_sd` contract.
+    pub(crate) fn sse_scalar_fp_mnemonic(self) -> Option<&'static str> {
+        use IntrinsicOp::*;
+        Some(match self {
+            AddSd128 => "addsd",
+            SubSd128 => "subsd",
+            MulSd128 => "mulsd",
+            DivSd128 => "divsd",
+            MinSd128 => "minsd",
+            MaxSd128 => "maxsd",
+            SqrtSd128 => "sqrtsd",
+            AddSs128 => "addss",
+            SubSs128 => "subss",
+            MulSs128 => "mulss",
+            DivSs128 => "divss",
+            MinSs128 => "minss",
+            MaxSs128 => "maxss",
+            SqrtSs128 => "sqrtss",
+            _ => return None,
+        })
+    }
+
+    /// Width of an actual SIMD result (including explicit-SIMD result homes).
+    /// An opcode property, not a claim that an instruction has a live `dest`:
+    /// callers must check the instruction's destination separately. Stores
+    /// consume vector values but produce none, even when their source has a
+    /// SIMD home. Modern register-valued producers are classified separately
+    /// by `produces_vector_value` (explicit-SIMD ops can use memory homes).
+    pub fn vector_result_width(&self) -> Option<u32> {
+        if self.writes_memory_via_args()
+            || matches!(self, IntrinsicOp::StoreuPs256 | IntrinsicOp::StoreuPd256)
+        {
+            None
+        } else {
+            self.vector_home_width()
+        }
+    }
+
+    /// SIMD home width used by the backend's homing metadata, not the
+    /// actual-result contract (`vector_result_width`). Normally the widths
+    /// agree. Store exceptions describe SOURCE homes: VecStoreI64x2 and
+    /// VecStoreI32x4Pair have 16-byte homes; StoreuPs256 and StoreuPd256 have
+    /// 32-byte homes. None of these stores produces a result. The Pair store
+    /// writes only 8 bytes despite its 16-byte SIMD home.
+    ///
+    /// Backend destination homing still requires an instruction destination;
+    /// this metadata alone does not register a store's source as a new value.
+    /// Never infer purity, a read-only argument or access size from it alone.
+    ///
+    /// Keeping this metadata separate preserves explicit-SIMD and vectorizer
+    /// slot protection without pretending that stores return vector values.
+    /// Scalar reductions/extracts are excluded even if their inputs are SIMD.
+    pub fn vector_home_width(&self) -> Option<u32> {
+        if matches!(self, Self::AvxWiden(_)) {
+            return Some(32);
+        }
+        use IntrinsicOp::*;
+        match self {
+            // ---- 256-bit AVX/AVX2 results ----
+            Loadu256 | Load256
+            | Paddb256 | Paddw256 | Paddd256 | Psubb256 | Psubw256 | Psubusw256
+            | Psadbw256 | Pmaddubsw256 | Pmaddwd256 | Pcmpeqb256 | Pcmpgtb256
+            | Pshufb256 | Pabsb256 | Pabsw256 | Pmaxub256
+            | Pminub256 | Pxor256 | Por256 | Pand256 | Psllidi256 | Psrlidi256
+            | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
+            | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256 | SetEpi8_256
+            | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
+            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB | MulAddF64x4HoistedSIB
+            | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
+            | VecLoadF64x4 | VecLoadI32x8 | VecLoadStrided2I32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
+            | VecPackssdwI16x16 | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
+            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecRoundF64x4 | VecXorF64x4
+            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecRoundF32x8 | VecXorF32x8
+            | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
+            | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8 | VecMaddF32x8Signed(..)
+            | VecBroadcastF32x8 | VecZeroF32x8
+            | VecMinF32x8 | VecMaxF32x8 | VecCmpF32x8 | VecBlendvF32x8
+            | VecMinF64x4 | VecMaxF64x4 | VecCmpF64x4 | VecBlendvF64x4
+            | VecMinU32x8 | VecMaxU32x8
+            | VecCmpI32x8 | VecCmpI64x4 | VecBlendvI32x8 | VecMinI32x8
+            | VecLoadI8x32 | VecBroadcastI8x32
+            | VecCmpI8x32 | VecBlendvI8x32 | VecMinU8x32 | VecMaxU8x32
+            | VecMinI8x32 | VecMaxI8x32
+            | VecAddI8x32 | VecSubI8x32 | VecAndI8x32 | VecOrI8x32 | VecXorI8x32
+            | VecAddI16x16
+            | VecSubI16x16
+            | VecSubSatU16x16
+            | VecMulI16x16
+            | VecAndI16x16
+            | VecOrI16x16
+            | VecXorI16x16
+            | VecLoadI16x16
+            | VecCmpI16x16
+            | VecMinI16x16
+            | VecMaxI16x16
+            | VecMinU16x16
+            | VecMaxU16x16
+            | VecBlendvI16x16
+            | VecBroadcastI16x16
+            // BB-SLP 256-bit packed lane shifts (word/dword/qword).
+            | VecShlI16x16
+            | VecLShrI16x16
+            | VecAShrI16x16
+            | VecShlI32x8
+            | VecLShrI32x8
+            | VecAShrI32x8
+            | VecShlI64x4
+            | VecLShrI64x4
+            // GNU-vector per-lane variable shifts (two vector operands).
+            | VecShlvI32x8
+            | VecLShrvI32x8
+            | VecAShrvI32x8
+            | VecShlvI64x4
+            | VecLShrvI64x4
+            // Newly wired AVX/AVX2 ops (previously scalar header loops)
+            | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
+            | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
+            | Setzero256 | AddPs256 | SubPs256 | MulPs256 | AddPd256
+            | SubPd256 | MulPd256 | LoaduPs256 | StoreuPs256 | LoaduPd256
+            | StoreuPd256 | Permute2x128 | Permute4x64 | Permutevar8x32 | Pshufd256
+            | Punpcklbw256 | Punpckhbw256 | Punpcklwd256 | Punpckhwd256
+            | Punpckldq256 | Punpckhdq256 | Punpcklqdq256 | Punpckhqdq256
+            | Pslldqi256 | Psrldqi256 | Psllqi256 | Psrlqi256
+            | Pmullw256 | Pmulhw256 | Pminsd256 | Pmaxsd256
+            | Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256
+            | Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256
+            | Psrawi256 | Psradi256 | Packssdw256 | Packuswb256
+            | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256
+            // `VecMaskedAddI32x8` folds eight I32 lanes into an I32x8
+            // accumulator: a 256-bit result, emitted with `vpaddd %ymm`.
+            // It was grouped with its then-128-bit WIDENING sibling (an
+            // I64x2-accumulator step, since widened to
+            // `VecWidenMaskedAddI32x4ToI64x4`), which made every copy of the accumulator a legacy
+            // `movdqa %xmm`. That preserves bits 255:128 of the destination,
+            // so the upper four lanes of the accumulator never advanced and
+            // the guarded sum silently dropped half its terms
+            // (tests/regression/vector_guard_sum.c: 279 instead of 651). It
+            // also handed the value a 16-byte protected slot for 32 bytes of
+            // data.
+            | VecMaskedAddI32x8
+            // The `I64x4` family (4 x i64 = 32 bytes) was once appended to
+            // the 128-bit list. A 256-bit shape declaring 16 bytes hands the
+            // value a half-size protected slot and makes every copy a legacy
+            // `movdqa %xmm` that silently freezes the upper lanes. Classify by
+            // shape -- including the widening steps, whose accumulator is
+            // I64x4.
+            | VecLoadI64x4 | VecAddI64x4 | VecZeroI64x4 | VecSadbwU8x32
+            | VecWidenAddI32x4ToI64x4 | VecWidenMaskedAddI32x4ToI64x4
+            // Adler-32 loop epic: the two packed multiply-add producers and
+            // the .rodata constant-table producer are 256-bit results.
+            | VecMaddubsU8x32 | VecMaddwdI16x16 | VecConstI8x32
+            // BB-SLP I64x4 family completion: sub/bitwise/broadcast and
+            // the 256-bit store round out the 4×u64 copy chains.
+            | VecSubI64x4 | VecAndI64x4 | VecOrI64x4 | VecXorI64x4
+            | VecBroadcastI64x4 => Some(32),
+            // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
+            Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
+            | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
+            | MulPs128 | AddPd128 | SubPd128 | MulPd128
+            | DivPs128 | MinPs128 | MaxPs128 | SqrtPs128 | RcpPs128 | RsqrtPs128
+            | AndPs128 | AndnPs128 | OrPs128 | XorPs128
+            | AndPd128 | AndnPd128 | OrPd128 | XorPd128
+            | DivPd128 | MinPd128 | MaxPd128 | SqrtPd128
+            | RcpSs128 | RsqrtSs128
+            | CmpPs128 | ShufPs128 | UnpcklPs128 | UnpckhPs128
+            | CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128 | CvtPs2Pd128 | CvtPd2Ps128
+            | CmpPd128 | ShufPd128 | UnpcklPd128 | UnpckhPd128
+            | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128
+            | CvtSs2Sd128 | CvtSd2Ss128 | CvtSi2Ss128 | CvtSi2Sd128
+            | CvtSi2Ss64_128 | CvtSi2Sd64_128 | Movss128 | Movsd128
+            | AddSd128 | SubSd128 | MulSd128 | DivSd128 | MinSd128 | MaxSd128
+            | SqrtSd128 | AddSs128 | SubSs128 | MulSs128 | DivSs128 | MinSs128
+            | MaxSs128 | SqrtSs128
+            | Pmuludq128
+            | Pmuldq128 | Pmulld128 | CastReinterpret128 | SetEpi8 | SetEpi16
+            | SetEpi32 | Pslldqi128 | Psrldqi128 | Psllqi128 | Psrlqi128
+            | Pshufd128 | Paddw128 | Psubw128 | Paddb128 | Psubb128
+            | Psubusw128 | Psadbw128 | Pmullw128 | Pmaddubsw128 | Phaddw128
+            | Phaddd128 | Phsubw128 | Phsubd128 | Phaddsw128 | Phsubsw128 | Psignb128 | Psignw128 | Psignd128 | Pmulhrsw128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
+            | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pblendw128 | Pmovzxbw128
+            | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
+            | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
+            | Psradi128 | Pslldi128 | Psrldi128 | Paddd128 | Psubd128
+            | Packssdw128 | Packsswb128 | Packuswb128 | Punpcklbw128
+            | Punpckhbw128 | Punpcklwd128 | Punpckhwd128 | Pinsrw128
+            | Cvtsi32Si128 | Pshuflw128 | Pshufhw128 | Pinsrd128 | Pinsrb128
+            | Pinsrq128 | Cast256to128 | Dpbusd128 | Dpbssd128 | Dpwuud128
+            | Gf2p8mulb128 | Aesenc128 | Aesenclast128 | Aesdec128
+            | Aesdeclast128 | Aesimc128 | Aeskeygenassist128 | Pclmulqdq128
+            | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
+            | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecLoadStrided2I32x4 | VecLoadStrided2CompactI32x4 | VecAddF64x2
+            | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
+            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2 | VecRoundF64x2 | VecXorF64x2
+            | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
+            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4 | VecRoundF32x4 | VecXorF32x4
+            | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
+            | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
+            | VecFmaF64x2 | VecFnmaF64x2 | VecFmaF32x4 | VecFnmaF32x4
+            | VecFmsF64x2 | VecFmsF32x4 | VecFnmsF64x2 | VecFnmsF32x4
+            | VecCmpI32x4 | VecCmpI64x2 | VecBlendvI32x4
+            | VecAddI8x16 | VecSubI8x16 | VecCmpI8x16
+            | VecMinU8x16 | VecMaxU8x16 | VecBlendvI8x16
+            | VecBroadcastI8x16
+            | VecAddI16x8
+            | VecSubI16x8
+            | VecSubSatU16x8
+            | VecMulI16x8
+            | VecCmpI16x8
+            | VecMinI16x8
+            | VecMaxI16x8
+            | VecBlendvI16x8
+            | VecBroadcastI16x8
+            // BB-SLP 128-bit packed lane shifts (word/dword/qword).
+            | VecShlI16x8
+            | VecLShrI16x8
+            | VecAShrI16x8
+            | VecShlI32x4
+            | VecLShrI32x4
+            | VecAShrI32x4
+            | VecShlI64x2
+            | VecLShrI64x2
+            // GNU-vector per-lane variable shifts (VEX.128, AVX2-only).
+            | VecShlvI32x4
+            | VecLShrvI32x4
+            | VecAShrvI32x4
+            | VecShlvI64x2
+            | VecLShrvI64x2
+            | VecWidenAddValueI32x4ToI64x2
+            | VecWidenMaskedAddValueI32x4ToI64x2
+            | VecMaskedAddValueI32x4
+            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
+            | VecSadbwU8x16
+            | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
+            | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4 | VecSminI32x4
+            | VecMaxU32x4 | VecMinU32x4
+            // BB-SLP 128-bit families: I64x2 bitwise, I16x8/I8x16
+            // load/store/bitwise, and the 2-lane gather/extract pairs.
+            | VecAndI64x2 | VecOrI64x2 | VecXorI64x2
+            | VecLoadI16x8 | VecAndI16x8 | VecOrI16x8 | VecXorI16x8
+            | VecLoadI8x16 | VecAndI8x16 | VecOrI8x16 | VecXorI8x16
+            | VecPackI64x2 | VecPackF64x2
+            | VecWidenByteFieldsI32x4 | VecLoadWidenU8ToI32x4 | VecLoadI32x4Pair | VecStoreI32x4Pair | VecStoreNarrowMaxU8x4 | VecPackI32x4Pair
+            | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
+            | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
+            | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
+            | Punpckldq128 | Punpckhdq128 | Punpcklqdq128 | Punpckhqdq128
+            | Setzero128 | SetzeroPs128 | Extracti128
+            // ARX lane family: 128-bit XMM results (pslld/pshufd/pshufb/
+            // pack are x4-lane).
+            | VecRotlI32x4 | VecShufdI32x4 | VecShufbI32x4 | VecPackI32x4
+            => Some(16),
+            // Everything else produces a scalar GPR/x87 result, no result, or
+            // is an F128 helper handled by the dedicated f128 slot path.
+            _ => None,
+        }
+    }
+
+    /// Pairwise horizontal reductions consume two vector images and produce
+    /// a scalar (or a narrower partial sum that the reducer finishes in GPRs).
+    /// They deliberately have no full-width vector home/result metadata; the
+    /// register allocator must not treat them as ordinary lane-wise Vec ops.
+    pub fn is_horizontal_vector_reduce(&self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::VecNarrowMaxU8x4
+                | IntrinsicOp::VecHorizontalAddI32x8
+                | IntrinsicOp::VecHorizontalAddI32x4
+                | IntrinsicOp::VecHorizontalAddI64x4
+                | IntrinsicOp::VecHorizontalAddI64x2
+                | IntrinsicOp::VecHorizontalAddF32x8
+                | IntrinsicOp::VecHorizontalAddF32x4
+                | IntrinsicOp::VecHorizontalAddF64x4
+                | IntrinsicOp::VecHorizontalAddF64x2
+                | IntrinsicOp::VecHorizontalMaxI32x4
+                | IntrinsicOp::VecHorizontalMaxI32x8
+                | IntrinsicOp::VecHorizontalMinI32x8
+        )
+    }
+
+    /// Returns true if this intrinsic is a pure function (no side effects, result depends
+    /// only on inputs). Pure intrinsics can be dead-code eliminated if their result is unused.
+    pub fn is_pure(&self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
+            IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
+            IntrinsicOp::FmaScalarF32 | IntrinsicOp::FmaScalarF64 |
+            IntrinsicOp::FmaScalarF32Signed(..) | IntrinsicOp::FmaScalarF64Signed(..) |
+            IntrinsicOp::RoundScalarF32(_) | IntrinsicOp::RoundScalarF64(_) |
+            IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
+            IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
+            IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 |
+            IntrinsicOp::UsubSat32 |
+            IntrinsicOp::Pdep32 | IntrinsicOp::Pdep64 |
+            IntrinsicOp::Pext32 | IntrinsicOp::Pext64 |
+            IntrinsicOp::VecWidenAddI32x4ToI64x4
+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
+            | IntrinsicOp::VecMaskedAddI32x8 |
+            IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
+            IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
+            IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
+            IntrinsicOp::Aesimc128 | IntrinsicOp::Aeskeygenassist128 |
+            IntrinsicOp::Pclmulqdq128 |
+            IntrinsicOp::Pslldqi128 | IntrinsicOp::Psrldqi128 |
+            IntrinsicOp::Psllqi128 | IntrinsicOp::Psrlqi128 |
+            IntrinsicOp::Pshufd128 |
+            // SSE2 packed operations are all pure
+            IntrinsicOp::Psubsb128 |
+            IntrinsicOp::Paddw128 | IntrinsicOp::Psubw128 |
+            IntrinsicOp::Pmulhw128 | IntrinsicOp::Pmaddwd128 |
+            IntrinsicOp::Pcmpgtw128 | IntrinsicOp::Pcmpgtb128 |
+            IntrinsicOp::Psllwi128 | IntrinsicOp::Psrlwi128 |
+            IntrinsicOp::Psrawi128 | IntrinsicOp::Psradi128 |
+            IntrinsicOp::Pslldi128 | IntrinsicOp::Psrldi128 |
+            IntrinsicOp::Paddd128 | IntrinsicOp::Psubd128 |
+            IntrinsicOp::Packssdw128 | IntrinsicOp::Packsswb128 | IntrinsicOp::Packuswb128 |
+            IntrinsicOp::Punpcklbw128 | IntrinsicOp::Punpckhbw128 |
+            IntrinsicOp::Punpcklwd128 | IntrinsicOp::Punpckhwd128 |
+            IntrinsicOp::SetEpi16 | IntrinsicOp::Pinsrw128 |
+            IntrinsicOp::Pextrw128 | IntrinsicOp::Cvtsi128Si32 |
+            IntrinsicOp::Cvtsi32Si128 | IntrinsicOp::Cvtsi128Si64 |
+            IntrinsicOp::CvtSs2Si128 | IntrinsicOp::CvtSd2Si128 |
+            IntrinsicOp::CvttSs2Si128 | IntrinsicOp::CvttSd2Si128 |
+            IntrinsicOp::Cvtsd2Si64 | IntrinsicOp::Cvtss2Si64 |
+            IntrinsicOp::MovemaskPs128 | IntrinsicOp::MovemaskPd128 |
+            IntrinsicOp::Pshuflw128 | IntrinsicOp::Pshufhw128 |
+            // SSE4.1 insert/extract are pure
+            IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128 |
+            IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128 |
+            IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128 |
+            // Vector reduction operations are pure
+            IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2 |
+            IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4 |
+            IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2 |
+            IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2 |
+            IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
+            IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
+            IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
+            | IntrinsicOp::VecMaxI32x8
+            | IntrinsicOp::VecMinU32x8 | IntrinsicOp::VecMaxU32x8
+            | IntrinsicOp::VecMinI32x8
+            | IntrinsicOp::VecMinU8x32
+            | IntrinsicOp::VecMinU8x16
+            | IntrinsicOp::VecMaxU8x32
+            | IntrinsicOp::VecMaxU8x16
+            | IntrinsicOp::VecMinI8x32
+            | IntrinsicOp::VecMaxI8x32
+            | IntrinsicOp::VecMinI16x16
+            | IntrinsicOp::VecMaxI16x16
+            | IntrinsicOp::VecMinU16x16
+            | IntrinsicOp::VecMaxU16x16
+            | IntrinsicOp::VecMinI16x8
+            | IntrinsicOp::VecMaxI16x8
+            | IntrinsicOp::VecHorizontalMaxI32x8
+            | IntrinsicOp::VecHorizontalMinI32x8
+        ) ||
+        // The modern vectorizer's value-producing families (splats, zeros,
+        // non-volatile vector loads, packed arithmetic) are pure: they have
+        // no observable effects. Loads still read memory; purity is NOT a
+        // read-none proof (see may_read_memory). Without this, an orphaned
+        // VecBroadcast left behind by a vectorizer bailout was DCE-rooted
+        // as "side-effecting", reached codegen with no register or slot
+        // home, and ICEd the intrinsic emitter (`gd[i] = gd[i]*k + c` over
+        // a global array). Stores are excluded from the result predicate;
+        // their source-home metadata lives in vector_home_width. Lane extracts read
+        // a vector and produce a scalar; they are pure reads (an orphaned
+        // extract left by an SLP bailout must be DCE-eligible, not rooted
+        // as a side effect).
+        self.produces_vector_value()
+            || matches!(
+                self,
+                IntrinsicOp::VecNarrowMaxU8x4 | IntrinsicOp::VecExtractLaneI32x4
+                    | IntrinsicOp::VecExtractLaneI64x2
+                    | IntrinsicOp::VecExtractLaneF64x2
+                    | IntrinsicOp::VecExtractLaneI64x4
+                    | IntrinsicOp::VecExtractLaneF64x4
+                    | IntrinsicOp::VecExtractLaneF32x4
+                    | IntrinsicOp::VecExtractLaneF32x8
+                    | IntrinsicOp::VecExtractLaneI32x8
+                    | IntrinsicOp::VecExtractLaneI16x8
+                    | IntrinsicOp::VecExtractLaneI16x16
+            )
+    }
+
+    /// True when this intrinsic moves or computes SIMD data: the `Vec*`
+    /// family the loop vectorizers emit plus the explicit-SIMD
+    /// (`Loadu256`/`Paddb256`/…) family from `<lccc/simd.h>`. The loop
+    /// alignment pass uses this to give vector-loop headers the stronger
+    /// 32-byte treatment.
+    pub fn is_vector_op(&self) -> bool {
+        // SIMD participation is not a purity or result classification.
+        self.produces_vector_value()
+            || self.vector_home_width().is_some()
+            || self.writes_memory_via_args()
+    }
+
+    /// True when an `args` position of this intrinsic may carry a READ-ONLY
+    /// memory pointer: the load families (the pointer is the load address)
+    /// and the vector compute families whose vector operands may be
+    /// memory-folded (the backend's VLFOLD / explicit-SIMD conventions —
+    /// an operand that is a pointer is only ever READ).
+    ///
+    /// This is an operand-role allowlist, NOT a whole-instruction read-only
+    /// or purity claim. In particular, StoreuPs256/StoreuPd256 return true:
+    /// args[0] can be a memory-folded source, while dest_ptr is a separate
+    /// write. Their reads need not appear in the explicit-load-only
+    /// may_read_memory list. Consumers must check dest_ptr and args-side writes
+    /// independently, including derived aliases of the pointer being proved.
+    /// This opcode query does not validate arity or identify operand indices;
+    /// width/position-sensitive forwarding uses pointer_vector_arg_width.
+    ///
+    /// This is the read-side counterpart of the write classification and
+    /// the ONLY allowlist through which a pointer may reach an intrinsic
+    /// argument in a callee-read-only proof. Unclassified opcodes default to
+    /// rejection, but SIMD home/result membership also admits families here:
+    /// adding an opcode to those families requires auditing its operand roles.
+    /// This is not an exhaustive per-position effect schema. Scalar pure
+    /// intrinsics (Crc32*, shifts, math) have no legitimate pointer argument;
+    /// a pointer there is address observation, not a memory operand.
+    pub fn reads_pointer_arg(&self) -> bool {
+        !self.writes_memory_via_args()
+            && (self.may_read_memory()
+                || self.produces_vector_value()
+                || self.vector_home_width().is_some())
+    }
+
+    /// True when this intrinsic writes memory through its `args` rather
+    /// than `dest_ptr`: the `VecStore*` family, which carries the
+    /// destination pointer in `args[1]` (the loop vectorizers add
+    /// `dest_ptr` redundantly for the [`Instruction::may_write_memory`]
+    /// contract; the BB-SLP vectorizer constructs the pure args form).
+    /// This is the args-side supplement that contract's `dest_ptr` key
+    /// needs to classify every memory-writing vector store. Strict reciprocal
+    /// reductions also write their private scratch argument when spilled.
+    pub fn writes_memory_via_args(&self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::FmaF64x4SIB
+                | IntrinsicOp::FmaF64x4HoistedSIB
+                | IntrinsicOp::MulAddF64x4HoistedSIB
+                | IntrinsicOp::StrictRecipMulAddF64x4
+                | IntrinsicOp::StrictRecipMulAddPackedF64x4
+                | IntrinsicOp::VecStoreI32x4
+                | IntrinsicOp::VecStoreI32x8
+                | IntrinsicOp::VecStoreF32x8
+                | IntrinsicOp::VecStoreF32x4
+                | IntrinsicOp::VecStoreF64x4
+                | IntrinsicOp::VecStoreF64x2
+                | IntrinsicOp::VecStoreI64x2
+                | IntrinsicOp::VecStoreI64x4
+                | IntrinsicOp::VecStoreI32x4Pair
+                | IntrinsicOp::VecStoreNarrowMaxU8x4
+                | IntrinsicOp::VecStoreI16x8
+                | IntrinsicOp::VecStoreI8x16
+                | IntrinsicOp::VecStoreI8x32
+                | IntrinsicOp::VecStoreI16x16
+        )
+    }
+
+    /// True when this intrinsic reads memory: the vector load families
+    /// (register-resident `VecLoad*`, the widening load, and the 256-bit
+    /// explicit-SIMD `Loadu*`/`Load*` family). Consumers that must not
+    /// reorder across a memory read (the BB-SLP vectorizer's
+    /// store-interval and load-interval legality rules) need this; writes
+    /// are covered by [`Instruction::may_write_memory`].
+    pub fn may_read_memory(&self) -> bool {
+        if matches!(self, Self::AvxTest(_) | Self::AvxWiden(_)) {
+            return true;
+        }
+        matches!(
+            self,
+            IntrinsicOp::FmaF64x2
+                | IntrinsicOp::FmaF64x2Hoisted
+                | IntrinsicOp::MulAddF64x2Hoisted
+                | IntrinsicOp::FmaF64x4
+                | IntrinsicOp::FmaF64x4Hoisted
+                | IntrinsicOp::FmaF64x4SIB
+                | IntrinsicOp::FmaF64x4HoistedSIB
+                | IntrinsicOp::MulAddF64x4HoistedSIB
+                | IntrinsicOp::BroadcastLoadF64
+                | IntrinsicOp::StrictRecipMulAddF64x4
+                | IntrinsicOp::StrictRecipMulAddPackedF64x4
+                | IntrinsicOp::LoadF64x4
+                | IntrinsicOp::LoadF64x2
+                | IntrinsicOp::LoadI32x8
+                | IntrinsicOp::LoadI32x4
+                | IntrinsicOp::VecLoadF64x4
+                | IntrinsicOp::VecLoadF64x2
+                | IntrinsicOp::VecLoadI32x8
+                | IntrinsicOp::VecLoadStrided2I32x8
+                | IntrinsicOp::VecLoadStrided2I32x4
+                | IntrinsicOp::VecLoadStrided2CompactI32x4
+                | IntrinsicOp::VecLoadI32x4
+                | IntrinsicOp::VecLoadF32x8
+                | IntrinsicOp::VecLoadF32x4
+                | IntrinsicOp::VecLoadI8x32
+                | IntrinsicOp::VecLoadWidenI32ToI64x2
+                | IntrinsicOp::VecLoadI64x2
+                | IntrinsicOp::VecLoadI32x4Pair
+                | IntrinsicOp::VecLoadWidenU8ToI32x4
+                | IntrinsicOp::VecLoadI64x4
+                | IntrinsicOp::VecLoadI16x8
+                | IntrinsicOp::VecLoadI8x16
+                | IntrinsicOp::VecLoadI16x16
+                | IntrinsicOp::Loadu256
+                | IntrinsicOp::Load256
+                | IntrinsicOp::LoaduPs256
+                | IntrinsicOp::LoaduPd256
+                | IntrinsicOp::Loadu512
+        )
+    }
+
+    /// Argument slot holding the `lane > rhs` guard of a masked reduction
+    /// step, or `None` for every other op. The ONE definition shared by the
+    /// vectorizer (which may place a hoisted preheader splat there), the
+    /// register allocator (which may home a broadcast only in that slot) and
+    /// the x86 emitter (which reads a vector-typed guard only from it).
+    pub fn masked_guard_arg_index(&self) -> Option<usize> {
+        match self {
+            IntrinsicOp::VecMaskedAddI32x8 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4 => Some(3),
+            IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+            | IntrinsicOp::VecMaskedAddValueI32x4 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Argument slot holding the byte-index operand of a register-dest
+    /// `VecLoad*` / `VecStore*` memory access, or `None` for every other op.
+    ///
+    /// The emitter addresses these families as `base + index*1 + disp`, with
+    /// `[base, index, disp]` for loads and `[src, base, index, disp]` for
+    /// stores — the `vec_mem_operand` / `emit_vec_store_addr` convention, which
+    /// [`crate::passes::alias::vec_intrinsic_access`] models for the alias
+    /// engine. This accessor is the ONE definition of that layout: consumers
+    /// that must distinguish an *address* operand from a *data* operand (IV
+    /// widening, SIB folding, alias analysis) ask here instead of restating the
+    /// family list, so a new op joins every consumer at once.
+    ///
+    /// Op families deliberately absent: the memory-dest `Load*`/`Loadu*`/
+    /// `Store*` forms (they round-trip through `dest_ptr`), every register-only
+    /// vector op, and the FMA/hoisted/strict-reciprocal family, whose scalar
+    /// slots are multiplicands and guards, not offsets.
+    pub fn vec_mem_offset_arg_index(&self) -> Option<usize> {
+        match self {
+            // `VecLoad*(base, index[, disp])`.
+            IntrinsicOp::VecLoadF64x4
+            | IntrinsicOp::VecLoadI32x8
+            | IntrinsicOp::VecLoadStrided2I32x8
+            | IntrinsicOp::VecLoadStrided2I32x4
+            | IntrinsicOp::VecLoadStrided2CompactI32x4
+            | IntrinsicOp::VecLoadF32x8
+            | IntrinsicOp::VecLoadI8x32
+            | IntrinsicOp::VecLoadI64x4
+            | IntrinsicOp::VecLoadI16x16
+            | IntrinsicOp::VecLoadF64x2
+            | IntrinsicOp::VecLoadI32x4
+            | IntrinsicOp::VecLoadF32x4
+            | IntrinsicOp::VecLoadI64x2
+            | IntrinsicOp::VecLoadI16x8
+            | IntrinsicOp::VecLoadI8x16
+            | IntrinsicOp::VecLoadWidenI32ToI64x2
+            | IntrinsicOp::VecLoadWidenU8ToI32x4
+            | IntrinsicOp::VecLoadI32x4Pair => Some(1),
+            // `VecStore*(src, base, index[, disp])`.
+            IntrinsicOp::VecStoreI32x4
+            | IntrinsicOp::VecStoreF32x4
+            | IntrinsicOp::VecStoreF64x2
+            | IntrinsicOp::VecStoreI64x2
+            | IntrinsicOp::VecStoreI16x8
+            | IntrinsicOp::VecStoreI8x16
+            | IntrinsicOp::VecStoreI32x8
+            | IntrinsicOp::VecStoreF32x8
+            | IntrinsicOp::VecStoreF64x4
+            | IntrinsicOp::VecStoreI64x4
+            | IntrinsicOp::VecStoreI8x32
+            | IntrinsicOp::VecStoreI16x16
+            | IntrinsicOp::VecStoreNarrowMaxU8x4
+            | IntrinsicOp::VecStoreI32x4Pair => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this intrinsic produces a 128/256-bit vector value
+    /// (as opposed to a scalar).  These values cannot live in a GPR; backends
+    /// either home them on the stack or allocate SIMD registers for them.
+    pub fn produces_vector_value(&self) -> bool {
+        matches!(
+            self,
+            IntrinsicOp::VecZeroF64x4
+                | IntrinsicOp::VecZeroF64x2
+                | IntrinsicOp::VecZeroI32x8
+                | IntrinsicOp::VecZeroI32x4
+                | IntrinsicOp::VecZeroF32x8
+                | IntrinsicOp::VecZeroF32x4
+                | IntrinsicOp::VecLoadF64x4
+                | IntrinsicOp::VecLoadF64x2
+                | IntrinsicOp::VecLoadI32x8
+                | IntrinsicOp::VecLoadStrided2I32x8
+                | IntrinsicOp::VecLoadStrided2I32x4
+                | IntrinsicOp::VecLoadStrided2CompactI32x4
+                | IntrinsicOp::VecLoadI32x4
+                | IntrinsicOp::VecPackssdwI16x16
+                | IntrinsicOp::VecLoadF32x8
+                | IntrinsicOp::VecLoadF32x4
+                | IntrinsicOp::VecAddF64x4
+                | IntrinsicOp::VecAddF64x2
+                | IntrinsicOp::VecFmaF64x2
+                | IntrinsicOp::VecFnmaF64x2
+                | IntrinsicOp::VecFmaF32x4
+                | IntrinsicOp::VecFnmaF32x4
+                | IntrinsicOp::VecFmsF64x2
+                | IntrinsicOp::VecFnmsF64x2
+                | IntrinsicOp::VecFmsF32x4
+                | IntrinsicOp::VecFnmsF32x4
+                | IntrinsicOp::VecAddI32x8
+                | IntrinsicOp::VecMaxI32x8
+                | IntrinsicOp::VecMinU32x8 | IntrinsicOp::VecMaxU32x8
+                | IntrinsicOp::VecMinI32x8
+                | IntrinsicOp::VecAddI32x4
+                | IntrinsicOp::VecSubI32x8
+                | IntrinsicOp::VecSubI32x4
+                | IntrinsicOp::VecSubI64x2
+                | IntrinsicOp::VecAndI64x2
+                | IntrinsicOp::VecOrI64x2
+                | IntrinsicOp::VecXorI64x2
+                | IntrinsicOp::VecAddI8x32
+                | IntrinsicOp::VecAddI8x16
+                | IntrinsicOp::VecSubI8x32
+                | IntrinsicOp::VecSubI8x16
+                | IntrinsicOp::VecAndI8x16
+                | IntrinsicOp::VecOrI8x16
+                | IntrinsicOp::VecXorI8x16
+                | IntrinsicOp::VecLoadI8x16
+                | IntrinsicOp::VecAndI16x8
+                | IntrinsicOp::VecOrI16x8
+                | IntrinsicOp::VecXorI16x8
+                | IntrinsicOp::VecLoadI16x8
+                | IntrinsicOp::VecMinU8x32
+                | IntrinsicOp::VecMinU8x16
+                | IntrinsicOp::VecMaxU8x32
+                | IntrinsicOp::VecMaxU8x16
+                | IntrinsicOp::VecMinI8x32
+                | IntrinsicOp::VecMaxI8x32
+                | IntrinsicOp::VecBroadcastI8x32
+                | IntrinsicOp::VecBroadcastI8x16
+                | IntrinsicOp::VecAddI16x16
+                | IntrinsicOp::VecSubI16x16
+                | IntrinsicOp::VecSubSatU16x16
+                | IntrinsicOp::VecMulI16x16
+                | IntrinsicOp::VecCmpI16x16
+                | IntrinsicOp::VecMinI16x16
+                | IntrinsicOp::VecMaxI16x16
+                | IntrinsicOp::VecMinU16x16
+                | IntrinsicOp::VecMaxU16x16
+                | IntrinsicOp::VecBlendvI16x16
+                | IntrinsicOp::VecBroadcastI16x16
+                | IntrinsicOp::VecAddI16x8
+                | IntrinsicOp::VecSubI16x8
+                | IntrinsicOp::VecSubSatU16x8
+                | IntrinsicOp::VecMulI16x8
+                | IntrinsicOp::VecCmpI16x8
+                | IntrinsicOp::VecMinI16x8
+                | IntrinsicOp::VecMaxI16x8
+                | IntrinsicOp::VecBlendvI16x8
+                | IntrinsicOp::VecBroadcastI16x8
+                // BB-SLP packed lane shifts (both widths; pure compute,
+                // vector SSA results).
+                | IntrinsicOp::VecShlI16x16
+                | IntrinsicOp::VecLShrI16x16
+                | IntrinsicOp::VecAShrI16x16
+                | IntrinsicOp::VecShlI16x8
+                | IntrinsicOp::VecLShrI16x8
+                | IntrinsicOp::VecAShrI16x8
+                | IntrinsicOp::VecShlI32x8
+                | IntrinsicOp::VecLShrI32x8
+                | IntrinsicOp::VecAShrI32x8
+                | IntrinsicOp::VecShlI32x4
+                | IntrinsicOp::VecLShrI32x4
+                | IntrinsicOp::VecAShrI32x4
+                | IntrinsicOp::VecShlI64x4
+                | IntrinsicOp::VecLShrI64x4
+                | IntrinsicOp::VecShlI64x2
+                | IntrinsicOp::VecLShrI64x2
+                | IntrinsicOp::VecShlvI32x8
+                | IntrinsicOp::VecLShrvI32x8
+                | IntrinsicOp::VecAShrvI32x8
+                | IntrinsicOp::VecShlvI64x4
+                | IntrinsicOp::VecLShrvI64x4
+                | IntrinsicOp::VecShlvI32x4
+                | IntrinsicOp::VecLShrvI32x4
+                | IntrinsicOp::VecAShrvI32x4
+                | IntrinsicOp::VecShlvI64x2
+                | IntrinsicOp::VecLShrvI64x2
+                | IntrinsicOp::VecAndI32x8
+                | IntrinsicOp::VecAndI32x4
+                | IntrinsicOp::VecOrI32x8
+                | IntrinsicOp::VecOrI32x4
+                | IntrinsicOp::VecXorI32x8
+                | IntrinsicOp::VecXorI32x4
+                | IntrinsicOp::VecRotlI32x4
+                | IntrinsicOp::VecShufdI32x4
+                | IntrinsicOp::VecShufbI32x4
+                | IntrinsicOp::VecPackI32x4
+                | IntrinsicOp::VecAddF32x8
+                | IntrinsicOp::VecAddF32x4
+                | IntrinsicOp::VecMulF64x4
+                | IntrinsicOp::VecMulF64x2
+                | IntrinsicOp::VecSubF64x4
+                | IntrinsicOp::VecSubF64x2
+                | IntrinsicOp::VecDivF64x4
+                | IntrinsicOp::VecDivF64x2
+                | IntrinsicOp::VecSqrtF64x4
+                | IntrinsicOp::VecSqrtF64x2
+                | IntrinsicOp::VecRoundF64x4
+                | IntrinsicOp::VecRoundF64x2
+                | IntrinsicOp::VecXorF64x4
+                | IntrinsicOp::VecXorF64x2
+                | IntrinsicOp::VecBroadcastF64x4
+                | IntrinsicOp::VecBroadcastF64x2
+                | IntrinsicOp::VecMulF32x8
+                | IntrinsicOp::VecMulF32x4
+                | IntrinsicOp::VecSubF32x8
+                | IntrinsicOp::VecSubF32x4
+                | IntrinsicOp::VecDivF32x8
+                | IntrinsicOp::VecDivF32x4
+                | IntrinsicOp::VecSqrtF32x8
+                | IntrinsicOp::VecSqrtF32x4
+                | IntrinsicOp::VecRoundF32x8
+                | IntrinsicOp::VecRoundF32x4
+                | IntrinsicOp::VecXorF32x8
+                | IntrinsicOp::VecXorF32x4
+                | IntrinsicOp::VecWidenAddI32x4ToI64x4
+                | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
+                | IntrinsicOp::VecWidenAddValueI32x4ToI64x2
+                | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+                | IntrinsicOp::VecMaskedAddValueI32x4
+                | IntrinsicOp::VecMaskedAddI32x8
+                | IntrinsicOp::VecBroadcastF32x8
+                | IntrinsicOp::VecBroadcastF32x4
+                | IntrinsicOp::VecFmaF64x4
+                | IntrinsicOp::VecFmaF32x8
+                | IntrinsicOp::VecMaddF64x4
+                | IntrinsicOp::VecMaddF64x4Signed(..)
+                | IntrinsicOp::VecMaddF32x8
+                | IntrinsicOp::VecMaddF32x8Signed(..)
+                | IntrinsicOp::VecLoadWidenI32ToI64x2
+                | IntrinsicOp::VecLoadI64x2
+                | IntrinsicOp::VecLoadI32x4Pair
+                | IntrinsicOp::VecWidenByteFieldsI32x4
+                | IntrinsicOp::VecLoadWidenU8ToI32x4
+                | IntrinsicOp::VecAddI64x2
+                | IntrinsicOp::VecSadbwU8x16
+                | IntrinsicOp::VecMulI64x2
+                | IntrinsicOp::VecBroadcastI64x2
+                | IntrinsicOp::VecZeroI64x2
+                | IntrinsicOp::VecLoadI64x4
+                | IntrinsicOp::VecAddI64x4
+                // Not `VecHorizontalAddI64x4`: like its I32x8/I32x4/I64x2
+                // siblings it yields a scalar (`movq %xmm0, %rax`); calling
+                // it a vector poisoned the reduction tail's scalar copy web.
+                | IntrinsicOp::VecZeroI64x4
+                | IntrinsicOp::VecSadbwU8x32
+                | IntrinsicOp::VecMaddubsU8x32
+                | IntrinsicOp::VecMaddwdI16x16
+                | IntrinsicOp::VecConstI8x32
+                | IntrinsicOp::VecSubI64x4
+                | IntrinsicOp::VecAndI64x4
+                | IntrinsicOp::VecOrI64x4
+                | IntrinsicOp::VecXorI64x4
+                | IntrinsicOp::VecBroadcastI64x4
+                | IntrinsicOp::VecPackI64x2
+                | IntrinsicOp::VecPackF64x2
+                | IntrinsicOp::VecPackI32x4Pair
+                | IntrinsicOp::VecMulI32x4
+                | IntrinsicOp::VecMulI32x8
+                | IntrinsicOp::VecBroadcastI32x4
+                | IntrinsicOp::VecBroadcastI32x8
+                | IntrinsicOp::VecSadalpI32x4
+                | IntrinsicOp::VecSmlalLoI32x4
+                | IntrinsicOp::VecSmlalHiI32x4
+                | IntrinsicOp::VecSmaxI32x4
+                | IntrinsicOp::VecSminI32x4
+                | IntrinsicOp::VecMinU32x4
+                | IntrinsicOp::VecMaxU32x4
+                | IntrinsicOp::VecMinF32x8
+                | IntrinsicOp::VecMinF32x4
+                | IntrinsicOp::VecMinF64x4
+                | IntrinsicOp::VecMinF64x2
+                | IntrinsicOp::VecMaxF32x8
+                | IntrinsicOp::VecMaxF32x4
+                | IntrinsicOp::VecMaxF64x4
+                | IntrinsicOp::VecMaxF64x2
+                | IntrinsicOp::VecCmpF32x8
+                | IntrinsicOp::VecCmpF32x4
+                | IntrinsicOp::VecCmpF64x4
+                | IntrinsicOp::VecCmpF64x2
+                | IntrinsicOp::VecBlendvF32x8
+                | IntrinsicOp::VecBlendvF32x4
+                | IntrinsicOp::VecBlendvF64x4
+                | IntrinsicOp::VecBlendvF64x2
+                | IntrinsicOp::VecCmpI32x8
+                | IntrinsicOp::VecCmpI32x4
+                | IntrinsicOp::VecCmpI64x4
+                | IntrinsicOp::VecCmpI64x2
+                | IntrinsicOp::VecBlendvI32x8
+                | IntrinsicOp::VecBlendvI32x4
+                | IntrinsicOp::VecLoadI8x32
+                | IntrinsicOp::VecCmpI8x32
+                | IntrinsicOp::VecCmpI8x16
+                | IntrinsicOp::VecBlendvI8x32
+                | IntrinsicOp::VecBlendvI8x16
+                | IntrinsicOp::VecAndI8x32
+                | IntrinsicOp::VecOrI8x32
+                | IntrinsicOp::VecXorI8x32
+                | IntrinsicOp::VecAndI16x16
+                | IntrinsicOp::VecOrI16x16
+                | IntrinsicOp::VecXorI16x16
+                | IntrinsicOp::VecLoadI16x16
+        )
+    }
+}
+
+#[cfg(test)]
+mod vector_width_tests {
+    use super::IntrinsicOp;
+
+    /// `vector_home_width` governs backend SIMD home sizing/copy metadata;
+    /// `vector_result_width` describes actual results. For these accumulator
+    /// producers both must agree with the width of the emitted copies
+    /// (`vmovdqa %ymm` vs legacy `movdqa %xmm`). A too-narrow answer is a
+    /// silent miscompile, not merely a missed optimisation: a legacy
+    /// `movdqa %xmm` PRESERVES bits 255:128 of the destination, so a
+    /// loop-carried 256-bit accumulator stops advancing in its upper lanes.
+    ///
+    /// `VecMaskedAddI32x8` (I32x8 accumulator, `vpaddd %ymm`) was grouped with
+    /// its then-128-bit widening sibling (the I64x2-accumulator step that
+    /// `VecWidenMaskedAddI32x4ToI64x4` replaced) and reported 16. A historical report recorded
+    /// `tests/regression/vector_guard_sum.c` summing 279 instead of 651
+    /// (low four lanes plus scalar remainder). That runtime observation is
+    /// not independently reproduced by this metadata test.
+    #[test]
+    fn masked_reduction_steps_report_their_real_accumulator_width() {
+        for (op, width) in [
+            (IntrinsicOp::VecMaskedAddI32x8, 32),
+            (IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4, 32),
+            (IntrinsicOp::VecWidenAddI32x4ToI64x4, 32),
+            (IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2, 16),
+            (IntrinsicOp::VecMaskedAddValueI32x4, 16),
+            (IntrinsicOp::VecWidenAddValueI32x4ToI64x2, 16),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
+        }
+    }
+
+    #[test]
+    fn strided_loads_report_their_actual_vector_widths() {
+        for (op, width) in [
+            (IntrinsicOp::VecLoadStrided2I32x4, 16),
+            (IntrinsicOp::VecLoadStrided2CompactI32x4, 16),
+            (IntrinsicOp::VecLoadStrided2I32x8, 32),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
+            assert!(op.produces_vector_value(), "{op:?} vector value");
+            assert!(op.may_read_memory(), "{op:?} exact memory reads");
+        }
+    }
+
+    #[test]
+    fn unsigned_word_saturation_has_pure_vector_value_homes() {
+        for (op, width) in [
+            (IntrinsicOp::VecSubSatU16x8, 16),
+            (IntrinsicOp::VecSubSatU16x16, 32),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width));
+            assert_eq!(op.vector_result_width(), Some(width));
+            assert!(op.produces_vector_value());
+            assert!(op.is_pure());
+            assert!(!op.may_read_memory());
+            assert!(!op.writes_memory_via_args());
+        }
+    }
+
+    /// The x86 SIMD code generator and the IR enum must stay in sync across
+    /// the rebase boundary. In particular, newly wired SSE logical and scalar
+    /// reciprocal operations are real 128-bit values, not side effects or
+    /// unhomed temporaries. Pin their result/purity contract and destructive
+    /// encoding metadata here so a future enum/classification conflict fails
+    /// in a focused test rather than at the compiler backend.
+    #[test]
+    fn restored_sse_intrinsics_have_128_bit_value_contracts() {
+        let vector_values = [
+            IntrinsicOp::AndPs128,
+            IntrinsicOp::AndnPs128,
+            IntrinsicOp::OrPs128,
+            IntrinsicOp::XorPs128,
+            IntrinsicOp::AndPd128,
+            IntrinsicOp::AndnPd128,
+            IntrinsicOp::OrPd128,
+            IntrinsicOp::XorPd128,
+            IntrinsicOp::RcpSs128,
+            IntrinsicOp::RsqrtSs128,
+        ];
+        for op in vector_values {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?} result");
+        }
+
+        for op in [
+            IntrinsicOp::AndPs128,
+            IntrinsicOp::AndnPs128,
+            IntrinsicOp::OrPs128,
+            IntrinsicOp::XorPs128,
+            IntrinsicOp::AndPd128,
+            IntrinsicOp::AndnPd128,
+            IntrinsicOp::OrPd128,
+            IntrinsicOp::XorPd128,
+        ] {
+            assert!(op.is_sse_fp_128_destructive_binary(), "{op:?}");
+        }
+        assert!(!IntrinsicOp::RcpSs128.is_sse_fp_128_destructive_binary());
+    }
+
+    /// SSE operations that already had enum/dispatcher entries but were
+    /// omitted from home/result-width metadata must all retain a full XMM
+    /// result home. Omitting one can route a value through a scalar slot or
+    /// truncate copies without a compile-time exhaustiveness error.
+    #[test]
+    fn restored_sse_result_families_have_16_byte_width() {
+        let vector_results = [
+            IntrinsicOp::DivPs128,
+            IntrinsicOp::MinPs128,
+            IntrinsicOp::MaxPs128,
+            IntrinsicOp::SqrtPs128,
+            IntrinsicOp::RcpPs128,
+            IntrinsicOp::RsqrtPs128,
+            IntrinsicOp::CmpPs128,
+            IntrinsicOp::ShufPs128,
+            IntrinsicOp::UnpcklPs128,
+            IntrinsicOp::UnpckhPs128,
+            IntrinsicOp::CvtPs2Ep32_128,
+            IntrinsicOp::CvtEp32ToPs128,
+            IntrinsicOp::CvttPs2Ep32_128,
+            IntrinsicOp::CvtPs2Pd128,
+            IntrinsicOp::CvtPd2Ps128,
+            IntrinsicOp::DivPd128,
+            IntrinsicOp::MinPd128,
+            IntrinsicOp::MaxPd128,
+            IntrinsicOp::SqrtPd128,
+            IntrinsicOp::CmpPd128,
+            IntrinsicOp::ShufPd128,
+            IntrinsicOp::UnpcklPd128,
+            IntrinsicOp::UnpckhPd128,
+            IntrinsicOp::CvtPd2Ep32_128,
+            IntrinsicOp::CvtEp32ToPd128,
+            IntrinsicOp::CvttPd2Ep32_128,
+            IntrinsicOp::CvtSs2Sd128,
+            IntrinsicOp::CvtSd2Ss128,
+            IntrinsicOp::CvtSi2Ss128,
+            IntrinsicOp::CvtSi2Sd128,
+            IntrinsicOp::CvtSi2Ss64_128,
+            IntrinsicOp::CvtSi2Sd64_128,
+            IntrinsicOp::Movss128,
+            IntrinsicOp::Movsd128,
+        ];
+        for op in vector_results {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?} result");
+        }
+    }
+
+    #[test]
+    fn scalar_sse_conversions_and_movemasks_are_pure() {
+        for op in [
+            IntrinsicOp::CvtSs2Si128,
+            IntrinsicOp::CvtSd2Si128,
+            IntrinsicOp::CvttSs2Si128,
+            IntrinsicOp::CvttSd2Si128,
+            IntrinsicOp::Cvtsd2Si64,
+            IntrinsicOp::Cvtss2Si64,
+            IntrinsicOp::MovemaskPs128,
+            IntrinsicOp::MovemaskPd128,
+        ] {
+            assert!(op.is_pure(), "{op:?} has no observable side effect");
+            assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");
+        }
+    }
+
+    /// `pdep`/`pext` are pure scalar functions of (source, mask) in every
+    /// function: the backend picks the instruction or the exact loop, so
+    /// CSE and DCE may treat them like any arithmetic.
+    #[test]
+    fn pdep_pext_are_pure_scalar_ops() {
+        for op in [
+            IntrinsicOp::Pdep32,
+            IntrinsicOp::Pdep64,
+            IntrinsicOp::Pext32,
+            IntrinsicOp::Pext64,
+        ] {
+            assert!(op.is_pure(), "{op:?} has no observable side effect");
+            assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");
+        }
+    }
+
+    /// Every `Vec*` op whose identifier ends in a `<Type><Lanes>` shape token
+    /// (`I32x4`, `I32x8`, `I64x2`, `I64x4`, `F32x4`, `F32x8`, `F64x2`,
+    /// `F64x4`) names its result shape; the declared width must agree with
+    /// that name.
+    ///
+    /// The op list is extracted from THIS source file's `pub enum
+    /// IntrinsicOp` block at compile time (`include_str!`), so the check is
+    /// exhaustive by construction: an op added to the enum tomorrow is
+    /// checked the next time the tests run, with no hand-maintained list to
+    /// forget. That failure mode is not hypothetical: the four x8 lane ops
+    /// (`VecSubI32x8`, `VecAndI32x8`, `VecOrI32x8`, `VecXorI32x8`) were
+    /// originally asserted against `Some(16)` here — pasted into the wrong
+    /// list by the same commit that added them — while the width table
+    /// correctly said `Some(32)`.
+    ///
+    /// Name grammar: take the LAST `<Type>x<Lanes>` token in the identifier
+    /// (`VecWiden*ToI64x2` results are the final shape) and expect
+    /// lanes * sizeof(Type) bytes. Documented divergences between name and
+    /// home metadata (this test calls vector_home_width, not result width):
+    /// - `VecHorizontal*` reduce pairwise to a narrower shape or a scalar;
+    ///   their home metadata is None.
+    /// - ALL `VecStore*` produce no result. Only VecStoreI64x2 and
+    ///   VecStoreI32x4Pair retain 16-byte SOURCE-home metadata; other VecStore*
+    ///   home entries are None. The Pair's memory write is only 8 bytes.
+    /// - StoreuPs256/StoreuPd256 also retain source homes (32 bytes), but are
+    ///   outside this Vec* name grammar and tested separately.
+    /// - `VecSadalpI32x4` / `VecSmlal{Hi,Lo}I32x4` are unlowered NEON-shaped
+    ///   variants with no registered result; exempt until a lowering lands.
+    #[test]
+    fn generator_pack_has_full_width_pure_value_metadata() {
+        let op = IntrinsicOp::VecPackssdwI16x16;
+        assert_eq!(op.vector_home_width(), Some(32));
+        assert_eq!(op.vector_result_width(), Some(32));
+        assert!(op.produces_vector_value());
+        assert!(op.is_pure());
+        assert!(!op.writes_memory_via_args());
+    }
+
+    #[test]
+    fn declared_width_agrees_with_the_lane_count_in_the_name() {
+        const SRC: &str = include_str!("intrinsics.rs");
+        let enum_start = SRC
+            .find("pub enum IntrinsicOp")
+            .expect("enum block present");
+        let enum_body = &SRC[enum_start..];
+        let enum_body = &enum_body[..enum_body.find("\n}\n").expect("enum block terminated")];
+        let mut names: Vec<&str> = Vec::new();
+        for line in enum_body.lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with("pub enum") {
+                continue;
+            }
+            // Variant entries: `Name,` / `Name | Name2,` — capture Vec* tokens
+            // that sit in variant position, never inside doc text.
+            for tok in t.split([',', '|']) {
+                let tok = tok.trim();
+                if tok.starts_with("Vec") && tok.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    names.push(tok);
+                }
+            }
+        }
+        assert!(
+            names.len() >= 100,
+            "variant extraction broke (found {} Vec* ops); fix the parser, not the count",
+            names.len()
+        );
+
+        // (name suffix token) -> (type bytes, lanes). Searched as exact
+        // substrings; the LAST occurrence in the name wins.
+        const SHAPES: [(&str, u32, u32); 18] = [
+            ("I16x16", 2, 16),
+            ("I16x8", 2, 8),
+            ("U16x16", 2, 16),
+            ("U16x8", 2, 8),
+            ("I8x32", 1, 32),
+            ("I8x16", 1, 16),
+            ("U8x32", 1, 32),
+            ("U8x16", 1, 16),
+            ("U32x8", 4, 8),
+            ("U32x4", 4, 4),
+            ("I32x8", 4, 8),
+            ("I32x4", 4, 4),
+            ("I64x4", 8, 4),
+            ("I64x2", 8, 2),
+            ("F32x8", 4, 8),
+            ("F32x4", 4, 4),
+            ("F64x4", 8, 4),
+            ("F64x2", 8, 2),
+        ];
+        let mut checked = 0usize;
+        for name in names {
+            // Home-metadata exceptions; none of these grants a store a result.
+            let op: IntrinsicOp = names_to_op(name)
+                .unwrap_or_else(|| panic!("unhandled Vec* variant {name}: add it to names_to_op"));
+            let exempt_none = op.is_horizontal_vector_reduce()
+                || (name.starts_with("VecStore")
+                    && name != "VecStoreI64x2"
+                    // The half-wide Pair store declares the FULL register
+                    // width its vector operand lives in (the I32x4 shape,
+                    // 16 bytes) — the homing web keys on it, exactly the
+                    // VecStoreI64x2 precedent (register-shaped stores).
+                    && name != "VecStoreI32x4Pair"
+                    && name != "VecStoreNarrowMaxU8x4")
+                || name.starts_with("VecSadalp")
+                || name.starts_with("VecSmlal")
+             // Reads a 128-bit vector, extracts ONE lane into a GPR:
+                // the name describes the input, the result is a scalar.
+                || name.starts_with("VecExtractLane");
+            let last = SHAPES
+                .iter()
+                .filter_map(|(tok, ty, lanes)| name.rfind(tok).map(|p| (p, tok, ty, lanes)))
+                .max_by_key(|(p, tok, _, _)| (*p, tok.len()));
+            let Some((_, tok, ty, lanes)) = last else {
+                continue; // no shape token: grammar cannot judge (VecAdd, ...)
+            };
+            let expected = if exempt_none { None } else { Some(ty * lanes) };
+            assert_eq!(
+                op.vector_home_width(),
+                expected,
+                "{name} ends in {tok}: name promises {expected:?}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 90,
+            "only {checked} shape-conforming ops checked; variant extraction regressed"
+        );
+    }
+
+    /// Map a `Vec*` variant name (as it appears in the enum) to its value.
+    /// Exhaustive over the shape-bearing families; extended only when a new
+    /// family is added to the enum, at which point the test above fails
+    /// loudly for the unknown name instead of silently skipping it.
+    fn names_to_op(name: &str) -> Option<IntrinsicOp> {
+        Some(match name {
+            "VecAddF32x4" => IntrinsicOp::VecAddF32x4,
+            "VecAddF32x8" => IntrinsicOp::VecAddF32x8,
+            "VecAddF64x2" => IntrinsicOp::VecAddF64x2,
+            "VecAddF64x4" => IntrinsicOp::VecAddF64x4,
+            "VecAddI32x4" => IntrinsicOp::VecAddI32x4,
+            "VecRotlI32x4" => IntrinsicOp::VecRotlI32x4,
+            "VecShufdI32x4" => IntrinsicOp::VecShufdI32x4,
+            "VecShufbI32x4" => IntrinsicOp::VecShufbI32x4,
+            "VecPackI32x4" => IntrinsicOp::VecPackI32x4,
+            "VecPackssdwI16x16" => IntrinsicOp::VecPackssdwI16x16,
+            "VecExtractLaneI32x4" => IntrinsicOp::VecExtractLaneI32x4,
+            "VecAddI32x8" => IntrinsicOp::VecAddI32x8,
+            "VecAddI64x2" => IntrinsicOp::VecAddI64x2,
+            "VecAddI64x4" => IntrinsicOp::VecAddI64x4,
+            "VecSadbwU8x32" => IntrinsicOp::VecSadbwU8x32,
+            "VecSadbwU8x16" => IntrinsicOp::VecSadbwU8x16,
+            "VecMaddubsU8x32" => IntrinsicOp::VecMaddubsU8x32,
+            "VecMaddwdI16x16" => IntrinsicOp::VecMaddwdI16x16,
+            "VecConstI8x32" => IntrinsicOp::VecConstI8x32,
+            "VecAndI32x4" => IntrinsicOp::VecAndI32x4,
+            "VecAndI32x8" => IntrinsicOp::VecAndI32x8,
+            "VecBlendvF32x4" => IntrinsicOp::VecBlendvF32x4,
+            "VecBlendvF32x8" => IntrinsicOp::VecBlendvF32x8,
+            "VecBlendvF64x2" => IntrinsicOp::VecBlendvF64x2,
+            "VecBlendvI32x4" => IntrinsicOp::VecBlendvI32x4,
+            "VecBlendvI32x8" => IntrinsicOp::VecBlendvI32x8,
+            "VecBlendvF64x4" => IntrinsicOp::VecBlendvF64x4,
+            "VecBroadcastF32x4" => IntrinsicOp::VecBroadcastF32x4,
+            "VecBroadcastF32x8" => IntrinsicOp::VecBroadcastF32x8,
+            "VecBroadcastF64x2" => IntrinsicOp::VecBroadcastF64x2,
+            "VecBroadcastF64x4" => IntrinsicOp::VecBroadcastF64x4,
+            "VecBroadcastI32x4" => IntrinsicOp::VecBroadcastI32x4,
+            "VecBroadcastI32x8" => IntrinsicOp::VecBroadcastI32x8,
+            "VecBroadcastI64x2" => IntrinsicOp::VecBroadcastI64x2,
+            "VecCmpF32x4" => IntrinsicOp::VecCmpF32x4,
+            "VecCmpF32x8" => IntrinsicOp::VecCmpF32x8,
+            "VecCmpI32x4" => IntrinsicOp::VecCmpI32x4,
+            "VecLoadI8x32" => IntrinsicOp::VecLoadI8x32,
+            "VecStoreI8x32" => IntrinsicOp::VecStoreI8x32,
+            "VecBroadcastI8x32" => IntrinsicOp::VecBroadcastI8x32,
+            "VecCmpI8x32" => IntrinsicOp::VecCmpI8x32,
+            "VecAddI8x16" => IntrinsicOp::VecAddI8x16,
+            "VecSubI8x16" => IntrinsicOp::VecSubI8x16,
+            "VecCmpI8x16" => IntrinsicOp::VecCmpI8x16,
+            "VecBlendvI8x16" => IntrinsicOp::VecBlendvI8x16,
+            "VecMinU8x32" => IntrinsicOp::VecMinU8x32,
+            "VecMinU8x16" => IntrinsicOp::VecMinU8x16,
+            "VecMaxU8x32" => IntrinsicOp::VecMaxU8x32,
+            "VecMaxU8x16" => IntrinsicOp::VecMaxU8x16,
+            "VecBlendvI8x32" => IntrinsicOp::VecBlendvI8x32,
+            "VecAddI8x32" => IntrinsicOp::VecAddI8x32,
+            "VecSubI8x32" => IntrinsicOp::VecSubI8x32,
+            "VecAndI8x32" => IntrinsicOp::VecAndI8x32,
+            "VecOrI8x32" => IntrinsicOp::VecOrI8x32,
+            "VecXorI8x32" => IntrinsicOp::VecXorI8x32,
+            "VecCmpI32x8" => IntrinsicOp::VecCmpI32x8,
+            "VecCmpI64x4" => IntrinsicOp::VecCmpI64x4,
+            "VecCmpI64x2" => IntrinsicOp::VecCmpI64x2,
+            "VecCmpF64x2" => IntrinsicOp::VecCmpF64x2,
+            "VecCmpF64x4" => IntrinsicOp::VecCmpF64x4,
+            "VecDivF32x4" => IntrinsicOp::VecDivF32x4,
+            "VecDivF32x8" => IntrinsicOp::VecDivF32x8,
+            "VecDivF64x2" => IntrinsicOp::VecDivF64x2,
+            "VecDivF64x4" => IntrinsicOp::VecDivF64x4,
+            "VecFmaF32x8" => IntrinsicOp::VecFmaF32x8,
+            "VecFmaF64x4" => IntrinsicOp::VecFmaF64x4,
+            "VecHorizontalAddF32x4" => IntrinsicOp::VecHorizontalAddF32x4,
+            "VecHorizontalAddF32x8" => IntrinsicOp::VecHorizontalAddF32x8,
+            "VecHorizontalAddF64x2" => IntrinsicOp::VecHorizontalAddF64x2,
+            "VecHorizontalAddF64x4" => IntrinsicOp::VecHorizontalAddF64x4,
+            "VecHorizontalAddI32x4" => IntrinsicOp::VecHorizontalAddI32x4,
+            "VecHorizontalAddI32x8" => IntrinsicOp::VecHorizontalAddI32x8,
+            "VecHorizontalAddI64x2" => IntrinsicOp::VecHorizontalAddI64x2,
+            "VecHorizontalAddI64x4" => IntrinsicOp::VecHorizontalAddI64x4,
+            "VecHorizontalMaxI32x4" => IntrinsicOp::VecHorizontalMaxI32x4,
+            "VecHorizontalMaxI32x8" => IntrinsicOp::VecHorizontalMaxI32x8,
+            "VecHorizontalMinI32x8" => IntrinsicOp::VecHorizontalMinI32x8,
+            "VecLoadF32x4" => IntrinsicOp::VecLoadF32x4,
+            "VecLoadF32x8" => IntrinsicOp::VecLoadF32x8,
+            "VecLoadF64x2" => IntrinsicOp::VecLoadF64x2,
+            "VecLoadF64x4" => IntrinsicOp::VecLoadF64x4,
+            "VecLoadI32x4" => IntrinsicOp::VecLoadI32x4,
+            "VecLoadI32x8" => IntrinsicOp::VecLoadI32x8,
+            "VecLoadStrided2I32x8" => IntrinsicOp::VecLoadStrided2I32x8,
+            "VecLoadStrided2I32x4" => IntrinsicOp::VecLoadStrided2I32x4,
+            "VecLoadStrided2CompactI32x4" => IntrinsicOp::VecLoadStrided2CompactI32x4,
+            "VecLoadI64x2" => IntrinsicOp::VecLoadI64x2,
+            "VecLoadI64x4" => IntrinsicOp::VecLoadI64x4,
+            "VecLoadWidenI32ToI64x2" => IntrinsicOp::VecLoadWidenI32ToI64x2,
+            "VecMaddF32x8" => IntrinsicOp::VecMaddF32x8,
+            "VecMaddF64x4" => IntrinsicOp::VecMaddF64x4,
+            "VecMaddF64x4Signed" => IntrinsicOp::VecMaddF64x4Signed(false, false),
+            "VecMaddF32x8Signed" => IntrinsicOp::VecMaddF32x8Signed(false, false),
+            "VecFmaF64x2" => IntrinsicOp::VecFmaF64x2,
+            "VecFnmaF64x2" => IntrinsicOp::VecFnmaF64x2,
+            "VecFmaF32x4" => IntrinsicOp::VecFmaF32x4,
+            "VecFnmaF32x4" => IntrinsicOp::VecFnmaF32x4,
+            "VecFmsF64x2" => IntrinsicOp::VecFmsF64x2,
+            "VecFnmsF64x2" => IntrinsicOp::VecFnmsF64x2,
+            "VecFmsF32x4" => IntrinsicOp::VecFmsF32x4,
+            "VecFnmsF32x4" => IntrinsicOp::VecFnmsF32x4,
+            "VecMaskedAddI32x8" => IntrinsicOp::VecMaskedAddI32x8,
+            "VecMaxF32x4" => IntrinsicOp::VecMaxF32x4,
+            "VecMaxF32x8" => IntrinsicOp::VecMaxF32x8,
+            "VecMaxF64x2" => IntrinsicOp::VecMaxF64x2,
+            "VecMaxF64x4" => IntrinsicOp::VecMaxF64x4,
+            "VecMaxI32x8" => IntrinsicOp::VecMaxI32x8,
+            "VecMinI32x8" => IntrinsicOp::VecMinI32x8,
+            "VecMinU32x8" => IntrinsicOp::VecMinU32x8,
+            "VecMaxU32x8" => IntrinsicOp::VecMaxU32x8,
+            "VecMinF32x4" => IntrinsicOp::VecMinF32x4,
+            "VecMinF32x8" => IntrinsicOp::VecMinF32x8,
+            "VecMinF64x2" => IntrinsicOp::VecMinF64x2,
+            "VecMinF64x4" => IntrinsicOp::VecMinF64x4,
+            "VecMulF32x4" => IntrinsicOp::VecMulF32x4,
+            "VecMulF32x8" => IntrinsicOp::VecMulF32x8,
+            "VecMulF64x2" => IntrinsicOp::VecMulF64x2,
+            "VecMulF64x4" => IntrinsicOp::VecMulF64x4,
+            "VecMulI32x4" => IntrinsicOp::VecMulI32x4,
+            "VecMulI32x8" => IntrinsicOp::VecMulI32x8,
+            "VecMulI64x2" => IntrinsicOp::VecMulI64x2,
+            "VecOrI32x4" => IntrinsicOp::VecOrI32x4,
+            "VecOrI32x8" => IntrinsicOp::VecOrI32x8,
+            "VecSadalpI32x4" => IntrinsicOp::VecSadalpI32x4,
+            "VecSmaxI32x4" => IntrinsicOp::VecSmaxI32x4,
+            "VecSminI32x4" => IntrinsicOp::VecSminI32x4,
+            "VecMinU32x4" => IntrinsicOp::VecMinU32x4,
+            "VecMaxU32x4" => IntrinsicOp::VecMaxU32x4,
+            "VecSmlalHiI32x4" => IntrinsicOp::VecSmlalHiI32x4,
+            "VecSmlalLoI32x4" => IntrinsicOp::VecSmlalLoI32x4,
+            "VecSqrtF32x4" => IntrinsicOp::VecSqrtF32x4,
+            "VecSqrtF32x8" => IntrinsicOp::VecSqrtF32x8,
+            "VecSqrtF64x2" => IntrinsicOp::VecSqrtF64x2,
+            "VecSqrtF64x4" => IntrinsicOp::VecSqrtF64x4,
+            "VecRoundF32x4" => IntrinsicOp::VecRoundF32x4,
+            "VecRoundF32x8" => IntrinsicOp::VecRoundF32x8,
+            "VecRoundF64x2" => IntrinsicOp::VecRoundF64x2,
+            "VecRoundF64x4" => IntrinsicOp::VecRoundF64x4,
+            "VecXorF32x4" => IntrinsicOp::VecXorF32x4,
+            "VecXorF32x8" => IntrinsicOp::VecXorF32x8,
+            "VecXorF64x2" => IntrinsicOp::VecXorF64x2,
+            "VecXorF64x4" => IntrinsicOp::VecXorF64x4,
+            "VecStoreF32x4" => IntrinsicOp::VecStoreF32x4,
+            "VecStoreF32x8" => IntrinsicOp::VecStoreF32x8,
+            "VecStoreF64x2" => IntrinsicOp::VecStoreF64x2,
+            "VecStoreF64x4" => IntrinsicOp::VecStoreF64x4,
+            "VecStoreI32x4" => IntrinsicOp::VecStoreI32x4,
+            "VecStoreI32x8" => IntrinsicOp::VecStoreI32x8,
+            "VecStoreI64x2" => IntrinsicOp::VecStoreI64x2,
+            "VecSubF32x4" => IntrinsicOp::VecSubF32x4,
+            "VecSubF32x8" => IntrinsicOp::VecSubF32x8,
+            "VecSubF64x2" => IntrinsicOp::VecSubF64x2,
+            "VecSubF64x4" => IntrinsicOp::VecSubF64x4,
+            "VecBroadcastI8x16" => IntrinsicOp::VecBroadcastI8x16,
+            "VecAddI16x16" => IntrinsicOp::VecAddI16x16,
+            "VecAddI16x8" => IntrinsicOp::VecAddI16x8,
+            "VecBlendvI16x16" => IntrinsicOp::VecBlendvI16x16,
+            "VecBlendvI16x8" => IntrinsicOp::VecBlendvI16x8,
+            "VecBroadcastI16x16" => IntrinsicOp::VecBroadcastI16x16,
+            "VecBroadcastI16x8" => IntrinsicOp::VecBroadcastI16x8,
+            "VecShlI16x16" => IntrinsicOp::VecShlI16x16,
+            "VecShlI16x8" => IntrinsicOp::VecShlI16x8,
+            "VecLShrI16x16" => IntrinsicOp::VecLShrI16x16,
+            "VecLShrI16x8" => IntrinsicOp::VecLShrI16x8,
+            "VecAShrI16x16" => IntrinsicOp::VecAShrI16x16,
+            "VecAShrI16x8" => IntrinsicOp::VecAShrI16x8,
+            "VecShlI32x8" => IntrinsicOp::VecShlI32x8,
+            "VecShlI32x4" => IntrinsicOp::VecShlI32x4,
+            "VecLShrI32x8" => IntrinsicOp::VecLShrI32x8,
+            "VecLShrI32x4" => IntrinsicOp::VecLShrI32x4,
+            "VecAShrI32x8" => IntrinsicOp::VecAShrI32x8,
+            "VecAShrI32x4" => IntrinsicOp::VecAShrI32x4,
+            "VecShlI64x4" => IntrinsicOp::VecShlI64x4,
+            "VecShlI64x2" => IntrinsicOp::VecShlI64x2,
+            "VecLShrI64x4" => IntrinsicOp::VecLShrI64x4,
+            "VecLShrI64x2" => IntrinsicOp::VecLShrI64x2,
+            "VecCmpI16x16" => IntrinsicOp::VecCmpI16x16,
+            "VecCmpI16x8" => IntrinsicOp::VecCmpI16x8,
+            "VecMaxI16x16" => IntrinsicOp::VecMaxI16x16,
+            "VecMaxI16x8" => IntrinsicOp::VecMaxI16x8,
+            "VecMaxU16x16" => IntrinsicOp::VecMaxU16x16,
+            "VecMinI16x16" => IntrinsicOp::VecMinI16x16,
+            "VecMinI16x8" => IntrinsicOp::VecMinI16x8,
+            "VecMinU16x16" => IntrinsicOp::VecMinU16x16,
+            "VecMulI16x16" => IntrinsicOp::VecMulI16x16,
+            "VecMulI16x8" => IntrinsicOp::VecMulI16x8,
+            "VecSubI16x16" => IntrinsicOp::VecSubI16x16,
+            "VecSubI16x8" => IntrinsicOp::VecSubI16x8,
+            "VecSubSatU16x16" => IntrinsicOp::VecSubSatU16x16,
+            "VecSubSatU16x8" => IntrinsicOp::VecSubSatU16x8,
+            "VecMaxI8x32" => IntrinsicOp::VecMaxI8x32,
+            "VecMinI8x32" => IntrinsicOp::VecMinI8x32,
+            "VecSubI32x4" => IntrinsicOp::VecSubI32x4,
+            "VecSubI32x8" => IntrinsicOp::VecSubI32x8,
+            "VecShlvI32x8" => IntrinsicOp::VecShlvI32x8,
+            "VecLShrvI32x8" => IntrinsicOp::VecLShrvI32x8,
+            "VecAShrvI32x8" => IntrinsicOp::VecAShrvI32x8,
+            "VecShlvI64x4" => IntrinsicOp::VecShlvI64x4,
+            "VecLShrvI64x4" => IntrinsicOp::VecLShrvI64x4,
+            "VecShlvI32x4" => IntrinsicOp::VecShlvI32x4,
+            "VecLShrvI32x4" => IntrinsicOp::VecLShrvI32x4,
+            "VecAShrvI32x4" => IntrinsicOp::VecAShrvI32x4,
+            "VecShlvI64x2" => IntrinsicOp::VecShlvI64x2,
+            "VecLShrvI64x2" => IntrinsicOp::VecLShrvI64x2,
+            "VecSubI64x2" => IntrinsicOp::VecSubI64x2,
+            "VecWidenAddI32x4ToI64x4" => IntrinsicOp::VecWidenAddI32x4ToI64x4,
+            "VecWidenMaskedAddI32x4ToI64x4" => IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4,
+            "VecWidenAddValueI32x4ToI64x2" => IntrinsicOp::VecWidenAddValueI32x4ToI64x2,
+            "VecWidenMaskedAddValueI32x4ToI64x2" => IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2,
+            "VecMaskedAddValueI32x4" => IntrinsicOp::VecMaskedAddValueI32x4,
+            "VecXorI32x4" => IntrinsicOp::VecXorI32x4,
+            "VecXorI32x8" => IntrinsicOp::VecXorI32x8,
+            "VecZeroF32x4" => IntrinsicOp::VecZeroF32x4,
+            "VecZeroF32x8" => IntrinsicOp::VecZeroF32x8,
+            "VecZeroF64x2" => IntrinsicOp::VecZeroF64x2,
+            "VecZeroF64x4" => IntrinsicOp::VecZeroF64x4,
+            "VecZeroI32x4" => IntrinsicOp::VecZeroI32x4,
+            "VecZeroI32x8" => IntrinsicOp::VecZeroI32x8,
+            "VecZeroI64x2" => IntrinsicOp::VecZeroI64x2,
+            "VecZeroI64x4" => IntrinsicOp::VecZeroI64x4,
+            "VecStoreI64x4" => IntrinsicOp::VecStoreI64x4,
+            "VecSubI64x4" => IntrinsicOp::VecSubI64x4,
+            "VecAndI64x4" => IntrinsicOp::VecAndI64x4,
+            "VecOrI64x4" => IntrinsicOp::VecOrI64x4,
+            "VecXorI64x4" => IntrinsicOp::VecXorI64x4,
+            "VecBroadcastI64x4" => IntrinsicOp::VecBroadcastI64x4,
+            "VecAndI64x2" => IntrinsicOp::VecAndI64x2,
+            "VecOrI64x2" => IntrinsicOp::VecOrI64x2,
+            "VecXorI64x2" => IntrinsicOp::VecXorI64x2,
+            "VecLoadI16x8" => IntrinsicOp::VecLoadI16x8,
+            "VecStoreI16x8" => IntrinsicOp::VecStoreI16x8,
+            "VecStoreI16x16" => IntrinsicOp::VecStoreI16x16,
+            "VecAndI16x16" => IntrinsicOp::VecAndI16x16,
+            "VecOrI16x16" => IntrinsicOp::VecOrI16x16,
+            "VecXorI16x16" => IntrinsicOp::VecXorI16x16,
+            "VecLoadI16x16" => IntrinsicOp::VecLoadI16x16,
+            "VecAndI16x8" => IntrinsicOp::VecAndI16x8,
+            "VecOrI16x8" => IntrinsicOp::VecOrI16x8,
+            "VecXorI16x8" => IntrinsicOp::VecXorI16x8,
+            "VecLoadI8x16" => IntrinsicOp::VecLoadI8x16,
+            "VecStoreI8x16" => IntrinsicOp::VecStoreI8x16,
+            "VecAndI8x16" => IntrinsicOp::VecAndI8x16,
+            "VecOrI8x16" => IntrinsicOp::VecOrI8x16,
+            "VecXorI8x16" => IntrinsicOp::VecXorI8x16,
+            "VecPackI64x2" => IntrinsicOp::VecPackI64x2,
+            "VecLoadI32x4Pair" => IntrinsicOp::VecLoadI32x4Pair,
+            "VecLoadWidenU8ToI32x4" => IntrinsicOp::VecLoadWidenU8ToI32x4,
+            "VecStoreI32x4Pair" => IntrinsicOp::VecStoreI32x4Pair,
+            "VecStoreNarrowMaxU8x4" => IntrinsicOp::VecStoreNarrowMaxU8x4,
+            "VecNarrowMaxU8x4" => IntrinsicOp::VecNarrowMaxU8x4,
+            "VecWidenByteFieldsI32x4" => IntrinsicOp::VecWidenByteFieldsI32x4,
+            "VecPackI32x4Pair" => IntrinsicOp::VecPackI32x4Pair,
+            "VecPackF64x2" => IntrinsicOp::VecPackF64x2,
+            "VecExtractLaneI64x4" => IntrinsicOp::VecExtractLaneI64x4,
+            "VecExtractLaneF64x4" => IntrinsicOp::VecExtractLaneF64x4,
+            "VecExtractLaneF32x4" => IntrinsicOp::VecExtractLaneF32x4,
+            "VecExtractLaneF32x8" => IntrinsicOp::VecExtractLaneF32x8,
+            "VecExtractLaneI32x8" => IntrinsicOp::VecExtractLaneI32x8,
+            "VecExtractLaneI16x8" => IntrinsicOp::VecExtractLaneI16x8,
+            "VecExtractLaneI16x16" => IntrinsicOp::VecExtractLaneI16x16,
+            "VecExtractLaneI64x2" => IntrinsicOp::VecExtractLaneI64x2,
+            "VecExtractLaneF64x2" => IntrinsicOp::VecExtractLaneF64x2,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod memory_classification_tests {
+    use super::IntrinsicOp as O;
+    #[test]
+    fn packed_sib_updates_read_and_write_argument_memory() {
+        use crate::ir::reexports::Instruction;
+        for op in [
+            O::FmaF64x4SIB,
+            O::FmaF64x4HoistedSIB,
+            O::MulAddF64x4HoistedSIB,
+        ] {
+            let inst = Instruction::Intrinsic {
+                dest: None,
+                op,
+                dest_ptr: None,
+                args: vec![],
+            };
+            assert!(op.may_read_memory());
+            assert!(op.writes_memory_via_args());
+            assert!(inst.may_write_memory());
+            assert!(!op.reads_pointer_arg());
+            assert!(!op.is_pure());
+            assert!(!op.produces_vector_value());
+            assert_eq!(op.vector_result_width(), None);
+        }
+    }
+
+    #[test]
+    fn strict_reciprocal_effects_and_scalar_result() {
+        // Result width and vector-home classification must agree: one F64,
+        // despite the four input/product lanes encoded in the operation name.
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{Instruction, Value};
+        for op in [O::StrictRecipMulAddF64x4, O::StrictRecipMulAddPackedF64x4] {
+            let inst = Instruction::Intrinsic {
+                dest: Some(Value(0)),
+                op,
+                dest_ptr: None,
+                args: vec![],
+            };
+            assert!(op.may_read_memory(), "{op:?} loads four doubles");
+            assert!(
+                op.writes_memory_via_args(),
+                "{op:?} may spill to its scratch arg"
+            );
+            assert!(inst.may_write_memory());
+            assert!(!op.reads_pointer_arg(), "scratch is not read-only");
+            assert!(!op.is_pure());
+            assert!(!op.produces_vector_value());
+            assert_eq!(op.vector_home_width(), None);
+            assert_eq!(inst.result_type(), Some(IrType::F64));
+        }
+    }
+
+    /// The two-wide group ops write their accumulator through `dest_ptr`, so
+    /// they are read-modify-write, never pure, and never a `VecStore*`.  The
+    /// two-rounding twin exists for the non-FMA baseline; if it were
+    /// classified as pure, DCE could delete the accumulation outright.
+    #[test]
+    fn two_wide_group_updates_read_and_write_its_destination() {
+        use crate::ir::reexports::{Instruction, Operand, Value};
+        for op in [O::FmaF64x2Hoisted, O::MulAddF64x2Hoisted] {
+            let inst = Instruction::Intrinsic {
+                dest: None,
+                op,
+                dest_ptr: Some(Value(4)),
+                args: vec![Operand::Value(Value(3))],
+            };
+            assert!(op.may_read_memory(), "{op:?} reads B and C");
+            assert!(!op.writes_memory_via_args(), "{op:?} writes via dest_ptr");
+            assert!(inst.may_write_memory(), "{op:?} stores C");
+            assert!(!op.is_pure(), "{op:?} has a memory side effect");
+            assert!(!op.produces_vector_value(), "{op:?} produces no value");
+            assert_eq!(inst.result_type(), None);
+            // The pointer arguments ARE read (they name B and C), so the
+            // read-side allowlist must admit the family; the write side is
+            // `dest_ptr`-only, which `writes_memory_via_args` denies.
+            assert!(
+                op.reads_pointer_arg(),
+                "{op:?} reads B and C through its pointer arguments"
+            );
+            // `is_vector_op` describes a REGISTER-valued vector result, which
+            // these ops do not have: their result lives in the destination
+            // home.  Claiming one would let the register-homing scan try to
+            // colour a value that never exists.
+            assert!(!op.is_vector_op(), "{op:?} has no register result");
+            assert_eq!(
+                op.vector_home_width(),
+                None,
+                "{op:?} is a memory-backed group op"
+            );
+        }
+    }
+
+    /// The memory-classification predicates the BB-SLP vectorizer's legality
+    /// rules key on. A store misclassified as non-writing is a miscompile (a
+    /// seed could reorder loads across it); a load misclassified as
+    /// non-reading likewise. Both lists must stay complete for every family
+    /// the vectorizers emit.
+    #[test]
+    fn store_effect_contract_classification() {
+        for op in super::VECTOR_STORES {
+            assert!(op.writes_memory_via_args(), "{op:?} writes through args");
+            assert!(!op.is_pure(), "{op:?} must not be classified as pure");
+            assert!(!op.produces_vector_value(), "{op:?} has no result");
+            assert_eq!(op.vector_result_width(), None, "{op:?} has no result home");
+            assert!(
+                !op.reads_pointer_arg(),
+                "{op:?} is not a read-only argument consumer"
+            );
+            assert!(op.is_vector_op(), "{op:?} is a SIMD store");
+        }
+    }
+
+    #[test]
+    fn store_source_homes_are_not_results_or_purity_proofs() {
+        for (op, width) in [
+            (O::VecStoreI64x2, 16),
+            (O::VecStoreI32x4Pair, 16),
+            (O::StoreuPs256, 32),
+            (O::StoreuPd256, 32),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width));
+            assert_eq!(op.vector_result_width(), None);
+            assert!(!op.produces_vector_value());
+            assert!(!op.is_pure());
+            assert!(op.is_vector_op());
+        }
+    }
+
+    #[test]
+    fn legacy_store_source_read_does_not_cancel_destination_write() {
+        use crate::ir::reexports::{Instruction, Operand, Value};
+
+        for op in [O::StoreuPs256, O::StoreuPd256] {
+            assert!(op.reads_pointer_arg(), "args[0] is a readable SIMD source");
+            assert!(!op.writes_memory_via_args(), "the write is in dest_ptr");
+            assert!(!op.is_pure());
+            assert!(!op.produces_vector_value());
+            assert_eq!(op.vector_home_width(), Some(32));
+            assert_eq!(op.vector_result_width(), None);
+            for source in [Value(0), Value(1)] {
+                let store = Instruction::Intrinsic {
+                    dest: None,
+                    op,
+                    dest_ptr: Some(Value(0)),
+                    args: vec![Operand::Value(source)],
+                };
+                assert!(store.may_write_memory(), "{op:?}, source={source:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_vec_store_family_writes_memory_via_args() {
+        for op in super::VECTOR_STORES {
+            assert!(
+                op.writes_memory_via_args(),
+                "{op:?} must classify as a memory write in the args form"
+            );
+            assert!(
+                !op.may_read_memory(),
+                "{op:?} is a store, not a memory reader"
+            );
+        }
+    }
+
+    #[test]
+    fn vec_load_families_read_memory_and_never_write_it() {
+        for op in [
+            O::VecLoadF64x2,
+            O::VecLoadF64x4,
+            O::VecLoadF32x4,
+            O::VecLoadF32x8,
+            O::VecLoadI32x4,
+            O::VecLoadI32x8,
+            O::VecLoadStrided2I32x8,
+            O::VecLoadStrided2I32x4,
+            O::VecLoadStrided2CompactI32x4,
+            O::VecLoadI64x2,
+            O::VecLoadI64x4,
+            O::VecLoadI16x8,
+            O::VecLoadI8x16,
+            O::VecLoadI8x32,
+            O::VecLoadI16x16,
+            O::VecLoadI32x4Pair,
+            O::VecLoadWidenI32ToI64x2,
+            O::Loadu256,
+            O::Load256,
+            O::LoadF64x4,
+            O::LoadF64x2,
+            O::LoadI32x8,
+            O::LoadI32x4,
+            O::LoaduPs256,
+            O::LoaduPd256,
+            O::Loadu512,
+        ] {
+            assert!(op.reads_pointer_arg(), "{op:?} allows a read-only pointer");
+            assert!(op.may_read_memory(), "{op:?} must classify as a read");
+            assert!(
+                !op.writes_memory_via_args(),
+                "{op:?} is a load, not a memory writer"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_alu_families_touch_no_memory() {
+        for op in [
+            O::VecAddI64x4,
+            O::VecSubI64x2,
+            O::VecMulF64x4,
+            O::VecAndI8x16,
+            O::VecOrI16x8,
+            O::VecXorI32x4,
+            O::VecXorF32x4,
+            O::VecXorF32x8,
+            O::VecXorF64x2,
+            O::VecXorF64x4,
+            O::VecBroadcastI64x4,
+            O::VecZeroF32x4,
+            O::VecPackI64x2,
+            O::VecPackI32x4Pair,
+            O::VecExtractLaneI64x2,
+            O::VecPackssdwI16x16,
+            O::VecAndI16x16,
+            O::VecOrI16x16,
+            O::VecXorI16x16,
+        ] {
+            assert!(
+                !op.writes_memory_via_args() && !op.may_read_memory(),
+                "{op:?} is pure compute and must not look like a memory op"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vec_mem_offset_tests {
+    use super::IntrinsicOp as O;
+
+    /// The register-dest `VecLoad*` families address `base + index + disp` with
+    /// the index in argument 1; the `VecStore*` families with `[src, base,
+    /// index, disp]` and the index in argument 2. This is the contract the
+    /// x86 emitter's `vec_mem_operand` implements and the alias engine models,
+    /// so a drift here is a miscompile in every consumer at once.
+    #[test]
+    fn load_families_expose_slot_one_and_stores_slot_two() {
+        for op in [
+            O::VecLoadF64x4,
+            O::VecLoadI32x8,
+            O::VecLoadStrided2I32x8,
+            O::VecLoadStrided2I32x4,
+            O::VecLoadStrided2CompactI32x4,
+            O::VecLoadF32x8,
+            O::VecLoadI8x32,
+            O::VecLoadI64x4,
+            O::VecLoadI16x16,
+            O::VecLoadF64x2,
+            O::VecLoadI32x4,
+            O::VecLoadF32x4,
+            O::VecLoadI64x2,
+            O::VecLoadI16x8,
+            O::VecLoadI8x16,
+            O::VecLoadWidenI32ToI64x2,
+            O::VecLoadI32x4Pair,
+        ] {
+            assert_eq!(op.vec_mem_offset_arg_index(), Some(1), "{op:?} index slot");
+            assert!(
+                op.may_read_memory(),
+                "{op:?} must classify as a memory read"
+            );
+            assert!(
+                !op.writes_memory_via_args(),
+                "{op:?} is a load and must not classify as an argument-memory write"
+            );
+        }
+        for op in [
+            O::VecStoreI32x4,
+            O::VecStoreF32x4,
+            O::VecStoreF64x2,
+            O::VecStoreI64x2,
+            O::VecStoreI16x8,
+            O::VecStoreI8x16,
+            O::VecStoreI32x8,
+            O::VecStoreF32x8,
+            O::VecStoreF64x4,
+            O::VecStoreI64x4,
+            O::VecStoreI8x32,
+            O::VecStoreI16x16,
+            O::VecStoreI32x4Pair,
+        ] {
+            assert_eq!(op.vec_mem_offset_arg_index(), Some(2), "{op:?} index slot");
+            assert!(
+                op.writes_memory_via_args(),
+                "{op:?} must classify as an argument-memory write"
+            );
+        }
+    }
+
+    /// The accessor must be strictly narrower than the memory-behaviour
+    /// predicates: the FMA / hoisted / strict-reciprocal families read or write
+    /// memory through *data-positioned* arguments (multiplicands, guards), so
+    /// they must never report an address-index slot. Widening an induction
+    /// variable consumed by one of them as data would change the computed
+    /// value rather than its address.
+    #[test]
+    fn non_vector_memory_ops_never_expose_an_index_slot() {
+        for op in [
+            O::FmaF64x2,
+            O::FmaF64x4,
+            O::FmaF64x2Hoisted,
+            O::FmaF64x4Hoisted,
+            O::FmaF64x4SIB,
+            O::MulAddF64x4HoistedSIB,
+            O::StrictRecipMulAddF64x4,
+            O::StrictRecipMulAddPackedF64x4,
+            O::BroadcastLoadF64,
+            O::Loadu256,
+            O::Load256,
+        ] {
+            assert_eq!(
+                op.vec_mem_offset_arg_index(),
+                None,
+                "{op:?} must not expose a vector index slot"
+            );
+        }
+        // ... and the register-only vector ops have no slot at all.
+        for op in [
+            O::VecAddI32x8,
+            O::VecSubI32x8,
+            O::VecMulI32x8,
+            O::VecAndI32x8,
+            O::VecHorizontalAddI32x8,
+            O::VecBroadcastI32x8,
+            O::VecZeroI32x8,
+            O::VecMaddwdI16x16,
+            O::VecConstI8x32,
+        ] {
+            assert_eq!(
+                op.vec_mem_offset_arg_index(),
+                None,
+                "{op:?} is register-only"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssse3_native_contract_tests {
+    use super::IntrinsicOp::*;
+    #[test]
+    fn shared_ssse3_mnemonics_cover_the_exact_legacy_family() {
+        use super::IntrinsicOp as O;
+        for (op, mnemonic) in [
+            (O::Phaddw128, "phaddw"),
+            (O::Phaddd128, "phaddd"),
+            (O::Phsubw128, "phsubw"),
+            (O::Phsubd128, "phsubd"),
+            (O::Phaddsw128, "phaddsw"),
+            (O::Phsubsw128, "phsubsw"),
+            (O::Psignb128, "psignb"),
+            (O::Psignw128, "psignw"),
+            (O::Psignd128, "psignd"),
+            (O::Pmulhrsw128, "pmulhrsw"),
+            (O::Palignr128, "palignr"),
+        ] {
+            assert_eq!(op.ssse3_binary_mnemonic(), Some(mnemonic));
+        }
+        assert_eq!(O::Pmulld128.ssse3_binary_mnemonic(), None);
+    }
+
+    #[test]
+    fn native_binary_results_have_full_vector_homes() {
+        for op in [
+            Phsubw128,
+            Phsubd128,
+            Phaddsw128,
+            Phsubsw128,
+            Psignb128,
+            Psignw128,
+            Psignd128,
+            Pmulhrsw128,
+        ] {
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?}");
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?}");
+            // Explicit-SIMD nodes read argument pointers and write a
+            // destination slot; match the existing horizontal-add contract.
+            assert_eq!(op.is_pure(), Phaddd128.is_pure());
+            assert!(op.is_vector_op());
+        }
+    }
+}
+
+#[cfg(test)]
+mod unsigned_dword_minmax_contract_tests {
+    use super::IntrinsicOp;
+
+    #[test]
+    fn unsigned_minmax_are_pure_register_values_without_memory_effects() {
+        for (op, width) in [
+            (IntrinsicOp::VecMinU32x4, 16),
+            (IntrinsicOp::VecMaxU32x4, 16),
+            (IntrinsicOp::VecMinU32x8, 32),
+            (IntrinsicOp::VecMaxU32x8, 32),
+        ] {
+            assert_eq!(op.vector_result_width(), Some(width));
+            assert_eq!(op.vector_home_width(), Some(width));
+            assert!(op.produces_vector_value());
+            assert!(op.is_pure());
+            // This legacy allowlist admits all vector-valued families; it
+            // is NOT a statement that this two-vector-operand op loads memory.
+            assert_eq!(
+                op.reads_pointer_arg(),
+                IntrinsicOp::VecSminI32x4.reads_pointer_arg()
+            );
+            assert!(!op.writes_memory_via_args());
+            assert!(!op.may_read_memory());
+        }
+    }
+}

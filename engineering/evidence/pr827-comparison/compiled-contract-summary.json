@@ -1,0 +1,42 @@
+{
+  "corpus-o2": {
+    "correct": 45,
+    "sha256": "a438d5afaf542ac860d002e995f908529b4ffbf761b483b72ea8235c410a557d",
+    "timing_claim": false,
+    "workloads": 45
+  },
+  "corpus-o3": {
+    "correct": 45,
+    "sha256": "f0bb0ebcc5a0d45e8a110dd2ddbca7347985bfbdf04ac54f4bd7708c6130d560",
+    "timing_claim": false,
+    "workloads": 45
+  },
+  "harness": {
+    "compiler": "gcc-16 (Debian 16.2.0-3) 16.2.0",
+    "errors": 0,
+    "failures": 0,
+    "sha256": "b23ff7171e9b92aca0e8233080319ec7ebcd13f26ff3a49b1d8839931135cbfe",
+    "skipped": 0,
+    "tests": 9
+  },
+  "pgo": {
+    "failed": 0,
+    "passed": 72,
+    "sha256": "2b665e674420f9bc207eb6c973d73870778ee6deeb4d1b0ecb0d1673b8553119",
+    "skipped": 0
+  },
+  "relocations": {
+    "failed": 0,
+    "oracle_version": null,
+    "passed": 466,
+    "sha256": "c6fee5a3388bca3e5bfa5ef1f6c7185ef9066906f97ddda0c88fb89856dd8de1",
+    "skipped": 0
+  },
+  "valid-oracle": {
+    "failed": 0,
+    "oracle_version": "Debian LLD 21.1.8 (compatible with GNU linkers)",
+    "passed": 230,
+    "sha256": "f940a863ed5a78d45924cd223b13ab4731751d11b2e8700ca1d282ea82dcc73a",
+    "skipped": 0
+  }
+}

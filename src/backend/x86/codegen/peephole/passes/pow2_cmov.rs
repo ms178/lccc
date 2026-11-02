@@ -1,0 +1,913 @@
+//! Conditional-add elimination for signed power-of-two division.
+//!
+//! `div_by_const` expands a signed `x / 2^k` into the bias-add identity:
+//!
+//! ```text
+//!     movl  %edi, %esi        ; S = x
+//!     sarl  $31, %esi         ; sign broadcast
+//!     shrl  $29, %esi         ; bias = (x < 0) ? 2^k-1 : 0
+//!     leal  (%rdi,%rsi), %eax ; biased = x + bias
+//!     sarl  $3, %eax          ; quotient = biased >> k
+//! ```
+//!
+//! The value identity is exact for truncating division, but the machine
+//! idiom GCC 16.2 emits is a conditionally added constant with a `cmov`
+//! selecting between the two arms —
+//!
+//! ```text
+//!     testl  %edi, %edi       ; SF of x
+//!     leal   7(%rdi), %eax    ; biased = x + (2^k-1)
+//!     cmovns %edi, %eax       ; x >= 0 ? x : biased
+//!     sarl   $3, %eax
+//! ```
+//!
+//! — five instructions down to four, and the scratch register that carried
+//! the sign chain disappears.  This pass performs exactly that machine-idiom
+//! rewrite on the emitted text.  The IR is untouched: the identity remains
+//! the documented `div_by_const` expansion, and
+//! `pow2_signed_expansions_match_truncating_semantics` still certifies the
+//! value algebra this rewrite compiles.
+//!
+//! # When it is legal
+//!
+//! 1. **Exact block shape**: five instructions (blank and debug-attribution
+//!    lines may interleave) spelling, in order, `mov{l,q} %X, %S`;
+//!    `sar{l,q} $(31|63), %S`; `shr{l,q} $(32|64-k), %S`;
+//!    `lea{l,q} (%X,%S), %T`; `sar{l,q} $k, %T` — all at one width, with
+//!    the scratch `S ≠ X` and the `lea` destination `T ≠ X` (the conditional
+//!    `cmov` source must still be live after the `lea`).
+//! 2. **No flag reads inside the block** and no flag-reader between the
+//!    block's final `sar` and the next flag-writer (or label) downstream:
+//!    the block's trailing flags are the `sar`'s both before and after the
+//!    rewrite, so every downstream reader keeps its value; unknown entry
+//!    state at a label in between is refused rather than reasoned about.
+//! 3. **The scratch dies with the block**: `%S` is dead after the sign
+//!    chain — deleting the two shifts would otherwise strand later readers.
+//!    The answer is the exact CFG dataflow of `liveness::FileLiveness`
+//!    (branches followed; at `ret` the prologue's `# LCCC_RET_RAX/RDX`
+//!    markers decide which return registers the caller observes); only a
+//!    function that analysis cannot resolve falls back to a fail-closed
+//!    linear scan that stops at every control transfer.
+//! 4. **Immediates fit**: the conditional `lea` displaces `2^k-1` as a
+//!    signed 32-bit displacement, so `1 ≤ k ≤ 31` (a wider shift keeps the
+//!    original identity).
+//! 5. **Nothing unusual in the window**: no labels, no comment-bearing
+//!    lines, no pinned lines — each aborts rather than half-applies.
+//!
+//! The pass runs after `return_home`, so on terminal paths the `lea`
+//! destination already *is* `%eax` and the rewrite lands straight in the
+//! return register.  `CCC_PEEPHOLE_SKIP=pow2_cmov` disables it.
+
+use super::super::types::*;
+use super::identical_blocks::reads_flags;
+use super::liveness::FileLiveness;
+use super::relay_and_lea::{plain_gp_operand, split_two_operands};
+
+/// Rewrite every recognised sign-chain block.  Returns whether the text
+/// changed.
+pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    // Exact CFG liveness, built on the first block that reaches the scratch
+    // question and never refreshed: a rewrite deletes only the dead scratch's
+    // definitions and reads and moves `%T`'s definition earlier *inside* the
+    // block, so the block's live-in set is unchanged or smaller and every
+    // answer outside the block can only become "dead" — a stale "live" is
+    // conservative. (Rewritten blocks never match again: their `lea` has a
+    // displacement and no `mov`/`sar`/`shr` head.)
+    let mut liveness: Option<FileLiveness> = None;
+    for end in 0..infos.len() {
+        if let Some(block) = Block::discover(store, infos, end, &mut liveness) {
+            if block.apply(store, infos) {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// A discovered five-instruction sign chain, anchored at its final `sar`.
+struct Block {
+    /// Instruction line indices: [mov, sign, bias, lea, sar].
+    lines: [usize; 5],
+    x_spelling: String,
+    base_spelling: String,
+    t_spelling: String,
+    width: char,
+    k: u32,
+}
+
+impl Block {
+    fn discover(
+        store: &LineStore,
+        infos: &[LineInfo],
+        end: usize,
+        liveness: &mut Option<FileLiveness>,
+    ) -> Option<Block> {
+        let e = plain_sar(store, infos, end)?;
+        // Walking down from the final sar: lea, bias shift, sign shift, mov.
+        let lea_i = prev_non_silence(store, infos, end)?;
+        let bias_i = prev_non_silence(store, infos, lea_i)?;
+        let sign_i = prev_non_silence(store, infos, bias_i)?;
+        let mov_i = prev_non_silence(store, infos, sign_i)?;
+
+        let mov = plain_text(store, infos, mov_i)?;
+        let sign = plain_text(store, infos, sign_i)?;
+        let bias = plain_text(store, infos, bias_i)?;
+        let lea = plain_text(store, infos, lea_i)?;
+
+        let width = width_letter(store, infos, end)?;
+        for line in [mov_i, sign_i, bias_i, lea_i] {
+            if width_letter(store, infos, line)? != width {
+                return None;
+            }
+        }
+
+        // mov: `mov{l,q} %X, %S`
+        let (mov_mnem, mov_rest) = split_head(mov)?;
+        if mov_mnem != format!("mov{width}") {
+            return None;
+        }
+        let (x_spelling, scratch) = split_two_operands(mov_rest)?;
+        let x = plain_gp_operand(x_spelling)?;
+        let s = plain_gp_operand(scratch)?;
+        if x == s {
+            return None;
+        }
+
+        // sign: `sar{l,q} $(31|63), %S`
+        let (sign_mnem, sign_rest) = split_head(sign)?;
+        if sign_mnem != format!("sar{width}") {
+            return None;
+        }
+        let (sign_src, sign_dst) = split_two_operands(sign_rest)?;
+        if plain_gp_operand(sign_dst)? != s {
+            return None;
+        }
+        let full_shift: u32 = if width == 'l' { 31 } else { 63 };
+        if imm_value(sign_src)? != full_shift {
+            return None;
+        }
+
+        // bias: `shr{l,q} $(width_bits-k), %S`
+        let (bias_mnem, bias_rest) = split_head(bias)?;
+        if bias_mnem != format!("shr{width}") {
+            return None;
+        }
+        let (bias_src, bias_dst) = split_two_operands(bias_rest)?;
+        if plain_gp_operand(bias_dst)? != s {
+            return None;
+        }
+        let width_bits: u32 = if width == 'l' { 32 } else { 64 };
+        let bias_shift = imm_value(bias_src)?;
+        if bias_shift < 1 || bias_shift >= width_bits {
+            return None;
+        }
+        let k = width_bits - bias_shift;
+
+        // lea: `lea{l,q} (%X, %S), %T` — two-register SIB, zero displacement.
+        let (lea_mnem, lea_rest) = split_head(lea)?;
+        if lea_mnem != format!("lea{width}") {
+            return None;
+        }
+        let (mem, t_spelling) = split_two_operands(lea_rest)?;
+        let t = plain_gp_operand(t_spelling)?;
+        if t == x {
+            return None; // the cmov source must survive the lea
+        }
+        let (base, index) = sib_pair(mem)?;
+        if plain_gp_operand(base)? != x || plain_gp_operand(index)? != s {
+            return None;
+        }
+
+        // sar: `sar{l,q} $k, %T`
+        if e.t != t || e.k != k {
+            return None;
+        }
+        if k == 0 || k > 31 {
+            return None; // 2^k-1 must be a positive signed-32 displacement
+        }
+
+        // The five lines must be pure: editable, comment-free, non-flag-reading.
+        let region = [mov_i, sign_i, bias_i, lea_i, end];
+        if !all_editable(infos, &region) {
+            return None;
+        }
+        for &j in &region {
+            let raw = store.get(j);
+            if raw.contains('#') {
+                return None;
+            }
+            if matches!(infos[j].kind, LineKind::Label | LineKind::Ret) {
+                return None;
+            }
+            if reads_flags(store, infos, j) {
+                return None;
+            }
+        }
+
+        // Scratch liveness after the lea (its last chain read): the exact
+        // dataflow answer — which follows branches and honours the
+        // prologue's return-register markers at `ret` — and the fail-closed
+        // linear scan only where that function is unanalysable.
+        let live = liveness
+            .get_or_insert_with(|| FileLiveness::new(store, infos))
+            .live_after(lea_i, s)
+            .unwrap_or_else(|| scratch_live_after(store, infos, lea_i, s));
+        if live {
+            return None;
+        }
+
+        // Downstream flag readers before the next writer (or an unknown
+        // label boundary) observe flags the rewrite does not disturb —
+        // the block's trailing flags are the final sar's either way — but
+        // refuse labels so no unknown entry state is assumed.
+        let mut j = end + 1;
+        while j < infos.len() {
+            if infos[j].is_nop() {
+                j += 1;
+                continue;
+            }
+            if matches!(infos[j].kind, LineKind::Label) {
+                break;
+            }
+            if reads_flags(store, infos, j) {
+                return None;
+            }
+            let text = infos[j].trimmed(store.get(j));
+            if definitely_kills_any_flags_text(text) {
+                break;
+            }
+            j += 1;
+        }
+
+        Some(Block {
+            lines: [mov_i, sign_i, bias_i, lea_i, end],
+            x_spelling: x_spelling.to_string(),
+            base_spelling: base.to_string(),
+            t_spelling: t_spelling.to_string(),
+            width,
+            k,
+        })
+    }
+
+    fn apply(&self, store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+        if !all_editable(infos, &self.lines) {
+            return false;
+        }
+        let bias: i64 = (1i64 << self.k) - 1;
+        let indent = "    ";
+        let new_lines = [
+            format!(
+                "{indent}test{} {}, {}",
+                self.width, self.x_spelling, self.x_spelling
+            ),
+            format!(
+                "{indent}lea{} {bias}({}), {}",
+                self.width, self.base_spelling, self.t_spelling
+            ),
+            format!("{indent}cmovns {}, {}", self.x_spelling, self.t_spelling),
+            // index 3 replaces the lea slot; the final sar (index 4) stays.
+        ];
+        // Slot swap, four lines into five slots: mov←test, sign←lea,
+        // bias←cmovns, lea←the original final sar (text unchanged), and the
+        // old sar slot becomes a nop — one instruction shorter overall, with
+        // every interleaved debug/blank line left exactly where it was.
+        let sar_text = store.get(self.lines[4]).to_string();
+        let edits = [
+            (self.lines[0], new_lines[0].clone()),
+            (self.lines[1], new_lines[1].clone()),
+            (self.lines[2], new_lines[2].clone()),
+            (self.lines[3], sar_text),
+        ];
+        for (line, text) in edits {
+            if text.trim().is_empty() {
+                return false;
+            }
+            replace_line(store, &mut infos[line], line, text);
+        }
+        mark_nop(&mut infos[self.lines[4]]);
+        true
+    }
+}
+
+struct Sar {
+    t: RegId,
+    k: u32,
+}
+
+fn plain_sar(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<Sar> {
+    if infos[i].is_nop()
+        || matches!(
+            infos[i].kind,
+            LineKind::Label | LineKind::Ret | LineKind::Pop { .. }
+        )
+    {
+        return None;
+    }
+    let raw = store.get(i);
+    if raw.contains('#') {
+        return None;
+    }
+    let text = infos[i].trimmed(raw);
+    let (mnem, rest) = split_head(text)?;
+    if mnem != "sarl" && mnem != "sarq" {
+        return None;
+    }
+    let (src, dst) = split_two_operands(rest)?;
+    Some(Sar {
+        t: plain_gp_operand(dst)?,
+        k: imm_value(src)?,
+    })
+}
+
+fn plain_text<'a>(store: &'a LineStore, infos: &[LineInfo], i: usize) -> Option<&'a str> {
+    if infos[i].is_nop() {
+        return None;
+    }
+    let raw = store.get(i);
+    if raw.contains('#') {
+        return None;
+    }
+    Some(infos[i].trimmed(raw))
+}
+
+fn split_head(text: &str) -> Option<(String, &str)> {
+    text.split_once(char::is_whitespace)
+        .map(|(m, r)| (m.to_string(), r))
+}
+
+fn imm_value(src: &str) -> Option<u32> {
+    let rest = src.strip_prefix('$')?;
+    rest.parse::<i64>().ok().and_then(|v| u32::try_from(v).ok())
+}
+
+/// `(%base,%index)` with no displacement and no scale — the two-register SIB
+/// the bias-add `lea` produces.
+fn sib_pair(mem: &str) -> Option<(&str, &str)> {
+    let inner = mem.strip_prefix('(')?.strip_suffix(')')?;
+    let mut it = inner.split(',');
+    let base = it.next()?;
+    let index = it.next()?;
+    if it.next().is_some() {
+        return None; // explicit scale: not the plain bias add
+    }
+    Some((base.trim(), index.trim()))
+}
+
+fn width_letter(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<char> {
+    let raw = store.get(i);
+    let text = infos[i].trimmed(raw);
+    let (mnem, _) = split_head(text)?;
+    mnem.chars().last().filter(|c| *c == 'l' || *c == 'q')
+}
+
+/// First non-silence line strictly before `i` (nop/inert/blank/comment and
+/// `#`-carriers are silence).
+fn prev_non_silence(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<usize> {
+    let mut c = i;
+    loop {
+        if c == 0 {
+            return None;
+        }
+        c -= 1;
+        if infos[c].is_steppable() {
+            continue;
+        }
+        let raw = store.get(c);
+        if raw.trim_start().starts_with('#') || raw.trim().is_empty() {
+            continue;
+        }
+        if crate::backend::peephole_common::inert_directive(raw) {
+            continue;
+        }
+        return Some(c);
+    }
+}
+
+/// True when the shared flag mask proves that this instruction definitely
+/// kills at least one incoming arithmetic flag bit. A possible/partial write
+/// with no proven killed bits does not end the scan; readers are checked first.
+pub(super) fn definitely_kills_any_flags_text(text: &str) -> bool {
+    super::flag_peepholes::flags_written_mask(text) != 0
+}
+
+/// True when `%S` is read after `from` before a proven full-register overwrite.
+///
+/// The scan is deliberately fail-closed: a two-operand mnemonic is not proof
+/// of a definition (`cmp` reads its last operand, arithmetic is read-modify-
+/// write, and a byte/word move preserves upper bits). Only full-width `mov`,
+/// `lea`, and `pop` writes with no source/address use of `%S` kill the old
+/// value. Comments are stripped rather than hiding the instruction, ABI return
+/// registers `%rax`/`%rdx` and the `%rsp` consumed by `ret` are live at that
+/// boundary, and an opaque control-flow edge or pinned region prevents a linear
+/// liveness claim.
+fn scratch_live_after(store: &LineStore, infos: &[LineInfo], from: usize, s: RegId) -> bool {
+    let mask = 1u16 << s;
+    for j in (from + 1)..infos.len() {
+        if infos[j].is_nop() {
+            continue;
+        }
+        let raw = store.get(j);
+        let code = raw
+            .split_once('#')
+            .map_or(raw, |(before, _)| before)
+            .trim_end();
+        if code.trim().is_empty() {
+            continue;
+        }
+        if infos[j].is_steppable() || infos[j].kind == LineKind::Empty {
+            continue;
+        }
+        let text = infos[j].trimmed(code);
+        if text.is_empty() {
+            continue;
+        }
+        if infos[j].pinned || infos[j].volatile_access {
+            return true;
+        }
+        if matches!(infos[j].kind, LineKind::Ret) {
+            const RET_OBSERVED_GPRS: u16 = (1 << 0) | (1 << 2) | (1 << 4);
+            // `%rax`/`%rdx` carry integer return values; `ret` also consumes `%rsp`.
+            return (implicit_reg_refs(text.as_bytes()) | RET_OBSERVED_GPRS) & mask != 0;
+        }
+        if super::is_opaque_control_transfer(text) {
+            return true;
+        }
+        if matches!(
+            infos[j].kind,
+            LineKind::Label
+                | LineKind::Jmp
+                | LineKind::JmpIndirect
+                | LineKind::CondJmp
+                | LineKind::Call
+                | LineKind::InlineAsm
+        ) || (infos[j].kind == LineKind::Directive && !infos[j].inert_dir)
+        {
+            return true;
+        }
+        if implicit_reg_refs(text.as_bytes()) & mask != 0 {
+            return true;
+        }
+        match infos[j].kind {
+            LineKind::Pop { reg } => {
+                if reg == s {
+                    return false; // pop writes the full register without reading it
+                }
+                continue;
+            }
+            LineKind::Push { reg } => {
+                if reg == s {
+                    return true; // push observes the old scratch value
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if full_register_overwrite(text, s) {
+            return false;
+        }
+        if operand_mentions(text, s) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A write which replaces every bit of the register family, without reading
+/// the previous value from either its source operand or a memory address.
+fn full_register_overwrite(text: &str, fam: RegId) -> bool {
+    let Some((mnem, rest)) = split_head(text) else {
+        return false;
+    };
+    if !matches!(
+        mnem.as_str(),
+        "movl"
+            | "movq"
+            | "movabsq"
+            | "movzbl"
+            | "movzwl"
+            | "movzbq"
+            | "movzwq"
+            | "movsbl"
+            | "movswl"
+            | "movsbq"
+            | "movswq"
+            | "movslq"
+            | "leal"
+            | "leaq"
+    ) {
+        return false;
+    }
+    let Some((src, dst)) = split_two_operands(rest) else {
+        return false;
+    };
+    plain_gp_operand(dst.trim()) == Some(fam) && !operand_fragment_mentions(src, fam)
+}
+
+/// Does any token in an operand fragment name family `fam` as a plain register?
+fn operand_fragment_mentions(fragment: &str, fam: RegId) -> bool {
+    fragment
+        .split([',', '(', ')', '\t', ' '])
+        .filter(|w| !w.is_empty())
+        .any(|w| plain_gp_operand(w) == Some(fam))
+}
+
+/// Does any operand of `text` name family `fam` as a plain register?
+fn operand_mentions(text: &str, fam: RegId) -> bool {
+    let Some((_, rest)) = text.split_once(char::is_whitespace) else {
+        return false;
+    };
+    operand_fragment_mentions(rest, fam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run ONLY `pow2_cmov` so every assertion is about this pass.
+    fn run_cmov(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        run(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn frame(body: &str) -> String {
+        format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n")
+    }
+
+    #[test]
+    fn definite_flag_mask_excludes_sse_avx_and_bmi2_nonwriters() {
+        for mnem in [
+            "addps %xmm0, %xmm1",
+            "andps %xmm0, %xmm1",
+            "cmpps $0, %xmm0, %xmm1",
+            "divsd %xmm0, %xmm1",
+            "mulsd %xmm0, %xmm1",
+            "vaddps %ymm0, %ymm1, %ymm2",
+            "vmulps %ymm0, %ymm1, %ymm2",
+            "mulx %r8, %r9, %r10",
+            "shrx %rcx, %r8, %r9",
+        ] {
+            assert!(
+                !definitely_kills_any_flags_text(mnem),
+                "{mnem} preserves EFLAGS"
+            );
+        }
+        for mnem in [
+            "addl %esi, %edi",
+            "incq %rcx",
+            "ucomiss %xmm0, %xmm1",
+            "vcomisd %xmm0, %xmm1",
+            "clc",
+            "sahf",
+        ] {
+            assert!(
+                definitely_kills_any_flags_text(mnem),
+                "{mnem} writes EFLAGS"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_or_variable_count_shift_does_not_kill_flags_in_the_oracle() {
+        assert!(!definitely_kills_any_flags_text("shlq $0, %rax"));
+        assert!(!definitely_kills_any_flags_text("shlq %cl, %rax"));
+    }
+
+    #[test]
+    fn sdiv32_identity_rewrites_to_the_cmov_form() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("leal 7(%rdi), %eax"), "{out}");
+        assert!(out.contains("cmovns %edi, %eax"), "{out}");
+        assert!(out.contains("sarl $3, %eax"), "{out}");
+        assert!(!out.contains("%esi"), "sign scratch retired:\n{out}");
+        assert!(!out.contains("leal (%rdi, %rsi)"), "{out}");
+    }
+
+    #[test]
+    fn sdiv64_identity_rewrites_to_the_cmov_form() {
+        let out = run_cmov(&frame(concat!(
+            "    movq %rdi, %rsi\n",
+            "    sarq $63, %rsi\n",
+            "    shrq $61, %rsi\n",
+            "    leaq (%rdi, %rsi), %rax\n",
+            "    sarq $3, %rax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("testq %rdi, %rdi"), "{out}");
+        assert!(out.contains("leaq 7(%rdi), %rax"), "{out}");
+        assert!(out.contains("cmovns %rdi, %rax"), "{out}");
+        assert!(out.contains("sarq $3, %rax"), "{out}");
+        assert!(!out.contains("%rsi"), "sign scratch retired:\n{out}");
+    }
+
+    #[test]
+    fn a_wide_64_bit_shift_keeps_the_identity() {
+        // k = 32 needs displacement 4294967295, which is not a positive
+        // signed-32 displacement — the original five lines must survive.
+        let out = run_cmov(&frame(concat!(
+            "    movq %rdi, %rsi\n",
+            "    sarq $63, %rsi\n",
+            "    shrq $32, %rsi\n",
+            "    leaq (%rdi, %rsi), %rax\n",
+            "    sarq $32, %rax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrq $32, %rsi"), "{out}");
+        assert!(out.contains("leaq (%rdi, %rsi), %rax"), "{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_scratch_still_live_after_the_block_blocks_the_rewrite() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    movl %esi, %r8d\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "identity kept:\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_prefixed_branch_cannot_hide_a_scratch_use_after_a_physical_overwrite() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    xorl %ecx, %ecx\n", // full flag overwrite; isolates the scratch scan
+            "    notrack jmp *%rax\n",
+            "    movl $0, %esi\n", // only fall-through would see this overwrite
+            ".Luse_scratch:\n",
+            "    movl %esi, %r8d\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("shrl $29, %esi"),
+            "opaque branch keeps identity:\n{out}"
+        );
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_scratch_in_an_abi_return_register_is_live_at_ret() {
+        for scratch in ["eax", "edx"] {
+            let body = format!(
+                concat!(
+                    "    movl %edi, %{0}\n",
+                    "    sarl $31, %{0}\n",
+                    "    shrl $29, %{0}\n",
+                    "    leal (%rdi, %{0}), %ecx\n",
+                    "    sarl $3, %ecx\n",
+                    "    ret\n",
+                ),
+                scratch
+            );
+            let asm = frame(&body);
+            let out = run_cmov(&asm);
+            assert!(out.contains(&format!("movl %edi, %{scratch}")), "{out}");
+            assert!(out.contains(&format!("shrl $29, %{scratch}")), "{out}");
+            assert!(
+                !out.contains("cmovns"),
+                "return-register scratch must stay live:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_return_markers_decide_which_return_register_ret_observes() {
+        // Prologue output for an `int` return: `%rdx` carries nothing at
+        // `ret`, so an `%edx` sign scratch dies with the block (the shape
+        // `x * (x + 2) / 2` lowers to); with the marker flipped it is live.
+        let body = |rdx: u8| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "    # LCCC_RET_RDX {}\n",
+                    "    # LCCC_RET_RAX 1\n",
+                    "    movl %edi, %edx\n",
+                    "    sarl $31, %edx\n",
+                    "    shrl $31, %edx\n",
+                    "    leal (%rdi,%rdx), %eax\n",
+                    "    sarl $1, %eax\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                rdx
+            )
+        };
+        let out = run_cmov(&body(0));
+        assert!(out.contains("cmovns %edi, %eax"), "{out}");
+        assert!(out.contains("leal 1(%rdi), %eax"), "{out}");
+        assert!(!out.contains("%edx"), "dead scratch retired:\n{out}");
+        let out = run_cmov(&body(1));
+        assert!(out.contains("shrl $31, %edx"), "live %rdx kept:\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_branch_is_followed_to_the_scratch_overwrite() {
+        // The jump's target overwrites the scratch before any read, so it is
+        // dead after the block on every path; a read at the target is not.
+        let body = |target: &str| {
+            frame(&format!(
+                concat!(
+                    "    movl %edi, %r9d\n",
+                    "    sarl $31, %r9d\n",
+                    "    shrl $28, %r9d\n",
+                    "    leal (%rdi, %r9), %esi\n",
+                    "    sarl $4, %esi\n",
+                    "    jmp .Ljoin\n",
+                    ".Ljoin:\n",
+                    "    {}\n",
+                    "    movl %esi, %eax\n",
+                    "    ret\n",
+                ),
+                target
+            ))
+        };
+        let out = run_cmov(&body("movl $7, %r9d"));
+        assert!(out.contains("cmovns %edi, %esi"), "{out}");
+        assert!(out.contains("leal 15(%rdi), %esi"), "{out}");
+        let out = run_cmov(&body("addl %r9d, %esi"));
+        assert!(out.contains("shrl $28, %r9d"), "read at the target:\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn ret_keeps_its_implicit_stack_pointer_live() {
+        let asm = frame("    xorl %ecx, %ecx\n    ret\n");
+        let store = LineStore::new(asm);
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(scratch_live_after(&store, &infos, 2, 4)); // family 4 is `%rsp`
+    }
+
+    #[test]
+    fn a_read_modify_write_of_the_scratch_after_the_block_blocks_the_rewrite() {
+        // The first two-operand instruction after the block reads and writes
+        // its destination; it cannot kill the old sign-chain value.
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    addl $1, %esi\n",
+            "    setne %cl\n",
+            "    movzbl %cl, %ecx\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "identity kept:\\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_compare_of_the_scratch_after_the_block_blocks_the_rewrite() {
+        // `cmp` reads its second operand; it is not a register definition even
+        // though the generic two-operand parser returns it as the destination.
+        // The setcc makes the stale scratch value observable after the block.
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    cmpl $0, %esi\n",
+            "    sete %cl\n",
+            "    movzbl %cl, %ecx\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "identity kept:\\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_hide_a_scratch_read() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    cmpl $0, %esi # the compare observes the scratch\n",
+            "    sete %cl\n",
+            "    movzbl %cl, %ecx\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "identity kept:\\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn the_cmov_source_must_survive_the_lea() {
+        // T == X: `leal (%rdi,%rsi), %edi` destroys the dividend the cmov
+        // must select from.
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %edi\n",
+            "    sarl $3, %edi\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("leal (%rdi, %rsi), %edi"),
+            "identity kept:\n{out}"
+        );
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_label_inside_the_block_declines() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            ".Ljoin:\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_comment_bearing_line_in_the_block_declines() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi  # sign\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("sarl $31, %esi"), "{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_forward_flag_reader_is_refused() {
+        // `setl` between the block and the next flag writer observes the
+        // final sar's flags today; the rewrite must not run under it.
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    setl %cl\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn the_skip_key_disables_the_pass_in_the_pipeline() {
+        use super::super::super::peephole_optimize;
+        use super::super::test_skips::skip_passes;
+        let body = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        {
+            let _skip = skip_passes(&["pow2_cmov"]);
+            let out = peephole_optimize(body.to_string());
+            assert!(out.contains("shrl $29, %esi"), "skipped:\n{out}");
+            assert!(!out.contains("cmovns"), "skipped:\n{out}");
+        }
+        let out = peephole_optimize(body.to_string());
+        assert!(out.contains("cmovns %edi, %eax"), "enabled:\n{out}");
+    }
+}

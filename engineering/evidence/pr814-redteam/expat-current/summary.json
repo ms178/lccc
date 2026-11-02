@@ -1,0 +1,74 @@
+{
+  "complete": true,
+  "status": "pass",
+  "version": "2.8.5",
+  "archive_sha256": "952c03c33a6b337f12dae7a9b0f9dee86f867550d35c994d6bdaaddd37dc8454",
+  "measurement": "correctness only, not a timing or PMU result",
+  "flags": "-O2 -DNDEBUG",
+  "jobs": 2,
+  "ctest_pass": {
+    "gcc": 1,
+    "lccc": 1
+  },
+  "xml_cases": [
+    {
+      "name": "attributes.xml",
+      "status": "pass",
+      "kind": "canonical",
+      "input_sha256": "ed1ba17d37c81437d627fc8e54cd9981444a26051749a77ccdc86ee3a46784eb",
+      "output_sha256": "919af823fba05efa84b0f4abade2c40243121c5b81072126546678686c9780a2"
+    },
+    {
+      "name": "namespaces.xml",
+      "status": "pass",
+      "kind": "canonical",
+      "input_sha256": "b26b33bce4c19ab3a72aec6e41e4537b2fcd5f34a3dc04b7b876e1e93507df68",
+      "output_sha256": "882e718c3eda8443c56777c66c57f671402f37dbd572adc60441b1b815a829e9"
+    },
+    {
+      "name": "entities.xml",
+      "status": "pass",
+      "kind": "canonical",
+      "input_sha256": "4a9858ff5fd07b0d1d5a9605f64104b2fdc27c48f7622538b8caba9731194d08",
+      "output_sha256": "edb90cf94b01410e298eac5a5197decc6712910fc839540f586b4efbbd541d7b"
+    },
+    {
+      "name": "unicode.xml",
+      "status": "pass",
+      "kind": "canonical",
+      "input_sha256": "ee03401b971605c5b9aa162c6c19a38ce45c1e4784ee3c5f4f958248a6cfc979",
+      "output_sha256": "fe589e517fa9774b7b6aea228742768b6a9c68dfc12e1f975ff521eb9300c06a"
+    },
+    {
+      "name": "large.xml",
+      "status": "pass",
+      "kind": "canonical",
+      "input_sha256": "354a134267a65b672db39653ddaee6ab95b32935fb524a7b7522e34d06a31232",
+      "output_sha256": "354a134267a65b672db39653ddaee6ab95b32935fb524a7b7522e34d06a31232"
+    },
+    {
+      "name": "bad-nesting.xml",
+      "status": "pass",
+      "kind": "reject",
+      "input_sha256": "7d0bb6f1bf9b3f5a54b1e46ef0235c050a9f989dc96034bab28c6c3814417199",
+      "output_sha256": null
+    },
+    {
+      "name": "bad-utf8.xml",
+      "status": "pass",
+      "kind": "reject",
+      "input_sha256": "aa2ebb658790b2e5d81e789c527f86bc9b73633c31fd9d5008124ccea264e0aa",
+      "output_sha256": null
+    },
+    {
+      "name": "bad-entity.xml",
+      "status": "pass",
+      "kind": "reject",
+      "input_sha256": "9f8d3ee8ab18f8a48ee4d4aa100c1ffb8bee5b7901fe9c83d14fd45abd3799c8",
+      "output_sha256": null
+    }
+  ],
+  "junit_comparison": "junit-comparison.json (identity multiset + CMake feature configuration, compared by junit_check.py)",
+  "invocation": "manual: no CI job builds Expat; run tests/workloads/expat-2.8.5/run.sh with LCCC/ARTIFACT_DIR set. Only the compiler-free junit_check.py --self-test contract is gated in CI (ci_local.sh expat-junit-contract).",
+  "scope": "static C library, examples, xmlwf and upstream C tests; no C++ code in this configuration"
+}

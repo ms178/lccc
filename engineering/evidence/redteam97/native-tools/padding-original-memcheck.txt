@@ -1,0 +1,15 @@
+==95898== Memcheck, a memory error detector
+==95898== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.
+==95898== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info
+==95898== Command: /home/user/.cache/redteam94/native97/padding-original
+==95898== Parent PID: 95891
+==95898== 
+==95898== 
+==95898== HEAP SUMMARY:
+==95898==     in use at exit: 0 bytes in 0 blocks
+==95898==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated
+==95898== 
+==95898== All heap blocks were freed -- no leaks are possible
+==95898== 
+==95898== For lists of detected and suppressed errors, rerun with: -s
+==95898== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)

@@ -1,0 +1,77 @@
+[
+  {
+    "name": "byte_load_reassembly",
+    "exit": 0,
+    "binary_sha256": "174009d334d2ac982e67180f3134e51ddeb76b55e8f512d82c2036e394a2cd2a"
+  },
+  {
+    "name": "spectral_norm",
+    "exit": 0,
+    "binary_sha256": "a316079b106dcc8e450cc4c71dfd04e2978a1cb59c815581146c9dadceb70dcc"
+  },
+  {
+    "name": "expat_siphash24",
+    "exit": 0,
+    "binary_sha256": "adf2e7ddc4de7149e9086c848cfb6172eb39e1e70562d4602688e77460f1aa07"
+  },
+  {
+    "name": "sha256_transform",
+    "exit": 0,
+    "binary_sha256": "36994b633fbfb41166a59821735156880f019e14b638df81643d119c02467602"
+  },
+  {
+    "name": "expat_xml_scan",
+    "exit": 0,
+    "binary_sha256": "4614339dd0a8c25448fcf5c1bad3bb858ff59c8e47054df6a89ed971499756de"
+  },
+  {
+    "name": "linux_find_bit_scaled",
+    "exit": 0,
+    "binary_sha256": "c720f52218dbd87eeba4643dd8f34aa737cfc0d785a8719e607ffa45ca9965e8"
+  },
+  {
+    "name": "linux_find_bit",
+    "exit": 0,
+    "binary_sha256": "d15b246c2f76dcdb68144f9aa3d07beaddfebbe134e05f497bd6b6331402e6dd"
+  },
+  {
+    "name": "sieve",
+    "exit": 0,
+    "binary_sha256": "eb601b302b8e0be792fa16558d875b4988167d22cc4cf7ec240f9eda1a4fdc9e"
+  },
+  {
+    "name": "binary_trees",
+    "exit": 0,
+    "binary_sha256": "e6566a24102b8828dd9c2f2d50e95c4d5763f1c4c16008d519dece79db72af48"
+  },
+  {
+    "name": "lz4_match_extend",
+    "exit": 0,
+    "binary_sha256": "5de41369ddd5aa12e813b8083934c3aee62cddab264dcc9b04a4d0c166a23016"
+  },
+  {
+    "name": "mandelbrot",
+    "exit": 0,
+    "binary_sha256": "c36f1ea9d627a9034140dffb7ca7ceeb75a4767a8aa5e607ec3819f9a63649f7"
+  },
+  {
+    "name": "sqlite_varint",
+    "exit": 0,
+    "binary_sha256": "c61d5e52e52347c91d5401d661b23a4840038afdb09967429b9738eeb0b7eadc"
+  },
+  {
+    "name": "zlib_ng_adler32_combine",
+    "exit": 0,
+    "binary_sha256": "d8e25ca24efda2e868ea92ed3d5e105f619f1e70cbf784d6c1b7c4c1d9888c40"
+  },
+  {
+    "name": "strlen_bench",
+    "exit": 0,
+    "binary_sha256": "118e186a46610f9d4c09fb1d0a40e909a7d33f8500fe4ea4b2392ac5a4496a75"
+  },
+  {
+    "name": "switch_dispatch",
+    "exit": 0,
+    "binary_sha256": "edc72861526c1a6fb74a984fadf62ba722ff40548dc0a414905c639f28e702a9"
+  }
+]

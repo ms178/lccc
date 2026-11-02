@@ -1,0 +1,140 @@
+{
+  "status": "performance acceptance remains open; not a demonstrated across-layout dispatch fix",
+  "default_alignment": 16,
+  "paired_rounds": 12,
+  "clock": "child user+system CPU seconds; startup included",
+  "cohorts": {
+    "dispatch": [
+      {
+        "mode": "direct",
+        "link_padding": 0,
+        "main_seconds": 0.08627249999999975,
+        "new_seconds": 0.08601149999999791,
+        "delta_percent_vs_main": -0.3025297748434852,
+        "delta_percent_vs_pre_batch2": 4.023099715784473,
+        "delta_percent_vs_return_ablation": -0.09756607488528024
+      },
+      {
+        "mode": "direct",
+        "link_padding": 16,
+        "main_seconds": 0.08832600000000035,
+        "new_seconds": 0.08872200000000063,
+        "delta_percent_vs_main": 0.4483391073979215,
+        "delta_percent_vs_pre_batch2": 0.9609968421985693,
+        "delta_percent_vs_return_ablation": -1.0401039546270363
+      },
+      {
+        "mode": "direct",
+        "link_padding": 32,
+        "main_seconds": 0.0871814999999998,
+        "new_seconds": 0.08757949999999681,
+        "delta_percent_vs_main": 0.4565188715461632,
+        "delta_percent_vs_pre_batch2": 3.1226634482303783,
+        "delta_percent_vs_return_ablation": -0.1960080454496249
+      },
+      {
+        "mode": "direct",
+        "link_padding": 48,
+        "main_seconds": 0.08565099999999504,
+        "new_seconds": 0.08574850000000289,
+        "delta_percent_vs_main": 0.11383404748088743,
+        "delta_percent_vs_pre_batch2": -5.2267138238705435,
+        "delta_percent_vs_return_ablation": 0.9138304382690476
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 0,
+        "main_seconds": 0.1263255000000001,
+        "new_seconds": 0.1275830000000049,
+        "delta_percent_vs_main": 0.995444308555915,
+        "delta_percent_vs_pre_batch2": -4.891367145128189,
+        "delta_percent_vs_return_ablation": 0.20538557902956
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 16,
+        "main_seconds": 0.12638899999999964,
+        "new_seconds": 0.12776549999999887,
+        "delta_percent_vs_main": 1.089097943649553,
+        "delta_percent_vs_pre_batch2": 1.5527135726314256,
+        "delta_percent_vs_return_ablation": 0.9980000474291373
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 32,
+        "main_seconds": 0.12564150000000396,
+        "new_seconds": 0.1250179999999972,
+        "delta_percent_vs_main": -0.4962532284370602,
+        "delta_percent_vs_pre_batch2": -5.742828061977068,
+        "delta_percent_vs_return_ablation": -3.0323243683498036
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 48,
+        "main_seconds": 0.12576399999999666,
+        "new_seconds": 0.12642950000000042,
+        "delta_percent_vs_main": 0.5291657390062099,
+        "delta_percent_vs_pre_batch2": -3.143649498593748,
+        "delta_percent_vs_return_ablation": 0.48122774669860924
+      }
+    ],
+    "new_patterns": [
+      {
+        "mode": "direct",
+        "link_padding": 0,
+        "main_seconds": 0.10699550000000002,
+        "new_seconds": 0.11950499999999664,
+        "delta_percent_vs_main": 11.69161319868277
+      },
+      {
+        "mode": "direct",
+        "link_padding": 16,
+        "main_seconds": 0.11583849999999529,
+        "new_seconds": 0.11112749999999849,
+        "delta_percent_vs_main": -4.066868959799197
+      },
+      {
+        "mode": "direct",
+        "link_padding": 32,
+        "main_seconds": 0.10520350000000178,
+        "new_seconds": 0.10960149999999835,
+        "delta_percent_vs_main": 4.180469280961652
+      },
+      {
+        "mode": "direct",
+        "link_padding": 48,
+        "main_seconds": 0.1153060000000039,
+        "new_seconds": 0.11271200000000192,
+        "delta_percent_vs_main": -2.249666105841752
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 0,
+        "main_seconds": 0.16999150000000185,
+        "new_seconds": 0.16884449999999873,
+        "delta_percent_vs_main": -0.6747396193357291
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 16,
+        "main_seconds": 0.18531550000000152,
+        "new_seconds": 0.17064300000000543,
+        "delta_percent_vs_main": -7.917578400077685
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 32,
+        "main_seconds": 0.1747839999999954,
+        "new_seconds": 0.16651699999999892,
+        "delta_percent_vs_main": -4.729837971437134
+      },
+      {
+        "mode": "indirect",
+        "link_padding": 48,
+        "main_seconds": 0.1830360000000013,
+        "new_seconds": 0.17316849999999917,
+        "delta_percent_vs_main": -5.391015975000579
+      }
+    ]
+  }
+}

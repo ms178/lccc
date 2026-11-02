@@ -1,0 +1,399 @@
+//! Shared linker data structures and linker-defined symbol tables.
+//!
+//! Contains `InputSection`, `OutputSection`, and the `GlobalSymbolOps` trait
+//! shared across x86 and ARM 64-bit linkers. Also defines the set of
+//! linker-provided symbols and `__start_`/`__stop_` resolution logic.
+
+use super::types::{DynSymbol, Elf64Object, Elf64Symbol};
+
+/// Reference to one input section placed within an output section.
+pub struct InputSection {
+    pub object_idx: usize,
+    pub section_idx: usize,
+    pub output_offset: u64,
+    pub size: u64,
+}
+
+/// A merged output section in the final executable or shared library.
+pub struct OutputSection {
+    pub name: String,
+    pub sh_type: u32,
+    pub flags: u64,
+    pub alignment: u64,
+    pub inputs: Vec<InputSection>,
+    pub data: Vec<u8>,
+    pub addr: u64,
+    pub file_offset: u64,
+    pub mem_size: u64,
+}
+
+/// Trait abstracting over backend-specific GlobalSymbol types.
+///
+/// Provides the interface needed by shared linker functions: symbol registration,
+/// section merging, dynamic symbol matching, and common symbol allocation.
+/// Each backend implements this for its own GlobalSymbol struct.
+pub trait GlobalSymbolOps: Clone {
+    fn is_defined(&self) -> bool;
+    fn is_dynamic(&self) -> bool;
+    fn info(&self) -> u8;
+    fn section_idx(&self) -> u16;
+    fn value(&self) -> u64;
+    fn size(&self) -> u64;
+    fn new_defined(obj_idx: usize, sym: &Elf64Symbol) -> Self;
+    fn new_common(obj_idx: usize, sym: &Elf64Symbol) -> Self;
+    fn new_undefined(sym: &Elf64Symbol) -> Self;
+    fn set_common_bss(&mut self, bss_offset: u64);
+
+    /// Create a GlobalSymbol representing a dynamic symbol resolved from a shared library.
+    fn new_dynamic(dsym: &DynSymbol, soname: &str) -> Self;
+
+    /// True when the symbol is satisfied by an `R_*_COPY` relocation rather
+    /// than by a definition in this image.  Defaults to false because only
+    /// the backends that emit copy relocations need it.
+    fn has_copy_reloc(&self) -> bool {
+        false
+    }
+
+    /// Merged `STV_*` visibility (see [`merge_object_visibility`]).  Backends
+    /// that do not track visibility report `STV_DEFAULT`, which preserves
+    /// their historical behaviour exactly.
+    fn visibility(&self) -> u8 {
+        crate::backend::elf::STV_DEFAULT
+    }
+
+    /// Store the merged visibility.  A no-op for backends without the field.
+    fn set_visibility(&mut self, _visibility: u8) {}
+}
+
+/// Rank of an `STV_*` value on the gABI constraint order
+/// `DEFAULT < PROTECTED < HIDDEN < INTERNAL`.  The numeric `STV_*` values do
+/// not follow that order (INTERNAL is 1, PROTECTED is 3), so comparing them
+/// directly would let PROTECTED override HIDDEN.
+fn visibility_rank(v: u8) -> u8 {
+    use crate::backend::elf::{STV_HIDDEN, STV_INTERNAL, STV_PROTECTED};
+    match v & 0x3 {
+        STV_PROTECTED => 1,
+        STV_HIDDEN => 2,
+        STV_INTERNAL => 3,
+        _ => 0,
+    }
+}
+
+/// Combine two `STV_*` values: the more constraining one wins.
+pub fn most_constraining_visibility(a: u8, b: u8) -> u8 {
+    if visibility_rank(b & 0x3) > visibility_rank(a & 0x3) {
+        b & 0x3
+    } else {
+        a & 0x3
+    }
+}
+
+/// Fold the visibility of every non-local symbol-table entry of every
+/// relocatable input into the matching global symbol.
+///
+/// gABI (Symbol Visibility): "the most constraining visibility attribute" of
+/// all references *and* the definition applies to the symbol in the output.
+/// That is why this is a post-resolution pass over the object symbol tables
+/// rather than a copy of the winning definition's `st_other`: the common
+/// case it gets right is a TU that declares `extern int f(void)
+/// __attribute__((visibility("hidden")))` and calls it, with the defining TU
+/// compiled without the attribute -- the reference alone makes `f` hidden.
+/// Running after resolution also makes the result independent of the order
+/// in which definitions replaced references.  Shared-library symbols never
+/// contribute: those are resolved against, not linked in.
+pub fn merge_object_visibility<G: GlobalSymbolOps>(
+    objects: &[super::types::Elf64Object],
+    globals: &mut crate::common::fx_hash::FxHashMap<String, G>,
+) {
+    for obj in objects {
+        for sym in &obj.symbols {
+            let vis = sym.visibility();
+            if vis == crate::backend::elf::STV_DEFAULT || sym.is_local() || sym.name.is_empty() {
+                continue;
+            }
+            if let Some(g) = globals.get_mut(sym.name.as_str()) {
+                let merged = most_constraining_visibility(g.visibility(), vis);
+                g.set_visibility(merged);
+            }
+        }
+    }
+}
+
+// ── Linker-defined symbols ──────────────────────────────────────────────
+//
+// These symbols are provided by the linker during layout and should not be
+// reported as undefined. The superset covers all architectures (x86, ARM,
+// RISC-V, i686). Architecture-specific symbols (e.g., __global_pointer$ for
+// RISC-V) are included; having extra entries is harmless.
+
+/// Symbols that the linker defines during layout.
+///
+/// Used by `is_linker_defined_symbol()` and `resolve_dynamic_symbols_elf64()`
+/// to avoid false "undefined symbol" errors and unnecessary shared library lookups.
+pub const LINKER_DEFINED_SYMBOLS: &[&str] = &[
+    "_GLOBAL_OFFSET_TABLE_",
+    "__bss_start",
+    "__bss_start__",
+    "__BSS_END__",
+    "_edata",
+    "edata",
+    "_end",
+    "end",
+    "__end",
+    "__end__",
+    "_etext",
+    "etext",
+    "__ehdr_start",
+    "__executable_start",
+    // Note: _start is intentionally excluded -- it comes from crt1.o, not the linker.
+    // Suppressing it here would mask missing-CRT errors.
+    "__dso_handle",
+    "_DYNAMIC",
+    "__data_start",
+    "data_start",
+    "__DATA_BEGIN__",
+    "__SDATA_BEGIN__",
+    "__init_array_start",
+    "__init_array_end",
+    "__fini_array_start",
+    "__fini_array_end",
+    "__preinit_array_start",
+    "__preinit_array_end",
+    "__rela_iplt_start",
+    "__rela_iplt_end",
+    "__rel_iplt_start",
+    "__rel_iplt_end",
+    "__global_pointer$", // RISC-V
+    "_IO_stdin_used",
+    "_init",
+    "_fini",
+    "___tls_get_addr", // i686 TLS
+    "__tls_get_addr",  // x86-64 TLS
+    // Exception handling / unwinding (often weak, but may appear undefined)
+    "_ITM_registerTMCloneTable",
+    "_ITM_deregisterTMCloneTable",
+    "__gcc_personality_v0",
+    "_Unwind_Resume",
+    "_Unwind_ForcedUnwind",
+    "_Unwind_GetCFA",
+    "__pthread_initialize_minimal",
+    "_dl_rtld_map",
+    "__GNU_EH_FRAME_HDR",
+    "__getauxval",
+    // Dynamic linker debug interface (provided by ld-linux*.so at runtime)
+    "_r_debug",
+    "_dl_debug_state",
+    "_dl_mcount",
+];
+
+/// Check whether a symbol name is one that the linker provides during layout.
+///
+/// This includes the static list of well-known linker symbols, plus the
+/// GNU ld `__start_<section>` / `__stop_<section>` pattern: when an undefined
+/// symbol matches `__start_X` or `__stop_X` where `X` is a valid C identifier,
+/// the linker will auto-generate it to point to the start/end of section `X`.
+/// Layout-anchor symbols: pure ADDRESSES the linker itself defines during
+/// layout (`__ehdr_start`, `_DYNAMIC`, `_end`, section start/stop markers,
+/// ...). Unlike the broader LINKER_DEFINED_SYMBOLS list (which also names
+/// real runtime functions like `__tls_get_addr`), these must NEVER receive a
+/// PLT slot or GOT dynamic relocation: they are not callable, they are
+/// link-time constants. glibc's ld.so bootstraps by computing its own load
+/// base as `&__ehdr_start` BEFORE any dynamic relocation is applied — a
+/// JUMP_SLOT for it hands _dl_start an unrelocated garbage address and the
+/// self-relocation loop dereferences NULL (the LK-24 startup SIGSEGV).
+pub fn is_layout_anchor_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "__ehdr_start"
+            | "__executable_start"
+            | "_DYNAMIC"
+            | "_GLOBAL_OFFSET_TABLE_"
+            | "_end"
+            | "end"
+            | "__end"
+            | "__end__"
+            | "_edata"
+            | "edata"
+            | "_etext"
+            | "etext"
+            | "__bss_start"
+            | "__bss_start__"
+            | "__BSS_END__"
+            | "__data_start"
+            | "data_start"
+            | "__DATA_BEGIN__"
+            | "__init_array_start"
+            | "__init_array_end"
+            | "__fini_array_start"
+            | "__fini_array_end"
+            | "__preinit_array_start"
+            | "__preinit_array_end"
+            | "__rela_iplt_start"
+            | "__rela_iplt_end"
+            | "__rel_iplt_start"
+            | "__rel_iplt_end"
+            | "__GNU_EH_FRAME_HDR"
+    ) || name.starts_with("__start_")
+        || name.starts_with("__stop_")
+}
+
+pub fn is_linker_defined_symbol(name: &str) -> bool {
+    if LINKER_DEFINED_SYMBOLS.contains(&name) {
+        return true;
+    }
+    // Recognize __start_<ident> and __stop_<ident> patterns (GNU ld feature).
+    // The section name must be a valid C identifier for this to apply.
+    // Note: GNU ld only resolves these when section X actually exists, but we
+    // accept the pattern here to suppress "undefined symbol" errors early.
+    // Actual resolution (in each backend) is guarded by section existence.
+    if let Some(suffix) = name
+        .strip_prefix("__start_")
+        .or_else(|| name.strip_prefix("__stop_"))
+    {
+        return is_valid_c_identifier_for_section(suffix);
+    }
+    false
+}
+
+/// Check if a string is a valid C identifier (used for __start_/__stop_ section pattern).
+/// Also used by RISC-V linker which has different section structures.
+pub fn is_valid_c_identifier_for_section(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Resolve `__start_<section>` and `__stop_<section>` symbols against the output sections.
+///
+/// GNU ld auto-generates these symbols when there are undefined references to
+/// `__start_X` or `__stop_X` where `X` is the name of an existing output section
+/// that is also a valid C identifier. `__start_X` gets the address of the section's
+/// start, `__stop_X` gets the address of the section's end (start + size).
+///
+/// Returns a vector of (name, address) pairs for all resolved symbols.
+pub fn resolve_start_stop_symbols(output_sections: &[OutputSection]) -> Vec<(String, u64)> {
+    let mut result = Vec::new();
+    for sec in output_sections {
+        if is_valid_c_identifier_for_section(&sec.name) {
+            result.push((format!("__start_{}", sec.name), sec.addr));
+            result.push((format!("__stop_{}", sec.name), sec.addr + sec.mem_size));
+        }
+    }
+    result
+}
+
+/// Is this symbol part of the executable's exported (`.dynsym`) set under
+/// `--export-dynamic`?
+///
+/// Shared by two callers that must agree exactly:
+///
+/// * the emitter, which decides what actually lands in `.dynsym`; and
+/// * `--gc-sections`, which must treat every such symbol as a **root**.
+///
+/// The second point is a correctness requirement, not a nicety: an exported
+/// symbol is reachable from *outside* the image (`dlsym`, a `dlopen`ed plugin,
+/// another DSO), so nothing inside the link references it, and a pure
+/// reachability sweep collects it.  The link still succeeds and the binary
+/// still runs -- it just fails at the first `dlsym`.  Keeping the predicate in
+/// one place means a future change to the export rule cannot silently
+/// desynchronise the two.
+pub fn is_exported_dynamic_symbol<G: GlobalSymbolOps>(g: &G) -> bool {
+    g.section_idx() != 0 // SHN_UNDEF
+        && !g.is_dynamic()
+        && !g.has_copy_reloc()
+        && (g.info() >> 4) != 0 // not STB_LOCAL
+        && is_dynamic_visibility(g.visibility())
+}
+
+/// GNU ld's resolution of a regular COMMON symbol against a shared-library
+/// definition of the same (default-version) name, as measured with bfd
+/// (runtime value, `DT_NEEDED` and `--warn-common` text agree; mold binds
+/// the same way, lld keeps the common):
+///
+/// | library definition | common met first  | library met first |
+/// |--------------------|-------------------|-------------------|
+/// | GLOBAL/UNIQUE data | library binds     | library binds     |
+/// | WEAK data          | common stays      | common stays      |
+/// | function, TLS      | common stays      | common stays      |
+///
+/// The order does not matter -- a weak library definition loses to the
+/// common even when a regular reference bound the name to it before the
+/// common arrived (x86-64 and i686, `--as-needed` or not).  A common is
+/// always a variable, so a function of that name is never what it means.
+/// `info` is the library symbol's `st_info`.  Binding the library
+/// definition turns the common into an import (a copy relocation in an
+/// executable).
+pub fn shared_def_overrides_common(info: u8) -> bool {
+    use crate::backend::elf::STB_GLOBAL;
+    const STB_GNU_UNIQUE: u8 = 10;
+    let binding = info >> 4;
+    (binding == STB_GLOBAL || binding == STB_GNU_UNIQUE) && is_data_type(info)
+}
+
+/// Code never takes over a common, and neither does thread-local data: a
+/// common is a non-TLS object, and binding it to a TLS definition would turn
+/// its every access into a read of the wrong address (bfd keeps the common
+/// when it comes first and rejects the mismatch when the library does).
+fn is_data_type(info: u8) -> bool {
+    use crate::backend::elf::{STT_FUNC, STT_GNU_IFUNC, STT_TLS};
+    !matches!(info & 0xf, STT_FUNC | STT_GNU_IFUNC | STT_TLS)
+}
+
+/// Whether a symbol of merged visibility `vis` may appear in `.dynsym` as a
+/// definition.  HIDDEN and INTERNAL symbols are, by definition, not visible
+/// outside the component; exporting them (as the x86-64 emitters once did
+/// for `__dso_handle`, `__TMC_END__` and `DW.ref.__gxx_personality_v0`) lets
+/// another module bind to a private object.  PROTECTED symbols are exported
+/// but not preemptible.
+pub fn is_dynamic_visibility(vis: u8) -> bool {
+    !matches!(
+        vis & 0x3,
+        crate::backend::elf::STV_HIDDEN | crate::backend::elf::STV_INTERNAL
+    )
+}
+
+/// Whether `DT_INIT` / `DT_FINI` exist, decided as GNU ld decides it: iff the
+/// image itself defines `_init` / `_fini` (crti.o's frame around the
+/// `.init`/`.fini` fragments); the tag then records that symbol.  A `.init`
+/// section with no `_init` (a `-nostartfiles` fragment with no prologue and
+/// no `ret`) gets no tag, since the loader would run off its end.
+///
+/// Decided from definedness alone, so it can size `.dynamic` before layout:
+/// symbol VALUES are not final until after it, and a value-dependent test
+/// would reserve fewer entries than emission writes.
+pub fn image_init_fini<G: GlobalSymbolOps>(
+    globals: &crate::common::fx_hash::FxHashMap<String, G>,
+) -> (bool, bool) {
+    let defined = |name: &str| {
+        globals
+            .get(name)
+            .is_some_and(|g| g.is_defined() && !g.is_dynamic())
+    };
+    (defined("_init"), defined("_fini"))
+}
+
+/// For every name the objects reference as an undefined global: whether ANY
+/// of those references is strong.  An import's `.dynsym` binding is
+/// `STB_WEAK` iff every reference is weak (`Some(false)`), exactly as in GNU
+/// ld -- it describes this output's references, never the provider's
+/// definition: glibc defines e.g. `puts`-family aliases weak, and copying
+/// that would let ld.so silently bind an ordinary call to 0 on a library
+/// lacking it; conversely crtbeginS.o's weak-only `__cxa_finalize` must stay
+/// weak although libc defines it `STB_GLOBAL`.
+pub fn import_strong_refs(
+    objects: &[Elf64Object],
+) -> crate::common::fx_hash::FxHashMap<&str, bool> {
+    let mut strong: crate::common::fx_hash::FxHashMap<&str, bool> = Default::default();
+    for sym in objects.iter().flat_map(|o| o.symbols.iter()) {
+        if sym.is_undefined() && !sym.is_local() && !sym.name.is_empty() {
+            *strong.entry(sym.name.as_str()).or_insert(false) |= !sym.is_weak();
+        }
+    }
+    strong
+}

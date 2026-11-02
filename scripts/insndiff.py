@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""Per-instruction encoding differential between LCCC and GNU as.
+
+LCCC has its own integrated assembler. Any divergence from GNU as in the bytes
+it emits is either a wrong encoding (a miscompile that only shows up at run
+time) or a missed size optimization (dead bytes in the I-cache). Both matter,
+and both are invisible unless the encodings are compared directly.
+
+This tool assembles instructions ONE AT A TIME with both assemblers and
+reports the byte-level difference, so an encoding bug reduces to a single
+mnemonic in one step instead of a bisect over a whole object file. It also
+classifies each divergence, because "LCCC emits 6 bytes where GAS emits 3" and
+"LCCC emits different bytes of the same length" are very different failures.
+
+Usage
+-----
+    # one-off
+    echo 'addw $65535, %ax' | scripts/insndiff.py
+
+    # a list, showing only what differs
+    scripts/insndiff.py --file cases.txt --only-diff
+
+    # sweep a template over a register/immediate matrix
+    scripts/insndiff.py --sweep 'add{S} ${IMM}, %{R{S}}'
+
+    # exit non-zero on any divergence (CI gate)
+    scripts/insndiff.py --file cases.txt --quiet
+
+Exit status is 0 when every instruction agrees with the oracle or is a
+verified-shorter encoding (BETTER), 1 when any diverges (wrong bytes, longer,
+rejects-valid, false-accept, or unverified shorter), and 2 on a setup error
+(missing tool, unreadable input).
+"""
+from __future__ import annotations
+
+import argparse
+import itertools
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LCCC = REPO_ROOT / "target" / "release" / "lccc"
+
+# ─── Register / immediate vocabularies for --sweep ────────────────────────
+
+VOCAB: dict[str, list[str]] = {
+    "R8":  ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil",
+            "r8b", "r9b", "r12b", "r15b"],
+    "R8L": ["al", "cl", "dl", "bl", "ah", "ch", "dh", "bh"],
+    "R16": ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
+            "r8w", "r12w", "r15w"],
+    "R32": ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
+            "r8d", "r12d", "r13d", "r15d"],
+    "R64": ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+            "r8", "r12", "r13", "r15"],
+    "XMM": [f"xmm{i}" for i in (0, 1, 7, 8, 12, 15)],
+    "YMM": [f"ymm{i}" for i in (0, 1, 7, 8, 12, 15)],
+    # Structurally interesting bases: rsp/r12 force a SIB byte, rbp/r13 force
+    # a displacement, r8+ force REX.B.
+    "BASE": ["rax", "rcx", "rsp", "rbp", "rsi", "r8", "r12", "r13", "r15"],
+    "IDX":  ["rax", "rbx", "rbp", "r12", "r13", "r15"],
+    "SCALE": ["1", "2", "4", "8"],
+    # Displacement and immediate boundaries: every place the encoder must
+    # switch width, plus one value on each side of it.
+    "DISP": ["0", "1", "-1", "127", "128", "-128", "-129", "255", "256",
+             "32767", "2147483647", "-2147483648"],
+    "IMM":  ["0", "1", "-1", "127", "128", "-128", "-129", "255", "256",
+             "65535", "2147483647", "-2147483648"],
+    "IMM8": ["0", "1", "127", "128", "255"],
+    "SHIFT": ["0", "1", "7", "15", "31", "63", "255"],
+    "S":    ["b", "w", "l", "q"],
+    "SEG":  ["cs", "ds", "es", "fs", "gs", "ss"],
+}
+
+# Suffix letter -> register vocabulary, for the `%{R{S}}` shorthand.
+SUFFIX_REGS = {"b": "R8", "w": "R16", "l": "R32", "q": "R64"}
+
+PLACEHOLDER = re.compile(r"\{([A-Z0-9]+)\}")
+
+
+def expand(template: str) -> list[str]:
+    """Expand `{NAME}` placeholders over the Cartesian product of VOCAB.
+
+    Repeated names are independent axes: `{XMM}` three times is dest × src1 ×
+    src2, not a single register forced equal in every slot.  (`str.replace`
+    on a unique-ified name list used to collapse them.)
+    """
+    # Resolve the `R{S}` shorthand first: the register class follows the size
+    # suffix chosen for this expansion.
+    out: list[str] = []
+    suffix_dependent = "{R{S}}" in template or "%{R{S}}" in template
+    sizes = VOCAB["S"] if ("{S}" in template) else [None]
+    for size in sizes:
+        t = template
+        if size is not None:
+            t = t.replace("{S}", size)
+            if suffix_dependent:
+                t = t.replace("{R{S}}", "{" + SUFFIX_REGS[size] + "}")
+        # Split on recognised placeholders, keeping order. Unknown `{FOO}`
+        # is left literal so a typo does not silently expand to nothing.
+        parts: list[str] = []
+        names: list[str] = []
+        last = 0
+        for m in PLACEHOLDER.finditer(t):
+            name = m.group(1)
+            if name not in VOCAB:
+                continue
+            parts.append(t[last:m.start()])
+            names.append(name)
+            last = m.end()
+        parts.append(t[last:])
+        if not names:
+            out.append(t)
+            continue
+        for combo in itertools.product(*(VOCAB[n] for n in names)):
+            s = parts[0]
+            for v, p in zip(combo, parts[1:]):
+                s += v + p
+            out.append(s)
+    return out
+
+
+# ─── Encoding ─────────────────────────────────────────────────────────────
+
+@dataclass
+class Encoding:
+    ok: bool
+    data: bytes | None
+    error: str
+
+    @property
+    def hexs(self) -> str:
+        if self.data is None:
+            return f"<{self.error[:58]}>"
+        return self.data.hex()
+
+
+def run_objcopy(objcopy: str, obj: Path, out: Path) -> bytes:
+    r = subprocess.run(
+        [objcopy, "-O", "binary", "--only-section=.text", str(obj), str(out)],
+        capture_output=True)
+    if r.returncode != 0 or not out.exists():
+        return b""
+    return out.read_bytes()
+
+
+def encode_lccc(lccc: str, src: Path, obj: Path, objcopy: str) -> Encoding:
+    r = subprocess.run([lccc, "-c", str(src), "-o", str(obj)],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        return Encoding(False, None, msg[-1] if msg else "error")
+    return Encoding(True, run_objcopy(objcopy, obj, obj.with_suffix(".bin")), "")
+
+
+def encode_gas(gas: str, src: Path, obj: Path, objcopy: str) -> Encoding:
+    r = subprocess.run([gas, "--64", "-o", str(obj), str(src)],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        return Encoding(False, None, msg[-1] if msg else "error")
+    return Encoding(True, run_objcopy(objcopy, obj, obj.with_suffix(".bin")), "")
+
+
+
+# A bare `jmp 1f` / `je 0b` cannot be assembled on its own: GAS rejects the
+# numeric local label because the matching `1:` is not in the file.  That made
+# every such case look like a FALSE-ACCEPT (LCCC assembles it, GAS errors out)
+# when in fact neither assembler was being asked a meaningful question.
+# Synthesise the labels the instruction refers to so the comparison tests the
+# encoding instead of the harness.
+_LOCAL_LABEL_RE = re.compile(r"(?:^|[\s,])(\d+)([fb])\b")
+
+
+def local_label_scaffold(inst: str) -> tuple[str, str]:
+    """Return (before, after) text defining any numeric local labels used."""
+    before: list[str] = []
+    after: list[str] = []
+    for num, direction in _LOCAL_LABEL_RE.findall(inst):
+        if direction == "b":
+            before.append(f"{num}:")
+        else:
+            after.append(f"{num}:")
+    return ("\n".join(before), "\n".join(after))
+
+
+
+_SCALE1 = re.compile(r"\(,%([a-z0-9]+),1\)")
+_ZERODISP = re.compile(r"(?<![0-9a-fx])0x0\(")
+
+
+_COMMUTATIVE_VEX = {
+    "vpand", "vpor", "vpxor", "vpaddb", "vpaddw", "vpaddd", "vpaddq",
+    "vpmullw", "vpaddsb", "vpaddsw", "vpaddusb", "vpaddusw",
+    "vpminub", "vpmaxub", "vpminsw", "vpmaxsw", "vpavgb", "vpavgw",
+    "vpmulhw", "vpmulhuw", "vpcmpeqb", "vpcmpeqw", "vpcmpeqd",
+    "vandps", "vandpd", "vorps", "vorpd", "vxorps", "vxorpd",
+    # Integer 0F-map ops LCCC may source-swap to reach VEX2 (not FP add/mul).
+    "vpmuludq", "vpsadbw", "vpmaddwd",
+}
+# VEX packed-FP compare pseudos with operand-symmetric predicates
+# ((imm&31)&7 in {eq,unord,neq,ord}, every _q/_s flavor + true/false):
+# objdump always disassembles VEX C2 to these spellings (never `vcmpps $imm`),
+# and LCCC/clang/icx may exchange the sources to reach the 2-byte VEX prefix.
+# Scalar (ss/sd) and ordered-predicate pseudos are deliberately absent: the
+# merge lane makes scalar swaps unsound and no oracle swaps ordered compares.
+_COMMUTATIVE_VEX_CMP = {
+    "vcmpeqps", "vcmpeqpd", "vcmpunordps", "vcmpunordpd",
+    "vcmpneqps", "vcmpneqpd", "vcmpordps", "vcmpordpd",
+    "vcmpeq_uqps", "vcmpeq_uqpd", "vcmpfalseps", "vcmpfalsepd",
+    "vcmpneq_oqps", "vcmpneq_oqpd", "vcmptrueps", "vcmptruepd",
+    "vcmpeq_osps", "vcmpeq_ospd", "vcmpunord_sps", "vcmpunord_spd",
+    "vcmpneq_usps", "vcmpneq_uspd", "vcmpord_sps", "vcmpord_spd",
+    "vcmpeq_usps", "vcmpeq_uspd", "vcmpfalse_osps", "vcmpfalse_ospd",
+    "vcmpneq_osps", "vcmpneq_ospd", "vcmptrue_usps", "vcmptrue_uspd",
+}
+_VEX3 = re.compile(r"^(v\S+)\s+(%\S+),(%\S+),(%\S+)$")
+_VEXCMP_IMM = re.compile(r"^(vcmpps|vcmppd)\s+\$(0x[0-9a-f]+|\d+),(%\S+),(%\S+),(%\S+)$")
+
+
+def _vcmp_imm_symmetric(text: str) -> bool:
+    """True when a VCMP numbered imm selects an operand-symmetric predicate.
+
+    objdump prints the pseudo-mnemonic only for imm 0-31; larger immediates
+    (GAS accepts the full imm8, e.g. `$0xab`) disassemble numbered. The
+    predicate lives in the low 5 bits; relations eq/unord/neq/ord (imm&7 in
+    {0,3,4,7}) are symmetric in every flavor, true/false included.
+    """
+    try:
+        imm = int(text, 0)
+    except ValueError:
+        return False
+    return ((imm & 31) & 7) in (0, 3, 4, 7)
+
+
+_GP32_TO_64 = {
+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
+    **{f"r{n}d": f"r{n}" for n in range(8, 32)},
+}
+_MOV_IMM = re.compile(r"^(movabs|mov)\s+\$(0x[0-9a-f]+|\d+),%(\w+)$")
+
+
+def _canon_commutative(insn: str) -> str:
+    """Order the two sources of a commutative VEX op canonically.
+
+    Exchanging them is how the 2-byte VEX prefix becomes reachable, so the
+    disassembly differs textually while the operation is identical. Restricted
+    to integer and bitwise ops: FP add/mul propagate SRC1's NaN payload.
+    """
+    s = insn.strip()
+    m = _VEX3.match(s)
+    if m and (m.group(1) in _COMMUTATIVE_VEX or m.group(1) in _COMMUTATIVE_VEX_CMP):
+        a, b = sorted((m.group(2), m.group(3)))
+        return f"{m.group(1)} {a},{b},{m.group(4)}"
+    m = _VEXCMP_IMM.match(s)
+    if m and _vcmp_imm_symmetric(m.group(2)):
+        a, b = sorted((m.group(3), m.group(4)))
+        return f"{m.group(1)} ${m.group(2)},{a},{b},{m.group(5)}"
+    return insn
+
+
+def _canon_mov_imm(insn: str) -> str:
+    """A 32-bit immediate load zero-extends, so it equals the 64-bit form."""
+    m = _MOV_IMM.match(insn.strip())
+    if not m:
+        return insn
+    val = int(m.group(2), 0)
+    reg = m.group(3)
+    if reg in _GP32_TO_64 and 0 <= val <= 0xFFFFFFFF:
+        return f"mov ${val:#x},%{_GP32_TO_64[reg]}"
+    return f"mov ${val:#x},%{reg}"
+
+
+def _decode(objdump: str, data: bytes, tmp: Path) -> str | None:
+    """Disassemble raw bytes and normalise away pure encoding choices.
+
+    `None` means the bytes could not be reliably decoded; it is never evidence
+    that two encodings are equivalent.
+    """
+    if not data:
+        return None
+    raw = tmp / "d.bin"
+    raw.write_bytes(data)
+    r = subprocess.run(
+        [objdump, "-D", "-b", "binary", "-m", "i386:x86-64",
+         "-M", "att", str(raw)],
+        capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return None
+    out = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"^\s+[0-9a-f]+:\s+((?:[0-9a-f]{2} )+)\s*\t(.*)$", line)
+        if not m:
+            continue
+        insn = m.group(2).split("#")[0].strip().lower()
+        if not insn or insn == "(bad)" or insn.startswith(".byte"):
+            return None
+        # Objdump's `{vex}` marker names a legal VEX encoding of an
+        # EVEX-only mnemonic; it is a GNU pseudo-prefix, not an operand.
+        insn = re.sub(r"^\{vex(?:2|3)?\}\s+", "", insn)
+        # A redundant scale-1 index and an explicit zero displacement are the
+        # two spellings that differ only by encoding, not by meaning.
+        insn = _SCALE1.sub(r"(%\1)", insn)
+        insn = _ZERODISP.sub("(", insn)
+        insn = re.sub(r"\s+", " ", insn)
+        insn = _canon_commutative(insn)
+        insn = _canon_mov_imm(insn)
+        out.append(insn)
+    return "\n".join(out) if out else None
+
+
+def verify_shorter(objdump: str, l: Encoding, g: Encoding, tmp: Path) -> bool:
+    """True only when both streams decode and canonicalize identically."""
+    try:
+        left, right = _decode(objdump, l.data, tmp), _decode(objdump, g.data, tmp)
+        return left is not None and right is not None and left == right
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+# ─── Classification ───────────────────────────────────────────────────────
+
+def classify(l: Encoding, g: Encoding) -> str:
+    """Name the failure mode. The name determines how urgent it is."""
+    if not g.ok and not l.ok:
+        return "both-reject"
+    if not g.ok and l.ok:
+        # LCCC accepted something the reference rejects: it emitted bytes for
+        # a malformed instruction, which is how a typo becomes a miscompile.
+        return "FALSE-ACCEPT"
+    if g.ok and not l.ok:
+        return "REJECTS-VALID"
+    if l.data == g.data:
+        return "ok"
+    if l.data is None or g.data is None:
+        return "WRONG-BYTES"
+    if len(l.data) == len(g.data):
+        return "WRONG-BYTES"
+    return "LONGER" if len(l.data) > len(g.data) else "SHORTER"
+
+
+SEVERITY = {
+    "FALSE-ACCEPT": 0,   # emits garbage for invalid input
+    "WRONG-BYTES": 1,    # same length, different meaning
+    "REJECTS-VALID": 2,  # cannot build valid code
+    "LONGER": 3,         # correct but wastes I-cache
+    "SHORTER": 4,        # smaller, but the decode check could not confirm it
+    "BETTER": 7,         # smaller AND verified to decode identically
+    "both-reject": 5,
+    "ok": 6,
+}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Per-instruction LCCC vs GNU as encoding differential.")
+    ap.add_argument("--lccc", default=str(DEFAULT_LCCC))
+    ap.add_argument("--as", dest="gas", default=os.environ.get("LCCC_GAS", "as"))
+    ap.add_argument("--objdump",
+                    default=os.environ.get("LCCC_OBJDUMP", "objdump"),
+                    help="disassembler used to verify SHORTER encodings")
+    ap.add_argument("--objcopy", default=os.environ.get("LCCC_OBJCOPY", "objcopy"))
+    ap.add_argument("--file", type=Path, help="one instruction per line")
+    ap.add_argument("--sweep", action="append", default=[],
+                    help="template with {R64}/{IMM}/{S}... placeholders")
+    ap.add_argument("--prologue", default=".text",
+                    help="assembly emitted before each instruction")
+    ap.add_argument("--only-diff", action="store_true")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print only the summary (non-zero on unaccounted diffs)")
+    ap.add_argument("--max-report", type=int, default=200)
+    ap.add_argument("--list-vocab", action="store_true")
+    args = ap.parse_args()
+
+    if args.list_vocab:
+        for k, v in VOCAB.items():
+            print(f"{{{k}}}: {' '.join(v)}")
+        return 0
+
+    for tool, label in ((args.lccc, "lccc"), (args.gas, "as"),
+                        (args.objcopy, "objcopy")):
+        if not (shutil.which(tool) or Path(tool).exists()):
+            print(f"error: {label} not found at {tool!r}", file=sys.stderr)
+            return 2
+
+    insns: list[str] = []
+    if args.file:
+        insns += [l for l in args.file.read_text().splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+    for t in args.sweep:
+        insns += expand(t)
+    if not insns and not sys.stdin.isatty():
+        insns += [l for l in sys.stdin.read().splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+    if not insns:
+        print("error: no instructions given (use --file, --sweep or stdin)",
+              file=sys.stderr)
+        return 2
+
+    results: list[tuple[str, str, Encoding, Encoding]] = []
+    with tempfile.TemporaryDirectory(prefix="insndiff-") as td:
+        tmp = Path(td)
+        src = tmp / "i.s"
+        for i, inst in enumerate(insns):
+            before, after = local_label_scaffold(inst)
+            parts = [args.prologue]
+            if before:
+                parts.append(before)
+            parts.append(inst)
+            if after:
+                parts.append(after)
+            src.write_text("\n".join(parts) + "\n")
+            le = encode_lccc(args.lccc, src, tmp / f"l{i}.o", args.objcopy)
+            ge = encode_gas(args.gas, src, tmp / f"g{i}.o", args.objcopy)
+            kind = classify(le, ge)
+            # A shorter encoding is only an improvement if it still means the
+            # same thing. Confirm that here rather than leaving it to a human:
+            # a shorter encoding that decodes differently is a miscompile.
+            if kind in ("SHORTER", "WRONG-BYTES") and \
+                    verify_shorter(args.objdump, le, ge, tmp):
+                # Equivalent after canonicalisation. Only call it BETTER when
+                # it is actually smaller; equal size is just a different but
+                # equally good spelling.
+                kind = "BETTER" if len(le.data or b"") < len(ge.data or b"") else "ok"
+            results.append((inst, kind, le, ge))
+
+    results.sort(key=lambda r: (SEVERITY.get(r[1], 9), r[0]))
+    shown = 0
+    for inst, kind, le, ge in results:
+        if args.quiet:
+            break
+        if args.only_diff and kind in ("ok", "both-reject", "BETTER"):
+            continue
+        if shown >= args.max_report:
+            print(f"... ({len(results) - shown} more)")
+            break
+        tag = "ok  " if kind == "ok" else kind
+        print(f"{tag:<14} {inst:<44} lccc={le.hexs:<30} gas={ge.hexs}")
+        shown += 1
+
+    counts: dict[str, int] = {}
+    for _, kind, _, _ in results:
+        counts[kind] = counts.get(kind, 0) + 1
+    bad = sum(v for k, v in counts.items()
+              if k not in ("ok", "both-reject", "BETTER"))
+    summary = "  ".join(f"{k}={v}" for k, v in
+                        sorted(counts.items(), key=lambda kv: SEVERITY.get(kv[0], 9)))
+    print(f"\n=== insndiff: {len(results)} instruction(s): {summary} ===")
+    print(f"oracle: {args.gas}")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

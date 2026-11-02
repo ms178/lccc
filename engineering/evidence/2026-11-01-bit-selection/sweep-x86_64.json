@@ -1,0 +1,26 @@
+{
+ "level": "-O2",
+ "files": 3176,
+ "shorter": [
+  [
+   "tests/regression/simd_avx2_defer_chain.c",
+   164,
+   178
+  ],
+  [
+   "engineering/evidence/2026-11-01-bit-selection/bit-selection-exec.c",
+   177,
+   181
+  ],
+  [
+   "engineering/evidence/2026-11-01-bit-selection/bit-selection.c",
+   176,
+   205
+  ]
+ ],
+ "same": 2394,
+ "longer": [],
+ "both_reject": 779,
+ "verdict": [],
+ "net_delta": -47
+}

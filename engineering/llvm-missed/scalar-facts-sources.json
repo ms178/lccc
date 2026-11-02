@@ -1,0 +1,106 @@
+{
+  "retrieved_at_utc": "2026-10-21T09:58:00.828225+00:00",
+  "method": "GitHub REST API issue and paginated comments; source references, not upstream closure evidence",
+  "reports": [
+    {
+      "number": 231586,
+      "title": "[InstCombine] Redundant comparisons implied by bit checks",
+      "url": "https://github.com/llvm/llvm-project/issues/231586",
+      "upstream_state": "open",
+      "updated_at": "2026-10-13T17:50:45Z",
+      "body_sha256": "3ade7be8c2573ae5e9daa040abfa24f247bfca8bae5e4b2301618ad453dd5f37",
+      "comments_sha256": "38e5d4c15fb361cbb6e721aea2319c430e928515ce046dda024e6e2a9228451a",
+      "comment_count": 1
+    },
+    {
+      "number": 231063,
+      "title": "[InstCombine] Missed constant substitution inside a comparison operands",
+      "url": "https://github.com/llvm/llvm-project/issues/231063",
+      "upstream_state": "open",
+      "updated_at": "2026-10-12T09:45:28Z",
+      "body_sha256": "1ceed69be5f34725db35c3bec7782c5ee49b83cc9ed265431372f8203e162559",
+      "comments_sha256": "10727340aa0bdfe0ec668fe585dfc0e370018d652cfe19af077f0343e3f93569",
+      "comment_count": 1
+    },
+    {
+      "number": 230800,
+      "title": "[InstCombine] Missed fold combining a range check with a masked equality",
+      "url": "https://github.com/llvm/llvm-project/issues/230800",
+      "upstream_state": "open",
+      "updated_at": "2026-10-10T19:24:54Z",
+      "body_sha256": "7f8cb4d646f8ba241fabd73a595c9d19997ed58d2ea1094795919d44604963c9",
+      "comments_sha256": "71df0fd1a52a1d0d5b15b3a6ec2a8a83418a09b43c70b4b8d9f78a1d900e3776",
+      "comment_count": 1
+    },
+    {
+      "number": 230021,
+      "title": "[InstCombine] Missed div/rem recombination with a shared or masked remainder",
+      "url": "https://github.com/llvm/llvm-project/issues/230021",
+      "upstream_state": "open",
+      "updated_at": "2026-10-15T05:21:34Z",
+      "body_sha256": "e06aaeead3b5c9dde551913da9babfa79b70c7654e082ce1cd8fe69efd57a5ad",
+      "comments_sha256": "83f0751207514c49875fadd3e419c5e7300346f864f62af4373a1fb7fe39b6ac",
+      "comment_count": 1
+    },
+    {
+      "number": 229537,
+      "title": "[InstSimplify] Missed Boolean select simplification under a conjunctive guard",
+      "url": "https://github.com/llvm/llvm-project/issues/229537",
+      "upstream_state": "open",
+      "updated_at": "2026-10-08T12:41:57Z",
+      "body_sha256": "9a83ccf1983b51e4c409ee60f8cfdab721013957e111bdf2064fc075b0cbf1a4",
+      "comments_sha256": "cd0b197b8beae615aff6136617c12fd70fe0017aad9cbb9493691d19e5bb48de",
+      "comment_count": 4
+    },
+    {
+      "number": 229332,
+      "title": "[EarlyCSE] Miss reusing available inverse comparisons for Boolean NOT",
+      "url": "https://github.com/llvm/llvm-project/issues/229332",
+      "upstream_state": "open",
+      "updated_at": "2026-10-19T02:38:33Z",
+      "body_sha256": "a1671a3db716c2ef90b42fb5da11f3bf59f118a9d46119f71b8493b6ef752481",
+      "comments_sha256": "c5526ac83fc81e687080ed7aeaf702405cabddb454449a90d12924eddebe5f6c",
+      "comment_count": 1
+    },
+    {
+      "number": 217230,
+      "title": "[InstCombine] Fold masked add/lshr/add runtime-unroll remainder using modular arithmetic",
+      "url": "https://github.com/llvm/llvm-project/issues/217230",
+      "upstream_state": "open",
+      "updated_at": "2026-08-24T17:17:05Z",
+      "body_sha256": "370270b6086fce06aaca1fbcd217862e8a5dce5f8fa496e2685dbdc6dd951433",
+      "comments_sha256": "e4ac257a3b40279461401442c45895d789df7792d24dd0731f7466b6d4365076",
+      "comment_count": 2
+    },
+    {
+      "number": 214397,
+      "title": "Missed folding of a masked-bit test implied by an unsigned range check",
+      "url": "https://github.com/llvm/llvm-project/issues/214397",
+      "upstream_state": "closed",
+      "updated_at": "2026-09-06T21:49:35Z",
+      "body_sha256": "73d42ef79455145418ca007962b51db87f12bd12b0c39bf53ea7aa43acceed6a",
+      "comments_sha256": "14f8c6939c6e47b7b687c0a2853ba1af1a2c4682cc177f6c84fe8f062432c131",
+      "comment_count": 2
+    },
+    {
+      "number": 213708,
+      "title": "[InstCombine] Missed folds for equality comparisons of `x & -x`",
+      "url": "https://github.com/llvm/llvm-project/issues/213708",
+      "upstream_state": "closed",
+      "updated_at": "2026-08-08T18:11:14Z",
+      "body_sha256": "92f5e8431030414f07b81d192ff98f148fbe958ceafac0e3602ddbf0e8c44e6c",
+      "comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "comment_count": 0
+    },
+    {
+      "number": 210131,
+      "title": "[InstCombine] Missed fold of ((y != 0) | y) in boolean context",
+      "url": "https://github.com/llvm/llvm-project/issues/210131",
+      "upstream_state": "open",
+      "updated_at": "2026-08-02T13:47:02Z",
+      "body_sha256": "c9c832a73ef90af76b2a9189d73a61f43f0d3ac2cbe4278219bcfa59fe44c965",
+      "comments_sha256": "8ca66037ac8a7b3558e7e4ff7ca4e7a5a6d2789c4ade3bf9c43babf4723167bd",
+      "comment_count": 7
+    }
+  ]
+}

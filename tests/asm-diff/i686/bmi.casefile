@@ -1,0 +1,51 @@
+;;; bmi32-register-and-memory
+.text
+andnl %eax,%ecx,%edx
+andnl 12(%ebx,%esi,4),%ecx,%edx
+bextrl %eax,%ecx,%edx
+bextrl %eax,12(%ebx,%esi,4),%edx
+bzhil %eax,%ecx,%edx
+bzhil %eax,12(%ebx,%esi,4),%edx
+mulxl %eax,%ecx,%edx
+mulxl 12(%ebx,%esi,4),%ecx,%edx
+pdepl %eax,%ecx,%edx
+pdepl 12(%ebx,%esi,4),%ecx,%edx
+pextl %eax,%ecx,%edx
+pextl 12(%ebx,%esi,4),%ecx,%edx
+sarxl %eax,%ecx,%edx
+sarxl %eax,12(%ebx,%esi,4),%edx
+shlxl %eax,%ecx,%edx
+shlxl %eax,12(%ebx,%esi,4),%edx
+shrxl %eax,%ecx,%edx
+shrxl %eax,12(%ebx,%esi,4),%edx
+blsil %ecx,%edx
+blsil 12(%ebx,%esi,4),%edx
+blsrl %ecx,%edx
+blsrl 12(%ebx,%esi,4),%edx
+blsmskl %ecx,%edx
+blsmskl 12(%ebx,%esi,4),%edx
+rorxl $7,%ecx,%edx
+rorxl $7,12(%ebx,%esi,4),%edx
+
+;;; bmi32-suffixless-and-vex-hints
+.text
+pdep %eax,%ecx,%edx
+pext %eax,%ecx,%edx
+{vex3} pdepl %eax,%ecx,%edx
+{vex3} pextl %eax,%ecx,%edx
+
+;;; bmi32-absolute-relocation
+.text
+pdepl bmi_symbol,%ecx,%edx
+pextl bmi_symbol,%ecx,%edx
+.data
+bmi_symbol: .long 0x12345678
+
+;;; bmi32-qword reject
+pdepq %eax,%ecx,%edx
+
+;;; bmi32-narrow reject
+pdepl %ax,%cx,%dx
+
+;;; bmi32-extended reject
+pdepl %r8d,%ecx,%edx

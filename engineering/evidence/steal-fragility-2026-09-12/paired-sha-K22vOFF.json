@@ -1,0 +1,97 @@
+{
+  "label": "sha K=22 vs stealOFF",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_6550yr7i/arm_a",
+    "sha256": "09d36ae8a51e2997f3c5c92e495a38ba428bd92d6e928f071b06b96cb07e8fc3",
+    "env": "CCC_SPAN_STEAL_DEAD_FLOOR=22",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_6550yr7i/arm_b",
+    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "K22",
+    "n": 15,
+    "min_ms": 808.176,
+    "median_ms": 817.46,
+    "mean_ms": 816.391,
+    "stdev_ms": 4.537,
+    "samples_ms": [
+      820.659,
+      817.46,
+      818.716,
+      810.586,
+      819.362,
+      823.354,
+      812.691,
+      821.834,
+      817.667,
+      815.246,
+      813.883,
+      808.176,
+      810.609,
+      822.025,
+      813.594
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "OFF",
+    "n": 15,
+    "min_ms": 406.51,
+    "median_ms": 408.988,
+    "mean_ms": 410.613,
+    "stdev_ms": 4.121,
+    "samples_ms": [
+      415.348,
+      408.811,
+      406.51,
+      410.564,
+      409.835,
+      408.363,
+      408.828,
+      408.224,
+      408.193,
+      409.183,
+      408.988,
+      417.76,
+      406.637,
+      421.577,
+      410.371
+    ]
+  },
+  "paired_diffs_ms": [
+    405.312,
+    408.649,
+    412.207,
+    400.022,
+    409.527,
+    414.991,
+    403.863,
+    413.61,
+    409.474,
+    406.063,
+    404.895,
+    390.416,
+    403.972,
+    400.448,
+    403.223
+  ],
+  "median_ratio_b_over_a": 0.50032,
+  "min_ratio_b_over_a": 0.503,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "K22 SLOWER by 49.97% (median)"
+}

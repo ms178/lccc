@@ -1,0 +1,9 @@
+Immutable S21 discovery run stopped after 207 passed gates and one wiring failure; not an acceptance receipt.
+GATE  ci-gate-parity
+────────────────────────────────────────────────────────────────────────
+gate scripts are wired into nothing and not allowlisted:
+  tests/regression/check_byte_accessor_inline.sh
+  wire the gate into scripts/ci_local.sh and/or a workflow
+ci gate parity: FAILED (orphaned gate scripts)
+FAIL  ci-gate-parity  (1s)
+────────────────────────────────────────────────────────────────────────

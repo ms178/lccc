@@ -1,0 +1,432 @@
+revision,path,line,column,method,region,preceding_function,test_region,source
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/arm/codegen/asm_emitter.rs,29,17,to_i64,backend-width-or-emission-review,const_for_asm_operand,false,let sext = c.to_i64().unwrap_or(0);
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/arm/codegen/asm_emitter.rs,148,38,to_i64,backend-width-or-emission-review,resolve_memory_operand,false,if let Some(addr) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/arm/codegen/asm_emitter.rs,218,31,to_i64,backend-width-or-emission-review,load_input_to_reg,false,"_ => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/arm/codegen/intrinsics.rs,161,41,to_i64,backend-width-or-emission-review,vec_addr_from_args,false,"Some(Operand::Const(c)) => c.to_i64() == Some(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/arm/codegen/intrinsics.rs,189,30,to_i64,backend-width-or-emission-review,vec_addr_from_args,false,let k = c.to_i64().unwrap_or(0);
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/arm/codegen/prologue.rs,103,92,to_i64,backend-width-or-emission-review,conditional_increment_leaf_plan,false,"let is_one = |operand: &Operand| matches!(operand, Operand::Const(constant) if constant.to_i64() == Some(1));"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,190,14,to_i64,backend-width-or-emission-review,foldable_const_disp,false,let v = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,1187,30,to_i64,backend-width-or-emission-review,build_indexed_gep_map,false,let k = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,1211,30,to_i64,backend-width-or-emission-review,build_indexed_gep_map,false,let n = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,1282,30,to_i64,backend-width-or-emission-review,build_indexed_gep_map,false,let k = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,1326,30,to_i64,backend-width-or-emission-review,build_indexed_gep_map,false,let k = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,2742,100,to_i64,backend-width-or-emission-review,detect_conditional_increment_selects,false,"let is_one = |operand: &Operand| matches!(operand, Operand::Const(constant) if constant.to_i64() == Some(1));"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,3262,32,to_i64,backend-width-or-emission-review,detect_shifted_logical_fusions,false,let Some(k) = shift_amt.to_i64() else {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,3887,18,to_i64,backend-width-or-emission-review,destlen_covers_n,false,match destlen.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,3900,37,to_i64,backend-width-or-emission-review,inline_memcpy_len,false,"Some(Operand::Const(c)) => c.to_i64().filter(|s| (0..=32).contains(s))?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/generation.rs,3934,37,to_i64,backend-width-or-emission-review,inline_memset_const_len,false,"Some(Operand::Const(c)) => c.to_i64().filter(|s| *s >= 0)?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/asm_emitter.rs,124,33,to_i64,backend-width-or-emission-review,setup_operand_metadata,false,op.imm_value = c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/asm_emitter.rs,164,38,to_i64,backend-width-or-emission-review,resolve_memory_operand,false,if let Some(addr) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/asm_emitter.rs,307,27,to_i64,backend-width-or-emission-review,load_input_to_reg,false,"_ => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/asm_emitter.rs,737,33,to_i64,backend-width-or-emission-review,setup_memory_fallback,false,op.imm_value = c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/calls.rs,348,38,to_i64,backend-width-or-emission-review,emit_call_reg_args_impl,false,let v = c.to_i64().unwrap_or(0);
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/calls.rs,458,43,to_i64,backend-width-or-emission-review,emit_call_instruction_impl,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/comparison.rs,423,35,to_i64,backend-width-or-emission-review,emit_fused_bit_test_branch_blocks_impl,false,"Operand::Const(c) => c.to_i64().filter(|v| *v >= 0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/globals.rs,178,35,to_i64,backend-width-or-emission-review,emit_global_store_abs_impl,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/i128_ops.rs,155,34,to_i64,backend-width-or-emission-review,resolve_rhs_lo,false,let v = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/i128_ops.rs,171,46,to_i64,backend-width-or-emission-review,resolve_rhs_lo,false,let v = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/i128_ops.rs,208,34,to_i64,backend-width-or-emission-review,resolve_addend_ref,false,let v = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/i128_ops.rs,425,35,to_i64,backend-width-or-emission-review,i64_rhs_ref,false,"other => other.to_i64()? as u128,"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/i686/codegen/i128_ops.rs,743,37,to_i64,backend-width-or-emission-review,emit_load_acc_pair_impl,false,if let Some(ext) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/inline_asm.rs,697,35,to_i64,backend-width-or-emission-review,classify_all_operands,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/inline_asm.rs,713,35,to_i64,backend-width-or-emission-review,classify_all_operands,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/liveness.rs,1010,44,to_i64,backend-width-or-emission-review,extend_gep_base_liveness,false,if let Some(offset) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/regalloc.rs,1973,31,to_i64,backend-width-or-emission-review,compute_i686_mulacc_chains_with_config,false,Operand::Const(c) => c.to_i64().is_some_and(|v| {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/regalloc.rs,2149,43,to_i64,backend-width-or-emission-review,compute_i686_mulacc_chains_with_config,false,"Operand::Const(c) if c.to_i64().is_some() => Some((op.clone(), None)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/regalloc.rs,2462,69,to_i64,backend-width-or-emission-review,collect_safe_folded_index_homes,false,"(Operand::Const(c), _) | (_, Operand::Const(c)) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/riscv/codegen/asm_emitter.rs,114,42,to_i64,backend-width-or-emission-review,setup_operand_metadata,false,op.imm_value = Some(c.to_i64().unwrap_or(0));
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/riscv/codegen/asm_emitter.rs,123,25,to_i64,backend-width-or-emission-review,setup_operand_metadata,false,if c.to_i64() == Some(0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/riscv/codegen/asm_emitter.rs,179,38,to_i64,backend-width-or-emission-review,resolve_memory_operand,false,if let Some(addr) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/riscv/codegen/asm_emitter.rs,293,31,to_i64,backend-width-or-emission-review,load_input_to_reg,false,"_ => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/riscv/codegen/asm_emitter.rs,306,32,to_i64,backend-width-or-emission-review,load_input_to_reg,false,let imm = c.to_i64().unwrap_or(0);
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/traits.rs,2803,24,to_i64,backend-width-or-emission-review,get_const_i128_shift_amount,false,let val = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/alu.rs,547,17,to_i64,backend-width-or-emission-review,emit_bit_test_reg_direct,false,.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/alu.rs,1540,21,to_i64,backend-width-or-emission-review,emit_int_binop_impl,false,.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/asm_emitter.rs,162,33,to_i64,backend-width-or-emission-review,setup_operand_metadata,false,op.imm_value = c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/asm_emitter.rs,238,38,to_i64,backend-width-or-emission-review,resolve_memory_operand,false,if let Some(addr) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/asm_emitter.rs,431,27,to_i64,backend-width-or-emission-review,load_input_to_reg,false,"_ => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/calls.rs,49,35,to_i64,backend-width-or-emission-review,operand_const_i64,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/calls.rs,61,58,to_i64,backend-width-or-emission-review,operand_const_i64,false,"Operand::Const(c) => return c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/calls.rs,65,58,to_i64,backend-width-or-emission-review,operand_const_i64,false,"Operand::Const(c) => return c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/calls.rs,1267,45,to_i64,backend-width-or-emission-review,emit_call_reg_args_impl,false,if let Some(imm) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/cast_ops.rs,981,49,to_i64,backend-width-or-emission-review,narrow_cmp_operands_impl,false,Operand::Const(c) => match c.clone().to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/comparison.rs,1089,35,to_i64,backend-width-or-emission-review,emit_fused_bit_test_branch_blocks_impl,false,"Operand::Const(c) => c.to_i64().filter(|v| *v >= 0 && *v <= i32::MAX as i64),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/emit.rs,3225,21,to_i64,backend-width-or-emission-review,operand_to_rax_i32,false,if c.to_i64() == Some(0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/emit.rs,3227,42,to_i64,backend-width-or-emission-review,operand_to_rax_i32,false,} else if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/emit.rs,3687,51,to_i64,backend-width-or-emission-review,find_gep_for_ivsr,false,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/emit.rs,3714,59,to_i64,backend-width-or-emission-review,extract_base_from_init,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/emit.rs,6760,61,to_i64,backend-width-or-emission-review,try_lower_call_typed,false,"crate::ir::reexports::Operand::Const(c) => c.to_i64().map(TypedCallSrc::Imm),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/globals.rs,68,33,to_i64,backend-width-or-emission-review,emit_rematerialized_global_addr_impl,false,if let Some(raw) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/globals.rs,301,37,to_i64,backend-width-or-emission-review,emit_global_store_rip_rel_impl,false,if let Some(imm) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,442,35,to_i64,backend-width-or-emission-review,try_elide_vec_load,false,"Operand::Const(c) if c.to_i64() == Some(0) => None,"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,1096,41,to_i64,backend-width-or-emission-review,try_all_ones_splat,false,Some(Operand::Const(c)) if c.to_i64() == Some(-1) => {}
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,1533,17,to_i64,backend-width-or-emission-review,vec_load_addr_regs,false,if c.to_i64() == Some(0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,1560,39,to_i64,backend-width-or-emission-review,vec_disp_arg,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,1578,31,to_i64,backend-width-or-emission-review,vec_mem_operand,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,3658,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,if let Some(d) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,3677,50,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"c.to_i64().map(|d| (a.clone(), d))"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,3680,50,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"c.to_i64().map(|d| (b.clone(), d))"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,4382,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,Operand::Const(c) if c.to_i64() == Some(0) => {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,4386,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,4490,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,Operand::Const(c) if c.to_i64() == Some(0) => {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,4494,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5123,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5141,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5250,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5294,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5327,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5345,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5380,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5419,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5436,43,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,5523,47,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,6265,47,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0) as i32,"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,6354,47,to_i64,backend-width-or-emission-review,emit_intrinsic_impl,false,"Operand::Const(c) => c.to_i64().unwrap_or(0xE4) as i32,"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,8699,35,to_i64,backend-width-or-emission-review,emit_avx_cmp_256,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,8730,35,to_i64,backend-width-or-emission-review,emit_sse_cmp_128,false,"Operand::Const(c) => c.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,8806,35,to_i64,backend-width-or-emission-review,emit_int_cmp,false,"Operand::Const(c) => c.to_i64().unwrap_or(-1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,9020,35,to_i64,backend-width-or-emission-review,emit_int_cmp_i8,false,"Operand::Const(c) => c.to_i64().unwrap_or(-1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,9170,35,to_i64,backend-width-or-emission-review,emit_int_rotl_i32x4,false,"Operand::Const(c) => c.to_i64().unwrap_or(-1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,9230,35,to_i64,backend-width-or-emission-review,emit_int_shufd_i32x4,false,"Operand::Const(c) => c.to_i64().unwrap_or(-1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,9579,41,to_i64,backend-width-or-emission-review,emit_int_pack_i32x4,false,Operand::Const(c) => match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/intrinsics.rs,9645,35,to_i64,backend-width-or-emission-review,emit_int_extract_i32x4,false,"Operand::Const(c) => c.to_i64().unwrap_or(-1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,310,40,to_i64,backend-width-or-emission-review,try_emit_phase9_indexed_store,false,let scale_val = match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,326,36,to_i64,backend-width-or-emission-review,try_emit_phase9_indexed_store,false,let shift = match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,542,40,to_i64,backend-width-or-emission-review,try_emit_phase9_indexed_load,false,let scale_val = match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,558,36,to_i64,backend-width-or-emission-review,try_emit_phase9_indexed_load,false,let shift = match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,739,37,to_i64,backend-width-or-emission-review,emit_store_impl,false,if let Some(imm) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,1333,37,to_i64,backend-width-or-emission-review,emit_store_with_const_offset_impl,false,if let Some(imm) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,2171,33,to_i64,backend-width-or-emission-review,emit_store_indexed_common,false,if let Some(imm) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/backend/x86/codegen/memory.rs,3209,35,to_i64,backend-width-or-emission-review,emit_inline_memset_call_impl,false,"Operand::Const(c) => c.to_i64().map(|v| v as u8),"
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_arith.rs,377,13,to_i64,semantic-decision-priority,eval_const_binop_i128,false,(lhs.to_i64()? as u64 as u128) as i128
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_arith.rs,382,13,to_i64,semantic-decision-priority,eval_const_binop_i128,false,(rhs.to_i64()? as u64 as u128) as i128
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_arith.rs,492,16,to_i64,semantic-decision-priority,eval_const_binop,false,let l = lhs.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_arith.rs,493,16,to_i64,semantic-decision-priority,eval_const_binop,false,let r = rhs.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,114,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u16;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,119,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,124,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,132,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,138,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,141,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,147,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,152,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,162,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,169,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,179,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,188,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,194,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,197,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,203,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,208,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,218,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,225,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,235,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,244,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,250,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,253,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,259,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,264,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as i32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,275,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()? as i32;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,283,28,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,294,24,to_i64,semantic-decision-priority,eval_builtin_call,false,let v = val.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/common/const_eval.rs,360,17,to_i64,semantic-decision-priority,irconst_to_bits,false,"_ => val.to_i64().unwrap_or(0) as u64,"
+81667ca4fab3bae877308885af059cb86aa44119,src/frontend/sema/analysis.rs,2384,41,to_i64,other-semantic-or-representation-review,eval_const_expr,false,evaluator.eval_const_expr(expr)?.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/frontend/sema/const_eval.rs,119,44,to_i64,other-semantic-or-representation-review,eval_const_expr,false,if let Some(v) = result.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/frontend/sema/const_eval.rs,515,34,to_i64,other-semantic-or-representation-review,eval_offsetof_pattern_with_type,false,let idx = idx_val.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/frontend/sema/const_eval.rs,890,39,to_i64,other-semantic-or-representation-review,resolve_packed_enum_type,false,next_val = val.to_i64().unwrap_or(next_val);
+81667ca4fab3bae877308885af059cb86aa44119,src/frontend/sema/const_eval.rs,933,52,to_i64,other-semantic-or-representation-review,sizeof_type_spec,false,let n = self.eval_const_expr(size)?.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/frontend/sema/const_eval.rs,1268,61,to_i64,other-semantic-or-representation-review,convert_struct_fields,false,.and_then(|bw| self.eval_const_expr(bw)?.to_i64().map(|v| v as u32));
+81667ca4fab3bae877308885af059cb86aa44119,src/frontend/sema/type_checker.rs,785,41,to_i64,other-semantic-or-representation-review,eval_const_expr,false,evaluator.eval_const_expr(expr)?.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/constants.rs,515,13,to_i64,other-semantic-or-representation-review,to_usize,false,self.to_i64().map(|v| v as usize)
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/constants.rs,520,13,to_i64,other-semantic-or-representation-review,to_u32,false,self.to_i64().map(|v| v as u32)
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/constants.rs,547,36,to_i64,other-semantic-or-representation-review,push_le_bytes,false,let le_bytes = self.to_i64().unwrap_or(0).to_le_bytes();
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/constants.rs,711,36,to_i64,other-semantic-or-representation-review,coerce_to_with_src,false,if let Some(int_val) = self.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/lowering/const_eval.rs,474,38,to_i64,semantic-decision-priority,eval_const_cast,false,"let (bits, _) = match src_val.to_i64() {"
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/lowering/const_eval.rs,778,34,to_i64,semantic-decision-priority,eval_offsetof_pattern_with_type,false,let idx = idx_val.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/lowering/const_eval.rs,1025,10,to_i64,semantic-decision-priority,const_to_i64,false,c.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/ir/lowering/expr_assign.rs,382,41,to_i64,other-semantic-or-representation-review,store_bitfield,false,if let Some(v64) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/aggregate_copy_forward.rs,50,62,to_i64,semantic-decision-priority,eliminate_dead_aggregate_field_stores,false,"(Operand::Const(c), Some(s)) => c.to_i64().map(|o| s + o),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/aggregate_copy_forward.rs,370,55,to_i64,semantic-decision-priority,pointer_paths,false,Operand::Const(c) if c.to_i64() == Some(0) => {}
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/aggregate_copy_forward.rs,515,48,to_i64,semantic-decision-priority,forward_store_only_temporaries,false,"Operand::Const(c) => total += c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/alias.rs,169,37,to_i64,semantic-decision-priority,vec_intrinsic_access,false,"Some(Operand::Const(c)) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/alias.rs,194,21,to_i64,semantic-decision-priority,resolve_vec_addr_in_frame,false,"konst: c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/alias.rs,204,44,to_i64,semantic-decision-priority,resolve_vec_addr_in_frame,false,f.konst = f.konst.checked_add(c.to_i64()?)?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/arx_vectorize.rs,685,35,to_i64,semantic-decision-priority,operand_term,false,"Operand::Const(c) => c.to_i64().map(|n| Rc::new(TermNode::Const(n as u32))),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/arx_vectorize.rs,761,47,to_i64,semantic-decision-priority,resolve,false,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/arx_vectorize.rs,830,55,to_i64,semantic-decision-priority,resolve,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/backedge_pre.rs,1483,21,to_i64,semantic-decision-priority,folding_respects_unsigned_storage_and_shift_semantics,true,"assert_eq!(r.to_i64(), Some(44));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/backedge_pre.rs,1485,21,to_i64,semantic-decision-priority,folding_respects_unsigned_storage_and_shift_semantics,true,"assert_eq!(r.to_i64(), Some(255));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/backedge_pre.rs,1494,21,to_i64,semantic-decision-priority,folding_respects_unsigned_storage_and_shift_semantics,true,"assert_eq!(r.to_i64(), Some(0x0FFF_FFFF));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/bit_idioms.rs,3139,35,to_i64,semantic-decision-priority,eval_val,true,"Operand::Const(c) => c.to_i64().unwrap_or(0) as u32,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,396,44,to_i64,semantic-decision-priority,fold_constant_switches,false,if let Some(switch_int) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1347,28,eval_i64,semantic-decision-priority,resolve_value_globally,false,"let result = op.eval_i64(ty.truncate_i64(l), ty.truncate_i64(r));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1359,22,to_i64,semantic-decision-priority,resolve_value_globally,false,let v = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1373,61,to_i64,semantic-decision-priority,resolve_value_globally,false,"to_ty.truncate_i64(from_ty.truncate_i64(base.to_i64()?)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1402,31,to_i64,semantic-decision-priority,resolve_operand_globally,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1403,79,to_i64,semantic-decision-priority,resolve_operand_globally,false,"Operand::Value(v) => resolve_value_globally(func, *v, val_map, depth)?.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1451,32,eval_i64,semantic-decision-priority,resolve_value_to_const_in_block,false,"let result = op.eval_i64(ty.truncate_i64(l), ty.truncate_i64(r));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1477,31,to_i64,semantic-decision-priority,resolve_operand_to_i64_in_block,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/cfg_simplify.rs,1478,73,to_i64,semantic-decision-priority,resolve_operand_to_i64_in_block,false,"Operand::Value(v) => resolve_value_to_const_in_block(block, *v)?.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/const_array_promote.rs,158,45,to_i64,semantic-decision-priority,gep_roots,false,if let Some(off) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,484,28,eval_i64,semantic-decision-priority,try_fold_with_map,true,"let result = op.eval_i64(ty.truncate_i64(lhs_const), ty.truncate_i64(rhs_const));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,544,36,to_i64,semantic-decision-priority,try_fold_with_map,true,"|| matches!((tv.to_i64(), fv.to_i64()), (Some(a), Some(b)) if a == b);"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,544,49,to_i64,semantic-decision-priority,try_fold_with_map,true,"|| matches!((tv.to_i64(), fv.to_i64()), (Some(a), Some(b)) if a == b);"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,613,32,to_i64,semantic-decision-priority,eval_binop_const,true,let l = ty.truncate_i64(lhs.to_i64()?);
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,614,32,to_i64,semantic-decision-priority,eval_binop_const,true,let r = ty.truncate_i64(rhs.to_i64()?);
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,685,32,to_i64,semantic-decision-priority,eval_cmp_const,true,let l = ty.truncate_i64(lhs.to_i64()?);
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,686,32,to_i64,semantic-decision-priority,eval_cmp_const,true,let r = ty.truncate_i64(rhs.to_i64()?);
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,687,25,eval_i64,semantic-decision-priority,eval_cmp_const,true,"Some(IrConst::I32(op.eval_i64(l, r) as i32))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,699,22,to_i64,semantic-decision-priority,eval_cast_const,true,"fold_cast(src.to_i64()?, from_ty, to_ty),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,723,26,to_i64,semantic-decision-priority,eval_float_cast_const,true,let raw = src.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,781,15,to_i64,semantic-decision-priority,promote_sub_int_const,true,"_ => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,812,34,to_i64,semantic-decision-priority,as_i64_const_mapped,true,"resolve_const(op, const_map)?.to_i64()"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,1271,28,eval_i64,semantic-decision-priority,test_fold_cmp,true,"assert!(IrCmpOp::Eq.eval_i64(5, 5));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,1272,29,eval_i64,semantic-decision-priority,test_fold_cmp,true,"assert!(!IrCmpOp::Eq.eval_i64(5, 6));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,1273,29,eval_i64,semantic-decision-priority,test_fold_cmp,true,"assert!(IrCmpOp::Slt.eval_i64(-1, 0));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,1275,30,eval_i64,semantic-decision-priority,test_fold_cmp,true,"assert!(!IrCmpOp::Ult.eval_i64(-1i64, 0));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/constant_fold.rs,1276,29,eval_i64,semantic-decision-priority,test_fold_cmp,true,"assert!(IrCmpOp::Ugt.eval_i64(-1i64, 0));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/copy_prop.rs,271,56,to_i64,semantic-decision-priority,forward_large_memcpy_loads,false,if let Some(offset) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/div_by_const.rs,173,35,to_i64,semantic-decision-priority,div_by_const_function,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/div_by_const.rs,189,35,to_i64,semantic-decision-priority,div_by_const_function,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/div_by_const.rs,220,47,to_i64,semantic-decision-priority,div_by_const_function,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/dse.rs,136,41,to_i64,semantic-decision-priority,build,false,"delta: c.to_i64().unwrap_or(i64::MAX),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/global_addr_cse.rs,160,39,to_i64,semantic-decision-priority,classify_site_local_indexed,false,if let Some(c) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/global_addr_cse.rs,172,39,to_i64,semantic-decision-priority,classify_site_local_indexed,false,if let Some(k) = c.to_i64().filter(|&k| (0..63).contains(&k)) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/if_convert.rs,1098,40,to_i64,semantic-decision-priority,is_boolean_condition,false,"Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/if_convert.rs,2189,15,to_i64,semantic-decision-priority,same_value_or_both_zero,false,ca.to_i64() == Some(0) && cb.to_i64() == Some(0)
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/if_convert.rs,2189,41,to_i64,semantic-decision-priority,same_value_or_both_zero,false,ca.to_i64() == Some(0) && cb.to_i64() == Some(0)
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/if_convert.rs,2221,70,to_i64,semantic-decision-priority,value_only_controls_branch,false,"&& matches!(other, Operand::Const(c) if c.to_i64() == Some(0) || c.to_i64() == Some(1));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/if_convert.rs,2221,95,to_i64,semantic-decision-priority,value_only_controls_branch,false,"&& matches!(other, Operand::Const(c) if c.to_i64() == Some(0) || c.to_i64() == Some(1));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/if_convert.rs,2323,67,to_i64,semantic-decision-priority,skip_boolean_diamond,false,".all(|(_, _, tv, _fv)| matches!(tv, Operand::Const(c) if c.to_i64() == Some(1)));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/inline.rs,1562,47,to_i64,semantic-decision-priority,trace_value_to_global,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/inline.rs,1630,31,to_i64,semantic-decision-priority,trace_operand_to_const,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/inline.rs,1640,37,to_i64,semantic-decision-priority,trace_operand_to_const,false,return c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/inline.rs,1652,66,to_i64,semantic-decision-priority,trace_operand_to_const,false,"Operand::Const(c) => return c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/inline.rs,1662,58,to_i64,semantic-decision-priority,trace_operand_to_const,false,"Operand::Const(c) => return c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/inline.rs,1679,42,eval_i64,semantic-decision-priority,trace_operand_to_const,false,"return bin_op.eval_i64(l, r);"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/inline.rs,1692,50,eval_i64,semantic-decision-priority,trace_operand_to_const,false,"return Some(if cmp_op.eval_i64(l, r) { 1 } else { 0 });"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/ipcp.rs,368,70,to_i64,semantic-decision-priority,eval_const_function,false,"let cond = eval_const_operand(cond, &values)?.to_i64()?;"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/ipcp.rs,415,66,to_i64,semantic-decision-priority,eval_const_function,false,"let cond = eval_const_operand(cond, &values)?.to_i64()?;"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/ipcp.rs,426,66,to_i64,semantic-decision-priority,eval_const_function,false,"let value = eval_const_operand(val, &values)?.to_i64()?;"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_strength_reduce.rs,789,46,to_i64,semantic-decision-priority,find_basic_ivs,true,if let Some(step) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_strength_reduce.rs,899,71,to_i64,semantic-decision-priority,find_derived_exprs,true,"if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_strength_reduce.rs,904,71,to_i64,semantic-decision-priority,find_derived_exprs,true,"if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_strength_reduce.rs,958,34,to_i64,semantic-decision-priority,find_derived_exprs,true,let s = c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_strength_reduce.rs,977,71,to_i64,semantic-decision-priority,find_derived_exprs,true,"if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_strength_reduce.rs,1110,31,to_i64,semantic-decision-priority,try_resolve_const,true,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_widen.rs,273,16,to_i64,semantic-decision-priority,widen_const,false,let raw = c.to_i64().unwrap_or(0) as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_widen.rs,1057,50,to_i64,semantic-decision-priority,analyze_iv,false,let count_val = count.to_i64().unwrap_or(i64::MAX);
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_widen.rs,1419,32,to_i64,semantic-decision-priority,const_as_range,false,"let v = widen_const(c, ty)?.to_i64()? as i128;"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/iv_widen.rs,1488,31,to_i64,semantic-decision-priority,prove_counted_bound,false,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_align.rs,913,30,to_i64,semantic-decision-priority,header_constant_trip_bound,false,let limit = limit.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_idiom.rs,101,6,to_i64,semantic-decision-priority,const_int_value,false,c.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_idiom.rs,1423,13,to_i64,semantic-decision-priority,rewrite_copy_loop,false,if c.to_i64().is_none() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_idiom.rs,1679,32,to_i64,semantic-decision-priority,rewrite_copy_loop,false,let Some(raw_i) = c.to_i64() else {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_idiom.rs,2005,30,to_i64,semantic-decision-priority,rewrite_guarded_copy_loop,false,let Some(raw) = c.to_i64() else { return false };
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,136,23,to_i64,semantic-decision-priority,pointer_paths,false,} => c.to_i64().and_then(|off| {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,167,69,to_i64,semantic-decision-priority,pointer_paths,false,"| (Operand::Const(c), Operand::Value(base)) => c.to_i64().and_then(|off| {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,325,19,to_i64,semantic-decision-priority,resolve_ptr_chain,false,"} => c.to_i64().map(|k| (*base, k)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,337,22,to_i64,semantic-decision-priority,resolve_ptr_chain,false,"c.to_i64().map(|k| (*v, k))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,447,29,to_i64,semantic-decision-priority,resolve_lin_form,false,"konst: c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,478,52,to_i64,semantic-decision-priority,resolve_lin_form,false,f.konst = f.konst.checked_add(c.to_i64()?)?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,508,50,to_i64,semantic-decision-priority,resolve_lin_form,false,fa.konst = fa.konst.checked_add(c.to_i64()?)?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,519,31,to_i64,semantic-decision-priority,resolve_lin_form,false,let shift = amount.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,545,27,to_i64,semantic-decision-priority,resolve_lin_form,false,"(*a, c.to_i64()?)"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_memory_promote.rs,604,38,to_i64,semantic-decision-priority,resolve_lin_form,false,let Some(iv_c0) = ivc.to_i64() else {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_unroll.rs,1032,29,to_i64,semantic-decision-priority,normalize_to_type,false,"IrConst::from_i64(v, ty).to_i64()"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_unroll.rs,3647,31,to_i64,semantic-decision-priority,resolve_const_operand,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_unroll.rs,3703,16,to_i64,semantic-decision-priority,signed_step,false,let raw = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_unroll.rs,3774,81,to_i64,semantic-decision-priority,find_iv_in_loop,false,"(Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/loop_unroll.rs,3775,81,to_i64,semantic-decision-priority,find_iv_in_loop,false,"(Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/narrow.rs,1663,29,to_i64,semantic-decision-priority,test_narrow_lshr_count_ge_width_folds_to_zero,true,"assert_eq!(c.to_i64(), Some(0), ""fold value must be zero, got {:?}"", c);"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/narrow.rs,1690,70,to_i64,semantic-decision-priority,test_narrow_shl_count_ge_width_folds_to_zero,true,"Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/narrow.rs,1736,47,to_i64,semantic-decision-priority,test_narrow_ashr_count_ge_width_clamps,true,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,484,113,to_i64,semantic-decision-priority,is_add_const_one,false,"&& ((matches!(lhs, Operand::Value(lv) if *lv == phi) && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,485,116,to_i64,semantic-decision-priority,is_add_const_one,false,"|| (matches!(rhs, Operand::Value(rv) if *rv == phi) && matches!(lhs, Operand::Const(c) if c.to_i64() == Some(1)))))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,496,109,to_i64,semantic-decision-priority,is_plus_one_of,false,"&& ((matches!(lhs, Operand::Value(v) if *v == a) && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,497,112,to_i64,semantic-decision-priority,is_plus_one_of,false,"|| (matches!(rhs, Operand::Value(v) if *v == a) && matches!(lhs, Operand::Const(c) if c.to_i64() == Some(1)))))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,520,73,to_i64,semantic-decision-priority,find_div2_result,false,"if lhs_v && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,526,68,to_i64,semantic-decision-priority,find_div2_result,false,"&& matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,547,68,to_i64,semantic-decision-priority,find_div2_result,false,"&& matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/quadratic_sr.rs,561,68,to_i64,semantic-decision-priority,find_div2_result,false,"&& matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)) =>"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,109,57,to_i64,semantic-decision-priority,canonicalize,false,"(Operand::Value(v), Operand::Const(c)) => (*v, c.to_i64()?, op),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,110,57,to_i64,semantic-decision-priority,canonicalize,false,"(Operand::Const(c), Operand::Value(v)) => (*v, c.to_i64()?, swap(op)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,594,54,to_i64,semantic-decision-priority,try_fold_select,false,"if matches!(false_val, Operand::Const(c) if c.to_i64() == Some(0)) {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,603,60,to_i64,semantic-decision-priority,try_fold_select,false,"} else if matches!(true_val, Operand::Const(c) if c.to_i64() == Some(1)) {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,858,39,to_i64,semantic-decision-priority,fold_phi_diamonds,false,"Operand::Const(c) if c.to_i64() == Some(0) => true,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,859,39,to_i64,semantic-decision-priority,fold_phi_diamonds,false,"Operand::Const(c) if c.to_i64() == Some(1) => false,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,1949,74,to_i64,semantic-decision-priority,run_function,false,"(IrCmpOp::Sle, Operand::Value(x), Operand::Const(c)) if c.to_i64() == Some(0) => {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,1952,74,to_i64,semantic-decision-priority,run_function,false,"(IrCmpOp::Sgt, Operand::Value(x), Operand::Const(c)) if c.to_i64() == Some(0) => {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,1955,74,to_i64,semantic-decision-priority,run_function,false,"(IrCmpOp::Sge, Operand::Const(c), Operand::Value(x)) if c.to_i64() == Some(0) => {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,1958,74,to_i64,semantic-decision-priority,run_function,false,"(IrCmpOp::Slt, Operand::Const(c), Operand::Value(x)) if c.to_i64() == Some(0) => {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,1996,25,to_i64,semantic-decision-priority,run_function,false,if limit.to_i64() == Some(u32::MAX as i64) || limit.to_i64() == Some(-1) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,1996,68,to_i64,semantic-decision-priority,run_function,false,if limit.to_i64() == Some(u32::MAX as i64) || limit.to_i64() == Some(-1) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,2022,72,to_i64,semantic-decision-priority,run_function,false,"&& matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,3565,67,to_i64,semantic-decision-priority,full_domain_or_retargets_bbody_phi_arms,true,"|(v, from)| matches!(v, Operand::Const(c) if c.to_i64() == Some(77))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,3569,67,to_i64,semantic-decision-priority,full_domain_or_retargets_bbody_phi_arms,true,"|(v, from)| matches!(v, Operand::Const(c) if c.to_i64() == Some(13))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/range_check.rs,3648,57,to_i64,semantic-decision-priority,full_domain_or_keeps_bexit_extra_predecessor,true,"(Operand::Const(c), BlockId(4)) if c.to_i64() == Some(42)"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/recursion_to_iter.rs,181,51,to_i64,semantic-decision-priority,recursion_to_iteration,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/recursion_to_iter.rs,439,33,to_i64,semantic-decision-priority,trace_param_decrement,false,return c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/recursion_to_iter.rs,444,37,to_i64,semantic-decision-priority,trace_param_decrement,false,return c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/recursion_to_iter.rs,471,39,to_i64,semantic-decision-priority,trace_param_decrement,false,if let Some(v) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/resolve_asm.rs,129,49,to_i64,semantic-decision-priority,resolve_in_function,false,if let Some(val) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/resolve_asm.rs,199,31,to_i64,semantic-decision-priority,eval_const_operand,false,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/sccp.rs,811,37,to_i64,semantic-decision-priority,evaluate_terminator,false,let target = match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/sccp.rs,1290,50,to_i64,semantic-decision-priority,fold_terminator,false,"let v = const_of_operand(val, state)?.to_i64()?;"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,110,16,to_i64,semantic-decision-priority,norm_const,false,let raw = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,344,31,to_i64,semantic-decision-priority,parse_member,false,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,372,31,to_i64,semantic-decision-priority,parse_member,false,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,552,67,to_i64,semantic-decision-priority,run_function,false,"*b == label && matches!(op, Operand::Const(c) if c.to_i64() == Some(1))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,1164,51,to_i64,semantic-decision-priority,eval,true,"Operand::Const(c) => c.to_i64().unwrap(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,1168,51,to_i64,semantic-decision-priority,eval,true,"Operand::Const(c) => c.to_i64().unwrap(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,1183,51,to_i64,semantic-decision-priority,eval,true,"Operand::Const(c) => c.to_i64().unwrap(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,1187,51,to_i64,semantic-decision-priority,eval,true,"Operand::Const(c) => c.to_i64().unwrap(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,1211,51,to_i64,semantic-decision-priority,eval,true,"Operand::Const(c) => c.to_i64().unwrap(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/set_membership.rs,1234,47,to_i64,semantic-decision-priority,eval,true,"Operand::Const(c) => c.to_i64().unwrap(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,481,40,to_i64,semantic-decision-priority,operand_is_boolean,false,"Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,1158,29,to_i64,semantic-decision-priority,fold_const_cast,true,if let Some(raw_val) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,1455,25,to_i64,semantic-decision-priority,simplify_cmp,true,let const_i64 = cval.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,1713,41,to_i64,semantic-decision-priority,simplify_gep,true,if let Some(outer_val) = outer_c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,1717,53,to_i64,semantic-decision-priority,simplify_gep,true,if let Some(inner_val) = inner_c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2292,24,to_i64,semantic-decision-priority,is_all_ones,true,match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2353,24,to_i64,semantic-decision-priority,is_neg_one,true,match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2454,24,to_i64,semantic-decision-priority,try_reassociate_add,true,let c2_val = c2.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2461,44,to_i64,semantic-decision-priority,try_reassociate_add,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2476,44,to_i64,semantic-decision-priority,try_reassociate_add,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2493,44,to_i64,semantic-decision-priority,try_reassociate_add,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2514,24,to_i64,semantic-decision-priority,try_reassociate_add,true,let c2_val = c2.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2518,36,to_i64,semantic-decision-priority,try_reassociate_add,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2532,36,to_i64,semantic-decision-priority,try_reassociate_add,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2570,31,to_i64,semantic-decision-priority,try_reassociate_sub,true,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2581,32,to_i64,semantic-decision-priority,try_reassociate_sub,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2596,32,to_i64,semantic-decision-priority,try_reassociate_sub,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2613,32,to_i64,semantic-decision-priority,try_reassociate_sub,true,let c1_val = c1.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2652,31,to_i64,semantic-decision-priority,try_reassociate_bitwise,true,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2661,21,to_i64,semantic-decision-priority,try_reassociate_bitwise,true,"(def.lhs, c1.to_i64()?)"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2663,21,to_i64,semantic-decision-priority,try_reassociate_bitwise,true,"(def.rhs, c1.to_i64()?)"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2730,31,to_i64,semantic-decision-priority,try_reassociate_shift,true,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2743,31,to_i64,semantic-decision-priority,try_reassociate_shift,true,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2798,35,to_i64,semantic-decision-priority,try_reassociate_mul,true,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2807,25,to_i64,semantic-decision-priority,try_reassociate_mul,true,"(def.lhs, c1.to_i64()?)"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,2809,25,to_i64,semantic-decision-priority,try_reassociate_mul,true,"(def.rhs, c1.to_i64()?)"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,4504,29,to_i64,semantic-decision-priority,test_or_all_ones_i32,true,"assert_eq!(c.to_i64(), Some(-1i32 as i64));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,5548,84,to_i64,semantic-decision-priority,bit_test_zero_base_is_zero,true,"matches!(got, Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/simplify.rs,5593,80,to_i64,semantic-decision-priority,bit_test_zero_base_and_index_is_zero,true,"matches!(got, Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,186,19,to_i64,semantic-decision-priority,affine_term,false,"off: c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,272,48,to_i64,semantic-decision-priority,affine_term,false,t.off = t.off.checked_sub(c.to_i64()?)?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,285,56,to_i64,semantic-decision-priority,affine_term,false,"(x, Operand::Const(c)) => (x, c.to_i64()?),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,286,56,to_i64,semantic-decision-priority,affine_term,false,"(Operand::Const(c), x) => (x, c.to_i64()?),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,303,30,to_i64,semantic-decision-priority,affine_term,false,let k = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,1404,42,to_i64,semantic-decision-priority,const_amount,false,"Operand::Const(c) => return c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,1423,36,to_i64,semantic-decision-priority,const_amount,false,let val = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,2331,35,to_i64,semantic-decision-priority,build_demoted_select_arm,false,let cv = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,2406,21,to_i64,semantic-decision-priority,build_demoted_select_arm,false,.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,2794,38,to_i64,semantic-decision-priority,build_pack,false,"Some((*vec, c.to_i64()?))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,2960,61,to_i64,semantic-decision-priority,build_pack,false,Operand::Const(c) => match c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,3030,48,to_i64,semantic-decision-priority,build_pack,false,let Some(k) = c.to_i64() else {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,3220,51,to_i64,semantic-decision-priority,build_pack,false,let cv = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,3340,37,to_i64,semantic-decision-priority,build_pack,false,.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,4637,72,to_i64,semantic-decision-priority,build_pack,false,".all(|o| matches!(o, Operand::Const(c) if c.to_i64() == Some(1)))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,5477,43,to_i64,semantic-decision-priority,build_plan,false,Operand::Const(c) if c.to_i64() == Some(-1));
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/slp_vectorizer.rs,6258,20,to_i64,semantic-decision-priority,narrow_const_variant_width_matches_lane,true,"got.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/store_load_forward.rs,107,27,to_i64,semantic-decision-priority,build_field_paths,false,} => c.to_i64().and_then(|off| {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,235,47,to_i64,semantic-decision-priority,find_gep_with_const_offset,false,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,259,68,to_i64,semantic-decision-priority,extract_base_from_init,false,"Operand::Const(c) => Some((*base, c.to_i64()?)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,334,21,to_i64,semantic-decision-priority,is_canonical_counter_iv,false,if c.to_i64() == Some(0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,366,50,to_i64,semantic-decision-priority,is_value_unit_increment_of,false,if v.0 == phi_dest.0 && c.to_i64() == Some(1) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,406,47,to_i64,semantic-decision-priority,is_value_const_zero,false,"Operand::Const(c) => c.to_i64() == Some(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,412,47,to_i64,semantic-decision-priority,is_value_const_zero,false,"Operand::Const(c) => c.to_i64() == Some(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,616,53,to_i64,semantic-decision-priority,find_transitive_ptr_uses,false,if let Some(off) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/univsr.rs,1197,25,to_i64,semantic-decision-priority,transitive_gep_offset_preserved,true,if c.to_i64() == Some(4))
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_arx.rs,178,41,to_i64,semantic-decision-priority,discover_slot_domain,false,if let Some(off) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_arx.rs,280,42,to_i64,semantic-decision-priority,fold_rotate_idioms,false,"let (Some(n), Some(n2)) = (cn.to_i64(), cn2.to_i64()) else {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_arx.rs,280,56,to_i64,semantic-decision-priority,fold_rotate_idioms,false,"let (Some(n), Some(n2)) = (cn.to_i64(), cn2.to_i64()) else {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_arx.rs,343,41,to_i64,semantic-decision-priority,extract_body,false,if let Some(off) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_arx.rs,433,38,to_i64,semantic-decision-priority,extract_body,false,let v = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_arx.rs,683,55,to_i64,semantic-decision-priority,emit_chunk,false,"Arg::Const(c) => self.rot_masks.get(&c.to_i64()?).copied(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_arx.rs,1177,35,to_i64,semantic-decision-priority,try_transform_loop,false,"Arg::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_interleave.rs,430,54,to_i64,semantic-decision-priority,analyze,false,"if !matches!(init, Operand::Const(c) if c.to_i64() == Some(0)) {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_interleave.rs,439,35,to_i64,semantic-decision-priority,analyze,false,"} if *l == iv => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_interleave.rs,956,25,to_i64,semantic-decision-priority,transform,false,"} => cst.to_i64().map(|cv| (dest.0, (*x, cv))),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_interleave.rs,981,47,to_i64,semantic-decision-priority,transform,false,"Operand::Const(cst) => cst.to_i64().unwrap_or(0),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_interleave.rs,1430,53,to_i64,semantic-decision-priority,interleave_dot_f64_transforms_and_verifies,true,"Some(Operand::Const(c)) => c.to_i64().unwrap_or(-1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vec_interleave.rs,1434,53,to_i64,semantic-decision-priority,interleave_dot_f64_transforms_and_verifies,true,"Some(Operand::Const(c)) => c.to_i64().unwrap_or(-1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,429,39,to_i64,semantic-decision-priority,vectorize_with_analysis_mode,false,"Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * machine_step_width),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,609,37,to_i64,semantic-decision-priority,vectorize_with_analysis_mode,false,if c.to_i64() == Some(0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,611,44,to_i64,semantic-decision-priority,vectorize_with_analysis_mode,false,} else if c.to_i64().is_some() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,657,39,to_i64,semantic-decision-priority,vectorize_with_analysis_mode,false,"Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * vec_width),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,1147,29,to_i64,semantic-decision-priority,analyze_loop_pattern,false,if c.to_i64() == Some(1) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,1908,29,to_i64,semantic-decision-priority,analyze_reduction_pattern,false,if c.to_i64() == Some(1) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,2050,33,to_i64,semantic-decision-priority,analyze_reduction_pattern,false,if c.to_i64() == Some(0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,2088,30,to_i64,semantic-decision-priority,analyze_reduction_pattern,false,c.to_i64() == Some(0) || c.to_f64().map(|f| f == 0.0).unwrap_or(false)
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,2337,45,to_i64,semantic-decision-priority,analyze_reduction_pattern,false,&& c.to_i64() == Some(4))
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,2365,44,to_i64,semantic-decision-priority,analyze_reduction_pattern,false,iv_init = c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,2411,47,to_i64,semantic-decision-priority,analyze_reduction_pattern,false,return off.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,4311,71,to_i64,semantic-decision-priority,emit_uncached,true,"Operand::Const(IrConst::I32(replicate_narrow(c.to_i64()?, nb))),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,6376,13,to_i64,semantic-decision-priority,analyze_map_pattern,true,if c.to_i64().is_some_and(|n| n <= 4) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,6386,56,to_i64,semantic-decision-priority,analyze_map_pattern,true,"&& matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,6690,63,to_i64,semantic-decision-priority,analyze_map_pattern,true,"&& matches!(op, Operand::Const(c) if c.to_i64() == Some(0))))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,7473,44,to_i64,semantic-decision-priority,is_scalar_zero_one_tree,true,"Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,7511,59,to_i64,semantic-decision-priority,rewrite_zero_one_selects,true,"MapExpr::Invariant(Operand::Const(c)) => c.to_i64().filter(|v| *v == 0 || *v == 1),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,7716,31,to_i64,semantic-decision-priority,analyze_byte_count_loop,true,Operand::Const(c) if c.to_i64() == Some(0) => {}
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,7739,71,to_i64,semantic-decision-priority,analyze_byte_count_loop,true,"let lhs_one = matches!(lhs, Operand::Const(c) if c.to_i64() == Some(1));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,7740,71,to_i64,semantic-decision-priority,analyze_byte_count_loop,true,"let rhs_one = matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,7826,17,to_i64,semantic-decision-priority,analyze_byte_count_loop,true,if c.to_i64().is_some_and(|n| n < 0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,8173,76,to_i64,semantic-decision-priority,transform_byte_count_reduction_inner,true,"matches!(r.as_ref(), MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9209,32,to_i64,semantic-decision-priority,adler_load_base_offset,true,let off = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9223,32,to_i64,semantic-decision-priority,adler_load_base_offset,true,let off = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9582,41,to_i64,semantic-decision-priority,analyze_adler_loop,true,if c.to_i64() == Some(chain_len as i64) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9596,81,to_i64,semantic-decision-priority,analyze_adler_loop,true,"let lhs_k = matches!(lhs, Operand::Const(c) if c.to_i64() == Some(chain_len as i64));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9597,81,to_i64,semantic-decision-priority,analyze_adler_loop,true,"let rhs_k = matches!(rhs, Operand::Const(c) if c.to_i64() == Some(chain_len as i64));"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9626,79,to_i64,semantic-decision-priority,analyze_adler_loop,true,Operand::Const(c) if c.to_i64() == Some(1)
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9630,79,to_i64,semantic-decision-priority,analyze_adler_loop,true,Operand::Const(c) if c.to_i64() == Some(1)
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9716,65,to_i64,semantic-decision-priority,analyze_adler_loop,true,"matches!(rhs, Operand::Const(c) if c.to_i64() == Some(chain_len as i64))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9721,65,to_i64,semantic-decision-priority,analyze_adler_loop,true,"matches!(rhs, Operand::Const(c) if c.to_i64() == Some(neg_k))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,9742,47,to_i64,semantic-decision-priority,analyze_adler_loop,true,"Operand::Const(c) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,10695,16,to_i64,semantic-decision-priority,map_const_lane,true,let raw = c.to_i64()? as u64;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,11564,20,to_i64,semantic-decision-priority,try_wrap_lane_cmp_constant,true,let Some(v) = c.to_i64() else {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12090,18,to_i64,semantic-decision-priority,parse_byte_map_operand,true,let v = c.to_i64()?;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12222,16,to_i64,semantic-decision-priority,strength_reduce_mask_select,true,if zero.to_i64() == Some(0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12285,41,to_i64,semantic-decision-priority,geps_proven_identical,true,a_base == b_base && a_offset.to_i64() == b_offset.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12285,62,to_i64,semantic-decision-priority,geps_proven_identical,true,a_base == b_base && a_offset.to_i64() == b_offset.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12398,31,to_i64,semantic-decision-priority,affine_iv_offset,true,"const_bytes: c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12407,31,to_i64,semantic-decision-priority,affine_iv_offset,true,"const_bytes: c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12417,39,to_i64,semantic-decision-priority,affine_iv_offset,true,"Operand::Const(c) => c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12427,35,to_i64,semantic-decision-priority,affine_iv_offset,true,"const_bytes: c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12442,65,to_i64,semantic-decision-priority,affine_iv_offset,true,"(Operand::Value(v), Operand::Const(c)) => (*v, c.to_i64()?),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12443,65,to_i64,semantic-decision-priority,affine_iv_offset,true,"(Operand::Const(c), Operand::Value(v)) => (*v, c.to_i64()?),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12493,27,to_i64,semantic-decision-priority,affine_operand,true,"const_bytes: c.to_i64()?,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12568,43,to_i64,semantic-decision-priority,analyze_stencil_pattern,true,if let Some(k) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12575,43,to_i64,semantic-decision-priority,analyze_stencil_pattern,true,if let Some(k) = c.to_i64() {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12660,41,to_i64,semantic-decision-priority,analyze_stencil_pattern,true,iv_start = c.to_i64();
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12674,56,to_i64,semantic-decision-priority,analyze_stencil_pattern,true,"&& matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12869,21,to_i64,semantic-decision-priority,analyze_stencil_pattern,true,let trip = c.to_i64()? - cmp_k - iv_start;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,12952,21,to_i64,semantic-decision-priority,transform_stencil_vector,true,let trip = c.to_i64().unwrap_or(0) - pattern.cmp_k - pattern.iv_start;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,13006,22,to_i64,semantic-decision-priority,transform_stencil_vector,true,let n = c.to_i64().unwrap_or(0) - pattern.cmp_k - pattern.iv_start;
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,13450,54,to_i64,semantic-decision-priority,broadcast,true,"Operand::Const(c) => u32::MAX as u64 + (c.to_i64().unwrap_or(0) as u64),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,14266,25,to_i64,semantic-decision-priority,offset_is_canonical_unit_stride,true,return c.to_i64() == Some(elem_size as i64)
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,14275,25,to_i64,semantic-decision-priority,offset_is_canonical_unit_stride,true,return c.to_i64() == Some(elem_size.trailing_zeros() as i64)
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,14615,31,to_i64,semantic-decision-priority,strict_i32_operand_is_clonable,true,"Operand::Const(c) => c.to_i64().is_some(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,15010,54,to_i64,semantic-decision-priority,analyze_strict_computed_recip_reduction,true,} if *dest == iv_latch && *lhs == iv && c.to_i64() == Some(1) => {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,15451,31,to_i64,semantic-decision-priority,offset_is_index_times,true,"} => pow2 && c.to_i64() == Some(log2 as i64),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,15459,77,to_i64,semantic-decision-priority,offset_is_index_times,true,"(Operand::Const(c), _) | (_, Operand::Const(c)) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,15534,41,to_i64,semantic-decision-priority,find_reduction_byte_iv,true,if c.to_i64() == Some(log2 as i64) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,15547,41,to_i64,semantic-decision-priority,find_reduction_byte_iv,true,.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,15550,41,to_i64,semantic-decision-priority,find_reduction_byte_iv,true,.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,18069,20,to_i64,semantic-decision-priority,const_trip_covers_exactly,true,let Some(n) = k.to_i64() else {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,18239,64,to_i64,semantic-decision-priority,insert_reduction_remainder_loop,true,"if !matches!(op, Operand::Const(k) if k.to_i64() == Some(0)) {"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,18401,38,to_i64,semantic-decision-priority,insert_reduction_remainder_loop,true,c = k.to_i64().unwrap_or(0);
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,19583,45,to_i64,semantic-decision-priority,transform_reduction_avx2,true,if c.to_i64() == Some(4) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,20847,45,to_i64,semantic-decision-priority,transform_reduction_sse2,true,if c.to_i64() == Some(4) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,21736,51,to_i64,semantic-decision-priority,const_of,true,"MapExpr::Invariant(Operand::Const(c)) => c.to_i64(),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,21843,27,to_i64,semantic-decision-priority,transform_map_vector,true,if let Some(n) = c.to_i64().filter(|n| *n > 0) {
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,21853,13,to_i64,semantic-decision-priority,transform_map_vector,true,if c.to_i64().is_some_and(|n| n <= packed_width as i64))
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,22501,17,to_i64,semantic-decision-priority,transform_map_vector,true,.to_i64()
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,23890,32,to_i64,semantic-decision-priority,load_address,true,"Some((*base, offset.to_i64()?))"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,24054,21,to_i64,semantic-decision-priority,vectorize_const_trip_map_loops,true,if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,25457,59,to_i64,semantic-decision-priority,eval_lane,true,"MapExpr::Invariant(Operand::Const(c)) => c.to_i64().unwrap_or(0) as u64,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,25931,60,to_i64,semantic-decision-priority,value,true,"MapExpr::Invariant(Operand::Const(c)) => (c.to_i64().unwrap() as u64) & mask,"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,26120,58,to_i64,semantic-decision-priority,eval_packed,true,"MapExpr::Invariant(Operand::Const(c)) => sx(c.to_i64().unwrap()),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/vectorize.rs,26193,58,to_i64,semantic-decision-priority,eval_mirror,true,"MapExpr::Invariant(Operand::Const(c)) => sx(c.to_i64().unwrap()),"
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/web_congruence.rs,337,32,to_i64,semantic-decision-priority,merge_congruent_recurrence_webs,false,let Some(k) = k.to_i64() else { continue };
+81667ca4fab3bae877308885af059cb86aa44119,src/passes/web_congruence.rs,347,32,to_i64,semantic-decision-priority,merge_congruent_recurrence_webs,false,let Some(k) = k.to_i64() else { continue };

@@ -1,0 +1,27 @@
+;;; i686-vbroadcastf32x2-register-and-compressed-disp8
+.text
+vbroadcastf32x2 %xmm7, %ymm6
+vbroadcastf32x2 %xmm1, %zmm2{%k3}{z}
+vbroadcastf32x2 (%eax), %ymm6{%k7}{z}
+vbroadcastf32x2 1016(%eax), %zmm6
+vbroadcastf32x2 1016(%eax), %ymm6{%k7}
+
+;;; i686-vbroadcastf32x2-reject-xmm-destination reject
+.text
+vbroadcastf32x2 %xmm1, %xmm2
+
+;;; i686-vbroadcastf32x2-reject-wide-source-register reject
+.text
+vbroadcastf32x2 %ymm1, %zmm2
+
+;;; i686-vbroadcastf32x2-reject-decorator-broadcast reject
+.text
+vbroadcastf32x2 (%eax){1to8}, %zmm2
+
+;;; i686-vbroadcastf32x2-reject-source-mask reject
+.text
+vbroadcastf32x2 %xmm1{%k2}, %zmm2
+
+;;; i686-vbroadcastf32x2-reject-forced-vex reject
+.text
+{vex} vbroadcastf32x2 %xmm1, %zmm2

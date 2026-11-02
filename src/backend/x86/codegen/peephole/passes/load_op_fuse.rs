@@ -1,0 +1,4663 @@
+//! Load→ALU memory-operand fusion, symbol-LEA CSE and immediate narrowing.
+//!
+//! Three x86-64 shapes that GCC 16 / Clang 23 / ICX all produce and LCCC did
+//! not (measured on `tests/benchmark/programs/gzip_crc32.c`: 12-insn inner
+//! CRC loop vs GCC's 8; `zlib_ng_adler32`, `hash_table`, `sqlite_varint` show
+//! the same load→scratch→ALU relay everywhere):
+//!
+//! ## 1. Generic load→ALU fusion (`fuse_load_into_alu`)
+//!
+//! ```text
+//!     movl  (%r12,%rsi,4), %r9d        xorl  (%r12,%rsi,4), %ebp
+//!     xorl  %r9d, %ebp            ->
+//! ```
+//!
+//! [`super::memory_fold`] only folds *stack-slot* loads whose scratch is
+//! `%rax/%rcx/%rdx`; this pass folds every other addressing mode (SIB,
+//! RIP-relative, base+disp, including `disp(%rbp)` where `%rbp` is an
+//! allocated GPR, see [`rbp_pointer_load`]) into ANY GP destination when the
+//! loaded register is provably dead afterwards ([`FileLiveness`]). Plain
+//! stack-slot reloads are left to store forwarding.  Supported consumers:
+//! `add/sub/and/or/xor/cmp/test/imul` with the load's exact width.
+//!
+//! The *copy-bridged* variant handles the loop-carried-phi relay the register
+//! allocator emits for `acc = mem OP x` recurrences (gzip CRC, adler, hashes):
+//!
+//! ```text
+//!     movl  (%r12,%rsi,4), %r9d        movl  %edi, %ebp
+//!     ...                              xorl  (%r12,%rsi,4), %ebp
+//!     movq  %r9, %rbp             ->
+//!     xorl  %edi, %ebp
+//! ```
+//!
+//! which is legal for commutative consumers (`B = T op C == C op T`).  The
+//! later `acc_roundtrip`/`copy_shift_back` passes then collapse the remaining
+//! copy into GCC's `shrl $8,%ebp; xorl mem,%ebp` shape.
+//!
+//! ### Soundness argument
+//!
+//! Every line strictly between the load and its consumer must be a plain
+//! `Other`/`Cmp`/`SetCC` instruction that
+//!
+//! * does not mention the loaded register `T` at all (`reg_refs`),
+//! * may-writes none of `T`, the registers named in the memory operand, the
+//!   copy destination `B` and commutative partner `C` ([`may_write_families`]
+//!   is a MAY model: unknown mnemonics write everything),
+//! * performs **no memory access of any kind** (stores would change the loaded
+//!   value; even loads are excluded so a `volatile` access never moves past
+//!   another one — the fused instruction performs exactly one access of the
+//!   original width at the original address, so volatile/MMIO semantics are
+//!   unchanged),
+//! * is not `pinned`, and is not a control-flow, push/pop, call or inline-asm
+//!   line (block boundaries end the window; a window never crosses a label).
+//!
+//! The consumer writes the flags identically with either operand form, the
+//! deleted load never wrote flags, and no width changes: the fused `OPl`
+//! reads a 32-bit `MEM` exactly where `movl MEM` did.
+//!
+//! ## 2. Symbol-LEA CSE for every GPR (`eliminate_redundant_symbol_lea`)
+//!
+//! `local_patterns::eliminate_redundant_leaq` is `%rax`-only.  Unrolled loops
+//! and inlined table lookups re-materialise `leaq table(%rip), %rcx` before
+//! every access (nine times in gzip's CRC self-check).  A RIP-relative source
+//! names no data register, so the only way the cached value can go stale is a
+//! write to the destination family or a control-flow boundary — both tracked
+//! with the MAY-write model.
+//!
+//! ## 3. Immediate narrowing (`narrow_wide_immediates`, BACKLOG PF-16)
+//!
+//! `movabsq $imm, %r` with `0 <= imm <= 0xFFFF_FFFF` and `movq $imm, %r` with
+//! `0 <= imm <= 0x7FFF_FFFF` both produce the same 64-bit value as
+//! `movl $imm, %r32` (zero-extension).  The 32-bit form is 5 bytes instead of
+//! 10 / 7, has no REX.W and is eligible for the renamer's mov elimination.
+//! Negative immediates need the sign-extending forms and are left alone.
+//!
+//! Every pass is individually switchable through `CCC_PEEPHOLE_SKIP=
+//! load_alu_fuse,load_lea_inplace,recurrence_inplace,copy_dying_operand,symbol_lea_cse,narrow_imm`
+//! for bisection.
+
+use super::super::types::*;
+use super::liveness::FileLiveness;
+use super::relay_and_lea::{is_stable_symbol_expr, plain_gp_operand, split_two_operands};
+
+const ALL_GPR: u16 = 0xFFFF;
+const RAX: u16 = 1 << 0;
+const RCX: u16 = 1 << 1;
+const RDX: u16 = 1 << 2;
+const RBX: u16 = 1 << 3;
+const RSP: u16 = 1 << 4;
+const RBP: u16 = 1 << 5;
+const R11: u16 = 1 << 11;
+/// `%rcx/%rsi/%rdi` — implicitly updated by every string primitive.
+const ALL_STRING_REGS: u16 = (1 << 1) | (1 << 6) | (1 << 7);
+
+/// Longest straight-line gap (non-NOP, non-directive lines) between a load
+/// and the consumer it is fused into.  Windows are short by construction: the
+/// allocator emits the relay right next to the use; a longer window only adds
+/// scan cost and register-pressure risk (the memory operand extends the
+/// address registers' live ranges to the consumer).
+const MAX_GAP: usize = 12;
+
+// ── MAY-write model ──────────────────────────────────────────────────────────
+
+/// Bitmask of GP families `t` MAY write.  This is the dual of the liveness
+/// model in `liveness.rs` (which under-approximates writes because a missed
+/// write only keeps a value live longer): a cache-invalidation query needs an
+/// OVER-approximation, so anything unrecognised writes everything.
+pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
+    match info.kind {
+        LineKind::Nop | LineKind::Empty | LineKind::Directive | LineKind::Label => return 0,
+        // Scalar-FP slot moves write no GP family (XMM stores write only
+        // memory; XMM loads write only an XMM register).
+        LineKind::StoreRbp { .. } | LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. } => {
+            return 0;
+        }
+        // `Cmp` also covers `cmpxchg*` (writes %rax and its destination), so
+        // it must go through the mnemonic analysis below.
+        LineKind::Cmp => {}
+        LineKind::LoadRbp { reg, .. } | LineKind::SetCC { reg } => {
+            return if reg <= REG_GP_MAX { 1u16 << reg } else { 0 };
+        }
+        LineKind::Push { .. } => return RSP,
+        LineKind::Pop { reg } => {
+            return RSP | if reg <= REG_GP_MAX { 1u16 << reg } else { 0 };
+        }
+        LineKind::Call | LineKind::JmpIndirect | LineKind::InlineAsm => return ALL_GPR,
+        LineKind::Jmp | LineKind::CondJmp | LineKind::Ret => return 0,
+        LineKind::SelfMove => return 0,
+        LineKind::Other { .. } => {}
+    }
+    if info.pinned {
+        return ALL_GPR;
+    }
+    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    let rest = t[mnemonic.len()..].trim();
+
+    // Flag-only / no-write instructions.
+    if mnemonic.starts_with("cmp")
+        && !mnemonic.starts_with("cmpxchg")
+        && !matches!(mnemonic, "cmpsb" | "cmpsw" | "cmpsl" | "cmpsq")
+        || mnemonic.starts_with("test")
+        || mnemonic.starts_with("ucomis")
+        || mnemonic.starts_with("comis")
+        || mnemonic.starts_with("vucomis")
+        || mnemonic.starts_with("vcomis")
+        || mnemonic.starts_with("prefetch")
+        || mnemonic.starts_with("nop")
+        || mnemonic.ends_with("fence")
+        || matches!(
+            mnemonic,
+            "vzeroupper"
+                | "vzeroall"
+                | "pause"
+                | "ud2"
+                | "hlt"
+                | "int3"
+                | "endbr64"
+                | "endbr32"
+                | "cld"
+                | "std"
+                | "clc"
+                | "stc"
+                | "cmc"
+                | "btq"
+                | "btl"
+                | "btw"
+        )
+    {
+        return 0;
+    }
+    // String compares name only vector inputs: I forms return an index in
+    // ECX, M forms write XMM0. Neither writes its final explicit operand.
+    match mnemonic.strip_prefix('v').unwrap_or(mnemonic) {
+        "pcmpistri" | "pcmpestri" => return RCX,
+        "pcmpistrm" | "pcmpestrm" | "ptest" | "testpd" | "testps" => return 0,
+        _ => {}
+    }
+    // Multi-destination / opaque: every mentioned GP family plus the
+    // implicit accumulator pair (cmpxchg16b names no register at all).
+    // These must run BEFORE the implicit oracle: `cmpxchg` has an implicit
+    // accumulator AND a conditionally-written explicit destination, so the
+    // implicit write set alone would under-approximate. (With the central
+    // union, `info.reg_refs` here already includes the implicit bits too.)
+    if mnemonic.starts_with("xchg")
+        || mnemonic.starts_with("cmpxchg")
+        || mnemonic.starts_with("xadd")
+        || mnemonic.starts_with("lock")
+        || mnemonic.starts_with("mulx")
+        || mnemonic.starts_with("rep")
+    {
+        return info.reg_refs | RAX | RDX | RCX | ALL_STRING_REGS;
+    }
+    // Explicit implicit-operand instructions: the central oracle in
+    // `types.rs` is the single source of truth for architectural implicit
+    // writes (this used to be a private duplicate that drifted — it knew
+    // nothing of `cmpxchg8b`, conflated rdtsc with rdtscp's %rcx write, and
+    // taxed every SSE `mulsd`/`divsd` with the integer accumulator pair,
+    // blocking load fusions in FP code).  Instructions reaching this arm
+    // either have no GP destination operand (`cqto`, `syscall`, `leave`,
+    // the string primitives) or name only read operands (`divq %r11`), so
+    // the implicit write set alone is the complete answer.
+    let implicit = implicit_write_refs(t.as_bytes());
+    if implicit != 0 {
+        return implicit;
+    }
+    // String instructions without operands (`movsb`, `stosq`, ...).
+    if !rest.contains('%') && !rest.contains('$') {
+        return ALL_GPR;
+    }
+    // Only recognized explicit-destination families may use the last-operand
+    // rule. Applying that rule to an unknown mnemonic silently turns this MAY
+    // query into a MUST-like under-approximation of hidden outputs.
+    let base = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+    let integer = base
+        .strip_suffix('q')
+        .or_else(|| base.strip_suffix('l'))
+        .or_else(|| base.strip_suffix('w'))
+        .or_else(|| base.strip_suffix('b'))
+        .unwrap_or(base);
+    // Apart from the string outputs handled above, the admitted vector
+    // families have no hidden GP outputs. Reuse their positive ISA admission
+    // rather than keeping another incomplete SSE/FMA spelling table here.
+    let explicit_destination = super::fp_liveness::known_explicit_vector_inputs(mnemonic, rest)
+        || base.starts_with("mov")
+        || base.starts_with("cmov")
+        || base.starts_with("set")
+        || base.starts_with("lea")
+        || matches!(
+            integer,
+            "add"
+                | "sub"
+                | "adc"
+                | "sbb"
+                | "and"
+                | "or"
+                | "xor"
+                | "neg"
+                | "not"
+                | "inc"
+                | "dec"
+                | "sal"
+                | "sar"
+                | "shl"
+                | "shr"
+                | "rol"
+                | "ror"
+                | "rcl"
+                | "rcr"
+                | "bswap"
+                | "popcnt"
+                | "lzcnt"
+                | "tzcnt"
+                | "bzhi"
+                | "blsi"
+                | "blsmsk"
+                | "blsr"
+                | "bextr"
+                | "pdep"
+                | "pext"
+                | "andn"
+                | "shlx"
+                | "shrx"
+                | "sarx"
+                | "rorx"
+                | "bts"
+                | "btr"
+                | "btc"
+                | "crc32"
+                | "imul"
+                | "rdrand"
+                | "rdseed"
+        );
+    if !explicit_destination {
+        return ALL_GPR;
+    }
+    // AT&T: the destination is the last top-level operand (single-operand
+    // forms — neg/not/inc/dec/setcc/bswap/shift-by-1/rdrand — write their
+    // only operand).  A memory destination writes no GP register.
+    let dest = match split_two_operands(rest) {
+        Some((_, d)) => d,
+        None => rest,
+    };
+    match plain_gp_operand(dest) {
+        Some(fam) => 1u16 << fam,
+        None => 0,
+    }
+}
+
+/// GP families named inside a memory operand such as `8(%rax,%rcx,4)` or
+/// `sym(%rip)` (`%rip` is not a GP family and is ignored).
+fn memory_operand_families(mem: &str) -> u16 {
+    let mut fams = 0u16;
+    let mut rest = mem;
+    while let Some(pct) = rest.find('%') {
+        let tok = &rest[pct..];
+        let end = tok[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|e| e + 1)
+            .unwrap_or(tok.len());
+        let fam = register_family_fast(&tok[..end]);
+        if fam != REG_NONE && fam <= REG_GP_MAX {
+            fams |= 1u16 << fam;
+        }
+        rest = &rest[pct + 1..];
+    }
+    fams
+}
+
+/// A memory source operand this pass is willing to carry into an ALU op:
+/// either a parenthesised address or a validated segment-qualified symbolic
+/// displacement, with no immediate/register form or `*` indirection marker.
+///
+/// The override is an address-space qualifier, not part of the operand shape:
+/// `movq %gs:8(%rsi), %rax` is the per-CPU spelling of `movq 8(%rsi), %rax`
+/// and folds the same way — the reuse sites re-emit the operand verbatim, so
+/// the prefix travels with it.  Validation is exactly the shared
+/// [`relay_and_lea::segment_prefix_len`], which refuses `%gss:…` (not one of
+/// the six segment registers) and `*%gs:…` (indirection marker), and leaves
+/// every other colon — a symbol/instruction-label form — refused as before.
+///
+/// `CCC_NO_SEG_OPERAND_FUSE=1` restores the pre-fusion behaviour (every
+/// segment override refused) so an A/B instruction-count or Callgrind run can
+/// attribute a delta to this rule alone.
+pub(super) fn is_plain_memory_operand(op: &str) -> bool {
+    if std::env::var_os("CCC_NO_SEG_OPERAND_FUSE").is_some() {
+        return op.contains('(')
+            && op.ends_with(')')
+            && !op.starts_with('$')
+            && !op.starts_with('%')
+            && !op.starts_with('*')
+            && !op.contains(':');
+    }
+    let (segment, body) = super::relay_and_lea::strip_segment_prefix(op);
+    let indexed = body.contains('(')
+        && body.ends_with(')')
+        && !body.starts_with('$')
+        && !body.starts_with('%')
+        && !body.starts_with('*')
+        && !body.contains(':');
+    // Local-Exec TLS is a segment-qualified symbolic displacement with no
+    // parenthesised base: `%fs:sym@TPOFF[+addend]`. Accept exactly the same
+    // validated symbol grammar used by address composition, and only behind
+    // a validated segment prefix; this does not broaden the pass to absolute
+    // DS-relative symbol operands.
+    indexed || (!segment.is_empty() && is_stable_symbol_expr(body))
+}
+
+fn is_reg_or_imm(op: &str) -> bool {
+    op.starts_with('%') || op.starts_with('$')
+}
+
+/// True when `t` (an `Other`/`Cmp`/`SetCC` line) touches memory in any way.
+/// `lea` computes an address without accessing it and is allowed.
+fn accesses_memory(t: &str, info: &LineInfo) -> bool {
+    if matches!(
+        info.kind,
+        LineKind::LoadRbp { .. } | LineKind::StoreRbp { .. }
+    ) {
+        return true;
+    }
+    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    if mnemonic.starts_with("lea") {
+        return false;
+    }
+    if info.has_indirect_mem || t.contains('(') || t.contains(':') {
+        return true;
+    }
+    // Absolute-symbol operands (`movl counter, %eax`) carry neither `%` nor
+    // `$`; any such operand is a memory access.
+    let rest = t[mnemonic.len()..].trim();
+    if rest.is_empty() {
+        return false;
+    }
+    match split_two_operands(rest) {
+        Some((a, b)) => !is_reg_or_imm(a) || !is_reg_or_imm(b),
+        None => !is_reg_or_imm(rest),
+    }
+}
+
+/// Kinds that may sit between a load and its consumer.
+fn is_window_kind(kind: LineKind) -> bool {
+    matches!(
+        kind,
+        LineKind::Other { .. } | LineKind::Cmp | LineKind::SetCC { .. }
+    )
+}
+
+/// Parse `mov{l,q} MEM, %reg` into `(is_q, mem, family)`.
+fn parse_memory_load(t: &str) -> Option<(bool, &str, RegId)> {
+    // (load_q, rest): load_q is the FOLDABLE width — the memory operand's
+    // width a flag/alu consumer may re-read in place of the register.
+    // `movslq mem, %r64` loads a 32-bit memory sign-extended into a 64-bit
+    // register: only the LOW DWORD is the loaded value, so load_q stays
+    // false (an l-suffixed consumer) and a q-suffixed consumer mismatches
+    // and declines — reading 8 bytes of memory would not reproduce the
+    // sign-extended 64-bit compare.
+    let (is_q, dest_is_64, rest) = if let Some(r) = t.strip_prefix("movl ") {
+        (false, false, r)
+    } else if let Some(r) = t.strip_prefix("movq ") {
+        (true, true, r)
+    } else if let Some(r) = t.strip_prefix("movslq ") {
+        (false, true, r)
+    } else {
+        return None;
+    };
+    let (src, dst) = split_two_operands(rest)?;
+    if !is_plain_memory_operand(src) {
+        return None;
+    }
+    let fam = plain_gp_operand(dst)?;
+    // The destination must be the exact register spelling of its bank
+    // (movq/movslq → %r64, movl → %r32); anything else is not the shape
+    // the allocator emits.
+    let expect = if dest_is_64 {
+        REG_NAMES[0][fam as usize]
+    } else {
+        REG_NAMES[1][fam as usize]
+    };
+    if dst != expect {
+        return None;
+    }
+    Some((is_q, src, fam))
+}
+
+/// Consumers whose first (source) operand may be a memory operand.
+const FUSIBLE_OPS: &[&str] = &["add", "sub", "and", "or", "xor", "cmp", "test", "imul"];
+/// Subset for which `B = T op C` equals `B = C op T`.
+const COMMUTATIVE_OPS: &[&str] = &["add", "and", "or", "xor", "imul"];
+
+/// Reject unsupported suffixes without slicing through a UTF-8 character.
+/// The accepted ASCII instruction set is unchanged.
+#[inline]
+fn split_lq_mnemonic(mnemonic: &str) -> Option<(&str, bool)> {
+    if let Some(op) = mnemonic.strip_suffix('q') {
+        Some((op, true))
+    } else {
+        mnemonic.strip_suffix('l').map(|op| (op, false))
+    }
+}
+
+/// Parse `OP{l,q} %src, %dst` where both are plain GP registers of the
+/// suffix width.  Returns `(op, is_q, src_fam, dst_fam)`.
+fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
+    let op = *FUSIBLE_OPS.iter().find(|o| **o == op)?;
+    let rest = t[mnemonic.len()..].trim();
+    let (a, b) = split_two_operands(rest)?;
+    let src = plain_gp_operand(a)?;
+    let dst = plain_gp_operand(b)?;
+    let width = if is_q { 0 } else { 1 };
+    if a != REG_NAMES[width][src as usize] || b != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    Some((op, is_q, src, dst))
+}
+
+/// Parse `cmp{l,q} $imm, %dst` — the immediate-source flag consumer whose
+/// DESTINATION slot holds the loaded scratch (the constant-key pointer
+/// walk: `movl 8(%rdx), %r10d; cmpl $25, %r10d`). The immediate is kept
+/// verbatim (decimal, hex and negative spellings all re-emit as written).
+/// Only the two non-writing flag producers are accepted — same discipline
+/// as the register mirror form.
+fn parse_imm_reg_flag(t: &str) -> Option<(&'static str, bool, &str, RegId)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
+    if op != "cmp" && op != "test" {
+        return None;
+    }
+    // Reborrow from the static spelling (the split borrows `t`).
+    let op: &'static str = if op == "cmp" { "cmp" } else { "test" };
+    let rest = t[mnemonic.len()..].trim();
+    let (a, b) = split_two_operands(rest)?;
+    if !a.starts_with('$') {
+        return None;
+    }
+    // Backend-emitted immediates: optional minus, then digits/hex; no
+    // spaces or expression syntax (those never fold).
+    let digits = &a[1..];
+    if digits.is_empty()
+        || !digits
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() || c == b'-' || c == b'x')
+    {
+        return None;
+    }
+    let dst = plain_gp_operand(b)?;
+    let width = if is_q { 0 } else { 1 };
+    if b != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    Some((op, is_q, a, dst))
+}
+
+/// Parse `mov{l,q} %src, %dst` (plain GP register copy).  Returns
+/// `(is_q, src_fam, dst_fam)`.
+fn parse_reg_copy(t: &str) -> Option<(bool, RegId, RegId)> {
+    let (is_q, rest) = if let Some(r) = t.strip_prefix("movl ") {
+        (false, r)
+    } else if let Some(r) = t.strip_prefix("movq ") {
+        (true, r)
+    } else {
+        return None;
+    };
+    let (a, b) = split_two_operands(rest)?;
+    let src = plain_gp_operand(a)?;
+    let dst = plain_gp_operand(b)?;
+    let width = if is_q { 0 } else { 1 };
+    if a != REG_NAMES[width][src as usize] || b != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    Some((is_q, src, dst))
+}
+
+/// Parse `andn{q,l} %src2, %src1, %dst` (all plain GP registers of the
+/// suffix width) and, when the FIRST source is the loaded scratch `t_fam`,
+/// produce the folded `andn{q,l} MEM, %src1, %dst` line.
+///
+/// AT&T operand order for the three-operand BMI form is
+/// `andn src2, src1, dst` = Intel `andn dst, src1, src2` (`dst = ~src2 &
+/// src1`), and Intel's `src2` is the r/m-encodable slot — so exactly the
+/// AT&T-first operand may become the folded memory operand.  The loaded
+/// scratch must be dead after the `andn` (caller-proved) and every other
+/// slot stays a register.
+fn try_fold_bmi_andn(
+    cons: &str,
+    load_q: bool,
+    t_fam: RegId,
+    mem: &str,
+    scratch_dead: bool,
+) -> Option<String> {
+    if !scratch_dead {
+        return None;
+    }
+    let suffix = if load_q { "q" } else { "l" };
+    let rest = cons
+        .strip_prefix("andn")
+        .and_then(|r| r.strip_prefix(suffix))?;
+    let rest = rest.trim_start();
+    // Three operands: src2, src1, dst — split on the first two commas.
+    let (a, tail) = rest.split_once(',')?;
+    let (b, c) = tail.split_once(',')?;
+    let a = a.trim();
+    let b = b.trim();
+    let c = c.trim().trim_end();
+    let width = if load_q { 0 } else { 1 };
+    let s2 = plain_gp_operand(a)?;
+    let s1 = plain_gp_operand(b)?;
+    let dst = plain_gp_operand(c)?;
+    // Exact-width spellings only (the shape the backend emits).
+    if a != REG_NAMES[width][s2 as usize]
+        || b != REG_NAMES[width][s1 as usize]
+        || c != REG_NAMES[width][dst as usize]
+    {
+        return None;
+    }
+    if s2 != t_fam || s1 == t_fam || dst == t_fam {
+        return None;
+    }
+    Some(format!("    andn{suffix} {mem}, {}, {}", b, c))
+}
+
+/// Outcome of scanning the lines strictly between two indices.
+struct Window {
+    /// Union of MAY-written families.
+    written: u16,
+    /// Union of mentioned families.
+    mentioned: u16,
+}
+
+/// Scan `(from, to)` exclusive.  `None` when the window is not straight-line
+/// or touches memory.
+fn scan_window(store: &LineStore, infos: &[LineInfo], from: usize, to: usize) -> Option<Window> {
+    let mut w = Window {
+        written: 0,
+        mentioned: 0,
+    };
+    let mut gap = 0usize;
+    for k in from + 1..to {
+        let info = &infos[k];
+        if super::helpers::steps_over_line(info, info.trimmed(store.get(k))) {
+            continue;
+        }
+        if !is_window_kind(info.kind) || info.pinned {
+            return None;
+        }
+        let t = info.trimmed(store.get(k));
+        if accesses_memory(t, info) {
+            return None;
+        }
+        let wr = may_write_families(t, info);
+        if wr == ALL_GPR {
+            return None;
+        }
+        w.written |= wr;
+        w.mentioned |= info.reg_refs;
+        gap += 1;
+        if gap > MAX_GAP {
+            return None;
+        }
+    }
+    Some(w)
+}
+
+/// Index of the next line that is neither a NOP nor a benign directive, or
+/// `len`.  A data directive is code the text does not spell out, so it counts
+/// as an instruction here (see `steps_over_line`).
+pub(super) fn next_insn(store: &LineStore, infos: &[LineInfo], mut j: usize, len: usize) -> usize {
+    while j < len && super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
+        j += 1;
+    }
+    j
+}
+
+/// Try the adjacent commuted form `mov MEM, %T; ...; OP %S, %T` by writing the
+/// product into `%S` and safely renaming its live range from `%T`.
+fn try_fuse_commuted_adjacent_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    load_idx: usize,
+    consumer_idx: usize,
+    mem: &str,
+    load_q: bool,
+    op: &str,
+    op_q: bool,
+    scratch: RegId,
+    source: RegId,
+    dest: RegId,
+    _gap: usize,
+) -> Option<usize> {
+    if op_q != load_q
+        || dest != scratch
+        || source == scratch
+        || source == REG_RSP
+        || dest == REG_RSP
+        || !COMMUTATIVE_OPS.contains(&op)
+        || lv.live_after(consumer_idx, source) != Some(false)
+    {
+        return None;
+    }
+    let span_end = rename_product_range(store, infos, consumer_idx, dest, source, lv)?;
+    let suffix = if load_q { "q" } else { "l" };
+    let width = if load_q { 0 } else { 1 };
+    let new_line = format!(
+        "    {op}{suffix} {mem}, {}",
+        REG_NAMES[width][source as usize]
+    );
+    mark_nop(&mut infos[load_idx]);
+    replace_line(store, &mut infos[consumer_idx], consumer_idx, new_line);
+    lv.refresh_span(store, infos, load_idx, span_end);
+    Some(span_end)
+}
+
+/// Parse 3-operand BMI1 `andn{l,q} %src2, %src1, %dst` -> `(is_64bit, src2_rm_fam, src1_fam, dst_fam)`.
+fn parse_andn_reg_reg_reg(trimmed: &str) -> Option<(bool, RegId, RegId, RegId)> {
+    let (is_q, rest) = if let Some(r) = trimmed.strip_prefix("andnq ") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("andnl ") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let mut parts = rest.split(',');
+    let op1 = parts.next()?.trim();
+    let op2 = parts.next()?.trim();
+    let op3 = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None;
+    }
+    let r1 = plain_gp_operand(op1)?;
+    let r2 = plain_gp_operand(op2)?;
+    let r3 = plain_gp_operand(op3)?;
+    let width = if is_q { 0 } else { 1 };
+    if op1 != REG_NAMES[width][r1 as usize]
+        || op2 != REG_NAMES[width][r2 as usize]
+        || op3 != REG_NAMES[width][r3 as usize]
+    {
+        return None;
+    }
+    Some((is_q, r1, r2, r3))
+}
+
+/// Fuse `mov MEM1, %T; mov MEM2, %S; <unary %S>+; [mov %T, %D;] OP %S, %D`
+/// (or BMI1 `mov MEM1, %T; mov MEM2, %S; andn %T, %S, %D`) into a memory-operand
+/// ALU instruction when `%T` / `%S` die there.
+fn try_fuse_commuted_unary_load_pair(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    load_idx: usize,
+    k0: usize,
+    len: usize,
+    mem: &str,
+    load_q: bool,
+    t_fam: RegId,
+) -> Option<usize> {
+    if t_fam == REG_RSP
+        || super::relay_and_lea::segment_prefix_len(mem).is_some()
+        || memory_operand_families(mem) & (1u16 << t_fam) != 0
+    {
+        return None;
+    }
+    if k0 >= len || infos[k0].pinned || infos[k0].volatile_access || !is_window_kind(infos[k0].kind)
+    {
+        return None;
+    }
+    let k0_text = infos[k0].trimmed(store.get(k0)).to_string();
+    let (ld2_q, mem2, s_fam) = parse_memory_load(&k0_text)?;
+    if ld2_q != load_q
+        || s_fam == t_fam
+        || s_fam == REG_RSP
+        || super::relay_and_lea::segment_prefix_len(mem2).is_some()
+        || (!k0_text.starts_with("movq ") && !k0_text.starts_with("movl "))
+        || memory_operand_families(mem) & (1u16 << s_fam) != 0
+        || memory_operand_families(mem2) & ((1u16 << s_fam) | (1u16 << t_fam)) != 0
+    {
+        return None;
+    }
+    let width = if load_q { 0usize } else { 1usize };
+    let suffix = if load_q { "q" } else { "l" };
+    let mut unary_indices: Vec<(usize, String)> = Vec::new();
+    let mut k = next_insn(store, infos, k0 + 1, len);
+    while k < len && unary_indices.len() < MAX_GAP {
+        if infos[k].pinned || infos[k].volatile_access || !is_window_kind(infos[k].kind) {
+            return None;
+        }
+        let tk = infos[k].trimmed(store.get(k));
+        if let Some((u_q, u_dst, _, true)) = parse_inplace_op(tk) {
+            if u_q != load_q || u_dst != s_fam {
+                return None;
+            }
+            let u_mn = tk.split_whitespace().next()?;
+            unary_indices.push((k, u_mn.to_string()));
+            k = next_insn(store, infos, k + 1, len);
+            continue;
+        }
+        break;
+    }
+    if k >= len || infos[k].pinned || infos[k].volatile_access {
+        return None;
+    }
+    if unary_indices.is_empty() {
+        let cons_text = infos[k].trimmed(store.get(k)).to_string();
+        let (andn_q, rm_fam, vvvv_fam, dst_fam) = parse_andn_reg_reg_reg(&cons_text)?;
+        if andn_q != load_q
+            || rm_fam != t_fam
+            || vvvv_fam != s_fam
+            || dst_fam == REG_RSP
+            || (dst_fam != t_fam && lv.live_after(k, t_fam) != Some(false))
+        {
+            return None;
+        }
+        let mut trail_copy_idx: Option<usize> = None;
+        let mut out_fam = dst_fam;
+        let mut scan = next_insn(store, infos, k + 1, len);
+        let mut steps = 0usize;
+        let mut intervening_refs: u16 = 0;
+        while scan < len && steps < 2 {
+            if infos[scan].pinned
+                || infos[scan].volatile_access
+                || !is_window_kind(infos[scan].kind)
+            {
+                break;
+            }
+            let st = infos[scan].trimmed(store.get(scan));
+            if let Some((tc_q, tc_src, tc_dst)) = parse_reg_copy(st) {
+                if tc_q == load_q
+                    && tc_src == dst_fam
+                    && tc_dst != dst_fam
+                    && tc_dst != REG_RSP
+                    && (intervening_refs & (1u16 << tc_dst)) == 0
+                    && lv.live_after(scan, dst_fam) == Some(false)
+                {
+                    trail_copy_idx = Some(scan);
+                    out_fam = tc_dst;
+                }
+                break;
+            }
+            if infos[scan].reg_refs & (1u16 << dst_fam) != 0 {
+                break;
+            }
+            intervening_refs |= infos[scan].reg_refs;
+            scan = next_insn(store, infos, scan + 1, len);
+            steps += 1;
+        }
+        let s_reg = REG_NAMES[width][s_fam as usize];
+        let out_reg = REG_NAMES[width][out_fam as usize];
+        let cons_new = format!("    andn{suffix} {mem}, {s_reg}, {out_reg}");
+        mark_nop(&mut infos[load_idx]);
+        if let Some(ti) = trail_copy_idx {
+            mark_nop(&mut infos[ti]);
+        }
+        replace_line(store, &mut infos[k], k, cons_new);
+        let span_end = trail_copy_idx.unwrap_or(k);
+        lv.refresh_span(store, infos, load_idx, span_end);
+        return Some(span_end);
+    }
+    // Optional copy `mov{l,q} %T, %D` right before `OP %S, %D`.
+    let mut opt_copy_idx: Option<usize> = None;
+    let mut d_fam = t_fam;
+    if let Some((cp_q, cp_src, cp_dst)) = parse_reg_copy(infos[k].trimmed(store.get(k))) {
+        if cp_q == load_q
+            && cp_src == t_fam
+            && cp_dst != t_fam
+            && cp_dst != s_fam
+            && cp_dst != REG_RSP
+            && memory_operand_families(mem) & (1u16 << cp_dst) == 0
+            && memory_operand_families(mem2) & (1u16 << cp_dst) == 0
+            && lv.live_after(k, t_fam) == Some(false)
+        {
+            opt_copy_idx = Some(k);
+            d_fam = cp_dst;
+            k = next_insn(store, infos, k + 1, len);
+            if k >= len || infos[k].pinned || infos[k].volatile_access {
+                return None;
+            }
+        }
+    }
+    let cons_text = infos[k].trimmed(store.get(k)).to_string();
+    let (op, op_q, src, dst) = parse_reg_reg_alu(&cons_text)?;
+    if op_q != load_q || src != s_fam || dst != d_fam || !COMMUTATIVE_OPS.contains(&op) {
+        return None;
+    }
+    // Check for an optional trailing copy `mov{l,q} %D, %R` within a couple of
+    // non-interfering instructions after `OP %S, %D` where `%D` dies at the copy
+    // (e.g. `andq %r10, %rbx; leaq 1(%r11), %r12; movq %rbx, %r10`).
+    let mut trail_copy_idx: Option<usize> = None;
+    let mut out_fam = d_fam;
+    let mut scan = next_insn(store, infos, k + 1, len);
+    let mut steps = 0usize;
+    let mut intervening_refs: u16 = 0;
+    while scan < len && steps < 2 {
+        if infos[scan].pinned || infos[scan].volatile_access || !is_window_kind(infos[scan].kind) {
+            break;
+        }
+        let st = infos[scan].trimmed(store.get(scan));
+        if let Some((tc_q, tc_src, tc_dst)) = parse_reg_copy(st) {
+            if tc_q == load_q
+                && tc_src == d_fam
+                && tc_dst != d_fam
+                && tc_dst != REG_RSP
+                && (intervening_refs & (1u16 << tc_dst)) == 0
+                && memory_operand_families(mem) & (1u16 << tc_dst) == 0
+                && memory_operand_families(mem2) & (1u16 << tc_dst) == 0
+                && lv.live_after(scan, d_fam) == Some(false)
+                && (tc_dst == s_fam || lv.live_after(k, s_fam) == Some(false))
+            {
+                trail_copy_idx = Some(scan);
+                out_fam = tc_dst;
+            }
+            break;
+        }
+        if infos[scan].reg_refs & ((1u16 << d_fam) | (1u16 << s_fam)) != 0 {
+            break;
+        }
+        intervening_refs |= infos[scan].reg_refs;
+        scan = next_insn(store, infos, scan + 1, len);
+        steps += 1;
+    }
+    if trail_copy_idx.is_none() && lv.live_after(k, s_fam) != Some(false) {
+        return None;
+    }
+    let out_reg = REG_NAMES[width][out_fam as usize];
+    let k0_new = format!("    mov{suffix} {mem2}, {out_reg}");
+    let cons_new = format!("    {op}{suffix} {mem}, {out_reg}");
+    mark_nop(&mut infos[load_idx]);
+    if let Some(ci) = opt_copy_idx {
+        mark_nop(&mut infos[ci]);
+    }
+    if let Some(ti) = trail_copy_idx {
+        mark_nop(&mut infos[ti]);
+    }
+    replace_line(store, &mut infos[k0], k0, k0_new);
+    for (uk, u_mn) in unary_indices {
+        replace_line(store, &mut infos[uk], uk, format!("    {u_mn} {out_reg}"));
+    }
+    replace_line(store, &mut infos[k], k, cons_new);
+    let span_end = trail_copy_idx.unwrap_or(k);
+    lv.refresh_span(store, infos, load_idx, span_end);
+    Some(span_end)
+}
+
+/// A `LoadRbp` line that is really a pointer dereference: the line classifier
+/// has no function context and files every `disp(%rbp)` load as a stack-slot
+/// load, but in a function that never makes `%rbp` its frame pointer, `%rbp`
+/// is an allocated GPR and `movq (%rbp), %rsi` is the same load this pass
+/// folds through any other base register (`zstd_double_fast`'s match check
+/// lost its `cmpq (%rbp), %rdi` fold the moment the allocator put the input
+/// cursor in `%rbp` instead of `%r15`). True stack slots (`disp(%rsp)`, or
+/// `disp(%rbp)` under a frame pointer) stay excluded: store forwarding turns
+/// their reloads into register copies, which a memory operand would block.
+/// The fold's soundness does not depend on this distinction -- the window
+/// admits no memory access of any kind -- only its profitability does.
+fn rbp_pointer_load(
+    store: &LineStore,
+    infos: &[LineInfo],
+    lv: &FileLiveness,
+    i: usize,
+    frame_cache: &mut Option<(usize, bool)>,
+) -> bool {
+    let t = infos[i].trimmed(store.get(i));
+    let rbp_base = t
+        .split_once(',')
+        .is_some_and(|(src, _)| src.trim_end().ends_with("(%rbp)"));
+    if !rbp_base {
+        return false;
+    }
+    let Some((start, end)) = lv.recorded_function(store, infos, i) else {
+        return false;
+    };
+    let is_frame = match *frame_cache {
+        Some((cached, frame)) if cached == start => frame,
+        _ => {
+            let frame = rbp_is_frame_pointer(store, infos, start, end);
+            *frame_cache = Some((start, frame));
+            frame
+        }
+    };
+    !is_frame
+}
+
+/// `%rbp` is (or may be) the frame pointer of the function `[start, end)`:
+/// a frame setup or restore, `leave`/`enter`, a CFA rooted at `%rbp`
+/// (x86-64 DWARF register 6), or an opaque line -- pinned or inline
+/// assembly -- naming `%rbp`, whose contract is unknowable. Callee-save
+/// `pushq/popq %rbp` of an `%rsp`-relative frame is not frame evidence.
+pub(super) fn rbp_is_frame_pointer(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+) -> bool {
+    (start..end.min(infos.len())).any(|n| {
+        if infos[n].is_nop() {
+            return false;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        let names_rbp = t.contains("%rbp") || t.contains("%ebp");
+        if !names_rbp
+            && !t.starts_with("leave")
+            && !t.starts_with("enter")
+            && !t.starts_with(".cfi_def_cfa")
+        {
+            return false;
+        }
+        let save_restore = matches!(t, "pushq %rbp" | "popq %rbp");
+        if (infos[n].pinned || infos[n].kind == LineKind::InlineAsm) && names_rbp && !save_restore {
+            return true;
+        }
+        matches!(
+            t,
+            "movq %rsp, %rbp"
+                | "mov %rsp, %rbp"
+                | "movq %rbp, %rsp"
+                | "mov %rbp, %rsp"
+                | "movl %esp, %ebp"
+                | "movl %ebp, %esp"
+        ) || t.starts_with("leave")
+            || t.starts_with("enter")
+            || (t.starts_with(".cfi_def_cfa")
+                && !t.starts_with(".cfi_def_cfa_offset")
+                && (names_rbp || t.ends_with(" 6") || t.contains(" 6,")))
+    })
+}
+
+/// Retire a proven-dead load and install its fused consumer. A volatile pin
+/// moves with the one surviving memory access; clearing it on the old carrier
+/// is deliberately confined to this post-legality-check helper.
+/// The caller must prove equal access widths, a dead temporary, and an editable
+/// consumer. A pinned load may be retired only for the adjacent volatile form.
+fn replace_fused_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    load: usize,
+    consumer: usize,
+    new_line: String,
+    volatile: bool,
+) {
+    debug_assert_ne!(load, consumer);
+    debug_assert!(!infos[consumer].pinned);
+    debug_assert_eq!(infos[load].pinned, volatile);
+    debug_assert_eq!(infos[load].volatile_access, volatile);
+    if volatile {
+        infos[load].pinned = false;
+        infos[load].volatile_access = false;
+    }
+    mark_nop(&mut infos[load]);
+    replace_line(store, &mut infos[consumer], consumer, new_line);
+    if volatile {
+        infos[consumer].pinned = true;
+        infos[consumer].volatile_access = true;
+    }
+}
+
+/// Fuse `mov MEM, %T ... OP %T, %D` into `OP MEM, %D` (see module docs).
+pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    // `(function start, rbp is its frame pointer)` of the last function asked.
+    let mut frame_cache: Option<(usize, bool)> = None;
+    let mut i = 0;
+    while i < len {
+        let candidate = match infos[i].kind {
+            LineKind::Other { .. } => true,
+            LineKind::LoadRbp { .. } => rbp_pointer_load(store, infos, &lv, i, &mut frame_cache),
+            _ => false,
+        };
+        if infos[i].is_nop() || !candidate {
+            i += 1;
+            continue;
+        }
+        // A volatile load is normally opaque to text peepholes. There is one
+        // exception which preserves the C abstract-machine access exactly:
+        // an immediately adjacent register ALU consumer can carry the same
+        // memory operand itself. No access is added, removed, widened, or
+        // moved across another instruction. The replacement is re-pinned
+        // below so later passes cannot erase or relocate the access.
+        let load_volatile = infos[i].pinned && infos[i].volatile_access;
+        if infos[i].pinned && !load_volatile {
+            i += 1;
+            continue;
+        }
+        let load = infos[i].trimmed(store.get(i)).to_string();
+        let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
+            i += 1;
+            continue;
+        };
+        let t_bit = 1u16 << t_fam;
+        let addr = memory_operand_families(mem);
+
+        // Walk forward to the first line that mentions T; every line before
+        // it must satisfy the window rules.
+        // Volatile accesses may cross only deleted lines and unpinned debug
+        // attribution, not CFI, alignment, or pinned bookkeeping directives.
+        // Keep the ordinary walker's established nonvolatile policy unchanged.
+        let mut j = if load_volatile {
+            let mut next = i + 1;
+            while next < len && debug_transparent(store, infos[next], next) {
+                next += 1;
+            }
+            next
+        } else {
+            next_insn(store, infos, i + 1, len)
+        };
+        let mut consumer = None;
+        let mut gap = 0usize;
+        while j < len {
+            let info = &infos[j];
+            if !is_window_kind(info.kind) || info.pinned {
+                break;
+            }
+            if info.reg_refs & t_bit != 0 {
+                consumer = Some(j);
+                break;
+            }
+            let t = info.trimmed(store.get(j));
+            if accesses_memory(t, info) {
+                break;
+            }
+            let wr = may_write_families(t, info);
+            if wr == ALL_GPR || wr & (t_bit | addr) != 0 {
+                break;
+            }
+            gap += 1;
+            if gap > MAX_GAP {
+                break;
+            }
+            j = next_insn(store, infos, j + 1, len);
+        }
+        let Some(j) = consumer else {
+            if !load_volatile && gap == 0 {
+                if let Some(span_end) = try_fuse_commuted_unary_load_pair(
+                    store, infos, &mut lv, i, j, len, mem, load_q, t_fam,
+                ) {
+                    changed = true;
+                    i = span_end + 1;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        };
+        // A segment-qualified operand is a promise about a SEGMENT BASE, and
+        // the instruction text cannot enumerate every way one can change
+        // (`swapgs`, `wrgsbase`/`wrfsbase`, `wrmsr` on MSR_GS_BASE/MSR_FS_BASE,
+        // a raw encoding inside an inline-asm `.byte` line).  Re-reading
+        // `%gs:MEM` at the consumer therefore has to be as close to the load as
+        // possible: require the consumer to be the immediately following
+        // instruction, so that *no* instruction can sit in between.  The
+        // unqualified (DS-relative) fold keeps its gap tolerance — in 64-bit
+        // mode there is no instruction that rebases DS.  (Labels and calls are
+        // already window barriers in both cases, so no control flow can reach
+        // the consumer on a different segment base.)
+        if (load_volatile || super::relay_and_lea::segment_prefix_len(mem).is_some()) && gap != 0 {
+            i += 1;
+            continue;
+        }
+        let cons = infos[j].trimmed(store.get(j)).to_string();
+        let suffix = if load_q { "q" } else { "l" };
+        let width = if load_q { 0 } else { 1 };
+
+        // ── direct form: OP %T, %D ─────────────────────────────────────────
+        if let Some((op, op_q, src, dst)) = parse_reg_reg_alu(&cons) {
+            if op_q == load_q
+                && src == t_fam
+                && dst != t_fam
+                && lv.live_after(j, t_fam) == Some(false)
+            {
+                let new_line =
+                    format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][dst as usize]);
+                replace_fused_load(store, infos, i, j, new_line, load_volatile);
+                lv.refresh_span(store, infos, i, j);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+            if load_volatile {
+                i += 1;
+                continue;
+            }
+            // ── mirror form: OP %C, %T ────────────────────────────────────
+            // The loaded scratch sits in the DESTINATION operand slot
+            // (`movl (%rsi), %edx; cmpl %edi, %edx` — the hash-chain walk
+            // every pointer-chasing kernel emits).  Only flag-producing,
+            // non-writing consumers may take a memory operand in that
+            // slot: `cmp` writes nothing, and folding `cmpl %edi, %edx` to
+            // `cmpl %edi, (%rsi)` computes the identical MEM−%edi flags
+            // difference.  `test`'s operands are symmetric (the left-slot
+            // rule already covers it), and every other FUSIBLE op writes
+            // its destination — folding the dst slot would turn the
+            // instruction into an unintended memory RMW.
+            if op_q == load_q
+                && dst == t_fam
+                && src != t_fam
+                && (op == "cmp" || op == "test")
+                && lv.live_after(j, t_fam) == Some(false)
+            {
+                let new_line =
+                    format!("    {op}{suffix} {}, {mem}", REG_NAMES[width][src as usize]);
+                mark_nop(&mut infos[i]);
+                replace_line(store, &mut infos[j], j, new_line);
+                lv.refresh_span(store, infos, i, j);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+            if let Some(span_end) = try_fuse_commuted_adjacent_load(
+                store, infos, &mut lv, i, j, mem, load_q, op, op_q, t_fam, src, dst, gap,
+            ) {
+                changed = true;
+                i = span_end + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        if load_volatile {
+            i += 1;
+            continue;
+        }
+
+        // ── mirror form, immediate source: cmp $I, %T ─────────────────────
+        // `movl 8(%rdx), %r10d; cmpl $25, %r10d` — the constant-key walk —
+        // folds to `cmpl $25, 8(%rdx)` (cmp r/m32, imm8/imm32 is the
+        // classic 83 /7 or 81 /7 encoding). Same flag-producing, non-
+        // writing discipline as the register mirror: cmp/test only, the
+        // immediate stays the AT&T source, the loaded scratch's slot takes
+        // the memory operand, and the scratch must be dead after.
+        if let Some((op, op_q, imm, dst)) = parse_imm_reg_flag(&cons) {
+            if op_q == load_q && dst == t_fam && lv.live_after(j, t_fam) == Some(false) {
+                let new_line = format!("    {op}{suffix} {imm}, {mem}");
+                mark_nop(&mut infos[i]);
+                replace_line(store, &mut infos[j], j, new_line);
+                lv.refresh_span(store, infos, i, j);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── BMI three-operand form: andn %T, %S, %D ────────────────────────
+        // `andn` (Intel `andn dst, src1, src2` = ~src2 & src1) takes its
+        // AT&T-first operand (Intel src2) as r/m — the bitmap-word shape
+        // `mov (%rdi,%r10,8), %rbp; ...; andn %rbp, %rax, %rcx` folds the
+        // load away exactly like the two-operand left-slot rule.  The
+        // other two slots stay registers (architectural).
+        if let Some(new_line) = try_fold_bmi_andn(
+            &cons,
+            load_q,
+            t_fam,
+            mem,
+            lv.live_after(j, t_fam) == Some(false),
+        ) {
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[j], j, new_line);
+            lv.refresh_span(store, infos, i, j);
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+
+        // ── copy-bridged commutative form: mov %T, %B ... OP %C, %B ────────
+        if let Some(span_end) = try_fuse_copy_bridged_load(
+            store, infos, &mut lv, i, j, len, &cons, mem, load_q, t_fam, addr,
+        ) {
+            changed = true;
+            i = span_end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Fuse copy-bridged commutative load `mov MEM, %T ... mov %T, %B ... OP %C, %B`
+/// into `mov %C, %B; OP MEM, %B`, returning `Some(k)` on rewrite.
+#[allow(clippy::too_many_arguments)]
+fn try_fuse_copy_bridged_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    i: usize,
+    j: usize,
+    len: usize,
+    cons: &str,
+    mem: &str,
+    load_q: bool,
+    t_fam: RegId,
+    addr: u16,
+) -> Option<usize> {
+    let (copy_q, csrc, b_fam) = parse_reg_copy(cons)?;
+    // A movl copy of a movq load would truncate; a movq copy of a movl
+    // load is the zero-extension the load already performed.
+    if csrc != t_fam || b_fam == t_fam || (load_q && !copy_q) {
+        return None;
+    }
+    let t_bit = 1u16 << t_fam;
+    let b_bit = 1u16 << b_fam;
+    // Find the consumer of B: first line mentioning B after the copy.
+    let mut k = next_insn(store, infos, j + 1, len);
+    let mut op_line = None;
+    let mut gap2 = 0usize;
+    while k < len {
+        let info = &infos[k];
+        if !is_window_kind(info.kind) || info.pinned {
+            break;
+        }
+        if info.reg_refs & b_bit != 0 {
+            op_line = Some(k);
+            break;
+        }
+        if info.reg_refs & t_bit != 0 {
+            break;
+        }
+        let t = info.trimmed(store.get(k));
+        if accesses_memory(t, info) {
+            break;
+        }
+        let wr = may_write_families(t, info);
+        if wr == ALL_GPR || wr & (t_bit | b_bit | addr) != 0 {
+            break;
+        }
+        gap2 += 1;
+        if gap2 > MAX_GAP {
+            break;
+        }
+        k = next_insn(store, infos, k + 1, len);
+    }
+    let k = op_line?;
+    // The copy-bridged form moves the load's memory operand to a LATER
+    // line, so the same distance argument as the direct form applies (see
+    // the segmented-operand guard above): with any instruction between the
+    // copy and the op, that instruction could rebase the segment.  The
+    // copy itself is a validated register-to-register mov and cannot.
+    if gap2 != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
+        return None;
+    }
+    let op_text = infos[k].trimmed(store.get(k)).to_string();
+    let (op, op_q, c_fam, dst) = parse_reg_reg_alu(&op_text)?;
+    if op_q != load_q
+        || dst != b_fam
+        || c_fam == b_fam
+        || c_fam == t_fam
+        || !COMMUTATIVE_OPS.contains(&op)
+        // The replacement is TWO instructions: `mov C, B` (at j) followed
+        // by `op mem, B` (at k), and the folded memory operand's address
+        // is evaluated at k. If B is one of the address families the copy
+        // writes an address input BEFORE the op reads it (e.g. an index
+        // `(base,%rdx,4)` with B=%rdx staged by `mov %r11d, %edx`) — a
+        // miscompile. Bail: the copy-bridged shape stays untouched.
+        || (b_bit & addr) != 0
+    {
+        return None;
+    }
+    // C must hold the same value at the copy as at the op (nothing in
+    // (j, k) writes it), and T must be dead once the copy is gone.
+    let w2 = scan_window(store, infos, j, k)?;
+    let c_bit = 1u16 << c_fam;
+    if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0 {
+        return None;
+    }
+    if lv.live_after(j, t_fam) != Some(false) {
+        return None;
+    }
+    let suffix = if load_q { "q" } else { "l" };
+    let width = if load_q { 0 } else { 1 };
+    let copy_line = format!(
+        "    mov{suffix} {}, {}",
+        REG_NAMES[width][c_fam as usize], REG_NAMES[width][b_fam as usize]
+    );
+    let op_new = format!(
+        "    {op}{suffix} {mem}, {}",
+        REG_NAMES[width][b_fam as usize]
+    );
+    mark_nop(&mut infos[i]);
+    replace_line(store, &mut infos[j], j, copy_line);
+    replace_line(store, &mut infos[k], k, op_new);
+    lv.refresh_span(store, infos, i, k);
+    Some(k)
+}
+
+// ── in-place recurrence update ───────────────────────────────────────────────
+
+/// Two-operand ALU forms whose destination may be renamed from the scratch
+/// copy to the accumulator itself (`OP src, %Tm` → `OP src, %A`).
+const INPLACE_OPS: &[&str] = &[
+    "shl", "shr", "sar", "sal", "rol", "ror", "add", "sub", "and", "or", "xor", "imul",
+];
+/// Single-operand forms (`OP %Tm` → `OP %A`).
+const INPLACE_UNARY: &[&str] = &["not", "neg", "inc", "dec"];
+
+/// Parse `OP{l,q} SRC, %dst` / `OP{l,q} %dst` for the in-place whitelist.
+/// Returns `(is_q, dst_fam, src_text, unary)`; SRC is `$imm` or a plain GP
+/// register of the same width.
+fn parse_inplace_op(t: &str) -> Option<(bool, RegId, &str, bool)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let (op, is_q) = split_lq_mnemonic(mnemonic)?;
+    let rest = t[mnemonic.len()..].trim();
+    let width = if is_q { 0 } else { 1 };
+    if INPLACE_UNARY.contains(&op) {
+        let dst = plain_gp_operand(rest)?;
+        if rest != REG_NAMES[width][dst as usize] {
+            return None;
+        }
+        return Some((is_q, dst, "", true));
+    }
+    if !INPLACE_OPS.contains(&op) {
+        return None;
+    }
+    let (src, dst_text) = split_two_operands(rest)?;
+    let dst = plain_gp_operand(dst_text)?;
+    if dst_text != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    // THREE-OPERAND FORM (`imulq $imm, %src, %dst`): split_two_operands
+    // splits at the last top-level comma, so `src` arrives as the two-operand
+    // group `"$imm, %src"`.  Accepting that group as an "immediate" (it
+    // starts with '$') made the caller retarget the destination register
+    // while keeping the separate source register — emitting
+    // `imulq $imm, %src, %A` where the original computed `dst = dst * imm`
+    // in place.  After the caller deletes the defining copy, `%src` holds a
+    // STALE value (peephole_families shiftchain far_use repro at -Os:
+    // `imulq $7, %rsi, %rax` multiplied by the pre-copy register).  Parse
+    // the form explicitly instead: it is in-place only when the real
+    // register source equals the destination, and the caller's retarget then
+    // drops to the equivalent 2-operand form (`imulq $imm, %A`).
+    if let Some(comma) = last_top_level_comma(src.as_bytes()) {
+        let imm = src[..comma].trim();
+        let reg = src[comma + 1..].trim();
+        if !imm.starts_with('$') || imm.contains(',') {
+            return None;
+        }
+        let reg_fam = plain_gp_operand(reg)?;
+        if reg != REG_NAMES[width][reg_fam as usize] || reg_fam != dst {
+            return None;
+        }
+        return Some((is_q, dst, imm, false));
+    }
+    let src_ok = src.starts_with('$')
+        || plain_gp_operand(src).is_some_and(|f| src == REG_NAMES[width][f as usize]);
+    if !src_ok {
+        return None;
+    }
+    Some((is_q, dst, src, false))
+}
+
+/// Compute a loop-carried recurrence in place instead of through a scratch
+/// copy (the shape the allocator emits for `acc = f(acc) OP x` phis):
+///
+/// ```text
+///     movl %ebx, %r9d          shrl $8, %ebx
+///     shrl $8, %r9d       ->   xorl %edi, %ebx
+///     movl %edi, %ebx
+///     xorl %r9d, %ebx
+/// ```
+///
+/// Legal when `OP2` is commutative (`A = Tm OP2 X == X OP2 Tm`), `Tm` is dead
+/// after `OP2`, `OP1` does not read `A`, nothing between `OP1` and the second
+/// copy mentions `A`/`Tm` or writes `X`, and the copies are at least as wide
+/// as the ops (a `movq` copy of a value updated by `l` ops is the same
+/// zero-extension the `l` op performs on `A` directly).  Flags are identical
+/// at every surviving instruction: only flag-neutral `mov`s are removed.
+pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let copy1 = infos[i].trimmed(store.get(i)).to_string();
+        let Some((c1_q, a_fam, tm_fam)) = parse_reg_copy(&copy1) else {
+            i += 1;
+            continue;
+        };
+        if a_fam == tm_fam {
+            i += 1;
+            continue;
+        }
+        // OP1 must be the very next instruction.
+        let j = next_insn(store, infos, i + 1, len);
+        if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
+            i += 1;
+            continue;
+        }
+        let op1 = infos[j].trimmed(store.get(j)).to_string();
+        let Some((op_q, op1_dst, op1_src, unary)) = parse_inplace_op(&op1) else {
+            i += 1;
+            continue;
+        };
+        if op1_dst != tm_fam || (op_q && !c1_q) {
+            i += 1;
+            continue;
+        }
+        let a_bit = 1u16 << a_fam;
+        let tm_bit = 1u16 << tm_fam;
+        if !unary && op1_src.starts_with('%') && plain_gp_operand(op1_src) == Some(a_fam) {
+            i += 1;
+            continue;
+        }
+        // Find copy2 (`mov %X, %A`): first line after OP1 mentioning A or Tm.
+        let mut k = next_insn(store, infos, j + 1, len);
+        let mut copy2 = None;
+        let mut gap = 0usize;
+        let mut gap_written = 0u16;
+        while k < len {
+            let info = &infos[k];
+            if !is_window_kind(info.kind) || info.pinned {
+                break;
+            }
+            if info.reg_refs & (a_bit | tm_bit) != 0 {
+                copy2 = Some(k);
+                break;
+            }
+            let t = info.trimmed(store.get(k));
+            if accesses_memory(t, info) {
+                break;
+            }
+            let wr = may_write_families(t, info);
+            if wr == ALL_GPR {
+                break;
+            }
+            gap_written |= wr;
+            gap += 1;
+            if gap > MAX_GAP {
+                break;
+            }
+            k = next_insn(store, infos, k + 1, len);
+        }
+        let Some(k) = copy2 else {
+            i += 1;
+            continue;
+        };
+        let copy2_text = infos[k].trimmed(store.get(k)).to_string();
+        let Some((c2_q, x_fam, c2_dst)) = parse_reg_copy(&copy2_text) else {
+            i += 1;
+            continue;
+        };
+        if c2_dst != a_fam || x_fam == a_fam || x_fam == tm_fam || (op_q && !c2_q) {
+            i += 1;
+            continue;
+        }
+        let x_bit = 1u16 << x_fam;
+        if gap_written & (x_bit | a_bit | tm_bit) != 0 {
+            i += 1;
+            continue;
+        }
+        // OP2 must immediately follow copy2.
+        let m = next_insn(store, infos, k + 1, len);
+        if m >= len || infos[m].pinned {
+            i += 1;
+            continue;
+        }
+        let op2 = infos[m].trimmed(store.get(m)).to_string();
+        let Some((op2_name, op2_q, op2_src, op2_dst)) = parse_reg_reg_alu(&op2) else {
+            i += 1;
+            continue;
+        };
+        if op2_q != op_q
+            || op2_src != tm_fam
+            || op2_dst != a_fam
+            || !COMMUTATIVE_OPS.contains(&op2_name)
+        {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(m, tm_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        let width = if op_q { 0 } else { 1 };
+        let suffix = if op_q { "q" } else { "l" };
+        let a_name = REG_NAMES[width][a_fam as usize];
+        let op1_mnemonic = op1.split_whitespace().next().unwrap_or("");
+        let op1_new = if unary {
+            format!("    {op1_mnemonic} {a_name}")
+        } else {
+            format!("    {op1_mnemonic} {op1_src}, {a_name}")
+        };
+        let op2_new = format!(
+            "    {op2_name}{suffix} {}, {a_name}",
+            REG_NAMES[width][x_fam as usize]
+        );
+        mark_nop(&mut infos[i]);
+        mark_nop(&mut infos[k]);
+        replace_line(store, &mut infos[j], j, op1_new);
+        replace_line(store, &mut infos[m], m, op2_new);
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = m + 1;
+    }
+    changed
+}
+
+// ── load + LEA-add into the dying accumulator ────────────────────────────────
+
+/// Flag-clobbering ALU consumers whose FIRST window instruction makes the
+/// `add` below safe: each writes all six arithmetic flags (CF, OF, SF, ZF, AF,
+/// PF) and reads none, so any flag state that was live across the LEA is dead
+/// before it can be observed — the flag state after this instruction is its
+/// own, identical in the folded and unfolded spellings.  Deliberately excludes
+/// `inc`/`dec` (no CF), `not` (no flags) and every flag READER (`adc`, `sbb`,
+/// `rcl`, `setcc`, `jcc`, `cmovcc`), all of which could observe the inserted
+/// `add`.  A `mov`/`lea`/`push`/`pop` reader would keep the earlier flags live
+/// across the fold, so it vetoes too.
+const LEA_FOLD_FLAG_CLOBBER: &[&str] = &["add", "sub", "and", "or", "xor", "cmp", "test"];
+
+/// True when `t` is a two-operand `OP{l,q} ...` with `OP` a full flag clobber.
+fn is_full_flag_clobber(t: &str) -> bool {
+    let Some(mnemonic) = t.split_whitespace().next() else {
+        return false;
+    };
+    let Some((op, suffix)) = mnemonic.split_at_checked(mnemonic.len().saturating_sub(1)) else {
+        return false;
+    };
+    if suffix != "l" && suffix != "q" {
+        return false;
+    }
+    LEA_FOLD_FLAG_CLOBBER.contains(&op)
+}
+
+/// Parse the two-register `lea`-add the allocator emits for `acc + x` when the
+/// result needs its own home: `leaq (%B,%T,1), %S` (scale explicit or omitted).
+/// Returns `(is_q, base_fam, index_fam, dest_fam)`.  A displacement, a scale
+/// other than 1, or any operand that is not the exact register spelling of the
+/// suffix width is refused — `add` cannot reproduce those.
+fn parse_lea_add(t: &str) -> Option<(bool, RegId, RegId, RegId)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let is_q = match mnemonic {
+        "leaq" => true,
+        "leal" => false,
+        _ => return None,
+    };
+    let width = if is_q { 0 } else { 1 };
+    let rest = t[mnemonic.len()..].trim();
+    let (src, dst) = split_two_operands(rest)?;
+    let dst_fam = plain_gp_operand(dst)?;
+    if dst != REG_NAMES[width][dst_fam as usize] {
+        return None;
+    }
+    // SRC must be exactly `(%a,%b)` / `(%a, %b)` / `(%a, %b, 1)`.
+    let inner = src.strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return None;
+    }
+    if parts.len() == 3 && parts[2] != "1" {
+        return None;
+    }
+    let mut fams = [0 as RegId; 2];
+    for (k, p) in parts.iter().take(2).enumerate() {
+        let fam = plain_gp_operand(p)?;
+        if *p != REG_NAMES[width][fam as usize] {
+            return None;
+        }
+        fams[k] = fam;
+    }
+    if fams[0] == fams[1] {
+        return None;
+    }
+    Some((is_q, fams[0], fams[1], dst_fam))
+}
+
+/// `mov MEM, %T` + `leaq (%B,%T,1), %S` → `add MEM, %B` with every use of `%S`
+/// up to the end of its live range renamed to `%B`.
+///
+/// This is gcc's accumulation shape: the allocator keeps an SSA chain in one
+/// register (`addq MEM, %acc; xorq MEM2, %acc; ...`) while lccc materialises
+/// each link three-operand (`movq MEM, %t; leaq (%acc,%t,1), %s`), costing one
+/// extra instruction per link — measured on the pointer-chasing accumulator
+/// kernel (`struct node *p; acc += p->hits; acc ^= p->miss; acc += p->tag & 7;
+/// p = p->next`) lccc 9 vs gcc 8 instructions per iteration, and on
+/// tests/benchmark/programs/percpu_ptr_walk.c 10 vs 8.
+///
+/// Soundness, in the order the gates are checked:
+///
+/// * The folded `add MEM, %B` reads MEM at the LEA's position with nothing in
+///   between (the LEA must be the immediately following instruction), so the
+///   memory access and its trap behaviour are unchanged, and a segment-qualified
+///   MEM cannot be invalidated by an instruction in the window.
+/// * The LEA computes `%B + %T`; `add` is commutative and `add MEM, %B` writes
+///   the identical value into the identical register, so the renamed chain
+///   computes what the moved value computes.  A read of MEM's address
+///   registers inside the same instruction still sees their pre-fold values
+///   (x86 reads every source before writing a destination) — including the
+///   self-addressing `add (%B), %B` case.
+/// * `%T` is dead after the LEA (its only use was the add), so dropping its
+///   definition cannot be observed.
+/// * `%B` is dead after the LEA: its value has been consumed, so the result may
+///   be written back into it.  Every use of `%S` is then renamed to `%B` until
+///   `%S` dies; the scan aborts if any visited instruction writes `%B` without
+///   mentioning `%S` (the rename would feed it a wrong value) or is a barrier,
+///   a label, an opaque `ALL_GPR` writer, or further away than `MAX_GAP`.
+/// * The first window instruction must be a full flag clobber (see
+///   [`LEA_FOLD_FLAG_CLOBBER`]): `lea` writes no flags while `add` does, and
+///   this instruction kills every arithmetic flag before any reader can see
+///   the difference.
+pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    // Frame setup detection (see the frame-register guard below): any
+    // `movq %rsp, %rbp` in the file means %rbp may be the frame base here.
+    let frame_pointer_in_use = {
+        let mut found = false;
+        for n in 0..len {
+            if infos[n].is_nop() {
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if t.starts_with("movq %rsp, %rbp") {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let load = infos[i].trimmed(store.get(i)).to_string();
+        let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
+            i += 1;
+            continue;
+        };
+        let j = next_insn(store, infos, i + 1, len);
+        if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
+            i += 1;
+            continue;
+        }
+        let cons = infos[j].trimmed(store.get(j)).to_string();
+        let Some((lea_q, base_fam, idx_fam, dst_fam)) = parse_lea_add(&cons) else {
+            i += 1;
+            continue;
+        };
+        if lea_q != load_q
+            || idx_fam != t_fam
+            || base_fam == t_fam
+            || dst_fam == t_fam
+            || dst_fam == base_fam
+        {
+            i += 1;
+            continue;
+        }
+        // Frame-register guard.  The rewrite writes the sum into `%B` and
+        // renames the chain onto it, so `%B` must be a plain VALUE home.
+        // `%rsp` is never one — no allocator pool contains PhysReg 4
+        // (X86_CALLEE_SAVED/WITH_RBP are 1..=6, the caller-saved set 10..=16,
+        // APX 40..=55, and RSP is not among them) — but a `leaq (%rsp,%t,1)`
+        // can still appear while *computing* an address (alloca plus a runtime
+        // index), and folding THAT would corrupt the stack pointer for every
+        // later stack access.  `%rbp` is a value home only when the frame
+        // pointer is omitted, so it is refused whenever this file contains a
+        // frame setup (`movq %rsp, %rbp`); the check is per file and costs one
+        // store scan, and refusing only loses the fold in the mixed case.
+        if base_fam == REG_RSP || (base_fam == REG_RBP && frame_pointer_in_use) {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(j, t_fam) != Some(false) || lv.live_after(j, base_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        // The renamed chain must start at the very next instruction, and that
+        // instruction must kill every flag the inserted `add` could disturb.
+        let k = next_insn(store, infos, j + 1, len);
+        if k >= len || infos[k].pinned || !is_window_kind(infos[k].kind) {
+            i += 1;
+            continue;
+        }
+        let dst_bit = 1u16 << dst_fam;
+        let base_bit = 1u16 << base_fam;
+        if infos[k].reg_refs & dst_bit == 0 || infos[k].reg_refs & base_bit != 0 {
+            i += 1;
+            continue;
+        }
+        let k_text = infos[k].trimmed(store.get(k)).to_string();
+        if !is_full_flag_clobber(&k_text) {
+            i += 1;
+            continue;
+        }
+        // Collect the rename: every mention of %S from k until %S dies.
+        let mut rename: Vec<(usize, String)> = Vec::new();
+        let mut n = k;
+        let mut steps = 0usize;
+        let last = loop {
+            if n >= len || infos[n].pinned || !is_window_kind(infos[n].kind) {
+                break None;
+            }
+            let text = infos[n].trimmed(store.get(n)).to_string();
+            let written = may_write_families(&text, &infos[n]);
+            if written == ALL_GPR {
+                break None;
+            }
+            // A write to %B that does not come from the renamed value would
+            // make later renamed reads observe it.
+            if written & base_bit != 0 && infos[n].reg_refs & dst_bit == 0 {
+                break None;
+            }
+            if infos[n].reg_refs & dst_bit != 0 {
+                let Some(new_text) = rename_family(&text, dst_fam, base_fam) else {
+                    break None;
+                };
+                rename.push((n, new_text));
+            }
+            match lv.live_after(n, dst_fam) {
+                Some(false) => break Some(n),
+                Some(true) => {}
+                None => break None,
+            }
+            steps += 1;
+            if steps > MAX_GAP {
+                break None;
+            }
+            n = next_insn(store, infos, n + 1, len);
+        };
+        let Some(last) = last else {
+            i += 1;
+            continue;
+        };
+        let width = if load_q { 0 } else { 1 };
+        let suffix = if load_q { "q" } else { "l" };
+        let new_line = format!(
+            "    add{suffix} {mem}, {}",
+            REG_NAMES[width][base_fam as usize]
+        );
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        for (idx, text) in rename {
+            replace_line(store, &mut infos[idx], idx, format!("    {text}"));
+        }
+        lv.refresh_span(store, infos, i, last);
+        changed = true;
+        i = last + 1;
+    }
+    changed
+}
+
+// ── copy + commutative op into the dying operand ─────────────────────────────
+
+/// Rewrite every width-name of family `from` in `text` to family `to`.
+/// Returns `None` when a high-byte alias (`%ah`..`%dh`) is present, because
+/// families 4..15 have no high-byte counterpart.
+fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
+    // Register names are not interchangeable when the ISA fixes an operand:
+    // MUL's accumulator is absent from the text, and legacy shifts name CL
+    // explicitly but cannot encode another byte register. This helper also
+    // accepts isolated source expressions (no mnemonic), which have no such
+    // instruction effects. Keep ordinary RCX addressing and BMI2 shifts legal.
+    let trimmed = text.trim();
+    if from >= 16 || to >= 16 {
+        return None;
+    }
+    let families = (1u16 << from) | (1u16 << to);
+    if from == REG_RSP || to == REG_RSP || implicit_reg_refs(trimmed.as_bytes()) & families != 0 {
+        return None;
+    }
+    let mn = trimmed.split_whitespace().next().unwrap_or("");
+    let operands = trimmed[mn.len()..].trim();
+    let fixed_shift = [
+        "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "shld", "shrd",
+    ]
+    .iter()
+    .any(|base| {
+        mn == *base
+            || mn
+                .strip_prefix(base)
+                .is_some_and(|suffix| matches!(suffix, "b" | "w" | "l" | "q"))
+    });
+    if (from == 1 || to == 1)
+        && fixed_shift
+        && operands
+            .split(',')
+            .next()
+            .is_some_and(|count| count.trim() == "%cl")
+    {
+        return None;
+    }
+    const HIGH: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+    if HIGH.iter().any(|h| text.contains(h)) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pct) = rest.find('%') {
+        out.push_str(&rest[..pct]);
+        let tok = &rest[pct..];
+        let end = tok[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|e| e + 1)
+            .unwrap_or(tok.len());
+        let reg = &tok[..end];
+        let mut replaced = false;
+        for w in 0..4 {
+            if reg == REG_NAMES[w][from as usize] {
+                out.push_str(REG_NAMES[w][to as usize]);
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            out.push_str(reg);
+        }
+        rest = &rest[pct + end..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// `%rsp`'s family id (REG_NAMES[0] index 4): renaming it is never sane.
+
+/// True when `t`'s mentions of `fam` include a partial-width spelling
+/// (16-bit, 8-bit or a high-byte alias) — those do not kill the family.
+fn fam_mentions_partial_width(t: &str, fam: RegId) -> bool {
+    const HIGH: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+    if HIGH.iter().any(|h| t.contains(h)) {
+        // Only the first four families even have high-byte spellings, and a
+        // high-byte touch is a partial-width touch of whichever family it
+        // belongs to; the exact owner does not matter for this predicate
+        // (rename_family independently vetoes these on renamed lines).
+        return true;
+    }
+    let mut rest = t;
+    while let Some(pct) = rest.find('%') {
+        let tok = &rest[pct..];
+        let end = tok[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|e| e + 1)
+            .unwrap_or(tok.len());
+        let reg = &tok[..end];
+        for w in 2..4 {
+            if reg == REG_NAMES[w][fam as usize] {
+                return true;
+            }
+        }
+        rest = &rest[pct + end..];
+    }
+    false
+}
+
+/// Whether an apparent full-width definition also reads the old value of
+/// `fam` in its source operand.  `reg_refs` is deliberately only a mention
+/// bitmap, so `may_write_families` + `!is_read_modify_write` is not enough to
+/// prove a clean kill: `movl %edx, %edx` reads the old `%edx` and then
+/// zero-extends it, and `movq (%rdx), %rdx` reads it as an address before
+/// replacing it.  Treat an unparseable two-operand form as a read (fail
+/// closed); a destination-only definition may terminate the product's live
+/// range safely.
+fn source_reads_family(t: &str, fam: RegId) -> bool {
+    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    if mnemonic.is_empty() {
+        return true;
+    }
+    let rest = t[mnemonic.len()..].trim();
+    let Some((src, dst)) = split_two_operands(rest) else {
+        // These explicit single-operand instructions overwrite their register
+        // destination without reading its old value. Other opaque/implicit
+        // forms stay conservative; in particular DIV/MUL-like operands must
+        // never be mistaken for clean kills.
+        return !((mnemonic.starts_with("pop")
+            || mnemonic.starts_with("rdrand")
+            || mnemonic.starts_with("rdseed"))
+            && plain_gp_operand(rest) == Some(fam));
+    };
+    if plain_gp_operand(dst) != Some(fam) {
+        return true;
+    }
+    plain_gp_operand(src) == Some(fam) || memory_operand_families(src) & (1u16 << fam) != 0
+}
+
+/// A full-width self-copy preserves the product, so it is a read-through,
+/// not a death of `from`; both register operands must follow the renamed value.
+fn is_full_width_self_move(t: &str, fam: RegId) -> bool {
+    parse_reg_copy(t).is_some_and(|(is_q, src, dst)| is_q && src == fam && dst == fam)
+}
+
+/// Does a two-operand instruction write the complete family named by `from`?
+/// In 64-bit mode, either a q-width write or a dword write (which zero-extends)
+/// does; byte and word writes do not.
+fn has_full_width_register_dest(t: &str, from: RegId) -> bool {
+    let Some(mnemonic) = t.split_whitespace().next() else {
+        return false;
+    };
+    let rest = t[mnemonic.len()..].trim();
+    let Some((_, dst)) = split_two_operands(rest) else {
+        return false;
+    };
+    plain_gp_operand(dst) == Some(from)
+        && (dst == REG_NAMES[0][from as usize] || dst == REG_NAMES[1][from as usize])
+}
+
+/// `is_read_modify_write` intentionally defaults to true for opaque mnemonics.
+/// Rehoming a product is safe only for familiar explicit GP operations whose
+/// complete write set is the destination family. Keep this allowlist separate
+/// from the broader helper so an unknown instruction cannot acquire an
+/// unmodelled implicit read/write merely because its last operand looks like
+/// `%from`.
+fn is_rehomeable_full_width_rmw(t: &str, from: RegId) -> bool {
+    if !super::helpers::is_read_modify_write(t) || fam_mentions_partial_width(t, from) {
+        return false;
+    }
+    let Some(mnemonic) = t.split_whitespace().next() else {
+        return false;
+    };
+    let rest = t[mnemonic.len()..].trim();
+    let Some((base, width)) = mnemonic.split_at_checked(mnemonic.len().saturating_sub(1)) else {
+        return false;
+    };
+    let (suffix_width, valid_width) = match width {
+        "q" => (0, true),
+        "l" => (1, true),
+        _ => (0, false),
+    };
+    if !valid_width {
+        return false;
+    }
+
+    if base == "lea" {
+        if super::helpers::count_top_level_operands(rest) != 2 {
+            return false;
+        }
+        let Some((_, dst)) = split_two_operands(rest) else {
+            return false;
+        };
+        return plain_gp_operand(dst) == Some(from)
+            && dst == REG_NAMES[suffix_width][from as usize];
+    }
+
+    let unary = matches!(base, "inc" | "dec" | "neg" | "not" | "bswap");
+    let binary = matches!(
+        base,
+        "add"
+            | "adc"
+            | "and"
+            | "or"
+            | "sbb"
+            | "sub"
+            | "xor"
+            | "imul"
+            | "shl"
+            | "sal"
+            | "shr"
+            | "sar"
+            | "rol"
+            | "ror"
+            | "rcl"
+            | "rcr"
+            | "shld"
+            | "shrd"
+            | "bts"
+            | "btr"
+            | "btc"
+    );
+    let conditional_move = base.strip_prefix("cmov").is_some_and(|cc| {
+        matches!(
+            cc,
+            "o" | "no"
+                | "b"
+                | "c"
+                | "nae"
+                | "ae"
+                | "nb"
+                | "nc"
+                | "e"
+                | "z"
+                | "ne"
+                | "nz"
+                | "be"
+                | "na"
+                | "a"
+                | "nbe"
+                | "s"
+                | "ns"
+                | "p"
+                | "pe"
+                | "np"
+                | "po"
+                | "l"
+                | "nge"
+                | "ge"
+                | "nl"
+                | "le"
+                | "ng"
+                | "g"
+                | "nle"
+        )
+    });
+    if !unary && !binary && !conditional_move {
+        return false;
+    }
+    let operand_count = super::helpers::count_top_level_operands(rest);
+    let valid_count = if unary {
+        operand_count == 1
+    } else if base == "shld" || base == "shrd" {
+        operand_count == 3
+    } else {
+        operand_count == 2
+    };
+    if !valid_count {
+        return false;
+    }
+    let dst = if unary {
+        rest
+    } else {
+        let Some((_, dst)) = split_two_operands(rest) else {
+            return false;
+        };
+        dst
+    };
+    plain_gp_operand(dst) == Some(from) && dst == REG_NAMES[suffix_width][from as usize]
+}
+
+/// For an unconditional pure definition of `from` whose source depends on
+/// the old product, retarget only that source and leave the fresh result in
+/// `from`. This covers memory addresses (`movq (%rdx), %rdx`), register
+/// self-copies at widths that change the family (`movl %edx, %edx`), and the
+/// two-operand count instructions; the old product's range ends at this line.
+fn rename_full_def_source(t: &str, from: RegId, to: RegId) -> Option<String> {
+    let mnemonic = t.split_whitespace().next()?;
+    if !(mnemonic.starts_with("mov")
+        || mnemonic.starts_with("popcnt")
+        || mnemonic.starts_with("lzcnt")
+        || mnemonic.starts_with("tzcnt"))
+    {
+        return None;
+    }
+    let rest = t[mnemonic.len()..].trim();
+    let (src, dst) = split_two_operands(rest)?;
+    if plain_gp_operand(dst) != Some(from)
+        || !has_full_width_register_dest(t, from)
+        || !source_reads_family(t, from)
+    {
+        return None;
+    }
+    let renamed_src = rename_family(src, from, to)?;
+    Some(format!("    {mnemonic} {renamed_src}, {dst}"))
+}
+
+/// Rename every read of `from` to `to` over `from`'s live range starting just
+/// after `start`, for the commuted-adjacent fuse (the fused RMW wrote the
+/// product into `to`, so `from`'s old value is that same product).
+///
+/// Two-phase (verify the whole span before mutating anything — a late veto
+/// must leave the file untouched). The walk covers exactly the lines the
+/// product is live over and stops at its death:
+///   * a line that touches `to` while the product is live is a stale read or
+///     a clobber → veto;
+///   * a destination-only full-width def of `from` ends the range; the
+///     recognized q-width self-move is effectless and may be crossed, while
+///     pure source-dependent definitions retarget their source and leave the
+///     fresh result in `from`; a single-family full-width RMW is renamed as a
+///     continuing product update; partial-width or multi/opaque writes → veto;
+///   * any other line reading `from` is renamed with `rename_family`
+///     (which vetoes `%ah`-class spellings);
+///   * once `from` is dead after a line, the range is over — later touches
+///     of `to` are fresh values and none of this walk's business;
+///   * a barrier (label, jump, call, ret, pinned line) met while the product
+///     is still live → veto: a call could consume the product as an argument
+///     without a text mention, so textual checks cannot save a live crossing;
+///   * `%rsp` may never be renamed.
+///
+/// Returns the last index whose text is part of the product's range (the
+/// consumer `start` when nothing needed renaming), or `None` on veto.
+fn rename_product_range(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    start: usize,
+    from: RegId,
+    to: RegId,
+    lv: &FileLiveness,
+) -> Option<usize> {
+    if from == REG_RSP || to == REG_RSP {
+        return None;
+    }
+    let len = store.len();
+    let d_bit = 1u16 << from;
+    let t_bit = 1u16 << to;
+    let mut renames: Vec<(usize, String)> = Vec::new();
+    let mut end = start;
+    let mut k = next_insn(store, infos, start + 1, len);
+    while k < len {
+        let info = &infos[k];
+        if !(is_window_kind(info.kind) || matches!(info.kind, LineKind::SelfMove)) || info.pinned {
+            // `SelfMove` is preclassified with no GP effects, but
+            // `is_window_kind` excludes it. A q-width self-move is a semantic
+            // no-op, so admit it locally; the following real product reads
+            // still have to follow the renamed value. Other barriers cannot be
+            // crossed while the product is live.
+            return None;
+        }
+        let t = info.trimmed(store.get(k));
+        // Opaque instructions can read unspelled architectural operands.
+        if may_write_families(t, info) == ALL_GPR {
+            return None;
+        }
+        if info.reg_refs & t_bit != 0 {
+            return None;
+        }
+        if info.reg_refs & d_bit != 0 {
+            let writes_from = may_write_families(t, info) & d_bit;
+            if writes_from != 0 {
+                if is_full_width_self_move(t, from) {
+                    // A q-width self-move is a read-through, not a kill.
+                    // Rename both operands and continue looking for the true
+                    // end of the product's live range.
+                    let new_text = rename_family(store.get(k), from, to)?;
+                    renames.push((k, new_text));
+                    end = k;
+                } else if super::helpers::is_read_modify_write(t) {
+                    // A supported single-family full-width RMW keeps the
+                    // product live in `to`. Multi-output, partial-width, and
+                    // opaque forms are not a local register substitution.
+                    if may_write_families(t, info) != d_bit
+                        || !is_rehomeable_full_width_rmw(t, from)
+                    {
+                        return None;
+                    }
+                    let new_text = rename_family(store.get(k), from, to)?;
+                    renames.push((k, new_text));
+                    end = k;
+                } else if source_reads_family(t, from) {
+                    if let Some(new_text) = rename_full_def_source(t, from, to) {
+                        // This is a pure definition whose new value depends
+                        // on the old product (including a memory address or a
+                        // zero-extending self-move). Retarget only the source;
+                        // leave the fresh result in `from` and end the old
+                        // product range at this instruction.
+                        renames.push((k, new_text));
+                        end = k;
+                        break;
+                    } else {
+                        return None;
+                    }
+                } else {
+                    // Only a full-family, destination-only definition is a
+                    // clean kill. Byte/word writes leave old product bits live.
+                    if fam_mentions_partial_width(t, from) {
+                        return None;
+                    }
+                    break;
+                }
+            } else {
+                // Pure read of the product: rename (vetoes `%ah` spellings).
+                let new_text = rename_family(store.get(k), from, to)?;
+                renames.push((k, new_text));
+                end = k;
+            }
+        }
+        if lv.live_after(k, from) == Some(false) {
+            // Product dead: the range is over. Later `to` touches are fresh
+            // values outside this transform's scope.
+            break;
+        }
+        k = next_insn(store, infos, k + 1, len);
+    }
+    for (r, new_text) in renames {
+        replace_line(store, &mut infos[r], r, new_text);
+    }
+    Some(end)
+}
+
+/// ```text
+///     movl %ebp, %eax          xorl %ebp, %edi
+///     xorl %edi, %eax     ->   movzbl %dil, %esi
+///     movzbl %al, %esi
+/// ```
+///
+/// A copy feeding a commutative op whose other operand `C` dies at the op:
+/// compute `A op C` into `C` instead and retarget the single reader of the
+/// copy destination `B`.  Sound when `C` is dead after the op, `B` is dead
+/// after its (immediately following) reader, `A`/`B`/`C` are three distinct
+/// families, the reader is a plain instruction with no high-byte alias, and
+/// widths agree (`l` copy with `l` op, `q` with `q`).  The op writes the
+/// same flags in both forms and the copy was flag-neutral.
+///
+/// The reader may also name `C` as its full-width destination
+/// (`leaq (%rbp,%r11), %rdx` -> `leaq (%rbp,%rdx), %rdx`): `C` is dead after
+/// the op, so the reader cannot read it, and an `l`/`q` register destination
+/// kills it outright, after the renamed read. Any other mention of `C` (a
+/// source, an address, a partial-width destination that merges old bits) is
+/// refused.
+pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let copy = infos[i].trimmed(store.get(i)).to_string();
+        let Some((c_q, a_fam, b_fam)) = parse_reg_copy(&copy) else {
+            i += 1;
+            continue;
+        };
+        if a_fam == b_fam {
+            i += 1;
+            continue;
+        }
+        let j = next_insn(store, infos, i + 1, len);
+        if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
+            i += 1;
+            continue;
+        }
+        let op = infos[j].trimmed(store.get(j)).to_string();
+        let Some((op_name, op_q, c_fam, dst)) = parse_reg_reg_alu(&op) else {
+            i += 1;
+            continue;
+        };
+        if op_q != c_q
+            || dst != b_fam
+            || c_fam == a_fam
+            || c_fam == b_fam
+            || !COMMUTATIVE_OPS.contains(&op_name)
+        {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(j, c_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        let k = next_insn(store, infos, j + 1, len);
+        if k >= len || infos[k].pinned || !is_window_kind(infos[k].kind) {
+            i += 1;
+            continue;
+        }
+        let b_bit = 1u16 << b_fam;
+        let c_bit = 1u16 << c_fam;
+        let reader = infos[k].trimmed(store.get(k)).to_string();
+        if infos[k].reg_refs & b_bit == 0
+            || (infos[k].reg_refs & c_bit != 0 && !kills_family_only(&reader, c_fam))
+        {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(k, b_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        // Opaque readers (implicit operands, string ops, x87) are refused by
+        // the MAY model; a memory-destination reader is fine (it reads B in
+        // the address or as the stored value, both renamed consistently).
+        if may_write_families(&reader, &infos[k]) == ALL_GPR {
+            i += 1;
+            continue;
+        }
+        let Some(reader_new) = rename_family(&reader, b_fam, c_fam) else {
+            i += 1;
+            continue;
+        };
+        let width = if op_q { 0 } else { 1 };
+        let suffix = if op_q { "q" } else { "l" };
+        let op_new = format!(
+            "    {op_name}{suffix} {}, {}",
+            REG_NAMES[width][a_fam as usize], REG_NAMES[width][c_fam as usize]
+        );
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, op_new);
+        replace_line(store, &mut infos[k], k, format!("    {reader_new}"));
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+/// `true` when the only mention of family `fam` in `insn` is its full-width
+/// (`l`/`q`) register destination: `OP SRC..., %fam` with no `fam` in the
+/// sources. Single-operand forms (implicit destinations such as `mulq`)
+/// never qualify. Whether `OP` also READS its destination (two-address ALU,
+/// `cmov`) is the caller's liveness obligation.
+///
+/// Extension readers (`movz*`/`movs*`) are refused although the rename is
+/// exact: it turns `movzbl %Bb, %Cd` into the self-extension `movzbl %Cb,
+/// %Cd`, which no pass may delete (it clears bits 8..63), while the
+/// cross-register form is what the relay folds retire entirely
+/// (affine_countdown: `movzbl %r12b, %esi; movq %rsi, %rax; movb %al, (m)`
+/// reaches `movb %r12b, (m)`; renamed, a `movzbl %sil, %esi` survived).
+fn kills_family_only(insn: &str, fam: RegId) -> bool {
+    if insn.starts_with("movz") || insn.starts_with("movs") {
+        return false;
+    }
+    let Some((_, rest)) = insn.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let Some((src, dst)) = split_two_operands(rest.trim()) else {
+        return false;
+    };
+    (dst == REG_NAMES[0][fam as usize] || dst == REG_NAMES[1][fam as usize])
+        && !mentions_family(src.as_bytes(), fam)
+}
+
+// ── symbol-LEA CSE ───────────────────────────────────────────────────────────
+
+/// Parse `leaq SRC, %r64` where SRC names no data register (RIP-relative
+/// symbol or absolute symbol).  Returns `(src, family)`.
+fn parse_symbol_lea(t: &str) -> Option<(&str, RegId)> {
+    let rest = t.strip_prefix("leaq ")?;
+    let (src, dst) = split_two_operands(rest)?;
+    let fam = plain_gp_operand(dst)?;
+    if dst != REG_NAMES[0][fam as usize] {
+        return None;
+    }
+    if !is_stable_symbol_expr(src.strip_suffix("(%rip)").unwrap_or(src)) {
+        return None;
+    }
+    if memory_operand_families(src) != 0 {
+        return None; // register-relative address: value can go stale
+    }
+    Some((src, fam))
+}
+
+/// Delete `leaq sym(%rip), %R` when `%R` provably still holds `sym`.
+pub(super) fn eliminate_redundant_symbol_lea(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut cache: [Option<String>; 16] = Default::default();
+    let mut changed = false;
+    for i in 0..len {
+        let info = &infos[i];
+        if info.pinned {
+            cache = Default::default();
+            continue;
+        }
+        if super::helpers::steps_over_line(info, info.trimmed(store.get(i))) {
+            continue;
+        }
+        if !is_window_kind(info.kind)
+            && !matches!(
+                info.kind,
+                LineKind::Push { .. }
+                    | LineKind::Pop { .. }
+                    | LineKind::StoreRbp { .. }
+                    | LineKind::LoadRbp { .. }
+                    | LineKind::SelfMove
+            )
+        {
+            // Label / jump / call / ret / inline asm: nothing survives.
+            cache = Default::default();
+            continue;
+        }
+        let t = info.trimmed(store.get(i));
+        if !info.pinned {
+            if let Some((src, fam)) = parse_symbol_lea(t) {
+                if cache[fam as usize].as_deref() == Some(src) {
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                    continue;
+                }
+                cache[fam as usize] = Some(src.to_string());
+                continue;
+            }
+        }
+        let wr = may_write_families(t, info);
+        if wr == 0 {
+            continue;
+        }
+        for (fam, slot) in cache.iter_mut().enumerate() {
+            if wr & (1u16 << fam) != 0 {
+                *slot = None;
+            }
+        }
+    }
+    changed
+}
+
+// ── immediate narrowing ──────────────────────────────────────────────────────
+
+fn parse_immediate(s: &str) -> Option<i128> {
+    let s = s.strip_prefix('$')?;
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i128::from_str_radix(h, 16).ok()?
+    } else {
+        s.parse::<i128>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// `movabsq $imm32u, %r` / `movq $imm31, %r` → `movl $imm, %r32`.
+pub(super) fn narrow_wide_immediates(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    for i in 0..len {
+        if infos[i].is_nop() || infos[i].pinned || !matches!(infos[i].kind, LineKind::Other { .. })
+        {
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        let (limit, rest) = if let Some(r) = t.strip_prefix("movabsq ") {
+            (0xFFFF_FFFFi128, r)
+        } else if let Some(r) = t.strip_prefix("movq ") {
+            (0x7FFF_FFFFi128, r)
+        } else {
+            continue;
+        };
+        let Some((imm, dst)) = split_two_operands(rest) else {
+            continue;
+        };
+        let Some(fam) = plain_gp_operand(dst) else {
+            continue;
+        };
+        if dst != REG_NAMES[0][fam as usize] {
+            continue;
+        }
+        let Some(v) = parse_immediate(imm) else {
+            continue;
+        };
+        if !(0..=limit).contains(&v) {
+            continue;
+        }
+        let new_line = format!("    movl ${v}, {}", REG_NAMES[1][fam as usize]);
+        replace_line(store, &mut infos[i], i, new_line);
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unsupported_unicode_mnemonics_refuse_without_panicking() {
+        for mnemonic in ["cmpé", "λ", "add界", "λq", "cmplλ", "q", "l"] {
+            let regs = format!("{mnemonic} %eax, %ecx");
+            let immediate = format!("{mnemonic} $1, %eax");
+            assert!(super::parse_reg_reg_alu(&regs).is_none());
+            assert!(super::parse_imm_reg_flag(&immediate).is_none());
+            assert!(super::parse_inplace_op(&immediate).is_none());
+        }
+    }
+
+    use super::*;
+
+    fn run<F: Fn(&mut LineStore, &mut [LineInfo]) -> bool>(asm: &str, f: F) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        f(&mut store, &mut infos);
+        store.build_result(|i| infos[i].is_nop())
+    }
+
+    fn body(s: &str) -> Vec<String> {
+        s.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    const PRO: &str = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n";
+    const EPI: &str = "    ret\n    .cfi_endproc\n    .size f, .-f\n";
+
+    /// `%rbp` as an allocated GPR (callee-saved by push/pop, no frame): a
+    /// dereference through it folds exactly like one through `%r15`.
+    #[test]
+    fn rbp_pointer_load_folds_in_a_frameless_function() {
+        let asm = format!(
+            "{PRO}    pushq %rbp\n    movq %rdi, %rbp\n    movq (%rbp), %rsi\n    cmpq %rsi, %rdx\n    sete %al\n    movzbl %al, %eax\n    popq %rbp\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpq (%rbp), %rdx"), "{out:?}");
+        assert!(!has(&out, "movq (%rbp), %rsi"), "{out:?}");
+    }
+
+    /// Under a frame pointer `disp(%rbp)` is a stack slot, and so is any
+    /// `disp(%rsp)`: both stay with store forwarding.
+    #[test]
+    fn stack_slot_loads_are_left_to_store_forwarding() {
+        let framed = format!(
+            "{PRO}    pushq %rbp\n    movq %rsp, %rbp\n    movq -8(%rbp), %rsi\n    cmpq %rsi, %rdx\n    sete %al\n    movzbl %al, %eax\n    popq %rbp\n{EPI}"
+        );
+        assert_eq!(run(&framed, fuse_load_into_alu), framed);
+        let rsp_slot = format!(
+            "{PRO}    movq 8(%rsp), %rsi\n    cmpq %rsi, %rdx\n    sete %al\n    movzbl %al, %eax\n{EPI}"
+        );
+        assert_eq!(run(&rsp_slot, fuse_load_into_alu), rsp_slot);
+    }
+
+    #[test]
+    fn copy_commute_preserves_implicit_accumulator_reader() {
+        let asm = format!(
+            "{PRO}    movq %rdi, %rax\n    addq %rsi, %rax\n    mulq %r8\n    movq %rdx, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fold_copy_into_dying_operand), asm);
+    }
+
+    #[test]
+    fn copy_commute_preserves_fixed_cl_reader() {
+        let asm = format!(
+            "{PRO}    movq %rdi, %rcx\n    addq %rsi, %rcx\n    shlq %cl, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fold_copy_into_dying_operand), asm);
+    }
+
+    #[test]
+    fn adjacent_commute_preserves_fixed_cl_reader() {
+        let asm = format!(
+            "{PRO}    movq (%rdi), %rcx\n    addq %rsi, %rcx\n    shlq %cl, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fuse_load_into_alu), asm);
+    }
+
+    #[test]
+    fn family_rename_preserves_isa_constraints_not_just_text() {
+        for op in [
+            "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "shld", "shrd",
+        ] {
+            for suffix in ["", "b", "w", "l", "q"] {
+                let text = format!("    {op}{suffix} %cl, %r8");
+                assert!(rename_family(&text, 1, 6).is_none(), "{text}");
+            }
+        }
+        for text in ["mulq %r8", "imulq %r8", "divq %r8", "cqto", "rep movsq"] {
+            assert!(rename_family(text, 0, 6).is_none(), "{text}");
+        }
+        // Positive controls: no blanket ban of RCX, CL or shifts.
+        for (text, from, to, expected) in [
+            ("movzbl %cl, %eax", 1, 6, "movzbl %sil, %eax"),
+            ("shlq $1, (%rcx)", 1, 6, "shlq $1, (%rsi)"),
+            ("shlxq %rcx, %r8, %r9", 1, 6, "shlxq %rsi, %r8, %r9"),
+            ("shlq %cl, %r8", 8, 9, "shlq %cl, %r9"),
+        ] {
+            assert_eq!(rename_family(text, from, to).as_deref(), Some(expected));
+        }
+        assert!(rename_family("movq %rax, %rdx", 0, REG_RSP).is_none());
+        assert!(rename_family("shlq %cl, %r8", 8, 1).is_none());
+        for (from, to) in [(REG_NONE, 0), (0, REG_NONE), (16, 1), (1, 24)] {
+            assert!(rename_family("movq %rax, %rcx", from, to).is_none());
+        }
+    }
+
+    #[test]
+    fn vector_flag_and_string_output_may_writes_are_precise() {
+        for (text, expected) in [
+            ("vptest %xmm5, %xmm7", 0),
+            ("vpcmpistrm $0, %xmm5, %xmm7", 0),
+            ("pcmpestrm $0, %xmm5, %xmm7", 0),
+            ("vpcmpistri $0, %xmm5, %xmm7", RCX),
+            ("pcmpestri $0, %xmm5, %xmm7", RCX),
+            ("vfmadd231sd %xmm2, %xmm3, %xmm4", 0),
+            ("vcvttsd2siq %xmm3, %rax", RAX),
+            ("vfutureop %xmm5, %xmm7", ALL_GPR),
+        ] {
+            assert_eq!(
+                may_write_families(text, &classify_line(text)),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn fuses_sib_load_into_xor() {
+        let asm = format!(
+            "{PRO}    movl (%r12,%rsi,4), %r9d\n    xorl %r9d, %ebp\n    movl %ebp, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "xorl (%r12,%rsi,4), %ebp"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movl (%r12")), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_commuting_adjacent_load_with_product_rename() {
+        // The dot-product pair GCC writes as `imulq (b,%i,8), %rax`:
+        // `movq (a), %rax; movq (b), %rdx; imulq %rax, %rdx` commutes and
+        // folds to `imulq (b), %rax`; the product's later uses rename
+        // %rdx→%rax.
+        let asm = format!(
+            "{PRO}    movq (%rsi,%r11,8), %rax\n    movq (%rdi,%r11,8), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq $0, %rdx\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi,%r11,8), %rax"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq (%rdi,%r11,8)")),
+            "{out:?}"
+        );
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(!has(&out, "addq %rdx, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $0, %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refused_when_other_operand_stays_live() {
+        // %rax (the fused RMW's destination) is still used after the
+        // consumer: the product would clobber that value. Refuse.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    addq %rax, %rcx\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!out.iter().any(|l| l == "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "imulq %rax, %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refused_on_high_byte_in_product_range() {
+        // %dh is the product's high byte: renaming it to %ah would change
+        // the REX encoding contract. Refuse the whole fold.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addb %dh, %cl\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!out.iter().any(|l| l == "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rdi), %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_stops_rename_at_clean_kill() {
+        // `movq $0, %rdx` is a clean full-width kill: the fresh %rdx value
+        // stays in %rdx while the product's uses before it rename to %rax.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq $0, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $0, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_retargets_a_zero_extending_self_move_source() {
+        // A 32-bit self move reads the old product and zero-extends it into
+        // the full %rdx family. Retarget only its source to the fused product;
+        // keep the fresh zero-extended result in %edx for subsequent users.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movl %edx, %edx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movl %eax, %edx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_retargets_a_partial_source_of_full_width_definition() {
+        // The destination is a complete qword definition even though the
+        // source reads only the low byte of the old product. Redirect that
+        // source to the fused product, and leave the new zero-extended byte
+        // result in %rdx.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movzbq %dl, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movzbq %al, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_steps_over_full_width_self_move() {
+        // This one-register return marks %rdx dead at ret; without that ABI
+        // fact the product in %rdx is observable and the fold must be refused.
+        // The q-width self-move is effectless, not a kill: leave it in place
+        // and still rename the following real product consumer.
+        let asm = format!(
+            "{PRO}    # LCCC_RET_RDX 0\n    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rax, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_refuses_when_product_is_returned_in_rdx() {
+        // Without a return marker the raw assembly model keeps both integer
+        // return registers live. Moving the product to %rax would lose the
+        // original %rdx return value, so the whole fusion must be refused.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq %rdx, %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(!has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert_eq!(out, body(&asm), "refusal must preserve every input line");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_retargets_a_full_width_load_address() {
+        // This full-width definition consumes the old product as its memory
+        // address before replacing %rdx. Retarget just that address to the
+        // fused product in %rax and keep the fresh loaded result in %rdx.
+        let asm = format!(
+            "{PRO}    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    movq (%rdx), %rdx\n    movq %rdx, (%r8)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "movq (%rax), %rdx"), "{out:?}");
+        assert!(has(&out, "movq %rdx, (%r8)"), "{out:?}");
+    }
+
+    #[test]
+    fn commuting_adjacent_fuse_rehomes_a_single_family_rmw_product_update() {
+        // This one-register return marks %rdx dead at ret. The RMW reads the
+        // product and produces its next value, so rehome the whole update to
+        // the fused destination rather than treating it as a clean kill.
+        let asm = format!(
+            "{PRO}    # LCCC_RET_RDX 0\n    movq (%rsi), %rax\n    movq (%rdi), %rdx\n    imulq %rax, %rdx\n    addq %rdx, %rcx\n    addq %r8, %rdx\n    movq %rdx, (%r9)\n    movq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %rcx"), "{out:?}");
+        assert!(has(&out, "addq %r8, %rax"), "{out:?}");
+        assert!(has(&out, "movq %rax, (%r9)"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_across_flag_neutral_gap_and_rip_source() {
+        let asm = format!(
+            "{PRO}    movq tbl(%rip), %rcx\n    movq %rdi, %rdx\n    shrq $3, %rdx\n    addq %rcx, %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq tbl(%rip), %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_segment_qualified_load_into_alu() {
+        // The per-CPU shape `this_cpu_ptr(p)->b` in an accumulator:
+        // `movq %gs:8(%rsi), %rax; addq %rax, %r8` is one instruction and one
+        // live GPR more than GCC's `addq %gs:8(%rsi), %r8`.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rsi), %rax\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq %gs:8(%rsi), %r8"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movq %gs:")), "{out:?}");
+    }
+
+    fn volatile_fixture(code: &str) -> (LineStore, Vec<LineInfo>, usize) {
+        let store = LineStore::new(format!("{PRO}{code}{EPI}"));
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let load = (0..store.len())
+            .find(|&i| store.get(i).trim().starts_with("mov"))
+            .unwrap();
+        infos[load].pinned = true;
+        infos[load].volatile_access = true;
+        (store, infos, load)
+    }
+
+    fn assert_volatile_rejected(code: &str) {
+        let (mut store, mut infos, _) = volatile_fixture(code);
+        let text = store.build_result(|_| false);
+        let metadata = infos.clone();
+        assert!(!fuse_load_into_alu(&mut store, &mut infos), "{code}");
+        assert_eq!(store.build_result(|_| false), text, "{code}");
+        assert_eq!(infos, metadata, "{code}");
+    }
+
+    #[test]
+    fn volatile_direct_matrix_preserves_width_address_and_metadata() {
+        for (suffix, temp, dest, result) in
+            [("q", "%r9", "%rdx", "%rax"), ("l", "%r9d", "%edx", "%eax")]
+        {
+            for op in FUSIBLE_OPS {
+                for mem in ["(%rsi)", "8(%rdx)", "(%r9)", "%fs:tls@TPOFF+24"] {
+                    let code = format!(
+                        "mov{suffix} {mem}, {temp}\n{op}{suffix} {temp}, {dest}\nmov{suffix} {dest}, {result}\n"
+                    );
+                    let (mut store, mut infos, load) = volatile_fixture(&code);
+                    assert!(fuse_load_into_alu(&mut store, &mut infos), "{code}");
+                    assert!(infos[load].is_nop());
+                    let expected = format!("{op}{suffix} {mem}, {dest}");
+                    let consumer = (0..store.len())
+                        .find(|&i| store.get(i).trim() == expected)
+                        .unwrap();
+                    assert!(infos[consumer].pinned && infos[consumer].volatile_access);
+                    assert!(!fuse_load_into_alu(&mut store, &mut infos));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn volatile_sign_extended_load_folds_only_at_its_memory_width() {
+        let narrow = "movslq (%rsi), %r9\naddl %r9d, %edx\nmovl %edx, %eax\n";
+        let (mut store, mut infos, _) = volatile_fixture(narrow);
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        assert!(
+            store
+                .build_result(|i| infos[i].is_nop())
+                .contains("addl (%rsi), %edx")
+        );
+        assert_volatile_rejected("movslq (%rsi), %r9\naddq %r9, %rdx\nmovq %rdx, %rax\n");
+    }
+
+    #[test]
+    fn volatile_unsegmented_gap_is_distinct_from_segment_policy() {
+        let code = "movq (%rsi), %r9\nmovq %r10, %r11\naddq %r9, %rdx\nmovq %rdx, %rax\n";
+        assert_volatile_rejected(code);
+        let (mut store, mut infos, load) = volatile_fixture(code);
+        infos[load].pinned = false;
+        infos[load].volatile_access = false;
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn volatile_illegal_forms_leave_text_and_metadata_untouched() {
+        for code in [
+            "movq (%rsi), %r9\naddq %r9, %rdx\nmovq %r9, %rax\n",
+            "movq (%rsi), %r9\naddl %r9d, %edx\nmovq %rdx, %rax\n",
+            "movl (%rsi), %r9d\naddq %r9, %rdx\nmovq %rdx, %rax\n",
+            "movq (%rsi), %r9\naddq %r9, %r9\nmovq %r9, %rax\n",
+            "movq (%rsi), %r9\ncmpq %rdx, %r9\nsete %al\n",
+            "movq (%rsi), %r9\naddq %rdx, %r9\nmovq %r9, %rax\n",
+            "movq (%rsi), %r9\ncmpq $1, %r9\nsete %al\n",
+            "movq (%rsi), %r9\nandnq %r9, %rdx, %rax\n",
+            "movq (%rsi), %r9\nmovq %r9, %r8\naddq %rdx, %r8\nmovq %r8, %rax\n",
+        ] {
+            assert_volatile_rejected(code);
+        }
+        for barrier in [
+            "call other",
+            "barrier:",
+            "movq (%rdi), %r10",
+            ".byte 0x90",
+            ".cfi_adjust_cfa_offset 8",
+            ".p2align 4",
+            ".p2align 4,0xcc",
+        ] {
+            assert_volatile_rejected(&format!(
+                "movq (%rsi), %r9\n{barrier}\naddq %r9, %rdx\nmovq %rdx, %rax\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn volatile_fusion_respects_other_pins_and_debug_attribution() {
+        let code = "movq (%rsi), %r9\naddq %r9, %rdx\nmovq %rdx, %rax\n";
+        for pin_consumer in [false, true] {
+            let (mut store, mut infos, load) = volatile_fixture(code);
+            if pin_consumer {
+                infos[load + 1].pinned = true;
+            } else {
+                infos[load].volatile_access = false;
+            }
+            let metadata = infos.clone();
+            assert!(!fuse_load_into_alu(&mut store, &mut infos));
+            assert_eq!(infos, metadata);
+        }
+        let code = "movq (%rsi), %r9\n.loc 1 2 0\naddq %r9, %rdx\nmovq %rdx, %rax\n";
+        let (mut store, mut infos, _) = volatile_fixture(code);
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        let (mut store, mut infos, load) = volatile_fixture(code);
+        infos[load + 1].pinned = true;
+        assert!(!fuse_load_into_alu(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn real_nested_markers_preserve_two_reads_through_pipeline() {
+        let asm = format!(
+            "{PRO}# LCCC_VOLATILE_BEGIN\n# LCCC_VOLATILE_BEGIN\nmovq (%rsi), %r9\n# LCCC_VOLATILE_END\n# LCCC_VOLATILE_END\naddq %r9, %rdx\n# LCCC_VOLATILE_BEGIN\nmovq (%rdi), %r10\n# LCCC_VOLATILE_END\naddq %r10, %rdx\nmovq %rdx, %rax\n{EPI}"
+        );
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::pin_volatile_access_regions(&store, &mut infos);
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.pinned && i.volatile_access)
+                .count(),
+            2
+        );
+        let metadata = infos.clone();
+        assert!(!fuse_load_into_alu(&mut store, &mut infos));
+        assert_eq!(infos, metadata);
+        let out = super::super::peephole_optimize(asm);
+        let reads: Vec<_> = out
+            .lines()
+            .filter(|l| l.contains("(%rsi)") || l.contains("(%rdi)"))
+            .collect();
+        assert_eq!(reads.len(), 2, "{out}");
+        assert!(reads[0].contains("(%rsi)"), "{out}");
+        assert!(reads[1].contains("(%rdi)"), "{out}");
+        // Re-enter with real markers: finalized assembly intentionally strips
+        // internal metadata and is not a lossless IR serialization.
+        let wrapped = out
+            .lines()
+            .map(|l| {
+                if l.contains("(%rsi)") || l.contains("(%rdi)") {
+                    format!("# LCCC_VOLATILE_BEGIN\n{l}\n# LCCC_VOLATILE_END\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect::<String>();
+        let again = super::super::peephole_optimize(wrapped);
+        assert_eq!(
+            again
+                .lines()
+                .filter(|l| l.contains("(%rsi)") || l.contains("(%rdi)"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn symbolic_tls_zero_extension_cmp_keeps_volatile_inputs_opaque() {
+        let asm = format!(
+            "{PRO}movzbl %fs:a@TPOFF, %r8d\nmovzbl %fs:b@TPOFF+1, %r9d\ncmpl %r9d, %r8d\nsete %al\n{EPI}"
+        );
+        let out = run(&asm, fuse_zero_ext_cmp);
+        assert!(out.contains("cmpb %fs:b@TPOFF+1, %r8b"), "{out}");
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        for i in &mut infos {
+            if matches!(i.kind, LineKind::Other { .. }) {
+                i.pinned = true;
+                i.volatile_access = true;
+            }
+        }
+        assert!(!fuse_zero_ext_cmp(&mut store, &mut infos));
+        assert_eq!(store.build_result(|_| false), asm);
+    }
+
+    #[test]
+    fn fuses_only_an_adjacent_volatile_load_and_repins_the_memory_alu() {
+        let asm = format!(
+            "{PRO}    movq %fs:tls_counter@TPOFF, %r9\n    addq %r9, %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let load = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("movq %fs:"))
+            .expect("volatile load");
+        infos[load].pinned = true;
+        infos[load].volatile_access = true;
+
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        let fused = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)) == "addq %fs:tls_counter@TPOFF, %rdx")
+            .expect("fused memory add");
+        assert!(infos[load].is_nop());
+        assert!(infos[fused].pinned);
+        assert!(infos[fused].volatile_access);
+
+        // Even a flag-neutral instruction is too much movement for a volatile
+        // access. The ordinary nonvolatile pass may cross such a gap, but this
+        // deliberately narrow exception must not.
+        let asm = format!(
+            "{PRO}    movq %fs:tls_counter@TPOFF, %r9\n    movq %r10, %r11\n    addq %r9, %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let load = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("movq %fs:"))
+            .expect("volatile load");
+        infos[load].pinned = true;
+        infos[load].volatile_access = true;
+        assert!(!fuse_load_into_alu(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn fuses_local_exec_tls_operand_like_gcc() {
+        // `return a + tls;` — the LE fold's load, then the add (GCC 16.2:
+        // `addl %fs:s@tpoff, %eax`). Addends and the i386 spelling travel.
+        for mem in [
+            "%fs:s@TPOFF",
+            "%fs:arr@TPOFF+8",
+            "%fs:arr@tpoff-4",
+            "%gs:s@NTPOFF",
+        ] {
+            let asm = format!(
+                "{PRO}    movl {mem}, %eax\n    addl %eax, %edi\n    movl %edi, %eax\n{EPI}"
+            );
+            let out = body(&run(&asm, fuse_load_into_alu));
+            assert!(has(&out, &format!("addl {mem}, %edi")), "{mem}: {out:?}");
+        }
+        // An intervening store to the same variable must block the fusion
+        // (the reloaded value would differ): any `:` line is memory.
+        let asm = format!(
+            "{PRO}    movl %fs:s@TPOFF, %eax\n    movl $5, %fs:s@TPOFF\n    addl %eax, %edi\n    movl %edi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl %fs:s@TPOFF, %eax"), "{out:?}");
+        assert!(!has(&out, "addl %fs:s@TPOFF, %edi"), "{out:?}");
+    }
+
+    /// The base-less Local-Exec operand is a plain memory operand: every
+    /// spelling the TLS fold emits (both modifier cases, signed addends, the
+    /// i386 `%gs:`/`@NTPOFF` form) fuses through the one predicate.  Shapes
+    /// that are not a single memory operand stay refused.  (The predicate
+    /// may accept any validated segment and symbol -- `%fs:s`, `%es:s@TPOFF`
+    /// -- because every fusion re-emits the operand verbatim and the window
+    /// counts every `:`-bearing line as a memory access.)
+    #[test]
+    fn local_exec_tls_operands_are_plain_memory() {
+        for ok in [
+            "%fs:s@TPOFF",
+            "%FS:_x.1@tpoff+16",
+            "%gs:v@NTPOFF-8",
+            "%fs:arr@tpoff-4",
+        ] {
+            assert!(is_plain_memory_operand(ok), "{ok}");
+        }
+        for bad in [
+            "s@TPOFF",          // no segment: an absolute DS address
+            "%fs:s@TPOFF+",     // malformed addend
+            "%fs:s@TPOFF+%rax", // register in the displacement
+            "*%fs:s@TPOFF",     // indirection marker
+            "%fs:",             // no operand at all
+            "$s@TPOFF",         // an immediate
+        ] {
+            assert!(!is_plain_memory_operand(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fuses_segment_qualified_cmp_mirror_and_case_insensitive_prefix() {
+        // Direct form: the loaded scratch is the cmp SOURCE (`cmpl %ecx, %esi`
+        // computes `%esi - %ecx`), and the folded `cmpl {mem}, %esi` keeps the
+        // operand roles — the pre-existing non-segment twin folds identically.
+        let asm = format!(
+            "{PRO}    movl %gs:8(%rdi), %ecx\n    cmpl %ecx, %esi\n    setl %al\n    movzbl %al, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpl %gs:8(%rdi), %esi"), "{out:?}");
+        // Mirror form: the loaded scratch is the cmp DESTINATION slot — the
+        // only slot cmp may take a memory operand in besides the left one —
+        // and the prefix travels with it.  (The kill below is what the
+        // file-liveness proof needs; the plain twin folds identically, so the
+        // override changes nothing about the decision.)
+        for mem in ["8(%rdi)", "%gs:8(%rdi)"] {
+            let asm = format!(
+                "{PRO}    movl {mem}, %edx\n    cmpl %edi, %edx\n    movl %ecx, %edx\n{EPI}"
+            );
+            let out = body(&run(&asm, fuse_load_into_alu));
+            assert!(has(&out, &format!("cmpl %edi, {mem}")), "{mem}: {out:?}");
+        }
+        // The shared validator is case-insensitive, exactly like the
+        // integrated assembler.
+        let asm = format!(
+            "{PRO}    movq %GS:8(%rsi), %rax\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq %GS:8(%rsi), %r8"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_segment_qualified_immediate_cmp_and_bmi_andn() {
+        // Immediate mirror: `cmpl $I, %T` folds to `cmpl $I, MEM` (the 83/81
+        // /7 encoding), and the segment prefix rides along.
+        let asm = format!(
+            "{PRO}    movl %gs:8(%rdi), %edx\n    cmpl $25, %edx\n    movl %ecx, %edx\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpl $25, %gs:8(%rdi)"), "{out:?}");
+        // BMI three-operand form: `andn %T, %S, %D` takes the memory operand in
+        // its AT&T-first (r/m) slot; the prefix rides along here too.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rdi), %rbp\n    andnq %rbp, %rax, %rcx\n    movq %r8, %rbp\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "andnq %gs:8(%rdi), %rax, %rcx"), "{out:?}");
+    }
+
+    #[test]
+    fn segment_qualified_fold_requires_adjacency() {
+        // A segment-qualified operand is re-read at the consumer, and any
+        // instruction in between could rebase FS/GS (`wrfsbase`, `wrmsr`,
+        // `swapgs`); it folds only when nothing can sit in between.  The
+        // DS-relative twin keeps its gap tolerance.
+        let asm = format!(
+            "{PRO}    movq %fs:8(%rsi), %rax\n    movl %edx, %edx\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq %fs:8(%rsi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %r8"), "{out:?}");
+        let asm = format!(
+            "{PRO}    movq 8(%rsi), %rax\n    movl %edx, %edx\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq 8(%rsi), %r8"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_segment_fold_requires_adjacency_too() {
+        // The copy-bridged form moves the memory operand to the OP's line, so
+        // with any instruction between the copy and the op the operand would
+        // be re-read at a different distance — the same rebase hazard the
+        // direct form vetoes.  A register-only gap (here a `movl` that writes
+        // no address family and touches no memory) is exactly the case that
+        // would slip through a missing guard.
+        // `xorl %eax, %eax` retires the loaded value so deadness is proven and
+        // the distance guard is the only thing that can refuse the fold.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rdi), %rax\n    movq %rax, %rbp\n    movl %edx, %edx\n    addq %rsi, %rbp\n    xorl %eax, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq %gs:8(%rdi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rsi, %rbp"), "{out:?}");
+        // Adjacent (gap2 == 0): the copy is the only line between the load and
+        // the op, and a register-to-register mov cannot rebase a segment.
+        let asm = format!(
+            "{PRO}    movq %gs:8(%rdi), %rax\n    movq %rax, %rbp\n    addq %rsi, %rbp\n    xorl %eax, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq %gs:8(%rdi), %rbp"), "{out:?}");
+    }
+
+    #[test]
+    fn malformed_segment_prefix_still_refused() {
+        assert!(is_plain_memory_operand("%fs:tls@TPOFF"));
+        assert!(is_plain_memory_operand("%fs:tls@TPOFF+24"));
+        for malformed in [
+            "%gss:tls@TPOFF",
+            "%fs:tls@TPOFF+bad",
+            "%fs:tls@TPOFF;call evil",
+            "%fs:*tls@TPOFF",
+            "%fs:",
+            "tls@TPOFF",
+        ] {
+            assert!(!is_plain_memory_operand(malformed), "{malformed}");
+        }
+        // `%gss:` is not one of the six segment registers: the operand stays a
+        // load, and nothing may fold it into the consumer.
+        let asm = format!(
+            "{PRO}    movq %gss:8(%rsi), %rax\n    addq %rax, %r8\n    movq %r8, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq %gss:8(%rsi), %rax"), "{out:?}");
+        assert!(has(&out, "addq %rax, %r8"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_cmp_and_imul_consumers() {
+        let asm = format!(
+            "{PRO}    movl 8(%rdi), %ecx\n    cmpl %ecx, %esi\n    setl %al\n    movzbl %al, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpl 8(%rdi), %esi"), "{out:?}");
+        let asm = format!("{PRO}    movq (%rdi), %rcx\n    imulq %rcx, %rax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_loaded_register_live_after() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    addl %ecx, %esi\n    movl %ecx, %eax\n    addl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_across_store_or_address_write() {
+        let asm =
+            format!("{PRO}    movl (%rdi), %ecx\n    movl $1, (%rsi)\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm =
+            format!("{PRO}    movl (%rdi), %ecx\n    addq $4, %rdi\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        // Single-operand writer of the address register without a comma.
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    incq %rdi\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_across_label_call_and_width_mismatch() {
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n.LBB1:\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    call g\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    addq %rcx, %rax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_intervening_load_volatile_order() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    movl (%rsi), %edx\n    addl %ecx, %eax\n    addl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_commuted_unary_load_pair_in_place() {
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rsi, %r11, 8), %rax"), "{out:?}");
+        assert!(has(&out, "notq %rax"), "{out:?}");
+        assert!(has(&out, "andq (%rdi, %r11, 8), %rax"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("%rcx")), "{out:?}");
+    }
+
+    // ---- commuted-unary load-pair fusion: the refusal space ----
+    // Positive control: `fuses_commuted_unary_load_pair_in_place` above.
+    // Each case below breaks exactly one legality condition of the new
+    // shape; the first load must survive verbatim in every one.
+
+    #[test]
+    fn commuted_unary_refuses_when_unary_chain_register_stays_live() {
+        // %rcx is read after the consumer, so its load may not be
+        // retargeted into the product register.
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n    addq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rsi, %r11, 8), %rcx"), "{out:?}");
+        assert!(has(&out, "movq (%rdi, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn commuted_unary_refuses_non_commutative_consumer() {
+        // sub is not commutative: MEM1 may not change places with the
+        // unary-chain operand.
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    subq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn commuted_unary_refuses_segment_overridden_operand() {
+        let asm = format!(
+            "{PRO}    movq %gs:(%r11), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fuse_load_into_alu), asm);
+    }
+
+    #[test]
+    fn commuted_unary_refuses_memory_addressed_by_product() {
+        // MEM1 is addressed through %r10 itself: the load rewrites its own
+        // address base, so the memory text must not be carried past the
+        // intervening instructions into the consumer.
+        let asm = format!(
+            "{PRO}    movq (%r10, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%r10, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_andn_load_pair_with_trailing_copy() {
+        // BMI1 three-operand shape: andn's r/m operand comes from MEM1,
+        // MEM2 stays as the (non-inverted) VEX.vvvv operand, and the
+        // trailing copy to %rax is absorbed into the destination.
+        let asm = format!(
+            "{PRO}    movq (%rdi), %r10\n    movq (%rsi), %rcx\n    andnq %r10, %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "andnq (%rdi), %rcx, %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rsi), %rcx"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "movq (%rdi), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn andn_refuses_when_inverted_operand_stays_live() {
+        // %r10 is read after the andn with a different destination, so
+        // MEM1's load into %r10 is load-bearing and must stay.
+        let asm = format!(
+            "{PRO}    movq (%rdi), %r10\n    movq (%rsi), %rcx\n    andnq %r10, %rcx, %rax\n    addq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_commutative_crc_shape() {
+        let asm = format!(
+            "{PRO}    movl (%r12,%rsi,4), %r9d\n    movq %rbp, %rdi\n    shrl $8, %edi\n    movq %r9, %rbp\n    xorl %edi, %ebp\n    movl %ebp, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl %edi, %ebp"), "{out:?}");
+        assert!(has(&out, "xorl (%r12,%rsi,4), %ebp"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movl (%r12")), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_refuses_non_commutative_and_truncating_copy() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    movq %rcx, %rdx\n    subl %esi, %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm = format!(
+            "{PRO}    movq (%rdi), %rcx\n    movl %ecx, %edx\n    addl %esi, %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi), %rcx"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_refuses_when_partner_rewritten() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    movq %rcx, %rdx\n    addl $1, %esi\n    addl %esi, %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn recurrence_update_in_place_crc_shape() {
+        let asm = format!(
+            "{PRO}    movl (%r8,%r9,4), %edi\n    movl %ebx, %r9d\n    shrl $8, %r9d\n    movl %edi, %ebx\n    xorl %r9d, %ebx\n    movl %ebx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "shrl $8, %ebx"), "{out:?}");
+        assert!(has(&out, "xorl %edi, %ebx"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movl %ebx, %r9d")),
+            "{out:?}"
+        );
+        // Then the load fuses because %r9 is no longer rewritten.
+        let out2 = body(&run(&out.join("\n"), fuse_load_into_alu));
+        assert!(has(&out2, "xorl (%r8,%r9,4), %ebx"), "{out2:?}");
+    }
+
+    /// THREE-OPERAND IMUL FORMS.  `imulq $imm, %Tm, %Tm` (src == dst) is a
+    /// true in-place update: the fold must drop to the 2-operand form on A
+    /// (`imulq $imm, %A`) — NOT retarget the destination while keeping the
+    /// separate source register, which reads the stale pre-copy register
+    /// once the defining copy is deleted (peephole_families shiftchain
+    /// far_use repro @-Os multiplied by garbage).
+    #[test]
+    fn recurrence_3op_imul_src_equals_dst_folds_to_2op() {
+        let asm = format!(
+            "{PRO}    movq %rax, %rsi\n    imulq $7, %rsi, %rsi\n    movq %r8, %rax\n    addq %rsi, %rax\n    movq %rax, %rdi\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "imulq $7, %rax"), "{out:?}");
+        assert!(has(&out, "addq %r8, %rax"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("imulq $7, %rsi, %rax")),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq %rax, %rsi")),
+            "{out:?}"
+        );
+    }
+
+    /// `imulq $imm, %X, %Tm` with X != Tm: the 3-operand form never reads
+    /// its destination, so retargeting the destination to A would CLOBBER
+    /// A_old before OP2 (which reads A) executes.  The fold must refuse.
+    #[test]
+    fn recurrence_refuses_3op_imul_distinct_src() {
+        let asm = format!(
+            "{PRO}    movq %rax, %rsi\n    imulq $7, %rcx, %rsi\n    movq %r8, %rax\n    addq %rsi, %rax\n    movq %rax, %rdi\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movq %rax, %rsi"), "{out:?}");
+        assert!(has(&out, "imulq $7, %rcx, %rsi"), "{out:?}");
+    }
+
+    /// Precision control: the plain 2-operand register form still folds.
+    #[test]
+    fn recurrence_2op_reg_imul_still_folds() {
+        let asm = format!(
+            "{PRO}    movq %rax, %rsi\n    imulq %rcx, %rsi\n    movq %r8, %rax\n    addq %rsi, %rax\n    movq %rax, %rdi\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "imulq %rcx, %rax"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq %rax, %rsi")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn recurrence_update_refuses_live_scratch_and_non_commutative() {
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    shrl $8, %r9d\n    movl %edi, %ebx\n    xorl %r9d, %ebx\n    movl %r9d, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    shrl $8, %r9d\n    movl %edi, %ebx\n    subl %r9d, %ebx\n    movl %ebx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+        // q ops through l copies would change the upper half: refuse.
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    shrq $8, %r9\n    movl %edi, %ebx\n    xorq %r9, %rbx\n    movq %rbx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+        // OP1 reading A itself is not the accumulator shape.
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    addl %ebx, %r9d\n    movl %edi, %ebx\n    xorl %r9d, %ebx\n    movl %ebx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_into_dying_operand_crc_index_shape() {
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %al, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "xorl %ebp, %edi"), "{out:?}");
+        assert!(has(&out, "movzbl %dil, %esi"), "{out:?}");
+        assert!(!has(&out, "movl %ebp, %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_into_dying_operand_refusals() {
+        // C live after the op.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %al, %esi\n    addl %edi, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // B live after the reader.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %al, %esi\n    addl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // Non-commutative op.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    subl %edi, %eax\n    movzbl %al, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // Reader mentions C as well: cannot retarget.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    addl %edi, %eax\n    movl %eax, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // High-byte alias in the reader.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %ah, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+    }
+
+    /// hot_web_loop with an IPA-RA home in %r9: the reader that last reads the
+    /// copy destination also redefines the dying operand's register.
+    #[test]
+    fn copy_into_dying_operand_reader_kills_c() {
+        let asm = format!(
+            "{PRO}    movq %rsi, %r11\n    xorq %rdx, %r11\n    leaq (%rbp, %r11, 1), %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "xorq %rsi, %rdx"), "{out:?}");
+        assert!(has(&out, "leaq (%rbp, %rdx, 1), %rdx"), "{out:?}");
+        assert!(!has(&out, "movq %rsi, %r11"), "{out:?}");
+        // A 32-bit destination zero-extends: a full kill too.
+        let asm = format!(
+            "{PRO}    movl %esi, %r11d\n    xorl %edx, %r11d\n    leal 1(%r11), %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "xorl %esi, %edx"), "{out:?}");
+        assert!(has(&out, "leal 1(%rdx), %edx"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_into_dying_operand_reader_mentions_c_otherwise() {
+        // Partial-width destination merges C's old upper bits: refuse.
+        let asm = format!(
+            "{PRO}    movq %rsi, %r11\n    xorq %rdx, %r11\n    movb %r11b, %dl\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movq %rsi, %r11"), "{out:?}");
+        // C read in the reader's address: C is live after the op.
+        let asm = format!(
+            "{PRO}    movq %rsi, %r11\n    xorq %rdx, %r11\n    leaq (%rdx, %r11, 1), %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movq %rsi, %r11"), "{out:?}");
+        // Implicit %rdx writer (single operand): never a plain kill.
+        let asm = format!(
+            "{PRO}    movq %rsi, %rax\n    xorq %rdx, %rax\n    mulq %rax\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movq %rsi, %rax"), "{out:?}");
+        // Extension reader: renaming would leave a self-extension.
+        let asm = format!(
+            "{PRO}    movl %eax, %r12d\n    xorl %esi, %r12d\n    movzbl %r12b, %esi\n    movb %sil, (%rdi)\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %eax, %r12d"), "{out:?}");
+    }
+
+    /// affine_countdown end to end: the byte store takes the xor result
+    /// directly, with no extension left behind.
+    #[test]
+    fn copy_into_dying_operand_extension_reader_pipeline() {
+        let out = super::super::super::peephole_optimize(format!(
+            "{PRO}    movzbl (%r10, %rdx), %eax\n    movl %eax, %r12d\n    xorl %esi, %r12d\n    movzbl %r12b, %esi\n    movq %rsi, %rax\n    movb %al, (%r10, %rdx)\n    xorl %eax, %eax\n{EPI}"
+        ));
+        assert!(!out.contains("movzbl %sil, %esi"), "{out}");
+        assert!(!out.contains("movzbl %r12b"), "{out}");
+    }
+
+    #[test]
+    fn symbol_lea_cse_all_gprs_and_invalidation() {
+        let asm = format!(
+            "{PRO}    leaq tbl(%rip), %rcx\n    movl (%rcx,%rdx,4), %eax\n    leaq tbl(%rip), %rcx\n    movl (%rcx,%rsi,4), %edx\n    notq %rcx\n    leaq tbl(%rip), %rcx\n    xorl %ecx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq tbl")).count(),
+            2,
+            "{out:?}"
+        );
+        let asm = format!(
+            "{PRO}    leaq tbl(%rip), %r8\n.LBB1:\n    leaq tbl(%rip), %r8\n    jmp .LBB1\n{EPI}"
+        );
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq tbl")).count(),
+            2,
+            "{out:?}"
+        );
+        let asm = format!("{PRO}    leaq 8(%rax), %rcx\n    leaq 8(%rax), %rcx\n{EPI}");
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq 8")).count(),
+            2,
+            "{out:?}"
+        );
+        let asm =
+            format!("{PRO}    leaq tbl(%rip), %rcx\n    call g\n    leaq tbl(%rip), %rcx\n{EPI}");
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq tbl")).count(),
+            2,
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn narrows_wide_immediates_but_keeps_negative_and_large() {
+        let asm = format!(
+            "{PRO}    movabsq $4294967295, %r14\n    movq $2147483647, %rax\n    movq $2147483648, %rcx\n    movq $-1, %rdx\n    movabsq $4294967296, %rsi\n    movabsq $0xff, %r9\n{EPI}"
+        );
+        let out = body(&run(&asm, narrow_wide_immediates));
+        assert!(has(&out, "movl $4294967295, %r14d"), "{out:?}");
+        assert!(has(&out, "movl $2147483647, %eax"), "{out:?}");
+        assert!(has(&out, "movq $2147483648, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $-1, %rdx"), "{out:?}");
+        assert!(has(&out, "movabsq $4294967296, %rsi"), "{out:?}");
+        assert!(has(&out, "movl $255, %r9d"), "{out:?}");
+    }
+
+    #[test]
+    fn may_write_model_is_conservative() {
+        let li = |s: &str| classify_line(s);
+        let t = "    notl %ecx";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RCX);
+        let t = "    divl %ecx";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
+        let t = "    rep stosq";
+        assert_eq!(
+            may_write_families(t.trim(), &li(t)) & ALL_STRING_REGS,
+            ALL_STRING_REGS
+        );
+        let t = "    cmpl %ecx, %eax";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        let t = "    addl %ecx, (%rax)";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        let t = "    frobnicate";
+        assert_eq!(may_write_families(t.trim(), &li(t)), ALL_GPR);
+        let t = "    vmovd %xmm0, %eax";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX);
+        let t = "    cmpxchg16b (%rdi)";
+        assert_eq!(
+            may_write_families(t.trim(), &li(t)) & (RAX | RDX),
+            RAX | RDX
+        );
+    }
+    #[test]
+    fn symbol_cse_rejects_position_dependent_addresses() {
+        for expr in [".", ".+8", ".-8", "8", "-8", "0x10", "1f", "1b"] {
+            let asm = format!(
+                "{PRO}    leaq {expr}(%rip), %r9\n    movq %r9, (%rdi)\n    leaq {expr}(%rip), %r9\n    movq %r9, (%rsi)\n{EPI}"
+            );
+            let out = body(&run(&asm, |store, infos| {
+                eliminate_redundant_symbol_lea(store, infos)
+            }));
+            assert_eq!(
+                out.iter().filter(|s| s.starts_with("leaq ")).count(),
+                2,
+                "{expr}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn may_write_model_is_exact_for_implicit_operands() {
+        let li = |s: &str| classify_line(s);
+        // The widening branch writes ONLY %rdx: %rax is its input. The old
+        // private table returned RAX | RDX, freezing cache invalidation for
+        // an accumulator it never touched.
+        let t = "    cqto";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RDX);
+        // rdtsc vs rdtscp: only the latter reports the TSC_AUX in %rcx.
+        let t = "    rdtsc";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
+        let t = "    rdtscp";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RCX | RDX);
+        // SSE arithmetic does not inherit the integer accumulator pair.
+        let t = "    mulsd %xmm0, %xmm1";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        let t = "    divsd %xmm1, %xmm0";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+    }
+}
+
+// ── zero-extended byte/word compare → memory-operand `cmp` ──────────────
+//
+// A byte-compare loop — LZ4/DEFLATE match extension, `memcmp`, hand-written
+// scanners — lowers to two zero-extending loads and a full-width compare:
+//
+//     movzbl (%rax), %r8d          cmpb  (%rbx), %r8b
+//     movzbl (%rbx), %r9d    ->    ...
+//     cmpl  %r9d, %r8d
+//
+// That is GCC's, Clang's and ICX's shape.  Measured on `lz4_compress.c` with
+// `-DMATCH_RICH=1` (the 96-byte-repeat input that actually reaches the
+// extension loop): GCC emits 4 instructions per iteration, lccc 7.  The
+// generic [`fuse_load_into_alu`] declines the pattern for two independent
+// reasons — it parses only the same-width `movl`/`movq` loads, and it demands
+// the consumer carry the load's exact width.  Neither holds for a
+// zero-extending load feeding a wider compare.
+//
+// ## Why the narrowing is flag-for-flag exact
+//
+// Both operands are zero-extensions of the same narrow width, so as integers
+// `X` and `Y` lie in `[0, 2^n)`.  The full-width compare computes `X - Y`; the
+// narrow one computes the low `n` bits of the same difference, and because
+// `|X - Y| < 2^n` no borrow escapes the low half, so:
+//
+// * **ZF** — `X == Y` iff the narrow difference is zero.  Identical.
+// * **CF** — the unsigned borrow `X <u Y`.  The narrow subtraction borrows on
+//   exactly the same condition.  Identical.
+// * **SF** — bit `n-1` of a possibly-negative difference, against bit 31/63
+//   of the wide one.  **Differs**, and is masked out by the condition codes.
+// * **PF, OF, AF** — all differ.  Masked out, and unreachable by any `cc`.
+//
+// So the fold is licensed only under [`flag_consumers_are_zf_cf_only`], which
+// is exactly the {ZF, CF} condition-code set.  A `js`/`jg`/`jp` downstream
+// vetoes it, as does any whole-word reader (`lahf`, `pushf`, inline asm, an
+// unrecognised mnemonic), and so does a flag-flow walk that could not prove it
+// reached every consumer.  On the two flags that do survive the rewrite the
+// result is not merely equivalent but identical, for any operand values.
+
+/// A zero-extending narrow load: `movz{bl,wl,bq,wq} <mem>, %dst`.
+/// Returns `(narrow_suffix, mem, dest_fam, dest_is_64)`.
+fn parse_zero_ext_load(t: &str) -> Option<(&'static str, &str, RegId, bool)> {
+    let (suf, dest_is_64, rest) = if let Some(r) = t.strip_prefix("movzbl ") {
+        ("b", false, r)
+    } else if let Some(r) = t.strip_prefix("movzwl ") {
+        ("w", false, r)
+    } else if let Some(r) = t.strip_prefix("movzbq ") {
+        ("b", true, r)
+    } else if let Some(r) = t.strip_prefix("movzwq ") {
+        ("w", true, r)
+    } else {
+        return None;
+    };
+    let (src, dst) = split_two_operands(rest)?;
+    if !is_plain_memory_operand(src) {
+        return None;
+    }
+    let fam = plain_gp_operand(dst)?;
+    // The destination must be the exact register spelling of its bank, the
+    // same shape discipline `parse_memory_load` applies.
+    let expect = if dest_is_64 {
+        REG_NAMES[0][fam as usize]
+    } else {
+        REG_NAMES[1][fam as usize]
+    };
+    if dst != expect {
+        return None;
+    }
+    Some((suf, src, fam, dest_is_64))
+}
+
+/// `cmp{l,q} %a, %b` with both operands plain GP registers of the suffix width.
+fn parse_reg_reg_cmp(t: &str) -> Option<(bool, RegId, RegId)> {
+    let (op, is_q, src, dst) = parse_reg_reg_alu(t)?;
+    if op != "cmp" || src == dst {
+        return None;
+    }
+    Some((is_q, src, dst))
+}
+
+/// Fuse `movz{n} memA, X; movz{n} memB, Y; cmp{W} %Y, %X` into
+/// `movz{n} memA, X; cmp{n} memB, X` — and the mirrored operand order — when
+/// the folded register dies at the compare and only ZF/CF select on it.
+/// See the comment above for the flag argument.
+pub(super) fn fuse_zero_ext_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        // All three lines must be plain, unpinned and ADJACENT.  Adjacency is
+        // what makes the window trivially memory-safe: the only memory access
+        // between the first load and the compare is the second load, and the
+        // compare contributes none.  Loads are `Other`; the compare is
+        // classified `Cmp`.
+        let plain = |infos: &[LineInfo], n: usize, cmp_ok: bool| {
+            n < infos.len()
+                && !infos[n].is_nop()
+                && !infos[n].pinned
+                && match infos[n].kind {
+                    LineKind::Other { .. } => true,
+                    LineKind::Cmp => cmp_ok,
+                    _ => false,
+                }
+        };
+        if !plain(infos, i, false) {
+            i += 1;
+            continue;
+        }
+        let first = infos[i].trimmed(store.get(i)).to_string();
+        let Some((suf_a, _mem_a, fam_a, wide_a)) = parse_zero_ext_load(&first) else {
+            i += 1;
+            continue;
+        };
+        let j = next_insn(store, infos, i + 1, len);
+        if !plain(infos, j, false) {
+            i += 1;
+            continue;
+        }
+        let second = infos[j].trimmed(store.get(j)).to_string();
+        let Some((suf_b, mem_b, fam_b, wide_b)) = parse_zero_ext_load(&second) else {
+            i += 1;
+            continue;
+        };
+        // Equal narrow widths, and distinct destinations.  Equal widths are
+        // not an aesthetic choice: a 16-bit compare of an 8-bit load would
+        // read one byte PAST the address the deleted load touched, which can
+        // fault against a page boundary.  Requiring equality keeps the folded
+        // memory access bit-for-bit the one the load performed.
+        if suf_a != suf_b || fam_a == fam_b || wide_a != wide_b {
+            i += 1;
+            continue;
+        }
+        let k = next_insn(store, infos, j + 1, len);
+        if !plain(infos, k, true) {
+            i += 1;
+            continue;
+        }
+        let cons = infos[k].trimmed(store.get(k)).to_string();
+        let Some((is_q, src_fam, dst_fam)) = parse_reg_reg_cmp(&cons) else {
+            i += 1;
+            continue;
+        };
+        // The compare must be the full width of the registers it reads: a
+        // `cmpl` over 32-bit `movzbl` destinations, `cmpq` over 64-bit
+        // `movzbq` ones.  Any other pairing means the compare is already
+        // narrower or wider than the values, which this pass does not model.
+        if is_q != wide_a {
+            i += 1;
+            continue;
+        }
+        // ── The operand-slot problem, and why it is not patched ──────────
+        //
+        // `cmpl %S, %D` computes `D - S` in AT&T order, and a `cmp` may take
+        // its memory operand in EITHER slot:
+        //
+        //     cmp mem, reg   ->  reg - mem        (reg is dst)
+        //     cmp reg, mem   ->  mem - reg        (mem is dst)
+        //
+        // So folding either load is expressible, and the tempting general form
+        // is "keep one register, delete the other load, put the memory in the
+        // matching slot".  Implemented that way it is WRONG, and wrong in a
+        // way that compiles, links and returns a plausible answer.
+        //
+        // Taking the mirrored case -- `cmpl %X, %Y`, i.e. the FIRST load's
+        // register in the source slot and the SECOND load's in the
+        // destination slot -- and keeping the first load's register while
+        // deleting the second is the version that is correct, and it is also
+        // the version with NO address and NO ordering question:
+        //
+        //     cmpl %r8d, %r9d  +  movzbl (%rcx),%r8d  +  movzbl (%rbx),%r9d
+        //       ->   cmpb %r8b, (%rbx)          (r9 deleted)
+        //
+        // The first load keeps its own register and its own address, so its
+        // effective address is never re-evaluated and nothing can observe a
+        // changed address.  The second load's read simply moves DOWN to the
+        // compare, so the two reads stay in source order.  Both properties
+        // fall out of the construction; there is no guard to get wrong and
+        // no case left to audit.
+        //
+        // The shape this replaces is the genuinely dangerous one.  Deleting
+        // the FIRST load instead keeps the second, and then:
+        //
+        //   * if the first load's address uses the second load's
+        //     destination register, the read is re-issued from the NEW value
+        //     (`movzbl (%r8),%r8d` style) -- a different address entirely;
+        //   * the first load's read moves DOWN past the second load's, so two
+        //     sequenced reads swap order, which is observable through
+        //     volatile and atomic accesses and changes which one faults
+        //     first.
+        //
+        // So this pass deletes the second load in BOTH arms.  The arm that
+        // deletes the first load is not merely unguarded, it is not
+        // expressible: its only AT&T spelling computes `S - D` where the
+        // source computed `D - S`.  For an unsigned consumer that inverts
+        // CF, so `jb` silently becomes `ja` and `jbe` becomes `jae`.  That
+        // was a live miscompile, not a theoretical one: assembling the
+        // pass's own output for
+        //
+        //     movzbl (%rdi),%r8d ; movzbl (%rsi),%r9d ; cmpl %r8d,%r9d ; setb %al
+        //
+        // and running it returns 0 where the input returns 1 for
+        // a=200, b=100.  `setb` reads only CF, so the ZF/CF consumer law
+        // admitted it.
+        //
+        // Therefore: exactly one delete site (the second load), exactly one
+        // memory operand (the second load's), exactly one kept register (the
+        // first load's), and the AT&T slot is the only thing that varies.
+        let pick = if src_fam == fam_b && dst_fam == fam_a {
+            // S is the second load: `cmp mem_S, D` keeps D in the dst slot.
+            (fam_a, mem_b, true)
+        } else if src_fam == fam_a && dst_fam == fam_b {
+            // D is the second load: `cmp S, mem_D` puts the memory in the dst
+            // slot, which is what makes the subtraction `D - S` and not `S - D`.
+            (fam_a, mem_b, false)
+        } else {
+            i += 1;
+            continue;
+        };
+        let (keep_fam, fold_mem, keep_is_dst) = pick;
+        // The folded register must be dead the moment the compare retires.
+        // It is always the SECOND load's destination: we never delete the
+        // first, so the first load's address register is untouched by this.
+        if lv.live_after(k, fam_b) != Some(false) {
+            i += 1;
+            continue;
+        }
+        // Only ZF and CF may select on the result.  `from` is the line AFTER
+        // the flag writer, the convention every other caller follows.
+        if !super::flag_peepholes::flag_consumers_are_zf_cf_only_preserving_zf_cf(
+            store,
+            infos,
+            k + 1,
+        ) {
+            i += 1;
+            continue;
+        }
+        let narrow_bank = if suf_a == "b" { 3 } else { 2 };
+        let keep = REG_NAMES[narrow_bank][keep_fam as usize];
+        let new_line = if keep_is_dst {
+            format!("    cmp{suf_a} {fold_mem}, {keep}")
+        } else {
+            format!("    cmp{suf_a} {keep}, {fold_mem}")
+        };
+        mark_nop(&mut infos[j]);
+        replace_line(store, &mut infos[k], k, new_line);
+        lv.refresh_span(store, infos, j, k);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+/// Narrow `cmp{l,q} $imm, %R` to `cmpb $imm, %Rb` when `%R` provably holds a
+/// zero-extended byte -- its last write in the block is `movzb{l,q} SRC, %R`
+/// -- the immediate is in `0..=255`, and only ZF and CF select on the result.
+///
+/// This is GCC's and Clang's byte compare for `c < 0x80` on a promoted byte:
+/// `cmpb $-128, %r10b` is 4 bytes (3 with a legacy register) where
+/// `cmpl $128, %r10d` needs an imm32 and takes 7. The IR narrowing in
+/// `simplify` declines when the widening cast has other readers (narrowing
+/// there gives the byte a second live range, which spilled it in sqlite's
+/// `vdbe_serial_get`); here the extension already sits in `%R`, so reading
+/// its low byte costs nothing.
+///
+/// Flags: `R` and `imm` both lie in `0..=255`, so the wide difference
+/// `R - imm` lies in `-255..=255` and its low byte is the byte difference.
+/// ZF (`R == imm`) and CF (`R <u imm`) are identical; SF, OF, PF and AF can
+/// differ, and a consumer of any of them vetoes the rewrite -- the argument
+/// [`fuse_zero_ext_cmp`] makes above.
+pub(super) fn narrow_zero_ext_imm_cmp(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    for i in 0..store.len() {
+        if infos[i].is_nop() || infos[i].pinned || infos[i].kind != LineKind::Cmp {
+            continue;
+        }
+        let Some(("cmp", _, imm, fam)) = parse_imm_reg_flag(infos[i].trimmed(store.get(i))) else {
+            continue;
+        };
+        // `%spl` needs a REX prefix and the frame pointer families never hold
+        // a loaded byte; neither is worth a special case.
+        let Some(byte) = parse_byte_imm(imm).filter(|_| fam != 4 && fam != 5) else {
+            continue;
+        };
+        if !zero_ext_byte_reaches(store, infos, i, fam)
+            || !super::flag_peepholes::flag_consumers_are_zf_cf_only_preserving_zf_cf(
+                store,
+                infos,
+                i + 1,
+            )
+        {
+            continue;
+        }
+        let byte = i8::from_ne_bytes([byte]);
+        let reg = REG_NAMES[3][fam as usize];
+        replace_line(store, &mut infos[i], i, format!("    cmpb ${byte}, {reg}"));
+        changed = true;
+    }
+    changed
+}
+
+/// `$imm` in `0..=255` (decimal or `0x` hex, as the backend spells it).
+fn parse_byte_imm(imm: &str) -> Option<u8> {
+    let digits = imm.strip_prefix('$')?;
+    let value = match digits.strip_prefix("0x") {
+        Some(hex) => i64::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<i64>().ok()?,
+    };
+    u8::try_from(value).ok()
+}
+
+/// Whether the last write to GP family `fam` before line `at`, within its
+/// block, is a byte zero-extension into the whole family (`movzbl` into the
+/// 32-bit register clears bits 8..63, `movzbq` into the 64-bit one). A
+/// label, branch, call or opaque line ends the search unproven.
+fn zero_ext_byte_reaches(store: &LineStore, infos: &[LineInfo], at: usize, fam: RegId) -> bool {
+    for k in (0..at).rev() {
+        let info = &infos[k];
+        let t = info.trimmed(store.get(k));
+        if super::helpers::steps_over_line(info, t) {
+            continue;
+        }
+        if info.is_barrier() {
+            return false;
+        }
+        if super::helpers::writes_family(info, t, fam) {
+            let (bank, rest) = if let Some(r) = t.strip_prefix("movzbl ") {
+                (1, r)
+            } else if let Some(r) = t.strip_prefix("movzbq ") {
+                (0, r)
+            } else {
+                return false;
+            };
+            return split_two_operands(rest)
+                .is_some_and(|(_, dst)| dst == REG_NAMES[bank][fam as usize]);
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod zeic_tests {
+    use super::*;
+
+    fn run(body: &str) -> Vec<String> {
+        let asm = format!(
+            "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n{body}\n    ret\n.L16:\n    testl %eax, %eax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        narrow_zero_ext_imm_cmp(&mut store, &mut infos);
+        store
+            .build_result(|i| infos[i].is_nop())
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    /// sqlite's varint tail arm, verbatim from the peephole input: the byte
+    /// stays live in `%r10d` (the `andl` copy) and two `cmovb` read CF.
+    #[test]
+    fn narrows_the_varint_tail_compare() {
+        let out = run(
+            "    movzbl 2(%r8), %r10d\n    movl %r10d, %ebx\n    andl $127, %ebx\n    cmpl $128, %r10d\n    movl %r9d, %r11d\n    cmovbl %ecx, %r11d\n    movl $3, %ecx\n    cmovbl %ecx, %r10d",
+        );
+        assert!(has(&out, "cmpb $-128, %r10b"), "{out:?}");
+    }
+
+    #[test]
+    fn legacy_registers_and_64_bit_compares_narrow() {
+        let out = run("    movzbl (%rdi), %esi\n    cmpl $10, %esi\n    jae .L16");
+        assert!(has(&out, "cmpb $10, %sil"), "{out:?}");
+        let out = run("    movzbq (%rdi), %rax\n    cmpq $0xff, %rax\n    je .L16");
+        assert!(has(&out, "cmpb $-1, %al"), "{out:?}");
+    }
+
+    /// Each guard on its own: a signed or sign-flag consumer, a write that
+    /// may leave bits above 7, a label (another predecessor), an immediate
+    /// outside the byte range, and a 16-bit zero-extension.
+    #[test]
+    fn every_unproven_shape_is_left_alone() {
+        for (body, keep) in [
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $128, %esi\n    jl .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $128, %esi\n    js .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    addl $1, %esi\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n.L9:\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $256, %esi\n    jb .L16",
+                "cmpl $256, %esi",
+            ),
+            (
+                "    movzbl (%rdi), %esi\n    cmpl $-1, %esi\n    jb .L16",
+                "cmpl $-1, %esi",
+            ),
+            (
+                "    movzwl (%rdi), %esi\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+            (
+                "    movl (%rdi), %esi\n    cmpl $128, %esi\n    jb .L16",
+                "cmpl $128, %esi",
+            ),
+        ] {
+            let out = run(body);
+            assert!(has(&out, keep), "must refuse:\n{body}\n{out:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod zec_tests {
+    use super::*;
+
+    /// The lz4_compress.c `-DMATCH_RICH=1` match-extension loop, verbatim
+    /// from the peephole input, with the branch the flags feed.
+    const EXTEND: &str = "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n    addq $1, %rcx\n    addq $1, %rbx\n    cmpq %r13, %rcx\n    jb .Ltop\n";
+
+    fn lines(asm: &str) -> Vec<String> {
+        asm.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    /// Runs the pass over `body`, appending the branch targets the snippets
+    /// forward-reference and a flag writer at each, so the flag walk is given
+    /// a realistic block to resolve rather than running off into directives.
+    fn fold(body: &str) -> Vec<String> {
+        let asm = format!(
+            "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n{body}\n.L16:\n    testl %eax, %eax\n.Ltop:\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fuse_zero_ext_cmp(&mut store, &mut infos);
+        lines(&store.build_result(|i| infos[i].is_nop()))
+    }
+
+    #[test]
+    fn folds_the_match_extension_loop_to_gcc_shape() {
+        let out = fold(EXTEND);
+        assert!(has(&out, "cmpb (%rbx), %r8b"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movzbl (%rbx)")),
+            "{out:?}"
+        );
+        assert!(
+            has(&out, "movzbl (%rcx), %r8d"),
+            "retained load must survive: {out:?}"
+        );
+    }
+
+    /// The mirrored operand order used to MISCOMPILE, and this is the
+    /// regression that says so in a form a reviewer can check.
+    ///
+    /// `cmpl %r8d, %r9d` is `r9 - r8`.  The old mirror arm kept `r9` and
+    /// emitted `cmpb %r9b, (%rcx)`, i.e. `(%rcx) - r9` = `r8 - r9`: the
+    /// subtraction was INVERTED.  For an unsigned consumer that flips CF, so
+    /// `jb` became `ja`.  `setb` reads only CF, so the ZF/CF law admitted it.
+    /// Assembling the old output and running it returns 0 where the input
+    /// returns 1 for a=200, b=100.
+    ///
+    /// The fix is not a guard -- it is that the pass never deletes the FIRST
+    /// load, so the only legal AT&T spelling is the one that preserves `D - S`.
+    #[test]
+    fn mirrored_operand_order_preserves_the_subtraction_direction() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r8d, %r9d\n    jne .L16\n",
+        );
+        // r9 (the SECOND load) is deleted; r8 (the FIRST load) survives, so
+        // its effective address is never re-evaluated.
+        assert!(
+            has(&out, "movzbl (%rcx), %r8d"),
+            "first load must survive: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("movzbl (%rbx)")),
+            "second load must be the deleted one: {out:?}"
+        );
+        // `cmp mem, reg` = reg - mem = r8 - r9 is WRONG here; the source was
+        // `cmpl %r8d, %r9d` = r9 - r8, so the memory must land in the dst
+        // slot: `cmp %r8b, (%rbx)` = (%rbx) - r8b = r9 - r8.
+        assert!(has(&out, "cmpb %r8b, (%rbx)"), "{out:?}");
+        assert!(
+            !has(&out, "cmpb %r9b, (%rcx)"),
+            "the CF-inverting spelling must never be produced: {out:?}"
+        );
+    }
+
+    /// The address-dependency hazard that motivated the guard the old mirror
+    /// arm needed.  With the first load never deleted, this is not merely
+    /// refused -- it is impossible, because the first load keeps both its
+    /// address register and its value register.  Pin it so that a future
+    /// "optimisation" that reintroduces a first-load delete is caught here
+    /// rather than by a miscompile.
+    #[test]
+    fn a_load_addressed_by_the_other_loads_destination_is_never_reordered() {
+        // %r8 is the first load's destination AND the second load's address.
+        // Deleting the first load and re-issuing its read at the compare would
+        // read from the post-load %r8 -- a different address.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%r8), %r9d\n    cmpl %r8d, %r9d\n    jne .L16\n",
+        );
+        assert!(
+            has(&out, "movzbl (%rcx), %r8d"),
+            "first load must survive: {out:?}"
+        );
+        assert!(
+            has(&out, "cmpb %r8b, (%r8)"),
+            "second load folds, first does not: {out:?}"
+        );
+        // The surviving load must still read the ORIGINAL address %rcx, and
+        // the folded memory operand must be the SECOND load's own memory.
+        assert!(
+            !out.iter().any(|l| l == "cmpb %r8b, (%rcx)"),
+            "must not re-issue the first load's read: {out:?}"
+        );
+    }
+
+    /// Source-order preservation.  Deleting the FIRST load would move its read
+    /// DOWN past the second load's, swapping two sequenced reads.  Deleting
+    /// the second load moves its read down to the compare, which is still
+    /// after the first read, so the order mem_a-then-mem_b is preserved and
+    /// volatile/atomic semantics and fault order are untouched.
+    #[test]
+    fn the_deleted_load_is_always_the_second_one() {
+        for cmp_line in ["cmpl %r9d, %r8d", "cmpl %r8d, %r9d"] {
+            let out = fold(&format!(
+                "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    {cmp_line}\n    jne .L16\n"
+            ));
+            assert!(
+                out.iter().any(|l| l.starts_with("movzbl (%rcx)")),
+                "the FIRST read must never be the deleted one ({cmp_line}): {out:?}"
+            );
+        }
+    }
+
+    /// The Review-AI control-flow attack, verbatim.  `jb` is an allowed ZF/CF
+    /// consumer and is walked, its target is queued, and the queue is reached
+    /// only through `stc`, which writes CF and NOTHING ELSE.  The old walker
+    /// treated every writer as a total clobber, stopped at `stc`, and never
+    /// reached the `jo` behind it -- so it reported "ZF/CF only" for a block
+    /// containing a consumer of OF, which is precisely the flag the narrowing
+    /// changes.  Byte values 0x7f and 0xff give equal CF and different OF.
+    ///
+    /// The fold must be REFUSED here, and it is, because the walk now steps
+    /// over `stc` (it clobbers only CF, which the fold preserves) and reaches
+    /// `jo`, which reads OF.
+    #[test]
+    fn a_cf_only_flag_setter_does_not_hide_an_of_consumer() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jb .Lkeep\n    addl $1, %eax\n.Lkeep:\n    stc\n    jo .Loverflow\n    ret\n.Loverflow:\n    ret\n",
+        );
+        assert!(
+            has(&out, "cmpl %r9d, %r8d"),
+            "must refuse: `jo` behind `stc` reads OF: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.starts_with("movzbl (%rbx)")),
+            "the folded load must be left alone: {out:?}"
+        );
+    }
+
+    /// The precise half of the same fix, in the direction that must NOT
+    /// regress: a CF-only writer must not make the walk give up on a block
+    /// whose ONLY consumers really are ZF/CF.  This is the common shape --
+    /// a compare feeding `jb` with a `clc` in the middle of the path -- and
+    /// refusing it would throw away the fold for no reason.
+    #[test]
+    fn a_cf_only_flag_setter_does_not_veto_a_genuine_zf_cf_block() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jb .Lkeep\n    clc\n.Lkeep:\n    jae .L16\n    ret\n",
+        );
+        assert!(has(&out, "cmpb (%rbx), %r8b"), "must still fold: {out:?}");
+    }
+
+    /// `sahf` leaves OF alone (SDM), so it is stepped over exactly like `stc`
+    /// -- but only for a rewrite that preserves ZF and CF, and `sahf` writes
+    /// ZF.  So for THIS fold `sahf` is a clobber and must stop the walk, and a
+    /// consumer behind it is unaccounted for -- which is why the walk is
+    /// fail-closed and the fold is refused rather than assumed safe.
+    #[test]
+    fn sahf_is_treated_as_a_zf_clobber() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jb .Lkeep\n    sahf\n.Lkeep:\n    jo .Loverflow\n    ret\n.Loverflow:\n    ret\n",
+        );
+        assert!(
+            has(&out, "cmpl %r9d, %r8d"),
+            "sahf writes ZF, so the block after it is unproved: {out:?}"
+        );
+    }
+
+    /// ── The check that actually catches a wrong fold ────────────────────
+    ///
+    /// Every other test here compares TEXT.  That is not enough, and this is
+    /// the demonstration: the pass shipped a mirrored arm that emitted
+    /// `cmpb %r9b, (%rcx)` for `cmpl %r8d, %r9d` -- the memory in the wrong
+    /// AT&T slot, so the compare computed `r8 - r9` where the source computed
+    /// `r9 - r8`.  For an unsigned consumer that inverts CF, so `jb` became
+    /// `ja`.  It compiled, it assembled, it linked, the instruction count went
+    /// DOWN, the flag-law test passed, and the answer was wrong.
+    ///
+    /// So: run the pass, take the assembly it really produced, assemble that,
+    /// run it, and compare against running the assembly it replaced.  A
+    /// textual assertion can agree with a miscompile; an executed one cannot.
+    ///
+    /// Skips (rather than fails) when no assembler is present, so the test is
+    /// honest about what it proved instead of quietly passing.
+    #[test]
+    fn the_emitted_assembly_computes_the_same_predicate_as_its_input() {
+        // `a > b` on two unsigned chars.  The compare the peephole sees is
+        // `cmpl %first, %second` with a CF-only consumer, which is the shape
+        // that reached the broken mirror arm.
+        const SRC: &str = "f:\n    movzbl (%rdi), %r8d\n    movzbl (%rsi), %r9d\n    cmpl %r8d, %r9d\n    setb %al\n    movzbl %al, %eax\n    ret\n";
+
+        /// Assemble `asm` as the body of `main`, call it for four
+        /// discriminating argument pairs, and return the summed results.
+        ///
+        /// Returns `Err` with the reason instead of skipping.  A harness that
+        /// quietly stops testing is indistinguishable from a passing test --
+        /// and that is exactly how this check managed to sit green with the
+        /// inversion bug live: its first version returned early on a malformed
+        /// wrapper, so it never once ran the folded code.
+        fn run_asm(asm: &str, tag: &str) -> Result<i64, String> {
+            let dir = std::env::temp_dir().join(format!("zec_exec_{tag}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            // Keep instructions only: drop directives, labels, comments, blanks.
+            let body: Vec<&str> = asm
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    !l.is_empty() && !l.starts_with('.') && !l.starts_with('#') && !l.ends_with(':')
+                })
+                .collect();
+            assert!(!body.is_empty(), "{tag}: nothing extracted from {asm:?}");
+            // The pass output becomes `zf`, a C-callable function.  The
+            // driver is ordinary C so the process starts normally: a
+            // hand-rolled `main` in .s fights libc's startup and segfaults for
+            // reasons that have nothing to do with the fold.
+            let mut asm_lines: Vec<String> = vec![
+                "    .text".into(),
+                "    .globl zf".into(),
+                "    .type zf,@function".into(),
+                "zf:".into(),
+            ];
+            asm_lines.extend(body.iter().map(|l| (*l).to_string()));
+            let wrapper = asm_lines.join("\n");
+            let drv = "#include <stdio.h>\n                      unsigned char zf(unsigned char*,unsigned char*);\n                      int main(void){\n                        unsigned char p[2],q[2]; int t=0;\n                        p[0]=200;q[0]=100;t+=zf(p,q);\n                        p[0]=100;q[0]=200;t+=zf(p,q);\n                        p[0]=0;  q[0]=0;  t+=zf(p,q);\n                        p[0]=255;q[0]=0;  t+=zf(p,q);\n                        printf(\"%d\\n\", t); return 0; }\n";
+            let s = dir.join("f.s");
+            std::fs::write(&s, &wrapper).map_err(|e| e.to_string())?;
+            let d = dir.join("d.c");
+            std::fs::write(&d, drv).map_err(|e| e.to_string())?;
+            let exe = dir.join("a.out");
+            let st = std::process::Command::new("gcc")
+                .args([
+                    s.to_str().unwrap(),
+                    d.to_str().unwrap(),
+                    "-o",
+                    exe.to_str().unwrap(),
+                ])
+                .output()
+                .map_err(|e| format!("{tag}: cannot run gcc: {e}"))?;
+            if !st.status.success() {
+                return Err(format!(
+                    "{tag}: assembler/linker rejected it:\n{wrapper}\n---\n{}",
+                    String::from_utf8_lossy(&st.stderr)
+                ));
+            }
+            let st = std::process::Command::new(&exe)
+                .output()
+                .map_err(|e| format!("{tag}: cannot execute: {e}"))?;
+            let t: i64 = String::from_utf8_lossy(&st.stdout)
+                .trim()
+                .parse()
+                .map_err(|_| {
+                    format!(
+                        "{tag}: driver printed {:?}",
+                        String::from_utf8_lossy(&st.stdout)
+                    )
+                })?;
+            Ok(t)
+        }
+
+        // Input, run as-is.
+        let before = run_asm(SRC, "before").expect("harness: unfolded source must run");
+        // Same input, through the pass.
+        let folded_lines = fold(SRC);
+        let folded: Vec<String> = folded_lines.iter().map(|l| format!("    {l}")).collect();
+        let after = run_asm(&folded.join("\n"), "after")
+            .unwrap_or_else(|e| panic!("harness: folded output must run -- {e}\n{folded_lines:?}"));
+        assert_eq!(
+            before, after,
+            "the fold changed the predicate: input returned {before}, folded returned {after}\nfolded: {folded_lines:?}"
+        );
+        // Sanity: this input is one where a wrong answer is actually possible.
+        // a>b, b>a, a<b, b<b for (200,100) => 1 + 0 + 0 + 0.
+        // 2 of the 4 pairs satisfy `a > b`.  A harness that cannot tell the
+        // two operand orders apart would return a different number here.
+        assert_eq!(before, 2, "harness: the four pairs must discriminate");
+    }
+
+    #[test]
+    fn folds_word_wide_zero_extension() {
+        let out = fold(
+            "f:\n    movzwl (%rcx), %r8d\n    movzwl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpw (%rbx), %r8w"), "{out:?}");
+    }
+
+    #[test]
+    fn folds_64_bit_zero_extension() {
+        let out = fold(
+            "f:\n    movzbq (%rcx), %r8\n    movzbq (%rbx), %r9\n    cmpq %r9, %r8\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpb (%rbx), %r8b"), "{out:?}");
+    }
+
+    #[test]
+    fn preserves_cf_selecting_branches() {
+        // `jb`/`jbe`/`jae`/`ja` read CF (and ZF) and nothing else, so the
+        // flag-preserving narrowing is legal and must fire.
+        for br in ["jb", "jbe", "jae", "ja", "jne", "je"] {
+            let out = fold(&format!(
+                "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    {br} .L16\n"
+            ));
+            assert!(
+                has(&out, "cmpb (%rbx), %r8b"),
+                "{br} should permit the fold: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_when_a_consumer_selects_on_sf() {
+        // `js` reads SF, which the byte compare does NOT preserve: the 32-bit
+        // result is negative whenever r8d < r9d, while the 8-bit one borrows
+        // instead.  This is what makes the fold unsound.
+        for br in ["js", "jns", "jg", "jng", "jl", "jge", "jp", "jo"] {
+            let out = fold(&format!(
+                "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    {br} .L16\n"
+            ));
+            assert!(
+                has(&out, "cmpl %r9d, %r8d"),
+                "{br} must veto the fold: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_setcc_selecting_on_sf() {
+        // `sets` is a ZF/SF consumer reached without a branch, so the walk
+        // must still charge it with reading outside {ZF, CF}.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    sets %al\n    movzbl %al, %eax\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_whole_flag_reader() {
+        // `lahf` captures the entire EFLAGS word, AF included, so no
+        // narrowing is permissible.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    lahf\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_mismatched_narrow_widths() {
+        // A 16-bit compare of an 8-bit load would read ONE BYTE PAST the
+        // address the deleted load touched, which can fault at a page edge.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzwl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_the_folded_register_is_live_after() {
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n    movl %r9d, %eax\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_non_adjacent_triple() {
+        // A store between the loads could alias the second load's memory
+        // operand, so the pass only folds strictly adjacent triples.
+        let out = fold(
+            "f:\n    movzbl (%rcx), %r8d\n    movl %eax, (%rbx)\n    movzbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn never_widens_the_memory_access_of_a_sign_extending_load() {
+        // `movsbl` is NOT a zero extension: folding it would compare the
+        // sign-extended value against the byte.
+        let out = fold(
+            "f:\n    movsbl (%rcx), %r8d\n    movsbl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_plain_full_width_pair() {
+        // The pre-existing `fuse_load_into_alu` already owns `movl`/`movq`;
+        // this pass must not double-handle or perturb it.
+        let out = fold(
+            "f:\n    movl (%rcx), %r8d\n    movl (%rbx), %r9d\n    cmpl %r9d, %r8d\n    jne .L16\n",
+        );
+        assert!(has(&out, "cmpl %r9d, %r8d"), "{out:?}");
+    }
+}
+
+/// Focused tests for [`fuse_load_into_lea_add`] (the "lea-inplace" fold):
+/// `mov MEM,%t; leaq (%B,%t,1),%S` -> `add MEM,%B` with the `%S` consumer chain
+/// renamed onto `%B`.
+///
+/// The template is the shape the register allocator really emits for a
+/// loop-carried accumulator it could not keep in place: the sum is built in a
+/// fresh register `%S` and written back to `%B` by the final `leaq`.  That
+/// write-back is what makes `%B` provably dead right after the LEA, which is
+/// the guard the fold needs.  It is also why the fold is worth having: with it
+/// the loop body loses one instruction and one live register —
+/// `tests/benchmark/programs/percpu_ptr_walk.c` and `tw.c` both drop from 9 to
+/// 8 instructions per iteration.
+#[cfg(test)]
+mod lea_fold_tests {
+    use super::*;
+
+    /// The folding template, parameterised by the two lines under test.
+    fn tmpl(load: &str, lea: &str, extra: &str) -> String {
+        format!(
+            "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n{extra}    xorl %edx, %edx\n.LBB1:\n    testq %rdi, %rdi\n    je .LBB3\n.LBB2:\n    {load}\n    {lea}\n    xorq 16(%rdi), %r11\n    movq (%rdi), %r9\n    andq $7, %r9\n    leaq (%r11,%r9,1), %rdx\n    movq 24(%rdi), %rdi\n    testq %rdi, %rdi\n    jne .LBB2\n.LBB3:\n    movq %rdx, %rax\n    ret\n    .cfi_endproc\n    .size f, .-f\n"
+        )
+    }
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fuse_load_into_lea_add(&mut store, &mut infos);
+        store
+            .build_result(|i| infos[i].is_nop())
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    fn plain() -> String {
+        tmpl("movq 8(%rdi), %r9", "leaq (%rdx,%r9,1), %r11", "")
+    }
+
+    #[test]
+    fn folds_the_lea_inplace_step_and_renames_the_chain() {
+        let out = run(&plain());
+        // The load is gone; the accumulator doubles as the base and the whole
+        // consumer chain is renamed onto it.
+        assert!(has(&out, "addq 8(%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "xorq 16(%rdi), %rdx"), "{out:?}");
+        assert!(has(&out, "leaq (%rdx,%r9,1), %rdx"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("%r11")), "{out:?}");
+    }
+
+    #[test]
+    fn folds_a_segment_qualified_load() {
+        // The per-CPU spelling: the folded ALU op takes the `%gs:` memory
+        // operand whole, so the scratch load disappears entirely.
+        let out = run(&tmpl(
+            "movq %gs:8(%rdi), %r9",
+            "leaq (%rdx,%r9,1), %r11",
+            "",
+        ));
+        assert!(has(&out, "addq %gs:8(%rdi), %rdx"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movq %gs:")), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_the_next_instruction_cannot_carry_the_flags() {
+        // The inserted `add` clobbers EFLAGS; the instruction that consumes the
+        // renamed value must be a full clobber itself (`leaq` is flag-neutral
+        // and would silently re-read the pre-fold flags).
+        let asm = plain().replace("xorq 16(%rdi), %r11", "leaq 16(%rdi), %r11");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r9,1), %r11"), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("addq 8(%rdi)")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_when_the_load_destination_is_live_after_the_lea() {
+        // `%r8` (the scratch) escapes to the exit block: the load cannot be
+        // folded away because the value is still needed.
+        let asm = plain()
+            .replace("movq 8(%rdi), %r9", "movq 8(%rdi), %r8")
+            .replace("leaq (%rdx,%r9,1), %r11", "leaq (%rdx,%r8,1), %r11")
+            .replace("movq %rdx, %rax", "addq %r8, %rdx\n    movq %rdx, %rax");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r8,1), %r11"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_the_base_is_not_dead_after_the_lea() {
+        // Drop the write-back: `%rdx` now flows to the exit unmodified, so the
+        // `add` would destroy a live value.
+        let asm = plain().replace("    leaq (%r11,%r9,1), %rdx\n", "");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r9,1), %r11"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_frame_register_bases() {
+        // `%rsp` is never a value home: a `leaq (%rsp,%t,1)` builds an address
+        // and folding it would clobber the stack pointer.
+        let sp = tmpl("movq 8(%rdi), %r9", "leaq (%rsp,%r9,1), %r11", "");
+        let out = run(&sp);
+        assert!(has(&out, "leaq (%rsp,%r9,1), %r11"), "{out:?}");
+        // `%rbp` is a value home only in frame-pointer-omitting functions.
+        let bp_fp = tmpl(
+            "movq 8(%rdi), %r9",
+            "leaq (%rbp,%r9,1), %r11",
+            "    movq %rsp, %rbp\n",
+        );
+        let out = run(&bp_fp);
+        assert!(has(&out, "leaq (%rbp,%r9,1), %r11"), "{out:?}");
+        // …and folds when the frame pointer really is absent (the relay has to
+        // write `%rbp` back, exactly as it writes `%rdx` in the template).
+        let bp_fpo = tmpl("movq 8(%rdi), %r9", "leaq (%rbp,%r9,1), %r11", "")
+            .replace("leaq (%r11,%r9,1), %rdx", "leaq (%r11,%r9,1), %rbp")
+            .replace("movq %rdx, %rax", "movq %rbp, %rax");
+        let out = run(&bp_fpo);
+        assert!(has(&out, "addq 8(%rdi), %rbp"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_a_width_mismatch_between_load_and_lea() {
+        // A 32-bit load with a 64-bit LEA would add a partially-defined value.
+        let asm = tmpl("movl 8(%rdi), %r9d", "leaq (%rdx,%r9,1), %r11", "");
+        let out = run(&asm);
+        assert!(has(&out, "leaq (%rdx,%r9,1), %r11"), "{out:?}");
+    }
+}

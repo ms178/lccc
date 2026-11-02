@@ -1,0 +1,125 @@
+{
+  "base": "3ff36e8592b0d0e26645bf37d6685395b1a6eca5",
+  "ci_receipt": "Exact final tree CI result is published outside the source tree in workspace artifacts; UNGATED checkpoints are not green CI.",
+  "files": {
+    "address-after.txt": "4596615f2da59f6482b97230a623a2140deba569bcefb618b6d8eb0bd4b76852",
+    "asm-inputs-before.s": "eb5c2a1b44f71d97813f7c6e87175f27eb20d743e3e2f7b98fec37967a80a0f9",
+    "build-homes.txt": "89ae7fd04beaaedba0d2c9f3380a1849a88cedc3d95beb238bc317cdc98457a9",
+    "codegen-identity.json": "9afad042d7f6718666458f887f900d43acc990c8a94db5f9db1f15ec554224e8",
+    "codegen-identity.txt": "3a2cab7994e00cb3e099ff35216b9d16c7680fbc420abe12eed1284ef424af8e",
+    "expat-attribution-aa.txt": "e7e41cc369e47ab0cb6802363998cbd267c242fb69cfd11ca606737751ad33a0",
+    "expat-attribution-bb.txt": "0b3ac191d75878797a83da8bb95e76414daa7743b7dbceab2a79aac6baeb8441",
+    "f1-before.txt": "09b0c10cb79ff132f59e55c29e2d39c43d29067a5f31a963eea54644ffdbe291",
+    "f3-before.txt": "d799819189fee11cfd20cf01e2bb5159be4ecb93caf424dc0cf1f8fcdaef47d6",
+    "godbolt-audit.txt": "3e30ebad3acf8820b54ec97395f16d37a8a8e08ce54b2778d3712410f622bfe7",
+    "i386-abi-after.txt": "755e3e64f109330cadfc1fe97e0000e531a936d289e0736d4d3d7d233b20b531",
+    "i386-dynamic-before.txt": "4e4da0788141fb2a1844cc672a130195471dbb1fab88c2f06716e9602e260d33",
+    "i386-relent-mutation.txt": "a77a382082e4bb45deab0566fd47f95bf02a58c22408a3991e63aca6d3784ad4",
+    "linker-fixtures-after.txt": "f67a4a846fddb2510e60175889f2392b6e8aa62929ff05dad284aa39ccbfc058",
+    "linker-fixtures-before.txt": "0900a9a586b598b375c705d4dd05e7b82a52e6ce8c7776bca45b50e1f6da9375",
+    "measurements.tar.gz": "2816c5dce4e276fc713a65b3a5afc3b265946013804f4adf9942c9ca9035345f",
+    "memcheck.json": "e3ebc4e2158361997cba6b18f695b3cf810a1267b9a217db88c00a8aca0b19a0",
+    "notype-after.txt": "d750959455aadfc0cc5f7b2643d7473f88588c56d396aec8907f7a90b07bd54c",
+    "oracle-attempt-core-avx2.txt": "f5b73dc47eac4e62c0ecb377651dc2ae1ace3fc24dcd5b98b924b5023975799d",
+    "oracle-attempt-v3.txt": "aff170639ff32c43cdc7447b656c486988bee59f1e237d5b05df6a0821f761aa",
+    "oracle-final.txt": "d1d21938551bf45bc97539dd2b4c2e9084ef3f5808af23d2d9f06f12153dc1bb",
+    "popcount-after.txt": "4b9f5f7305c868c59b7510e8a30bd02d982479579c2692a8b24419fbd1a42fee",
+    "repeated-measurements.tar.gz": "6bbc2918b26be1161b1639a7710873c67f570acfe5e0cd70a335815d9986f383",
+    "workloads.tar.gz": "74fd05b575a341db554799058bd656e4e55c2755da7d1b8d805bc7b5730693f6"
+  },
+  "host": "Linux-6.1.158+-x86_64-with-glibc2.43",
+  "inputs": {
+    "src/backend/arm/codegen/asm_emitter.rs": "05269c53196f1d3ef0b1b9e91e623818303f1ab906e74a9a9785a6bef88e767b",
+    "src/backend/arm/linker/reloc.rs": "e8407ef1263f708b6f99370d5f7f7c975cfd35b607fb7881eba6843e23d0d158",
+    "src/backend/i686/linker/dynamic.rs": "b5f2e5f8decf4f6626499d6dcd4e1fbe8a17a0237fbfc6daf9e8f3ea03285947",
+    "tests/benchmark/programs/expat_xml_scan.c": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+    "tests/benchmark/programs/gzip_crc32.c": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+    "tests/benchmark/programs/zlib_ng_adler32.c": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+    "tests/linker/run_linker_tests.py": "b590d5fc950dadf6a90b7e60bf6081bf99f10195329697aa82bad5bc5c4037f0",
+    "tests/regression/fixtures/arm_popcount/asm_inputs.c": "20febad7a305f24e3d2badf64f53a450d2d84f0143ff33e17bd8f5650b426333"
+  },
+  "perf_event_paranoid": "2",
+  "pmu_sysfs": [
+    "breakpoint",
+    "msr",
+    "software",
+    "tracepoint",
+    "uprobe"
+  ],
+  "schema": "lccc-pr821-822-evidence-v1",
+  "target_warning": "virtual Xeon, not physical i7-14700KF; no PMU speed claims",
+  "tools": {
+    "bfd": {
+      "banner": "GNU ld (GNU Binutils for Debian) 2.47",
+      "command": [
+        "ld",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "clang": {
+      "banner": "Debian clang version 23.1.3 (1)",
+      "command": [
+        "clang",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "ctest": {
+      "banner": "ctest version 3.31.6",
+      "command": [
+        "ctest",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "gas_aarch64": {
+      "banner": "GNU assembler (GNU Binutils for Debian) 2.47",
+      "command": [
+        "aarch64-linux-gnu-as",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "gcc": {
+      "banner": "gcc (Debian 16.2.0-3) 16.2.0",
+      "command": [
+        "gcc",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "lld": {
+      "banner": "Debian LLD 23.1.3 (compatible with GNU linkers)",
+      "command": [
+        "ld.lld",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "qemu": {
+      "banner": "qemu-aarch64 version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)",
+      "command": [
+        "qemu-aarch64",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "rust": {
+      "banner": "rustc 1.99.0 (b940084d7 2026-09-28)",
+      "command": [
+        "/home/user/.cargo/bin/rustc",
+        "--version"
+      ],
+      "exit": 0
+    },
+    "valgrind": {
+      "banner": "valgrind-3.24.0",
+      "command": [
+        "valgrind",
+        "--version"
+      ],
+      "exit": 0
+    }
+  }
+}

@@ -1,0 +1,1939 @@
+//! Shared type-building utilities used by both sema and lowering.
+//!
+//! This module contains the canonical implementations of functions that convert
+//! AST type syntax (TypeSpecifier + DerivedDeclarator chains) into CType values.
+//!
+//! The core `TypeConvertContext` trait provides a single `resolve_type_spec_to_ctype`
+//! default method that handles all 22 primitive C types, pointers, arrays, and
+//! function pointers identically. Only 4 cases differ between sema and lowering
+//! (typedef names, struct/union, enum, typeof), so implementors provide just those
+//! via required trait methods. This ensures primitive type mapping can never diverge.
+
+use crate::common::types::{AddressSpace, CType, ExtVectorLayout, FunctionType, PtrQuals};
+use crate::frontend::parser::ast::{
+    DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
+};
+
+/// Trait for contexts that can resolve types and evaluate constant expressions.
+///
+/// Both sema and lowering implement this trait. The shared `resolve_type_spec_to_ctype`
+/// default method handles all primitive types, pointers, arrays, and function pointers.
+/// Implementors only provide the 4 divergent methods for typedef, struct/union, enum,
+/// and typeof resolution.
+pub trait TypeConvertContext {
+    /// Resolve a typedef name to its CType.
+    /// Sema: looks up in type_context.typedefs.
+    /// Lowering: also checks function pointer typedefs for richer type info.
+    fn resolve_typedef(&self, name: &str) -> CType;
+
+    /// Resolve a struct or union definition to its CType.
+    /// Both phases compute layout, but lowering has caching and forward-declaration logic.
+    fn resolve_struct_or_union(
+        &self,
+        name: &Option<String>,
+        fields: &Option<Vec<StructFieldDecl>>,
+        is_union: bool,
+        is_packed: bool,
+        pragma_pack: Option<usize>,
+        struct_aligned: Option<usize>,
+        reverse_sso: bool,
+    ) -> CType;
+
+    /// Resolve an enum type to its CType.
+    /// Sema: returns CType::Enum with name info.
+    /// Lowering: returns CType::Int (enums are ints at IR level).
+    fn resolve_enum(
+        &self,
+        name: &Option<String>,
+        variants: &Option<Vec<EnumVariant>>,
+        is_packed: bool,
+    ) -> CType;
+
+    /// Resolve typeof(expr) to a CType.
+    /// Sema: returns CType::Int (doesn't have full expr type resolution yet).
+    /// Lowering: evaluates the expression's type.
+    fn resolve_typeof_expr(&self, expr: &Expr) -> CType;
+
+    /// Named address space of the object an expression designates, as
+    /// `typeof(expr)` inherits it. GCC gives `typeof(obj)` the object's
+    /// qualifier: `__typeof__(gobj) *p` points into `gobj`'s segment and
+    /// `__typeof__(gobj) v;` declares a segment object. Sema answers from its
+    /// symbol table, lowering from its scope. `Default` for rvalues.
+    fn typeof_object_space(&self, expr: &Expr) -> AddressSpace;
+
+    /// The complete qualifiers of a declaration's base type `spec`: `written`
+    /// (the specifiers' own `const`/`volatile`) plus whatever a typedef base
+    /// carries. `None` when that is not completely known: a typedef whose
+    /// qualifiers the implementor does not track, `typeof(expr)` (the
+    /// expression's qualifiers are not part of `CType`), `__auto_type`.
+    fn specifier_cvr(&self, spec: &TypeSpecifier, written: u8) -> Option<u8> {
+        specifier_cvr_with(spec, written, &|name| self.typedef_cvr(name))
+    }
+
+    /// The qualifiers a typedef's own type carries at its top level
+    /// (`typedef const char cchar;` carries `const`), if tracked.
+    fn typedef_cvr(&self, _name: &str) -> Option<u8> {
+        None
+    }
+
+    /// Space the pointee of a pointer whose innermost base is `leaf` gets from
+    /// that base: `typeof(expr)` contributes the space of `expr`, any other
+    /// base contributes nothing.
+    fn typeof_pointee_space(&self, leaf: &TypeSpecifier) -> AddressSpace {
+        match leaf {
+            // typeof_unqual drops the named address space: no space.
+            TypeSpecifier::Typeof(expr, false) => self.typeof_object_space(expr),
+            _ => AddressSpace::Default,
+        }
+    }
+
+    /// Space the objects declared with `decl_space` and `type_spec` live in:
+    /// the declaration's own qualifier, or for an unqualified `typeof(expr)`
+    /// the space of `expr`. Sema and lowering both read declarations through
+    /// this, so the two can never disagree about where an object lives.
+    fn declaration_address_space(
+        &self,
+        decl_space: AddressSpace,
+        type_spec: &TypeSpecifier,
+    ) -> AddressSpace {
+        if decl_space != AddressSpace::Default {
+            return decl_space;
+        }
+        self.typeof_pointee_space(type_spec)
+    }
+
+    /// Evaluate a constant array bound to an element count.
+    ///
+    /// `elem` is the array's element type, needed because the bound that must
+    /// be rejected is the *byte* size, not the element count: a bound is only
+    /// usable when `count * size_of(elem) <= max_object_bytes()`. Callers pass
+    /// the element type they are about to wrap, so the test happens before the
+    /// `CType::Array` exists and no size can be computed from a bound that is
+    /// not a valid object size.
+    ///
+    /// Returns None if the expression cannot be evaluated at compile time (the
+    /// array then keeps its existing unsized behaviour) *or* if it violates the
+    /// bound rules, in which case the implementation has emitted a diagnostic.
+    fn eval_array_bound_len(&self, expr: &Expr, elem: &CType) -> Option<usize>;
+
+    /// Convert a TypeSpecifier to a CType.
+    ///
+    /// This default implementation handles all shared cases (22 primitive types,
+    /// Pointer, Array, FunctionPointer, TypeofType, AutoType) and delegates to
+    /// the 4 required trait methods for the divergent cases.
+    fn resolve_type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
+        match spec {
+            // === 22 primitive types (identical in sema and lowering) ===
+            TypeSpecifier::Void => CType::Void,
+            TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
+            TypeSpecifier::UnsignedChar => CType::UChar,
+            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
+            TypeSpecifier::Short => CType::Short,
+            TypeSpecifier::UnsignedShort => CType::UShort,
+            TypeSpecifier::Bool => CType::Bool,
+            TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
+            TypeSpecifier::UnsignedInt | TypeSpecifier::Unsigned => CType::UInt,
+            TypeSpecifier::Long => CType::Long,
+            TypeSpecifier::UnsignedLong => CType::ULong,
+            TypeSpecifier::LongLong => CType::LongLong,
+            TypeSpecifier::UnsignedLongLong => CType::ULongLong,
+            TypeSpecifier::Int128 => CType::Int128,
+            TypeSpecifier::UnsignedInt128 => CType::UInt128,
+            TypeSpecifier::Float => CType::Float,
+            TypeSpecifier::Double => CType::Double,
+            TypeSpecifier::Float16 => CType::Float16,
+            TypeSpecifier::BFloat16 => CType::BFloat16,
+            TypeSpecifier::Float128 => CType::Float128,
+            TypeSpecifier::Decimal32 => CType::Decimal32,
+            TypeSpecifier::Decimal64 => CType::Decimal64,
+            TypeSpecifier::Decimal128 => CType::Decimal128,
+            TypeSpecifier::LongDouble => CType::LongDouble,
+            TypeSpecifier::ComplexFloat => CType::ComplexFloat,
+            TypeSpecifier::ComplexDouble => CType::ComplexDouble,
+            TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
+
+            // === Compound types (shared logic) ===
+            TypeSpecifier::Pointer(inner, addr_space) => {
+                // A pointer chain is a LINEAR SPINE -- `int ****p` is
+                // Pointer(Pointer(Pointer(Pointer(Int)))) -- so walking it is a
+                // loop, not a recursion. This arm used to recurse one frame per
+                // `*`, on a path with no frame budget at all: the parser's
+                // PARSER_FRAME_BUDGET machinery covers expressions, blocks,
+                // initializers and record definitions, but not this. Measured
+                // under gdb, ~400k stars abort with rc=134 inside this very arm
+                // ("has overflowed its stack") on a file GCC 16.2 accepts, and
+                // the declaration alone is enough to trigger it -- no call site
+                // involved. Collecting the address spaces on the way down and
+                // wrapping on the way up moves the cost from the thread stack to
+                // the heap, so the legal depth is bounded by memory instead of
+                // by a fixed stack size.
+                //
+                // The single-level fast path keeps the common case identical to
+                // the old code: no scratch allocation, one call, one Box. Only
+                // a genuinely multi-level pointer pays for the Vec, and even
+                // then it trades N call frames for N pushes, which is cheaper.
+                // The innermost pointer's pointee is the base type, so when
+                // the base is `typeof(expr)` an unqualified innermost pointer
+                // takes the space of `expr` (GCC: `__typeof__(gobj) *`).
+                if !matches!(&**inner, TypeSpecifier::Pointer(..)) {
+                    let space = if *addr_space == AddressSpace::Default {
+                        self.typeof_pointee_space(inner)
+                    } else {
+                        *addr_space
+                    };
+                    return CType::Pointer(
+                        Box::new(self.resolve_type_spec_to_ctype(inner)),
+                        PtrQuals::of(space),
+                    );
+                }
+                let mut spaces: Vec<AddressSpace> = vec![*addr_space];
+                let mut node: &TypeSpecifier = inner;
+                while let TypeSpecifier::Pointer(next, space) = node {
+                    spaces.push(*space);
+                    node = next.as_ref();
+                }
+                let leaf_space = self.typeof_pointee_space(node);
+                let mut ty = self.resolve_type_spec_to_ctype(node);
+                let innermost = spaces.len() - 1;
+                for (i, space) in spaces.into_iter().enumerate().rev() {
+                    let space = if i == innermost && space == AddressSpace::Default {
+                        leaf_space
+                    } else {
+                        space
+                    };
+                    ty = CType::Pointer(Box::new(ty), PtrQuals::of(space));
+                }
+                ty
+            }
+            TypeSpecifier::Array(elem, size_expr) => {
+                let elem_ctype = self.resolve_type_spec_to_ctype(elem);
+                let size = size_expr
+                    .as_ref()
+                    .and_then(|e| self.eval_array_bound_len(e, &elem_ctype));
+                CType::Array(Box::new(elem_ctype), size)
+            }
+            TypeSpecifier::FunctionPointer(return_type, params, variadic, has_prototype) => {
+                let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
+                let param_ctypes: Vec<(CType, Option<String>)> = params
+                    .iter()
+                    .map(|p| {
+                        (
+                            param_decl_to_ctype_qualified(
+                                &|ts| self.resolve_type_spec_to_ctype(ts),
+                                &|ts, written| self.specifier_cvr(ts, written),
+                                p,
+                            ),
+                            p.name.clone(),
+                        )
+                    })
+                    .collect();
+                CType::Pointer(
+                    Box::new(CType::Function(Box::new(FunctionType {
+                        return_type: ret_ctype,
+                        params: param_ctypes,
+                        variadic: *variadic,
+                        has_prototype: *has_prototype,
+                    }))),
+                    PtrQuals::of(AddressSpace::Default),
+                )
+            }
+            TypeSpecifier::BareFunction(return_type, params, variadic, has_prototype) => {
+                // Bare function type (no pointer wrapper) — produced by typeof on
+                // function names. Resolves to CType::Function, NOT Pointer(Function).
+                let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
+                let param_ctypes: Vec<(CType, Option<String>)> = params
+                    .iter()
+                    .map(|p| {
+                        (
+                            param_decl_to_ctype_qualified(
+                                &|ts| self.resolve_type_spec_to_ctype(ts),
+                                &|ts, written| self.specifier_cvr(ts, written),
+                                p,
+                            ),
+                            p.name.clone(),
+                        )
+                    })
+                    .collect();
+                CType::Function(Box::new(FunctionType {
+                    return_type: ret_ctype,
+                    params: param_ctypes,
+                    variadic: *variadic,
+                    has_prototype: *has_prototype,
+                }))
+            }
+            TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_to_ctype(inner),
+            TypeSpecifier::AutoType => CType::Int,
+            TypeSpecifier::NullPtrT => CType::NullPtr,
+
+            // === Divergent cases (delegated to implementors) ===
+            TypeSpecifier::TypedefName(name) => self.resolve_typedef(name),
+            TypeSpecifier::Struct(
+                name,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => self.resolve_struct_or_union(
+                name,
+                fields,
+                false,
+                *is_packed,
+                *pragma_pack,
+                *struct_aligned,
+                reverse_sso.is_some_and(|v| v),
+            ),
+            TypeSpecifier::Union(
+                name,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => self.resolve_struct_or_union(
+                name,
+                fields,
+                true,
+                *is_packed,
+                *pragma_pack,
+                *struct_aligned,
+                reverse_sso.is_some_and(|v| v),
+            ),
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
+                let resolved = self.resolve_enum(name, variants, *is_packed);
+                let fixed = underlying.as_deref().and_then(|u| {
+                    crate::common::types::EnumType::fixed_underlying(
+                        self.resolve_type_spec_to_ctype(u),
+                    )
+                });
+                match (resolved, fixed) {
+                    (CType::Enum(mut et), Some(fixed)) => {
+                        et.fixed = Some(Box::new(fixed));
+                        CType::Enum(et)
+                    }
+                    // A context that resolves an enum to its compatible
+                    // integer type (lowering) takes the fixed type itself.
+                    (_, Some(fixed)) => fixed,
+                    (resolved, None) => resolved,
+                }
+            }
+            TypeSpecifier::Typeof(expr, _) => self.resolve_typeof_expr(expr),
+            TypeSpecifier::Vector(inner, total_bytes) => {
+                let elem_ctype = self.resolve_type_spec_to_ctype(inner);
+                CType::Vector(Box::new(elem_ctype), *total_bytes)
+            }
+            TypeSpecifier::ExtVector(inner, lanes) => {
+                let elem_ctype = self.resolve_type_spec_to_ctype(inner);
+                match ExtVectorLayout::new(&elem_ctype, *lanes) {
+                    Some(layout) => CType::ExtVector(Box::new(elem_ctype), layout),
+                    // Parser/sema diagnose unsupported element types and
+                    // invalid lane counts. For malformed recovery, treat the
+                    // attribute the same way GCC treats unknown attributes:
+                    // fall back to the scalar element type so downstream
+                    // layout code never sees a zero-byte Vector.
+                    None => elem_ctype,
+                }
+            }
+        }
+    }
+}
+
+/// The values of an enum body's enumerators (C11 6.7.2.2p3): an explicit
+/// value re-anchors the count, an implicit one continues it. `value` gives a
+/// variant's explicit value; where there is none, or it cannot be folded
+/// (sema reports that), the count continues.
+pub fn enum_variant_values(
+    variants: &[EnumVariant],
+    mut value: impl FnMut(&EnumVariant) -> Option<i64>,
+) -> Vec<(String, i64)> {
+    let mut next: i64 = 0;
+    variants
+        .iter()
+        .map(|v| {
+            if let Some(explicit) = value(v) {
+                next = explicit;
+            }
+            let entry = (v.name.clone(), next);
+            next = next.wrapping_add(1);
+            entry
+        })
+        .collect()
+}
+
+/// The enum type an `enum` specifier names in some context: `completed` is
+/// the definition visible for its tag, `underlying` the resolved C23 `: T`,
+/// `value` as for [`enum_variant_values`]. A body-less reference takes the
+/// visible definition's values, packing and fixed type.
+pub fn enum_type_of(
+    name: &Option<String>,
+    variants: &Option<Vec<EnumVariant>>,
+    is_packed: bool,
+    completed: Option<&crate::common::types::EnumType>,
+    underlying: Option<CType>,
+    value: impl FnMut(&EnumVariant) -> Option<i64>,
+) -> crate::common::types::EnumType {
+    crate::common::types::EnumType {
+        name: name.clone(),
+        variants: match variants {
+            Some(vars) => enum_variant_values(vars, value),
+            None => completed.map(|et| et.variants.clone()).unwrap_or_default(),
+        },
+        is_packed: is_packed || completed.is_some_and(|et| et.is_packed),
+        fixed: match (variants, underlying) {
+            (_, Some(u)) => crate::common::types::EnumType::fixed_underlying(u).map(Box::new),
+            (None, None) => completed.and_then(|et| et.fixed.clone()),
+            (Some(_), None) => None,
+        },
+    }
+}
+
+/// Find the start index of the function pointer core in a derived declarator list.
+///
+/// The function pointer core is one of:
+/// - `[Pointer, FunctionPointer]` — the `(*name)(params)` syntax
+/// - Standalone `FunctionPointer` — direct function pointer declarator
+/// - Standalone `Function` — function declaration (not pointer)
+///
+/// Returns `Some(index)` where the core begins, or `None` if no function
+/// pointer/function declarator is present.
+/// Address space of the storage the pointer at `derived[i]` points into.
+///
+/// The qualifier written after a `*` (carried by that `Pointer`) qualifies the
+/// pointer built by the NEXT `*`: in `long *__seg_gs *p` the first star's
+/// `__seg_gs` makes the first pointer's storage the segment, so `p`'s pointee
+/// is a `%gs` pointer. The pointer at `i` therefore takes its pointee space from
+/// the star immediately before it. The first star has no earlier star, so its
+/// pointee is the base type, and the base-specifier space is placed on it by
+/// `apply_declaration_address_space`.
+/// The address space of the POINTEE of the pointer declared at `derived[i]`:
+/// the space recorded on the previous star (`Default` when there is none).
+///
+/// `T * __seg_gs *p` writes two stars; the qualifier after the first one says
+/// the pointer values that the NEXT (outer) star points at live in %gs, so the
+/// wrapper built for star `i` takes star `i-1`'s space.  This is the single
+/// definition of that rule: `build_full_ctype_with_base` and the parser's
+/// `build_return_type` both call it, so a named variable, a parameter, a
+/// struct member and a function's return type cannot disagree again
+/// (`T * __seg_gs *f(void)` used to lose %gs on the return type only, which
+/// made the kernel's `struct perf_event * __percpu *` return values
+/// unassignable in kernel/events/hw_breakpoint.c).
+pub fn pointee_space_before(derived: &[DerivedDeclarator], i: usize) -> AddressSpace {
+    match i.checked_sub(1).map(|j| &derived[j]) {
+        Some(DerivedDeclarator::Pointer(space, _)) => *space,
+        _ => AddressSpace::Default,
+    }
+}
+
+/// [`pointee_space_before`] with the pointee's qualifiers: star `i` points at
+/// the pointer object star `i-1` made (through any array dimensions between
+/// them, whose elements those pointers are), and that object carries the
+/// qualifiers written after star `i-1`. With no star before it, star `i`
+/// points at the declaration's base type (or arrays of it), qualified by
+/// `base`: the specifiers' qualifiers when they are completely known.
+pub fn pointee_quals_before(derived: &[DerivedDeclarator], i: usize, base: Option<u8>) -> PtrQuals {
+    let quals = PtrQuals::of(pointee_space_before(derived, i));
+    let star = derived[..i]
+        .iter()
+        .rev()
+        .find(|d| !matches!(d, DerivedDeclarator::Array(_)));
+    match star {
+        Some(DerivedDeclarator::Pointer(_, cvr)) => quals.with_cvr(Some(*cvr)),
+        Some(_) => quals,
+        None => quals.with_cvr(base),
+    }
+}
+
+/// Record the qualifiers of the pointer levels a declarator wrote as a
+/// chain of stars (`T q0 * q1 * ... *`, as the parser collects them for
+/// parameters and type names): `levels[k]` qualifies the pointer object at
+/// level `k` (level 0 closest to the base type) and `base` the base type.
+/// Only the outermost `levels.len()` pointer levels of `ty` are the
+/// declarator's; anything below them belongs to the base type (a typedef of
+/// a pointer) and keeps its own record. Nothing is recorded if `ty` has
+/// fewer levels than `levels`.
+pub fn record_pointer_quals(ty: &mut CType, base: Option<u8>, levels: &[u8]) {
+    let mut depth = 0usize;
+    let mut cur: &CType = ty;
+    while let CType::Pointer(inner, _) = cur {
+        depth += 1;
+        cur = inner;
+    }
+    if levels.is_empty() || depth < levels.len() {
+        return;
+    }
+    // The outermost pointer points at the object of level `len - 2`, ...,
+    // the innermost declarator level at the base.
+    let mut cur: &mut CType = ty;
+    for level in (0..levels.len()).rev() {
+        let CType::Pointer(inner, quals) = cur else {
+            return;
+        };
+        let cvr = if level == 0 {
+            base
+        } else {
+            Some(levels[level - 1])
+        };
+        *quals = quals.with_cvr(cvr);
+        cur = inner;
+    }
+}
+
+/// Record the qualifiers of a type the parser folded into a specifier
+/// (`fold_simple_derived`: a struct field's `T *a[2]`, `T **p` or
+/// `T (*p)[3]`). Folding happens only when no star carries a qualifier, so
+/// every folded pointer object is unqualified and the innermost pointee is
+/// the base, qualified `base`. Walks `spec` and `ty` in lockstep and stops
+/// at anything else (a function, a mismatched shape).
+pub fn record_folded_spec_quals(ty: &mut CType, spec: &TypeSpecifier, base: Option<u8>) {
+    match (spec, ty) {
+        (TypeSpecifier::Array(elem_spec, _), CType::Array(elem, _)) => {
+            record_folded_spec_quals(elem, elem_spec, base);
+        }
+        (TypeSpecifier::Pointer(pointee_spec, _), CType::Pointer(pointee, quals)) => {
+            // The pointee's qualifiers are those of its element object: a
+            // pointer to an array is qualified like the array's elements.
+            let mut object = pointee_spec.as_ref();
+            while let TypeSpecifier::Array(elem_spec, _) = object {
+                object = elem_spec;
+            }
+            let cvr = match object {
+                TypeSpecifier::Pointer(..) => Some(0),
+                TypeSpecifier::FunctionPointer(..) | TypeSpecifier::BareFunction(..) => return,
+                _ => base,
+            };
+            *quals = quals.with_cvr(cvr);
+            record_folded_spec_quals(pointee, pointee_spec, base);
+        }
+        _ => {}
+    }
+}
+
+/// [`TypeConvertContext::specifier_cvr`] with the typedef table injected.
+pub fn specifier_cvr_with(
+    spec: &TypeSpecifier,
+    written: u8,
+    typedef_cvr: &dyn Fn(&str) -> Option<u8>,
+) -> Option<u8> {
+    match spec {
+        TypeSpecifier::TypedefName(name) => typedef_cvr(name).map(|t| t | written),
+        TypeSpecifier::Typeof(_, unqual) => unqual.then_some(written),
+        TypeSpecifier::TypeofType(_, quals) => quals.unqual.then_some(written),
+        TypeSpecifier::AutoType => None,
+        _ => Some(written),
+    }
+}
+
+/// [`specifier_cvr_with`] for callers that track no typedef qualifiers: a
+/// pointer built on a typedef base leaves its pointee's unrecorded.
+pub fn untracked_specifier_cvr(spec: &TypeSpecifier, written: u8) -> Option<u8> {
+    specifier_cvr_with(spec, written, &|_| None)
+}
+
+fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
+    for i in 0..derived.len() {
+        // Look for Pointer followed by FunctionPointer
+        if matches!(&derived[i], DerivedDeclarator::Pointer(..))
+            && i + 1 < derived.len()
+            && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(..))
+        {
+            return Some(i);
+        }
+        // Standalone FunctionPointer
+        if matches!(&derived[i], DerivedDeclarator::FunctionPointer(..)) {
+            return Some(i);
+        }
+        // Standalone Function (for function declarations)
+        if matches!(&derived[i], DerivedDeclarator::Function(..)) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Convert a ParamDecl list to a list of (CType, Option<name>) pairs.
+///
+/// Uses the provided `TypeConvertContext` to resolve each parameter's type.
+/// Convert one parameter declaration to the CType it denotes.
+///
+/// This is the single implementation, and it exists because there used to be
+/// two. This one resolved only `p.type_spec`; `SemanticAnalyzer::param_decl_ctype`
+/// resolved the function-pointer fields as well. A parameter list reaches the
+/// compiler by two routes -- a prototype goes through `build_full_ctype_with_base`
+/// (here) and a definition through the analyzer -- so the same signature was
+/// typed differently depending on whether the body had been seen yet:
+///
+/// ```text
+/// void f(int (*p)(int));              // prototype: p is `int *`
+/// void f(int (*p)(int)) { ... }       // definition: p is `int (*)(int)`
+/// ```
+///
+/// and `void g(void) { int (*q)(int); f(q); }` was a hard type error against the
+/// prototype while the identical call to the definition was fine. The analyzer's
+/// doc comment already recorded this failure mode for the SQLite amalgamation
+/// (`int (*xStress)(void*, PgHdr*)` typed as `int *`); it was fixed on one side
+/// of the duplication and not the other. Both sides now call this.
+pub fn param_decl_to_ctype(ctx: &dyn TypeConvertContext, param: &ParamDecl) -> CType {
+    param_decl_to_ctype_qualified(
+        &|ts| ctx.resolve_type_spec_to_ctype(ts),
+        &|ts, written| ctx.specifier_cvr(ts, written),
+        param,
+    )
+}
+
+/// `param_decl_to_ctype` with the TypeSpecifier resolver injected. The
+/// FunctionPointer/BareFunction TypeSpecifier arms and sema's own type
+/// resolver share this so a nested function-pointer parameter
+/// (`int (*fun)(unsigned int)` inside a type name) resolves through
+/// `fptr_params` everywhere; resolving `param.type_spec` alone yields
+/// `int *` and rejects GCC-legal probe dispatch code
+/// (include/trace/events/cpuhp.h __traceiter_cpuhp_enter).
+pub fn param_decl_to_ctype_with(
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    param: &ParamDecl,
+) -> CType {
+    param_decl_to_ctype_qualified(resolve, &untracked_specifier_cvr, param)
+}
+
+/// [`param_decl_to_ctype_with`] recording the qualifiers of the pointer
+/// levels the parameter's declarator wrote (see [`PtrQuals`]), the innermost
+/// one's pointee from `spec_cvr` (see [`TypeConvertContext::specifier_cvr`]).
+/// Plain leading-star chains, adjusted arrays and supported parenthesised
+/// pointer-to-array shapes are recorded. Function-pointer construction paths
+/// without a complete star record remain unknown, never known-unqualified.
+pub fn param_decl_to_ctype_qualified(
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+    param: &ParamDecl,
+) -> CType {
+    let mut ty = param_ctype_unrecorded(resolve, spec_cvr, param);
+    if param.fptr_params.is_some() {
+        return ty;
+    }
+    let written = written_param_cvr(param);
+    if param.decayed_array {
+        if param.paren_star_quals.is_empty() {
+            record_decayed_array_quals(&mut ty, spec_cvr, written, param);
+        }
+        return ty;
+    }
+    if let Some((leaf, leading)) = paren_array_shape(param) {
+        let base = spec_cvr(leaf, written);
+        record_paren_array_quals(
+            &mut ty,
+            base,
+            &param.pointer_quals[..leading],
+            &param.paren_star_quals,
+        );
+        return ty;
+    }
+    let depth = param.pointer_depth as usize;
+    if depth == 0 || param.pointer_quals.len() != depth {
+        return ty;
+    }
+    let mut leaf = &param.type_spec;
+    let mut wraps = 0usize;
+    while let TypeSpecifier::Pointer(inner, _) = leaf {
+        wraps += 1;
+        leaf = inner;
+    }
+    if wraps != depth || is_derived_spec(leaf) {
+        return ty;
+    }
+    record_pointer_quals(&mut ty, spec_cvr(leaf, written), &param.pointer_quals);
+    ty
+}
+
+/// A parameter declared as pointers over arrays over a star chain on a
+/// non-derived base, `T *q... (*q... p)[N]...`: its spec is exactly
+/// `Pointer^t(Array^k(Pointer^l(base)))` with `t` the parenthesised stars
+/// and `l` the leading ones. Returns the base and `l`.
+fn paren_array_shape(param: &ParamDecl) -> Option<(&TypeSpecifier, usize)> {
+    let outer = param.paren_star_quals.len();
+    let leading = (param.pointer_depth as usize + 1).checked_sub(outer)?;
+    if outer == 0 || param.pointer_quals.len() < leading {
+        return None;
+    }
+    let mut spec = &param.type_spec;
+    for _ in 0..outer {
+        let TypeSpecifier::Pointer(inner, _) = spec else {
+            return None;
+        };
+        spec = inner;
+    }
+    let mut arrays = 0usize;
+    while let TypeSpecifier::Array(elem, _) = spec {
+        arrays += 1;
+        spec = elem;
+    }
+    for _ in 0..leading {
+        let TypeSpecifier::Pointer(inner, _) = spec else {
+            return None;
+        };
+        spec = inner;
+    }
+    (arrays > 0 && !is_derived_spec(spec)).then_some((spec, leading))
+}
+
+/// Record a [`paren_array_shape`] type: parenthesised pointer level `j`
+/// (0 closest to the array) points at level `j - 1`, qualified by star
+/// `j - 1`, and level 0 at the array, whose elements are the outermost
+/// leading pointer (qualified by its star) or else the base.
+fn record_paren_array_quals(ty: &mut CType, base: Option<u8>, leading: &[u8], paren: &[u8]) {
+    let elements = leading.last().map_or(base, |&cvr| Some(cvr));
+    let mut cur = ty;
+    for level in (0..paren.len()).rev() {
+        let CType::Pointer(inner, quals) = cur else {
+            return;
+        };
+        *quals = quals.with_cvr(if level == 0 {
+            elements
+        } else {
+            Some(paren[level - 1])
+        });
+        cur = inner;
+    }
+    while let CType::Array(elem, _) = cur {
+        cur = elem;
+    }
+    record_pointer_quals(cur, base, leading);
+}
+
+/// An adjusted array parameter `T q... a[N]...` (C23 6.7.6.3p8): the parser
+/// has already adjusted its spec to exactly `Pointer(Array^(k-1)(Pointer^l(
+/// base)))`, `l` the leading stars. The pointer's pointee is qualified like
+/// the array's elements -- the outermost leading star, or else the base
+/// (`const int a[2]` adjusts to `const int *`). Any other shape stays
+/// unrecorded.
+fn record_decayed_array_quals(
+    ty: &mut CType,
+    spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+    written: u8,
+    param: &ParamDecl,
+) {
+    let depth = param.pointer_depth as usize;
+    if param.pointer_quals.len() != depth {
+        return;
+    }
+    let TypeSpecifier::Pointer(adjusted, _) = &param.type_spec else {
+        return;
+    };
+    let mut spec: &TypeSpecifier = adjusted;
+    while let TypeSpecifier::Array(elem, _) = spec {
+        spec = elem;
+    }
+    for _ in 0..depth {
+        let TypeSpecifier::Pointer(inner, _) = spec else {
+            return;
+        };
+        spec = inner;
+    }
+    if is_derived_spec(spec) {
+        return;
+    }
+    let base = spec_cvr(spec, written);
+    let CType::Pointer(inner, quals) = ty else {
+        return;
+    };
+    *quals = quals.with_cvr(param.pointer_quals.last().map_or(base, |&cvr| Some(cvr)));
+    let mut cur = &mut **inner;
+    while let CType::Array(elem, _) = cur {
+        cur = elem;
+    }
+    record_pointer_quals(cur, base, &param.pointer_quals);
+}
+
+/// The own CVR bits a declarator of only pointers and arrays gives the
+/// declared object (an array: its elements'). The parser lists such a
+/// declarator in type-construction order, innermost first, so after the
+/// trailing array dimensions a final star's own qualifiers are the
+/// object's (`T *const p`, `T *volatile a[3]`, `T (*const p)[3]`); with no
+/// star left the specifier decides (`specifier_cvr`). `None` for a function
+/// declarator, or when `ty`, the declared type, disagrees with that reading.
+pub fn declarator_own_cvr(
+    derived: &[DerivedDeclarator],
+    ty: &CType,
+    specifier_cvr: impl FnOnce() -> Option<u8>,
+) -> Option<u8> {
+    if !derived.iter().all(|d| {
+        matches!(
+            d,
+            DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(_)
+        )
+    }) {
+        return None;
+    }
+    let dims = derived
+        .iter()
+        .rev()
+        .take_while(|d| matches!(d, DerivedDeclarator::Array(_)))
+        .count();
+    let mut top = ty;
+    for _ in 0..dims {
+        let CType::Array(elem, _) = top else {
+            return None;
+        };
+        top = elem;
+    }
+    match derived[..derived.len() - dims].last() {
+        None => specifier_cvr(),
+        Some(DerivedDeclarator::Pointer(_, cvr)) if matches!(top, CType::Pointer(..)) => Some(*cvr),
+        Some(_) => None,
+    }
+}
+
+/// The qualifiers a parameter's specifiers wrote, as `PtrQuals` bits.
+fn written_param_cvr(param: &ParamDecl) -> u8 {
+    u8::from(param.is_const) * PtrQuals::CONST
+        | u8::from(param.is_volatile) * PtrQuals::VOLATILE
+        | u8::from(param.base_restrict) * PtrQuals::RESTRICT
+}
+
+/// Whether `spec` derives a type (array, function, pointer) rather than
+/// naming a base one.
+fn is_derived_spec(spec: &TypeSpecifier) -> bool {
+    matches!(
+        spec,
+        TypeSpecifier::Pointer(..)
+            | TypeSpecifier::Array(..)
+            | TypeSpecifier::FunctionPointer(..)
+            | TypeSpecifier::BareFunction(..)
+    )
+}
+
+fn param_ctype_unrecorded(
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+    param: &ParamDecl,
+) -> CType {
+    if let Some(ref fptr_params) = param.fptr_params {
+        // `float (*func)(float, float)`: the specifier is the pointee function's
+        // return type, and the parenthesised declarator's own parameter list
+        // rides on `fptr_params`. The parser wraps type_spec with a Pointer
+        // per declarator star — the parenthesised group's own stars
+        // (`long (**op)(req)` has two) AND any leading stars (`long *(*op)(req)`
+        // has one, and it qualifies the RETURN pointer). fptr_inner_ptr_depth
+        // counts the parenthesised group's stars — 0 when the parameter list
+        // directly follows a leading star (`void *lookup_elem(struct bpf_map *,
+        // u32)`, a function parameter decaying to a pointer) — so strip
+        // max(that, 1) levels: one for the implicit is_func_ptr wrap, plus the
+        // extra group stars. The old single strip turned `long (**op)(req)`
+        // into a function RETURNING long* one level short
+        // (crypto/ahash.c ahash_do_req_chain); stripping zero made
+        // `void *f(map, u32)` return void** (kernel/bpf/devmap.c
+        // __bpf_xdp_redirect_map's lookup_elem).
+        let return_ctype = resolve(&param.type_spec);
+        let mut actual_return = return_ctype;
+        for _ in 0..param.fptr_inner_ptr_depth.max(1) {
+            if let CType::Pointer(inner, _) = actual_return {
+                actual_return = *inner;
+            } else {
+                break;
+            }
+        }
+        // The leading stars qualify the callback's RETURN, not its object.
+        // pointer_depth includes extra parenthesised group stars; strip those
+        // before matching the plain return-star chain. More complex folded
+        // returns remain unknown rather than assigning bits to the wrong level.
+        let leading = (param.pointer_depth as usize)
+            .saturating_sub(param.fptr_inner_ptr_depth.saturating_sub(1) as usize);
+        let mut leaf = &param.type_spec;
+        let mut wraps = 0;
+        while let TypeSpecifier::Pointer(inner, _) = leaf {
+            wraps += 1;
+            leaf = inner;
+        }
+        if wraps == leading + param.fptr_inner_ptr_depth.max(1) as usize && !is_derived_spec(leaf) {
+            if let Some(levels) = param.pointer_quals.get(..leading) {
+                record_pointer_quals(
+                    &mut actual_return,
+                    spec_cvr(leaf, written_param_cvr(param)),
+                    levels,
+                );
+            }
+        }
+        let param_types: Vec<(CType, Option<String>)> = fptr_params
+            .iter()
+            .map(|p| {
+                (
+                    param_decl_to_ctype_qualified(resolve, spec_cvr, p),
+                    p.name.clone(),
+                )
+            })
+            .collect();
+        let func_type = CType::Function(Box::new(FunctionType {
+            return_type: actual_return,
+            params: param_types,
+            variadic: param.fptr_variadic,
+            has_prototype: param.fptr_has_prototype,
+        }));
+        let mut result = CType::Pointer(Box::new(func_type), PtrQuals::GENERIC);
+        // `(**fpp)(int)` is a pointer to a function pointer; CType would
+        // otherwise erase the distinction from `void *(*fp)(size_t)`.
+        for _ in 1..param.fptr_inner_ptr_depth.max(1) {
+            result = CType::Pointer(Box::new(result), PtrQuals::GENERIC);
+        }
+        return result;
+    }
+    // C23 6.7.6.3p8: a parameter declared as an array is adjusted to a pointer
+    // to its first element, and one declared as a function to a pointer to that
+    // function. Both adjustments belong to the parameter, not to the caller.
+    match resolve(&param.type_spec) {
+        CType::Array(elem, _) => CType::Pointer(elem, PtrQuals::GENERIC),
+        CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), PtrQuals::GENERIC),
+        other => other,
+    }
+}
+
+fn convert_param_decls_to_ctypes_with(
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+    params: &[ParamDecl],
+) -> Vec<(CType, Option<String>)> {
+    params
+        .iter()
+        .map(|p| {
+            (
+                param_decl_to_ctype_qualified(resolve, spec_cvr, p),
+                p.name.clone(),
+            )
+        })
+        .collect()
+}
+
+/// CVR bits of each pointer level of `derived`, in CType creation order.
+/// Index `L-1` describes pointer level `L`; `CType` erases qualifiers, so this
+/// is the only record of a middle level's `const`.
+pub fn declarator_pointer_quals(derived: &[DerivedDeclarator]) -> Vec<u8> {
+    derived
+        .iter()
+        .filter_map(|d| match d {
+            DerivedDeclarator::Pointer(_, cvr) => Some(*cvr),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Build a full CType from a TypeSpecifier and DerivedDeclarator chain.
+///
+/// The derived list is produced by the parser's declarator handling, which stores
+/// declarators outer-to-inner. For building the CType, we process inner-to-outer
+/// (the C "inside-out" declarator rule).
+///
+/// This is the single canonical implementation used by both sema and lowering.
+///
+/// Examples (derived list → CType):
+/// - `int **p`: [Pointer, Pointer] → Pointer(Pointer(Int))
+/// - `int *arr[3]`: [Pointer, Array(3)] → Array(Pointer(Int), 3)
+/// - `int (*fp)(int)`: [Pointer, FunctionPointer([int])] → Pointer(Function(Int→Int))
+/// - `int (*fp[3])(int)`: [Array(3), Pointer, FunctionPointer([int])] → Array(Pointer(Function(Int→Int)), 3)
+/// - `Page *(*xFetch)(int)`: [Pointer, Pointer, FunctionPointer([int])] → Pointer(Function(Pointer(Page)→...))
+pub fn build_full_ctype(
+    ctx: &dyn TypeConvertContext,
+    type_spec: &crate::frontend::parser::ast::TypeSpecifier,
+    derived: &[DerivedDeclarator],
+) -> CType {
+    let base = ctx.resolve_type_spec_to_ctype(type_spec);
+    build_full_ctype_with_base(ctx, base, derived)
+}
+
+/// Build a full CType from an already-resolved base type and derived declarators.
+/// Use this instead of `build_full_ctype` when the base type has already been
+/// resolved (e.g., to avoid re-resolving anonymous struct type specs which would
+/// generate different anonymous struct keys for the same declaration).
+pub fn build_full_ctype_with_base(
+    ctx: &dyn TypeConvertContext,
+    base: CType,
+    derived: &[DerivedDeclarator],
+) -> CType {
+    build_full_ctype_with_callbacks(
+        base,
+        derived,
+        &|ts| ctx.resolve_type_spec_to_ctype(ts),
+        &|e, elem| ctx.eval_array_bound_len(e, elem),
+    )
+}
+
+/// Build a full CType using caller-supplied `TypeSpecifier` and array-bound resolvers.
+/// Shared by `TypeConvertContext` implementors and expression/constant-evaluator
+/// sub-contexts (`ExprTypeChecker`, `SemaConstEval`) so derived declarators
+/// (including function pointers and pointers to arrays) never diverge.
+pub fn build_full_ctype_with_callbacks(
+    base: CType,
+    derived: &[DerivedDeclarator],
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    eval_bound: &dyn Fn(&Expr, &CType) -> Option<usize>,
+) -> CType {
+    build_qualified_ctype_with_callbacks(
+        base,
+        None,
+        derived,
+        resolve,
+        eval_bound,
+        &untracked_specifier_cvr,
+    )
+}
+
+/// [`build_full_ctype`] for a declaration whose specifiers wrote the
+/// qualifiers `written` (`decl_flag::CONST`/`VOLATILE` as `PtrQuals` bits):
+/// the pointer levels the declarator adds record their pointees' qualifiers
+/// (see [`PtrQuals`]), the innermost one from the base when
+/// [`TypeConvertContext::specifier_cvr`] knows it completely.
+pub fn build_qualified_ctype(
+    ctx: &dyn TypeConvertContext,
+    type_spec: &TypeSpecifier,
+    written: u8,
+    derived: &[DerivedDeclarator],
+) -> CType {
+    let base = ctx.resolve_type_spec_to_ctype(type_spec);
+    build_qualified_ctype_with_base(ctx, base, ctx.specifier_cvr(type_spec, written), derived)
+}
+
+/// [`build_qualified_ctype`] on an already-resolved `base` whose qualifiers
+/// are `base_cvr` (see [`TypeConvertContext::specifier_cvr`]).
+pub fn build_qualified_ctype_with_base(
+    ctx: &dyn TypeConvertContext,
+    base: CType,
+    base_cvr: Option<u8>,
+    derived: &[DerivedDeclarator],
+) -> CType {
+    build_qualified_ctype_with_callbacks(
+        base,
+        base_cvr,
+        derived,
+        &|ts| ctx.resolve_type_spec_to_ctype(ts),
+        &|e, elem| ctx.eval_array_bound_len(e, elem),
+        &|ts, written| ctx.specifier_cvr(ts, written),
+    )
+}
+
+/// [`build_full_ctype_with_callbacks`] with the base type's qualifiers, if
+/// completely known (see [`build_qualified_ctype`]).
+pub fn build_qualified_ctype_with_callbacks(
+    base: CType,
+    base_cvr: Option<u8>,
+    derived: &[DerivedDeclarator],
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    eval_bound: &dyn Fn(&Expr, &CType) -> Option<usize>,
+    spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
+) -> CType {
+    let fptr_idx = find_function_pointer_core(derived);
+
+    if let Some(fp_start) = fptr_idx {
+        // Build the function/function-pointer return type from `prefix = &derived[..fp_start]`.
+        // Pointer declarators in `prefix` (and any `Array` dimensions that sit BEFORE a
+        // return-type `Pointer` in `prefix`, such as `int (*get_arr(int))[4]` or
+        // `int (*(*fp)(int))[4]` where `prefix = [Array(4), Pointer]`) belong to the
+        // return type. Only trailing `Array` entries in `prefix` with no `Pointer`
+        // after them in `prefix` (e.g. `[Array(10), Pointer, FunctionPointer]`, where
+        // `prefix = [Array(10)]`) are outer array-of-function-pointers wrappers.
+        let prefix = &derived[..fp_start];
+        let last_prefix_ptr = prefix
+            .iter()
+            .rposition(|d| matches!(d, DerivedDeclarator::Pointer(..)));
+        let return_prefix_end = last_prefix_ptr.map_or(0, |p| p + 1);
+
+        let mut result = base;
+        let mut p = 0;
+        while p < return_prefix_end {
+            match &prefix[p] {
+                DerivedDeclarator::Pointer(..) => {
+                    result = CType::Pointer(
+                        Box::new(result),
+                        pointee_quals_before(derived, p, base_cvr),
+                    );
+                    p += 1;
+                }
+                DerivedDeclarator::Array(_) => {
+                    let start = p;
+                    while p < return_prefix_end && matches!(&prefix[p], DerivedDeclarator::Array(_))
+                    {
+                        p += 1;
+                    }
+                    for j in (start..p).rev() {
+                        if let DerivedDeclarator::Array(size_expr) = &prefix[j] {
+                            let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
+                            result = CType::Array(Box::new(result), size);
+                        }
+                    }
+                }
+                _ => p += 1,
+            }
+        }
+
+        // Process from fp_start to end (the function pointer core and any
+        // additional inner wrappers after it)
+        let mut i = fp_start;
+        while i < derived.len() {
+            match &derived[i] {
+                DerivedDeclarator::Pointer(..) => {
+                    if let Some(DerivedDeclarator::FunctionPointer(
+                        params,
+                        variadic,
+                        has_prototype,
+                    )) = derived.get(i + 1)
+                    {
+                        let param_types =
+                            convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
+                        let func_type = CType::Function(Box::new(FunctionType {
+                            return_type: result,
+                            params: param_types,
+                            variadic: *variadic,
+                            has_prototype: *has_prototype,
+                        }));
+                        result = CType::Pointer(Box::new(func_type), PtrQuals::GENERIC);
+                        i += 2;
+                    } else {
+                        // The parser keeps no qualifiers for the stars around a
+                        // function-pointer core (`declarators.rs` emits them as
+                        // `Pointer(_, 0)`), so this level stays unrecorded.
+                        result = CType::Pointer(
+                            Box::new(result),
+                            PtrQuals::of(pointee_space_before(derived, i)),
+                        );
+                        i += 1;
+                    }
+                }
+                DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
+                    let param_types = convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
+                    let func_type = CType::Function(Box::new(FunctionType {
+                        return_type: result,
+                        params: param_types,
+                        variadic: *variadic,
+                        has_prototype: *has_prototype,
+                    }));
+                    result = CType::Pointer(Box::new(func_type), PtrQuals::GENERIC);
+                    i += 1;
+                }
+                DerivedDeclarator::Function(params, variadic, has_prototype) => {
+                    let param_types = convert_param_decls_to_ctypes_with(resolve, spec_cvr, params);
+                    let func_type = CType::Function(Box::new(FunctionType {
+                        return_type: result,
+                        params: param_types,
+                        variadic: *variadic,
+                        has_prototype: *has_prototype,
+                    }));
+                    result = func_type;
+                    i += 1;
+                }
+                DerivedDeclarator::Array(size_expr) => {
+                    // Array declarators after the function pointer core are outer
+                    // wrappers (e.g., array-of-function-pointers when inner_derived
+                    // had [Pointer, Array(N)] which the parser emits as
+                    // [Pointer, FunctionPointer, Array(N)]).
+                    let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
+                    result = CType::Array(Box::new(result), size);
+                    i += 1;
+                }
+            }
+        }
+
+        // Apply any remaining outer Array wrappers from `prefix[return_prefix_end..]`.
+        for d in prefix[return_prefix_end..].iter().rev() {
+            if let DerivedDeclarator::Array(size_expr) = d {
+                let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
+                result = CType::Array(Box::new(result), size);
+            }
+        }
+
+        result
+    } else {
+        // No function pointer — simple case: apply pointers and arrays
+        let mut result = base;
+        let mut i = 0;
+        while i < derived.len() {
+            match &derived[i] {
+                DerivedDeclarator::Pointer(..) => {
+                    result = CType::Pointer(
+                        Box::new(result),
+                        pointee_quals_before(derived, i, base_cvr),
+                    );
+                    i += 1;
+                }
+                DerivedDeclarator::Array(_) => {
+                    // Collect consecutive array dimensions
+                    let start = i;
+                    while i < derived.len() && matches!(&derived[i], DerivedDeclarator::Array(_)) {
+                        i += 1;
+                    }
+                    // Apply in reverse: innermost (rightmost) dimension wraps first
+                    for j in (start..i).rev() {
+                        if let DerivedDeclarator::Array(size_expr) = &derived[j] {
+                            let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
+                            result = CType::Array(Box::new(result), size);
+                        }
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Plant a declaration-level address-space qualifier (`__seg_fs`/`__seg_gs`)
+/// on the pointer level it qualifies in C: the INNERMOST one.
+///
+/// GCC named address spaces qualify the *pointee* memory:
+///   `T __seg_fs *p`   — p (ordinary memory) points into %fs
+///   `T __seg_fs **pp` — pp and *pp are ordinary; **pp reads %fs
+///   `T __seg_fs *a[4]`— each element points into %fs
+/// In this IR, `CType::Pointer(pointee, AddressSpace)` carries "the space the
+/// pointer points into", so the qualifier belongs on the innermost Pointer
+/// (the one whose pointee is the qualified data), reached through Array
+/// elements and outer Pointer levels.
+///
+/// The parser records the qualifier on the whole `Declaration`
+/// (`parsing_address_space`), but `build_full_ctype*` used to hardcode
+/// `AddressSpace::Default` for every derived Pointer, so any *named* variable
+/// or typedef of a segment pointer silently lost its qualifier and its
+/// dereferences read absolute addresses (glibc TLS: `%fs:16`/`%fs:40`
+/// stack-guard loads compiled to NULL-page loads). Only direct
+/// `*(T __seg_fs *)N` casts survived, via TypeSpecifier::Pointer's own field.
+/// Returns `true` when the space was absorbed by a pointer's POINTEE, `false`
+/// when it was not consumed and therefore belongs to the declared object's own
+/// storage. The distinction is not cosmetic: for `T __seg_gs v;` the object `v`
+/// lives in the segment (`&v` is `__seg_gs T *`), but for `T __seg_gs *p;` the
+/// space qualifies the type *name* — GCC reads a named address space as a type
+/// qualifier, exactly like `const T *p` — so `p` is a pointer INTO the segment
+/// while the object `p` itself has default storage and `&p` is
+/// `__seg_gs T **` with a default-space outer pointer. Sema folds this return
+/// value into `Symbol::address_space`; getting it wrong double-applies the
+/// qualifier (observed as `have '__seg_gs __seg_gs unsigned long **'` on
+/// include/linux/percpu-refcount.h).
+pub fn apply_declaration_address_space(ty: &mut CType, space: AddressSpace) -> bool {
+    if space == AddressSpace::Default {
+        return false;
+    }
+    match ty {
+        CType::Pointer(inner, sp) => {
+            // gcc 14.2: the space qualifies the innermost pointer's pointee. An
+            // array of pointers between this level and that pointer is
+            // transparent (`struct c __seg_gs *(*pa)[4]`: the outer pointer and
+            // the array stay generic; each element points into the segment).
+            if pointee_reaches_pointer_level(inner) {
+                apply_declaration_address_space(inner, space)
+            } else if let CType::Function(ft) = inner.as_mut() {
+                // `T __seg_gs *(*f)(void)`: the space names the pointer in the
+                // return type; the function pointer itself stays generic.
+                apply_declaration_address_space(&mut ft.return_type, space)
+            } else {
+                // The pointee is an object (`int __seg_gs (*p)[4]` points at an
+                // array that lives in the segment), so the space qualifies it.
+                *sp = PtrQuals::of(space);
+                true
+            }
+        }
+        CType::Array(elem, _) => apply_declaration_address_space(elem, space),
+        CType::Function(ft) => apply_declaration_address_space(&mut ft.return_type, space),
+        // A plain object (or an array of plain objects): the data IS the object,
+        // so the space is the object's own storage and nothing absorbed it.
+        _ => false,
+    }
+}
+
+/// Whether the declarator itself supplies a pointer level (`*` or a
+/// function-pointer `(*f)`), as opposed to the pointer coming from the type
+/// specifier through a typedef or `typeof` name.
+///
+/// Measured against gcc 14.2 (see [`apply_declaration_address_space_for_object`]):
+/// this is the discriminator between the two spellings of a per-CPU object.
+pub fn declarator_supplies_pointer(derived: &[DerivedDeclarator]) -> bool {
+    derived.iter().any(|d| {
+        matches!(
+            d,
+            DerivedDeclarator::Pointer(..) | DerivedDeclarator::FunctionPointer(..)
+        )
+    })
+}
+
+/// Declaration-level address space for an OBJECT declaration — the rule that
+/// decides between the pointee and the object's storage.
+///
+/// gcc applies the space to the type *as it stands at that point in the
+/// declaration*:
+///
+/// ```c
+/// typedef int *intp;
+/// static int        __seg_gs *p1;   /* declarator supplies `*`  */
+/// static __seg_gs   intp       p2;   /* specifier supplies `*`  */
+/// ```
+///
+/// * `p1`: the space qualifies the base type, so the declarator's `*` makes it
+///   `__seg_gs int *` — a pointer into the segment.  `typeof(p1)` is
+///   `__seg_gs int *`.  (Absorbed into the pointee: the existing rule.)
+/// * `p2`: the specifier's type is already `int *`; the space cannot qualify
+///   the pointee of a type it never touched, so gcc leaves the VALUE's type
+///   plain (`typeof(p2) == int *`) and the space qualifies the object's
+///   storage — `typeof(&p2) == __seg_gs int **`.
+///
+/// Linux's `DEFINE_PER_CPU(type, name)` is the second spelling
+/// (`__PCPU_ATTRS(sec) __typeof__(type) name`), and `per_cpu(var, cpu)`
+/// dereferences `PERCPU_PTR(&var)` — which is compiled as
+/// `(TYPEOF_UNQUAL(*(&var)) *)(unsigned long)(&var)`.  With the space on the
+/// pointee instead of the storage, that chain yields a `__seg_gs`-qualified
+/// pointer where gcc yields a plain one, and `device_unregister(per_cpu(...))`
+/// is rejected (drivers/base/cacheinfo.c).  Storage placement also makes the
+/// object's own reads/writes segment-relative, which is what the kernel means.
+///
+/// Returns whether the type absorbed the space (pointee placement). Callers
+/// that declare objects must use the result to set the object's storage space
+/// (see sema's `object_address_space` / the lowerer's `var.address_space`).
+/// Count how many `CType::Pointer` layers `derived` itself constructs on top
+/// of the base type specifier (excluding pointers already inside a typedef or
+/// `typeof` specifier).
+fn declarator_pointer_levels(derived: &[DerivedDeclarator]) -> usize {
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < derived.len() {
+        match &derived[i] {
+            DerivedDeclarator::Pointer(..) => {
+                count += 1;
+                if matches!(
+                    derived.get(i + 1),
+                    Some(DerivedDeclarator::FunctionPointer(..))
+                ) {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            DerivedDeclarator::FunctionPointer(..) => {
+                count += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    count
+}
+
+fn apply_declaration_address_space_bounded(
+    ty: &mut CType,
+    space: AddressSpace,
+    remaining_ptr_levels: usize,
+) -> bool {
+    if space == AddressSpace::Default || remaining_ptr_levels == 0 {
+        return false;
+    }
+    match ty {
+        CType::Pointer(inner, sp) => {
+            if remaining_ptr_levels > 1 && pointee_reaches_pointer_level(inner) {
+                apply_declaration_address_space_bounded(inner, space, remaining_ptr_levels - 1)
+            } else if let CType::Function(ft) = inner.as_mut() {
+                apply_declaration_address_space_bounded(
+                    &mut ft.return_type,
+                    space,
+                    remaining_ptr_levels - 1,
+                )
+            } else {
+                *sp = PtrQuals::of(space);
+                true
+            }
+        }
+        CType::Array(elem, _) => {
+            apply_declaration_address_space_bounded(elem, space, remaining_ptr_levels)
+        }
+        CType::Function(ft) => apply_declaration_address_space_bounded(
+            &mut ft.return_type,
+            space,
+            remaining_ptr_levels,
+        ),
+        _ => false,
+    }
+}
+
+pub fn apply_declaration_address_space_for_object(
+    ty: &mut CType,
+    space: AddressSpace,
+    derived: &[DerivedDeclarator],
+) -> bool {
+    if space == AddressSpace::Default {
+        return false;
+    }
+    let ptr_levels = declarator_pointer_levels(derived);
+    if ptr_levels == 0 {
+        // The pointer level (if any) came from the specifier: the space is the
+        // object's storage and the value's type is left alone.
+        return false;
+    }
+    apply_declaration_address_space_bounded(ty, space, ptr_levels)
+}
+
+/// The object's OWN storage space for a declaration — the exact complement of
+/// [`apply_declaration_address_space_for_object`], sharing its predicate so the
+/// two can never drift.
+///
+/// A pointer supplied by the DECLARATOR absorbs the qualifier into its pointee,
+/// so the declared object keeps DEFAULT storage: gcc reads element `a[1]` of
+///
+/// ```c
+/// int __seg_gs *a[4];
+/// ```
+/// as `movq 8+a(%rip), %rdx` and only the pointee dereference carries the
+/// override (`movl %gs:(%rdx), %eax`).  The object rule alone was not enough:
+/// the storage slot (`GlobalInfo::var.address_space` / `LocalInfo::var`) was
+/// filled from `decl.address_space` unconditionally, which turned that array
+/// into a genuinely segment-relative object — every element load became
+/// `movq %gs:a+8(%rip)` (segment base + symbol offset, i.e. a wild address
+/// once a GS base is installed) and the recursive `off = p->next`
+/// segment-pointer walk read the wrong node forever (reduced: `int __seg_gs
+/// *garr[4]; int *loadidx(void){ return garr[1]; }`).  Storage space is
+/// therefore the declaration's qualifier ONLY when no declarator pointer
+/// absorbed it.
+pub fn object_storage_address_space(
+    space: AddressSpace,
+    derived: &[DerivedDeclarator],
+) -> AddressSpace {
+    if space == AddressSpace::Default || declarator_supplies_pointer(derived) {
+        AddressSpace::Default
+    } else {
+        space
+    }
+}
+
+/// The object's storage space, including an object-level qualifier.
+///
+/// `object_space` is the qualifier written after the declarator's LAST `*`
+/// (`void *__seg_gs ix_p[N]`: the element pointers' qualifier names the array's
+/// storage, as in gcc 14.2, where `ix_p[i]` is a `%gs` load). When it is set it
+/// wins outright; otherwise the declaration-level rule of
+/// [`object_storage_address_space`] applies unchanged.
+pub fn object_storage_address_space_with_object(
+    space: AddressSpace,
+    derived: &[DerivedDeclarator],
+    object_space: AddressSpace,
+) -> AddressSpace {
+    if object_space != AddressSpace::Default {
+        return object_space;
+    }
+    object_storage_address_space(space, derived)
+}
+
+#[cfg(test)]
+mod address_space_tests {
+    use super::*;
+
+    /// The object's own storage space is the declaration space only when no
+    /// pointer in the declarator absorbed it. These four shapes are measured
+    /// against gcc 14.2 (see the function's contract) and are what sema folds
+    /// into `Symbol::address_space`; getting any of them backwards either
+    /// breaks `&percpu_obj` (kernel/softirq.c) or double-qualifies the pointee
+    /// (include/linux/percpu-refcount.h).
+    #[test]
+    fn object_space_is_absorbed_by_pointer_declarators() {
+        // `T __seg_gs v;` — plain object: the object itself lives in the segment.
+        let mut ty = CType::Int;
+        assert!(!apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegGs
+        ));
+        assert_eq!(ty, CType::Int);
+
+        // `T __seg_gs *p;` — a pointer: the space qualifies the POINTEE, so the
+        // object `p` keeps default storage and `&p` is `__seg_gs T **`.
+        let mut ty = CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC);
+        assert!(apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegGs
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(Box::new(CType::Int), PtrQuals::of(AddressSpace::SegGs))
+        );
+
+        // `T __seg_gs **p;` — outer pointer levels are traversed to the innermost
+        // pointer, so the space still lands on the data pointer.
+        let mut ty = CType::Pointer(
+            Box::new(CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC)),
+            PtrQuals::GENERIC,
+        );
+        assert!(apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegGs
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(
+                Box::new(CType::Pointer(
+                    Box::new(CType::Int),
+                    PtrQuals::of(AddressSpace::SegGs)
+                )),
+                PtrQuals::GENERIC
+            )
+        );
+
+        // `T __seg_fs f(void);` — the space belongs to the returned pointer, not
+        // to the function designator (srcu_read_lock_fast call sites).
+        let mut ty = CType::Function(Box::new(FunctionType {
+            return_type: CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC),
+            params: Vec::new(),
+            variadic: false,
+            has_prototype: true,
+        }));
+        assert!(apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::SegFs
+        ));
+
+        // Default space is a no-op and always reports "nothing absorbed".
+        let mut ty = CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC);
+        assert!(!apply_declaration_address_space(
+            &mut ty,
+            AddressSpace::Default
+        ));
+    }
+
+    /// The object rule adds the declarator to the decision (gcc 14.2,
+    /// `spacecases.c`): a pointer supplied by the DECLARATOR absorbs the
+    /// space into its pointee; a pointer supplied by the TYPE SPECIFIER
+    /// (typedef/typeof, i.e. the kernel's `DEFINE_PER_CPU` spelling) leaves
+    /// the value's type plain and the space on the object's storage.
+    #[test]
+    fn object_rule_distinguishes_declarator_from_specifier_pointers() {
+        let ptr = CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC);
+
+        // `int __percpu *p;` — declarator supplies the `*`: pointee placement,
+        // exactly like the raw function.
+        let mut ty = ptr.clone();
+        assert!(apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)]
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(Box::new(CType::Int), PtrQuals::of(AddressSpace::SegGs))
+        );
+
+        // `__percpu intp p;` (intp = int *) — specifier supplies the pointer:
+        // the type must come back UNCHANGED (plain `int *`) and the space is
+        // the object's storage.
+        let mut ty = ptr.clone();
+        assert!(!apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[]
+        ));
+        assert_eq!(ty, ptr);
+
+        // `__percpu int **p;` — pointer levels in the declarator absorb, and
+        // the walk still reaches the innermost pointer: the result is
+        // `Pointer(Pointer(Int, SegGs), Default)`, i.e. `__seg_gs int **`
+        // (gcc 14.2 agrees: `typeof(p) == __seg_gs int **`).
+        let mut ty = CType::Pointer(Box::new(ptr.clone()), PtrQuals::GENERIC);
+        assert!(apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[
+                DerivedDeclarator::Pointer(AddressSpace::Default, 0),
+                DerivedDeclarator::Pointer(AddressSpace::Default, 0)
+            ]
+        ));
+        assert_eq!(
+            ty,
+            CType::Pointer(
+                Box::new(CType::Pointer(
+                    Box::new(CType::Int),
+                    PtrQuals::of(AddressSpace::SegGs)
+                )),
+                PtrQuals::GENERIC
+            )
+        );
+
+        // `__percpu struct device *f(void);` — a function returning a pointer:
+        // the `*` is in the declarator, so the return type absorbs.
+        let mut ty = CType::Function(Box::new(FunctionType {
+            return_type: ptr.clone(),
+            params: Vec::new(),
+            variadic: false,
+            has_prototype: true,
+        }));
+        assert!(apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[
+                DerivedDeclarator::Pointer(AddressSpace::Default, 0),
+                DerivedDeclarator::Function(Vec::new(), false, true)
+            ]
+        ));
+
+        // `__percpu int arr[4];` — no pointer anywhere: storage placement.
+        let mut ty = CType::Array(Box::new(CType::Int), Some(4));
+        assert!(!apply_declaration_address_space_for_object(
+            &mut ty,
+            AddressSpace::SegGs,
+            &[DerivedDeclarator::Array(None)]
+        ));
+        assert_eq!(ty, CType::Array(Box::new(CType::Int), Some(4)));
+
+        // Storage complement — the SAME predicate, so the object's storage and
+        // its pointee placement can never disagree.  Only a declaration whose
+        // pointer level did NOT come from the declarator puts its storage in
+        // the segment; `int __seg_gs *a[4]` is a NORMAL array of pointers into
+        // the segment (gcc reads `a[1]` as `8+a(%rip)`), while
+        // `__seg_gs intp d[4]` (pointer typedef) stores the array itself in the
+        // segment (gcc: `%gs:8+d(%rip)`).
+        assert_eq!(
+            object_storage_address_space(
+                AddressSpace::SegGs,
+                &[
+                    DerivedDeclarator::Pointer(AddressSpace::Default, 0),
+                    DerivedDeclarator::Array(None)
+                ]
+            ),
+            AddressSpace::Default
+        );
+        assert_eq!(
+            object_storage_address_space(AddressSpace::SegGs, &[DerivedDeclarator::Array(None)]),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            object_storage_address_space(AddressSpace::SegGs, &[]),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            object_storage_address_space(
+                AddressSpace::SegFs,
+                &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)]
+            ),
+            AddressSpace::Default
+        );
+        assert_eq!(
+            object_storage_address_space(AddressSpace::Default, &[]),
+            AddressSpace::Default
+        );
+
+        // Function pointers count as declarator-supplied pointers.
+        assert!(declarator_supplies_pointer(&[
+            DerivedDeclarator::Pointer(AddressSpace::Default, 0),
+            DerivedDeclarator::FunctionPointer(Vec::new(), false, true)
+        ]));
+        assert!(!declarator_supplies_pointer(&[
+            DerivedDeclarator::Array(None),
+            DerivedDeclarator::Function(Vec::new(), false, true)
+        ]));
+    }
+}
+
+/// Does the pointee of a pointer declarator reach a pointer level through its
+/// arrays? If so the innermost pointer owns the named space (`T __seg_gs
+/// *a[4]`). If not, the pointee object itself is the segment object: the array
+/// in `int __seg_gs (*p)[4]` is the one in %gs, and the space belongs on the
+/// pointer, as for `struct c __seg_gs *p`.
+fn pointee_reaches_pointer_level(ty: &CType) -> bool {
+    match ty {
+        CType::Pointer(..) | CType::Function(..) => true,
+        CType::Array(elem, _) => pointee_reaches_pointer_level(elem),
+        _ => false,
+    }
+}
+
+/// Does the named address space qualify the declared type as a whole?
+///
+/// `__seg_gs` written against a typedef name or `typeof` qualifies the type
+/// itself, so for `__seg_gs __typeof__(T *) p;` the pointer object `p` is the
+/// one in the segment (the kernel's per-CPU pointer variables). Written against
+/// a base specifier (`__seg_gs T *p;`) it qualifies the base type, and so the
+/// pointee. The two cases are distinguished by the type specifier alone.
+///
+/// A typedef or typeof base only qualifies the whole object when the declarator
+/// adds no pointer level: `typedef long L; L __seg_gs *p;` makes `p` ordinary
+/// memory pointing into %gs, exactly like `long __seg_gs *p;`. Without this
+/// check the typedef path put `p` itself in %gs and loaded it through the
+/// segment (silent miscompile).
+pub fn named_space_qualifies_whole_type(
+    type_spec: &TypeSpecifier,
+    derived: &[DerivedDeclarator],
+) -> bool {
+    let typedef_base = matches!(
+        type_spec,
+        TypeSpecifier::TypedefName(_) | TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(..)
+    );
+    typedef_base
+        && !derived.iter().any(|d| {
+            matches!(
+                d,
+                DerivedDeclarator::Pointer(..) | DerivedDeclarator::FunctionPointer(..)
+            )
+        })
+}
+
+/// Apply a declaration's named address space to the declared object's type and
+/// return the storage space of the object itself.
+///
+/// This is the single entry point for declaration sites (file scope, asm
+/// register globals, extern re-declarations, locals). A whole-type qualifier
+/// (`named_space_qualifies_whole_type`) is the object's own space and leaves
+/// the type unchanged. Otherwise the space is placed on the declared type
+/// (`apply_declaration_address_space`) and the storage follows
+/// `declared_object_space`. With no CType available the declaration space is
+/// the storage space, as before.
+pub fn place_declared_space(
+    ct: Option<&mut CType>,
+    space: AddressSpace,
+    type_spec: &TypeSpecifier,
+    derived: &[DerivedDeclarator],
+    object_space: AddressSpace,
+) -> AddressSpace {
+    let whole_type = named_space_qualifies_whole_type(type_spec, derived);
+    match ct {
+        None => {
+            if object_space != AddressSpace::Default {
+                object_space
+            } else {
+                space
+            }
+        }
+        Some(ct) => {
+            if !whole_type {
+                apply_declaration_address_space_for_object(ct, space, derived);
+            }
+            // A named space after the declarator's last `*` (`long *__seg_gs p`)
+            // is the object's own space; it does not reach the pointee.
+            if object_space != AddressSpace::Default {
+                object_space
+            } else {
+                declared_object_space(space, ct, whole_type)
+            }
+        }
+    }
+}
+
+/// Address space in which the object a declaration declares is stored.
+///
+/// * `whole_type` (see `named_space_qualifies_whole_type`): the object is in
+///   `space`, whatever its shape.
+/// * Otherwise `space` qualifies the base type. A plain object
+///   (`int __seg_gs x;`, `struct pcpu __seg_gs arr[4];`) lives in `space`.
+///   Once the declared type has a pointer level (`struct c __seg_gs *g;`,
+///   `struct c __seg_gs *a[4];`) the space belongs to the pointee, so the
+///   pointer object is ordinary memory. Using `space` as the storage for these
+///   made `g` load itself through %gs.
+///
+/// Call this after `apply_declaration_address_space` on the same type, and only
+/// when `whole_type` is false (a whole-type qualifier does not reach the
+/// pointee).
+pub fn declared_object_space(space: AddressSpace, ty: &CType, whole_type: bool) -> AddressSpace {
+    if space == AddressSpace::Default {
+        AddressSpace::Default
+    } else if matches!(ty, CType::Function(_)) {
+        // A function designator is code, not an object: it has no %gs storage,
+        // whatever qualifier the declaration carries.
+        AddressSpace::Default
+    } else if whole_type {
+        space
+    } else if has_pointer_level(ty) {
+        AddressSpace::Default
+    } else {
+        space
+    }
+}
+
+fn has_pointer_level(ty: &CType) -> bool {
+    match ty {
+        CType::Pointer(..) => true,
+        CType::Array(elem, _) => has_pointer_level(elem),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod seg_placement_tests {
+    use super::*;
+
+    /// Pointee of every test pointer: a non-derived scalar.
+    fn base() -> CType {
+        CType::Long
+    }
+    fn gs_ptr_plain() -> CType {
+        CType::Pointer(Box::new(base()), PtrQuals::GENERIC)
+    }
+    fn func_returning(ret: CType) -> CType {
+        CType::Function(Box::new(FunctionType {
+            return_type: ret,
+            params: Vec::new(),
+            variadic: false,
+            has_prototype: true,
+        }))
+    }
+    /// Space of the pointer that directly points at the base struct, found by
+    /// walking from `ty` down the pointer/array/function chain.
+    fn innermost_space(ty: &CType) -> Option<AddressSpace> {
+        match ty {
+            CType::Pointer(inner, sp) => match inner.as_ref() {
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..) => {
+                    innermost_space(inner)
+                }
+                _ => Some(sp.space),
+            },
+            CType::Array(elem, _) => innermost_space(elem),
+            CType::Function(ft) => innermost_space(&ft.return_type),
+            _ => None,
+        }
+    }
+    /// Space stored on the outermost pointer, if `ty` is a pointer.
+    fn outer_space(ty: &CType) -> Option<AddressSpace> {
+        match ty {
+            CType::Pointer(_, sp) => Some(sp.space),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn plain_pointer_gets_its_own_space() {
+        let mut t = gs_ptr_plain();
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_pointer_qualifies_only_the_inner_level() {
+        let mut t = CType::Pointer(Box::new(gs_ptr_plain()), PtrQuals::GENERIC);
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_function_returning_gs_pointer_qualifies_the_return_pointer() {
+        // struct c __seg_gs *(*fp)(void)
+        let mut t = CType::Pointer(Box::new(func_returning(gs_ptr_plain())), PtrQuals::GENERIC);
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(
+            outer_space(&t),
+            Some(AddressSpace::Default),
+            "fp itself stays generic"
+        );
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn function_returning_gs_pointer_qualifies_the_return_pointer() {
+        // struct c __seg_gs *f(void)
+        let mut t = func_returning(gs_ptr_plain());
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn array_of_gs_pointers_qualifies_the_element_pointers() {
+        // struct c __seg_gs *a[4]
+        let mut t = CType::Array(Box::new(gs_ptr_plain()), Some(4));
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn pointer_to_array_of_gs_pointers_keeps_outer_pointer_generic() {
+        // struct c __seg_gs *(*pa)[4]
+        let mut t = CType::Pointer(
+            Box::new(CType::Array(Box::new(gs_ptr_plain()), Some(4))),
+            PtrQuals::GENERIC,
+        );
+        apply_declaration_address_space(&mut t, AddressSpace::SegGs);
+        assert_eq!(outer_space(&t), Some(AddressSpace::Default));
+        assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
+    }
+
+    #[test]
+    fn default_space_is_a_no_op() {
+        let mut t = CType::Pointer(Box::new(gs_ptr_plain()), PtrQuals::GENERIC);
+        let before = t.clone();
+        apply_declaration_address_space(&mut t, AddressSpace::Default);
+        assert_eq!(t, before);
+    }
+
+    #[test]
+    fn plain_object_lives_in_the_declared_space() {
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &CType::Int, false),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            declared_object_space(
+                AddressSpace::SegGs,
+                &CType::Array(Box::new(CType::Int), Some(4)),
+                false
+            ),
+            AddressSpace::SegGs
+        );
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &base(), false),
+            AddressSpace::SegGs
+        );
+    }
+
+    #[test]
+    fn whole_type_qualifier_puts_the_pointer_object_in_the_space() {
+        // __seg_gs __typeof__(struct c *) p;  -> p itself is %gs (kernel per-CPU pointer)
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &gs_ptr_plain(), true),
+            AddressSpace::SegGs
+        );
+        let arr = CType::Array(Box::new(gs_ptr_plain()), Some(4));
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &arr, true),
+            AddressSpace::SegGs
+        );
+    }
+
+    #[test]
+    fn pointer_object_is_generic_even_when_pointee_is_gs() {
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &gs_ptr_plain(), false),
+            AddressSpace::Default
+        );
+        let arr = CType::Array(Box::new(gs_ptr_plain()), Some(4));
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &arr, false),
+            AddressSpace::Default
+        );
+        assert_eq!(
+            declared_object_space(AddressSpace::Default, &base(), false),
+            AddressSpace::Default
+        );
+    }
+
+    #[test]
+    fn typedef_base_qualifies_whole_object_only_without_declarator_pointer() {
+        // typedef long L;  L __seg_gs x;   -> x itself is %gs
+        let td = TypeSpecifier::TypedefName("L".to_string());
+        assert!(named_space_qualifies_whole_type(&td, &[]));
+        // typedef long L;  L __seg_gs arr[4];  -> arr is %gs
+        assert!(named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::Array(None)]
+        ));
+        // typedef long L;  L __seg_gs *p;  -> p is generic, *p is %gs
+        assert!(!named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)]
+        ));
+        // typedef long L;  L __seg_gs (*fp)(void);  -> fp is generic
+        assert!(!named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::FunctionPointer(Vec::new(), false, true)]
+        ));
+        // A plain base type never qualifies the whole object by itself.
+        assert!(!named_space_qualifies_whole_type(&TypeSpecifier::Int, &[]));
+    }
+
+    #[test]
+    fn typedef_pointer_base_with_declarator_pointer_keeps_object_generic() {
+        // typedef struct c *P;  P __seg_gs *pp;  -> pp is generic memory.
+        let ct = CType::Pointer(Box::new(gs_ptr_plain()), PtrQuals::GENERIC);
+        let td = TypeSpecifier::TypedefName("P".to_string());
+        let whole = named_space_qualifies_whole_type(
+            &td,
+            &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)],
+        );
+        assert!(!whole);
+        assert_eq!(
+            declared_object_space(AddressSpace::SegGs, &ct, whole),
+            AddressSpace::Default
+        );
+    }
+}

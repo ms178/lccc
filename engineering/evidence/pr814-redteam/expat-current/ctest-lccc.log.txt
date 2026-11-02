@@ -1,0 +1,8 @@
+Internal ctest changing into directory: /home/user/.cache/lccc-expat.WzvEgx/lccc
+Test project /home/user/.cache/lccc-expat.WzvEgx/lccc
+    Start 1: runtests
+1/1 Test #1: runtests .........................   Passed   19.94 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =  19.94 sec

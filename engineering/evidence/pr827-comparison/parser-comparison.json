@@ -1,0 +1,32 @@
+[
+  {
+    "probe": "missing_function_after_header",
+    "version": "agent-b",
+    "result": "accepted"
+  },
+  {
+    "probe": "missing_function_after_header",
+    "version": "candidate",
+    "result": "rejected:AssertionError"
+  },
+  {
+    "probe": "negative_count",
+    "version": "agent-b",
+    "result": "accepted"
+  },
+  {
+    "probe": "negative_count",
+    "version": "candidate",
+    "result": "rejected:AssertionError"
+  },
+  {
+    "probe": "extra_record_fields",
+    "version": "agent-b",
+    "result": "accepted"
+  },
+  {
+    "probe": "extra_record_fields",
+    "version": "candidate",
+    "result": "rejected:AssertionError"
+  }
+]

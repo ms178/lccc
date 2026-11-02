@@ -1,0 +1,549 @@
+{
+  "sources": {
+    "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c": "d824a1f9a543c1c93db56ab8efac314982fd6beecfdce646c4a9bab989f46ed3",
+    "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_reader.c": "75b63a3ae96b70f054076ed9346ab900e8fb793ac4c6b6928c5be60e87ebb128"
+  },
+  "oracle_reader": "gcc -O2 -march=x86-64-v3 -c alias_reader.c",
+  "cases": [
+    {
+      "opt": "-O0",
+      "compiler": "lccc_pre617",
+      "compile_cmd": [
+        "/home/user/.cache/lccc-head-5624367",
+        "-O0",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O0.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O0.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O0.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O0",
+      "compiler": "lccc_post617_fixed",
+      "compile_cmd": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O0.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O0.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O0.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O0",
+      "compiler": "gcc",
+      "compile_cmd": [
+        "gcc",
+        "-O0",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O0.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O0.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O0.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O0",
+      "compiler": "clang19",
+      "compile_cmd": [
+        "clang-19",
+        "-O0",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O0.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O0.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O0.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O1",
+      "compiler": "lccc_pre617",
+      "compile_cmd": [
+        "/home/user/.cache/lccc-head-5624367",
+        "-O1",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O1.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O1.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O1.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O1",
+      "compiler": "lccc_post617_fixed",
+      "compile_cmd": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O1.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O1.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O1.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O1",
+      "compiler": "gcc",
+      "compile_cmd": [
+        "gcc",
+        "-O1",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O1.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O1.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O1.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O1",
+      "compiler": "clang19",
+      "compile_cmd": [
+        "clang-19",
+        "-O1",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O1.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O1.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O1.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O2",
+      "compiler": "lccc_pre617",
+      "compile_cmd": [
+        "/home/user/.cache/lccc-head-5624367",
+        "-O2",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O2.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O2.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O2.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O2",
+      "compiler": "lccc_post617_fixed",
+      "compile_cmd": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O2.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O2.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O2.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O2",
+      "compiler": "gcc",
+      "compile_cmd": [
+        "gcc",
+        "-O2",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O2.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O2.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O2.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O2",
+      "compiler": "clang19",
+      "compile_cmd": [
+        "clang-19",
+        "-O2",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O2.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O2.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O2.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O3",
+      "compiler": "lccc_pre617",
+      "compile_cmd": [
+        "/home/user/.cache/lccc-head-5624367",
+        "-O3",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O3.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O3.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--O3.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O3",
+      "compiler": "lccc_post617_fixed",
+      "compile_cmd": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O3.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O3.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--O3.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O3",
+      "compiler": "gcc",
+      "compile_cmd": [
+        "gcc",
+        "-O3",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O3.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O3.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--O3.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-O3",
+      "compiler": "clang19",
+      "compile_cmd": [
+        "clang-19",
+        "-O3",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O3.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O3.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--O3.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-Os",
+      "compiler": "lccc_pre617",
+      "compile_cmd": [
+        "/home/user/.cache/lccc-head-5624367",
+        "-Os",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--Os.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--Os.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_pre617--Os.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-Os",
+      "compiler": "lccc_post617_fixed",
+      "compile_cmd": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--Os.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--Os.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/lccc_post617_fixed--Os.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-Os",
+      "compiler": "gcc",
+      "compile_cmd": [
+        "gcc",
+        "-Os",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--Os.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--Os.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/gcc--Os.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    },
+    {
+      "opt": "-Os",
+      "compiler": "clang19",
+      "compile_cmd": [
+        "clang-19",
+        "-Os",
+        "-march=x86-64-v3",
+        "-c",
+        "engineering/evidence/2026-09-25-redteam/post-merge/repro/alias_writer.c",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--Os.o"
+      ],
+      "compile_rc": 0,
+      "compile_stderr": "",
+      "link_cmd": [
+        "gcc",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--Os.o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/reader.o",
+        "-o",
+        "/tmp/lccc-alias-cross-tu-fx4sblua/clang19--Os.bin"
+      ],
+      "link_rc": 0,
+      "link_stderr": "",
+      "run_rc": 0,
+      "run_stdout": "123",
+      "run_stderr": ""
+    }
+  ]
+}

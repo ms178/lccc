@@ -1,0 +1,52 @@
+{
+  "archive": "S106-MEASURED-PAYLOADS.tar.xz",
+  "bytes": 791256,
+  "sha256": "6306327dc5cf83467e3403c80cb6f40ca23924a1b01b401911514a6a0e8c9601",
+  "members": [
+    {
+      "path": "within-process",
+      "bytes": 2171536,
+      "sha256": "08c8cdb894f2d1d6d5d7648b43130035f027d19a1f16dbeaf3366ac0f3627ccb"
+    },
+    {
+      "path": "base.a",
+      "bytes": 1109188,
+      "sha256": "5a004ca8987b2104a12b46248947ae8a4ff4370fec234bde01d45b4aa42d8362"
+    },
+    {
+      "path": "opt.a",
+      "bytes": 1107588,
+      "sha256": "58b8d4f11035809ce925252d9e6731bffdc7f2d22a7da0545f4fa26a694ba7c3"
+    },
+    {
+      "path": "gcc.a",
+      "bytes": 1657404,
+      "sha256": "4c85148fa3275135d866fee464b57f238a92c14a9cd422a8d39452ad75569b55"
+    },
+    {
+      "path": "throughput-candidate",
+      "bytes": 6344,
+      "sha256": "e15fbc360e733ee7af3185e17e864750a5fc82d8d1197f256f100651bd238c7c"
+    },
+    {
+      "path": "throughput-main",
+      "bytes": 6376,
+      "sha256": "43840bf851a0b971ed0064a09b0134ec877dd4306f7e2007d84aac07f63d03af"
+    },
+    {
+      "path": "throughput-gcc",
+      "bytes": 16080,
+      "sha256": "929e9becc4960cb1f9808009e06791c2324717cf90632918eb16db26b401e616"
+    },
+    {
+      "path": "throughput-clang",
+      "bytes": 16112,
+      "sha256": "69c389d913526255a6b108f1b437e9e64f58f3ccb3fc561605f9623467da2b73"
+    },
+    {
+      "path": "throughput-icx",
+      "bytes": 16064,
+      "sha256": "2fe20578987972ab94b6c173ea96cc0b6481268299fcde6744734ef16327a44d"
+    }
+  ]
+}

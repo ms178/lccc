@@ -1,0 +1,9 @@
+lccc: note: x86 tuning row 'generic'
+Lexed 3811 tokens from tests/regression/affine_control_proof.c
+Parsed 198 declarations
+Lowered to 3 IR functions
+Generated I686 assembly (1252 bytes)
+ /usr/bin/ld -dynamic-linker /lib/ld-linux.so.2 -o /home/user/.cache/pr824-gcc16-after -L/usr/lib/gcc/x86_64-linux-gnu/16/32 -L/usr/lib32 -L/usr/lib -L/lib
+LIBRARY_PATH=/usr/lib/gcc/x86_64-linux-gnu/16/32:/usr/lib32:/usr/lib:/lib
+Output: /home/user/.cache/pr824-gcc16-after
+affine-control-proof 5 97

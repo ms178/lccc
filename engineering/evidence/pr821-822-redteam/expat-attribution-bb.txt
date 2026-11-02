@@ -1,0 +1,28 @@
+--------------------------------------------------------------------------------
+Profile data file '/home/user/.cache/pr821-callgrind/expat_xml_scan/bb/expat_xml_scan.cg' (creator: callgrind-3.24.0)
+--------------------------------------------------------------------------------
+I1 cache: 32768 B, 64 B, 8-way associative
+D1 cache: 32768 B, 64 B, 8-way associative
+LL cache: 33554432 B, 64 B, 16-way associative
+Timerange: Basic block 0 - 457265
+Trigger: Program termination
+Profiled target:  /home/user/.cache/pr821-callgrind/expat_xml_scan/bb/expat_xml_scan (PID 16707, part 1)
+Events recorded:  Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim
+Events shown:     Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim
+Event sort order: Ir Dr Dw I1mr D1mr D1mw ILmr DLmr DLmw Bc Bcm Bi Bim
+Thresholds:       85 0 0 0 0 0 0 0 0 0 0 0 0
+Include dirs:     
+User annotated:   
+Auto-annotation:  off
+
+--------------------------------------------------------------------------------
+Ir                 Dr               Dw              I1mr           D1mr           D1mw         ILmr           DLmr         DLmw         Bc               Bcm             Bi           Bim          
+--------------------------------------------------------------------------------
+1,435,301 (100.0%) 131,175 (100.0%) 30,761 (100.0%) 1,395 (100.0%) 1,311 (100.0%) 909 (100.0%) 1,369 (100.0%) 973 (100.0%) 865 (100.0%) 411,862 (100.0%) 31,893 (100.0%) 461 (100.0%) 263 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir               Dr              Dw             I1mr        D1mr         D1mw         ILmr        DLmr         DLmw         Bc               Bcm             Bi           Bim           file:function
+--------------------------------------------------------------------------------
+690,384 (48.10%) 56,803 (43.30%) 6,554 (21.31%)  5 ( 0.36%)   1 ( 0.08%)   1 ( 0.11%)  5 ( 0.37%)   1 ( 0.10%)   0          221,754 (53.84%) 15,308 (48.00%)   .            .           ???:expat_utf8_name_length [/home/user/.cache/pr821-callgrind/expat_xml_scan/bb/expat_xml_scan]
+591,483 (41.21%) 38,246 (29.16%) 8,204 (26.67%)  7 ( 0.50%)   2 ( 0.15%) 257 (28.27%)  7 ( 0.51%)   1 ( 0.10%) 256 (29.60%) 163,083 (39.60%) 13,152 (41.24%)   2 ( 0.43%)   2 ( 0.76%)  ???:main [/home/user/.cache/pr821-callgrind/expat_xml_scan/bb/expat_xml_scan]
+

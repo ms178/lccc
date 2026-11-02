@@ -1,0 +1,30 @@
+Register allocator (current vs remaining)
+=========================================
+
+Shipped (do not re-implement March 2026 linear-scan-from-scratch):
+- live_range.rs LinearScanAllocator + eviction modes 0/1/2/3/5
+- Hole-aware call-span (segments)
+- Copy-group + phi latch coalescing
+- Multi-wave caller-saved + call_arg / r10 exclusion
+- i686 ecx/edx/eax homes
+- XMM/NEON second class + fail-closed 128-bit vecreg
+- split_ranges IR pre-pass (timid, fail-closed)
+- AArch64 folded-index liveness + loop-pin
+
+Validated 2026-08-20 vs GCC -O2 (see VALIDATION_ZLIB_GZIP_EXPAT.md):
+- gzip longest_match: 118 stack-mem vs 0 (GOT + 248 B frame)
+- zlib-ng Adler kernel 1.49× (sum2/n spilled in DO8)
+- Expat xmltok 12× stack-mem; inflate 15×
+- gzip CRC 1.47× is NOT a spill problem (2 vs 0 stack-mem)
+
+Remaining (ranked):
+1. Remat + RIP-relative file-scope (window, prev, strstart, CRC tables).
+2. Next-use eviction: keep loop-carried sums; kill consumed byte temps.
+3. Segment-aware scan / stronger split_ranges (tokenizer, inflate).
+4. Call-site save/restore vs always callee-saved (doProlog).
+5. Reload-at-next-use (Wimmer). future_uses exists; codegen does not insert reloads.
+6. Affinity coalescing instead of disjoint-only merge.
+7. Residual Briggs coloring; GPR→XMM spill cache (ICX-class).
+8. Write-through skip; pressure feedback to inliner.
+
+Do not enable CCC_EVICT_MODE=5 or CCC_PGO_WEIGHT_MAX>1 without gzip numbers.

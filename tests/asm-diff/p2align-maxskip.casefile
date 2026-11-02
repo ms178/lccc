@@ -1,0 +1,197 @@
+# `.p2align N[, fill][, max-skip]` differential cases (GAS 2.47 oracle).
+# Inside a case, `#` lines are comments both assemblers accept.
+
+;;; p2align_maxskip_pad
+# `.p2align N,,M` pads when <= M bytes are needed (here 10 <= 10).
+.text
+.byte 0x0f
+.byte 0x0b
+.byte 0x0c
+.byte 0x0d
+.byte 0x0e
+.p2align 4,,10
+ret
+
+;;; p2align_maxskip_skip
+# `.p2align N,,M` suppresses padding entirely when more than M bytes
+# would be needed (here 15 > 10): the ret follows the byte directly.
+.text
+.byte 0xc3
+.p2align 4,,10
+ret
+
+;;; p2align_maxskip_exact_boundary
+# Needing exactly M bytes pads (the skip test is padding > max_skip).
+.text
+.byte 0x01
+.byte 0x02
+.byte 0x03
+.byte 0x04
+.byte 0x05
+.byte 0x06
+.p2align 4,,10
+ret
+
+;;; p2align_fill_cc
+# An explicit non-0x90 fill byte pads verbatim (no multi-byte NOPs).
+.text
+.byte 0x01
+.p2align 4, 0xcc
+ret
+
+;;; p2align_fill_90_keeps_nops
+# fill = 0x90 in an executable section keeps GAS's optimal NOP padding.
+.text
+.byte 0x01
+.p2align 4, 0x90
+ret
+
+;;; p2align_fill_truncate
+# GAS truncates the fill to a byte (300 & 0xff == 0x2c).
+.text
+.byte 0x01
+.p2align 4, 300
+ret
+
+;;; p2align_fill_and_maxskip
+# Combined form: explicit fill with a max-skip that refuses to pad.
+.text
+.byte 0x01
+.p2align 4, 0x5a, 3
+ret
+
+;;; p2align_fill_and_maxskip_pads
+# Combined form that pads (7 <= 8) with the explicit fill byte.
+.text
+.byte 0x01
+.p2align 16, 0x5a, 8
+ret
+
+;;; balign_maxskip
+# The byte-count spelling takes the same fill/max-skip grammar.
+.text
+.byte 0x01
+.byte 0x02
+.byte 0x03
+.byte 0x04
+.byte 0x05
+.balign 8,,3
+ret
+
+;;; align_maxskip_bytes
+# `.align` on x86 GAS is a byte count and accepts max-skip too.
+.text
+.byte 0x01
+.align 16,,10
+ret
+
+;;; p2align_data_fill
+# Data sections pad with the explicit fill byte verbatim.
+.data
+.byte 0x01
+.p2align 4, 0xff
+.quad 0x1122334455667788
+
+;;; p2align_data_maxskip
+# Max-skip suppression applies in data sections as well.
+.data
+.byte 0x01
+.p2align 4,,2
+.quad 0x1122334455667788
+
+;;; p2align_maxskip_relax_reeval
+# Jump relaxation interaction: the long jmp relaxes to a 2-byte short
+# jump, shifting the `.p2align 4,,3` marker down; with the shrunk
+# offset fewer bytes are needed than in the pre-relaxation layout, and
+# the fixup pass must re-evaluate the max-skip decision on the relaxed
+# offset (GAS semantic: the skip test runs on the FINAL layout).
+.text
+.globl f
+f:
+    jmp target
+    .byte 0x01
+    .byte 0x02
+    .byte 0x03
+    .byte 0x04
+    .byte 0x05
+    .byte 0x06
+    .p2align 4,,3
+target:
+    ret
+
+;;; p2align_maxskip_relax_reeval_skip
+# The mirror case: relaxation shrinks the code so the marker needs
+# MORE padding than before and the max-skip must now suppress a run
+# that was material in the pre-relaxation layout.
+.text
+.globl g
+g:
+    jmp target2
+    .byte 0x01
+    .byte 0x02
+    .p2align 4,,4
+target2:
+    ret
+
+;;; p2align_zero_aligned_kept
+# An alignment that is exactly satisfied records a marker anyway;
+# the preceding long jmp relaxes to 2 bytes, and the fixup must
+# insert the padding that the new offset now needs.
+.text
+.globl h
+h:
+    jmp target3
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    .p2align 4
+target3:
+    ret
+
+;;; p2align_exponent_zero
+# `.p2align 0` aligns to 1: no padding, no section alignment change.
+.text
+.byte 0x01
+.p2align 0
+ret
+
+;;; p2align_negative_exponent_clamped
+# GAS accepts a negative exponent by clamping it to 63 (warning only);
+# at offset 0 nothing pads, so the object is empty and accepted.
+.text
+.p2align -1
+ret
+
+;;; p2align_exponent_64_clamped
+# GAS accepts `.p2align 64` the same way: clamp to 63, no padding at 0.
+.text
+.p2align 64
+ret
+
+;;; balign_nonpow2_reject reject
+# Byte-count alignment forms reject non-power-of-two counts
+# ("alignment not a power of 2" in GAS).
+.text
+.balign 12
+ret
+
+;;; balign_negative_reject reject
+# A negative byte count is rejected by the byte-count spellings too.
+.text
+.balign -1
+ret
+
+;;; align_nonpow2_reject reject
+# `.align` is a byte count on x86 GAS and rejects non-powers-of-two.
+.text
+.align 6
+ret

@@ -1,0 +1,6404 @@
+//! i686 (32-bit x86) code generator. Implements the ArchCodegen trait.
+//!
+//! Uses the cdecl calling convention (System V i386 ABI):
+//! - All arguments passed on the stack, pushed right-to-left
+//! - Return values: eax (32-bit), eax:edx (64-bit), st(0) for float/double/long double
+//! - Callee-saved: ebx, esi, edi, ebp
+//! - Caller-saved: eax, ecx, edx
+//! - No register-based argument passing (unlike x86-64 SysV ABI)
+//! - Stack aligned to 16 bytes at call sites (modern i386 ABI)
+
+use crate::backend::call_abi;
+use crate::backend::common::PtrDirective;
+use crate::backend::generation::is_i128_type;
+use crate::backend::regalloc::{PhysReg, RaConfig};
+use crate::backend::state::{CodegenState, StackSlot};
+use crate::backend::traits::ArchCodegen;
+use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::FxHashSet;
+use crate::common::types::{AddressSpace, IrType};
+use crate::delegate_to_impl;
+use crate::emit;
+use crate::ir::reexports::{
+    AtomicOrdering, AtomicRmwOp, BlockId, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction,
+    IrUnaryOp, Operand, Value,
+};
+use std::sync::Arc;
+
+use super::i128_ops::MulAccPlan;
+
+/// One i686 fastcall parameter slot from [`I686Codegen::fastcall_layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum I686FastcallSlot {
+    /// Passed in %ecx (0) or %edx (1).
+    Reg(u8),
+    /// Passed on the stack at `offset` bytes into the fastcall argument
+    /// area (callee reference: 8(%ebp) / entry ESP+4), occupying `size`
+    /// bytes.
+    Stack { offset: i64, size: usize },
+    /// A native vector passed in `%xmm`/`%ymm`/`%zmm{reg_idx}`, assigned
+    /// exactly as for cdecl (`call_abi::i386_vector_reg_bytes`).
+    Vector {
+        reg_idx: usize,
+        width: VectorRegWidth,
+    },
+}
+
+/// The register file of a native vector argument. Typed rather than a byte
+/// count so the argument copier's match is total: the classifier only ever
+/// yields one of these three widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VectorRegWidth {
+    Xmm,
+    Ymm,
+    Zmm,
+}
+
+impl VectorRegWidth {
+    fn from_bytes(bytes: usize) -> Option<Self> {
+        match bytes {
+            16 => Some(Self::Xmm),
+            32 => Some(Self::Ymm),
+            64 => Some(Self::Zmm),
+            _ => None,
+        }
+    }
+
+    /// The unaligned full-width load and register name for `%{reg}{idx}`.
+    fn load(self, reg_idx: usize) -> (&'static str, String) {
+        match self {
+            Self::Xmm => ("movups", format!("xmm{reg_idx}")),
+            Self::Ymm => ("vmovups", format!("ymm{reg_idx}")),
+            Self::Zmm => ("vmovups", format!("zmm{reg_idx}")),
+        }
+    }
+}
+
+/// Where the bytes of an outgoing by-value argument are read from.
+///
+/// The by-value staging sites differ only in how the source and the
+/// destination are named, so the copy *policy* — instruction mix, tail
+/// handling, the in-bounds guarantee and the accumulator contract — is
+/// written exactly once, in [`I686Codegen::emit_copy_bytes`].
+#[derive(Clone, Copy)]
+pub(super) enum CopySrc {
+    /// A frame slot, resolved through `slot_ref_offset` so the source honours
+    /// `param_direct_homes` and `-fomit-frame-pointer` exactly like every
+    /// other slot reference.
+    Slot(StackSlot),
+    /// `%ecx` already holds the source address.
+    Ecx,
+    /// `off(%reg)`: a source pointer that is already in a register.
+    Register(&'static str),
+}
+
+/// Destination of a by-value argument copy.
+#[derive(Clone, Copy)]
+pub(super) enum CopyDst {
+    /// `off(%esp)`: the outgoing argument area.
+    OutgoingArea(usize),
+    /// `off(%reg)`: a destination pointer that is already in a register.
+    Register(&'static str, usize),
+    /// A frame object, resolved through `slot_ref_offset` like `CopySrc::Slot`.
+    Slot(StackSlot),
+}
+
+/// The general-purpose register a scalar tail may use as its scratch.
+///
+/// An enum rather than three strings so the 32/16/8-bit spellings can never
+/// drift apart (`%eax`/`%ax`/`%al` versus `%edx`/`%dx`/`%dl`): a mismatch
+/// would assemble to a different width than the one the copy intends.
+#[derive(Clone, Copy)]
+pub(super) enum CopyScratch {
+    Eax,
+    Edx,
+}
+
+impl CopyScratch {
+    fn r32(self) -> &'static str {
+        match self {
+            CopyScratch::Eax => "%eax",
+            CopyScratch::Edx => "%edx",
+        }
+    }
+
+    fn r16(self) -> &'static str {
+        match self {
+            CopyScratch::Eax => "%ax",
+            CopyScratch::Edx => "%dx",
+        }
+    }
+
+    fn r8(self) -> &'static str {
+        match self {
+            CopyScratch::Eax => "%al",
+            CopyScratch::Edx => "%dl",
+        }
+    }
+}
+
+/// i686 code generator. Implements the ArchCodegen trait for the shared framework.
+/// Uses cdecl calling convention with no register allocation (accumulator-based).
+pub struct I686Codegen {
+    pub(crate) state: CodegenState,
+    pub(super) current_return_type: IrType,
+    /// Whether this function returns an i686 integer ExtVector through EAX:EDX:ECX.
+    /// The three INTEGER return markers are carried in ret_eightbyte_classes.
+    pub(super) current_return_i686_ext_vector_gp3: bool,
+    /// Whether this function returns a 16-byte i386 vector piece in %xmm0
+    /// (IR: I128 with `[Sse, SseUp]` return classes).
+    pub(super) current_return_i686_xmm: bool,
+    /// Whether this function returns a 16-bit half-float (`_Float16`/`__bf16`) in `%xmm0`.
+    pub(super) current_return_half_xmm: bool,
+    pub(super) vector_ret_buffer_bytes: usize,
+    pub(super) vector_ret_buffer_offset: i64,
+    /// Whether the current function is variadic
+    pub(super) is_variadic: bool,
+    /// Register allocation results (callee-saved registers: ebx, esi, edi)
+    pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
+    /// Per-value materialisation widths from
+    /// [`crate::backend::common::compute_value_type_map`] (populated once per
+    /// function in the prologue). The indexed SIB emitters consult it to
+    /// extend a narrow post-peel index root to its defined 32-bit form
+    /// (`extend_sib_index_form`).
+    pub(super) value_types: FxHashMap<u32, IrType>,
+    /// Which callee-saved registers are used and need save/restore
+    pub(super) used_callee_saved: Vec<PhysReg>,
+    /// Total stack bytes consumed by named parameters (for va_start computation).
+    pub(super) va_named_stack_bytes: usize,
+    /// Bytes of the caller's stack argument area (cdecl stack args of THIS
+    /// function).  Used by __builtin_apply_args to snapshot the incoming
+    /// argument area.  Set in the prologue walk from call_abi classification.
+    pub(super) incoming_stack_arg_bytes: i64,
+    /// Offset from %ebp to the post-prologue %esp baseline:
+    /// callee_saved_bytes + frame_size.  Valid in BOTH frame-pointer modes
+    /// (unlike frame_base_offset, which is only meaningful under FPO).  Used
+    /// by DoBuiltinApply to restore %esp after its untracked staging subl.
+    pub(super) esp_baseline_offset: i64,
+    /// Scratch register allocation index for inline asm GP registers.
+    pub(super) asm_scratch_idx: usize,
+    /// Scratch register allocation index for inline asm XMM registers.
+    pub(super) asm_xmm_scratch_idx: usize,
+    /// Whether the current function uses the fastcall calling convention.
+    pub(super) is_fastcall: bool,
+    /// For fastcall functions, the number of bytes of stack args the callee must pop on return.
+    pub(super) fastcall_stack_cleanup: usize,
+    /// Per-parameter fastcall slots from `fastcall_layout` (empty for cdecl).
+    /// The single source of truth for capture, ParamRef and the return
+    /// instruction; replaces the previous `fastcall_reg_param_count` counter
+    /// whose positional counting diverged from the GCC i386 fastcall rules.
+    pub(super) fastcall_slots: Vec<I686FastcallSlot>,
+    /// Incoming register parameters whose ParamRef dests share one physical
+    /// register. Their IR live ranges are disjoint, so RA may reuse the
+    /// register — but every capture happens at function entry, so capturing
+    /// both into the shared register would clobber the first. These params
+    /// are captured into 4-byte frame slots instead (allocated in
+    /// `calculate_stack_space_impl`) and the ParamRef reloads from there.
+    pub(super) conflict_param_slots: FxHashMap<usize, StackSlot>,
+    /// Stack-scalar parameters whose alloca slot is REDIRECTED to the
+    /// caller's argument slot ("direct homing").
+    ///
+    /// The classic i686 model homes every stack argument into a fresh frame
+    /// slot (`movl 220(%esp),%eax; movl %eax,188(%esp)`) and all uses read
+    /// the home. GCC instead reads and writes the caller's argument slot
+    /// directly — the i386 psABI gives the callee ownership of incoming
+    /// stack-argument slots, so no copy is needed. This map records
+    /// `slot id -> (incoming ebp-relative offset, extent)` for redirected
+    /// slots. Every frame operand is formed by [`Self::slot_base_disp`],
+    /// which translates any byte inside `[slot, slot + extent)` -- so every
+    /// load, store, spill, coalesced alias, constant-offset alias and indexed
+    /// (SIB) access transparently hits the caller's slot. Eligibility and the
+    /// extent: `stack_param_direct_home_eligible`. Kill switch:
+    /// CCC_NO_PARAM_DIRECT_HOME=1.
+    pub(super) param_direct_homes: FxHashMap<i64, (i64, i64)>,
+    /// Whether %ebx holds the PIC GOT base for the function being emitted.
+    ///
+    /// Set per function by `function_needs_got`. When false the GOT setup is
+    /// skipped entirely and %ebx stays a general allocatable register, which
+    /// is what keeps leaf functions small in the 32 KiB kernel setup binary.
+    pub(super) pic_got_live: bool,
+    /// Whether the __x86.get_pc_thunk.bx helper needs to be emitted.
+    pub(super) needs_pc_thunk_bx: bool,
+    /// Number of integer arguments to pass in registers (-mregparm=N).
+    /// 0 = standard cdecl, 1-3 = pass first N int args in EAX, EDX, ECX.
+    /// This is the EFFECTIVE per-function value; `base_regparm` holds the
+    /// global flag and is re-applied per function (a function-level
+    /// `__attribute__((regparm(N)))` overrides it).
+    pub(super) regparm: u8,
+    /// The global -mregparm=N flag value (0..=3).
+    pub(super) base_regparm: u8,
+    /// Effective regparm for the call currently being emitted (per-callee
+    /// __attribute__((regparm(N))) override of `base_regparm`; 0 = cdecl).
+    pub(super) current_call_regparm: u8,
+    /// Stack boundary in bytes for frame rounding (4, 8, or 16).
+    /// From -mpreferred-stack-boundary; the kernel realmode code uses 4.
+    pub(super) stack_boundary: i64,
+    /// Whether to omit the frame pointer (-fomit-frame-pointer).
+    pub(super) omit_frame_pointer: bool,
+    /// When omit_frame_pointer is true, this holds the offset from ESP (at its
+    /// base position after prologue) to where EBP would have pointed.
+    /// slot_ref() adds this to convert EBP-relative slot offsets to ESP-relative.
+    /// Value: frame_size + callee_saved_bytes (without the pushed EBP).
+    pub(super) frame_base_offset: i64,
+    /// Tracks temporary ESP adjustments (e.g., subl $N,%esp for call args,
+    /// subl $4,%esp for f32 conversion). Incremented on subl, decremented on addl.
+    /// Added to frame_base_offset in slot_ref() to get the correct ESP offset.
+    pub(super) esp_adjust: i64,
+    /// The active call used runtime ESP realignment for a >16-byte-aligned
+    /// GNU-vector argument. Cleanup restores the saved pre-alignment ESP
+    /// instead of adding the statically known argument area.
+    pub(super) dyn_align_cleanup: bool,
+    /// -Os/-Oz: prefer the shorter sequence (idiv/imul) over the faster one
+    /// (magic-number division, multi-instruction LEA multiply chains).
+    pub(super) optimize_for_size: bool,
+    /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
+    /// LZCNT is NOT baseline i686 ISA: the F3-prefixed encoding decodes as
+    /// BSR on CPUs without the feature and silently returns the bit index
+    /// instead of a zero count. When false, Clz lowers to a BSR sequence
+    /// with an explicit zero fixup preserving the IR's Clz(0) == width.
+    pub(super) lzcnt_enabled: bool,
+    /// True when the target has BMI1 (-mbmi or an enabling -march): TZCNT
+    /// is a BMI1 instruction, distinct from LZCNT/ABM (GCC: `-m32 -mlzcnt`
+    /// keeps `rep bsf`). When false, Ctz lowers to BSF with a stop bit
+    /// (narrow) or an explicit zero fixup (32/64-bit).
+    pub(super) bmi1_enabled: bool,
+    /// True when the target has POPCNT (-mpopcnt or an enabling -march).
+    /// When false, Popcount lowers to an shr/adc bit loop.
+    pub(super) popcnt_enabled: bool,
+    /// `IntrinsicOp::Prefetch` lowering permissions; `None` under
+    /// `CCC_NO_PREFETCH` (see `CodegenOptions::no_prefetch`).
+    pub(super) prefetch_isa: Option<crate::backend::x86_common::X86PrefetchIsa>,
+    /// Final TU permission for SSE1 `movups` copies. This is independent of
+    /// SSE2/AVX: no-SSE targets retain the scalar bit-exact copy loops.
+    pub(super) sse_enabled: bool,
+    /// The resolved ISA has SSE2: scalar F32 arithmetic, compares and
+    /// int<->F32 casts may use the `movd`-based SSE forms. Otherwise they
+    /// use x87 (see `CodegenOptions::i686_no_sse2`).
+    pub(super) sse2_scalar_enabled: bool,
+    /// The resolved ISA has SSE3, so FISTTP is available for truncating
+    /// x87 stores (see [`Self::emit_x87_truncating_store`]).
+    pub(super) fisttp_enabled: bool,
+    /// Same-block div/rem pair analysis (see backend::regalloc::
+    /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
+    /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
+    pub(super) divrem_tail_dests: FxHashSet<u32>,
+    pub(super) divrem_head_partners: FxHashMap<u32, (u32, bool)>,
+    /// Pairs broken at emission time (pathological home combination — see
+    /// emit_divrem_pair_head): the tail must emit its own standalone
+    /// division even though the table lists it as a tail.
+    pub(super) divrem_broken_tails: FxHashSet<u32>,
+    /// Resolved mul-accumulate chain plans (see backend::regalloc::
+    /// compute_i686_mulacc_chains). Only FUSED chains are listed; each plan
+    /// carries the resolved operand references for the fused head emission.
+    pub(super) mulacc_plans: Vec<MulAccPlan>,
+    /// head (Mul) dest value-id -> index into mulacc_plans.
+    pub(super) mulacc_head_of: FxHashMap<u32, usize>,
+    /// FUSED tail (Add) dest value-ids — emit nothing (the head stored the
+    /// fused result).
+    pub(super) mulacc_fused_tails: FxHashSet<u32>,
+    /// ZExt cast dests that are VIRTUAL feeders of a fused chain: the cast
+    /// emits nothing; the fused head references the 32-bit source directly.
+    pub(super) mulacc_virtual_casts: FxHashSet<u32>,
+    /// Wide values whose IR definition is a ZERO-EXTENDING cast from a
+    /// 32-bit-or-smaller unsigned type (u32→u64, u8→u64, …): the high half
+    /// is provably zero, so 64-bit multiply/add with them drops the alo×bhi
+    /// cross term and carries with an immediate 0 — the parser hot shape
+    /// `res = res * base + val` (GCC: imull/mull/addl/adcl $0).
+    pub(super) zext_wide_values: FxHashSet<u32>,
+    /// Narrow values whose 32-bit image is a proven extension
+    /// (`comparison::compute_narrow_images`): lets a byte/word compare in a
+    /// register without that sub-register (`%esi`/`%edi`/`%ebp`) run at 32
+    /// bits exactly instead of staging through `%eax`.
+    pub(super) narrow_images: FxHashMap<u32, super::comparison::NarrowImage>,
+}
+
+// Callee-saved physical register indices for i686
+// PhysReg(0) = ebx, PhysReg(1) = esi, PhysReg(2) = edi, PhysReg(3) = ebp
+pub(super) const I686_CALLEE_SAVED: &[PhysReg] = &[PhysReg(0), PhysReg(1), PhysReg(2)];
+// Extended callee-saved list including ebp (used when -fomit-frame-pointer)
+pub(super) const I686_CALLEE_SAVED_WITH_EBP: &[PhysReg] =
+    &[PhysReg(0), PhysReg(1), PhysReg(2), PhysReg(3)];
+// Caller-saved registers for Phase-2 allocation (non-call-spanning values).
+// PhysReg(4) = ecx, PhysReg(5) = edx. %eax stays the accumulator.
+//
+// These are handed out ONLY to values whose live range crosses neither a
+// call point nor a "scratch hazard" -- an instruction whose i686 emitter
+// uses %ecx/%edx internally (non-const binop rhs staging, div/rem, indirect
+// loads/stores, wide operations, casts, atomics, inline asm, ...). The
+// hazard scan lives in regalloc.rs (collect_i686_scratch_hazard_points) and
+// is a WHITELIST: anything not proven clean is a hazard, so a missed case
+// costs a register, never a wrong value. This is GCC's main size advantage
+// on the 32 KiB kernel setup binary: values that live between two compares
+// can sit in %edx instead of forcing a %ebx..%ebp spill + push/pop pair.
+pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[PhysReg(5), PhysReg(4)];
+
+/// The 8-byte scalars an i686 value carries as a 32-bit pair (`%eax:%edx`
+/// in the accumulator, two words in memory and in the argument area):
+/// 64-bit integers, `double` when moved as bits, and the `_Decimal64` BID
+/// container, which is only ever moved (its arithmetic is libbid calls) and
+/// never goes through x87, which would reinterpret the bits.
+pub(super) fn is_pair_scalar(ty: IrType) -> bool {
+    matches!(ty, IrType::I64 | IrType::U64 | IrType::F64 | IrType::D64)
+}
+
+/// The exact 64-bit image of a constant held in an i686 register pair, or
+/// `None` for a constant of at most 32 bits that has no high word of its
+/// own (it zero-extends).  Integers are their sign-extended IR value,
+/// `I128` contributes its low half (the 64-bit pair family serves the low
+/// 64 bits), and `double`/`_Decimal64` constants are their bit patterns.
+pub(super) fn pair_const_bits(c: &IrConst) -> Option<u64> {
+    Some(match c {
+        IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) => c.to_i64()? as u64,
+        IrConst::I128(v) => *v as u64,
+        IrConst::F64(f) => f.to_bits(),
+        IrConst::D64(v) => *v,
+        IrConst::Zero => 0,
+        _ => return None,
+    })
+}
+
+/// `%reg` for a bare i686 GPR name as returned by [`phys_reg_name`].
+fn base_name(reg: &str) -> &'static str {
+    match reg {
+        "ebx" => "%ebx",
+        "esi" => "%esi",
+        "edi" => "%edi",
+        "ebp" => "%ebp",
+        "ecx" => "%ecx",
+        "edx" => "%edx",
+        "eax" => "%eax",
+        _ => panic!("invalid i686 base register: {reg}"),
+    }
+}
+
+/// Largest `Memcpy` the i686 backend copies straight-line at speed levels;
+/// the library-call rewrite (`builtin_policy::library_memcpy_inline_max`)
+/// uses the same number, so a `memcpy` call is turned into an IR `Memcpy`
+/// exactly when the emitter will expand it this way.
+///
+/// Measured on the host CPU in the `memcpy` regime (copy, then read the
+/// copy's last dword; min of 301 rounds, L1-hot), cycles per copy:
+///
+/// ```text
+///   bytes   rep movsb   movups+overlap   movl pairs   call memcpy@PLT
+///    8..64      21.76             4.60    4.60-7.64          6.9-8.5
+///      128      21.76             5.25   13.03-13.88             9.7
+///      256      25.25             9.58        26.58             17.1
+///      512      31.37            17.50        52.06             25.4
+/// ```
+///
+/// `rep movsb` pays a ~20-cycle start-up at every size this window covers,
+/// which makes it slower than even the library call. The budget is 16 chunk
+/// pairs: 256 bytes of `movups` (2.6x faster than `rep movsb` at the edge,
+/// 1.8x faster than the call) and 64 bytes of `movl` (2.8x; past 64 the
+/// scalar copy loses to the library call too). Under `-Os` this is only the
+/// candidate window: the emitter keeps whichever of the straight-line copy
+/// and the `rep movsb` sequence encodes to fewer bytes.
+pub(crate) fn straight_memcpy_max(sse: bool) -> usize {
+    if sse { 256 } else { 64 }
+}
+
+/// Bytes the in-tree i686 assembler encodes `text` to, or `None` when any
+/// line is not a plain instruction it can encode. Used to compare emission
+/// candidates by size with the same encoder that produces the object file
+/// (GAS-identical encodings for these forms), not with a hand model that
+/// could drift from it.
+fn encoded_len(text: &str) -> Option<usize> {
+    use crate::backend::i686::assembler::encoder::InstructionEncoder;
+    use crate::backend::x86::assembler::parser::AsmItem;
+    let mut enc = InstructionEncoder::new();
+    for item in crate::backend::i686::assembler::parse_asm(text).ok()? {
+        match item {
+            AsmItem::Instruction(instr) => enc.encode(&instr).ok()?,
+            AsmItem::Empty => {}
+            _ => return None,
+        }
+    }
+    Some(enc.bytes.len())
+}
+
+pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        0 => "ebx",
+        1 => "esi",
+        2 => "edi",
+        3 => "ebp",
+        4 => "ecx",
+        5 => "edx",
+        // The accumulator as an allocatable home (Phase 2e; see the
+        // eax-hazard wave in regalloc.rs). Every emitter path that uses
+        // %eax as scratch is an eax hazard point, so a homed value here is
+        // never spanned by an unstaged accumulator use.
+        6 => "eax",
+        _ => panic!("invalid i686 phys reg: {:?}", reg),
+    }
+}
+
+/// Map inline asm constraint register names to callee-saved PhysReg indices.
+pub(super) fn i686_constraint_to_phys(constraint: &str) -> Option<PhysReg> {
+    match constraint {
+        "b" | "{ebx}" | "ebx" => Some(PhysReg(0)),
+        "S" | "{esi}" | "esi" => Some(PhysReg(1)),
+        "D" | "{edi}" | "edi" => Some(PhysReg(2)),
+        _ => None,
+    }
+}
+
+/// Map inline asm clobber register names to callee-saved PhysReg indices.
+pub(super) fn i686_clobber_to_phys(clobber: &str) -> Option<PhysReg> {
+    let clobber = crate::backend::inline_asm::normalize_inline_asm_reg_name(clobber);
+    match clobber {
+        "ebx" => Some(PhysReg(0)),
+        "esi" => Some(PhysReg(1)),
+        "edi" => Some(PhysReg(2)),
+        _ => None,
+    }
+}
+
+/// A/B gate for [`I686Codegen::store_const_to_stack_arg`]: the presence of
+/// `CCC_NO_CONST_STACK_ARG` restores the historical two-instruction
+/// `operand_to_eax` + `movl %eax, N(%esp)` marshalling (same presence-means-off
+/// convention as the i686 slot forwarders' `CCC_NO_*` switches, so one harness
+/// can disable any subset of the S19 changes).  Read once and cached: the gate
+/// is consulted per call argument, and an uncached environment lookup on a
+/// codegen hot path is a compile-time regression, not a debugging aid.
+fn const_stack_arg_disabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var_os("CCC_NO_CONST_STACK_ARG").is_some())
+}
+
+/// The 32-bit value that materializing `c` into a register produces, i.e. the
+/// exact four bytes a direct `movl $imm, N(%esp)` must store to be
+/// indistinguishable from the historical `operand_to_eax` + store pair.
+///
+/// This is the single source of truth for both paths: [`I686Codegen::operand_to_eax`]
+/// emits `movl $imm` from it and [`I686Codegen::store_const_to_stack_arg`]
+/// stores the same `imm`, so the fold cannot drift from the sequence it
+/// replaces.  The per-arm conventions are the IR's, not this function's: i64 and
+/// i128 truncate to their low half (only 32 bits fit), `F32`/`F64` pass the
+/// IEEE bit pattern, `D32`/`D64` are BID containers converted numerically, and
+/// `LongDouble` passes its leading four bytes.
+pub(super) fn const_stack_arg_imm(c: &IrConst) -> i32 {
+    match c {
+        IrConst::I8(v) => *v as i32,
+        IrConst::I16(v) => *v as i32,
+        IrConst::I32(v) => *v,
+        IrConst::I64(v) => *v as i32,
+        IrConst::I128(v) => *v as i32,
+        IrConst::F32(fval) => fval.to_bits() as i32,
+        IrConst::D32(v) => *v as i32,
+        IrConst::D64(v) => *v as i32,
+        IrConst::F64(fval) => fval.to_bits() as i32,
+        IrConst::LongDouble(_, bytes) => {
+            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+        IrConst::Zero => 0,
+    }
+}
+
+/// Whether [`I686Codegen::operand_to_eax`] materializes a ZERO value of this
+/// constant's kind with `xorl %eax, %eax` (2 bytes) instead of `movl $0, %eax`
+/// (5 bytes).  Only the integer arms that special-case zero do; `I128`, the
+/// decimal containers, the floats and the narrow integers emit the `movl` even
+/// for zero -- and the i686 peephole then rewrites that `movl $0, %reg` into
+/// the same `xorl`, which is why the two forms are indistinguishable in final
+/// assembly and why [`const_stack_arg_fold_wins`] refuses every zero rather
+/// than only these arms'.
+pub(super) fn const_zero_uses_xorl(c: &IrConst) -> bool {
+    matches!(c, IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero)
+}
+
+/// Whether replacing `operand_to_eax(c)` + `movl %eax, N(%esp)` with the single
+/// `movl $imm, N(%esp)` makes the encoding smaller, i.e. whether the fold may
+/// fire at all.
+///
+/// ENCODING ARITHMETIC, not a heuristic.  With an 8-bit displacement:
+///
+/// ```text
+///   non-zero imm    movl $imm,%eax (5B) + movl %eax,d8(%esp) (4B) = 9B
+///                   -> movl $imm,d8(%esp)                    = 8B   WIN
+///   zero            xorl %eax,%eax (2B) + movl %eax,d8(%esp) (4B) = 6B
+///                   -> movl $0,d8(%esp)                      = 8B   LOSS
+/// ```
+///
+/// With a 32-bit displacement both sides grow by 3 bytes, so the ordering is
+/// unchanged.  The rule is therefore "fold every non-zero immediate, never a
+/// zero", which wins both metrics wherever it fires: one instruction fewer AND
+/// one byte fewer.
+///
+/// The zero row is arm-INDEPENDENT, and that is not obvious from this file:
+/// only `I32`, `I64` and `Zero` materialize zero with `xorl` here, so a
+/// per-arm predicate looks tempting -- `I8(0)`, `F32(0.0)`, `I128(0)` and the
+/// decimal containers emit `movl $0, %eax` (5B), for which the 8-byte folded
+/// store would seem to win.  It does not, because the i686 peephole normalizes
+/// `movl $0, %reg` to `xorl %reg, %reg` (`peephole.rs`, "saves 3 bytes"), so
+/// the zero that reaches the assembler is 2 bytes whichever arm produced it.
+/// Implementing the per-arm form anyway was measured, not reasoned about: 8
+/// corpus TUs changed and every change was `xorl %eax,%eax; movl %eax,N(%esp)`
+/// becoming `movl $0,N(%esp)`, i.e. +2 bytes and -1 instruction each
+/// (`tools/asm_identity.py`).  The cost model has to be the FINAL encoding, not
+/// the encoding at the point of emission.
+///
+/// Folding zeros as well was measured and rejected on the same grounds at
+/// corpus scale: -1,189 instructions but +1,344 `.text` bytes (+0.477%), with
+/// two memset TUs at +319 bytes each.  Runtime was neutral either way (paired
+/// geomean -0.24%), so there is no performance argument for paying bytes.  The
+/// two forms that would win BOTH metrics are documented in the S19 FOLLOWUP
+/// §8: push-based outgoing arguments (`pushl $0` is 2 bytes against an 8-byte
+/// displaced store -- how gcc gets 132 pushes into fewer bytes than 111
+/// stores), or a reliable "%eax already holds zero" cache, which is blocked by
+/// the incomplete i686 accumulator-cache contract noted in `operand_to_eax` (a
+/// stale zero claim would be a miscompile).
+pub(super) fn const_stack_arg_fold_wins(imm: i32) -> bool {
+    imm != 0
+}
+
+impl I686Codegen {
+    /// Pop the cached x87 top-of-stack copy, if one is live. The slot copy
+    /// was already written and reloaded at F64 precision, so this is purely an
+    /// FP-stack hygiene step (bounded depth); the popped value is dead.
+    pub(super) fn flush_x87_pending_copy(&mut self) {
+        if self.state.x87_pending.take().is_some() {
+            self.state.out.emit("    fstp %st(0)");
+        }
+    }
+
+    /// F64 binop with x87 top-of-stack tracking (the FP twin of the vector
+    /// deferred-store mechanism).
+    ///
+    /// Stack-depth invariant: exactly one register is occupied while
+    /// `x87_pending` is `Some(v)` (a copy of `v`; its slot is already
+    /// correct via `fstpl; fldl`), none while it is `None`. Every path below
+    /// restores the invariant before returning, and the central
+    /// `x87_pre_emit` hook flushes the copy before any foreign x87 line or
+    /// label, so no sequence of foreign emissions can unbalance the stack.
+    ///
+    /// Operand cases (P = pending copy; non-commutative mappings follow the
+    /// classic popping-form operand roles, where the lhs sits in the higher
+    /// slot and the mnemonic carries the reversed-direction suffix):
+    ///   [P] + dup(P)                -> `fld %st(0)` then `f{add,mul}p %st, %st(1)`
+    ///   [P] as lhs + push(R): st0=R,st1=P -> `f{add,subr,mul,divr} %st(1), %st`
+    ///                                   computes st0 = st1 op st0 = P op R,
+    ///                                   then `fstp %st(1)` frees the dead
+    ///                                   original (the new top holds the
+    ///                                   result afterwards).
+    ///   [P] as rhs + push(L): st0=L,st1=P -> `f{add,sub,mul,div} %st(1), %st`
+    ///                                   computes st0 = st0 op st1 = L op P,
+    ///                                   then `fstp %st(1)` as above.
+    ///   no P: push(L) + push(R)     -> `f{add,subr,mul,divr}p %st, %st(1)`
+    ///                                   (unchanged classic path)
+    ///
+    /// A rounded copy stays on the stack (`fstpl; fldl`) exactly when the
+    /// precomputed `x87_defer_values` analysis guarantees the next F64 binop
+    /// is its single consumer; otherwise it is stored with `fstpl` as before.
+    fn emit_f64_binop_tracked(
+        &mut self,
+        dest: &Value,
+        op: crate::backend::cast::FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
+        let mnemonic = self.emit_float_binop_mnemonic(op);
+        // Forward-direction (non-reversed) mnemonics, for the case where the
+        // pending value plays the rhs role: with L on top (st0) and the
+        // pending P below (st1), `f{op} %st(1), %st` computes st0 op st1,
+        // which is exactly L op P.
+        let plain_mnemonic = match op {
+            crate::backend::cast::FloatOp::Add => "add",
+            crate::backend::cast::FloatOp::Sub => "sub",
+            crate::backend::cast::FloatOp::Mul => "mul",
+            crate::backend::cast::FloatOp::Div => "div",
+        };
+
+        let lhs_matches = matches!(lhs, Operand::Value(v)
+            if self.state.x87_pending == Some(v.0));
+        let rhs_matches = matches!(rhs, Operand::Value(v)
+            if self.state.x87_pending == Some(v.0));
+
+        // Every controlled emission in this arm is suppressed: the central
+        // hook must not fire on our own x87 lines while we manage the cache.
+        self.state.x87_suppress = true;
+
+        if !lhs_matches && !rhs_matches {
+            // Pending copy not consumed here: pop it before building the
+            // fresh operand pair so the depth invariant holds on every path.
+            self.flush_x87_pending_copy();
+            self.emit_f64_load_to_x87(lhs);
+            self.emit_f64_load_to_x87(rhs);
+            emit!(self.state, "    f{}p %st, %st(1)", mnemonic);
+        } else if lhs_matches && rhs_matches {
+            // Square of the pending value: duplicate and fold with the
+            // popping form. Consumes both the duplicate and the original.
+            // (Only reachable for Add/Mul: both operands of a Sub/Div can
+            // only be the same pending value if the IR reuses it twice,
+            // which the single-use deferral excludes.)
+            self.state.out.emit("    fld %st(0)");
+            self.state.x87_pending = None;
+            emit!(self.state, "    f{}p %st, %st(1)", mnemonic);
+        } else if lhs_matches {
+            // Pending value is the lhs: push the rhs on top, compute
+            // st0 = st1 op st0 with the same reversed-direction mnemonic the
+            // classic path uses when the lhs sits in the higher slot, then
+            // free the consumed original.
+            self.emit_f64_load_to_x87(rhs);
+            self.state.x87_pending = None;
+            emit!(self.state, "    f{} %st(1), %st", mnemonic);
+            self.state.out.emit("    fstp %st(1)");
+        } else {
+            // Pending value is the rhs: push the lhs on top, compute
+            // st0 = st0 op st1 with the forward-direction mnemonic.
+            self.emit_f64_load_to_x87(lhs);
+            self.state.x87_pending = None;
+            emit!(self.state, "    f{} %st(1), %st", plain_mnemonic);
+            self.state.out.emit("    fstp %st(1)");
+        }
+
+        // Result is now in st(0). Defer the pop exactly when the analysis
+        // proved this value's next (and only) use is the adjacent binop;
+        // otherwise pop-and-store as the classic path does.
+        let defer = self.state.x87_defer_values.contains(&dest.0);
+        if defer && self.state.get_slot(dest.0).is_some() {
+            let sr = self.slot_ref(self.state.get_slot(dest.0).unwrap());
+            // FST without pop rounds MEMORY, not ST(0). Forwarding the
+            // unrounded 80-bit register violates the F64 IR contract (and
+            // FLT_EVAL_METHOD=0), notably on a cancelling multiply/add.
+            // Keep the depth-one cache invariant, but cache the actual F64
+            // value. No control-word mutation: rounding mode and exponent
+            // range must be those of the original double store/reload.
+            emit!(self.state, "    fstpl {}", sr);
+            emit!(self.state, "    fldl {}", sr);
+            self.state.x87_pending = Some(dest.0);
+        } else {
+            self.emit_f64_store_from_x87(dest);
+            self.state.x87_pending = None;
+        }
+        self.state.x87_suppress = false;
+        self.state.reg_cache.invalidate_acc();
+    }
+    pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(RaConfig::from_process_env()))
+    }
+
+    pub(crate) fn new_with_ra_config(ra_config: Arc<RaConfig>) -> Self {
+        let mut state = CodegenState::new_with_ra_config(ra_config);
+        // i686 tracks the %eax accumulator (same rax-family discipline as
+        // x86-64, same AT&T vocabulary for the sink classifier): arm the
+        // shadow-epoch validator for this target too. Its parks go through
+        // `park_acc` and its consuming probes through `acc_has_verified`.
+        state.enable_rax_epoch_discipline();
+        Self {
+            state,
+            current_return_type: IrType::I32,
+            current_return_i686_ext_vector_gp3: false,
+            current_return_i686_xmm: false,
+            current_return_half_xmm: false,
+            vector_ret_buffer_bytes: 0,
+            vector_ret_buffer_offset: 0,
+            is_variadic: false,
+            reg_assignments: FxHashMap::default(),
+            value_types: FxHashMap::default(),
+            narrow_images: FxHashMap::default(),
+            divrem_tail_dests: FxHashSet::default(),
+            divrem_head_partners: FxHashMap::default(),
+            divrem_broken_tails: FxHashSet::default(),
+            mulacc_plans: Vec::new(),
+            mulacc_head_of: FxHashMap::default(),
+            mulacc_fused_tails: FxHashSet::default(),
+            mulacc_virtual_casts: FxHashSet::default(),
+            zext_wide_values: FxHashSet::default(),
+            used_callee_saved: Vec::new(),
+            va_named_stack_bytes: 0,
+            incoming_stack_arg_bytes: 0,
+            esp_baseline_offset: 0,
+            asm_scratch_idx: 0,
+            asm_xmm_scratch_idx: 0,
+            is_fastcall: false,
+            fastcall_stack_cleanup: 0,
+            fastcall_slots: Vec::new(),
+            conflict_param_slots: FxHashMap::default(),
+            param_direct_homes: FxHashMap::default(),
+            pic_got_live: false,
+            needs_pc_thunk_bx: false,
+            regparm: 0,
+            base_regparm: 0,
+            current_call_regparm: 0,
+            stack_boundary: 16,
+            omit_frame_pointer: false,
+            frame_base_offset: 0,
+            esp_adjust: 0,
+            dyn_align_cleanup: false,
+            optimize_for_size: false,
+            lzcnt_enabled: false,
+            bmi1_enabled: false,
+            popcnt_enabled: false,
+            prefetch_isa: None,
+            sse_enabled: false,
+            sse2_scalar_enabled: true,
+            fisttp_enabled: true,
+        }
+    }
+
+    pub fn set_pic(&mut self, pic: bool) {
+        self.state.pic_mode = pic;
+    }
+
+    pub fn set_no_jump_tables(&mut self, enabled: bool) {
+        self.state.no_jump_tables = enabled;
+    }
+
+    /// Apply all relevant options from a `CodegenOptions` struct.
+    pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
+        self.state.disable_regalloc = opts.disable_regalloc;
+        self.state.apply_tls_options(opts);
+        self.set_pic(opts.pic || opts.pie);
+        self.state.pie_mode = opts.pie;
+        self.state.no_plt = opts.no_plt;
+        self.set_no_jump_tables(opts.no_jump_tables);
+        self.state.mcount = opts.mcount;
+        self.base_regparm = opts.regparm;
+        self.regparm = opts.regparm;
+        self.omit_frame_pointer = opts.omit_frame_pointer;
+        self.state.emit_cfi = opts.emit_cfi;
+        // Function delimiters for the peephole even without unwind tables;
+        // stripped after it (see CodegenState::fn_boundary_markers).
+        self.state.fn_boundary_markers = true;
+        // 0 (Default::default()) means "unspecified" -> SysV 16.
+        self.stack_boundary = match opts.preferred_stack_bytes {
+            4 => 4,
+            8 => 8,
+            _ => 16,
+        };
+        self.optimize_for_size = opts.optimize_for_size;
+        self.lzcnt_enabled = opts.lzcnt;
+        self.bmi1_enabled = opts.bmi1;
+        self.popcnt_enabled = opts.popcnt;
+        // i686 is NOT SSE-baseline: the driver decides (SSE or PRFCHW).
+        self.prefetch_isa = (!opts.no_prefetch).then_some(opts.x86_prefetch);
+        self.sse_enabled = !opts.no_sse && !opts.general_regs_only;
+        self.sse2_scalar_enabled = !opts.i686_no_sse2 && !opts.general_regs_only;
+        self.fisttp_enabled = self.sse2_scalar_enabled && !opts.i686_no_sse3;
+    }
+
+    /// Pop st(0) into the `suffix`-sized integer at `(%esp)`, truncating
+    /// toward zero (`suffix`: `s` = 16, `l` = 32, `q` = 64 bits).
+    ///
+    /// With SSE3 this is FISTTP. Without it the x87 rounding control is
+    /// switched to round-toward-zero around a plain FIST(P) and then
+    /// restored, which is GCC's non-SSE3 lowering: FISTP under RC=11 has
+    /// FISTTP's exact semantics (truncation, the integer-indefinite result
+    /// and FE_INVALID for NaN/out-of-range, FE_INEXACT for fractions). Only
+    /// the RC field changes, so the caller's precision control and exception
+    /// masks are preserved. Both control words live in a 4-byte scratch
+    /// below the caller's slot, so no GPR is touched; the `orw` clobbers
+    /// EFLAGS, which no caller has live across the conversion.
+    pub(super) fn emit_x87_truncating_store(&mut self, suffix: char) {
+        debug_assert!(matches!(suffix, 's' | 'l' | 'q'));
+        if self.fisttp_enabled {
+            emit!(self.state, "    fisttp{} (%esp)", suffix);
+            return;
+        }
+        self.state.emit("    subl $4, %esp");
+        self.state.emit("    fnstcw (%esp)");
+        self.state.emit("    fnstcw 2(%esp)");
+        self.state.emit("    orw $0x0c00, 2(%esp)");
+        self.state.emit("    fldcw 2(%esp)");
+        emit!(self.state, "    fistp{} 4(%esp)", suffix);
+        self.state.emit("    fldcw (%esp)");
+        self.state.emit("    addl $4, %esp");
+    }
+
+    // --- i686 helper methods ---
+
+    /// Format a stack slot reference as either `offset(%ebp)` or `offset(%esp)`.
+    /// When frame pointer is omitted, converts EBP-relative offsets to ESP-relative
+    /// by adding frame_base_offset + esp_adjust.
+    pub(super) fn slot_ref(&self, slot: StackSlot) -> String {
+        self.slot_ref_offset(slot, 0)
+    }
+
+    /// Format a stack slot reference with an additional byte offset.
+    /// Used for accessing sub-fields of multi-byte slots (e.g., upper 4 bytes of i64).
+    pub(super) fn slot_ref_offset(&self, slot: StackSlot, extra: i64) -> String {
+        let (base, disp) = self.slot_base_disp(slot, extra);
+        format!("{}(%{})", disp, base)
+    }
+
+    /// Base register and displacement of byte `extra` of `slot`: the single
+    /// place a frame operand is formed, for plain (`slot_ref*`) and indexed
+    /// (`frame_sib_for_alloca_base`) operands alike.
+    ///
+    /// A directly-homed stack parameter's slot *is* the caller's argument
+    /// slot (see `param_direct_homes`), and so is every byte inside its
+    /// extent: `slot` may be the home itself or a constant-offset alias into
+    /// it (`resolve_slot_addr` yields `Direct(home + k)` for
+    /// `(char *)&param + k`). Translating only the exact home -- as this used
+    /// to -- sent `((unsigned char *)&a)[1]` and the register-indexed
+    /// `p[i]` to the parameter's never-written frame slot.
+    pub(super) fn slot_base_disp(&self, slot: StackSlot, extra: i64) -> (&'static str, i64) {
+        if let Some(src) = self.direct_home_offset(slot.0) {
+            return self.param_base_disp(src + extra);
+        }
+        if self.omit_frame_pointer {
+            (
+                "esp",
+                slot.0 + extra + self.frame_base_offset + self.esp_adjust,
+            )
+        } else {
+            ("ebp", slot.0 + extra)
+        }
+    }
+
+    /// The incoming ebp-relative offset frame byte `at` is redirected to, if
+    /// it lies inside a directly-homed parameter's extent. Extents never
+    /// overlap (each is the frame object the home owns), so at most one
+    /// entry matches; the map holds one entry per homed parameter.
+    fn direct_home_offset(&self, at: i64) -> Option<i64> {
+        if let Some(&(src, _)) = self.param_direct_homes.get(&at) {
+            return Some(src);
+        }
+        self.param_direct_homes
+            .iter()
+            .find(|&(&home, &(_, extent))| home < at && at < home + extent)
+            .map(|(&home, &(src, _))| src + (at - home))
+    }
+
+    /// Format a parameter reference from the caller's stack frame.
+    /// With frame pointer: offset(%ebp) where offset is positive (above EBP).
+    /// Without frame pointer: params are at ESP + frame_base_offset + esp_adjust + offset,
+    /// but we need to subtract 4 because there's no pushed EBP taking up space.
+    /// The param_offset is the EBP-relative offset (e.g., 8 for first param).
+    pub(super) fn param_ref(&self, ebp_offset: i64) -> String {
+        let (base, disp) = self.param_base_disp(ebp_offset);
+        format!("{}(%{})", disp, base)
+    }
+
+    /// Base register and displacement of the incoming argument byte at
+    /// `ebp_offset(%ebp)`.
+    fn param_base_disp(&self, ebp_offset: i64) -> (&'static str, i64) {
+        if self.omit_frame_pointer {
+            // Without pushed EBP, params are 4 bytes closer to the frame.
+            // EBP would have been at original_esp - 4 (after push ebp).
+            // Without push ebp, the return address is at original_esp.
+            // So param at ebp_offset(%ebp) = (ebp_offset - 4) relative to original_esp.
+            // And relative to current ESP: ebp_offset - 4 + frame_base_offset + esp_adjust.
+            (
+                "esp",
+                ebp_offset - 4 + self.frame_base_offset + self.esp_adjust,
+            )
+        } else {
+            ("ebp", ebp_offset)
+        }
+    }
+
+    pub(super) fn dest_reg(&self, dest: &Value) -> Option<PhysReg> {
+        self.reg_assignments.get(&dest.0).copied()
+    }
+
+    /// Direct REGISTER source reference for a 32-bit ALU/cmp operand. Returns
+    /// `Some("%reg")` when the value is register-allocated — authoritative
+    /// (the linear scan guarantees the register holds the value throughout its
+    /// range), so `op %reg, %eax` replaces the `movl %reg,%ecx; op %ecx,%eax`
+    /// staging with an identical read. Returns `None` otherwise (including
+    /// when the accumulator cache holds the value, whose slot may be stale or
+    /// not-yet-materialized): the caller stages via operand_to_ecx. Slot
+    /// values are deliberately NOT folded here — their slots are finalized
+    /// lazily (deferred/coalesced), so a direct slot read at emission time can
+    /// hit a stale location; the peephole folds those after materialization.
+    pub(super) fn direct_reg_src_ref(&self, v: &Value) -> Option<String> {
+        if self.state.wide_values.contains(&v.0)
+            || self.state.is_alloca(v.0)
+            || self.state.f128_direct_slots.contains(&v.0)
+        {
+            return None;
+        }
+        if let Some(&phys) = self.reg_assignments.get(&v.0) {
+            return Some(format!("%{}", phys_reg_name(phys)));
+        }
+        None
+    }
+
+    /// Direct divisor source for div/idiv. Unlike `direct_reg_src_ref`,
+    /// register-homed ALLOCAS qualify: the divisor emission path stages a
+    /// register-homed operand with exactly `movl %home,%ecx` (see
+    /// operand_to_ecx's reg_assignments branch, which runs before the slot
+    /// path), so the home register holds the value and `divl %home` performs
+    /// the identical read without the %ecx relay. `%edx` (dividend high
+    /// half — divl would divide by edx:edx:eax) and `%eax` (clobbered by
+    /// operand_to_eax(lhs) moments before) are excluded; those home shapes
+    /// stage through %ecx exactly as before.
+    pub(super) fn div_rhs_direct_ref(&self, v: &Value) -> Option<String> {
+        if self.state.wide_values.contains(&v.0) || self.state.f128_direct_slots.contains(&v.0) {
+            return None;
+        }
+        if let Some(&phys) = self.reg_assignments.get(&v.0) {
+            if phys.0 == 5 || phys.0 == 6 {
+                return None; // %edx / %eax: stage through %ecx instead
+            }
+            return Some(format!("%{}", phys_reg_name(phys)));
+        }
+        None
+    }
+
+    /// Load the address of va_list storage into %edx.
+    ///
+    /// va_list_ptr is an IR value that holds a pointer to the va_list storage.
+    /// - If va_list_ptr is an alloca (local va_list variable), we LEA the slot
+    ///   address into %edx (the alloca IS the va_list storage).
+    /// - If va_list_ptr is a regular value (e.g., loaded pointer from va_list*),
+    ///   we load its value into %edx (the value IS the address of va_list storage).
+    pub(super) fn load_va_list_addr_to_edx(&mut self, va_list_ptr: &Value) {
+        let is_alloca = self.state.is_alloca(va_list_ptr.0);
+        if let Some(phys) = self.reg_assignments.get(&va_list_ptr.0).copied() {
+            // Value is in a callee-saved register (non-alloca pointer value)
+            let reg = phys_reg_name(phys);
+            emit!(self.state, "    movl %{}, %edx", reg);
+        } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
+            let sr = self.slot_ref(slot);
+            if is_alloca {
+                // Alloca: the slot IS the va_list; get the address of the slot
+                emit!(self.state, "    leal {}, %edx", sr);
+            } else {
+                // Regular value: the slot holds a pointer to the va_list storage
+                emit!(self.state, "    movl {}, %edx", sr);
+            }
+        }
+    }
+
+    /// Write a copy source straight into the GPR home `dest` (never %eax),
+    /// with exactly the bits and flag effects of `operand_to_eax(src)`
+    /// followed by `movl %eax, %dest`: constants use the accumulator path's
+    /// immediate and zero-idiom choice (`const_stack_arg_imm`,
+    /// `const_zero_uses_xorl`), slot values the same `movl`/`leal`. Returns
+    /// false, emitting nothing, for every source the detour handles better
+    /// or differently: register-homed values (the caller's reg-to-reg path
+    /// owns those), a value already verified in %eax (one `movl %eax` and
+    /// no memory access), home-less accumulator temporaries, wide and x87
+    /// values, and over-aligned allocas.
+    fn emit_copy_direct_to_home(&mut self, src: &Operand, dest: PhysReg) -> bool {
+        let d = phys_reg_name(dest);
+        match src {
+            Operand::Const(c) => {
+                let imm = const_stack_arg_imm(c);
+                if imm == 0 && const_zero_uses_xorl(c) {
+                    emit!(self.state, "    xorl %{}, %{}", d, d);
+                } else {
+                    emit!(self.state, "    movl ${}, %{}", imm, d);
+                }
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.reg_assignments.contains_key(&v.0)
+                    || self.state.acc_has_verified(v.0, is_alloca)
+                    || self.state.is_wide_value(v.0)
+                    || self.state.f128_direct_slots.contains(&v.0)
+                {
+                    return false;
+                }
+                let Some(slot) = self.state.get_slot(v.0) else {
+                    return false;
+                };
+                let sr = self.slot_ref(slot);
+                if is_alloca {
+                    if self.state.alloca_over_align(v.0).is_some() {
+                        return false;
+                    }
+                    emit!(self.state, "    leal {}, %{}", sr, d);
+                } else {
+                    emit!(self.state, "    movl {}, %{}", sr, d);
+                }
+            }
+        }
+        if dest.0 == 4 {
+            // %ecx doubles as the secondary staging register.
+            self.state.reg_cache.invalidate_sec();
+        }
+        true
+    }
+
+    /// Load an operand into %eax.
+    pub(super) fn operand_to_eax(&mut self, op: &Operand) {
+        // Check register cache - skip load if value is already in eax.
+        // This SOURCES the value from %eax when it returns early, so it is
+        // a verified consume: the epoch contract must hold between the park
+        // and this probe.
+        if let Operand::Value(v) = op {
+            let is_alloca = self.state.is_alloca(v.0);
+            let has_register_home = self.reg_assignments.contains_key(&v.0);
+            if self.state.acc_has_verified(v.0, is_alloca) && !(is_alloca && has_register_home) {
+                return;
+            }
+        }
+
+        match op {
+            Operand::Const(c) => {
+                // Same value the direct stack-argument store uses, so the two
+                // marshalling paths cannot disagree about a constant's bits.
+                let imm = const_stack_arg_imm(c);
+                if imm == 0 && const_zero_uses_xorl(c) {
+                    self.state.emit("    xorl %eax, %eax");
+                } else {
+                    emit!(self.state, "    movl ${}, %eax", imm);
+                }
+                self.state.reg_cache.invalidate_acc();
+            }
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                // An alloca's value is its frame address, not a register-held
+                // scalar. Coalescing can nevertheless give an alloca alias a
+                // register home; that home may be undefined on a branch where
+                // the address has not yet been materialized (notably an sret
+                // argument in a conditional expression). Recompute from the
+                // authoritative stack slot instead of consuming that register.
+                if is_alloca {
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        self.emit_alloca_addr_to("eax", v.0, slot);
+                        self.state.park_acc(v.0, true);
+                        return;
+                    }
+                }
+                // Check if value is in a callee-saved register.
+                if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
+                    if phys.0 == 6 {
+                        // Value is homed in %eax itself (Phase 2e): it is
+                        // already where the caller wants it. Refresh the
+                        // cache entry and emit nothing.
+                        self.state.park_acc(v.0, false);
+                    } else {
+                        let reg = phys_reg_name(phys);
+                        emit!(self.state, "    movl %{}, %eax", reg);
+                        self.state.park_acc(v.0, false);
+                    }
+                } else if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot);
+                    if is_alloca {
+                        // Alloca: the slot IS the data; load the address of the slot
+                        if let Some(align) = self.state.alloca_over_align(v.0) {
+                            // Over-aligned alloca: compute aligned address
+                            emit!(self.state, "    leal {}, %eax", sr);
+                            emit!(self.state, "    addl ${}, %eax", align - 1);
+                            emit!(self.state, "    andl ${}, %eax", -(align as i32));
+                        } else {
+                            emit!(self.state, "    leal {}, %eax", sr);
+                        }
+                    } else {
+                        // Regular value: load the value from the slot
+                        emit!(self.state, "    movl {}, %eax", sr);
+                    }
+                    self.state.park_acc(v.0, is_alloca);
+                } else {
+                    // i686 acc-flow contract: the accumulator-centric backend
+                    // has paths where a no-home value is consumed DIRECTLY
+                    // from %eax without a cache entry (the producer staged it
+                    // there outside the cache-tracked flow).  The legacy
+                    // behavior is to emit nothing and let the consumer read
+                    // %eax as-is.  (x86-64 has a HARD panic gate in the same
+                    // situation — session 26 — because its cache contract is
+                    // complete; there it caught the sqlite3KeyInfoAlloc and
+                    // sqlite3VdbeExec corruptions.  i686's cache contract is
+                    // not yet complete enough for the gate; hardening it is
+                    // tracked as the i686 acc-cache audit.)
+                }
+            }
+        }
+    }
+
+    /// Store a constant call argument straight into the outgoing stack slot at
+    /// `offset(%esp)` instead of routing it through `%eax`.
+    ///
+    /// `emit_call_stack_args` historically did `operand_to_eax(arg)` followed by
+    /// `movl %eax, N(%esp)` for EVERY stack argument.  For an operand that is
+    /// already a constant that is two instructions plus a pointless `%eax`
+    /// clobber where one suffices: `movl $IMM, N(%esp)` stores the same four
+    /// bytes.  gcc, clang and icx all pass the constant directly
+    /// (`pushl $.LC1`), which is the dominant term in lccc's 403-instruction
+    /// `main` against gcc's 291 on `narrow_shift_count_ge_width.c` (both
+    /// `-O2 -m32 -fno-pic`): lccc emitted 236 `movl` (111 of them reg->slot,
+    /// 38 imm->reg, 13 imm->slot) against gcc's 22, and 37% of its
+    /// instructions carried a memory operand against gcc's 1%.  A corpus census
+    /// (`tools/dead_materialize_census.py`, 809 i686 TUs) counted **432**
+    /// constant sites — 327 of them a zero materialized as `xorl %eax, %eax` —
+    /// where the register is dead immediately after the store.
+    ///
+    /// Only the CONSTANT path is bypassed.  `%eax` is still genuinely required
+    /// for:
+    ///   * a value in a slot — x86 has no memory-to-memory move, and for an
+    ///     alloca what is passed is the slot's ADDRESS (a `leal`, or a
+    ///     `leal`/`addl`/`andl` triple when over-aligned), not its contents;
+    ///   * the legacy no-home acc-flow case, where the value is only implicitly
+    ///     in `%eax` and there is nothing else to store from.
+    ///
+    /// A value already in a callee-saved register could also be stored directly
+    /// (`movl %esi, N(%esp)`, 39 census sites), but `operand_to_eax` caches it
+    /// in `%eax` for reuse, so bypassing trades one instruction here for a
+    /// possible re-materialization after the call.  That trade is measured
+    /// separately rather than assumed — see the S19 FOLLOWUP.
+    ///
+    /// Returns false when `%eax` is required and the caller must fall back to
+    /// `operand_to_eax` + `movl %eax, N(%esp)`.
+    pub(super) fn store_const_to_stack_arg(&mut self, op: &Operand, offset: usize) -> bool {
+        if const_stack_arg_disabled() {
+            return false;
+        }
+        let Operand::Const(c) = op else {
+            return false;
+        };
+        // Bit-exactness and the fold predicate both live in the shared pure
+        // helpers above, next to `operand_to_eax`'s own use of them, so the
+        // stored bytes are by construction the bytes the two-instruction
+        // sequence would have stored.
+        let imm = const_stack_arg_imm(c);
+        if !const_stack_arg_fold_wins(imm) {
+            return false;
+        }
+        emit!(self.state, "    movl ${}, {}(%esp)", imm, offset);
+        // `%eax` is NOT written here, so the accumulator cache stays valid as
+        // it is; the old path had to `invalidate_acc()` because materializing
+        // the constant clobbered `%eax`.  Leaving the cache alone is strictly
+        // better: a value already cached in `%eax` survives the marshalling.
+        true
+    }
+
+    /// Load a 64-bit value's slot into %eax by OR'ing both 32-bit halves.
+    /// Used for truthiness testing of I64/U64/F64 values on i686, where a value
+    /// is nonzero iff either half is nonzero.
+    pub(super) fn emit_wide_value_to_eax_ored(&mut self, value_id: u32) {
+        if let Some(slot) = self.state.get_slot(value_id) {
+            let sr0 = self.slot_ref(slot);
+            let sr4 = self.slot_ref_offset(slot, 4);
+            emit!(self.state, "    movl {}, %eax", sr0);
+            emit!(self.state, "    orl {}, %eax", sr4);
+        } else {
+            // Wide values (I64/F64) on i686 should always have stack slots since
+            // they can't fit in a single 32-bit register. Fall back to loading
+            // the low 32 bits only as a last resort.
+            self.operand_to_eax(&Operand::Value(Value(value_id)));
+        }
+    }
+
+    /// Load an operand into %ecx.
+    pub(super) fn operand_to_ecx(&mut self, op: &Operand) {
+        match op {
+            Operand::Const(c) => match c {
+                IrConst::I8(v) => emit!(self.state, "    movl ${}, %ecx", *v as i32),
+                IrConst::I16(v) => emit!(self.state, "    movl ${}, %ecx", *v as i32),
+                IrConst::I32(v) => {
+                    if *v == 0 {
+                        self.state.emit("    xorl %ecx, %ecx");
+                    } else {
+                        emit!(self.state, "    movl ${}, %ecx", v);
+                    }
+                }
+                IrConst::I64(v) => {
+                    let low = *v as i32;
+                    if low == 0 {
+                        self.state.emit("    xorl %ecx, %ecx");
+                    } else {
+                        emit!(self.state, "    movl ${}, %ecx", low);
+                    }
+                }
+                IrConst::I128(v) => {
+                    let low = *v as i32;
+                    emit!(self.state, "    movl ${}, %ecx", low);
+                }
+                IrConst::F32(fval) => {
+                    emit!(self.state, "    movl ${}, %ecx", fval.to_bits() as i32)
+                }
+                IrConst::D32(v) => {
+                    emit!(self.state, "    movl ${}, %ecx", *v as i32)
+                }
+                IrConst::D64(v) => {
+                    let low = *v as i32;
+                    emit!(self.state, "    movl ${}, %ecx", low);
+                }
+                IrConst::F64(fval) => {
+                    let low = fval.to_bits() as i32;
+                    emit!(self.state, "    movl ${}, %ecx", low);
+                }
+                IrConst::LongDouble(_, bytes) => {
+                    let low = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    emit!(self.state, "    movl ${}, %ecx", low);
+                }
+                IrConst::Zero => {
+                    self.state.emit("    xorl %ecx, %ecx");
+                }
+            },
+            Operand::Value(v) => {
+                let is_alloca = self.state.is_alloca(v.0);
+                if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
+                    let reg = phys_reg_name(phys);
+                    emit!(self.state, "    movl %{}, %ecx", reg);
+                } else if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot);
+                    if is_alloca {
+                        // Alloca: load the address of the slot
+                        if let Some(align) = self.state.alloca_over_align(v.0) {
+                            emit!(self.state, "    leal {}, %ecx", sr);
+                            emit!(self.state, "    addl ${}, %ecx", align - 1);
+                            emit!(self.state, "    andl ${}, %ecx", -(align as i32));
+                        } else {
+                            emit!(self.state, "    leal {}, %ecx", sr);
+                        }
+                    } else {
+                        emit!(self.state, "    movl {}, %ecx", sr);
+                    }
+                } else if self.state.acc_has_verified(v.0, false)
+                    || self.state.acc_has_verified(v.0, true)
+                {
+                    // Value is in accumulator (no stack slot) — move eax to ecx.
+                    // Verified consume: the eax→ecx move sources the value
+                    // from the accumulator, so the epoch contract must hold.
+                    self.state.emit("    movl %eax, %ecx");
+                } else {
+                    self.state.emit("    xorl %ecx, %ecx");
+                }
+            }
+        }
+    }
+
+    /// Store %eax to a value's destination (callee-saved register or stack slot).
+    pub(super) fn store_eax_to(&mut self, dest: &Value) {
+        if let Some(phys) = self.dest_reg(dest) {
+            if phys.0 == 6 {
+                // Destination homed in %eax (Phase 2e): the result is already
+                // home. Keep the cache entry, emit nothing.
+                self.state.park_acc(dest.0, false);
+                return;
+            }
+            let reg = phys_reg_name(phys);
+            emit!(self.state, "    movl %eax, %{}", reg);
+            // `movl %eax,%reg` leaves %eax unchanged, so the accumulator still
+            // holds the value. Keep the cache entry (mirror the slot path's
+            // park below) so a later operand_to_eax / cast skips the reload;
+            // the cache is invalidated by any real %eax clobber anyway.
+            self.state.park_acc(dest.0, false);
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    movl %eax, {}", sr);
+            // If this dest is a wide value (I64/U64/F64), zero the upper 4 bytes.
+            // Wide values occupy 8-byte slots, and other paths (e.g. Copy from
+            // IrConst::I64) may write all 8 bytes. If we only write the low 4,
+            // the upper half retains stack garbage, which corrupts truthiness
+            // checks that OR both halves (emit_wide_value_to_eax_ored).
+            if self.state.wide_values.contains(&dest.0) {
+                let sr4 = self.slot_ref_offset(slot, 4);
+                emit!(self.state, "    movl $0, {}", sr4);
+            }
+            self.state.park_acc(dest.0, false);
+        }
+    }
+
+    /// Store %edx to a value's destination (register home or stack slot).
+    /// Mirror of `store_eax_to` for the remainder output of divl/idivl.
+    /// A dest homed in %edx needs no code — the value is born there.
+    pub(super) fn store_edx_to(&mut self, dest: &Value) {
+        if let Some(phys) = self.dest_reg(dest) {
+            if phys.0 == 5 {
+                // Destination homed in %edx: the remainder is already home.
+                return;
+            }
+            let reg = phys_reg_name(phys);
+            emit!(self.state, "    movl %edx, %{}", reg);
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    movl %edx, {}", sr);
+        }
+    }
+
+    /// Return the store mnemonic for a given type.
+    pub(super) fn mov_store_for_type(&self, ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 | IrType::U8 => "movb",
+            IrType::I16 | IrType::U16 => "movw",
+            // On i686, pointer-sized types use movl (32-bit)
+            _ => "movl",
+        }
+    }
+
+    /// Return the load mnemonic for a given type.
+    pub(super) fn mov_load_for_type(&self, ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 => "movsbl",  // sign-extend byte to 32-bit
+            IrType::U8 => "movzbl",  // zero-extend byte to 32-bit
+            IrType::I16 => "movswl", // sign-extend word to 32-bit
+            IrType::U16 => "movzwl", // zero-extend word to 32-bit
+            // Everything 32-bit or larger uses movl
+            _ => "movl",
+        }
+    }
+
+    /// Return the type suffix for an operation.
+    pub(super) fn type_suffix(&self, ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 | IrType::U8 => "b",
+            IrType::I16 | IrType::U16 => "w",
+            // On i686, the default (pointer-sized) is "l" (32-bit)
+            _ => "l",
+        }
+    }
+
+    /// Return the register name for eax sub-register based on type size.
+    pub(super) fn eax_for_type(&self, ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 | IrType::U8 => "%al",
+            IrType::I16 | IrType::U16 => "%ax",
+            _ => "%eax",
+        }
+    }
+
+    /// Check if a param type is eligible for fastcall register passing.
+    /// Only DWORD-sized or smaller integer/pointer types qualify.
+    pub(super) fn is_fastcall_reg_eligible(&self, ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::Ptr
+        )
+    }
+
+    /// Count how many leading params are passed in registers for fastcall (max 2).
+    pub(super) fn count_fastcall_reg_params(&self, func: &IrFunction) -> usize {
+        let mut count = 0;
+        for param in &func.params {
+            if count >= 2 {
+                break;
+            }
+            let ty = param.ty;
+            if self.is_fastcall_reg_eligible(ty) {
+                count += 1;
+            } else {
+                break; // non-eligible param stops register assignment
+            }
+        }
+        count
+    }
+
+    /// GCC-exact i386 fastcall parameter layout, verified against the
+    /// GCC 14.2 -m32 oracle (caller and callee, -O0 and -O2):
+    ///
+    /// - The first two eligible integer/pointer arguments take %ecx, %edx
+    ///   in parameter order.
+    /// - Float and `_Decimal` scalars (F32/F64/F128, D32/D64/D128) are
+    ///   SKIPPED: they neither consume a register slot nor end the chain
+    ///   (`f(double,int)`: the int still arrives in %ecx — GCC oracle
+    ///   `fldl 16(%esp) … addl %ecx,%eax; ret $8`).
+    /// - Nonempty aggregates and 64/128-bit integers BREAK the chain: they and every
+    ///   following parameter go on the stack (`f(int,S2,int)`: the trailing
+    ///   int is a stack argument — GCC oracle `ret $12` with %ecx only).
+    /// - Zero-sized GNU aggregates consume no register or stack bytes and
+    ///   do not break the chain (confirmed by mixed-compiler ABI tests).
+    /// - The sret hidden pointer is an explicit leading `Ptr` parameter, so
+    ///   it takes %ecx and the first eligible argument shifts to %edx (the
+    ///   GCC -O2 protocol, which is what optimized callers emit).
+    /// - Variadic fastcall passes everything on the stack; the callee does
+    ///   not pop (plain `ret`).
+    ///
+    /// Returns the per-parameter slots and the total stack bytes (the
+    /// callee's `ret $N` operand / the caller's pop count).  The layout is
+    /// the single source of truth shared by parameter capture, ParamRef and
+    /// the return instruction; the previous implementation re-derived
+    /// register assignment, offsets and cleanup sizes in three places with
+    /// incompatible rules.
+    #[cfg(test)]
+    pub(super) fn fastcall_layout(
+        &self,
+        param_tys: &[IrType],
+        struct_sizes: &[Option<usize>],
+        force_stack: &[bool],
+        is_variadic: bool,
+    ) -> (Vec<I686FastcallSlot>, usize) {
+        self.fastcall_layout_with_abi(param_tys, struct_sizes, force_stack, is_variadic, &[], &[])
+    }
+
+    /// Fastcall layout with aggregate ABI metadata. The legacy wrapper above
+    /// keeps older unit tests source-compatible; production caller/callee
+    /// paths use this version so wide GNU vectors share the cdecl rule.
+    pub(super) fn fastcall_layout_with_abi(
+        &self,
+        param_tys: &[IrType],
+        struct_sizes: &[Option<usize>],
+        force_stack: &[bool],
+        is_variadic: bool,
+        struct_aligns: &[Option<usize>],
+        struct_classes: &[Vec<crate::common::types::EightbyteClass>],
+    ) -> (Vec<I686FastcallSlot>, usize) {
+        // Every (scalarized) parameter slot needs a parallel force_stack entry
+        // so i686 ExtVector lanes cannot silently fall back to the register
+        // path when a future caller forgets the argument. The slices are
+        // allowed to be empty in legacy unit tests that predate these
+        // parameters, which always means "no lanes forced, no aggregates".
+        debug_assert!(
+            force_stack.is_empty() || force_stack.len() == param_tys.len(),
+            "fastcall_layout: force_stack length {} must match param_tys length {}",
+            force_stack.len(),
+            param_tys.len(),
+        );
+        debug_assert!(
+            struct_sizes.is_empty() || struct_sizes.len() == param_tys.len(),
+            "fastcall_layout: struct_sizes length {} must match param_tys length {}",
+            struct_sizes.len(),
+            param_tys.len(),
+        );
+        let mut slots = Vec::with_capacity(param_tys.len());
+        let mut regs_free = [true, true];
+        let mut chain_broken = is_variadic;
+        let mut cursor: i64 = 0;
+        let abi = self.call_abi_config_impl();
+        let mut vector_regs_used = 0usize;
+        let vector_align = |i: usize| {
+            let align = struct_aligns.get(i).copied().flatten().unwrap_or(4);
+            let classes = struct_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            crate::backend::call_abi::i386_gnu_vector_stack_align(
+                &self.call_abi_config_impl(),
+                classes,
+                align,
+            )
+        };
+
+        for (i, ty) in param_tys.iter().enumerate() {
+            let aggregate = struct_sizes
+                .get(i)
+                .copied()
+                .flatten()
+                .map(|size| (size + 3) & !3);
+            let size = aggregate.unwrap_or_else(|| match ty {
+                IrType::F32 | IrType::D32 => 4,
+                IrType::I64 | IrType::U64 | IrType::F64 | IrType::D64 => 8,
+                IrType::F128 => 12,
+                _ if is_i128_type(*ty) => 16,
+                _ => 4,
+            });
+
+            // A native vector takes the next SSE argument register as in
+            // cdecl (GCC 16.2: `t1(v2, int)` passes the vector in %xmm0 and
+            // the int in %ecx; the 4th vector goes to the stack in argument
+            // order). In a register or on the stack, it neither consumes nor
+            // breaks the ECX/EDX chain. Variadic calls keep every vector on
+            // the stack, like cdecl.
+            let classes = struct_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let native_vector = if force_stack.get(i).copied().unwrap_or(false) {
+                None
+            } else {
+                crate::backend::call_abi::i386_vector_reg_bytes(
+                    &abi,
+                    classes,
+                    struct_sizes.get(i).copied().flatten(),
+                )
+                .and_then(VectorRegWidth::from_bytes)
+            };
+            if let Some(width) = native_vector {
+                if !is_variadic && vector_regs_used < abi.vector_xmm_regs {
+                    slots.push(I686FastcallSlot::Vector {
+                        reg_idx: vector_regs_used,
+                        width,
+                    });
+                    vector_regs_used += 1;
+                    continue;
+                }
+                if let Some(align) = vector_align(i) {
+                    let a = align as i64;
+                    cursor = (cursor + a - 1) & !(a - 1);
+                }
+                slots.push(I686FastcallSlot::Stack {
+                    offset: cursor,
+                    size,
+                });
+                cursor += size as i64;
+                continue;
+            }
+
+            // Clang i686 ExtVector lanes are scalar values in their own stack
+            // slots, but unlike aggregates they do not break fastcall's
+            // ECX/EDX eligibility chain for subsequent ordinary parameters.
+            if force_stack.get(i).copied().unwrap_or(false) {
+                if let Some(align) = vector_align(i) {
+                    let a = align as i64;
+                    cursor = (cursor + a - 1) & !(a - 1);
+                }
+                slots.push(I686FastcallSlot::Stack {
+                    offset: cursor,
+                    size,
+                });
+                cursor += size as i64;
+                continue;
+            }
+
+            if !chain_broken && aggregate.is_none() && self.is_fastcall_reg_eligible(*ty) {
+                if let Some(idx) = regs_free.iter().position(|&free| free) {
+                    regs_free[idx] = false;
+                    slots.push(I686FastcallSlot::Reg(idx as u8));
+                    continue;
+                }
+            }
+
+            // Empty aggregates are zero-byte stack slots, not chain breaks.
+            if aggregate.is_some_and(|size| size != 0)
+                || matches!(ty, IrType::I64 | IrType::U64)
+                || is_i128_type(*ty)
+            {
+                chain_broken = true;
+            }
+
+            if let Some(align) = vector_align(i) {
+                let a = align as i64;
+                cursor = (cursor + a - 1) & !(a - 1);
+            }
+            slots.push(I686FastcallSlot::Stack {
+                offset: cursor,
+                size,
+            });
+            cursor += size as i64;
+        }
+
+        (slots, cursor as usize)
+    }
+
+    /// Move an incoming ABI register into a target register, normalizing
+    /// narrow integer types. The i386 regparm/fastcall ABIs guarantee only
+    /// the low 8/16 bits of a sub-int argument, so a bare `movl` would
+    /// leave the register home's upper bits caller-garbage. Every
+    /// accumulator read re-extends by type, but the capture itself should
+    /// not rely on that invariant: normalizing at the capture costs exactly
+    /// the instruction the first use would pay anyway.
+    pub(super) fn emit_incoming_reg_move(
+        &mut self,
+        src_full: &'static str,
+        dst_name: &'static str,
+        ty: IrType,
+    ) {
+        debug_assert_eq!(src_full.len(), 4, "expected %eax/%ecx/%edx");
+        let byte_name = format!("%{}l", &src_full[2..3]);
+        let word_name = format!("%{}x", &src_full[2..3]);
+        match ty {
+            IrType::I8 => {
+                emit!(self.state, "    movsbl {}, %{}", byte_name, dst_name);
+            }
+            IrType::U8 => {
+                emit!(self.state, "    movzbl {}, %{}", byte_name, dst_name);
+            }
+            IrType::I16 => {
+                emit!(self.state, "    movswl {}, %{}", word_name, dst_name);
+            }
+            IrType::U16 => {
+                emit!(self.state, "    movzwl {}, %{}", word_name, dst_name);
+            }
+            _ => {
+                emit!(self.state, "    movl {}, %{}", src_full, dst_name);
+            }
+        }
+    }
+
+    /// Resolve incoming-register captures whose targets are registers as a
+    /// parallel move. A target register can itself be another move's
+    /// still-unread source (incoming registers %eax/%ecx/%edx are all
+    /// allocatable), so moves are emitted only while a move exists whose
+    /// target is not a pending source. A stuck state is a cycle:
+    ///
+    /// - 2-cycles are resolved with a single `xchgl` (both values land in
+    ///   their targets), and
+    /// - longer cycles (only possible when %eax participates) are rotated
+    ///   through a scratch stack slot: `pushl` the first source, move every
+    ///   successor in reverse, `popl` into the first target. The push/pop
+    ///   pair is stack-neutral, so no esp_adjust bookkeeping is needed.
+    ///
+    /// The previous implementation hardcoded `xchgl %ecx, %edx` for every
+    /// stuck state, which miscompiles any cycle that involves %eax.
+    pub(super) fn resolve_incoming_reg_moves(
+        &mut self,
+        moves: &mut Vec<(usize, &'static str, PhysReg, IrType)>,
+    ) {
+        while !moves.is_empty() {
+            let pending_srcs: Vec<&str> = moves.iter().map(|m| m.1).collect();
+            if let Some(pos) = moves.iter().position(|&(_, src, dst, _)| {
+                let dst_name = format!("%{}", phys_reg_name(dst));
+                dst_name == src || !pending_srcs.contains(&dst_name.as_str())
+            }) {
+                let (i, src, dst, ty) = moves.remove(pos);
+                let dst_name = phys_reg_name(dst);
+                if format!("%{}", dst_name) != src {
+                    self.emit_incoming_reg_move(src, dst_name, ty);
+                }
+                self.state.param_pre_stored.insert(i);
+            } else if moves.len() == 2 {
+                // Pure 2-cycle: xchg places both values in their targets.
+                let (s0, s1) = (moves[0].1, moves[1].1);
+                emit!(self.state, "    xchgl {}, {}", s0, s1);
+                for m in moves.drain(..) {
+                    self.state.param_pre_stored.insert(m.0);
+                }
+            } else {
+                // Longer cycle: rotate through a scratch stack slot.
+                let first = moves[0];
+                let n = moves.len();
+                emit!(self.state, "    pushl {}", first.1);
+                for k in (1..n).rev() {
+                    let (i, src, dst, ty) = moves[k];
+                    let dst_name = phys_reg_name(dst);
+                    self.emit_incoming_reg_move(src, dst_name, ty);
+                    self.state.param_pre_stored.insert(i);
+                }
+                let (i0, _, dst0, _) = first;
+                let dst0_name = phys_reg_name(dst0);
+                emit!(self.state, "    popl %{}", dst0_name);
+                self.state.param_pre_stored.insert(i0);
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Check if an operand is a constant that fits in an i32 immediate.
+    pub(super) fn const_as_imm32(op: &Operand) -> Option<i64> {
+        match op {
+            Operand::Const(c) => {
+                match c {
+                    IrConst::I8(v) => Some(*v as i64),
+                    IrConst::I16(v) => Some(*v as i64),
+                    IrConst::I32(v) => Some(*v as i64),
+                    IrConst::I64(v) => {
+                        // On i686, check if the value fits in 32 bits
+                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                            Some(*v)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract an immediate integer value from an operand.
+    /// Used for SSE/AES instructions that require compile-time immediate operands.
+    pub(super) fn operand_to_imm_i64(op: &Operand) -> i64 {
+        match op {
+            Operand::Const(c) => match c {
+                IrConst::I8(v) => *v as i64,
+                IrConst::I16(v) => *v as i64,
+                IrConst::I32(v) => *v as i64,
+                IrConst::I64(v) => *v,
+                _ => 0,
+            },
+            Operand::Value(_) => 0,
+        }
+    }
+
+    /// Load an F128 (long double) operand onto the x87 FPU stack.
+    pub(super) fn emit_f128_load_to_x87(&mut self, op: &Operand) {
+        match op {
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot);
+                    emit!(self.state, "    fldt {}", sr);
+                }
+            }
+            Operand::Const(IrConst::LongDouble(_, bytes)) => {
+                // Convert f128 (IEEE binary128) bytes to x87 80-bit format for fldt
+                let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(bytes);
+                let dword0 = i32::from_le_bytes([x87[0], x87[1], x87[2], x87[3]]);
+                let dword1 = i32::from_le_bytes([x87[4], x87[5], x87[6], x87[7]]);
+                let word2 = i16::from_le_bytes([x87[8], x87[9]]) as i32;
+                self.state.emit("    subl $12, %esp");
+                emit!(self.state, "    movl ${}, (%esp)", dword0);
+                emit!(self.state, "    movl ${}, 4(%esp)", dword1);
+                emit!(self.state, "    movw ${}, 8(%esp)", word2);
+                self.state.emit("    fldt (%esp)");
+                self.state.emit("    addl $12, %esp");
+            }
+            Operand::Const(IrConst::F64(fval)) => {
+                // Convert f64 to x87: push to stack as f64, fld, convert
+                let bits = fval.to_bits();
+                let low = (bits & 0xFFFFFFFF) as i32;
+                let high = ((bits >> 32) & 0xFFFFFFFF) as i32;
+                self.state.emit("    subl $8, %esp");
+                emit!(self.state, "    movl ${}, (%esp)", low);
+                emit!(self.state, "    movl ${}, 4(%esp)", high);
+                self.state.emit("    fldl (%esp)");
+                self.state.emit("    addl $8, %esp");
+            }
+            Operand::Const(IrConst::F32(fval)) => {
+                emit!(self.state, "    movl ${}, %eax", fval.to_bits() as i32);
+                self.state.emit("    pushl %eax");
+                self.state.emit("    flds (%esp)");
+                self.state.emit("    addl $4, %esp");
+            }
+            _ => {
+                self.operand_to_eax(op);
+                // Fallback: treat as integer, push to stack
+                self.state.emit("    pushl %eax");
+                self.state.emit("    flds (%esp)");
+                self.state.emit("    addl $4, %esp");
+            }
+        }
+    }
+
+    /// Load an F64 (double) operand onto the x87 FPU stack.
+    /// F64 values occupy 8-byte stack slots on i686, so we use fldl to load
+    /// them directly from memory rather than going through the 32-bit accumulator.
+    pub(super) fn emit_f64_load_to_x87(&mut self, op: &Operand) {
+        match op {
+            Operand::Value(v) => {
+                // Floats are never GPR-allocated (`is_non_gpr_type`), so a
+                // materialized F64 always has a slot. Emitting nothing here
+                // used to leave the x87 stack one short and the consumer
+                // reading garbage; fail closed instead.
+                let slot = self.state.get_slot(v.0).unwrap_or_else(|| {
+                    panic!("i686 x87 F64 load of v{} which has no stack slot", v.0)
+                });
+                let sr = self.slot_ref(slot);
+                emit!(self.state, "    fldl {}", sr);
+            }
+            // Exact bit patterns only: -0.0 must not become `fldz`.
+            Operand::Const(IrConst::F64(fval)) if fval.to_bits() == 0 => {
+                self.state.emit("    fldz");
+            }
+            Operand::Const(IrConst::F64(fval)) if fval.to_bits() == 1.0f64.to_bits() => {
+                self.state.emit("    fld1");
+            }
+            Operand::Const(IrConst::F64(fval)) => {
+                // Push the halves (high first, so the low word lands at the
+                // lower address): no GPR is written, so neither %eax nor the
+                // accumulator cache is disturbed for a following load.
+                let bits = fval.to_bits();
+                emit!(self.state, "    pushl ${}", (bits >> 32) as u32 as i32);
+                emit!(self.state, "    pushl ${}", bits as u32 as i32);
+                self.state.emit("    fldl (%esp)");
+                self.state.emit("    addl $8, %esp");
+            }
+            Operand::Const(IrConst::F32(fval)) => {
+                // Same contract as `emit_f32_load_to_x87`: no GPR clobber.
+                emit!(self.state, "    pushl ${}", fval.to_bits() as i32);
+                self.state.emit("    flds (%esp)");
+                self.state.emit("    addl $4, %esp");
+            }
+            Operand::Const(IrConst::Zero) => {
+                self.state.emit("    fldz");
+            }
+            _ => {
+                // Fallback: load integer bits and convert
+                self.operand_to_eax(op);
+                self.state.emit("    pushl %eax");
+                self.state.emit("    fildl (%esp)");
+                self.state.emit("    addl $4, %esp");
+            }
+        }
+    }
+
+    /// Store the x87 st(0) value as F64 into a destination stack slot.
+    /// Pops st(0).
+    pub(super) fn emit_f64_store_from_x87(&mut self, dest: &Value) {
+        if let Some(slot) = self.state.get_slot(dest.0) {
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    fstpl {}", sr);
+        } else {
+            // No slot available, pop x87 stack to discard
+            self.state.emit("    fstp %st(0)");
+        }
+    }
+
+    // --- 64-bit atomic helpers using cmpxchg8b (for I64/U64/F64 on i686) ---
+
+    /// Check if a type requires 64-bit atomic handling on i686 (needs cmpxchg8b).
+    pub(super) fn is_atomic_wide(&self, ty: IrType) -> bool {
+        is_pair_scalar(ty)
+    }
+
+    /// 64-bit atomic RMW using lock cmpxchg8b loop.
+    ///
+    /// cmpxchg8b compares edx:eax with 8 bytes at memory location.
+    /// If equal, stores ecx:ebx to memory. If not, loads memory into edx:eax.
+    /// We use a loop: load old value, compute new value, try cmpxchg8b.
+    ///
+    /// Register plan:
+    ///   esi = pointer to atomic variable (saved/restored)
+    ///   edx:eax = old (expected) value
+    ///   ecx:ebx = new (desired) value
+    ///   Stack: saved operand value (8 bytes)
+    pub(super) fn emit_atomic_rmw_wide(
+        &mut self,
+        dest: &Value,
+        op: AtomicRmwOp,
+        ptr: &Operand,
+        val: &Operand,
+    ) {
+        // Save callee-saved registers we need to clobber
+        self.state.emit("    pushl %ebx");
+        self.esp_adjust += 4;
+        self.state.emit("    pushl %esi");
+        self.esp_adjust += 4;
+
+        // Load pointer into esi
+        self.operand_to_eax(ptr);
+        self.state.emit("    movl %eax, %esi");
+
+        // Load 64-bit operand value onto stack (8 bytes)
+        self.emit_load_acc_pair(val);
+        self.state.emit("    pushl %edx"); // high word at 4(%esp)
+        self.state.emit("    pushl %eax"); // low word at (%esp)
+
+        // Load current value from memory into edx:eax
+        self.state.emit("    movl (%esi), %eax");
+        self.state.emit("    movl 4(%esi), %edx");
+
+        match op {
+            AtomicRmwOp::Xchg => {
+                // For exchange, the desired value is the operand (constant across retries)
+                self.state.emit("    movl (%esp), %ebx");
+                self.state.emit("    movl 4(%esp), %ecx");
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::Add => {
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    addl (%esp), %ebx");
+                self.state.emit("    adcl 4(%esp), %ecx");
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::Sub => {
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    subl (%esp), %ebx");
+                self.state.emit("    sbbl 4(%esp), %ecx");
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::And => {
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    andl (%esp), %ebx");
+                self.state.emit("    andl 4(%esp), %ecx");
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::Or => {
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    orl (%esp), %ebx");
+                self.state.emit("    orl 4(%esp), %ecx");
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::Xor => {
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    xorl (%esp), %ebx");
+                self.state.emit("    xorl 4(%esp), %ecx");
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::Nand => {
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    movl %eax, %ebx");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    andl (%esp), %ebx");
+                self.state.emit("    andl 4(%esp), %ecx");
+                self.state.emit("    notl %ebx");
+                self.state.emit("    notl %ecx");
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+            AtomicRmwOp::TestAndSet => {
+                // For 64-bit test-and-set, set the low byte to 1, rest to 0
+                self.state.emit("    movl $1, %ebx");
+                self.state.emit("    xorl %ecx, %ecx");
+                let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+                emit!(self.state, "{}:", loop_label);
+                self.state.emit("    lock cmpxchg8b (%esi)");
+                emit!(self.state, "    jne {}", loop_label);
+            }
+        }
+
+        // Clean up stack (remove 8-byte operand value)
+        self.state.emit("    addl $8, %esp");
+        // Restore callee-saved registers
+        self.state.emit("    popl %esi");
+        self.esp_adjust -= 4;
+        self.state.emit("    popl %ebx");
+        self.esp_adjust -= 4;
+
+        // Result (old value) is in edx:eax — store to dest's 64-bit stack slot
+        self.state.reg_cache.invalidate_acc();
+        self.emit_store_acc_pair(dest);
+    }
+
+    /// 64-bit atomic compare-exchange using lock cmpxchg8b.
+    ///
+    /// cmpxchg8b: compares edx:eax with 8 bytes at memory.
+    /// If equal, stores ecx:ebx to memory and sets ZF.
+    /// If not equal, loads memory into edx:eax and clears ZF.
+    pub(super) fn emit_atomic_cmpxchg_wide(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        returns_bool: bool,
+    ) {
+        // Save callee-saved registers
+        self.state.emit("    pushl %ebx");
+        self.esp_adjust += 4;
+        self.state.emit("    pushl %esi");
+        self.esp_adjust += 4;
+
+        // Load pointer into esi
+        self.operand_to_eax(ptr);
+        self.state.emit("    movl %eax, %esi");
+
+        // Load expected into edx:eax, save on stack temporarily
+        self.emit_load_acc_pair(expected);
+        self.state.emit("    pushl %edx");
+        self.esp_adjust += 4;
+        self.state.emit("    pushl %eax");
+        self.esp_adjust += 4;
+
+        // Load desired into ecx:ebx
+        self.emit_load_acc_pair(desired);
+        self.state.emit("    movl %eax, %ebx");
+        self.state.emit("    movl %edx, %ecx");
+
+        // Restore expected into edx:eax
+        self.state.emit("    popl %eax");
+        self.esp_adjust -= 4;
+        self.state.emit("    popl %edx");
+        self.esp_adjust -= 4;
+
+        // Execute cmpxchg8b
+        self.state.emit("    lock cmpxchg8b (%esi)");
+
+        if returns_bool {
+            self.state.emit("    sete %al");
+            self.state.emit("    movzbl %al, %eax");
+            // Restore callee-saved registers
+            self.state.emit("    popl %esi");
+            self.esp_adjust -= 4;
+            self.state.emit("    popl %ebx");
+            self.esp_adjust -= 4;
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        } else {
+            // Result (old value) is in edx:eax
+            // Restore callee-saved registers
+            self.state.emit("    popl %esi");
+            self.esp_adjust -= 4;
+            self.state.emit("    popl %ebx");
+            self.esp_adjust -= 4;
+            self.state.reg_cache.invalidate_acc();
+            self.emit_store_acc_pair(dest);
+        }
+    }
+
+    /// 64-bit atomic load using cmpxchg8b with expected == desired == 0.
+    ///
+    /// cmpxchg8b always loads the current memory value into edx:eax on failure,
+    /// so we set edx:eax = ecx:ebx = 0 and execute cmpxchg8b. If the memory
+    /// happens to be 0, the exchange writes 0 (no change). If non-zero,
+    /// we get the current value in edx:eax without modifying memory.
+    pub(super) fn emit_atomic_load_wide(&mut self, dest: &Value, ptr: &Operand) {
+        self.state.emit("    pushl %ebx");
+        self.esp_adjust += 4;
+        self.state.emit("    pushl %esi");
+        self.esp_adjust += 4;
+
+        self.operand_to_eax(ptr);
+        self.state.emit("    movl %eax, %esi");
+
+        // Set all registers to zero: edx:eax = ecx:ebx = 0
+        self.state.emit("    xorl %eax, %eax");
+        self.state.emit("    xorl %edx, %edx");
+        self.state.emit("    xorl %ebx, %ebx");
+        self.state.emit("    xorl %ecx, %ecx");
+        // lock cmpxchg8b: if (%esi) == 0 -> store 0 (no change), else load into edx:eax
+        self.state.emit("    lock cmpxchg8b (%esi)");
+
+        self.state.emit("    popl %esi");
+        self.esp_adjust -= 4;
+        self.state.emit("    popl %ebx");
+        self.esp_adjust -= 4;
+
+        self.state.reg_cache.invalidate_acc();
+        self.emit_store_acc_pair(dest);
+    }
+
+    /// 64-bit atomic store using a cmpxchg8b loop.
+    ///
+    /// There is no single instruction for atomic 64-bit stores on i686, so we
+    /// use a cmpxchg8b loop: read current value, try to replace with desired.
+    pub(super) fn emit_atomic_store_wide(&mut self, ptr: &Operand, val: &Operand) {
+        self.state.emit("    pushl %ebx");
+        self.esp_adjust += 4;
+        self.state.emit("    pushl %esi");
+        self.esp_adjust += 4;
+
+        // Load pointer into esi
+        self.operand_to_eax(ptr);
+        self.state.emit("    movl %eax, %esi");
+
+        // Load desired value into ecx:ebx
+        self.emit_load_acc_pair(val);
+        self.state.emit("    movl %eax, %ebx");
+        self.state.emit("    movl %edx, %ecx");
+
+        // Load current value from memory into edx:eax (initial guess for cmpxchg8b)
+        self.state.emit("    movl (%esi), %eax");
+        self.state.emit("    movl 4(%esi), %edx");
+
+        let loop_label = format!(".Latomic_{}", self.state.next_label_id());
+        emit!(self.state, "{}:", loop_label);
+        self.state.emit("    lock cmpxchg8b (%esi)");
+        emit!(self.state, "    jne {}", loop_label);
+
+        self.state.emit("    popl %esi");
+        self.esp_adjust -= 4;
+        self.state.emit("    popl %ebx");
+        self.esp_adjust -= 4;
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Emit a fastcall function call on i686.
+    /// Register and stack assignment follows `fastcall_layout` (the GCC
+    /// i386 fastcall rules): the first two eligible integer/pointer args
+    /// take %ecx/%edx, float/decimal scalars are skipped, aggregates and
+    /// wide integers break the chain, and variadic callees receive every
+    /// argument on the stack and pop nothing.
+    pub(super) fn emit_fastcall(
+        &mut self,
+        args: &[Operand],
+        arg_types: &[IrType],
+        struct_arg_sizes: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+        struct_arg_is_f128_sse: &[bool],
+        direct_name: Option<&str>,
+        func_ptr: Option<&Operand>,
+        dest: Option<Value>,
+        return_type: IrType,
+        is_variadic: bool,
+    ) {
+        let indirect = func_ptr.is_some() && direct_name.is_none();
+
+        // One authoritative layout, identical to the callee-side prologue.
+        let force_stack: Vec<bool> = (0..arg_types.len())
+            .map(|i| {
+                let classes = struct_arg_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                let half_fp = arg_types[i] == IrType::U16
+                    && struct_arg_is_f128_sse.get(i).copied().unwrap_or(false);
+                half_fp
+                    || (classes.len() == 1
+                        && classes[0] == crate::common::types::EightbyteClass::NoClass)
+            })
+            .collect();
+        let (slots, stack_bytes) = self.fastcall_layout_with_abi(
+            arg_types,
+            struct_arg_sizes,
+            &force_stack,
+            is_variadic,
+            struct_arg_aligns,
+            struct_arg_classes,
+        );
+
+        // Only stack-resident arguments constrain the outgoing area: a
+        // vector in %xmm/%ymm needs no ESP boundary.
+        let dyn_align_a = struct_arg_aligns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| matches!(slots.get(*i), Some(I686FastcallSlot::Stack { .. })))
+            .fold(16usize, |max_align, (i, align)| {
+                let classes = struct_arg_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                crate::backend::call_abi::i386_gnu_vector_stack_align(
+                    &self.call_abi_config_impl(),
+                    classes,
+                    align.unwrap_or(4),
+                )
+                .map_or(max_align, |a| max_align.max(a))
+            });
+        let dyn_align = dyn_align_a > 16;
+        debug_assert!(!dyn_align || !self.omit_frame_pointer);
+        // The callee pops exactly `stack_bytes`; alignment padding is
+        // caller-owned. Wide vectors additionally require an absolute ESP
+        // boundary, just like the cdecl path.
+        let stack_arg_space = (stack_bytes + dyn_align_a - 1) & !(dyn_align_a - 1);
+        self.dyn_align_cleanup = false;
+
+        // Spill indirect function pointer before stack manipulation.
+        if indirect {
+            self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
+        }
+
+        // Phase 1: Allocate stack space and write stack args at their
+        // layout offsets.
+        if dyn_align {
+            let total = stack_arg_space + 4;
+            self.state.emit("    movl %esp, %ecx");
+            emit!(self.state, "    leal -{}(%esp), %eax", total);
+            emit!(self.state, "    andl ${}, %eax", dyn_align_a - 1);
+            self.state.emit("    subl %eax, %esp");
+            self.state.emit("    subl $4, %esp");
+            self.state.emit("    movl %ecx, (%esp)");
+            emit!(self.state, "    subl ${}, %esp", stack_arg_space);
+            self.esp_adjust += total as i64;
+            self.state.reg_cache.invalidate_all();
+        } else if stack_arg_space > 0 {
+            emit!(self.state, "    subl ${}, %esp", stack_arg_space);
+            self.esp_adjust += stack_arg_space as i64;
+        }
+
+        for (i, slot) in slots.iter().enumerate() {
+            let I686FastcallSlot::Stack { offset, .. } = *slot else {
+                continue;
+            };
+            let arg = &args[i];
+            let ty = arg_types[i];
+
+            // The shared cdecl stack-argument helpers handle every operand
+            // kind (values, slots, F128/D128/i128 constants). The previous
+            // hand-rolled arms only handled slot-backed values: constant
+            // long double / i128 arguments were silently NOT written to the
+            // outgoing area, and aggregate arguments were truncated to one
+            // word — the callee then read garbage.
+            if let Some(object_size) = struct_arg_sizes.get(i).copied().flatten() {
+                // The slot includes ABI padding. Only the actual object is
+                // readable: copying the rounded size can cross a guard page.
+                self.emit_call_struct_stack_arg(arg, offset as usize, object_size);
+                continue;
+            }
+
+            match ty {
+                _ if is_pair_scalar(ty) => {
+                    self.emit_load_acc_pair(arg);
+                    emit!(self.state, "    movl %eax, {}(%esp)", offset);
+                    emit!(self.state, "    movl %edx, {}(%esp)", offset + 4);
+                }
+                IrType::F128 => {
+                    self.emit_call_f128_stack_arg(arg, offset as usize);
+                }
+                _ if is_i128_type(ty) => {
+                    self.emit_call_i128_stack_arg(arg, offset as usize);
+                }
+                _ => {
+                    self.emit_load_operand(arg);
+                    emit!(self.state, "    movl %eax, {}(%esp)", offset);
+                }
+            }
+        }
+
+        // Phase 1.5: vector register arguments. After the stack writes (the
+        // by-value copier uses %xmm0 as scratch) and before the GP
+        // registers (the operand -- the vector object's address -- is
+        // staged through %eax, and %ecx/%edx must be the last writes).
+        for (i, slot) in slots.iter().enumerate() {
+            let I686FastcallSlot::Vector { reg_idx, width } = *slot else {
+                continue;
+            };
+            self.operand_to_eax(&args[i]);
+            let (instruction, register) = width.load(reg_idx);
+            emit!(self.state, "    {} (%eax), %{}", instruction, register);
+            if width != VectorRegWidth::Xmm {
+                self.state.dirty_upper_ymm = true;
+            }
+        }
+
+        // Phase 2: Load register args. Load the %edx argument before the
+        // %ecx argument: materializing the first argument may clobber %edx
+        // (its home can itself be a caller-saved register).
+        for reg_idx in [1u8, 0u8] {
+            if let Some((i, _)) = slots
+                .iter()
+                .enumerate()
+                .find(|(_, slot)| matches!(slot, I686FastcallSlot::Reg(r) if *r == reg_idx))
+            {
+                let reg = ["%ecx", "%edx"][reg_idx as usize];
+                self.emit_load_operand(&args[i]);
+                emit!(self.state, "    movl %eax, {}", reg);
+            }
+        }
+
+        // Phase 3: Emit the call.
+        if indirect {
+            // Reload the function pointer from the spill slot. With dynamic
+            // realignment the save word holds the pre-realignment ESP, which
+            // is also the address of that spill slot.
+            if dyn_align {
+                emit!(self.state, "    movl {}(%esp), %eax", stack_arg_space);
+                self.state.emit("    movl (%eax), %eax");
+            } else {
+                let fptr_offset = stack_arg_space as i64;
+                emit!(self.state, "    movl {}(%esp), %eax", fptr_offset);
+            }
+            self.state.emit("    call *%eax");
+        } else if let Some(name) = direct_name {
+            // PIC: external fastcall callees must go through the PLT
+            // exactly like cdecl calls (calls.rs); a bare `call name`
+            // to an external symbol would create a text relocation or
+            // resolve to the wrong address in a PIE.
+            if self.state.needs_got_call(name) {
+                let n = name.split('@').next().unwrap_or(name);
+                if self.state.pic_mode {
+                    emit!(self.state, "    call *{}@GOT(%ebx)", n);
+                } else {
+                    emit!(self.state, "    call *{}@GOT", n);
+                }
+            } else if self.state.needs_plt(name) {
+                emit!(self.state, "    call {}@PLT", name);
+            } else {
+                emit!(self.state, "    call {}", name);
+            }
+        }
+
+        let pops = if is_variadic { 0 } else { stack_bytes as u32 };
+        if indirect {
+            self.state.record_call_pop(None, Some(pops));
+        } else if direct_name.is_some() {
+            self.state.record_call_pop(direct_name, Some(pops));
+        }
+
+        // Phase 4: Stack cleanup. Non-variadic fastcall callees pop the
+        // stack args themselves (`ret $N`); variadic callees pop nothing.
+        if dyn_align {
+            // Skip the remaining area to the save word, then restore the
+            // exact pre-realignment ESP. Do not also remove `pops` or the
+            // alignment padding: the restore already accounts for both.
+            let remaining = stack_arg_space - pops as usize;
+            if remaining > 0 {
+                emit!(self.state, "    addl ${}, %esp", remaining);
+            }
+            self.state.emit("    movl (%esp), %esp");
+            self.esp_adjust -= (stack_arg_space + 4) as i64;
+        } else {
+            if is_variadic {
+                if stack_bytes != 0 {
+                    emit!(self.state, "    addl ${}, %esp", stack_bytes);
+                    self.esp_adjust -= stack_bytes as i64;
+                }
+            } else {
+                // Callee popped stack_bytes, so esp_adjust drops by that amount.
+                self.esp_adjust -= stack_bytes as i64;
+            }
+            // Clean up alignment padding (the difference between actual stack bytes and aligned)
+            let padding = stack_arg_space - stack_bytes;
+            if padding > 0 {
+                emit!(self.state, "    addl ${}, %esp", padding);
+                self.esp_adjust -= padding as i64;
+            }
+        }
+        if indirect {
+            self.state.emit("    addl $4, %esp"); // pop fptr spill
+            self.esp_adjust -= 4;
+        }
+
+        // Phase 5: Store return value.
+        if let Some(dest) = dest {
+            self.emit_call_store_result(&dest, return_type);
+        }
+
+        self.state.reg_cache.invalidate_acc();
+    }
+}
+
+// Helper functions for ALU mnemonics
+pub(super) fn alu_mnemonic(op: IrBinOp) -> &'static str {
+    match op {
+        IrBinOp::Add => "add",
+        IrBinOp::Sub => "sub",
+        IrBinOp::And => "and",
+        IrBinOp::Or => "or",
+        IrBinOp::Xor => "xor",
+        _ => panic!("not a simple ALU op: {:?}", op),
+    }
+}
+
+pub(super) fn shift_mnemonic(op: IrBinOp) -> &'static str {
+    match op {
+        IrBinOp::Shl => "shll",
+        IrBinOp::AShr => "sarl",
+        IrBinOp::LShr => "shrl",
+        _ => panic!("not a shift op: {:?}", op),
+    }
+}
+
+// --- 64-bit bit-manipulation helpers ---
+// On i686, 64-bit values are in the eax:edx register pair (eax=low, edx=high).
+// The result of clz/ctz/popcount is a small integer (0-64) that fits in eax,
+// so we zero edx to produce a proper I64 result.
+impl I686Codegen {
+    /// clz32 on a 32-bit register without LZCNT: 31 - BSR(src) into dst.
+    /// BSR leaves dst undefined for src == 0; the explicit fixup preserves
+    /// the IR's defined Clz(0) == 32 semantics (constant folding matches).
+    pub(super) fn emit_clz32_baseline(&mut self, src: &str, dst: &str) {
+        let nz = self.state.fresh_label("clz_nz");
+        let done = self.state.fresh_label("clz_done");
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jnz {}", nz);
+        emit!(self.state, "    movl $32, %{d}", d = dst);
+        emit!(self.state, "    jmp {}", done);
+        emit!(self.state, "{}:", nz);
+        emit!(self.state, "    bsrl %{s}, %{d}", s = src, d = dst);
+        emit!(self.state, "    xorl $31, %{d}", d = dst);
+        emit!(self.state, "{}:", done);
+    }
+
+    /// ctz32 on a 32-bit register without TZCNT: BSF(src) into dst, with
+    /// the zero fixup so Ctz(0) == 32 holds.
+    pub(super) fn emit_ctz32_baseline(&mut self, src: &str, dst: &str) {
+        let nz = self.state.fresh_label("ctz_nz");
+        let done = self.state.fresh_label("ctz_done");
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jnz {}", nz);
+        emit!(self.state, "    movl $32, %{d}", d = dst);
+        emit!(self.state, "    jmp {}", done);
+        emit!(self.state, "{}:", nz);
+        emit!(self.state, "    bsfl %{s}, %{d}", s = src, d = dst);
+        emit!(self.state, "{}:", done);
+    }
+
+    /// clzll(x): Count leading zeros of 64-bit value in eax:edx.
+    /// If high half (edx) != 0, result = lzcnt(edx).
+    /// Otherwise, result = 32 + lzcnt(eax).
+    pub(super) fn emit_i64_clz(&mut self) {
+        let done = self.state.fresh_label("clz64_done");
+        let hi_zero = self.state.fresh_label("clz64_hi_zero");
+        // Test high half
+        self.state.emit("    testl %edx, %edx");
+        emit!(self.state, "    je {}", hi_zero);
+        // High half is non-zero: result = lzcnt(edx)
+        if self.lzcnt_enabled {
+            self.state.emit("    lzcntl %edx, %eax");
+        } else {
+            self.emit_clz32_baseline("edx", "eax");
+        }
+        self.state.emit("    xorl %edx, %edx");
+        emit!(self.state, "    jmp {}", done);
+        // High half is zero: result = 32 + lzcnt(eax)
+        emit!(self.state, "{}:", hi_zero);
+        if self.lzcnt_enabled {
+            self.state.emit("    lzcntl %eax, %eax");
+        } else {
+            self.emit_clz32_baseline("eax", "eax");
+        }
+        self.state.emit("    addl $32, %eax");
+        self.state.emit("    xorl %edx, %edx");
+        emit!(self.state, "{}:", done);
+    }
+
+    /// ctzll(x): Count trailing zeros of 64-bit value in eax:edx.
+    /// If low half (eax) != 0, result = tzcnt(eax).
+    /// Otherwise, result = 32 + tzcnt(edx).
+    pub(super) fn emit_i64_ctz(&mut self) {
+        let done = self.state.fresh_label("ctz64_done");
+        let lo_zero = self.state.fresh_label("ctz64_lo_zero");
+        // Test low half
+        self.state.emit("    testl %eax, %eax");
+        emit!(self.state, "    je {}", lo_zero);
+        // Low half is non-zero: result = tzcnt(eax)
+        if self.bmi1_enabled {
+            self.state.emit("    tzcntl %eax, %eax");
+        } else {
+            self.emit_ctz32_baseline("eax", "eax");
+        }
+        self.state.emit("    xorl %edx, %edx");
+        emit!(self.state, "    jmp {}", done);
+        // Low half is zero: result = 32 + tzcnt(edx)
+        emit!(self.state, "{}:", lo_zero);
+        if self.bmi1_enabled {
+            self.state.emit("    tzcntl %edx, %eax");
+        } else {
+            self.emit_ctz32_baseline("edx", "eax");
+        }
+        self.state.emit("    addl $32, %eax");
+        self.state.emit("    xorl %edx, %edx");
+        emit!(self.state, "{}:", done);
+    }
+
+    /// popcountll(x): Population count of 64-bit value in eax:edx.
+    /// result = popcount(eax) + popcount(edx)
+    pub(super) fn emit_i64_popcount(&mut self) {
+        if self.popcnt_enabled {
+            self.state.emit("    popcntl %edx, %ecx");
+            self.state.emit("    popcntl %eax, %eax");
+            self.state.emit("    addl %ecx, %eax");
+            self.state.emit("    xorl %edx, %edx");
+            return;
+        }
+        // POPCNT is #UD on i686 CPUs without the feature (SSE4.2 era /
+        // -mpopcnt). Baseline: count each half with the shr/adc loop.
+        self.emit_popcount32_baseline("edx", "ecx");
+        // careful: the loop for eax must not clobber ecx — count eax into
+        // edx's old role is unnecessary; count eax into eax directly.
+        self.emit_popcount32_baseline_eax_preserving_ecx();
+        self.state.emit("    addl %ecx, %eax");
+        self.state.emit("    xorl %edx, %edx");
+    }
+
+    /// 32-bit popcount of `src` into `dst` without POPCNT (shr/adc loop).
+    /// May only use the two named registers.
+    pub(super) fn emit_popcount32_baseline(&mut self, src: &str, dst: &str) {
+        let top = self.state.fresh_label("pop_loop");
+        let done = self.state.fresh_label("pop_done");
+        emit!(self.state, "    xorl %{d}, %{d}", d = dst);
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jz {}", done);
+        emit!(self.state, "{}:", top);
+        emit!(self.state, "    shrl $1, %{s}", s = src);
+        emit!(self.state, "    adcl $0, %{d}", d = dst);
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jnz {}", top);
+        emit!(self.state, "{}:", done);
+    }
+
+    /// popcount(eax) -> eax without POPCNT and without touching %ecx
+    /// (used by emit_i64_popcount, which keeps the edx count in %ecx).
+    fn emit_popcount32_baseline_eax_preserving_ecx(&mut self) {
+        // Count into edx (already consumed as the high half input).
+        let top = self.state.fresh_label("pop_lo");
+        let done = self.state.fresh_label("pop_dn");
+        self.state.emit("    xorl %edx, %edx");
+        self.state.emit("    testl %eax, %eax");
+        emit!(self.state, "    jz {}", done);
+        emit!(self.state, "{}:", top);
+        self.state.emit("    shrl $1, %eax");
+        self.state.emit("    adcl $0, %edx");
+        self.state.emit("    testl %eax, %eax");
+        emit!(self.state, "    jnz {}", top);
+        emit!(self.state, "{}:", done);
+        self.state.emit("    movl %edx, %eax");
+    }
+
+    /// bswap64(x): Byte-swap 64-bit value in eax:edx.
+    /// result_lo = bswap(high), result_hi = bswap(low)
+    pub(super) fn emit_i64_bswap(&mut self) {
+        // eax=low, edx=high
+        // bswap each half, then swap: new_eax = bswap(edx), new_edx = bswap(eax)
+        self.state.emit("    bswapl %eax");
+        self.state.emit("    bswapl %edx");
+        self.state.emit("    xchgl %eax, %edx");
+    }
+
+    /// Copy `n_bytes` of a by-value object to `dst`.
+    ///
+    /// Every access below is **strictly inside** both the source object
+    /// (`[0, n_bytes)`) and the destination slot, so no padding byte is ever
+    /// read or written and no access can reach a neighbouring argument. That
+    /// in-bounds property is what makes the vector form safe here: the i686
+    /// outgoing area is sized by the object's own footprint, and every chunk
+    /// offset below satisfies `offset + 16 <= n_bytes`.
+    ///
+    /// Policy, decided by measurement (`scripts/measure_i686_stack_copy.py`, min of 101
+    /// rounds, L1-hot, destination = outgoing area, callee reading the last
+    /// field immediately afterwards — the call sequence's own regime):
+    ///
+    /// 1. **16 bytes per `movups` pair** when the TU permits SSE. `movups` is
+    ///    a *bit* copy — it preserves NaN payloads and signalling bits, unlike
+    ///    any FP movement — and it is the SSE1 form, so it stays available
+    ///    under `-mno-sse2` and only the genuinely SSE-less targets
+    ///    (`-mno-sse`, `-mgeneral-regs-only`) fall back to the scalar loop.
+    ///    Measured: 1.93 cycles against the scalar 3.86 at 16 bytes, and
+    ///    0.048 cyc/byte against 0.120 at 64 bytes.
+    /// 2. **The last chunk is the overlapping one at `n_bytes - 16`** — the
+    ///    classic memcpy tail. It needs no 8-byte or 4-byte tail sequences at
+    ///    all, and it keeps the final 16 bytes in a *single* store, so a field
+    ///    read by the callee is store-forwarded from one store instead of
+    ///    being recombined from two. This is the decisive measured case: a
+    ///    24-byte argument whose 8-byte tail used two `movl` pairs cost 14.6
+    ///    cycles (a forwarding stall) and costs 2.3 now; the whole 21..31-byte
+    ///    range went from 14.6-16.1 to 2.3. Rejected alternatives, both
+    ///    measured: an 8-byte `movlps` tail is equal here (2.31) but needs an
+    ///    extra instruction for every remainder of 9..15 bytes, and `rep
+    ///    movsl` costs 25+ cycles at every size up to 256 bytes.
+    /// 3. **Objects under 16 bytes**, and every non-SSE TU, take the scalar
+    ///    4 / 2 / 1-byte tail. The 2-byte step is not decoration: a 3-byte
+    ///    remainder is 4 instructions instead of 6, and it is the same 4/2/1
+    ///    policy the `va_arg` struct copier applies, so both by-value paths
+    ///    agree byte for byte.
+    ///
+    /// `scratch` is never a register the copy itself needs. Every caller
+    /// stages stack arguments before register arguments, so the staging
+    /// scratch is dead on entry; the accumulator cache is invalidated on exit
+    /// so that any `%eax`-derived state stays honest.
+    pub(super) fn emit_copy_bytes(
+        &mut self,
+        src: CopySrc,
+        dst: CopyDst,
+        scratch: CopyScratch,
+        n_bytes: usize,
+    ) {
+        let mut copied = 0usize;
+        if self.sse_enabled && n_bytes >= 16 {
+            while copied + 16 <= n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movups {}, %xmm0", sr);
+                let dr = self.copy_dst_ref(dst, copied);
+                emit!(self.state, "    movups %xmm0, {}", dr);
+                copied += 16;
+            }
+            if copied < n_bytes {
+                // Overlapping tail, wholly inside `[0, n_bytes)` because
+                // `n_bytes >= 16`, and it covers every byte the chunk loop
+                // did not. The overlap is intentional, not a bookkeeping
+                // slip: it replaces up to eight scalar tail instructions.
+                let tail = n_bytes - 16;
+                let sr = self.copy_src_ref(src, tail);
+                emit!(self.state, "    movups {}, %xmm0", sr);
+                let dr = self.copy_dst_ref(dst, tail);
+                emit!(self.state, "    movups %xmm0, {}", dr);
+            }
+        } else {
+            while copied + 4 <= n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movl {}, {}", sr, scratch.r32());
+                let dr = self.copy_dst_ref(dst, copied);
+                emit!(self.state, "    movl {}, {}", scratch.r32(), dr);
+                copied += 4;
+            }
+            while copied + 2 <= n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movzwl {}, {}", sr, scratch.r32());
+                let dr = self.copy_dst_ref(dst, copied);
+                emit!(self.state, "    movw {}, {}", scratch.r16(), dr);
+                copied += 2;
+            }
+            while copied < n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movb {}, {}", sr, scratch.r8());
+                let dr = self.copy_dst_ref(dst, copied);
+                emit!(self.state, "    movb {}, {}", scratch.r8(), dr);
+                copied += 1;
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Name byte `off` of `src` for the copy policy above.
+    fn copy_src_ref(&self, src: CopySrc, off: usize) -> String {
+        match src {
+            CopySrc::Slot(slot) => self.slot_ref_offset(slot, off as i64),
+            CopySrc::Ecx => format!("{}(%ecx)", off),
+            CopySrc::Register(reg) => format!("{}({})", off, reg),
+        }
+    }
+
+    /// Name byte `off` of `dst` for the copy policy above.
+    fn copy_dst_ref(&self, dst: CopyDst, off: usize) -> String {
+        match dst {
+            CopyDst::OutgoingArea(base) => format!("{}(%esp)", base + off),
+            CopyDst::Register(reg, base) => format!("{}({})", base + off, reg),
+            CopyDst::Slot(slot) => self.slot_ref_offset(slot, off as i64),
+        }
+    }
+
+    /// Copy `size` bytes between the objects `src` and `dest` point to,
+    /// straight-line, without `rep movsb` and without borrowing a
+    /// callee-saved register. Returns false (nothing emitted) when an
+    /// endpoint has no resolvable address; the caller keeps the general path.
+    ///
+    /// `Memcpy` is a call point for liveness and register allocation, so no
+    /// value lives *across* it in `%eax`, `%ecx` or `%edx`; only the copy's
+    /// own pointer operands may still be there. Each endpoint is therefore
+    /// addressed in the cheapest way that cannot clobber the other:
+    ///
+    /// * a frame object (alloca or constant-offset alias of one) directly as
+    ///   a frame operand, with no address register at all;
+    /// * a pointer in a register other than `%eax` in place, as the base;
+    /// * anything else (a pointer in a slot, an over-aligned alloca, a
+    ///   pointer in `%eax`) materialized into whichever of `%ecx`/`%edx` the
+    ///   other endpoint does not use as its base.
+    ///
+    /// Materializations read only frame memory or `%eax` and write only
+    /// their own target, so there is no ordering cycle; `%eax` (or `%xmm0`
+    /// with SSE) is then free for the data. A source and destination that
+    /// are the same object (C's exact-overlap struct self-assignment) copy
+    /// correctly too: every chunk, including the overlapping tail, is loaded
+    /// and stored back unchanged.
+    fn emit_small_memcpy(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
+        use crate::backend::state::SlotAddr;
+        #[derive(Clone, Copy)]
+        enum End {
+            Frame(StackSlot),
+            Base(&'static str),
+            Load(StackSlot),
+            Aligned(StackSlot, u32),
+            FromEax,
+        }
+        let end_of = |cg: &Self, v: &Value| -> Option<End> {
+            Some(match cg.state.resolve_slot_addr(v.0)? {
+                SlotAddr::Direct(slot) => End::Frame(slot),
+                SlotAddr::OverAligned(slot, id) => End::Aligned(slot, id),
+                SlotAddr::Reg(reg) => match phys_reg_name(reg) {
+                    "eax" => End::FromEax,
+                    r => End::Base(r),
+                },
+                SlotAddr::Indirect(slot) => match cg.reg_assignments.get(&v.0) {
+                    Some(&phys) => match phys_reg_name(phys) {
+                        "eax" => End::FromEax,
+                        r => End::Base(r),
+                    },
+                    None => End::Load(slot),
+                },
+            })
+        };
+        let (Some(d), Some(s)) = (end_of(self, dest), end_of(self, src)) else {
+            return false;
+        };
+        let base_of = |e: End| match e {
+            End::Base(r) => Some(r),
+            _ => None,
+        };
+        // The register an endpoint is materialized into: `%ecx` for the
+        // source and `%edx` for the destination unless the other endpoint
+        // already uses that one as its base. Both need one only when neither
+        // has a base, and then they are `%ecx`/`%edx`: distinct.
+        let pick = |preferred: &'static str, other: Option<&'static str>| {
+            if other == Some(preferred) {
+                if preferred == "ecx" { "edx" } else { "ecx" }
+            } else {
+                preferred
+            }
+        };
+        let s_reg = pick("ecx", base_of(d));
+        let d_reg = pick("edx", base_of(s));
+        let materialize = |cg: &mut Self, e: End, reg: &'static str| match e {
+            End::Load(slot) => {
+                let sr = cg.slot_ref(slot);
+                emit!(cg.state, "    movl {}, %{}", sr, reg);
+            }
+            End::Aligned(slot, id) => cg.emit_alloca_addr_to(reg, id, slot),
+            End::FromEax => emit!(cg.state, "    movl %eax, %{}", reg),
+            End::Frame(_) | End::Base(_) => {}
+        };
+        materialize(self, s, s_reg);
+        materialize(self, d, d_reg);
+        let copy_src = match s {
+            End::Frame(slot) => CopySrc::Slot(slot),
+            End::Base(r) => CopySrc::Register(base_name(r)),
+            _ => CopySrc::Register(base_name(s_reg)),
+        };
+        let copy_dst = match d {
+            End::Frame(slot) => CopyDst::Slot(slot),
+            End::Base(r) => CopyDst::Register(base_name(r), 0),
+            _ => CopyDst::Register(base_name(d_reg), 0),
+        };
+        self.emit_copy_bytes(copy_src, copy_dst, CopyScratch::Eax, size);
+        self.state.reg_cache.invalidate_sec();
+        true
+    }
+
+    /// `-Os`: whether the straight-line copy encodes to no more bytes than
+    /// the `rep movsb` sequence, both measured by the in-tree encoder on the
+    /// exact text each would emit here (frame displacements, SIB bytes and
+    /// address materializations included). A tie keeps the straight-line
+    /// copy, which is also the faster one. Unmeasurable text or an endpoint
+    /// the straight-line form cannot address keeps `rep movsb`.
+    ///
+    /// The trials are emitted and cut off again. Neither allocates labels or
+    /// moves the net stack adjustment; the only state they can leave behind
+    /// is register-cache facts about text that no longer exists, so both
+    /// cached registers are invalidated afterwards -- facts can only be lost
+    /// (a missed reuse), never wrongly gained.
+    fn small_memcpy_is_no_larger(&mut self, dest: &Value, src: &Value, size: usize) -> bool {
+        let esp = self.esp_adjust;
+        let mark = self.state.out.buf.len();
+        let straight = self.emit_small_memcpy(dest, src, size);
+        let straight_text = self.state.out.buf.split_off(mark);
+        self.emit_rep_memcpy(dest, src, size);
+        let rep_text = self.state.out.buf.split_off(mark);
+        debug_assert_eq!(
+            self.esp_adjust, esp,
+            "a memcpy trial moved the stack adjustment"
+        );
+        self.state.reg_cache.invalidate_acc();
+        self.state.reg_cache.invalidate_sec();
+        straight
+            && matches!(
+                (encoded_len(&straight_text), encoded_len(&rep_text)),
+                (Some(s), Some(r)) if s <= r
+            )
+    }
+
+    /// The register a `Memcpy` pointer operand is read from, if it lives in
+    /// one.
+    fn memcpy_ptr_reg(&self, v: &Value) -> Option<&'static str> {
+        use crate::backend::state::SlotAddr;
+        match self.state.resolve_slot_addr(v.0)? {
+            SlotAddr::Reg(reg) => Some(phys_reg_name(reg)),
+            SlotAddr::Indirect(_) => self.reg_assignments.get(&v.0).map(|&p| phys_reg_name(p)),
+            SlotAddr::Direct(_) | SlotAddr::OverAligned(..) => None,
+        }
+    }
+
+    /// Load the address `v` denotes into `%edi`/`%esi` for `rep movsb`.
+    /// Nothing when it is already there: no self-move for the peephole to
+    /// delete, and none to inflate the `-Os` size comparison.
+    fn emit_rep_memcpy_addr(&mut self, v: &Value, to: &'static str) {
+        use crate::backend::state::SlotAddr;
+        if self.memcpy_ptr_reg(v) == Some(to) {
+            return;
+        }
+        let Some(addr) = self.state.resolve_slot_addr(v.0) else {
+            return;
+        };
+        let to_edi = to == "edi";
+        match addr {
+            SlotAddr::OverAligned(slot, id) => {
+                self.emit_alloca_aligned_addr_to_acc(slot, id);
+                emit!(self.state, "    movl %eax, %{}", to);
+            }
+            SlotAddr::Direct(slot) if to_edi => self.emit_memcpy_load_dest_addr(slot, true, v.0),
+            SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, v.0),
+            SlotAddr::Indirect(slot) if to_edi => self.emit_memcpy_load_dest_addr(slot, false, v.0),
+            SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, v.0),
+            SlotAddr::Reg(reg) => emit!(self.state, "    movl %{}, %{}", phys_reg_name(reg), to),
+        }
+    }
+
+    /// `rep movsb` with `%esi`/`%edi` saved around it (callee-saved in the
+    /// System V i386 ABI, so preserved even when the allocator assigned
+    /// nothing to them).
+    ///
+    /// The two address loads are a parallel move: `%edi <- dest`,
+    /// `%esi <- src`. Each writes its target (and `%eax` too when the address
+    /// is an over-aligned alloca) and reads the pointer's home register, if
+    /// any. They are emitted in an order in which no load clobbers a register
+    /// a later one reads; the only cycle is the exchange (source homed in
+    /// `%edi`, destination in `%esi`), done with one `xchgl`. Loading the
+    /// destination first unconditionally copied the destination onto itself
+    /// whenever the source pointer was homed in `%edi`.
+    fn emit_rep_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        use crate::backend::state::SlotAddr;
+        self.state.emit("    pushl %esi");
+        self.esp_adjust += 4;
+        self.state.emit("    pushl %edi");
+        self.esp_adjust += 4;
+        let clobbers = |cg: &Self, v: &Value, to: &'static str, r: Option<&'static str>| {
+            let over_aligned = matches!(
+                cg.state.resolve_slot_addr(v.0),
+                Some(SlotAddr::OverAligned(..))
+            );
+            r.is_some_and(|r| r == to || (over_aligned && r == "eax"))
+        };
+        let src_reads = self.memcpy_ptr_reg(src);
+        let dest_reads = self.memcpy_ptr_reg(dest);
+        if !clobbers(self, dest, "edi", src_reads) {
+            self.emit_rep_memcpy_addr(dest, "edi");
+            self.emit_rep_memcpy_addr(src, "esi");
+        } else if !clobbers(self, src, "esi", dest_reads) {
+            self.emit_rep_memcpy_addr(src, "esi");
+            self.emit_rep_memcpy_addr(dest, "edi");
+        } else {
+            // A register-homed source is not over-aligned, so the source load
+            // clobbers only %esi: the destination reads %esi and the source
+            // %edi.
+            debug_assert_eq!((src_reads, dest_reads), (Some("edi"), Some("esi")));
+            self.state.emit("    xchgl %esi, %edi");
+        }
+        self.emit_memcpy_impl(size);
+        self.state.emit("    popl %edi");
+        self.esp_adjust -= 4;
+        self.state.emit("    popl %esi");
+        self.esp_adjust -= 4;
+    }
+
+    /// Copy `n_bytes` from a frame slot to the outgoing argument area.
+    pub(super) fn emit_copy_slot_to_stack(
+        &mut self,
+        slot: StackSlot,
+        stack_offset: usize,
+        n_bytes: usize,
+    ) {
+        self.emit_copy_bytes(
+            CopySrc::Slot(slot),
+            CopyDst::OutgoingArea(stack_offset),
+            CopyScratch::Eax,
+            n_bytes,
+        );
+    }
+
+    /// Fallback: store eax to stack, zero-fill remaining bytes.
+    pub(super) fn emit_eax_to_stack_zeroed(
+        &mut self,
+        arg: &Operand,
+        stack_offset: usize,
+        total_bytes: usize,
+    ) {
+        self.operand_to_eax(arg);
+        emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+        for j in (4..total_bytes).step_by(4) {
+            emit!(self.state, "    movl $0, {}(%esp)", stack_offset + j);
+        }
+    }
+
+    /// Emit a scalar _Float128/_Decimal128 argument to its 16-byte stack
+    /// slot. Unlike a true aggregate, the operand is the value itself rather
+    /// than an address. Keep the full object image: the low limb of many
+    /// binary128 values is zero and is not a null aggregate pointer.
+    pub(super) fn emit_call_f128_sse_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
+        match arg {
+            Operand::Value(v) => {
+                let slot = crate::backend::call_abi::require_f128_sse_value_slot(
+                    self.state.get_slot(v.0),
+                    v.0,
+                );
+                self.emit_copy_slot_to_stack(slot, stack_offset, 16);
+            }
+            Operand::Const(c) => {
+                let bits = crate::backend::call_abi::f128_sse_const_image(*c);
+                for word in 0usize..4 {
+                    let dword = (bits >> (word * 32)) as u32 as i32;
+                    emit!(
+                        self.state,
+                        "    movl ${}, {}(%esp)",
+                        dword,
+                        stack_offset + word * 4
+                    );
+                }
+            }
+        }
+    }
+
+    /// Emit I128 argument to call stack (16 bytes).
+    pub(super) fn emit_call_i128_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
+        if let Operand::Value(v) = arg {
+            if let Some(slot) = self.state.get_slot(v.0) {
+                self.emit_copy_slot_to_stack(slot, stack_offset, 16);
+            } else {
+                self.emit_eax_to_stack_zeroed(arg, stack_offset, 16);
+            }
+        }
+    }
+
+    /// Emit F128 (long double) argument to call stack (12 bytes).
+    pub(super) fn emit_call_f128_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
+        match arg {
+            Operand::Value(v) => {
+                if self.state.f128_direct_slots.contains(&v.0) {
+                    // Bit-exact 12-byte copy of the slot (10 payload + 2
+                    // pad). The x87 round trip the old code used
+                    // re-canonicalizes exceptional encodings, rewrites the
+                    // padding and costs a store-forwarding stall; three
+                    // movl are exact and cheaper.
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        self.emit_copy_slot_to_stack(slot, stack_offset, 12);
+                    }
+                } else if let Some(slot) = self.state.get_slot(v.0) {
+                    self.emit_copy_slot_to_stack(slot, stack_offset, 12);
+                } else {
+                    self.emit_eax_to_stack_zeroed(arg, stack_offset, 12);
+                }
+            }
+            Operand::Const(IrConst::LongDouble(_, bytes)) => {
+                let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(bytes);
+                let dword0 = i32::from_le_bytes([x87[0], x87[1], x87[2], x87[3]]);
+                let dword1 = i32::from_le_bytes([x87[4], x87[5], x87[6], x87[7]]);
+                let word2 = i16::from_le_bytes([x87[8], x87[9]]) as i32;
+                emit!(self.state, "    movl ${}, {}(%esp)", dword0, stack_offset);
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    dword1,
+                    stack_offset + 4
+                );
+                emit!(
+                    self.state,
+                    "    movw ${}, {}(%esp)",
+                    word2,
+                    stack_offset + 8
+                );
+            }
+            Operand::Const(IrConst::F64(fval)) => {
+                let bits = fval.to_bits();
+                let low = (bits & 0xFFFFFFFF) as i32;
+                let high = ((bits >> 32) & 0xFFFFFFFF) as i32;
+                self.state.emit("    subl $8, %esp");
+                emit!(self.state, "    movl ${}, (%esp)", low);
+                emit!(self.state, "    movl ${}, 4(%esp)", high);
+                self.state.emit("    fldl (%esp)");
+                self.state.emit("    addl $8, %esp");
+                emit!(self.state, "    fstpt {}(%esp)", stack_offset);
+            }
+            _ => {
+                self.emit_eax_to_stack_zeroed(arg, stack_offset, 12);
+            }
+        }
+    }
+
+    /// Bounded call-site copy. Source is staged before temporary pushes,
+    /// so frame-pointer-less slot addresses keep their existing coordinate.
+    /// ESI/EDI are saved in the function prologue as well (see the frame
+    /// planner), giving correct unwind rules even in the middle of REP.
+    fn emit_large_struct_stack_arg(&mut self, v: Value, stack_offset: usize, size: usize) {
+        if self.state.is_alloca(v.0) {
+            let slot = self
+                .state
+                .get_slot(v.0)
+                .expect("aggregate alloca needs a slot");
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    leal {}, %eax", sr);
+            if let Some(a) = self.state.alloca_over_align(v.0) {
+                emit!(self.state, "    addl ${}, %eax", a - 1);
+                emit!(self.state, "    andl ${}, %eax", -(a as i32));
+            }
+        } else {
+            self.operand_to_eax(&Operand::Value(v));
+        }
+        // These registers may hold other argument values or caller-local
+        // live homes. Save all of them, even when the callee will clobber
+        // caller-saved ECX: its input has not necessarily been staged yet.
+        self.state.emit("    pushl %esi");
+        self.state.emit("    pushl %edi");
+        self.state.emit("    pushl %ecx");
+        self.state.emit("    movl %eax, %esi");
+        emit!(self.state, "    leal {}(%esp), %edi", stack_offset + 12);
+        emit!(self.state, "    movl ${}, %ecx", size);
+        self.state.emit("    rep movsb");
+        self.state.emit("    popl %ecx");
+        self.state.emit("    popl %edi");
+        self.state.emit("    popl %esi");
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Emit struct-by-value argument to call stack.
+    pub(super) fn emit_call_struct_stack_arg(
+        &mut self,
+        arg: &Operand,
+        stack_offset: usize,
+        size: usize,
+    ) {
+        if size >= crate::backend::call_abi::LARGE_ARG_COPY_THRESHOLD {
+            if let Operand::Value(v) = arg {
+                self.emit_large_struct_stack_arg(*v, stack_offset, size);
+                return;
+            }
+        }
+        if let Operand::Const(c @ (IrConst::I128(_) | IrConst::Zero)) = arg {
+            // 16-byte carrier constant (_Float128/_Decimal128 literal, i686
+            // TFmode by-value stack arg): four immediate stores into the
+            // outgoing window. The historic code only handled Operand::Value
+            // and SILENTLY EMITTED NOTHING for constants — the callee then
+            // read whatever the window happened to hold (ident(1.5F128)).
+            if size == 16 {
+                let words: [u32; 4] = match c {
+                    IrConst::I128(v) => {
+                        let b = v.to_le_bytes();
+                        [
+                            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                            u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                            u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                        ]
+                    }
+                    _ => [0; 4],
+                };
+                for (k, w) in words.iter().enumerate() {
+                    emit!(
+                        self.state,
+                        "    movl ${}, {}(%esp)",
+                        w,
+                        stack_offset + 4 * k
+                    );
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+        if let Operand::Value(v) = arg {
+            let is_i128_carrier = self.state.i128_values.contains(&v.0)
+                || self
+                    .state
+                    .alloca_types
+                    .get(&v.0)
+                    .is_some_and(|t| crate::backend::generation::is_i128_type(*t));
+            if self.state.is_alloca(v.0) {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    // Over-aligned (>16) alloca: the struct's bytes live at
+                    // align_up(slot, align) — the same address every other
+                    // alloca-storage user resolves (memcpy paths, param
+                    // copies). Copying from the raw slot would forward the
+                    // alignment-pad bytes instead of the struct (caller-side
+                    // twin of the prologue's param-copy fix).
+                    if let Some(a) = self.state.alloca_over_align(v.0) {
+                        let sr = self.slot_ref(slot);
+                        emit!(self.state, "    leal {}, %ecx", sr);
+                        emit!(self.state, "    addl ${}, %ecx", a - 1);
+                        emit!(self.state, "    andl ${}, %ecx", -(a as i32));
+                        self.emit_copy_bytes(
+                            CopySrc::Ecx,
+                            CopyDst::OutgoingArea(stack_offset),
+                            CopyScratch::Eax,
+                            size,
+                        );
+                    } else {
+                        self.emit_copy_slot_to_stack(slot, stack_offset, size);
+                    }
+                }
+            } else if is_i128_carrier {
+                // 16-byte carrier value (U128 gp-view): the slot IS the data.
+                // Copy the payload words straight out of the slot — the
+                // pointer-deref path below would read the first dword as an
+                // address (state.rs resolve_slot_addr SEGV case).
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.emit_copy_slot_to_stack(slot, stack_offset, size);
+                }
+            } else {
+                // Non-alloca: value is a pointer to struct data.
+                self.operand_to_eax(arg);
+                self.state.emit("    movl %eax, %ecx");
+                self.emit_copy_bytes(
+                    CopySrc::Ecx,
+                    CopyDst::OutgoingArea(stack_offset),
+                    CopyScratch::Eax,
+                    size,
+                );
+            }
+        }
+    }
+
+    /// Store an 8-byte pair scalar argument (`is_pair_scalar`) at
+    /// `stack_offset(%esp)`: constants as their exact two-word image
+    /// (`pair_const_bits`: a `_Decimal64` BID high word, a sign-extended
+    /// narrow integer), slot values word by word, anything else through
+    /// the accumulator pair.
+    pub(super) fn emit_call_8byte_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
+        if let Operand::Const(c) = arg {
+            if let Some(bits) = pair_const_bits(c) {
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    bits as u32 as i32,
+                    stack_offset
+                );
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    (bits >> 32) as u32 as i32,
+                    stack_offset + 4
+                );
+                return;
+            }
+        }
+        if let Operand::Value(v) = arg {
+            if let Some(slot) = self.state.get_slot(v.0) {
+                let sr0 = self.slot_ref(slot);
+                let sr4 = self.slot_ref_offset(slot, 4);
+                emit!(self.state, "    movl {}, %eax", sr0);
+                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+                emit!(self.state, "    movl {}, %eax", sr4);
+                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + 4);
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+        self.emit_load_acc_pair(arg);
+        emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+        emit!(self.state, "    movl %edx, {}(%esp)", stack_offset + 4);
+        self.state.reg_cache.invalidate_acc();
+    }
+}
+
+// ─── ArchCodegen trait implementation ────────────────────────────────────────
+
+impl ArchCodegen for I686Codegen {
+    /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
+    /// `#` starts a comment in this target's GAS syntax, so the markers are
+    /// invisible to the assembler, to objdump, and to this backend's text
+    /// peephole alike; downstream scanners (the -mno-sse /
+    /// -mgeneral-regs-only SIMD guard) use them to exempt user-authored
+    /// text from the compiler-generated code policy.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
+    fn mark_volatile_access(&mut self, begin: bool) {
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_VOLATILE_{}",
+            if begin { "BEGIN" } else { "END" }
+        ));
+    }
+
+    fn is_value_reg_assigned(&self, vid: u32) -> bool {
+        self.reg_assignments.contains_key(&vid)
+    }
+
+    fn emit_acc_save(&mut self) -> i64 {
+        // 32-bit mode: `pushq`/`popq` are not encodable, so the push width
+        // follows the pointer size (4 bytes).
+        self.state.emit("    pushl %eax");
+        4
+    }
+
+    fn emit_acc_restore(&mut self) {
+        self.state.emit("    popl %eax");
+    }
+
+    fn flush_x87_pending(&mut self) {
+        self.flush_x87_pending_copy();
+    }
+
+    fn state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
+    fn state_ref(&self) -> &CodegenState {
+        &self.state
+    }
+
+    fn ptr_directive(&self) -> PtrDirective {
+        PtrDirective::Long
+    }
+
+    fn optimize_for_size(&self) -> bool {
+        self.optimize_for_size
+    }
+
+    /// fentry/nop/record modes emit through the generic path (i686 assembler
+    /// accepts `call __fentry__` / `.byte`); classic frame-ABI mcount is not
+    /// wired on i686 yet and warns (see supports_classic_mcount).
+    fn supports_mcount(&self) -> bool {
+        true
+    }
+
+    fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
+        self.reg_assignments.get(&val_id).copied()
+    }
+
+    fn emit_reg_to_reg_move(&mut self, src: PhysReg, dest: PhysReg) {
+        let src_name = phys_reg_name(src);
+        let dest_name = phys_reg_name(dest);
+        emit!(self.state, "    movl %{}, %{}", src_name, dest_name);
+    }
+
+    fn emit_acc_to_phys_reg(&mut self, dest: PhysReg) {
+        let dest_name = phys_reg_name(dest);
+        emit!(self.state, "    movl %eax, %{}", dest_name);
+    }
+
+    fn emit_load_direct_to_phys_reg(&mut self, src: &Operand, dest: PhysReg) -> bool {
+        // Materialize straight into the destination register instead of the
+        // `movl src,%eax; movl %eax,%dest` accumulator detour that
+        // emit_copy_value's default takes. One instruction shorter and it
+        // leaves %eax (and the reg_cache) untouched.
+        let d = phys_reg_name(dest);
+        match src {
+            Operand::Const(c) => {
+                let val: i32 = match c {
+                    IrConst::I8(v) => *v as i32,
+                    IrConst::I16(v) => *v as i32,
+                    IrConst::I32(v) => *v,
+                    IrConst::I64(v) => *v as i32,
+                    IrConst::Zero => 0,
+                    // F32/F64/LongDouble/I128 keep the accumulator path.
+                    _ => return false,
+                };
+                if val == 0 {
+                    emit!(self.state, "    xorl %{}, %{}", d, d);
+                } else {
+                    emit!(self.state, "    movl ${}, %{}", val, d);
+                }
+                true
+            }
+            Operand::Value(v) => {
+                // Wide values need two registers -- never direct.
+                if self.state.wide_values.contains(&v.0) {
+                    return false;
+                }
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot);
+                    if self.state.is_alloca(v.0) {
+                        if self.state.alloca_over_align(v.0).is_some() {
+                            return false; // needs the lea+add+and sequence
+                        }
+                        emit!(self.state, "    leal {}, %{}", sr, d);
+                    } else {
+                        emit!(self.state, "    movl {}, %{}", sr, d);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn emit_reg_to_addr(&mut self, reg: PhysReg) {
+        emit!(self.state, "    movl %{}, %ecx", phys_reg_name(reg));
+        self.state.reg_cache.invalidate_sec();
+    }
+
+    fn emit_reg_to_secondary(&mut self, reg: PhysReg) {
+        // Single home->secondary move for the default emit_gep's general
+        // path: staging a register-resident base must not pass through the
+        // accumulator (which may still hold the live GEP offset).  The
+        // secondary cache cannot be updated (the hook carries no value id),
+        // so invalidate it — matches the conservative emit_reg_to_addr
+        // precedent.
+        emit!(self.state, "    movl %{}, %ecx", phys_reg_name(reg));
+        self.state.reg_cache.invalidate_sec();
+    }
+
+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
+        // The trait DEFAULT for this hook is a NO-OP ("backends override").
+        // i686 never overrode it, so emit_leaq_base_index's default path
+        //     emit_reg_to_acc(base);      <- silently did nothing
+        //     emit_acc_to_secondary();    <- copied the STALE acc (the index!)
+        //     emit_reg_to_acc(index);     <- silently did nothing
+        //     emit_add_secondary_to_acc() <- acc = 2*index, base never added
+        // producing addr = 2*offset for every GEP whose base AND index were
+        // register-allocated: a[i] at -O0 segfaulted (gep0.c/fptest.c).
+        let name = phys_reg_name(reg);
+        emit!(self.state, "    movl %{}, %eax", name);
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    fn emit_leaq_base_index(
+        &mut self,
+        base_reg: PhysReg,
+        index_reg: PhysReg,
+        dest: &Value,
+        dest_reg: Option<PhysReg>,
+    ) {
+        // Single-instruction form, like x86-64: leal (%base,%index), %dest.
+        let b = phys_reg_name(base_reg);
+        let i = phys_reg_name(index_reg);
+        if let Some(d) = dest_reg {
+            let d = phys_reg_name(d);
+            emit!(self.state, "    leal (%{}, %{}), %{}", b, i, d);
+            self.state.reg_cache.invalidate_acc();
+        } else {
+            emit!(self.state, "    leal (%{}, %{}), %eax", b, i);
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        }
+    }
+
+    fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
+        // Register-resident base + constant offset → `leal off(%base), %dest`.
+        // Without this hook the default emit_gep silently drops the base for
+        // slot-less bases (both branches key on resolve_slot_addr), so a
+        // rematerialised folded GEP computed `offset + stale scratch`.
+        let Some(&br) = self.reg_assignments.get(&base.0) else {
+            return false;
+        };
+        if offset < i32::MIN as i64 || offset > i32::MAX as i64 {
+            return false;
+        }
+        let b_name = phys_reg_name(br);
+        if let Some(&dr) = self.reg_assignments.get(&dest.0) {
+            let d_name = phys_reg_name(dr);
+            if offset == 0 {
+                if br != dr {
+                    emit!(self.state, "    movl %{}, %{}", b_name, d_name);
+                }
+            } else {
+                emit!(
+                    self.state,
+                    "    leal {}(%{}), %{}",
+                    offset as i32,
+                    b_name,
+                    d_name
+                );
+            }
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Slot-only dest: stage through %eax, then store to the home.
+        if offset == 0 {
+            emit!(self.state, "    movl %{}, %eax", b_name);
+        } else {
+            emit!(self.state, "    leal {}(%{}), %eax", offset as i32, b_name);
+        }
+        self.state.park_acc(dest.0, false);
+        self.emit_store_result(dest);
+        true
+    }
+
+    // ---- Standard trait methods (kept inline - arch-specific) ----
+    fn emit_load_operand(&mut self, op: &Operand) {
+        self.operand_to_eax(op);
+    }
+    fn emit_store_result(&mut self, dest: &Value) {
+        self.store_eax_to(dest);
+    }
+    fn emit_save_acc(&mut self) {
+        self.state.emit("    movl %eax, %edx");
+    }
+    fn emit_add_secondary_to_acc(&mut self) {
+        self.state.emit("    addl %ecx, %eax");
+    }
+    fn emit_acc_to_secondary(&mut self) {
+        self.state.emit("    movl %eax, %ecx");
+    }
+    fn emit_memcpy_store_dest_from_acc(&mut self) {
+        self.state.emit("    movl %eax, %edi");
+    }
+    fn emit_memcpy_store_src_from_acc(&mut self) {
+        self.state.emit("    movl %eax, %esi");
+    }
+    fn current_return_type(&self) -> IrType {
+        self.current_return_type
+    }
+    fn emit_gep_add_const_to_acc(&mut self, offset: i64) {
+        if offset != 0 {
+            emit!(self.state, "    addl ${}, %eax", offset as i32);
+        }
+    }
+
+    /// Override emit_memcpy for i686: straight-line up to
+    /// [`Self::straight_memcpy_max`], `rep movsb` with esi/edi above it.
+    fn emit_memcpy(&mut self, dest: &Value, src: &Value, size: usize) {
+        if size <= straight_memcpy_max(self.sse_enabled) {
+            if !self.optimize_for_size {
+                if self.emit_small_memcpy(dest, src, size) {
+                    return;
+                }
+            } else if self.small_memcpy_is_no_larger(dest, src, size) {
+                let emitted = self.emit_small_memcpy(dest, src, size);
+                debug_assert!(emitted, "the size trial emitted this copy");
+                return;
+            }
+        }
+        self.emit_rep_memcpy(dest, src, size);
+    }
+
+    /// Override emit_binop to route I64/U64 through register-pair (eax:edx) arithmetic.
+    fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if matches!(ty, IrType::I64 | IrType::U64) {
+            // Fused mul-acc chain HEAD (the Mul): the whole res*base+val
+            // expression emits here; the tail Add and the virtual feeder
+            // zexts emit nothing (compute_i686_mulacc_chains soundness model).
+            if op == IrBinOp::Mul {
+                if let Some(&pi) = self.mulacc_head_of.get(&dest.0) {
+                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
+                        eprintln!("[MULACC] head-emit dest={} plan={}", dest.0, pi);
+                    }
+                    self.emit_mulacc_chain_head(pi);
+                    return;
+                }
+            }
+            // Fused mul-acc chain TAIL (the Add): nothing to emit — the
+            // fused head stored the result at the Mul's program point.
+            if op == IrBinOp::Add && self.mulacc_fused_tails.contains(&dest.0) {
+                if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
+                    eprintln!("[MULACC] tail-skip dest={}", dest.0);
+                }
+                return;
+            }
+            if self.try_emit_i64_binop_fast(dest, op, lhs, rhs) {
+                return;
+            }
+            self.emit_i128_binop(dest, op, lhs, rhs);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+        if crate::backend::generation::is_i128_type(ty) {
+            self.emit_i128_binop(dest, op, lhs, rhs);
+            return;
+        }
+        if ty.is_float() {
+            let float_op = crate::backend::cast::classify_float_binop(op)
+                .unwrap_or_else(|| panic!("unsupported float binop: {:?} on type {:?}", op, ty));
+            self.emit_float_binop(dest, float_op, lhs, rhs, ty);
+            return;
+        }
+        self.emit_int_binop(dest, op, lhs, rhs, ty);
+    }
+
+    /// Override emit_cmp to route F64 and I64/U64 comparisons correctly on i686.
+    fn emit_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+        if ty == IrType::F128 {
+            self.emit_f128_cmp(dest, op, lhs, rhs);
+            return;
+        }
+        if ty == IrType::F64 || ty == IrType::F32 {
+            self.emit_float_cmp(dest, op, lhs, rhs, ty);
+            return;
+        }
+        if crate::backend::generation::is_i128_type(ty) {
+            self.emit_i128_carrier_cmp(dest, op, lhs, rhs);
+            return;
+        }
+        if matches!(ty, IrType::I64 | IrType::U64) {
+            if self.try_emit_i64_cmp_fast(dest, op, lhs, rhs) {
+                return;
+            }
+            // The register-pair compare family (`emit_i128_cmp`) is 64-bit
+            // on i686: it serves I64/U64 only.
+            self.emit_i128_cmp(dest, op, lhs, rhs);
+            return;
+        }
+        self.emit_int_cmp(dest, op, lhs, rhs, ty);
+    }
+
+    fn emit_unaryop(&mut self, dest: &Value, op: IrUnaryOp, src: &Operand, ty: IrType) {
+        if op == IrUnaryOp::IsConstant {
+            self.emit_load_operand(&Operand::Const(IrConst::I32(0)));
+            self.emit_store_result(dest);
+            return;
+        }
+        if ty == IrType::F128 && matches!(op, IrUnaryOp::Neg) {
+            self.emit_f128_neg(dest, src);
+            return;
+        }
+        if ty == IrType::F64 && op == IrUnaryOp::Neg {
+            self.emit_f64_load_to_x87(src);
+            self.state.emit("    fchs");
+            self.emit_f64_store_from_x87(dest);
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        if matches!(ty, IrType::I64 | IrType::U64) || crate::backend::generation::is_i128_type(ty) {
+            self.emit_load_acc_pair(src);
+            match op {
+                IrUnaryOp::Neg => self.emit_i128_neg(),
+                IrUnaryOp::Not => self.emit_i128_not(),
+                IrUnaryOp::Clz | IrUnaryOp::ClzNonZero => self.emit_i64_clz(),
+                IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => self.emit_i64_ctz(),
+                IrUnaryOp::Popcount => self.emit_i64_popcount(),
+                IrUnaryOp::Bswap => self.emit_i64_bswap(),
+                IrUnaryOp::BitReverse | IrUnaryOp::IsConstant => {
+                    unreachable!("{op:?} never reaches the i686 unary dispatch")
+                }
+            }
+            self.emit_store_acc_pair(dest);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+        self.operand_to_eax(src);
+        match op {
+            IrUnaryOp::Neg => {
+                if ty.is_float() {
+                    self.emit_float_neg(ty);
+                } else {
+                    self.emit_int_neg(ty);
+                }
+            }
+            IrUnaryOp::Not => self.emit_int_not(ty),
+            IrUnaryOp::Clz => self.emit_int_clz(ty),
+            IrUnaryOp::ClzNonZero => self.emit_int_clz_nonzero(ty),
+            IrUnaryOp::Ctz => self.emit_int_ctz(ty),
+            IrUnaryOp::CtzNonZero => self.emit_int_ctz_nonzero(ty),
+            IrUnaryOp::Popcount => self.emit_int_popcount(ty),
+            IrUnaryOp::Bswap => self.emit_int_bswap(ty),
+            IrUnaryOp::BitReverse | IrUnaryOp::IsConstant => {
+                unreachable!("{op:?} never reaches the i686 unary dispatch")
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+        self.store_eax_to(dest);
+    }
+
+    /// Override emit_call to handle fastcall calling convention.
+    fn emit_call(
+        &mut self,
+        args: &[Operand],
+        arg_types: &[IrType],
+        direct_name: Option<&str>,
+        func_ptr: Option<&Operand>,
+        dest: Option<Value>,
+        return_type: IrType,
+        is_variadic: bool,
+        _num_fixed_args: usize,
+        struct_arg_sizes: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        struct_arg_is_f128_sse: &[bool],
+        is_sret: bool,
+        is_fastcall: bool,
+        is_regparm: Option<u8>,
+        ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
+        ret_is_f128_sse: bool,
+    ) {
+        let returns_half_xmm = ret_is_f128_sse && return_type == IrType::U16;
+        let returns_i686_ext_vector_gp3 = return_type == IrType::I128
+            && ret_eightbyte_classes.len() == 3
+            && ret_eightbyte_classes
+                .iter()
+                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
+        let returns_i686_xmm = return_type == IrType::I128
+            && ret_eightbyte_classes
+                == [
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::SseUp,
+                ];
+        // `call_passes_wide_vector` gates the pre-call vzeroupper
+        // (calls.rs). This override bypasses the generic `emit_call` that
+        // publishes it, so set it here: conservatively first (any by-value
+        // aggregate wider than 16 bytes, a superset of %ymm/%zmm vectors;
+        // fastcall keeps this), exactly below once the standard path has
+        // classified. A spurious `true` only skips the cleanup; a stale
+        // `false` would zero a YMM argument.
+        self.state.call_passes_wide_vector = struct_arg_sizes
+            .iter()
+            .any(|size| size.is_some_and(|bytes| bytes > 16));
+        if is_fastcall {
+            let gp3_dest = returns_i686_ext_vector_gp3.then(|| dest.clone()).flatten();
+            let xmm_dest = returns_i686_xmm.then(|| dest.clone()).flatten();
+            let half_dest = returns_half_xmm.then(|| dest.clone()).flatten();
+            let fc_dest = if returns_half_xmm { None } else { dest };
+            self.emit_fastcall(
+                args,
+                arg_types,
+                struct_arg_sizes,
+                struct_arg_aligns,
+                struct_arg_classes,
+                struct_arg_is_f128_sse,
+                direct_name,
+                func_ptr,
+                fc_dest,
+                return_type,
+                is_variadic,
+            );
+            if let Some(dest) = gp3_dest {
+                self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
+            }
+            if let Some(dest) = xmm_dest {
+                self.emit_call_store_i686_xmm_result_impl(&dest);
+            }
+            if let Some(dest) = half_dest {
+                self.state.emit("    movd %xmm0, %eax");
+                self.state.emit("    movzwl %ax, %eax");
+                self.emit_store_result(&dest);
+            }
+            return;
+        }
+        use crate::backend::call_abi::*;
+        // Per-callee `__attribute__((regparm(N)))` overrides the global
+        // -mregparm flag for this call only (GCC semantics: the attribute
+        // wins over the command-line flag).
+        self.current_call_regparm = is_regparm.unwrap_or(self.base_regparm).min(3);
+        let mut config = self.call_abi_config();
+        // Zero is an override too: call_abi_config() describes the current
+        // function's parameters, not this callee. Leaving its register count
+        // behind for a regparm -> cdecl call classifies register arguments
+        // which neither the stack writer nor the cdecl register writer emits.
+        config.max_int_regs = self.current_call_regparm as usize;
+        let vector_return_bytes =
+            hidden_vector_return_bytes(is_sret, ret_eightbyte_classes).filter(|_| !args.is_empty());
+        let skip = usize::from(vector_return_bytes.is_some());
+        let mut arg_classes_vec = classify_call_args(
+            &args[skip..],
+            arg_types.get(skip..).unwrap_or(&[]),
+            struct_arg_sizes.get(skip..).unwrap_or(&[]),
+            struct_arg_aligns.get(skip..).unwrap_or(&[]),
+            struct_arg_classes.get(skip..).unwrap_or(&[]),
+            struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
+            struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
+            is_variadic,
+            &config,
+        );
+        if skip == 1 {
+            arg_classes_vec.insert(0, CallArgClass::ZeroSizeSkip);
+        }
+        self.state.call_passes_wide_vector = arg_classes_vec
+            .iter()
+            .any(|class| matches!(class, CallArgClass::StructXmmReg { size, .. } if *size > 16));
+        let indirect = func_ptr.is_some() && direct_name.is_none();
+        if indirect {
+            self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
+        }
+        let stack_arg_space = self.emit_call_compute_stack_space(
+            &arg_classes_vec,
+            arg_types,
+            struct_arg_aligns,
+            struct_arg_classes,
+            struct_arg_is_f128_sse,
+        );
+        let f128_temp_space =
+            self.emit_call_f128_pre_convert(args, &arg_classes_vec, arg_types, stack_arg_space);
+        self.state().reg_cache.invalidate_acc();
+        let total_sp_adjust = self.emit_call_stack_args(
+            args,
+            &arg_classes_vec,
+            arg_types,
+            stack_arg_space,
+            if indirect {
+                self.emit_call_fptr_spill_size()
+            } else {
+                0
+            },
+            f128_temp_space,
+            struct_arg_aligns,
+            struct_arg_classes,
+            struct_arg_is_f128_sse,
+        );
+        self.state().reg_cache.invalidate_acc();
+        self.emit_call_reg_args(
+            args,
+            &arg_classes_vec,
+            arg_types,
+            total_sp_adjust,
+            f128_temp_space,
+            stack_arg_space,
+            &[],
+        );
+        self.emit_call_instruction(direct_name, func_ptr, indirect, stack_arg_space);
+        let callee_pops = self.callee_pops_bytes_for_sret(is_sret && vector_return_bytes.is_none());
+        if indirect || direct_name.is_some() {
+            let target = if indirect { None } else { direct_name };
+            self.state.record_call_pop(target, Some(callee_pops as u32));
+        }
+        // Account for bytes the callee pops via `ret $N` (sret pointer on i686).
+        if callee_pops > 0 {
+            self.esp_adjust -= callee_pops as i64;
+        }
+        let effective_stack_cleanup = stack_arg_space.saturating_sub(callee_pops);
+        self.emit_call_cleanup(effective_stack_cleanup, f128_temp_space, indirect);
+        if let Some(bytes) = vector_return_bytes {
+            self.emit_call_store_vector_return(&args[0], bytes, dest.as_ref());
+        } else if let Some(dest) = dest {
+            if returns_half_xmm {
+                self.state.emit("    movd %xmm0, %eax");
+                self.state.emit("    movzwl %ax, %eax");
+                self.emit_store_result(&dest);
+            } else {
+                self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
+                self.emit_call_store_result(&dest, return_type);
+                if returns_i686_ext_vector_gp3 {
+                    self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
+                }
+                if returns_i686_xmm {
+                    self.emit_call_store_i686_xmm_result_impl(&dest);
+                }
+            }
+        }
+    }
+
+    /// Fold GlobalAddr+Load/Store into absolute `movl sym, %eax` — only in
+    /// non-PIC mode (PIC needs @GOT/@GOTOFF through %ebx, handled by
+    /// emit_global_addr). This is the i686 analogue of x86-64's sym(%rip)
+    /// fold; the kernel realmode/decompressor code is always -fno-pic.
+    fn supports_global_addr_fold(&self) -> bool {
+        !self.state.pic_mode
+    }
+
+    /// LE/IE loads of an omitted TLS root fold into one `%gs:` access (PIC
+    /// included: the IE offset comes from the GOT through `%ebx`).
+    fn supports_tls_direct_load_fold(&self) -> bool {
+        true
+    }
+
+    /// One 32-bit register: the 64-bit pair would need a second `%gs:` load
+    /// and the FP types the x87/SSE staging; those keep the materialized root.
+    fn tls_direct_load_type_ok(&self, ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::Ptr
+        )
+    }
+
+    fn try_emit_tls_direct_load(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        self.try_emit_tls_direct_load_impl(dest, base, offset, ty)
+    }
+
+    fn tls_direct_store_type_ok(&self, ty: IrType) -> bool {
+        self.tls_direct_load_type_ok(ty)
+    }
+
+    fn try_emit_tls_direct_store(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        self.try_emit_tls_direct_store_impl(val, base, offset, ty)
+    }
+
+    fn supports_fused_bit_test_branch(&self) -> bool {
+        // btl + jc: CF-consuming branch, same as x86-64. 32-bit masks only
+        // (the simplify/set_membership legality gates never build I64
+        // BitTests for this target).
+        std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
+    }
+
+    fn supports_fused_cmp_select(&self) -> bool {
+        // `cmp; jCC .Lsel_true` instead of `setCC; movzbl; test; jne`
+        // (emit_fused_cmp_select_impl). Kill switch: CCC_NO_FUSED_CSEL.
+        true
+    }
+
+    fn supports_load_cmp_mem_fold(&self) -> bool {
+        // The accumulator-based i686 codegen otherwise loads a byte/word into
+        // a register just to `testl` it; folding `*p != 0` into `cmpb $0,(mem)`
+        // is the single biggest source of string-loop bloat vs GCC.
+        true
+    }
+
+    /// Session 27: i686 emits SIB indexed addressing `off(%base,%idx,scale)`
+    /// directly at the Load/Store.  The prologue wires
+    /// collect_folded_gep_links_all (base AND index liveness) into register
+    /// allocation so both address registers survive to the access.
+    fn supports_indexed_addr(&self) -> bool {
+        std::env::var_os("CCC_NO_I686_SIB").is_none()
+    }
+
+    /// i686 mirror of emit_load_indexed_impl/emit_store_indexed_impl's
+    /// acceptance conditions, consulted by can_indexed_addr_fold BEFORE the
+    /// GEP's emission is skipped and its offset chain declared dead.
+    ///
+    /// Loads never stage: any SIB-scalar type at shift <= 3 is accepted.
+    /// Stores may need to stage the value through %eax (operand_to_eax),
+    /// which only callee-saved GPRs (PhysReg 0..=3 = ebx/esi/edi/ebp)
+    /// survive; a frame-anchored base (%esp/%ebp slot, the alloca-Direct
+    /// arm) is immune to staging by construction.  This is deliberately
+    /// STRICTER than the emitter (a directly-storable source would not
+    /// stage): strictness only costs a redundant address materialisation,
+    /// while the reverse disagreement reads expired offset homes/slots
+    /// after rematerialisation (20080122-1, i64 local-array loops).
+    fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
+        let scalar = info.shift <= 3 && info.access_tys.iter().all(|t| Self::sib_scalar_ty(*t));
+        if !scalar {
+            return false;
+        }
+        // Index-root extension contract (the deciding half of
+        // `extend_sib_index_form`): `I16`/`U16` roots get their missing
+        // movswl/movzwl at the access; wide roots and the conservative `I64`
+        // default need no work. `I8`/`U8` are refused here so the emitter
+        // never refuses after this point: plain i386 has no byte
+        // sub-register for esi/edi/ebp, and byte-rooted SIBs are rare enough
+        // that the rematerialised GEP costs nothing.
+        if !matches!(
+            info.index_ty,
+            IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        if !info.feeds_store {
+            return true;
+        }
+        let idx_ok = self
+            .reg_assignments
+            .get(&info.index.0)
+            .is_some_and(|r| matches!(r.0, 0..=3));
+        let base_ok = match self.reg_assignments.get(&info.base.0) {
+            Some(r) => matches!(r.0, 0..=3),
+            None => matches!(
+                self.state.resolve_slot_addr(info.base.0),
+                Some(crate::backend::state::SlotAddr::Direct(_))
+            ),
+        };
+        idx_ok && base_ok
+    }
+
+    /// Symbol-base SIB form `sym(,%idx,scale)`: legal only in non-PIC mode
+    /// (PIC would need @GOT/@GOTOFF indirection through %ebx).
+    fn supports_indexed_sym_base(&self) -> bool {
+        std::env::var_os("CCC_NO_I686_SIB").is_none() && !self.state.pic_mode
+    }
+
+    fn const_offset_fold_reg_base_ok(&self, base: &Value) -> bool {
+        // Register-base const-offset folds consume the base at the Load/Store
+        // position (RA-invisible): sound only with the folded-base liveness
+        // links wired into register allocation (prologue passes
+        // collect_gep_fold_base_links).  When that extension is disabled the
+        // folds must be refused too — the two are one contract.
+        if self.state.ra_config.no_folded_index_liveness {
+            return false;
+        }
+        self.reg_assignments
+            .get(&base.0)
+            .is_some_and(|&phys| i686_const_fold_base_reg(phys))
+    }
+
+    fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
+        // Under regparm>=1 (global or per-callee attribute) the sret pointer
+        // is passed in %eax, not pushed, so the callee's plain `ret` pops
+        // nothing (mirrors emit_epilogue).
+        if is_sret && self.current_call_regparm == 0 {
+            4
+        } else {
+            0
+        }
+    }
+
+    // ---- Control flow ----
+
+    fn jump_mnemonic(&self) -> &'static str {
+        "jmp"
+    }
+    fn trap_instruction(&self) -> &'static str {
+        "ud2"
+    }
+
+    fn peephole_for_metric(&self, text: String) -> String {
+        crate::backend::i686::codegen::peephole::peephole_optimize(text)
+    }
+
+    /// Dual-layout metric pair: the metric peephole is a free `text -> text`
+    /// function, so both candidates can be evaluated concurrently by the shared
+    /// scheduler (policy, counters and instrument labels live there).
+    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
+        crate::backend::metric_pair::run_metric_pair(
+            "i686",
+            first,
+            second,
+            crate::backend::i686::codegen::peephole::peephole_optimize,
+        )
+    }
+
+    fn emit_branch_nonzero(&mut self, label: &str) {
+        self.state.emit("    testl %eax, %eax");
+        emit!(self.state, "    jne {}", label);
+    }
+
+    /// On i686, 64-bit conditions need both 32-bit halves tested.
+    fn emit_cond_branch_blocks(
+        &mut self,
+        cond: &Operand,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        match cond {
+            Operand::Const(IrConst::I64(v)) => {
+                if *v != 0 {
+                    self.emit_branch_to_block(true_block);
+                } else {
+                    self.emit_branch_to_block(false_block);
+                }
+                return;
+            }
+            Operand::Const(IrConst::F64(fval)) => {
+                if *fval != 0.0 {
+                    self.emit_branch_to_block(true_block);
+                } else {
+                    self.emit_branch_to_block(false_block);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if let Operand::Value(v) = cond {
+            if self.state.is_wide_value(v.0) {
+                self.emit_wide_value_to_eax_ored(v.0);
+                self.state.reg_cache.invalidate_acc();
+                let true_label = true_block.as_label();
+                self.emit_branch_nonzero(&true_label);
+                self.emit_branch_to_block(false_block);
+                return;
+            }
+            // Register-homed condition: test it in place. The accumulator
+            // relay (`movl %reg,%eax; testl %eax,%eax`) added a copy on
+            // every register-allocated loop condition (find_c byte-load
+            // shape: the load coalesced into %ebp but the branch still
+            // bounced through %eax). testl is read-only, so no cache
+            // invalidation is needed and %eax keeps whatever it held.
+            if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                let reg = phys_reg_name(phys);
+                emit!(self.state, "    testl %{}, %{}", reg, reg);
+                let true_label = true_block.as_label();
+                emit!(self.state, "    jne {}", true_label);
+                self.emit_branch_to_block(false_block);
+                return;
+            }
+        }
+        self.operand_to_eax(cond);
+        let true_label = true_block.as_label();
+        self.emit_branch_nonzero(&true_label);
+        self.emit_branch_to_block(false_block);
+    }
+
+    fn emit_jump_indirect(&mut self) {
+        self.state.emit("    jmp *%eax");
+    }
+
+    /// Override emit_switch to handle 64-bit switch values on i686.
+    fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        let is_wide = match val {
+            Operand::Value(v) => self.state.is_wide_value(v.0),
+            Operand::Const(IrConst::I64(_)) => true,
+            _ => false,
+        };
+
+        if !is_wide {
+            use crate::backend::traits::{
+                MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT,
+            };
+            let use_jump_table = if self.state.no_jump_tables {
+                false
+            } else if cases.len() >= MIN_JUMP_TABLE_CASES {
+                let min_val = cases
+                    .iter()
+                    .map(|&(v, _)| v)
+                    .min()
+                    .expect("switch must have cases");
+                let max_val = cases
+                    .iter()
+                    .map(|&(v, _)| v)
+                    .max()
+                    .expect("switch must have cases");
+                let range = (max_val - min_val + 1) as usize;
+                range <= MAX_JUMP_TABLE_RANGE
+                    && cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT
+            } else {
+                false
+            };
+            if use_jump_table {
+                self.emit_switch_jump_table(val, cases, default, ty);
+            } else {
+                self.emit_load_operand(val);
+                for &(case_val, target) in cases {
+                    let label = target.as_label();
+                    self.emit_switch_case_branch(case_val, &label, ty);
+                }
+                self.emit_branch_to_block(*default);
+            }
+            return;
+        }
+
+        // 64-bit switch: compare both 32-bit halves
+        self.emit_load_acc_pair(val);
+        for &(case_val, target) in cases {
+            let case_low = case_val as i32;
+            let case_high = (case_val >> 32) as i32;
+            let label = target.as_label();
+            let skip_label = format!(".Lswskip_{}", self.state.next_label_id());
+
+            if case_low == 0 {
+                self.state.emit("    testl %eax, %eax");
+            } else {
+                emit!(self.state, "    cmpl ${}, %eax", case_low);
+            }
+            emit!(self.state, "    jne {}", skip_label);
+
+            if case_high == 0 {
+                self.state.emit("    testl %edx, %edx");
+            } else {
+                emit!(self.state, "    cmpl ${}, %edx", case_high);
+            }
+            emit!(self.state, "    je {}", label);
+
+            emit!(self.state, "{}:", skip_label);
+        }
+        self.emit_branch_to_block(*default);
+        self.state.reg_cache.invalidate_all();
+    }
+
+    fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, _ty: IrType) {
+        let val = case_val as i32;
+        if val == 0 {
+            self.state.emit("    testl %eax, %eax");
+        } else {
+            emit!(self.state, "    cmpl ${}, %eax", val);
+        }
+        emit!(self.state, "    je {}", label);
+    }
+
+    fn emit_switch_jump_table(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        _ty: IrType,
+    ) {
+        use crate::backend::traits::build_jump_table;
+        let (table, min_val, range) = build_jump_table(cases, default);
+        let table_label = self.state.fresh_label("jt");
+        let default_label = default.as_label();
+
+        self.operand_to_eax(val);
+        if min_val != 0 {
+            emit!(self.state, "    subl ${}, %eax", min_val as i32);
+        }
+        emit!(self.state, "    cmpl ${}, %eax", range);
+        emit!(self.state, "    jae {}", default_label);
+
+        if self.state.pic_mode {
+            emit!(self.state, "    leal {}@GOTOFF(%ebx), %ecx", table_label);
+            self.state.emit("    movl (%ecx, %eax, 4), %eax");
+            self.state.emit("    addl %ecx, %eax");
+            self.state.emit("    jmp *%eax");
+        } else {
+            emit!(self.state, "    jmp *{}(, %eax, 4)", table_label);
+        }
+
+        self.state.emit(".section .rodata");
+        self.state.emit(".align 4");
+        self.state.emit_fmt(format_args!("{}:", table_label));
+        for target in &table {
+            let target_label = target.as_label();
+            if self.state.pic_mode {
+                self.state
+                    .emit_fmt(format_args!("    .long {} - {}", target_label, table_label));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    .long {}", target_label));
+            }
+        }
+        self.state.restore_current_text_section();
+        self.state.reg_cache.invalidate_all();
+    }
+
+    fn emit_float_binop(
+        &mut self,
+        dest: &Value,
+        op: crate::backend::cast::FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        if ty == IrType::F64 {
+            self.emit_f64_binop_tracked(dest, op, lhs, rhs);
+            return;
+        }
+        if ty == IrType::F128 {
+            // Dead-destination contract (see float_ops.rs): the x87 stack
+            // entry the operand loads push is only ever popped by the
+            // destination store, and `f{}p` pops exactly one of the two
+            // loaded operands. A destination without a slot is a dead
+            // result under this backend's convention, so emit nothing at
+            // all -- emitting the loads without the store would leak one
+            // x87 stack entry per dead-result binop.
+            if self.state.get_slot(dest.0).is_none() {
+                return;
+            }
+
+            let mnemonic = self.emit_float_binop_mnemonic(op);
+            self.emit_f128_load_to_x87(lhs);
+            self.emit_f128_load_to_x87(rhs);
+            emit!(self.state, "    f{}p %st, %st(1)", mnemonic);
+            let slot = self.state.get_slot(dest.0).expect("checked above");
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    fstpt {}", sr);
+            self.state.f128_direct_slots.insert(dest.0);
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let mnemonic = match op {
+            crate::backend::cast::FloatOp::Add => "add",
+            crate::backend::cast::FloatOp::Sub => "sub",
+            crate::backend::cast::FloatOp::Mul => "mul",
+            crate::backend::cast::FloatOp::Div => "div",
+        };
+        self.emit_load_operand(lhs);
+        self.emit_acc_to_secondary();
+        self.emit_load_operand(rhs);
+        self.emit_float_binop_impl(mnemonic, ty);
+        self.emit_store_result(dest);
+    }
+
+    fn emit_float_binop_mnemonic(&self, op: crate::backend::cast::FloatOp) -> &'static str {
+        match op {
+            crate::backend::cast::FloatOp::Add => "add",
+            crate::backend::cast::FloatOp::Sub => "subr",
+            crate::backend::cast::FloatOp::Mul => "mul",
+            crate::backend::cast::FloatOp::Div => "divr",
+        }
+    }
+
+    /// F32 `%ecx <op> %eax` -> `%eax` (`mnemonic`: add/sub/mul/div).
+    fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
+        if ty == IrType::F32 {
+            if self.sse2_scalar_enabled {
+                self.state.emit("    movd %ecx, %xmm0");
+                self.state.emit("    movd %eax, %xmm1");
+                emit!(self.state, "    {}ss %xmm1, %xmm0", mnemonic);
+                self.state.emit("    movd %xmm0, %eax");
+            } else {
+                // x87 with F32 memory operands. The extended-precision
+                // intermediate is innocuous: x87 rounds to its 64-bit (or
+                // a user-selected 53-bit) significand, >= 2*24+2 bits, so
+                // the FSTPS rounding to F32 gives the correctly rounded
+                // single-precision +,-,*,/ result. FSTPS also performs the
+                // F32 overflow/underflow. `%ecx` (lhs) is left intact.
+                self.state.emit("    pushl %eax");
+                self.state.emit("    pushl %ecx");
+                self.state.emit("    flds (%esp)");
+                emit!(self.state, "    f{}s 4(%esp)", mnemonic);
+                self.state.emit("    fstps 4(%esp)");
+                self.state.emit("    movl 4(%esp), %eax");
+                self.state.emit("    addl $8, %esp");
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// emit_copy_value: handles F128, wide (F64/I64/U64), and 32-bit copies.
+    fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        // 128-bit integer container copies (IrType::I128/U128: the _Float128
+        // gp-view, _Decimal128): full 16-byte semantics.  The wide (8-byte)
+        // path below truncated the upper half (f128_softfloat: every
+        // _Float128 variable-to-variable copy lost the high qword).
+        // Only shapes this intercept fully handles return here; everything
+        // else (slot-less sources, x87 LongDouble consts, ...) falls through
+        // to the legacy paths — silently emitting NOTHING for a 16-byte dest
+        // would leave the slot holding whatever the previous owner left.
+        if self
+            .state
+            .alloca_types
+            .get(&dest.0)
+            .is_some_and(|t| crate::backend::generation::is_i128_type(*t))
+            || self.state.i128_values.contains(&dest.0)
+            || matches!(src, Operand::Const(IrConst::I128(_)))
+        {
+            if let Some(dslot) = self.state.get_slot(dest.0) {
+                match src {
+                    Operand::Const(c @ (IrConst::I128(_) | IrConst::Zero)) => {
+                        let words: [u32; 4] = match c {
+                            IrConst::I128(v) => {
+                                let b = v.to_le_bytes();
+                                [
+                                    u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                                    u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                                    u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                                    u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                                ]
+                            }
+                            _ => [0; 4],
+                        };
+                        for (k, w) in words.iter().enumerate() {
+                            let dsr = self.slot_ref_offset(dslot, (4 * k) as i64);
+                            emit!(self.state, "    movl ${}, {}", w, dsr);
+                        }
+                        return;
+                    }
+                    Operand::Value(sv) => {
+                        if let Some(sslot) = self.state.get_slot(sv.0) {
+                            for k in 0..4i64 {
+                                let ssr = self.slot_ref_offset(sslot, 4 * k);
+                                let dsr = self.slot_ref_offset(dslot, 4 * k);
+                                emit!(self.state, "    movl {}, %eax", ssr);
+                                emit!(self.state, "    movl %eax, {}", dsr);
+                            }
+                            return;
+                        }
+                        // No source slot: fall through to the legacy paths.
+                    }
+                    _ => {
+                        // Non-container source: the legacy paths below own
+                        // those shapes.
+                    }
+                }
+            }
+        }
+        if let Operand::Const(IrConst::LongDouble(..)) = src {
+            if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                self.emit_f128_load_to_x87(src);
+                let sr = self.slot_ref(dest_slot);
+                emit!(self.state, "    fstpt {}", sr);
+                self.state.f128_direct_slots.insert(dest.0);
+                return;
+            }
+        }
+
+        if let Operand::Value(v) = src {
+            if self.state.f128_direct_slots.contains(&v.0) {
+                if let (Some(src_slot), Some(dest_slot)) =
+                    (self.state.get_slot(v.0), self.state.get_slot(dest.0))
+                {
+                    let ssr = self.slot_ref(src_slot);
+                    let dsr = self.slot_ref(dest_slot);
+                    emit!(self.state, "    fldt {}", ssr);
+                    emit!(self.state, "    fstpt {}", dsr);
+                    self.state.f128_direct_slots.insert(dest.0);
+                    return;
+                }
+            }
+            if let Some(&alloca_ty) = self.state.alloca_types.get(&v.0) {
+                if alloca_ty == IrType::F128 {
+                    if let (Some(src_slot), Some(dest_slot)) =
+                        (self.state.get_slot(v.0), self.state.get_slot(dest.0))
+                    {
+                        let ssr = self.slot_ref(src_slot);
+                        let dsr = self.slot_ref(dest_slot);
+                        emit!(self.state, "    fldt {}", ssr);
+                        emit!(self.state, "    fstpt {}", dsr);
+                        self.state.f128_direct_slots.insert(dest.0);
+                        return;
+                    }
+                }
+            }
+        }
+
+        let is_wide = match src {
+            Operand::Value(v) => self.state.is_wide_value(v.0),
+            Operand::Const(IrConst::F64(_) | IrConst::D64(_)) => true,
+            // Integer constants are represented as I64 even when their
+            // semantic destination is U32 (for example a U32 phi incoming
+            // value).  Treating every I64 container as a wide value wrote a
+            // gratuitous zero high word.  That was merely bloat with legacy
+            // 8-byte slots, but corrupts the neighbouring value once i686
+            // uses its natural 4-byte scalar slots.  Stack classification and
+            // generate_copy propagate the authoritative semantic width to the
+            // destination; the range fallback preserves standalone constants
+            // that genuinely cannot fit one 32-bit word.
+            Operand::Const(IrConst::I64(v)) => {
+                self.state.is_wide_value(dest.0) || *v < i32::MIN as i64 || *v > u32::MAX as i64
+            }
+            _ => false,
+        };
+        if is_wide {
+            let Some(dest_slot) = self.state.get_slot(dest.0) else {
+                // No home of its own (an accumulator-consumed temporary):
+                // its consumer reads the pair from %eax:%edx.
+                self.emit_load_acc_pair(src);
+                self.state.reg_cache.invalidate_all();
+                return;
+            };
+            match src {
+                Operand::Value(v) => {
+                    if let Some(src_slot) = self.state.get_slot(v.0) {
+                        let ssr0 = self.slot_ref(src_slot);
+                        let dsr0 = self.slot_ref(dest_slot);
+                        let ssr4 = self.slot_ref_offset(src_slot, 4);
+                        let dsr4 = self.slot_ref_offset(dest_slot, 4);
+                        emit!(self.state, "    movl {}, %eax", ssr0);
+                        emit!(self.state, "    movl %eax, {}", dsr0);
+                        emit!(self.state, "    movl {}, %eax", ssr4);
+                        emit!(self.state, "    movl %eax, {}", dsr4);
+                    } else {
+                        // Register- or accumulator-resident source: the pair
+                        // loader handles every home.
+                        self.emit_load_acc_pair(src);
+                        let dsr0 = self.slot_ref(dest_slot);
+                        let dsr4 = self.slot_ref_offset(dest_slot, 4);
+                        emit!(self.state, "    movl %eax, {}", dsr0);
+                        emit!(self.state, "    movl %edx, {}", dsr4);
+                    }
+                }
+                Operand::Const(c) => {
+                    // `is_wide` admits exactly the pair constants.
+                    let bits = pair_const_bits(c)
+                        .unwrap_or_else(|| unreachable!("non-pair wide copy constant {c:?}"));
+                    let dsr0 = self.slot_ref(dest_slot);
+                    let dsr4 = self.slot_ref_offset(dest_slot, 4);
+                    emit!(self.state, "    movl ${}, {}", bits as u32 as i32, dsr0);
+                    emit!(
+                        self.state,
+                        "    movl ${}, {}",
+                        (bits >> 32) as u32 as i32,
+                        dsr4
+                    );
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        // Constant → spilled slot: fold the immediate directly into the
+        // store instead of round-tripping it through the accumulator
+        // (`movl $imm, slot` instead of `movl $imm, %eax; movl %eax, slot`).
+        // One instruction and 2-4 bytes smaller per copy; on -m16 boot code
+        // the eliminated accumulator reload also drops one 0x66 prefix.
+        // The accumulator is not written, so its register cache entry stays
+        // valid (unlike the generic path below, which clobbers %eax).
+        // Wide dests are excluded: store_eax_to zero-fills their upper word,
+        // which this single 4-byte store must not skip.
+        if let Operand::Const(_) = src {
+            if !self.reg_assignments.contains_key(&dest.0) && !self.state.is_wide_value(dest.0) {
+                if let Some(slot) = self.state.get_slot(dest.0) {
+                    // Reuse the store path's immediate formatter so accepted
+                    // constant kinds and width masking stay in one place.
+                    if let Some(imm) = self.direct_store_src(src, IrType::I32) {
+                        let sr = self.slot_ref(slot);
+                        emit!(self.state, "    movl {}, {}", imm, sr);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Register→register copy: when the source value and the destination
+        // value both hold non-accumulator GPR homes, emit ONE direct
+        // `movl %src, %dest` instead of relaying through the accumulator
+        // (`movl %s, %eax; movl %eax, %d`). Smaller per site, no accumulator
+        // clobber (the register cache stays valid), no flags touched. A
+        // same-register copy (phi-coalesced web transport) is elided
+        // entirely. eax-homed sources/destinations stay on the generic path:
+        // it already emits a single mov and maintains the accumulator cache.
+        // Wide/f128/alloca values are excluded: their copies have
+        // upper-word/segment semantics the single movl must not skip.
+        if let Operand::Value(v) = src {
+            if let (Some(sphys), Some(dphys)) = (
+                self.reg_assignments.get(&v.0).copied(),
+                self.reg_assignments.get(&dest.0).copied(),
+            ) {
+                if sphys.0 != 6
+                    && dphys.0 != 6
+                    && !self.state.is_wide_value(dest.0)
+                    && !self.state.is_wide_value(v.0)
+                    && !self.state.f128_direct_slots.contains(&dest.0)
+                    && !self.state.f128_direct_slots.contains(&v.0)
+                    && !self.state.is_alloca(v.0)
+                {
+                    if sphys != dphys {
+                        let s = phys_reg_name(sphys);
+                        let d = phys_reg_name(dphys);
+                        emit!(self.state, "    movl %{}, %{}", s, d);
+                    }
+                    // Same home: the copy is a no-op.
+                    return;
+                }
+            }
+        }
+
+        // Constant or memory-homed source landing in a non-accumulator GPR
+        // home: materialize straight into the home instead of the
+        // `movl src, %eax; movl %eax, %reg` detour (one instruction, %eax and
+        // its cache untouched). The detour cannot be repaired afterwards: phi
+        // copies end their block, so the peephole's accumulator deadness scan
+        // stops at the next label and the dead staging survives (a zero-
+        // initialized induction variable left `xorl %eax, %eax` before every
+        // such -m32 loop).
+        if let Some(dphys) = self.reg_assignments.get(&dest.0).copied() {
+            if dphys.0 != 6
+                && !self.state.is_wide_value(dest.0)
+                && self.emit_copy_direct_to_home(src, dphys)
+            {
+                return;
+            }
+        }
+
+        self.emit_load_operand(src);
+        self.emit_store_result(dest);
+    }
+
+    fn emit_inline_asm(
+        &mut self,
+        template: &str,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+        input_symbols: &[Option<String>],
+    ) {
+        // Inline assembly may clobber the full x87 stack; drop the cached
+        // copy before the user's template is emitted.
+        self.flush_x87_pending_copy();
+        let markers = self.asm_block_markers();
+        crate::backend::inline_asm::emit_inline_asm_common(
+            self,
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+            markers,
+        );
+    }
+
+    fn emit_intrinsic(
+        &mut self,
+        dest: &Option<Value>,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
+        self.emit_intrinsic_impl(dest, op, dest_ptr, args);
+    }
+
+    // ---- Delegated methods (via macro) ----
+
+    delegate_to_impl! {
+        // prologue
+        fn calculate_stack_space(&mut self, func: &IrFunction) -> i64 => calculate_stack_space_impl;
+        fn aligned_frame_size(&self, raw_space: i64) -> i64 => aligned_frame_size_impl;
+        fn emit_prologue(&mut self, func: &IrFunction, frame_size: i64) => emit_prologue_impl;
+        fn emit_epilogue(&mut self, frame_size: i64) => emit_epilogue_impl;
+        fn emit_store_params(&mut self, func: &IrFunction) => emit_store_params_impl;
+        fn emit_param_ref(&mut self, dest: &Value, param_idx: usize, ty: IrType) => emit_param_ref_impl;
+        fn emit_epilogue_and_ret(&mut self, frame_size: i64) => emit_epilogue_and_ret_impl;
+        fn store_instr_for_type(&self, ty: IrType) -> &'static str => store_instr_for_type_impl;
+        fn load_instr_for_type(&self, ty: IrType) -> &'static str => load_instr_for_type_impl;
+        // memory
+        fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
+        fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
+        fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) => emit_copy_i128_impl;
+        fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) => emit_store_with_const_offset_impl;
+        fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) => emit_load_with_const_offset_impl;
+        fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_load_indexed_impl;
+        fn emit_store_indexed(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_store_indexed_impl;
+        fn emit_load_indexed_sym(&mut self, dest: &Value, sym: &str, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_load_indexed_sym_impl;
+        fn emit_store_indexed_sym(&mut self, val: &Operand, sym: &str, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_store_indexed_sym_impl;
+        fn emit_typed_store_to_slot(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) => emit_typed_store_to_slot_impl;
+        fn emit_typed_load_from_slot(&mut self, instr: &'static str, slot: StackSlot) => emit_typed_load_from_slot_impl;
+        fn emit_load_ptr_from_slot(&mut self, slot: StackSlot, val_id: u32) => emit_load_ptr_from_slot_impl;
+        fn emit_typed_store_indirect(&mut self, instr: &'static str, ty: IrType) => emit_typed_store_indirect_impl;
+        fn emit_typed_load_indirect(&mut self, instr: &'static str) => emit_typed_load_indirect_impl;
+        fn emit_add_offset_to_addr_reg(&mut self, offset: i64) => emit_add_offset_to_addr_reg_impl;
+        fn emit_slot_addr_to_secondary(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) => emit_slot_addr_to_secondary_impl;
+        fn emit_gep_direct_const(&mut self, slot: StackSlot, offset: i64) => emit_gep_direct_const_impl;
+        fn emit_gep_indirect_const(&mut self, slot: StackSlot, offset: i64, val_id: u32) => emit_gep_indirect_const_impl;
+        fn emit_add_imm_to_acc(&mut self, imm: i64) => emit_add_imm_to_acc_impl;
+        fn emit_round_up_acc_to_16(&mut self) => emit_round_up_acc_to_16_impl;
+        fn emit_sub_sp_by_acc(&mut self) => emit_sub_sp_by_acc_impl;
+        fn emit_mov_sp_to_acc(&mut self) => emit_mov_sp_to_acc_impl;
+        fn emit_mov_acc_to_sp(&mut self) => emit_mov_acc_to_sp_impl;
+        fn emit_align_acc(&mut self, align: usize) => emit_align_acc_impl;
+        fn emit_alloca_aligned_addr(&mut self, slot: StackSlot, val_id: u32) => emit_alloca_aligned_addr_impl;
+        fn emit_alloca_aligned_addr_to_acc(&mut self, slot: StackSlot, val_id: u32) => emit_alloca_aligned_addr_to_acc_impl;
+        fn emit_memcpy_load_dest_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) => emit_memcpy_load_dest_addr_impl;
+        fn emit_memcpy_load_src_addr(&mut self, slot: StackSlot, is_alloca: bool, val_id: u32) => emit_memcpy_load_src_addr_impl;
+        fn emit_memcpy_impl(&mut self, size: usize) => emit_memcpy_impl_impl;
+        // alu
+        fn emit_float_neg(&mut self, ty: IrType) => emit_float_neg_impl;
+        fn emit_int_neg(&mut self, ty: IrType) => emit_int_neg_impl;
+        fn emit_int_not(&mut self, ty: IrType) => emit_int_not_impl;
+        fn emit_int_clz(&mut self, ty: IrType) => emit_int_clz_impl;
+        fn emit_int_clz_nonzero(&mut self, ty: IrType) => emit_int_clz_nonzero_impl;
+        fn emit_int_ctz(&mut self, ty: IrType) => emit_int_ctz_impl;
+        fn emit_int_ctz_nonzero(&mut self, ty: IrType) => emit_int_ctz_nonzero_impl;
+        fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
+        fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
+        fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
+        // comparison
+        fn emit_float_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_float_cmp_impl;
+        fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;
+        fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
+        fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
+        fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
+        fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
+        fn emit_fused_cmp_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, true_val: &Operand, false_val: &Operand, dest: &Value, sel_ty: IrType) => emit_fused_cmp_select_impl;
+        fn emit_f128_neg(&mut self, dest: &Value, src: &Operand) => emit_f128_neg_impl;
+        // calls
+        fn call_abi_config(&self) -> call_abi::CallAbiConfig => call_abi_config_impl;
+        fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
+        fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
+        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
+        fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
+        fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
+        fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
+        fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn emit_call_store_vector_return(&mut self, buffer: &Operand, bytes: usize, dest: Option<&Value>) => emit_call_store_vector_return_impl;
+        fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
+        fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
+        fn emit_call_move_f32_to_acc(&mut self) => emit_call_move_f32_to_acc_impl;
+        fn emit_call_move_f64_to_acc(&mut self) => emit_call_move_f64_to_acc_impl;
+        // globals
+        fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
+        fn emit_global_load_rip_rel(&mut self, dest: &Value, sym: &str, ty: IrType) => emit_global_load_abs_impl;
+        fn emit_global_store_rip_rel(&mut self, val: &Operand, sym: &str, ty: IrType) => emit_global_store_abs_impl;
+        fn emit_label_addr(&mut self, dest: &Value, label: &str) => emit_label_addr_impl;
+        fn emit_tls_global_addr(&mut self, dest: &Value, name: &str) => emit_tls_global_addr_impl;
+        // cast
+        fn emit_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) => emit_cast_impl;
+        fn emit_cast_instrs(&mut self, from_ty: IrType, to_ty: IrType) => emit_cast_instrs_impl;
+        // variadic
+        fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) => emit_va_arg_impl;
+        fn emit_va_start(&mut self, va_list_ptr: &Value) => emit_va_start_impl;
+        fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
+        fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize) => emit_va_arg_struct_impl;
+        // returns
+        fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) => emit_return_impl;
+        fn emit_return_i128_to_regs(&mut self) => emit_return_i128_to_regs_impl;
+        fn emit_return_f128_to_reg(&mut self) => emit_return_f128_to_reg_impl;
+        fn emit_return_f32_to_reg(&mut self) => emit_return_f32_to_reg_impl;
+        fn emit_return_f64_to_reg(&mut self) => emit_return_f64_to_reg_impl;
+        fn emit_return_int_to_reg(&mut self) => emit_return_int_to_reg_impl;
+        fn emit_get_return_f64_second(&mut self, dest: &Value) => emit_get_return_f64_second_impl;
+        fn emit_set_return_f64_second(&mut self, src: &Operand) => emit_set_return_f64_second_impl;
+        fn emit_get_return_f32_second(&mut self, dest: &Value) => emit_get_return_f32_second_impl;
+        fn emit_set_return_f32_second(&mut self, src: &Operand) => emit_set_return_f32_second_impl;
+        fn emit_get_return_f128_second(&mut self, dest: &Value) => emit_get_return_f128_second_impl;
+        fn emit_set_return_f128_second(&mut self, src: &Operand) => emit_set_return_f128_second_impl;
+        // GNU C nested functions (static chain / trampolines / non-local goto)
+        fn emit_get_static_chain(&mut self, dest: &Value) => emit_get_static_chain_impl;
+        fn emit_set_static_chain(&mut self, src: &Operand) => emit_set_static_chain_impl;
+        fn emit_init_trampoline(&mut self, buffer: &Value, chain: &Operand, func: &str) => emit_init_trampoline_impl;
+        fn emit_nonlocal_goto_save(&mut self, frame: &Value, rbp_off: i64, rsp_off: i64) => emit_nonlocal_goto_save_impl;
+        fn emit_nonlocal_goto(&mut self, chain: &Operand, up: usize, rbp_off: i64, rsp_off: i64, label: &str) => emit_nonlocal_goto_impl;
+        // atomics
+        fn emit_atomic_rmw(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_rmw_impl;
+        fn emit_atomic_cmpxchg(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, success_ordering: AtomicOrdering, failure_ordering: AtomicOrdering, returns_bool: bool) => emit_atomic_cmpxchg_impl;
+        fn emit_atomic_load(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_load_impl;
+        fn emit_atomic_store(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) => emit_atomic_store_impl;
+        fn emit_fence(&mut self, ordering: AtomicOrdering) => emit_fence_impl;
+        // i128 ops
+        fn emit_sign_extend_acc_high(&mut self) => emit_sign_extend_acc_high_impl;
+        fn emit_zero_acc_high(&mut self) => emit_zero_acc_high_impl;
+        fn emit_load_acc_pair(&mut self, op: &Operand) => emit_load_acc_pair_impl;
+        fn emit_store_acc_pair(&mut self, dest: &Value) => emit_store_acc_pair_impl;
+        fn emit_store_pair_to_slot(&mut self, slot: StackSlot) => emit_store_pair_to_slot_impl;
+        fn emit_load_pair_from_slot(&mut self, slot: StackSlot) => emit_load_pair_from_slot_impl;
+        fn emit_save_acc_pair(&mut self) => emit_save_acc_pair_impl;
+        fn emit_store_pair_indirect(&mut self) => emit_store_pair_indirect_impl;
+        fn emit_load_pair_indirect(&mut self) => emit_load_pair_indirect_impl;
+        fn emit_i128_neg(&mut self) => emit_i128_neg_impl;
+        fn emit_i128_not(&mut self) => emit_i128_not_impl;
+        fn emit_i128_to_float_call(&mut self, src: &Operand, from_signed: bool, to_ty: IrType) => emit_i128_to_float_call_impl;
+        fn emit_float_to_i128_call(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) => emit_float_to_i128_call_impl;
+        fn emit_i128_prep_binop(&mut self, lhs: &Operand, rhs: &Operand) => emit_i128_prep_binop_impl;
+        fn emit_i128_prep_shift_lhs(&mut self, lhs: &Operand) => emit_i128_prep_shift_lhs_impl;
+        fn emit_i128_add(&mut self) => emit_i128_add_impl;
+        fn emit_i128_sub(&mut self) => emit_i128_sub_impl;
+        fn emit_i128_mul(&mut self) => emit_i128_mul_impl;
+        fn emit_i128_and(&mut self) => emit_i128_and_impl;
+        fn emit_i128_or(&mut self) => emit_i128_or_impl;
+        fn emit_i128_xor(&mut self) => emit_i128_xor_impl;
+        fn emit_i128_shl(&mut self) => emit_i128_shl_impl;
+        fn emit_i128_lshr(&mut self) => emit_i128_lshr_impl;
+        fn emit_i128_ashr(&mut self) => emit_i128_ashr_impl;
+        fn emit_i128_shl_const(&mut self, amount: u32) => emit_i128_shl_const_impl;
+        fn emit_i128_lshr_const(&mut self, amount: u32) => emit_i128_lshr_const_impl;
+        fn emit_i128_ashr_const(&mut self, amount: u32) => emit_i128_ashr_const_impl;
+        fn emit_i128_divrem_call(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) => emit_i128_divrem_call_impl;
+        fn emit_i128_store_result(&mut self, dest: &Value) => emit_i128_store_result_impl;
+        fn emit_i128_cmp_eq(&mut self, is_ne: bool) => emit_i128_cmp_eq_impl;
+        fn emit_i128_cmp_ordered(&mut self, op: IrCmpOp) => emit_i128_cmp_ordered_impl;
+        fn emit_i128_cmp_store_result(&mut self, dest: &Value) => emit_i128_cmp_store_result_impl;
+    }
+
+    // ---- Segment overrides (x86-specific) ----
+
+    fn emit_seg_load(&mut self, dest: &Value, ptr: &Value, ty: IrType, seg: AddressSpace) {
+        self.operand_to_eax(&Operand::Value(*ptr));
+        self.state.emit("    movl %eax, %ecx");
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        let load_instr = self.mov_load_for_type(ty);
+        emit!(self.state, "    {} {}(%ecx), %eax", load_instr, seg_prefix);
+        self.state.reg_cache.invalidate_acc();
+        self.store_eax_to(dest);
+    }
+
+    fn emit_seg_store(&mut self, val: &Operand, ptr: &Value, ty: IrType, seg: AddressSpace) {
+        self.operand_to_eax(val);
+        self.state.emit("    movl %eax, %edx");
+        self.operand_to_eax(&Operand::Value(*ptr));
+        self.state.emit("    movl %eax, %ecx");
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        let store_instr = self.mov_store_for_type(ty);
+        let reg = match ty {
+            IrType::I8 | IrType::U8 => "%dl",
+            IrType::I16 | IrType::U16 => "%dx",
+            _ => "%edx",
+        };
+        emit!(
+            self.state,
+            "    {} {}, {}(%ecx)",
+            store_instr,
+            reg,
+            seg_prefix
+        );
+    }
+
+    fn emit_seg_load_symbol(&mut self, dest: &Value, sym: &str, ty: IrType, seg: AddressSpace) {
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        let load_instr = self.mov_load_for_type(ty);
+        // i686 uses absolute addressing (no RIP-relative)
+        emit!(self.state, "    {} {}{}, %eax", load_instr, seg_prefix, sym);
+        self.state.reg_cache.invalidate_acc();
+        self.store_eax_to(dest);
+    }
+
+    fn emit_seg_store_symbol(&mut self, val: &Operand, sym: &str, ty: IrType, seg: AddressSpace) {
+        self.operand_to_eax(val);
+        let seg_prefix = match seg {
+            AddressSpace::SegGs => "%gs:",
+            AddressSpace::SegFs => "%fs:",
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
+        };
+        let store_instr = self.mov_store_for_type(ty);
+        let reg = match ty {
+            IrType::I8 | IrType::U8 => "%al",
+            IrType::I16 | IrType::U16 => "%ax",
+            _ => "%eax",
+        };
+        emit!(
+            self.state,
+            "    {} {}, {}{}",
+            store_instr,
+            reg,
+            seg_prefix,
+            sym
+        );
+    }
+
+    fn emit_runtime_stubs(&mut self) {
+        if self.needs_pc_thunk_bx {
+            let s = &mut self.state;
+            s.emit("");
+            s.emit(".section .text.__x86.get_pc_thunk.bx,\"axG\",@progbits,__x86.get_pc_thunk.bx,comdat");
+            s.emit(".globl __x86.get_pc_thunk.bx");
+            s.emit(".hidden __x86.get_pc_thunk.bx");
+            s.emit(".type __x86.get_pc_thunk.bx, @function");
+            s.emit("__x86.get_pc_thunk.bx:");
+            begin_runtime_stub(s, "__x86.get_pc_thunk.bx");
+            s.emit("    movl (%esp), %ebx");
+            s.emit("    ret");
+            end_runtime_stub(s);
+            s.emit(".size __x86.get_pc_thunk.bx, .-__x86.get_pc_thunk.bx");
+            s.emit(".text");
+        }
+
+        if !self.state.needs_divdi3_helpers {
+            return;
+        }
+
+        // Each helper opens its own `.text.NAME` COMDAT section, so none can
+        // inherit the last function's custom section (e.g. `.init.text`, which
+        // the Linux kernel's modpost would reject .text references into; it
+        // classifies `.text.*` as text). Return to `.text` afterwards, as the
+        // thunk above does.
+        self.emit_udivdi3_stub();
+        self.emit_umoddi3_stub();
+        self.emit_divdi3_stub();
+        self.emit_moddi3_stub();
+        self.state.emit(".text");
+    }
+}
+
+// ─── 64-bit division runtime stubs for i686 ──────────────────────────────────
+//
+// On 32-bit x86, 64-bit division/modulo needs runtime helpers (libgcc's
+// __divdi3, __udivdi3, __moddi3, __umoddi3). lccc emits its own so that
+// objects link without libgcc, under COMPILER-PRIVATE names in the
+// implementation namespace -- `__lccc_divdi3` etc. -- the way GCC emits
+// `__x86.get_pc_thunk.*`: each in its own COMDAT group (one copy per link,
+// however many objects carry it; unused ones fall to --gc-sections),
+// `.globl` + `.hidden` (never exported from a shared object, never
+// interposable, and their mutual calls bind locally: a plain PC32, no PLT
+// and no %ebx = GOT requirement).
+//
+// The public libgcc names must NOT be defined here. ELF gives a linked
+// symbol the most constraining visibility of all its definitions, so a
+// hidden (weak) `__divdi3` in any object silently hides a strong one that a
+// shared object exports on purpose -- glibc i386 exports its compat
+// `__divdi3@GLIBC_2.0` exactly so (measured: the version vanished from
+// .dynsym). A default-visibility weak copy is no better: every lccc-built
+// DSO would export and interpose the helpers.
+//
+// Calling convention (cdecl, stack-based):
+//   4(%esp)  = dividend low  (A_lo)
+//   8(%esp)  = dividend high (A_hi)
+//   12(%esp) = divisor low   (B_lo)
+//   16(%esp) = divisor high  (B_hi)
+//   Return: edx:eax = 64-bit result
+
+/// Open a hand-written runtime helper as a function the CFI pass manages:
+/// the same bare boundary markers codegen puts around compiled functions,
+/// so `cfi_synth` derives the FDE from the helper's final instructions
+/// (push/pop depth, mid-function returns) exactly as GCC's own
+/// `__x86.get_pc_thunk.*` and libgcc division helpers carry one.  Without
+/// an FDE, an asynchronous unwind (profiler/backtrace from a signal
+/// handler, pthread_cancel) that lands in the helper cannot find its caller.
+/// With unwind tables off the markers are stripped again.
+fn begin_runtime_stub(s: &mut CodegenState, name: &str) {
+    s.emit(".cfi_startproc");
+    s.fn_boundary_marked.insert(name.to_string());
+}
+
+/// Open a 64-bit division helper: its own COMDAT group and `.text.NAME`
+/// section (modpost classifies `.text.*` as text), global + hidden, then the
+/// CFI-managed body (see the block comment above the stubs).
+fn open_divrem_helper(s: &mut CodegenState, name: &str) {
+    s.emit("");
+    s.emit_fmt(format_args!(
+        ".section .text.{name},\"axG\",@progbits,{name},comdat"
+    ));
+    s.emit_fmt(format_args!(".globl {name}"));
+    s.emit_fmt(format_args!(".hidden {name}"));
+    s.emit_fmt(format_args!(".type {name}, @function"));
+    s.emit_fmt(format_args!("{name}:"));
+    begin_runtime_stub(s, name);
+}
+
+/// Close a helper opened by [`begin_runtime_stub`]; must directly precede
+/// its `.size NAME, .-NAME`.
+fn end_runtime_stub(s: &mut CodegenState) {
+    s.emit(".cfi_endproc");
+}
+
+impl I686Codegen {
+    /// Emit __udivdi3: unsigned 64-bit division, returns quotient in edx:eax.
+    /// Algorithm based on compiler-rt's i386/udivdi3.S (Stephen Canon, 2008).
+    /// Uses normalized-divisor estimation with remainder-based adjustment.
+    fn emit_udivdi3_stub(&mut self) {
+        let s = &mut self.state;
+        open_divrem_helper(s, "__lccc_udivdi3");
+        s.emit("# lccc-i686-return-uses-edx");
+        // Stack: ret(0), A_lo(4), A_hi(8), B_lo(12), B_hi(16)
+        s.emit("    pushl %ebx");
+        // Stack: ebx(0), ret(4), A_lo(8), A_hi(12), B_lo(16), B_hi(20)
+        s.emit("    movl 20(%esp), %ebx"); // B_hi
+        s.emit("    bsrl %ebx, %ecx"); // ecx = i = index of leading bit of B_hi
+        s.emit("    jz .Ludiv_b_hi_zero"); // B_hi == 0 -> special case
+
+        // --- B_hi != 0: quotient fits in 32 bits ---
+        // Construct bhi = bits [1+i : 32+i] of B (top 32 bits of B, normalized).
+        //   bhi = (B_lo >> (1+i)) | (B_hi << (31-i))
+        s.emit("    movl 16(%esp), %eax"); // B_lo
+        s.emit("    shrl %cl, %eax"); // B_lo >> i
+        s.emit("    shrl %eax"); // B_lo >> (1+i)
+        s.emit("    notl %ecx"); // cl = 31-i (mod 32)
+        s.emit("    shll %cl, %ebx"); // B_hi << (31-i)
+        s.emit("    orl %eax, %ebx"); // ebx = bhi
+        s.emit("    movl 12(%esp), %edx"); // A_hi
+        s.emit("    movl 8(%esp), %eax"); // A_lo
+        s.emit("    cmpl %ebx, %edx"); // if A_hi >= bhi, need overflow path
+        s.emit("    jae .Ludiv_big_overflow");
+
+        // A_hi < bhi: divide edx:eax by bhi directly (no overflow)
+        s.emit("    divl %ebx"); // eax = qs
+        s.emit("    pushl %edi");
+        // Stack: edi(0), ebx(4), ret(8), A_lo(12), A_hi(16), B_lo(20), B_hi(24)
+        s.emit("    notl %ecx"); // cl = i again
+        s.emit("    shrl %eax");
+        s.emit("    shrl %cl, %eax"); // q = qs >> (1+i)
+        s.emit("    movl %eax, %edi"); // edi = q
+        // Verify: compute a - q*b, adjust if negative
+        s.emit("    mull 20(%esp)"); // edx:eax = q * B_lo
+        s.emit("    movl 12(%esp), %ebx");
+        s.emit("    movl 16(%esp), %ecx"); // ecx:ebx = a
+        s.emit("    subl %eax, %ebx");
+        s.emit("    sbbl %edx, %ecx"); // ecx:ebx = a - q*B_lo
+        s.emit("    movl 24(%esp), %eax"); // B_hi
+        s.emit("    imull %edi, %eax"); // q * B_hi (low 32 bits)
+        s.emit("    subl %eax, %ecx"); // ecx:ebx = a - q*b
+        s.emit("    sbbl $0, %edi"); // if remainder was negative, decrement q
+        s.emit("    xorl %edx, %edx");
+        s.emit("    movl %edi, %eax");
+        s.emit("    popl %edi");
+        s.emit("    popl %ebx");
+        s.emit("    ret");
+
+        // A_hi >= bhi: subtract bhi first to avoid divl overflow
+        s.emit(".Ludiv_big_overflow:");
+        s.emit("    subl %ebx, %edx"); // edx = A_hi - bhi
+        s.emit("    divl %ebx"); // eax = qs (for quotient 1:qs)
+        s.emit("    pushl %edi");
+        s.emit("    notl %ecx"); // cl = i
+        s.emit("    shrl %eax");
+        s.emit("    orl $0x80000000, %eax"); // set high bit (the '1' prefix)
+        s.emit("    shrl %cl, %eax"); // q = (1:qs) >> (1+i)
+        s.emit("    movl %eax, %edi");
+        s.emit("    mull 20(%esp)"); // q * B_lo
+        s.emit("    movl 12(%esp), %ebx");
+        s.emit("    movl 16(%esp), %ecx");
+        s.emit("    subl %eax, %ebx");
+        s.emit("    sbbl %edx, %ecx");
+        s.emit("    movl 24(%esp), %eax");
+        s.emit("    imull %edi, %eax");
+        s.emit("    subl %eax, %ecx");
+        s.emit("    sbbl $0, %edi");
+        s.emit("    xorl %edx, %edx");
+        s.emit("    movl %edi, %eax");
+        s.emit("    popl %edi");
+        s.emit("    popl %ebx");
+        s.emit("    ret");
+
+        // --- B_hi == 0: two-step divide ---
+        s.emit(".Ludiv_b_hi_zero:");
+        s.emit("    movl 12(%esp), %eax"); // A_hi
+        s.emit("    movl 16(%esp), %ecx"); // B_lo
+        s.emit("    xorl %edx, %edx");
+        s.emit("    divl %ecx"); // eax = Q_hi, edx = rem
+        s.emit("    movl %eax, %ebx"); // save Q_hi
+        s.emit("    movl 8(%esp), %eax"); // A_lo
+        s.emit("    divl %ecx"); // eax = Q_lo
+        s.emit("    movl %ebx, %edx"); // edx = Q_hi
+        s.emit("    popl %ebx");
+        s.emit("    ret");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_udivdi3, .-__lccc_udivdi3");
+    }
+
+    /// Emit __umoddi3: unsigned 64-bit modulo, returns remainder in edx:eax.
+    /// Computes a % b = a - (a / b) * b, delegating division to __udivdi3.
+    fn emit_umoddi3_stub(&mut self) {
+        let s = &mut self.state;
+        open_divrem_helper(s, "__lccc_umoddi3");
+        s.emit("# lccc-i686-return-uses-edx");
+        // Stack: ret(0), A_lo(4), A_hi(8), B_lo(12), B_hi(16)
+        s.emit("    pushl %ebx");
+        s.emit("    pushl %esi");
+        s.emit("    pushl %edi");
+        s.emit("    pushl %ebp");
+        // Stack: ebp(0), edi(4), esi(8), ebx(12), ret(16), A_lo(20), A_hi(24), B_lo(28), B_hi(32)
+
+        // Call __udivdi3(A, B) to get quotient
+        s.emit("    pushl 32(%esp)"); // B_hi
+        s.emit("    pushl 32(%esp)"); // B_lo (28+4=32 after push)
+        s.emit("    pushl 32(%esp)"); // A_hi (24+8=32 after two pushes)
+        s.emit("    pushl 32(%esp)"); // A_lo (20+12=32 after three pushes)
+        s.emit("    call __lccc_udivdi3");
+        s.emit("    addl $16, %esp");
+        // edx:eax = quotient (Q_hi:Q_lo)
+
+        // Compute q * B (64-bit), result in ecx:ebx
+        // q * B = Q_lo * B_lo + (Q_lo * B_hi + Q_hi * B_lo) << 32
+        // We only need the low 64 bits.
+        s.emit("    movl %eax, %ebx"); // save Q_lo
+        s.emit("    movl %edx, %ecx"); // save Q_hi
+        s.emit("    imull 28(%esp), %ecx"); // ecx = Q_hi * B_lo (low 32)
+        s.emit("    movl 32(%esp), %ebp"); // B_hi
+        s.emit("    imull %ebx, %ebp"); // ebp = Q_lo * B_hi (low 32)
+        s.emit("    addl %ebp, %ecx"); // ecx = cross terms sum
+        s.emit("    movl %ebx, %eax"); // eax = Q_lo
+        s.emit("    mull 28(%esp)"); // edx:eax = Q_lo * B_lo
+        s.emit("    addl %ecx, %edx"); // edx:eax = q * B (low 64 bits)
+
+        // remainder = A - q*B
+        s.emit("    movl 20(%esp), %ebx"); // A_lo
+        s.emit("    movl 24(%esp), %ecx"); // A_hi
+        s.emit("    subl %eax, %ebx");
+        s.emit("    sbbl %edx, %ecx");
+        s.emit("    movl %ebx, %eax");
+        s.emit("    movl %ecx, %edx");
+        s.emit("    popl %ebp");
+        s.emit("    popl %edi");
+        s.emit("    popl %esi");
+        s.emit("    popl %ebx");
+        s.emit("    ret");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_umoddi3, .-__lccc_umoddi3");
+    }
+
+    /// Emit __divdi3: signed 64-bit division.
+    /// Negates operands to unsigned, calls __udivdi3, negates result if needed.
+    fn emit_divdi3_stub(&mut self) {
+        let s = &mut self.state;
+        open_divrem_helper(s, "__lccc_divdi3");
+        s.emit("# lccc-i686-return-uses-edx");
+        // Stack: ret, A_lo(4), A_hi(8), B_lo(12), B_hi(16)
+        s.emit("    pushl %ebx");
+        s.emit("    pushl %esi");
+        s.emit("    pushl %edi");
+        // Stack: edi, esi, ebx, ret, A_lo(16), A_hi(20), B_lo(24), B_hi(28)
+        s.emit("    movl 20(%esp), %edx"); // A_hi
+        s.emit("    movl 28(%esp), %ecx"); // B_hi
+        s.emit("    movl %edx, %edi"); // save A_hi for sign
+        s.emit("    xorl %ecx, %edi"); // edi = sign of result (bit 31)
+        s.emit("    movl 16(%esp), %eax"); // A_lo
+        s.emit("    movl 24(%esp), %ebx"); // B_lo
+        // Negate A if negative
+        s.emit("    testl %edx, %edx");
+        s.emit("    jns .Ldiv_a_pos");
+        s.emit("    negl %eax");
+        s.emit("    adcl $0, %edx");
+        s.emit("    negl %edx");
+        s.emit(".Ldiv_a_pos:");
+        // Negate B if negative
+        s.emit("    testl %ecx, %ecx");
+        s.emit("    jns .Ldiv_b_pos");
+        s.emit("    negl %ebx");
+        s.emit("    adcl $0, %ecx");
+        s.emit("    negl %ecx");
+        s.emit(".Ldiv_b_pos:");
+        // Push unsigned args and call __udivdi3
+        s.emit("    pushl %ecx"); // B_hi (unsigned)
+        s.emit("    pushl %ebx"); // B_lo (unsigned)
+        s.emit("    pushl %edx"); // A_hi (unsigned)
+        s.emit("    pushl %eax"); // A_lo (unsigned)
+        s.emit("    call __lccc_udivdi3");
+        s.emit("    addl $16, %esp");
+        // Result in edx:eax. Negate if sign differs.
+        s.emit("    testl %edi, %edi");
+        s.emit("    jns .Ldiv_done");
+        s.emit("    negl %eax");
+        s.emit("    adcl $0, %edx");
+        s.emit("    negl %edx");
+        s.emit(".Ldiv_done:");
+        s.emit("    popl %edi");
+        s.emit("    popl %esi");
+        s.emit("    popl %ebx");
+        s.emit("    ret");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_divdi3, .-__lccc_divdi3");
+    }
+
+    /// Emit __moddi3: signed 64-bit modulo.
+    /// Negates operands to unsigned, calls __umoddi3, negates result if dividend was negative.
+    fn emit_moddi3_stub(&mut self) {
+        let s = &mut self.state;
+        open_divrem_helper(s, "__lccc_moddi3");
+        s.emit("# lccc-i686-return-uses-edx");
+        // Stack: ret, A_lo(4), A_hi(8), B_lo(12), B_hi(16)
+        s.emit("    pushl %ebx");
+        s.emit("    pushl %esi");
+        s.emit("    pushl %edi");
+        // Stack: edi, esi, ebx, ret, A_lo(16), A_hi(20), B_lo(24), B_hi(28)
+        s.emit("    movl 20(%esp), %edx"); // A_hi
+        s.emit("    movl 28(%esp), %ecx"); // B_hi
+        s.emit("    movl %edx, %edi"); // save A_hi sign (remainder sign = dividend sign)
+        s.emit("    movl 16(%esp), %eax"); // A_lo
+        s.emit("    movl 24(%esp), %ebx"); // B_lo
+        // Negate A if negative
+        s.emit("    testl %edx, %edx");
+        s.emit("    jns .Lmod_a_pos");
+        s.emit("    negl %eax");
+        s.emit("    adcl $0, %edx");
+        s.emit("    negl %edx");
+        s.emit(".Lmod_a_pos:");
+        // Negate B if negative
+        s.emit("    testl %ecx, %ecx");
+        s.emit("    jns .Lmod_b_pos");
+        s.emit("    negl %ebx");
+        s.emit("    adcl $0, %ecx");
+        s.emit("    negl %ecx");
+        s.emit(".Lmod_b_pos:");
+        // Push unsigned args and call __umoddi3
+        s.emit("    pushl %ecx");
+        s.emit("    pushl %ebx");
+        s.emit("    pushl %edx");
+        s.emit("    pushl %eax");
+        s.emit("    call __lccc_umoddi3");
+        s.emit("    addl $16, %esp");
+        // Negate result if dividend was negative
+        s.emit("    testl %edi, %edi");
+        s.emit("    jns .Lmod_done");
+        s.emit("    negl %eax");
+        s.emit("    adcl $0, %edx");
+        s.emit("    negl %edx");
+        s.emit(".Lmod_done:");
+        s.emit("    popl %edi");
+        s.emit("    popl %esi");
+        s.emit("    popl %ebx");
+        s.emit("    ret");
+        end_runtime_stub(s);
+        s.emit(".size __lccc_moddi3, .-__lccc_moddi3");
+    }
+}
+
+/// Homes in which an i686 register-base constant-offset fold is sound:
+/// %ebx/%esi/%edi/%ebp — callee-saved, never touched by the %eax:%edx
+/// accumulator staging or the %ecx address scratch the fold paths use.
+/// Shared by `const_offset_fold_reg_base_ok` and the allocator's
+/// fold-deferral pool.
+pub(crate) fn i686_const_fold_base_reg(phys: crate::backend::regalloc::PhysReg) -> bool {
+    matches!(phys.0, 0..=3)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_scalars_are_the_eight_byte_moves() {
+        for ty in [IrType::I64, IrType::U64, IrType::F64, IrType::D64] {
+            assert!(is_pair_scalar(ty), "{ty:?} is carried as a pair");
+            assert_eq!(I686Codegen::stack_scalar_arg_size(ty), 8, "{ty:?}");
+        }
+        for ty in [
+            IrType::I32,
+            IrType::U32,
+            IrType::F32,
+            IrType::D32,
+            IrType::Ptr,
+            IrType::U8,
+        ] {
+            assert!(!is_pair_scalar(ty), "{ty:?} is a single word");
+            assert_eq!(I686Codegen::stack_scalar_arg_size(ty), 4, "{ty:?}");
+        }
+        // Wider carriers have their own classes (F128Stack, I128Stack).
+        // (`_Decimal128` has no IR variant: it travels as U128.)
+        for ty in [IrType::F128, IrType::I128, IrType::U128] {
+            assert!(!is_pair_scalar(ty), "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn pair_constants_load_both_halves_exactly() {
+        let cases: &[(&str, IrConst, Option<u64>)] = &[
+            (
+                "D64 1.5DD keeps its BID high word",
+                IrConst::D64(0x31a0_0000_0000_000f),
+                Some(0x31a0_0000_0000_000f),
+            ),
+            ("D64(0)", IrConst::D64(0), Some(0)),
+            ("I64(-2) sign-extends", IrConst::I64(-2), Some(u64::MAX - 1)),
+            ("I32(-1) sign-extends", IrConst::I32(-1), Some(u64::MAX)),
+            (
+                "I8(-128) sign-extends",
+                IrConst::I8(-128),
+                Some((-128i64) as u64),
+            ),
+            ("I16(0x7fff)", IrConst::I16(0x7fff), Some(0x7fff)),
+            (
+                "I128 low half",
+                IrConst::I128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+                Some(0x5555_6666_7777_8888),
+            ),
+            ("F64 bits", IrConst::F64(1.5), Some(0x3ff8_0000_0000_0000)),
+            (
+                "F64 -0.0 bits",
+                IrConst::F64(-0.0),
+                Some(0x8000_0000_0000_0000),
+            ),
+            ("Zero", IrConst::Zero, Some(0)),
+            ("F32 has no high word", IrConst::F32(1.5), None),
+            ("D32 has no high word", IrConst::D32(0x3280_0000), None),
+        ];
+        for (what, c, want) in cases {
+            assert_eq!(pair_const_bits(c), *want, "{what}");
+        }
+    }
+
+    /// Native vectors take %xmm/%ymm registers as in cdecl and never touch
+    /// the ECX/EDX chain. Expected layouts are GCC 16.2 `-m32 -mavx2`
+    /// output for the same prototypes.
+    #[test]
+    fn fastcall_native_vectors_use_sse_registers_like_gcc() {
+        use crate::common::types::EightbyteClass::{Sse, SseUp};
+        use I686FastcallSlot::{Reg, Stack, Vector};
+        let cg = I686Codegen::new();
+        let v16 = vec![Sse, SseUp];
+        let v32 = vec![Sse, SseUp, SseUp, SseUp];
+        let int = Vec::new();
+        let ptr = IrType::Ptr;
+        let i32t = IrType::I32;
+
+        // t1(v2 a, int b): a in %xmm0, b in %ecx.
+        let (slots, bytes) = cg.fastcall_layout_with_abi(
+            &[ptr, i32t],
+            &[Some(16), None],
+            &[false, false],
+            false,
+            &[Some(16), None],
+            &[v16.clone(), int.clone()],
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Vector {
+                    reg_idx: 0,
+                    width: VectorRegWidth::Xmm
+                },
+                Reg(0)
+            ]
+        );
+        assert_eq!(bytes, 0);
+
+        // t2(int, v2 x, y, z, w, int, int): three vectors in registers, the
+        // fourth on the stack first, and the chain still gives %edx.
+        let tys = [i32t, ptr, ptr, ptr, ptr, i32t, i32t];
+        let sizes = [None, Some(16), Some(16), Some(16), Some(16), None, None];
+        let classes = [
+            int.clone(),
+            v16.clone(),
+            v16.clone(),
+            v16.clone(),
+            v16.clone(),
+            int.clone(),
+            int.clone(),
+        ];
+        let (slots, bytes) =
+            cg.fastcall_layout_with_abi(&tys, &sizes, &[false; 7], false, &sizes, &classes);
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Vector {
+                    reg_idx: 0,
+                    width: VectorRegWidth::Xmm
+                },
+                Vector {
+                    reg_idx: 1,
+                    width: VectorRegWidth::Xmm
+                },
+                Vector {
+                    reg_idx: 2,
+                    width: VectorRegWidth::Xmm
+                },
+                Stack {
+                    offset: 0,
+                    size: 16
+                },
+                Reg(1),
+                Stack {
+                    offset: 16,
+                    size: 4
+                },
+            ]
+        );
+        assert_eq!(bytes, 20);
+
+        // callee(int a, v4 v, int b): %ecx, %ymm0, %edx; nothing to pop.
+        let (slots, bytes) = cg.fastcall_layout_with_abi(
+            &[i32t, ptr, i32t],
+            &[None, Some(32), None],
+            &[false; 3],
+            false,
+            &[None, Some(32), None],
+            &[int.clone(), v32, int.clone()],
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Vector {
+                    reg_idx: 0,
+                    width: VectorRegWidth::Ymm
+                },
+                Reg(1)
+            ]
+        );
+        assert_eq!(bytes, 0);
+
+        // Variadic: vectors stay on the stack, as in cdecl.
+        let (slots, _) =
+            cg.fastcall_layout_with_abi(&[ptr], &[Some(16)], &[false], true, &[Some(16)], &[v16]);
+        assert_eq!(
+            slots,
+            vec![Stack {
+                offset: 0,
+                size: 16
+            }]
+        );
+    }
+
+    #[test]
+    fn fastcall_zero_aggregate_keeps_register_chain() {
+        use I686FastcallSlot::{Reg, Stack};
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[IrType::I32, IrType::Ptr, IrType::I32, IrType::I32],
+            &[None, Some(0), None, None],
+            &[],
+            false,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Stack { offset: 0, size: 0 },
+                Reg(1),
+                Stack { offset: 0, size: 4 }
+            ]
+        );
+        assert_eq!(bytes, 4);
+    }
+
+    #[test]
+    fn fastcall_zero_aggregate_cannot_reopen_broken_chain() {
+        use I686FastcallSlot::{Reg, Stack};
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[IrType::I32, IrType::Ptr, IrType::Ptr, IrType::I32],
+            &[None, Some(4), Some(0), None],
+            &[],
+            false,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Stack { offset: 0, size: 4 },
+                Stack { offset: 4, size: 0 },
+                Stack { offset: 4, size: 4 }
+            ]
+        );
+        assert_eq!(bytes, 8);
+    }
+
+    #[test]
+    fn fastcall_extvector_stack_lanes_preserve_register_chain() {
+        use I686FastcallSlot::{Reg, Stack};
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+            ],
+            &[None, None, None, None, None],
+            &[false, true, true, true, false],
+            false,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Stack { offset: 0, size: 4 },
+                Stack { offset: 4, size: 4 },
+                Stack { offset: 8, size: 4 },
+                Reg(1),
+            ]
+        );
+        assert_eq!(bytes, 12);
+    }
+
+    #[test]
+    fn fastcall_wide_gnu_vector_uses_natural_stack_padding() {
+        use I686FastcallSlot::Stack;
+        let cg = I686Codegen::new();
+        let classes = vec![
+            Vec::new(),
+            vec![
+                crate::common::types::EightbyteClass::Memory,
+                crate::common::types::EightbyteClass::NoClass,
+            ],
+            Vec::new(),
+        ];
+        let (slots, bytes) = cg.fastcall_layout_with_abi(
+            &[IrType::I32, IrType::Ptr, IrType::I32],
+            &[None, Some(32), None],
+            &[],
+            true,
+            &[None, Some(32), None],
+            &classes,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Stack { offset: 0, size: 4 },
+                Stack {
+                    offset: 32,
+                    size: 32
+                },
+                Stack {
+                    offset: 64,
+                    size: 4
+                },
+            ]
+        );
+        assert_eq!(bytes, 68);
+
+        // The same size/alignment on an ordinary record is not a vector
+        // marker and must retain the four-byte fastcall layout.
+        let (record_slots, record_bytes) = cg.fastcall_layout_with_abi(
+            &[IrType::I32, IrType::Ptr, IrType::I32],
+            &[None, Some(32), None],
+            &[],
+            true,
+            &[None, Some(32), None],
+            &[],
+        );
+        assert_eq!(
+            record_slots,
+            vec![
+                Stack { offset: 0, size: 4 },
+                Stack {
+                    offset: 4,
+                    size: 32
+                },
+                Stack {
+                    offset: 36,
+                    size: 4
+                },
+            ]
+        );
+        assert_eq!(record_bytes, 40);
+    }
+
+    #[test]
+    fn fastcall_variadic_zero_aggregate_stays_stack_only() {
+        use I686FastcallSlot::Stack;
+        let cg = I686Codegen::new();
+        let (slots, bytes) = cg.fastcall_layout(
+            &[IrType::I32, IrType::Ptr, IrType::I32],
+            &[None, Some(0), None],
+            &[],
+            true,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Stack { offset: 0, size: 4 },
+                Stack { offset: 4, size: 0 },
+                Stack { offset: 4, size: 4 }
+            ]
+        );
+        assert_eq!(bytes, 8);
+    }
+
+    /// One row per `IrConst` arm: the constant, the 32 bits a register
+    /// materialization of it produces (and therefore the 32 bits a direct
+    /// `movl $imm, N(%esp)` must store), and whether that arm's zero form is
+    /// the 2-byte `xorl %eax, %eax`.
+    fn arms() -> Vec<(&'static str, IrConst, i32, bool)> {
+        vec![
+            ("I8(-1) sign-extends", IrConst::I8(-1), -1, false),
+            ("I8(0)", IrConst::I8(0), 0, false),
+            ("I8(127)", IrConst::I8(127), 127, false),
+            ("I16(-2) sign-extends", IrConst::I16(-2), -2, false),
+            ("I16(0)", IrConst::I16(0), 0, false),
+            ("I32(1)", IrConst::I32(1), 1, true),
+            ("I32(0)", IrConst::I32(0), 0, true),
+            ("I32(i32::MIN)", IrConst::I32(i32::MIN), i32::MIN, true),
+            ("I32(i32::MAX)", IrConst::I32(i32::MAX), i32::MAX, true),
+            (
+                "I64 truncates to its low half",
+                IrConst::I64(0x0123_4567_89ab_cdef),
+                0x89ab_cdefu32 as i32,
+                true,
+            ),
+            ("I64(-1)", IrConst::I64(-1), -1, true),
+            (
+                "I64(i64::MIN) has a zero low half",
+                IrConst::I64(i64::MIN),
+                0,
+                true,
+            ),
+            (
+                "I128 truncates to its low half",
+                IrConst::I128(0x0123_4567_89ab_cdef_0000_0000_0000_0001),
+                1,
+                false,
+            ),
+            ("I128(0)", IrConst::I128(0), 0, false),
+            (
+                "F32 passes the IEEE bit pattern",
+                IrConst::F32(1.5),
+                1.5f32.to_bits() as i32,
+                false,
+            ),
+            (
+                "F32(-0.0) is the sign bit, not zero",
+                IrConst::F32(-0.0),
+                i32::MIN,
+                false,
+            ),
+            ("F32(0.0)", IrConst::F32(0.0), 0, false),
+            (
+                "F64 passes the LOW half of its bit pattern",
+                IrConst::F64(f64::from_bits(0x3ff8_0000_dead_beef)),
+                0xdead_beefu32 as i32,
+                false,
+            ),
+            ("F64(1.5) has a zero low half", IrConst::F64(1.5), 0, false),
+            ("F64(-0.0) low half is zero", IrConst::F64(-0.0), 0, false),
+            (
+                "D32 passes the BID pattern",
+                IrConst::D32(0xdead_beef),
+                0xdead_beefu32 as i32,
+                false,
+            ),
+            ("D32(0)", IrConst::D32(0), 0, false),
+            (
+                "D64 passes the BID pattern's low half",
+                IrConst::D64(0x1234_5678_9abc_def0),
+                0x9abc_def0u32 as i32,
+                false,
+            ),
+            ("D64(0)", IrConst::D64(0), 0, false),
+            (
+                "LongDouble passes its leading four bytes",
+                IrConst::LongDouble(1.5, ld_bytes()),
+                0xffc0_0000u32 as i32,
+                false,
+            ),
+            (
+                "LongDouble(0)",
+                IrConst::LongDouble(0.0, [0u8; 16]),
+                0,
+                false,
+            ),
+            ("Zero", IrConst::Zero, 0, true),
+        ]
+    }
+
+    /// x87 80-bit 1.5: sign/exponent 0x3fff, integer bit set, so the leading
+    /// four little-endian bytes are 00 00 c0 ff.
+    fn ld_bytes() -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&[0x00, 0x00, 0xc0, 0xff]);
+        b[8..10].copy_from_slice(&0x3fffu16.to_le_bytes());
+        b
+    }
+
+    /// Encoding sizes, i686, AT&T. `disp8` and `disp32` are the two forms of
+    /// the outgoing slot's displacement; both rows of the arithmetic differ by
+    /// the same +3 on each side, so the comparison is displacement-independent.
+    const MOV_IMM_TO_EAX: usize = 5; // movl $imm32, %eax
+    const XOR_EAX: usize = 2; // xorl %eax, %eax
+    const STORE_EAX_DISP8: usize = 4; // movl %eax, d8(%esp)
+    const STORE_EAX_DISP32: usize = 7; // movl %eax, d32(%esp)
+    const STORE_IMM_DISP8: usize = 8; // movl $imm32, d8(%esp)
+    const STORE_IMM_DISP32: usize = 11; // movl $imm32, d32(%esp)
+
+    #[test]
+    fn const_stack_arg_imm_matches_the_per_arm_convention() {
+        for (name, c, want_imm, _) in arms() {
+            assert_eq!(const_stack_arg_imm(&c), want_imm, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_the_arms_that_special_case_zero_use_xorl() {
+        for (name, c, _, want_xorl) in arms() {
+            assert_eq!(const_zero_uses_xorl(&c), want_xorl, "{name}");
+        }
+    }
+
+    /// The fold predicate must be *exactly* "the folded encoding is smaller",
+    /// evaluated with the byte counts above rather than asserted from a
+    /// comment.  If either the predicate or an encoding size changes without
+    /// the other, this fails.
+    ///
+    /// The materialization cost is the POST-PEEPHOLE cost: the i686 peephole
+    /// rewrites `movl $0, %reg` to `xorl %reg, %reg`, so a zero costs 2 bytes
+    /// in every arm, not only in the three that emit `xorl` here.  Modelling
+    /// the emission-time cost instead makes the predicate look per-arm and
+    /// grows the code by 2 bytes at every zero site in the other arms.
+    #[test]
+    fn the_fold_predicate_is_the_encoding_arithmetic() {
+        for (name, _c, imm, _) in arms() {
+            let materialize = if imm == 0 { XOR_EAX } else { MOV_IMM_TO_EAX };
+            let historical_disp8 = materialize + STORE_EAX_DISP8;
+            let historical_disp32 = materialize + STORE_EAX_DISP32;
+            let want = historical_disp8 > STORE_IMM_DISP8;
+            assert_eq!(const_stack_arg_fold_wins(imm), want, "{name}");
+            // The 32-bit displacement form must not change the answer.
+            assert_eq!(
+                historical_disp32 > STORE_IMM_DISP32,
+                want,
+                "{name}: disp32 disagrees with disp8"
+            );
+        }
+    }
+
+    /// No zero folds, in ANY arm -- including the arms whose emission-time form
+    /// is `movl $0, %eax` (5B), where a naive byte count says the 8-byte folded
+    /// store wins.  It does not, because the peephole turns that `movl $0` into
+    /// a 2-byte `xorl` before the assembler sees it.
+    ///
+    /// This is also the tripwire for that premise: if the `movl $0, %reg ->
+    /// xorl %reg, %reg` normalization is ever removed from `peephole.rs`, the
+    /// arms listed in the second loop genuinely become 9-byte sequences and the
+    /// fold predicate must be re-derived (and this test rewritten) rather than
+    /// left refusing a win.
+    #[test]
+    fn no_zero_folds_in_any_arm() {
+        // Arms that materialize zero with `xorl` at emission time.
+        for c in [IrConst::I32(0), IrConst::I64(0), IrConst::Zero] {
+            assert!(const_zero_uses_xorl(&c), "{c:?}");
+            assert!(!const_stack_arg_fold_wins(0), "{c:?}");
+        }
+        // Arms that emit `movl $0, %eax` at emission time and are normalized to
+        // `xorl` downstream: same verdict, different reason.
+        for c in [
+            IrConst::I8(0),
+            IrConst::I16(0),
+            IrConst::I128(0),
+            IrConst::D32(0),
+            IrConst::D64(0),
+            IrConst::F32(0.0),
+            IrConst::F64(0.0),
+            IrConst::LongDouble(0.0, [0u8; 16]),
+        ] {
+            assert!(!const_zero_uses_xorl(&c), "{c:?}");
+            assert!(
+                !const_stack_arg_fold_wins(const_stack_arg_imm(&c)),
+                "{c:?} folds, which costs 2 bytes per site"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_zero_is_a_nonzero_immediate_and_stores_its_sign_bit() {
+        // -0.0 must not be mistaken for a zero immediate: its bit pattern is
+        // 0x80000000, which is what the register path materializes and
+        // therefore what the direct store must write.
+        assert_eq!(const_stack_arg_imm(&IrConst::F32(-0.0)), i32::MIN);
+        assert!(const_stack_arg_fold_wins(i32::MIN));
+        // The f64 arm keeps only the low half, so -0.0 as an f64 argument does
+        // materialize zero -- and a zero never folds, whichever arm it came
+        // from.  Note the asymmetry with the f32 case above: whether -0.0 is a
+        // "zero immediate" depends on how many of its bits the arm keeps.
+        assert_eq!(const_stack_arg_imm(&IrConst::F64(-0.0)), 0);
+        assert!(!const_stack_arg_fold_wins(0));
+    }
+
+    #[test]
+    fn every_nonzero_immediate_folds_in_every_arm() {
+        for (name, _c, imm, _) in arms() {
+            if imm != 0 {
+                assert!(const_stack_arg_fold_wins(imm), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn sse_copy_permission_follows_final_target_gates() {
+        let mut cg = I686Codegen::new();
+        let mut opts = crate::backend::CodegenOptions::default();
+        cg.apply_options(&opts);
+        assert!(cg.sse_enabled);
+        let default_lines = copy_lines_with(&opts, 32);
+        assert!(
+            default_lines[0].contains("xmm"),
+            "default TU must copy via SSE"
+        );
+        opts.no_sse = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse_enabled);
+        let no_sse_lines = copy_lines_with(&opts, 32);
+        assert!(no_sse_lines.iter().all(|l| !l.contains("xmm")), "-mno-sse");
+        opts.no_sse = false;
+        opts.general_regs_only = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse_enabled);
+        let gp_only_lines = copy_lines_with(&opts, 32);
+        assert!(gp_only_lines.iter().all(|l| !l.contains("xmm")), "gp-only");
+    }
+
+    /// A codegen for `Memcpy` tests: value 1 is the destination, 2 the source.
+    fn memcpy_cg(sse: bool, size_opt: bool, setup: impl FnOnce(&mut I686Codegen)) -> I686Codegen {
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.no_sse = !sse;
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        cg.optimize_for_size = size_opt;
+        setup(&mut cg);
+        cg
+    }
+
+    fn memcpy_lines(cg: &mut I686Codegen, size: usize) -> Vec<String> {
+        cg.emit_memcpy(&Value(1), &Value(2), size);
+        emitted(cg)
+    }
+
+    /// Pointer value `v` spilled in a frame slot (`Indirect`).
+    fn ptr_in_slot(cg: &mut I686Codegen, v: u32, slot: i64) {
+        cg.state.value_locations.insert(v, StackSlot(slot));
+    }
+
+    /// Pointer value `v` in GPR `reg` (`Indirect` + register home).
+    fn ptr_in_reg(cg: &mut I686Codegen, v: u32, reg: u8) {
+        cg.state
+            .value_locations
+            .insert(v, StackSlot(-200 - 4 * v as i64));
+        cg.reg_assignments.insert(v, PhysReg(reg));
+    }
+
+    /// Alloca `v` at frame slot `slot` (`Direct`).
+    fn frame_object(cg: &mut I686Codegen, v: u32, slot: i64) {
+        cg.state.value_locations.insert(v, StackSlot(slot));
+        cg.state.alloca_values.insert(v);
+    }
+
+    #[test]
+    fn alloca_operand_uses_frame_address_instead_of_register_home() {
+        let mut cg = I686Codegen::new();
+        frame_object(&mut cg, 7, -64);
+        cg.reg_assignments.insert(7, PhysReg(5));
+
+        cg.operand_to_eax(&Operand::Value(Value(7)));
+
+        assert_eq!(
+            emitted(&cg),
+            [format!("leal {}, %eax", cg.slot_ref(StackSlot(-64)))]
+        );
+    }
+
+    /// Frame object to frame object: addressed as frame operands, no address
+    /// register, no callee-saved register borrowed, no `rep`.
+    #[test]
+    fn memcpy_between_frame_objects_needs_no_address_register() {
+        let mut cg = memcpy_cg(true, false, |cg| {
+            frame_object(cg, 1, -64);
+            frame_object(cg, 2, -32);
+        });
+        let lines = memcpy_lines(&mut cg, 24);
+        let s = |slot, off| cg.slot_ref_offset(StackSlot(slot), off);
+        assert_eq!(
+            lines,
+            vec![
+                format!("movups {}, %xmm0", s(-32, 0)),
+                format!("movups %xmm0, {}", s(-64, 0)),
+                format!("movups {}, %xmm0", s(-32, 8)),
+                format!("movups %xmm0, {}", s(-64, 8)),
+            ]
+        );
+    }
+
+    /// Pointers spilled in slots go to `%ecx` (source) and `%edx` (dest).
+    #[test]
+    fn memcpy_materializes_spilled_pointers_into_ecx_and_edx() {
+        let mut cg = memcpy_cg(false, false, |cg| {
+            ptr_in_slot(cg, 1, -8);
+            ptr_in_slot(cg, 2, -12);
+        });
+        let lines = memcpy_lines(&mut cg, 6);
+        let s = |slot| cg.slot_ref(StackSlot(slot));
+        assert_eq!(
+            lines,
+            vec![
+                format!("movl {}, %ecx", s(-12)),
+                format!("movl {}, %edx", s(-8)),
+                "movl 0(%ecx), %eax".to_string(),
+                "movl %eax, 0(%edx)".to_string(),
+                "movzwl 4(%ecx), %eax".to_string(),
+                "movw %ax, 4(%edx)".to_string(),
+            ]
+        );
+    }
+
+    /// A register-held pointer is used in place; a materialized endpoint
+    /// never targets the register the other endpoint uses as its base, in
+    /// either direction, and two register endpoints (even crossed) move
+    /// nothing.
+    #[test]
+    fn memcpy_register_endpoints_never_clobber_each_other() {
+        // Source in %edx: the spilled destination must avoid %edx.
+        let mut cg = memcpy_cg(true, false, |cg| {
+            ptr_in_slot(cg, 1, -8);
+            ptr_in_reg(cg, 2, 5);
+        });
+        let lines = memcpy_lines(&mut cg, 16);
+        assert_eq!(
+            lines[0],
+            format!("movl {}, %ecx", cg.slot_ref(StackSlot(-8)))
+        );
+        assert_eq!(
+            &lines[1..],
+            ["movups 0(%edx), %xmm0", "movups %xmm0, 0(%ecx)"]
+        );
+        // Destination in %ecx: the spilled source must avoid %ecx.
+        let mut cg = memcpy_cg(true, false, |cg| {
+            ptr_in_reg(cg, 1, 4);
+            ptr_in_slot(cg, 2, -12);
+        });
+        let lines = memcpy_lines(&mut cg, 16);
+        assert_eq!(
+            lines[0],
+            format!("movl {}, %edx", cg.slot_ref(StackSlot(-12)))
+        );
+        assert_eq!(
+            &lines[1..],
+            ["movups 0(%edx), %xmm0", "movups %xmm0, 0(%ecx)"]
+        );
+        // Crossed registers (source %edx, destination %ecx) and callee-saved
+        // homes: no moves at all.
+        for (d, s, dn, sn) in [(4u8, 5u8, "%ecx", "%edx"), (0, 1, "%ebx", "%esi")] {
+            let mut cg = memcpy_cg(true, false, |cg| {
+                ptr_in_reg(cg, 1, d);
+                ptr_in_reg(cg, 2, s);
+            });
+            let lines = memcpy_lines(&mut cg, 16);
+            assert_eq!(
+                lines,
+                [
+                    format!("movups 0({sn}), %xmm0"),
+                    format!("movups %xmm0, 0({dn})")
+                ]
+            );
+        }
+    }
+
+    /// A pointer homed in %eax is moved out before %eax carries data.
+    #[test]
+    fn memcpy_moves_an_eax_pointer_out_before_the_scalar_copy() {
+        let mut cg = memcpy_cg(false, false, |cg| {
+            ptr_in_slot(cg, 1, -8);
+            ptr_in_reg(cg, 2, 6);
+        });
+        let lines = memcpy_lines(&mut cg, 8);
+        assert_eq!(lines[0], "movl %eax, %ecx");
+        assert_eq!(
+            lines[1],
+            format!("movl {}, %edx", cg.slot_ref(StackSlot(-8)))
+        );
+        assert!(
+            lines[2..].iter().all(|l| !l.contains("(%eax)")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 6);
+    }
+
+    /// The speed windows, at their edges: straight-line inside (no borrowed
+    /// %esi/%edi), `rep movsb` one byte past.
+    #[test]
+    fn memcpy_straight_line_windows_follow_the_measured_policy() {
+        for (sse, max) in [(true, 256), (false, 64)] {
+            assert_eq!(straight_memcpy_max(sse), max);
+            for (size, straight) in [(max, true), (max + 1, false)] {
+                let mut cg = memcpy_cg(sse, false, |cg| {
+                    ptr_in_slot(cg, 1, -8);
+                    ptr_in_slot(cg, 2, -12);
+                });
+                let lines = memcpy_lines(&mut cg, size);
+                let rep = lines.iter().any(|l| l == "rep movsb");
+                assert_eq!(!rep, straight, "sse={sse} size={size}");
+                if straight {
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|l| !l.contains("%esi") && !l.contains("%edi"))
+                    );
+                    assert_eq!(lines.iter().any(|l| l.contains("xmm")), sse);
+                }
+            }
+        }
+    }
+
+    /// `-Os` keeps exactly the smaller encoding of the two candidates (a tie
+    /// keeps the straight-line copy), for every size in the window, frame
+    /// operands near and far (disp8 / disp32) and register bases.
+    #[test]
+    fn memcpy_under_os_keeps_the_smaller_encoding() {
+        type Setup = fn(&mut I686Codegen);
+        let layouts: [(&str, Setup); 3] = [
+            ("frame-near", |cg| {
+                frame_object(cg, 1, -40);
+                frame_object(cg, 2, -80);
+            }),
+            ("frame-far", |cg| {
+                frame_object(cg, 1, -400);
+                frame_object(cg, 2, -800);
+            }),
+            ("registers", |cg| {
+                ptr_in_reg(cg, 1, 0);
+                ptr_in_reg(cg, 2, 1);
+            }),
+        ];
+        let mut straight_won = 0;
+        let mut rep_won = 0;
+        for sse in [false, true] {
+            for (name, setup) in layouts {
+                for size in 1..=64 {
+                    let text = |cg: &I686Codegen| emitted(cg).join("\n");
+                    let mut s = memcpy_cg(sse, false, setup);
+                    assert!(s.emit_small_memcpy(&Value(1), &Value(2), size));
+                    let straight = encoded_len(&text(&s)).expect("straight-line text encodes");
+                    let mut r = memcpy_cg(sse, true, setup);
+                    r.emit_rep_memcpy(&Value(1), &Value(2), size);
+                    let rep = encoded_len(&text(&r)).expect("rep text encodes");
+                    let mut os = memcpy_cg(sse, true, setup);
+                    let chosen = memcpy_lines(&mut os, size).join("\n");
+                    let want = if straight <= rep { text(&s) } else { text(&r) };
+                    assert_eq!(
+                        chosen, want,
+                        "sse={sse} {name} size={size}: {straight} vs {rep} bytes"
+                    );
+                    if straight <= rep {
+                        straight_won += 1
+                    } else {
+                        rep_won += 1
+                    }
+                }
+            }
+        }
+        // Both outcomes occur, so the comparison is exercised, not vacuous.
+        assert!(straight_won > 0 && rep_won > 0, "{straight_won}/{rep_won}");
+    }
+
+    /// The `rep movsb` address loads are a parallel move: no load clobbers a
+    /// register a later load reads.
+    #[test]
+    fn rep_memcpy_address_loads_never_clobber_each_other() {
+        let rep_lines = |setup: fn(&mut I686Codegen)| {
+            let mut cg = memcpy_cg(true, false, setup);
+            cg.emit_rep_memcpy(&Value(1), &Value(2), 300);
+            let lines = emitted(&cg);
+            assert_eq!(&lines[..2], ["pushl %esi", "pushl %edi"]);
+            assert_eq!(
+                &lines[lines.len() - 4..],
+                ["movl $300, %ecx", "rep movsb", "popl %edi", "popl %esi"]
+            );
+            lines[2..lines.len() - 4].to_vec()
+        };
+        // Default order: destination first.
+        assert_eq!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 1);
+                ptr_in_reg(cg, 2, 0);
+            }),
+            ["movl %esi, %edi", "movl %ebx, %esi"]
+        );
+        // Source homed in %edi: it is read before %edi is written.
+        assert_eq!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 0);
+                ptr_in_reg(cg, 2, 2);
+            }),
+            ["movl %edi, %esi", "movl %ebx, %edi"]
+        );
+        // The exchange: source in %edi, destination in %esi.
+        assert_eq!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 1);
+                ptr_in_reg(cg, 2, 2);
+            }),
+            ["xchgl %esi, %edi"]
+        );
+        // Already in place: no moves at all.
+        assert!(
+            rep_lines(|cg| {
+                ptr_in_reg(cg, 1, 2);
+                ptr_in_reg(cg, 2, 1);
+            })
+            .is_empty()
+        );
+        // A pointer homed in %eax is read before an over-aligned alloca's
+        // address is formed through %eax, in either role.
+        for (src_in_eax, first) in [(true, "movl %eax, %esi"), (false, "movl %eax, %edi")] {
+            let mut cg = memcpy_cg(true, false, |cg| {
+                cg.state.value_locations.insert(1, StackSlot(-64));
+                cg.state.value_locations.insert(2, StackSlot(-128));
+                cg.state.alloca_values.insert(1);
+                cg.state.alloca_values.insert(2);
+            });
+            let (eax_v, aligned_v) = if src_in_eax { (2u32, 1u32) } else { (1, 2) };
+            cg.state.alloca_values.remove(&eax_v);
+            cg.reg_assignments.insert(eax_v, PhysReg(6));
+            cg.state.alloca_alignments.insert(aligned_v, 64);
+            assert!(matches!(
+                cg.state.resolve_slot_addr(aligned_v),
+                Some(crate::backend::state::SlotAddr::OverAligned(..))
+            ));
+            cg.emit_rep_memcpy(&Value(1), &Value(2), 300);
+            let lines = emitted(&cg);
+            assert_eq!(lines[2], first, "src_in_eax={src_in_eax}: {lines:?}");
+        }
+    }
+
+    /// Exhaustive safety and completeness of the straight-line copy: every
+    /// access lies inside `[0, size)` of both objects, and every byte of the
+    /// destination is written.
+    #[test]
+    fn memcpy_straight_line_copy_is_in_bounds_and_complete() {
+        fn width(mn: &str) -> usize {
+            match mn {
+                "movb" => 1,
+                "movw" | "movzwl" => 2,
+                "movl" => 4,
+                "movups" => 16,
+                other => panic!("unmodelled mnemonic {other}"),
+            }
+        }
+        for sse in [false, true] {
+            let max = if sse { 256 } else { 64 };
+            for size in 1..=max {
+                let mut cg = memcpy_cg(sse, false, |cg| {
+                    ptr_in_reg(cg, 1, 0);
+                    ptr_in_reg(cg, 2, 1);
+                });
+                let mut written = vec![false; size];
+                for line in memcpy_lines(&mut cg, size) {
+                    let (mn, ops) = line.split_once(' ').expect("instruction");
+                    let w = width(mn);
+                    for op in ops.split(", ").filter(|o| o.contains('(')) {
+                        let off: usize = op[..op.find('(').unwrap()].parse().unwrap();
+                        assert!(off + w <= size, "sse={sse} size={size}: `{line}`");
+                        if op.ends_with("(%ebx)") {
+                            written[off..off + w].iter_mut().for_each(|b| *b = true);
+                        }
+                    }
+                }
+                assert!(
+                    written.iter().all(|&b| b),
+                    "sse={sse} size={size}: bytes left unwritten"
+                );
+            }
+        }
+    }
+
+    /// A directly-homed parameter's whole extent is redirected, exact home
+    /// and interior bytes alike; bytes past the extent, and every byte of a
+    /// home whose extent is 1, keep their own frame location.
+    #[test]
+    fn direct_home_translation_covers_the_extent_and_nothing_else() {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.omit_frame_pointer = false;
+        cg.param_direct_homes.insert(-8, (12, 4));
+        cg.param_direct_homes.insert(-16, (16, 1));
+        assert_eq!(cg.slot_ref(StackSlot(-8)), "12(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-7)), "13(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-5)), "15(%ebp)");
+        assert_eq!(cg.slot_ref_offset(StackSlot(-7), 1), "14(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-4)), "-4(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-9)), "-9(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-16)), "16(%ebp)");
+        assert_eq!(cg.slot_ref(StackSlot(-15)), "-15(%ebp)");
+        // -fomit-frame-pointer: the same bytes, %esp-relative.
+        cg.omit_frame_pointer = true;
+        cg.frame_base_offset = 40;
+        cg.esp_adjust = 8;
+        assert_eq!(cg.slot_ref(StackSlot(-7)), cg.param_ref(13));
+        assert_eq!(cg.param_ref(13), format!("{}(%esp)", 13 - 4 + 40 + 8));
+        assert_eq!(cg.slot_ref(StackSlot(-4)), format!("{}(%esp)", -4 + 40 + 8));
+    }
+
+    fn emitted(cg: &I686Codegen) -> Vec<String> {
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn scalar_fp_permissions_follow_the_resolved_isa() {
+        let mut opts = crate::backend::CodegenOptions::default();
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        assert!(cg.sse2_scalar_enabled && cg.fisttp_enabled);
+        // The default -m32 baseline: SSE2 without SSE3.
+        opts.i686_no_sse3 = true;
+        cg.apply_options(&opts);
+        assert!(cg.sse2_scalar_enabled && !cg.fisttp_enabled);
+        // No SSE2 implies no SSE3 even if the SSE3 bit were left clear.
+        opts.i686_no_sse3 = false;
+        opts.i686_no_sse2 = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse2_scalar_enabled && !cg.fisttp_enabled);
+        opts.i686_no_sse2 = false;
+        opts.general_regs_only = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse2_scalar_enabled && !cg.fisttp_enabled);
+    }
+
+    #[test]
+    fn x87_f64_constant_loads_write_no_gpr() {
+        let load = |c: IrConst| {
+            let mut cg = I686Codegen::new();
+            cg.emit_f64_load_to_x87(&Operand::Const(c));
+            emitted(&cg)
+        };
+        assert_eq!(load(IrConst::F64(0.0)), ["fldz"]);
+        assert_eq!(load(IrConst::F64(1.0)), ["fld1"]);
+        // -0.0 is not +0.0: it must keep its sign bit (no `fldz`/`fchs`).
+        assert_eq!(
+            load(IrConst::F64(-0.0)),
+            [
+                "pushl $-2147483648",
+                "pushl $0",
+                "fldl (%esp)",
+                "addl $8, %esp"
+            ]
+        );
+        // 0.1 = 0x3FB999999999999A: high word pushed first so the low word
+        // sits at (%esp), the little-endian layout `fldl` reads.
+        assert_eq!(
+            load(IrConst::F64(0.1)),
+            [
+                "pushl $1069128089",
+                "pushl $-1717986918",
+                "fldl (%esp)",
+                "addl $8, %esp"
+            ]
+        );
+        assert_eq!(
+            load(IrConst::F32(1.5)),
+            ["pushl $1069547520", "flds (%esp)", "addl $4, %esp"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "has no stack slot")]
+    fn x87_f64_load_of_an_unhomed_value_fails_closed() {
+        I686Codegen::new().emit_f64_load_to_x87(&Operand::Value(Value(7)));
+    }
+
+    #[test]
+    fn truncating_store_switches_rounding_control_without_sse3() {
+        let mut opts = crate::backend::CodegenOptions::default();
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        cg.emit_x87_truncating_store('q');
+        assert_eq!(emitted(&cg), ["fisttpq (%esp)"]);
+
+        opts.i686_no_sse3 = true;
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        cg.emit_x87_truncating_store('l');
+        // The caller's `(%esp)` slot is `4(%esp)` inside the 4-byte
+        // control-word scratch; only RC (bits 10-11) is changed, and the
+        // saved word is restored before the scratch is released.
+        assert_eq!(
+            emitted(&cg),
+            [
+                "subl $4, %esp",
+                "fnstcw (%esp)",
+                "fnstcw 2(%esp)",
+                "orw $0x0c00, 2(%esp)",
+                "fldcw 2(%esp)",
+                "fistpl 4(%esp)",
+                "fldcw (%esp)",
+                "addl $4, %esp",
+            ]
+        );
+    }
+
+    #[test]
+    fn f32_binop_without_sse2_is_x87_and_preserves_ecx() {
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.i686_no_sse2 = true;
+        for (mnemonic, x87) in [
+            ("add", "fadds 4(%esp)"),
+            ("sub", "fsubs 4(%esp)"),
+            ("mul", "fmuls 4(%esp)"),
+            ("div", "fdivs 4(%esp)"),
+        ] {
+            let mut cg = I686Codegen::new();
+            cg.apply_options(&opts);
+            cg.emit_float_binop_impl(mnemonic, IrType::F32);
+            let lines = emitted(&cg);
+            assert!(lines.iter().all(|l| !l.contains("xmm")), "{lines:?}");
+            // lhs (%ecx) is loaded first, so `fsubs`/`fdivs` compute
+            // lhs - rhs and lhs / rhs, not the reverse.
+            assert_eq!(lines[..3], ["pushl %eax", "pushl %ecx", "flds (%esp)"]);
+            assert_eq!(lines[3], x87);
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| !l.ends_with("%ecx") || l == "pushl %ecx")
+            );
+        }
+        // With SSE2 the movd/*ss form is kept.
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.emit_float_binop_impl("sub", IrType::F32);
+        assert!(emitted(&cg).contains(&"subss %xmm1, %xmm0".to_string()));
+    }
+
+    /// The copy policy's instruction stream for `size` bytes at
+    /// `8(%esp)` from `%ecx`, with the target's SSE permission left at its
+    /// default.
+    fn copy_lines_with(opts: &crate::backend::CodegenOptions, size: usize) -> Vec<String> {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(opts);
+        cg.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::OutgoingArea(8),
+            CopyScratch::Eax,
+            size,
+        );
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn copy_lines(size: usize, sse: bool) -> Vec<String> {
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.no_sse = !sse;
+        copy_lines_with(&opts, size)
+    }
+
+    /// The exact instruction stream, not just the count: a size that is a
+    /// multiple of 16 is pure 16-byte chunks; every other size ≥ 16 ends in
+    /// the single overlapping chunk at `size - 16` (never a 4/2/1-byte tail,
+    /// and never a chunk that would cross `size`).
+    #[test]
+    fn sse_copy_is_chunks_plus_one_overlapping_tail() {
+        assert_eq!(
+            copy_lines(16, true),
+            vec!["movups 0(%ecx), %xmm0", "movups %xmm0, 8(%esp)"]
+        );
+        assert_eq!(
+            copy_lines(17, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 1(%ecx), %xmm0",
+                "movups %xmm0, 9(%esp)",
+            ]
+        );
+        assert_eq!(
+            copy_lines(24, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 8(%ecx), %xmm0",
+                "movups %xmm0, 16(%esp)",
+            ]
+        );
+        assert_eq!(
+            copy_lines(32, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 16(%ecx), %xmm0",
+                "movups %xmm0, 24(%esp)",
+            ]
+        );
+        // 33 bytes: two full chunks, then the tail at 17 (not at 32, which
+        // would write [32, 48) and overrun the object by 15 bytes).
+        assert_eq!(
+            copy_lines(33, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 16(%ecx), %xmm0",
+                "movups %xmm0, 24(%esp)",
+                "movups 17(%ecx), %xmm0",
+                "movups %xmm0, 25(%esp)",
+            ]
+        );
+        // Below 16 bytes there is no in-object 16-byte window, so the scalar
+        // path is mandatory even when SSE is available.
+        assert!(copy_lines(15, true).iter().all(|l| !l.contains("xmm")));
+    }
+
+    /// The scalar policy is 4 / 2 / 1 bytes -- the same tail the `va_arg`
+    /// struct copier uses. The 2-byte step is what keeps a 3-byte remainder at
+    /// four instructions instead of six.
+    #[test]
+    fn scalar_copy_tail_is_four_two_one() {
+        assert_eq!(
+            copy_lines(6, false),
+            vec![
+                "movl 0(%ecx), %eax",
+                "movl %eax, 8(%esp)",
+                "movzwl 4(%ecx), %eax",
+                "movw %ax, 12(%esp)",
+            ]
+        );
+        assert_eq!(
+            copy_lines(3, false),
+            vec![
+                "movzwl 0(%ecx), %eax",
+                "movw %ax, 8(%esp)",
+                "movb 2(%ecx), %al",
+                "movb %al, 10(%esp)",
+            ]
+        );
+        // Odd tails cost two instructions per byte at worst, never four.
+        assert_eq!(copy_lines(1, false).len(), 2);
+        assert_eq!(copy_lines(7, false).len(), 6);
+    }
+
+    /// Safety property, exhaustive over the sizes a by-value argument can have
+    /// in practice: **every** memory access the policy emits must lie inside
+    /// `[0, size)`. A copy that read or wrote one byte past the object would
+    /// read frame padding or clobber the next argument's slot.
+    #[test]
+    fn copy_policy_never_touches_a_byte_outside_the_object() {
+        const BASE: usize = 8;
+        fn width_of(mn: &str) -> usize {
+            match mn {
+                "movb" => 1,
+                "movw" | "movzwl" => 2,
+                "movl" => 4,
+                "movups" => 16,
+                other => panic!("copy policy emitted an unmodelled mnemonic {other}"),
+            }
+        }
+        for size in 0..=512usize {
+            for sse in [false, true] {
+                for line in copy_lines(size, sse) {
+                    let mut parts = line.split_ascii_whitespace();
+                    let mn = parts.next().expect("instruction");
+                    let width = width_of(mn);
+                    for operand in parts.filter(|o| o.contains('(')) {
+                        let open = operand.find('(').expect("address");
+                        let disp = &operand[..open];
+                        let off: usize = disp.parse().expect("plain displacement");
+                        // The destination is `BASE + off(%esp)`; the source is
+                        // `off(%ecx)`. Compare the offset WITHIN the object.
+                        let rel = if operand.ends_with("(%esp)") {
+                            off - BASE
+                        } else {
+                            off
+                        };
+                        let end = rel + width;
+                        assert!(end <= size, "size {size} sse {sse}: `{line}` overruns");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `CopyDst::Register` destination is named off the register, and the
+    /// Copy `src` into value 10 homed in `home`, after `setup`; the emitted
+    /// lines and the codegen (for cache inspection).
+    fn copy_into_home(
+        home: u8,
+        src: Operand,
+        setup: impl FnOnce(&mut I686Codegen),
+    ) -> (Vec<String>, I686Codegen) {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.reg_assignments.insert(10, PhysReg(home));
+        setup(&mut cg);
+        cg.emit_copy_value(&Value(10), &src);
+        (emitted(&cg), cg)
+    }
+
+    /// A constant copied into a GPR home is ONE instruction writing the home,
+    /// and it is the accumulator detour's materialization retargeted: same
+    /// immediate, same zero idiom (so the same flag effect), for every
+    /// constant kind. The reference is the detour itself, emitted by the
+    /// primitives the fallback path calls.
+    #[test]
+    fn constant_copy_into_a_home_is_the_detour_retargeted() {
+        let mut checked = 0;
+        for (name, c, _, _) in arms() {
+            // Pair constants (the copy path's own width rule) take the pair
+            // branch before the direct path is considered.
+            let pair = matches!(c, IrConst::F64(_) | IrConst::D64(_))
+                || matches!(c, IrConst::I64(v) if v < i32::MIN as i64 || v > u32::MAX as i64);
+            if pair {
+                continue;
+            }
+            let mut reference = I686Codegen::new();
+            reference.apply_options(&crate::backend::CodegenOptions::default());
+            reference.reg_assignments.insert(10, PhysReg(0));
+            reference.operand_to_eax(&Operand::Const(c));
+            reference.store_eax_to(&Value(10));
+            let detour = emitted(&reference);
+            assert_eq!(detour.len(), 2, "{name}: {detour:?}");
+            assert_eq!(detour[1], "movl %eax, %ebx", "{name}");
+            let (lines, _) = copy_into_home(0, Operand::Const(c), |_| {});
+            assert_eq!(lines, vec![detour[0].replace("%eax", "%ebx")], "{name}");
+            checked += 1;
+        }
+        assert!(checked >= 12, "only {checked} single-word arms exercised");
+    }
+
+    #[test]
+    fn slot_sources_load_straight_into_the_home() {
+        let (lines, cg) = copy_into_home(1, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-32));
+        });
+        assert_eq!(
+            lines,
+            vec![format!("movl {}, %esi", cg.slot_ref(StackSlot(-32)))]
+        );
+        // An alloca's value is its address.
+        let (lines, cg) = copy_into_home(1, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-32));
+            cg.state.alloca_values.insert(20);
+        });
+        assert_eq!(
+            lines,
+            vec![format!("leal {}, %esi", cg.slot_ref(StackSlot(-32)))]
+        );
+    }
+
+    /// Each refusal keeps the accumulator path, whose output differs from the
+    /// direct form: the controls above take the direct path.
+    #[test]
+    fn direct_home_copy_refusals_keep_the_accumulator_path() {
+        // Destination homed in %eax: materializing there IS the direct form.
+        let (lines, _) = copy_into_home(6, Operand::Const(IrConst::I32(0)), |_| {});
+        assert_eq!(lines, vec!["xorl %eax, %eax"]);
+        // Source already verified in %eax: one register move, no memory read.
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-32));
+            cg.state.park_acc(20, false);
+        });
+        assert_eq!(lines, vec!["movl %eax, %ebx"]);
+        // Source homed in %eax (the reg-to-reg path excludes it).
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |cg| {
+            cg.reg_assignments.insert(20, PhysReg(6));
+        });
+        assert_eq!(lines, vec!["movl %eax, %ebx"]);
+        // Home-less accumulator temporary: the consumer reads %eax as-is.
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |_| {});
+        assert_eq!(lines, vec!["movl %eax, %ebx"]);
+        // Over-aligned alloca: needs the lea+add+and sequence.
+        let (lines, _) = copy_into_home(0, Operand::Value(Value(20)), |cg| {
+            cg.state.value_locations.insert(20, StackSlot(-64));
+            cg.state.alloca_values.insert(20);
+            cg.state.alloca_alignments.insert(20, 32);
+        });
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[3], "movl %eax, %ebx");
+    }
+
+    /// %ecx is also the secondary staging register: writing an %ecx home
+    /// directly must drop the secondary cache entry; other homes keep it.
+    #[test]
+    fn direct_copy_into_ecx_drops_the_secondary_cache() {
+        let (lines, cg) = copy_into_home(4, Operand::Const(IrConst::I32(5)), |cg| {
+            cg.state.park_sec(30, false);
+        });
+        assert_eq!(lines, vec!["movl $5, %ecx"]);
+        assert!(!cg.state.reg_cache.sec_has(30, false));
+        let (lines, cg) = copy_into_home(0, Operand::Const(IrConst::I32(5)), |cg| {
+            cg.state.park_sec(30, false);
+        });
+        assert_eq!(lines, vec!["movl $5, %ebx"]);
+        assert!(cg.state.reg_cache.sec_has(30, false));
+    }
+
+    /// `%edx` scratch spellings keep their widths consistent -- the `va_arg`
+    /// copier depends on both, and a `%dl`/`%dx`/`%edx` mismatch would store
+    /// the wrong width.
+    #[test]
+    fn register_destination_and_edx_scratch_spellings() {
+        let mut cg = I686Codegen::new();
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.no_sse = true;
+        cg.apply_options(&opts);
+        cg.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::Register("%eax", 4),
+            CopyScratch::Edx,
+            7,
+        );
+        let lines: Vec<&str> = cg
+            .state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "movl 0(%ecx), %edx",
+                "movl %edx, 4(%eax)",
+                "movzwl 4(%ecx), %edx",
+                "movw %dx, 8(%eax)",
+                "movb 6(%ecx), %dl",
+                "movb %dl, 10(%eax)",
+            ]
+        );
+    }
+}

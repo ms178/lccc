@@ -1,0 +1,1 @@
+movb $imm into %dil/%sil/%bpl/%spl must emit REX (else it writes %bh/%dh/%ch/%ah and corrupts a live pointer)

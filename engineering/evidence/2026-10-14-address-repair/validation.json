@@ -1,0 +1,19 @@
+{
+  "base": "e047aa1eb2ae59b3943a64ab7ec5e5dddb89a3ff",
+  "baseline_head": "f8377536af3d32e9fc6a5ad3cacd956af08ed1ab",
+  "baseline_compiler_sha256": "ba07916b0b144c01ff923e833ff5fdec5e5e2c3c9b59b218714e0db46e3ad084",
+  "candidate_compiler_sha256": "f1d222ebe1e1bf8aa39e41d6f69960dc566c251848c09c1095768d81cf7d52f0",
+  "command": "python3 tests/regression/check_arm_address_contract.py",
+  "before_exit": 1,
+  "after_exit": 0,
+  "checks": 621,
+  "coverage": [
+    "all 32 destinations and signed field boundary residues",
+    "invalid widths/classes/arity/i64 extremes",
+    "same-section ADRP relocation and addend retained",
+    "static/shared/dynamic ADR and ADRP endpoint patches and overflow errors",
+    "shared preemptible global/weak ADR rejected"
+  ],
+  "build": "fastbuild opt-level=1 jobs=2 DEBUG=0 INCREMENTAL=0; 6 GiB active swap",
+  "certification": "targeted only; final unchanged-tree fast CI pending"
+}

@@ -1,0 +1,1738 @@
+//! Shared helper functions used across peephole optimization passes.
+//!
+//! These are small utility functions for register manipulation, label parsing,
+//! epilogue detection, and instruction analysis that multiple passes need.
+
+use super::super::types::*;
+// The data/benign classification of an assembler directive is a law for BOTH
+// x86 and i686, so it lives in `peephole_common`; `steps_over_line` below is the
+// x86 line-model wrapper around it (i686 has its own `LineInfo` and calls the
+// shared predicate directly).
+pub(super) use crate::backend::peephole_common::{
+    alignment_fill_is_explicit, directive_emits_data,
+};
+
+/// The single law for stepping over a line while a pass reasons about flags,
+/// register liveness or memory: a `nop`, or a directive that emits **no data**.
+///
+/// No walker in this directory may hard-code its own
+/// `is_nop() || kind == LineKind::Directive` test: that silently asserts that
+/// no directive can matter.  `directive_emits_data` says otherwise: a `.byte`
+/// in a function body is arbitrary machine code (`.byte 0xf5` is `cmc`,
+/// `.byte 0xb8` is `mov $imm32,%eax`), so a fold that steps over it can move a
+/// flag write across a hidden flag read, delete a store a hidden instruction
+/// reads, or narrow a `movsq` across a hidden wide read.  The hazard is the
+/// integrated assembler's, not lccc's own codegen: text spliced from `__asm__`
+/// is already opaque to every pass (`pin_inline_asm_regions` pins it with all
+/// registers live and indirect memory clobbered), but a `.s` file handed to
+/// `lccc` directly is not.
+///
+/// A data-emitting directive is therefore NOT steppable.  A walk that is
+/// *searching* for a property (register liveness, a preheader store, the
+/// frame-pointer shape) must additionally stop at one: falling through a line
+/// no classifier knows is not a conservative answer, it is an unclassified one,
+/// so those sites refuse the fold outright rather than `continue`.
+/// `check_peephole_directive_step.py` fails the build if a pass re-introduces
+/// the bare skip test.
+#[inline]
+pub(super) fn steps_over_line(info: &LineInfo, text: &str) -> bool {
+    if info.is_nop() {
+        return true;
+    }
+    info.kind == LineKind::Directive && !directive_emits_data(text)
+}
+
+// ── Register helpers ─────────────────────────────────────────────────────────
+
+/// Check if a register ID refers to a valid general-purpose register (0..=15).
+#[inline]
+pub(super) fn is_valid_gp_reg(reg: RegId) -> bool {
+    reg != REG_NONE && reg <= REG_GP_MAX
+}
+
+/// Check if a register family ID is callee-saved (rbx=3, r12=12, r13=13, r14=14, r15=15).
+pub(super) fn is_callee_saved_reg(reg: RegId) -> bool {
+    matches!(reg, 3 | 12 | 13 | 14 | 15)
+}
+
+/// True for instructions that change RSP at runtime (`push*`, `pop*`, or
+/// `subq/addq $N, %rsp`).
+///
+/// The text-based peephole passes reason about `%rsp`-relative stack-slot
+/// offsets as if they were absolute. A runtime RSP shift makes every offset
+/// inside the shifted window refer to a DIFFERENT physical slot, so slot-based
+/// reasoning (dead-store elimination, store forwarding, memory folding) must
+/// stop conservatively at these lines. The codegen used to emit
+/// `pushq/popfq` around i128 binop operand prep — those windows are gone, but
+/// F128 conversions still use `subq/addq %rsp`, and prologue pushes occur at
+/// function start (harmless: reasoning starts after the prologue).
+#[inline]
+pub(super) fn is_rsp_shift_line(t: &str) -> bool {
+    let t = t.trim();
+    if t.starts_with("push") || t.starts_with("pop") {
+        return true;
+    }
+    if t.starts_with("subq $") || t.starts_with("addq $") {
+        return t.ends_with("%rsp");
+    }
+    false
+}
+
+/// Check if a line of assembly text references a given register family.
+/// Uses the pre-computed reg_refs bitmask for O(1) lookup.
+#[inline]
+pub(super) fn line_references_reg_fast(info: &LineInfo, reg: RegId) -> bool {
+    info.reg_refs & (1u16 << reg) != 0
+}
+
+// ── Register rewriting ───────────────────────────────────────────────────────
+
+/// Replace all register-family occurrences of `old_family` with `new_family` in `line`.
+/// Handles all register sizes: 64-bit (%rax), 32-bit (%eax), 16-bit (%ax), 8-bit (%al).
+/// For example, replacing family 0 (rax) with family 1 (rcx) will convert:
+///   %rax -> %rcx, %eax -> %ecx, %ax -> %cx, %al -> %cl
+pub(super) fn replace_reg_family(line: &str, old_id: RegId, new_id: RegId) -> String {
+    // REG_NAMES only covers GP register families 0-15.
+    // XMM/YMM registers (families 24-39) are not in REG_NAMES and must be
+    // skipped to avoid out-of-bounds access that corrupts instruction text.
+    if old_id as usize >= REG_NAMES[0].len() || new_id as usize >= REG_NAMES[0].len() {
+        return line.to_string();
+    }
+    let mut result = line.to_string();
+    // Replace in order from shortest to longest so that smaller sub-register
+    // names (e.g., %ebx→%ebp) are replaced before their 64-bit counterparts
+    // (%rbx→%rbp). This prevents 64-bit replacement from consuming a 32-bit
+    // operand, leaving the wrong register size in the output.
+    for size_idx in [3, 2, 1, 0] {
+        let old_name = REG_NAMES[size_idx][old_id as usize];
+        let new_name = REG_NAMES[size_idx][new_id as usize];
+        if old_name == new_name {
+            continue;
+        }
+        result = replace_reg_name_exact(&result, old_name, new_name);
+    }
+    result
+}
+
+/// Replace all complete occurrences of `old_reg` with `new_reg` in `line`.
+/// A "complete" occurrence means `old_reg` is not a prefix of a longer register
+/// name (e.g., replacing `%r8` must not match `%r8d` or `%r8b`).
+/// After `old_reg`, the next character must be a delimiter: `,`, `)`, ` `, or end-of-string.
+///
+/// Unmatched text is copied in UTF-8 slices, never as individual `u8 as char`
+/// values.  Assembly comments are normally ASCII, but inline-asm and debug
+/// text can carry UTF-8; reconstructing each high byte as Latin-1 silently
+/// recodes it even when no register replacement is made.
+pub(super) fn replace_reg_name_exact(line: &str, old_reg: &str, new_reg: &str) -> String {
+    if old_reg.is_empty() || old_reg == new_reg {
+        return line.to_owned();
+    }
+
+    let bytes = line.as_bytes();
+    let old_bytes = old_reg.as_bytes();
+    let old_len = old_bytes.len();
+    let mut result = String::with_capacity(line.len());
+    let mut copied = 0usize;
+    let mut pos = 0usize;
+    let mut changed = false;
+
+    while pos + old_len <= bytes.len() {
+        if &bytes[pos..pos + old_len] == old_bytes {
+            let after = pos + old_len;
+            // Register spellings are ASCII, but retain valid UTF-8 slice
+            // boundaries even if this helper is ever reused for another token.
+            let is_complete =
+                after == bytes.len() || matches!(bytes[after], b',' | b')' | b' ' | b'\t' | b'\n');
+            if is_complete && line.is_char_boundary(pos) && line.is_char_boundary(after) {
+                result.push_str(&line[copied..pos]);
+                result.push_str(new_reg);
+                copied = after;
+                pos = after;
+                changed = true;
+                continue;
+            }
+        }
+        pos += 1;
+    }
+
+    if !changed {
+        return line.to_owned();
+    }
+    result.push_str(&line[copied..]);
+    result
+}
+
+/// Replace register family occurrences only in the source operand part
+/// (before the last comma). The destination operand is left unchanged.
+pub(super) fn replace_reg_family_in_source(line: &str, old_id: RegId, new_id: RegId) -> String {
+    if let Some(comma_pos) = line.rfind(',') {
+        let src_part = &line[..comma_pos];
+        let dst_part = &line[comma_pos..];
+        let new_src = replace_reg_family(src_part, old_id, new_id);
+        format!("{}{}", new_src, dst_part)
+    } else {
+        replace_reg_family(line, old_id, new_id)
+    }
+}
+
+// ── Instruction analysis ─────────────────────────────────────────────────────
+
+/// Check if an instruction has implicit register usage that makes register
+/// substitution unsafe (div/idiv/mul use rax/rdx, shifts use cl, etc.).
+pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
+    // `trimmed` is the caller's contract, but a veto that silently answers
+    // "safe" for an untrimmed line is a landmine: the tail of this function
+    // asks the shared operand model, which only understands left-trimmed
+    // input, and an empty mnemonic models as "no effects". Trim here so the
+    // answer cannot depend on formatting. Callers that already pass a
+    // trimmed slice pay one byte comparison.
+    let trimmed = trimmed.trim_start();
+    let nb = trimmed.as_bytes();
+    if nb.len() < 3 {
+        return false;
+    }
+    // Fast-reject common mnemonics with no implicit GP usage.
+    match nb[0] {
+        b'm' if nb[1] == b'o' && nb[2] == b'v' => {
+            if nb.len() > 3 && nb[3] != b's' {
+                return false;
+            }
+            if nb.starts_with(b"movslq ")
+                || nb.starts_with(b"movsbl ")
+                || nb.starts_with(b"movswl ")
+                || nb.starts_with(b"movsd ")
+                || nb.starts_with(b"movss ")
+            {
+                return false;
+            }
+        }
+        b'l' if nb.starts_with(b"leaq ") || nb.starts_with(b"leal ") => return false,
+        b'a' if nb.starts_with(b"add") || nb.starts_with(b"and") => return false,
+        b's' if nb.starts_with(b"sub")
+            || nb.starts_with(b"set")
+            || nb.starts_with(b"shlq ")
+            || nb.starts_with(b"shll ")
+            || nb.starts_with(b"shrq ")
+            || nb.starts_with(b"shrl ")
+            || nb.starts_with(b"sarq ")
+            || nb.starts_with(b"sarl ") =>
+        {
+            return false;
+        }
+        b'o' if nb.starts_with(b"orq ") || nb.starts_with(b"orl ") => return false,
+        b'x' if nb.starts_with(b"xor") => return false,
+        b'c' if nb.starts_with(b"cmpq ")
+            || nb.starts_with(b"cmpl ")
+            || nb.starts_with(b"cmpw ")
+            || nb.starts_with(b"cmpb ")
+            || nb.starts_with(b"cmov")
+            || nb.starts_with(b"call") =>
+        {
+            return false;
+        }
+        b't' if nb.starts_with(b"test") => return false,
+        b'j' | b'n' | b'b' => return false,
+        b'p' if nb.starts_with(b"pushq ") || nb.starts_with(b"popq ") => return false,
+        b'r' if nb.starts_with(b"ret") => return false,
+        _ => {}
+    }
+    // Integer div/mul use implicit rax:rdx. Exclude SSE variants (divsd/mulsd/etc.)
+    // which start with div[sp] or mul[sp] — these have no implicit register usage.
+    (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // div, divl, divq (not divsd/divpd)
+    (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i') || // idiv
+    (nb[0] == b'm' && nb[1] == b'u' && nb[2] == b'l'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p'))) || // mul, mulq (not mulsd/mulpd)
+    trimmed.starts_with("cltq") || // sign-extend eax -> rax (implicit read+write rax)
+    trimmed.starts_with("cbw") ||  // sign-extend al -> ax (implicit read+write rax)
+    trimmed.starts_with("cqto") || trimmed.starts_with("cdq") ||
+    trimmed.starts_with("cqo") || trimmed.starts_with("cwd") ||
+    trimmed.starts_with("rep ") || trimmed.starts_with("repne ") ||
+    trimmed.starts_with("cpuid") || trimmed.starts_with("syscall") ||
+    trimmed.starts_with("rdtsc") || trimmed.starts_with("rdmsr") ||
+    trimmed.starts_with("wrmsr") ||
+    trimmed.starts_with("xchg") || trimmed.starts_with("xadd") || trimmed.starts_with("cmpxchg") ||
+    trimmed.starts_with("lock ") ||
+    // shld/shrd use %cl implicitly (i128 shifts); treat like other shifts.
+    trimmed.starts_with("shld") || trimmed.starts_with("shrd") ||
+    // x87 FPU status/control instructions that write to %ax or memory.
+    // fnstsw writes to %ax (implicit destination), and the peephole's
+    // copy propagation must not rewrite %ax to another register since
+    // the x86 ISA only allows %ax or memory for fnstsw.
+    trimmed.starts_with("fnstsw") || trimmed.starts_with("fnstcw") ||
+    trimmed.starts_with("fstcw") || trimmed.starts_with("fnstenv") ||
+    trimmed.starts_with("fldenv") || trimmed.starts_with("fldcw") ||
+    has_bare_implicit_gp_effect(trimmed)
+}
+
+/// Bare instructions that implicitly WRITE a GP register (or transfer
+/// control to an unknown ABI), with no `%reg` in the operand text. The
+/// authoritative operand table is [`classify_implicit_operands`] (kept exact
+/// against the ISA in `types.rs`); this boolean asks its WRITE projection
+/// directly so the two lists never drift apart again.
+///
+/// The write projection is the deliberate contract of every caller: these
+/// scans track whether a cached register VALUE can survive a line, and an
+/// implicit READ alone is transparent here — family-specific reads are
+/// already visible through `LineInfo::reg_refs` (which unions the read half),
+/// and the copy/RMW coalescers consult the full read|write mask
+/// (`implicit_reg_refs`) themselves before renaming. The residual sets cover
+/// (1) control-exit lines whose GP write the table models as zero because
+/// their ABI is unknowable (`sysret`/`sysexit` consume rcx/rdx), (2)
+/// MSR/launch writes whose effect the exact table deliberately reports on
+/// the read half only (`wrmsr`), and (3) x87 control/environment
+/// loads/stores that invalidate windows through their MEMORY operand.
+fn has_bare_implicit_gp_effect(trimmed: &str) -> bool {
+    if implicit_write_refs(trimmed.as_bytes()) != 0 {
+        return true;
+    }
+    let tok = trimmed.split_whitespace().next().unwrap_or("");
+    if matches!(
+        tok,
+        "sysret"
+            | "sysretl"
+            | "sysretq"
+            | "sysexit"
+            | "sysexitl"
+            | "sysexitq"
+            | "wrmsr"
+            | "wrmsrns"
+            | "skinit"
+    ) {
+        return true;
+    }
+    // x87 control/environment loads/stores: memory-only operands, no implicit
+    // GP register, but they read/write the FPU environment through memory.
+    matches!(
+        tok,
+        "fnstcw" | "fstcw" | "fldcw" | "fnstenv" | "fstenv" | "fldenv"
+    )
+}
+
+/// Return the register FAMILY an instruction implicitly READS, when the
+/// implicit read can be pinned to one family. Unlike `has_implicit_reg_usage`
+/// (a boolean veto), this lets peephole deadness analysis distinguish e.g.
+/// `cltq` (implicitly reads %eax, family 0) from an unrelated instruction.
+///
+/// Only families that are not already visible via explicit `%reg` text matter;
+/// callers must treat `None` as "no known implicit read of a single family"
+/// (conservative callers may fall back to `has_implicit_reg_usage`).
+pub(super) fn implicit_read_reg_family(trimmed: &str) -> Option<RegId> {
+    let nb = trimmed.as_bytes();
+    if nb.len() < 3 {
+        return None;
+    }
+    // Sign/zero-extension idioms that read the accumulator family implicitly.
+    //   cltq/cdqe: read %eax (family 0), write %rax
+    //   cqto/cqo:  read %rax (family 0), write %rdx
+    //   cdq:       read %eax (family 0), write %edx
+    //   cbw/cwtl/cwd: read %ax (family 0), write wider accumulator
+    if trimmed.starts_with("cltq")
+        || trimmed.starts_with("cdqe")
+        || trimmed.starts_with("cqto")
+        || trimmed.starts_with("cqo")
+        || trimmed.starts_with("cdq")
+        || trimmed.starts_with("cwd")
+        || trimmed.starts_with("cbw")
+        || trimmed.starts_with("cwtl")
+    {
+        return Some(0);
+    }
+    // Integer div/idiv read %rax:%rdx (families 0 and 2); mul reads %rax.
+    // Exclude SSE variants (divsd/mulsd/...) which have explicit operands.
+    if (nb[0] == b'd'
+        && nb[1] == b'i'
+        && nb[2] == b'v'
+        && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p')))
+        || (nb[0] == b'i' && nb[1] == b'd' && nb[2] == b'i')
+        || (nb[0] == b'm'
+            && nb[1] == b'u'
+            && nb[2] == b'l'
+            && !(nb.len() > 3 && (nb[3] == b's' || nb[3] == b'p')))
+    {
+        // div/idiv also read %rdx; the caller checks the load's own family.
+        return Some(0);
+    }
+    // Double-precision shifts read %cl implicitly (family 1).
+    if trimmed.starts_with("shld") || trimmed.starts_with("shrd") {
+        return Some(1);
+    }
+    None
+}
+
+/// Check if an instruction is a shift/rotate that implicitly uses %cl.
+pub(super) fn is_shift_or_rotate(trimmed: &str) -> bool {
+    let nb = trimmed.as_bytes();
+    nb.len() >= 3
+        && (
+            (nb[0] == b's' && (nb[1] == b'h' || nb[1] == b'a')) || // shl, shr, sal, sar
+        (nb[0] == b'r' && (nb[1] == b'o' || nb[1] == b'c'))
+            // rol, ror, rcl, rcr
+        )
+}
+
+/// Parse a movq %src, %dst instruction. Returns (src_family, dst_family) if valid.
+pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(RegId, RegId)> {
+    if let LineKind::Other { dest_reg } = info.kind {
+        if dest_reg == REG_NONE || dest_reg > REG_GP_MAX {
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_prefix("movq ") {
+            if let Some((src_part, dst_part)) = rest.split_once(',') {
+                let src = src_part.trim();
+                let dst = dst_part.trim();
+                if !src.starts_with("%r") || !dst.starts_with("%r") {
+                    return None;
+                }
+                let sfam = register_family_fast(src);
+                let dfam = register_family_fast(dst);
+                if sfam == REG_NONE
+                    || sfam > REG_GP_MAX
+                    || sfam == REG_RSP
+                    || sfam == REG_RBP
+                    || dfam == REG_NONE
+                    || dfam > REG_GP_MAX
+                    || dfam == REG_RSP
+                    || dfam == REG_RBP
+                    || sfam == dfam
+                {
+                    return None;
+                }
+                return Some((sfam, dfam));
+            }
+        }
+    }
+    None
+}
+
+/// Parse a `movl %src, %dst` reg-reg copy.  Unlike [`parse_reg_to_reg_movq`]
+/// this admits `%ebp` as a SOURCE: the RA legitimately homes values in the
+/// frame family (fannkuch's swap loop keeps `perm[i]` in `%ebp` and paid a
+/// `movl %ebp, %eax` staging relay in front of every store), and a `movl`
+/// identity is low-32 only — the narrow substitution sites refuse any line
+/// naming the 64-bit register, so `%rbp` can never leak into an address or a
+/// frame-manipulation form (`leave`/`popq %rbp`/`movq %rsp, %rbp` are
+/// implicit-reg barriers or write family 5, which invalidates the copy).
+/// `%rsp` stays excluded at both ends: its implicit writers (`push`/`pop`/
+/// `call`/`ret`/`andq`-style alignment) are too numerous to audit for one
+/// missed model entry, and the RA never copies `%esp` in real output.
+/// Destinations in families 4/5 stay excluded (frame-setup shapes).
+pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(RegId, RegId)> {
+    if let LineKind::Other { dest_reg } = info.kind {
+        if dest_reg == REG_NONE || dest_reg > REG_GP_MAX {
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_prefix("movl ") {
+            if let Some((src_part, dst_part)) = rest.split_once(',') {
+                let src = src_part.trim();
+                let dst = dst_part.trim();
+                if !src.starts_with('%') || !dst.starts_with('%') {
+                    return None;
+                }
+                let sfam = register_family_fast(src);
+                let dfam = register_family_fast(dst);
+                if sfam == REG_NONE
+                    || sfam > REG_GP_MAX
+                    || sfam == REG_RSP
+                    || dfam == REG_NONE
+                    || dfam > REG_GP_MAX
+                    || dfam == REG_RSP
+                    || dfam == REG_RBP
+                    || sfam == dfam
+                {
+                    return None;
+                }
+                return Some((sfam, dfam));
+            }
+        }
+    }
+    None
+}
+
+/// Get the destination register of an instruction (the register it writes to).
+/// Whether `trimmed` is a self-referencing zeroing idiom such as
+/// `xorl %eax, %eax`, `xorq %r12, %r12` or `subl %ecx, %ecx`.
+///
+/// These instructions do not READ the named register: the CPU recognizes the
+/// pattern as a dependency-breaking define of zero. Any analysis that treats
+/// the source operand as a use will happily rewrite it and destroy both the
+/// zero and the register it was supposed to clear.
+pub(super) fn is_self_zeroing_idiom(trimmed: &str) -> bool {
+    let mut it = trimmed.split_whitespace();
+    let Some(op) = it.next() else { return false };
+    if !matches!(
+        op,
+        "xor"
+            | "xorb"
+            | "xorw"
+            | "xorl"
+            | "xorq"
+            | "sub"
+            | "subb"
+            | "subw"
+            | "subl"
+            | "subq"
+            | "pxor"
+            | "xorps"
+            | "xorpd"
+    ) {
+        return false;
+    }
+    let rest: String = it.collect::<Vec<_>>().join(" ");
+    let Some((a, b)) = rest.split_once(',') else {
+        return false;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    !a.is_empty() && a == b && a.starts_with('%')
+}
+
+pub(super) fn get_dest_reg(info: &LineInfo) -> RegId {
+    match info.kind {
+        LineKind::Other { dest_reg } => dest_reg,
+        LineKind::StoreRbp { .. } => REG_NONE, // stores don't write to a register
+        LineKind::LoadRbp { reg, .. } => reg,
+        LineKind::SetCC { reg } => reg,
+        LineKind::Pop { reg } => reg,
+        LineKind::Cmp => REG_NONE,
+        LineKind::Push { .. } => REG_NONE,
+        _ => REG_NONE,
+    }
+}
+
+/// Does the line classified as `info` (text `trimmed`) write ANY part of GP
+/// family `fam`?
+///
+/// `get_dest_reg` yields the single classified destination, which is the
+/// explicit AT&T destination or the primary implicit one (`%rax` for
+/// `cltq`/`cqto`/`div`/`mul`).  Instructions with a SECOND implicit output
+/// (`cqto` → `%rdx`, `idivq` → `%rax:%rdx`, `cpuid`, `rep stos`, `syscall`,
+/// ...) are invisible to that answer, and every copy-rewriting pass that
+/// asked "is the copy source still intact at line j?" via
+/// `get_dest_reg(j) == src` let `movq %rdx, %r8; ...; cqto; idivq; movzbl
+/// %r8b` be rewritten to read the remainder in `%dl`.  Use this predicate for
+/// every redefinition check.
+///
+/// Exactness contract (this predicate is safe to use on ACCEPTANCE paths —
+/// "the register is fully redefined, the old value is unobservable" — where
+/// an over-approximation would wrongly enable a transform):
+///
+/// * the architectural implicit write set ([`implicit_write_refs`]) is exact
+///   and wins over the classified destination;
+/// * the classified destination counts only if the line does not implicitly
+///   READ the family: the classifier reports `%rax` as the primary
+///   destination of `cqto`/`cdq`/`cqo`, but %rax is those instructions'
+///   implicit INPUT — their only output is `%rdx`, which the oracle already
+///   reported.  (An instruction that both reads and writes the family
+///   implicitly — `idivq` on %rax, `cltq` — is decided by its write set, so
+///   the read-guard only ever suppresses a classified answer for a family
+///   the instruction genuinely only reads.)
+#[inline]
+pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
+    if fam > REG_GP_MAX {
+        return false;
+    }
+    // Inline asm is opaque: an `"=r"` output or a clobber may land in ANY
+    // family, and nothing in the classified `LineInfo` names it (the kind is
+    // `InlineAsm`, not `Other { dest_reg }`).  The only sound answer to
+    // "may this line write `fam`?" is yes.  (The stress lab's framecall
+    // family caught `movq 32(%rsp), %r11` being forwarded from a `%rcx`
+    // that an intervening `#APP` block had redefined.)
+    if info.kind == LineKind::InlineAsm {
+        return true;
+    }
+    let bit = 1u16 << fam;
+    // 1. Architectural implicit writes: exact.
+    if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
+        return true;
+    }
+    // 2. The classified destination (explicit AT&T destination or the primary
+    //    implicit one), suppressed when the instruction implicitly reads the
+    //    family without writing it (the `cqto`-family %rax misclassification).
+    get_dest_reg(info) == fam && implicit_read_refs(trimmed.as_bytes()) & bit == 0
+}
+
+/// Does the line fully REDEFINE GP family `fam` at ≥32 bits (a 32-bit write
+/// zero-extends to the whole 64-bit family)?
+///
+/// This is the ACCEPTANCE-grade counterpart of [`writes_family`]: a true
+/// answer proves every consumer of the old value unreachable, so transforms
+/// that delete a definition (narrow sign-extension removal, the three-line
+/// copy-swap middle, ...) must ask THIS predicate.  [`writes_family`] answers
+/// "any part written" — byte/word partials (`movb %al`, `lahf`, `xlat`,
+/// `divb`, `setcc`) and conditional writes (`cmpxchg`) pass that bar but do
+/// NOT retire the old 64-bit value.
+#[inline]
+pub(super) fn writes_family_full(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
+    if fam > REG_GP_MAX {
+        return false;
+    }
+    // Opaque inline asm can never PROVE a full redefinition (it may read the
+    // old value first); acceptance paths must treat it as "unknown", i.e.
+    // false, while `writes_family` above treats it as "may write".
+    if info.kind == LineKind::InlineAsm {
+        return false;
+    }
+    let bit = 1u16 << fam;
+    // 1. Architectural implicit writes at full width: exact (see
+    //    `implicit_full_write_refs` for the exclusions).
+    if implicit_full_write_refs(trimmed.as_bytes()) & bit != 0 {
+        return true;
+    }
+    // 2. The explicit destination: full only when the destination token
+    //    names the family at 32 or 64 bits.  A memory destination redefines
+    //    no register; `%ax`/`%al`/`%ah`-style tokens redefine only part.
+    get_dest_reg(info) == fam && dest_operand_is_full_width(info, trimmed, fam)
+}
+
+/// Does the line's explicit destination name `fam` at 32 or 64 bits?
+/// `REG_NAMES[0]` is the 64-bit row, `REG_NAMES[1]` the 32-bit row; any other
+/// width (or a memory operand) is a partial/no write.
+///
+/// Two operand shapes reach a full-width destination, and the comma split only
+/// sees the first:
+///
+/// * two operands — the token after the last comma (`movl %ecx, %eax`);
+/// * `popq %r` — ONE operand, and that operand IS the destination.  Handing
+///   the whole `"popq %rcx"` string to the width test matched no register
+///   name, so every acceptance path above lost the kill: a `movq %rax, %rcx`
+///   whose only consumer was already gone survived a later `popq %rcx` that
+///   redefines the family unconditionally.  The classifier's answer is
+///   authoritative — `LineKind::Pop { reg }` is produced only for the `popq `
+///   spelling, which is always a full 64-bit write of the popped register,
+///   while `popfq`/`popfl` carry `REG_NONE` (no GP family) and `popl`/`popw`
+///   stay `Other` with an unparsed destination, i.e. conservatively partial.
+#[inline]
+fn dest_operand_is_full_width(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
+    if let LineKind::Pop { reg } = info.kind {
+        return reg == fam;
+    }
+    let dest = trimmed.rsplit(',').next().unwrap_or(trimmed).trim();
+    dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize]
+}
+
+/// Is `trimmed` a self-zeroing idiom that fully redefines GP family `fam`?
+///
+/// `xorl %ecx, %ecx` / `subl %ecx, %ecx` write a CONSTANT: the result does not
+/// depend on the operand's old value.  Both properties a liveness walk uses to
+/// veto a kill therefore misfire on them — the family appears on the source
+/// side, and `xor`/`sub` are classified read-modify-write — yet the old value
+/// is retired exactly as `movl $0, %ecx` retires it.  Callers must ask this
+/// predicate BEFORE those two vetoes, or the canonical zeroing idiom keeps a
+/// dead address copy alive.
+///
+/// Exactness (this is an ACCEPTANCE-grade predicate: a true answer deletes a
+/// definition, so it may not over-approximate):
+///
+/// * only `xor` and `sub`.  `and`/`or` preserve the old value, and `adc`/`sbb`
+///   additionally read CF — neither writes a constant;
+/// * both operand tokens must be IDENTICAL, so `xorl %eax, %ecx` (a real
+///   read-modify-write of %ecx) and `xorl $0, %ecx` are rejected;
+/// * the destination must name `fam` at 32 or 64 bits.  A 32-bit write
+///   zero-extends and so retires the whole family; `xorw`/`xorb` leave the
+///   surviving bits observable.  The four-byte mnemonic test also rejects the
+///   packed forms (`xorps`, `subss`) and the suffix-less `xor`.
+#[inline]
+pub(super) fn self_zeroing_full_write(trimmed: &str, fam: RegId) -> bool {
+    if fam > REG_GP_MAX {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    // One byte rejects every other mnemonic.  This predicate sits on the
+    // fall-through path of a liveness kill test — i.e. it is reached for every
+    // line that mentions the family and is NOT a kill, the common case — so it
+    // must be free before it is right.
+    if bytes.first() != Some(&b'x') && bytes.first() != Some(&b's') {
+        return false;
+    }
+    let (mnemonic, operands) = match trimmed.split_once(' ') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let m = mnemonic.as_bytes();
+    // `xor{l,q}` / `sub{l,q}`: exactly four bytes, last one the width suffix.
+    if m.len() != 4 || !matches!(m[3], b'l' | b'q') {
+        return false;
+    }
+    if !(m.starts_with(b"xor") || m.starts_with(b"sub")) {
+        return false;
+    }
+    // Exactly two operands.  A first-comma split is safe here: a SIB source
+    // such as `xorl (%rax,%rcx), %eax` yields a "destination" token that is
+    // not a bare register name and is rejected below, i.e. conservatively.
+    let (source, dest) = match operands.split_once(',') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let dest = dest.trim();
+    source.trim() == dest
+        && (dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize])
+}
+
+// ── Label/jump parsing ───────────────────────────────────────────────────────
+
+/// Parse ".LBB<number>:" label into its number, e.g. ".LBB123:" -> Some(123)
+#[inline]
+pub(super) fn parse_label_number(label_with_colon: &str) -> Option<u32> {
+    let s = label_with_colon.strip_suffix(':')?;
+    parse_dotl_number(s)
+}
+
+/// Parse ".LBB<number>" into its number, e.g. ".LBB123" -> Some(123)
+#[inline]
+pub(super) fn parse_dotl_number(s: &str) -> Option<u32> {
+    let rest = s.strip_prefix(".LBB")?;
+    let b = rest.as_bytes();
+    if b.is_empty() || b[0] < b'0' || b[0] > b'9' {
+        return None;
+    }
+    let mut v: u32 = 0;
+    for &c in b {
+        if c.is_ascii_digit() {
+            v = v.wrapping_mul(10).wrapping_add((c - b'0') as u32);
+        } else {
+            return None;
+        }
+    }
+    Some(v)
+}
+
+/// Extract the jump target label from a jump/branch instruction.
+pub(super) fn extract_jump_target(s: &str) -> Option<&str> {
+    // Handle: jmp .LBB1, je .LBB1, jne .LBB1, etc.
+    if let Some(rest) = s.strip_prefix("jmp ") {
+        return Some(rest.trim());
+    }
+    // Conditional jumps: j<cc> <target>
+    if s.starts_with('j') {
+        if let Some(space) = s.find(' ') {
+            return Some(s[space + 1..].trim());
+        }
+    }
+    None
+}
+
+// ── Epilogue detection ───────────────────────────────────────────────────────
+
+/// Check if a LoadRbp at position `pos` is part of the function epilogue.
+/// The epilogue pattern is: callee-save restores, then `movq %rbp, %rsp; popq %rbp; ret/jmp`.
+/// We look forward from `pos` for a Ret or Jmp (for __x86_return_thunk) within a small window,
+/// only allowing other LoadRbp or Pop or Other (for stack teardown) instructions between.
+pub(super) fn is_near_epilogue(infos: &[LineInfo], pos: usize) -> bool {
+    let limit = (pos + 20).min(infos.len());
+    for j in (pos + 1)..limit {
+        if infos[j].is_nop() {
+            continue;
+        }
+        match infos[j].kind {
+            // More callee-save restores or stack teardown moves are expected
+            LineKind::LoadRbp { .. } | LineKind::Pop { .. } | LineKind::SelfMove => continue,
+            // Stack pointer restoration (movq %rbp, %rsp) is classified as Other
+            LineKind::Other { .. } => continue,
+            // Found the return instruction - this is an epilogue
+            LineKind::Ret | LineKind::Jmp | LineKind::JmpIndirect => return true,
+            // Any other instruction type means we're not in the epilogue
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Check if an x86 instruction is a read-modify-write for its destination register.
+/// For most two-operand instructions like `addq %src, %dst`, the destination is read
+/// before being written.  For move instructions like `movq %src, %dst` or `leaq ...(%rip), %dst`,
+/// the destination is only written.
+///
+/// Returns true if the instruction reads the destination register (read-modify-write).
+pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
+    let b = trimmed.as_bytes();
+    if b.len() < 3 {
+        return true; // conservative
+    }
+
+    // Move instructions are write-only for the destination:
+    // movq, movl, movw, movb, movabs, movzbl, movzbq, movzwl, movzwq,
+    // movslq, movsbl, movsbq, movswl, movswq
+    if b[0] == b'm' && b[1] == b'o' && b[2] == b'v' {
+        return false;
+    }
+
+    // LEA is write-only for the destination, UNLESS the destination register
+    // also appears in the address computation (source operand). For example:
+    //   leaq 4(%rax), %rax   -- reads %rax (base) and writes %rax (dest)
+    //   leaq (%rax,%rcx), %rax  -- reads %rax and writes %rax
+    //   leaq 8(%rcx), %rax   -- does NOT read %rax, only writes it
+    if b[0] == b'l' && b[1] == b'e' && b[2] == b'a' {
+        // Check if dest register appears in the source (memory) operand.
+        // Source operand is everything before the last comma. This is an
+        // exact-SPELLING test: `leal 4(%rax), %eax` reads %rax yet is not
+        // caught. Family-level reads are the job of `src_mentions_family`,
+        // which every caller treating a dest-only line as a fresh overwrite
+        // must consult as well (see its contract).
+        if let Some(comma) = trimmed.rfind(',') {
+            let dest_part = trimmed[comma + 1..].trim();
+            let src_part = &trimmed[..comma];
+            // If the dest register name appears in the source part, it's a read
+            if src_part.contains(dest_part) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Conditional moves (cmovXX) are read-modify-write because the old value
+    // is kept when the condition is false.
+    if b[0] == b'c' && b[1] == b'm' && b[2] == b'o' {
+        return true; // cmov reads the original destination
+    }
+
+    // Check if it's a setCC instruction (write-only for byte reg)
+    if b[0] == b's' && b[1] == b'e' && b[2] == b't' {
+        return false;
+    }
+
+    // Dest-only two/three-operand BMI1/ABM: dest is written, not read.
+    // Default-true would treat `popcntl %edi, %eax` as RMW of eax and keep
+    // a dead staging `movq %rdi, %rax` that the producer never needed.
+    if match b[0] {
+        b'p' => {
+            trimmed.starts_with("popcnt")
+                || trimmed.starts_with("pext")
+                || trimmed.starts_with("pdep")
+        }
+        b'l' => trimmed.starts_with("lzcnt"),
+        b't' => trimmed.starts_with("tzcnt"),
+        b'a' => trimmed.starts_with("andn"),
+        b'b' => {
+            trimmed.starts_with("blsr")
+                || trimmed.starts_with("blsi")
+                || trimmed.starts_with("blsmsk")
+                || trimmed.starts_with("bzhi")
+                || trimmed.starts_with("bextr")
+        }
+        b's' => {
+            trimmed.starts_with("shlx")
+                || trimmed.starts_with("shrx")
+                || trimmed.starts_with("sarx")
+        }
+        b'r' => trimmed.starts_with("rorx"),
+        _ => false,
+    } {
+        return false;
+    }
+
+    // Vector/FP -> GPR transfers write their whole general-purpose destination
+    // and never read it: `vmovq %xmm0, %rax`, `vmovd %xmm0, %eax`,
+    // `vpextrd $1, %xmm0, %eax`, `vpmovmskb %ymm0, %eax`,
+    // `vmovmskpd %xmm0, %eax`, `cvttsd2si %xmm0, %rax` (the r32 forms
+    // zero-extend; none has an 8/16-bit register form, and `pextrb`/`pextrw`
+    // into r32 zero-extend too). The `mov` arm above covers only the legacy
+    // `movq`/`movd`; every `v`-prefixed or `cvt*2si` spelling fell into the
+    // read-modify-write default — a PHANTOM READ that liveness propagates
+    // backwards through whole regions. zlib_ng_adler32: the horizontal-sum
+    // tail `vmovq %xmm0, %rax; movq %rax, 24(%rsp)` kept %rax live from the
+    // vector epilogue back across the entire checksum loop nest into the
+    // buffer-fill loop, so a dead `movq %rdx, %rax` (and the in-place
+    // `movzbl` feeding it) ran 2M times. Callers consult this only for GPR
+    // destinations; a GPR -> vector or memory destination never reaches it.
+    {
+        let mnemonic = trimmed.split([' ', '\t']).next().unwrap_or("");
+        let m = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+        if matches!(m, "movq" | "movd" | "pmovmskb" | "movmskps" | "movmskpd")
+            || m.starts_with("pextr")
+            || m.starts_with("cvttsd2si")
+            || m.starts_with("cvtsd2si")
+            || m.starts_with("cvttss2si")
+            || m.starts_with("cvtss2si")
+        {
+            return false;
+        }
+    }
+
+    // ── non-destructive operand forms of the read-modify-write set ─────────
+    //
+    // The legacy two-operand forms (`imull %ebx, %r9d`, `addl $1, %eax`) and
+    // one-operand unary forms (`negl %eax`) READ their destination.  The
+    // extra-destination forms do not:
+    //   * `imul s1, s2, dst` (three operands) — the magic-division lowering
+    //     emits this on every division-by-constant (glibc_strstr's `% 26`,
+    //     fannkuch's index math, gzip's CRC folds);
+    //   * APX NDD `add/sub/adc/sbb/and/or/xor s1, s2, dst` (three operands);
+    //   * APX NDD unary `neg/not/inc/dec src, dst` (two operands).
+    // Calling those read-modify-write is a PHANTOM READ of the destination's
+    // old value: liveness then reports every staging relay in front of them
+    // live (`movl %eax, %r9d` before `imull $1664525, %ebx, %r9d` in the
+    // glibc_strstr Horspool loop) and dead-pure-write elimination refuses to
+    // delete it — one wasted instruction per hot iteration.
+    //
+    // `shld`/`shrd` are the deliberate counterexample that keeps this table
+    // exact: their three-operand form shifts bits THROUGH the destination and
+    // genuinely reads it, so they stay in the conservative default (as do all
+    // mnemonics not named below: `bsf`, `mul`, `div`, `xchg`, ...).  Mnemonic
+    // matching is EXACT so SSE look-alikes (`addss`, `imulsd`) never enter.
+    // The degenerate `src == dst` spellings (`imull $5, %r9d, %r9d`) still
+    // read the family — as the SOURCE operand; callers that care consult
+    // their own source-mentions-dest guard (see `is_pure_write_mnemonic`'s
+    // contract), which subsumes that case exactly as it does for `popcnt`.
+    if matches!(b[0], b'n' | b'i' | b'd' | b'a' | b's' | b'o' | b'x') {
+        let mut mnemonic_end = 0;
+        while mnemonic_end < b.len() && !b[mnemonic_end].is_ascii_whitespace() {
+            mnemonic_end += 1;
+        }
+        let mnemonic = &trimmed[..mnemonic_end];
+        let ndd_unary = matches!(b[0], b'n' | b'i' | b'd')
+            && matches!(
+                mnemonic,
+                "neg"
+                    | "negb"
+                    | "negw"
+                    | "negl"
+                    | "negq"
+                    | "not"
+                    | "notb"
+                    | "notw"
+                    | "notl"
+                    | "notq"
+                    | "inc"
+                    | "incb"
+                    | "incw"
+                    | "incl"
+                    | "incq"
+                    | "dec"
+                    | "decb"
+                    | "decw"
+                    | "decl"
+                    | "decq"
+            );
+        let ndd_binary = !ndd_unary
+            && matches!(b[0], b'a' | b's' | b'o' | b'x' | b'i')
+            && matches!(
+                mnemonic,
+                "add"
+                    | "addb"
+                    | "addw"
+                    | "addl"
+                    | "addq"
+                    | "sub"
+                    | "subb"
+                    | "subw"
+                    | "subl"
+                    | "subq"
+                    | "adc"
+                    | "adcb"
+                    | "adcw"
+                    | "adcl"
+                    | "adcq"
+                    | "sbb"
+                    | "sbbb"
+                    | "sbbw"
+                    | "sbbl"
+                    | "sbbq"
+                    | "and"
+                    | "andb"
+                    | "andw"
+                    | "andl"
+                    | "andq"
+                    | "or"
+                    | "orb"
+                    | "orw"
+                    | "orl"
+                    | "orq"
+                    | "xor"
+                    | "xorb"
+                    | "xorw"
+                    | "xorl"
+                    | "xorq"
+                    | "imul"
+                    | "imulb"
+                    | "imulw"
+                    | "imull"
+                    | "imulq"
+            );
+        if ndd_unary || ndd_binary {
+            let ops = trimmed[mnemonic_end..].split('#').next().unwrap_or("");
+            let operands = count_top_level_operands(ops);
+            if (ndd_binary && operands >= 3) || (ndd_unary && operands >= 2) {
+                return false;
+            }
+        }
+    }
+
+    // Default: assume read-modify-write (conservative)
+    true
+}
+
+/// Legacy high-byte aliases: REX-forbidden, never rewritten, always checked.
+pub(super) const HIGH_BYTE_NAMES: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+
+/// True when any SOURCE operand of `trimmed` mentions family `fam` at any
+/// width (64/32/16/8-low, plus the legacy high byte for fams 0..=3).
+/// Sources = everything before the last comma, so the NDD middle operand
+/// is covered: `imull $5, %r9d, %r9d` reads the family AS A SOURCE even
+/// though the shared dest-only predicate reports it dest-only. Trailing
+/// `#` comments are stripped so comment commas never move the boundary.
+/// Single source of truth for the source-mentions-dest guard: EVERY caller
+/// that treats a dest-only line as a fresh overwrite must ALSO consult
+/// this (the predicate alone cannot see middle==dst reads). No-comma
+/// lines have no source operands (vacuously false; their RMW-ness is the
+/// predicate's job and every caller consults both).
+pub(super) fn src_mentions_family(trimmed: &str, fam: RegId) -> bool {
+    if fam as usize >= REG_NAMES[0].len() {
+        return true; // fail-closed on out-of-range families
+    }
+    let code = trimmed.split('#').next().unwrap_or(trimmed);
+    let Some(comma) = code.rfind(',') else {
+        return false;
+    };
+    let src_part = &code[..comma];
+    if !src_part.as_bytes().contains(&b'%') {
+        return false;
+    }
+    if (fam as usize) >= 8 {
+        return src_part.contains(REG_NAMES[0][fam as usize]);
+    }
+    if REG_NAMES
+        .iter()
+        .any(|row| src_part.contains(row[fam as usize]))
+    {
+        return true;
+    }
+    (fam as usize) < 4 && src_part.contains(HIGH_BYTE_NAMES[fam as usize])
+}
+
+/// Count AT&T operands in `ops`, honoring the balanced-paren scanner so a SIB
+/// address's internal commas (`disp(%base,%idx,4)`) never split an operand.
+pub(super) fn count_top_level_operands(ops: &str) -> usize {
+    let mut n = 0usize;
+    let mut rest = ops.trim();
+    if rest.is_empty() {
+        return 0;
+    }
+    loop {
+        n += 1;
+        match crate::backend::peephole_common::last_top_level_comma(rest.as_bytes()) {
+            Some(i) => rest = rest[..i].trim(),
+            None => return n,
+        }
+    }
+}
+
+// ── tests: register rewriting and redefinition predicates ───────────────────
+
+#[cfg(test)]
+mod register_rewrite_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_preserves_unmatched_utf8_bytes() {
+        let input = "movq %rax, %rbx # café € 🦀";
+        let expected = "movq %rcx, %rbx # café € 🦀";
+        let rewritten = replace_reg_name_exact(input, "%rax", "%rcx");
+        assert_eq!(rewritten, expected);
+        assert_eq!(rewritten.as_bytes(), expected.as_bytes());
+
+        // The old byte-at-a-time implementation corrupted this no-match case
+        // too, because it rebuilt the entire line regardless of a match.
+        let unchanged = replace_reg_name_exact(input, "%r11", "%r10");
+        assert_eq!(unchanged.as_bytes(), input.as_bytes());
+        assert_eq!(replace_reg_family(input, 0, 1), expected);
+    }
+
+    #[test]
+    fn replacement_empty_pattern_is_a_noop() {
+        let input = "movq %rax, %rbx # café";
+        assert_eq!(replace_reg_name_exact(input, "", "%rcx"), input);
+        assert_eq!(replace_reg_name_exact(input, "%rax", "%rax"), input);
+    }
+
+    /// The step law, in both directions and at the line-model level: a walker
+    /// may step over a `nop` and over bookkeeping, never over data.  Pinning
+    /// this here (rather than only at the classifiers) is what keeps the 48
+    /// converted `is_nop() || kind == LineKind::Directive` sites honest: the
+    /// whole list of "things a fold is allowed to ignore" is these two loops.
+    #[test]
+    fn steps_over_line_admits_bookkeeping_and_nops_but_never_data() {
+        let steps = |t: &str| super::steps_over_line(&classify_line(t), t);
+        // Steppable: position, no bytes, no change of meaning.
+        for t in [
+            "    .cfi_adjust_cfa_offset 16",
+            "    .cfi_escape 0x2a",
+            "    .loc 1 42 7",
+            "    .file 1 \"x.c\"",
+            "    .size f, .-f",
+            "    .globl f",
+            "    .type f,@function",
+            "    .p2align 4",
+            "    .p2align 4,,10",
+            "    .align 16",
+            "    .balign 8,,64",
+        ] {
+            assert!(steps(t), "{t:?} must be steppable");
+        }
+        // Not steppable: bytes into the section, or a change of what the
+        // neighbouring lines mean.
+        for t in [
+            "    .byte 0xf5",
+            "    .byte 0xb8,0x00,0x00,0x00,0x00",
+            "    .long .LBB33 - .Ljt_0",
+            "    .quad 0",
+            "    .zero 16",
+            "    .space 8,0x90",
+            "    .ascii \"x\"",
+            "    .incbin \"blob\"",
+            "    .inst.n 0xbf00",
+            "    .p2align 4,0xf8",
+            "    .p2align 4,0xcc",
+            "    .p2align 4,0xf8,10",
+            "    .fill 8,1,0x90",
+            "    .text",
+            "    .code32",
+            "    .if 0",
+            "    .rept 4",
+            "    .totally_new_directive 1",
+        ] {
+            assert!(!steps(t), "{t:?} must not be stepped over");
+        }
+        // Horizontal indentation is normalized by the shared classifier, not
+        // by a private prefix allowlist. Tabs must preserve the SAME inert-
+        // directive law: bookkeeping and default padding remain steppable,
+        // while bytes, explicit fills and opaque directives remain barriers.
+        // A 4th operand is not data, it is an assembler *error*: GAS reads
+        // `.p2align abs[,fill[,max-log]]`, so in `.p2align 4,,10,0xcc` the fill
+        // field is empty (default nops) and `0xcc` sits in no field at all.
+        // `parse_align_tail` refuses it (TooMany) long before a walker sees it;
+        // classifying it "benign" here is therefore right, and pinning that
+        // keeps the two layers from disagreeing about who owns the case.
+        assert!(
+            steps("    .p2align 4,,10,0xcc"),
+            "a 4-operand tail is the PARSER's rejection; the step law must not
+             invent a second, different verdict for it"
+        );
+        for t in ["\t.cfi_startproc", "\t.p2align 4"] {
+            assert!(steps(t), "{t:?} retains its inert classification");
+        }
+        for t in [
+            "\t.byte 0xf5",
+            "\t.p2align 4,0xf8",
+            "\t.rept 2",
+            " \t.code32",
+            "\t.totally_new_directive 1",
+        ] {
+            assert!(!steps(t), "{t:?} remains an opaque/data barrier");
+        }
+        // A pass-marked nop is steppable even though its text is empty-ish:
+        // that is what `is_nop()` is for.
+        let mut marked = classify_line("    addl $1, %ecx");
+        mark_nop(&mut marked);
+        assert!(
+            super::steps_over_line(&marked, "    nop"),
+            "a marked nop must be steppable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod writes_family_tests {
+    use super::*;
+
+    #[test]
+    fn is_exact_for_the_widening_branch() {
+        let info = classify_line("    cqto");
+        // The classifier names %rax as cqto's primary destination, but %rax
+        // is the implicit INPUT; the only family written is %rdx.
+        assert!(writes_family(&info, "cqto", 2));
+        assert!(!writes_family(&info, "cqto", 0));
+    }
+
+    /// `line_writes_gp_family` (in `types.rs`, so the passes that cannot reach
+    /// this module can still ask) must never be NARROWER than this acceptance
+    /// predicate: a family this one calls written and the other does not would
+    /// split "does this line clobber the family" between the push/pop pass and
+    /// every fold. It is deliberately WIDER in two documented ways — the
+    /// two-destination forms (`xchg`/`xadd`/`cmpxchg` write an operand the AT&T
+    /// destination rule does not name) and the barrier kinds (`Call`,
+    /// `InlineAsm`, `JmpIndirect`), whose clobber set belongs to the caller's
+    /// window proof.
+    #[test]
+    fn agrees_with_the_shared_oracle() {
+        for text in [
+            "cqto",
+            "cltq",
+            "cltd",
+            "cpuid",
+            "rdtsc",
+            "rep stosq",
+            "idivq %r11",
+            "imulq %r11",
+            "imulq %r11, %rax",
+            "mulxq %r11, %rax, %rcx",
+            "xchgq %rbx, %rcx",
+            "lock xaddl %eax, %ebx",
+            "cmpxchgq %rbx, (%rdi)",
+            "pcmpistri $0, %xmm1, %xmm2",
+            "addq %rax, %rax",
+            "movq %rdi, %rcx",
+            "movq %rdi, (%rsp)",
+            "shlq %cl, %rax",
+        ] {
+            let info = classify_line(text);
+            for fam in 0u8..=7 {
+                assert!(
+                    !writes_family(&info, text, fam) || line_writes_gp_family(&info, text, fam),
+                    "{text} family {fam}: writes_family says yes, the shared oracle says no"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn covers_the_implicit_second_output() {
+        let info = classify_line("    idivq %r11");
+        assert!(writes_family(&info, "idivq %r11", 0));
+        assert!(writes_family(&info, "idivq %r11", 2));
+        assert!(!writes_family(&info, "idivq %r11", 3));
+    }
+
+    #[test]
+    fn still_answers_explicit_destinations() {
+        let info = classify_line("    movq %rcx, %rax");
+        assert!(writes_family(&info, "movq %rcx, %rax", 0));
+        assert!(!writes_family(&info, "movq %rcx, %rax", 1));
+        // An RMW of another family is not a write of the source family; a
+        // read of a family the instruction never writes must not be one
+        // either.
+        let info = classify_line("    addq %rdx, %rcx");
+        assert!(!writes_family(&info, "addq %rdx, %rcx", 2));
+        assert!(writes_family(&info, "addq %rdx, %rcx", 1));
+    }
+
+    #[test]
+    fn rejects_non_gp_families() {
+        let info = classify_line("    movsd %xmm0, %xmm1");
+        assert!(!writes_family(&info, "movsd %xmm0, %xmm1", 25));
+    }
+
+    // ── the full-width acceptance oracle ─────────────────────────────────────
+
+    #[test]
+    fn full_width_requires_32_or_64_bit_writes() {
+        // movl zero-extends: a full family redefinition.  Byte/word writes
+        // leave the upper bits of the old value observable.
+        let info = classify_line("    movl %ecx, %eax");
+        assert!(writes_family_full(&info, "movl %ecx, %eax", 0));
+        let info = classify_line("    movb $1, %al");
+        assert!(!writes_family_full(&info, "movb $1, %al", 0));
+        let info = classify_line("    movw %cx, %ax");
+        assert!(!writes_family_full(&info, "movw %cx, %ax", 0));
+        let info = classify_line("    sete %al");
+        assert!(!writes_family_full(&info, "sete %al", 0));
+        // A memory destination redefines no register.
+        let info = classify_line("    movq %rax, (%rdi)");
+        assert!(!writes_family_full(&info, "movq %rax, (%rdi)", 0));
+        // 32-bit ALU forms zero-extend too.
+        let info = classify_line("    addl %ecx, %eax");
+        assert!(writes_family_full(&info, "addl %ecx, %eax", 0));
+    }
+
+    #[test]
+    fn architectural_implicit_operand_matrix() {
+        for line in include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/implicit_operands.tsv"
+        ))
+        .lines()
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4);
+            let text = fields[0].to_owned();
+            let reads: u16 = fields[1].parse().unwrap();
+            let writes: u16 = fields[2].parse().unwrap();
+            let full: u16 = fields[3].parse().unwrap();
+            for asm in [text.clone(), format!("{text} # trailing comment")] {
+                assert_eq!(implicit_read_refs(asm.as_bytes()) & reads, reads, "{asm}");
+                assert_eq!(implicit_write_refs(asm.as_bytes()), writes, "{asm}");
+                assert_eq!(implicit_full_write_refs(asm.as_bytes()), full, "{asm}");
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_full_writes_exclude_partials_and_conditionals() {
+        // Full-width implicit writes.
+        let info = classify_line("    cqto");
+        assert!(writes_family_full(&info, "cqto", 2));
+        assert!(!writes_family_full(&info, "cqto", 0)); // %rax is the input
+        let info = classify_line("    idivq %r11");
+        assert!(writes_family_full(&info, "idivq %r11", 0));
+        assert!(writes_family_full(&info, "idivq %r11", 2));
+        let info = classify_line("    cltq");
+        assert!(writes_family_full(&info, "cltq", 0));
+        // Partial implicit writes must NOT retire the old value.
+        let info = classify_line("    lahf");
+        assert!(!writes_family_full(&info, "lahf", 0));
+        let info = classify_line("    idivb %cl");
+        assert!(!writes_family_full(&info, "idivb %cl", 0));
+        let info = classify_line("    xlat");
+        assert!(!writes_family_full(&info, "xlat", 0));
+        let info = classify_line("    fnstsw");
+        assert!(!writes_family_full(&info, "fnstsw", 0));
+        // Conditional accumulator reloads are not full redefinitions.
+        let info = classify_line("    cmpxchgq %rbx, (%rdi)");
+        assert!(!writes_family_full(&info, "cmpxchgq %rbx, (%rdi)", 0));
+        let info = classify_line("    xbegin .L1");
+        assert!(!writes_family_full(&info, "xbegin .L1", 0));
+        // The over-approximate `int` row proves nothing.
+        let info = classify_line("    int $0x80");
+        assert!(!writes_family_full(&info, "int $0x80", 0));
+        assert!(!writes_family_full(&info, "int $0x80", 5));
+    }
+
+    #[test]
+    fn bare_string_ops_flag_implicit() {
+        for t in [
+            "movsq", "movsb", "stosq", "stosl", "lodsq", "cmpsb", "scasq", "insl", "outsb",
+        ] {
+            assert!(has_implicit_reg_usage(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn repe_family_flags_implicit() {
+        for t in ["repe cmpsb", "repz scasb", "repnz scasb"] {
+            assert!(has_implicit_reg_usage(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn misc_implicit_gp_effects_flagged() {
+        for t in [
+            "loop .L1",
+            "loope .L1",
+            "xlat",
+            "xlatb",
+            "rdpmc",
+            "sysret",
+            "sysretq",
+            "sysretl",
+            "sysexit",
+            "sysexitq",
+            "sysexitl",
+            "iretq",
+            "uiret",
+            "int $3",
+            "int3",
+            "int1",
+            "into",
+            "xgetbv",
+            "rdpkru",
+            "pconfig",
+            "rsm",
+            "vmcall",
+            "vmmcall",
+            "tdcall",
+            "seamcall",
+            "getsec",
+            "enclu",
+            "encls",
+            "enclv",
+            "pushal",
+            "popal",
+            "pushaw",
+            "popaw",
+            "aaa",
+            "aam",
+            "daa",
+            "das",
+            "leaveq",
+            "skinit %eax",
+        ] {
+            assert!(has_implicit_reg_usage(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn implicit_read_only_system_ops_stay_transparent() {
+        // Read-only implicit GP traffic (the family-specific mask is what
+        // gates these) must not trip the coarse write/ABI veto, matching
+        // xsetbv/monitor/mwait.
+        for t in ["wrpkru", "monitorx", "mwaitx", "invlpga %rax, %ecx"] {
+            assert!(!has_implicit_reg_usage(t), "{t}");
+        }
+        // …but the read mask itself must still name the families.
+        assert!(implicit_read_refs(b"wrpkru") & (1u16 << 0) != 0);
+        assert!(implicit_read_refs(b"monitorx") & (1u16 << 1) != 0);
+        assert!(implicit_read_refs(b"invlpga") & (1u16 << 1) != 0);
+        // And the new writers land in the write projection.
+        assert!(implicit_write_refs(b"rdpkru") & 1u16 != 0);
+        assert!(implicit_write_refs(b"popal") & (1u16 << 3) != 0);
+        assert!(implicit_write_refs(b"daa") & 1u16 != 0);
+    }
+
+    #[test]
+    fn sign_extends_and_reads_stay_unflagged() {
+        // `movswl` shares a prefix with the `movs` string op but is a plain
+        // sign-extend with explicit operands; `xsetbv`/`monitor`/`mwait` only
+        // read GP regs implicitly (reads don't modify), so skipping them is
+        // sound and they must not abort the coalescing scans.
+        for t in [
+            "movswl %dx, %eax",
+            "movsbq %cl, %rax",
+            "xsetbv",
+            "monitor %rax, %rcx, %rdx",
+            "mwait %rax, %rcx",
+            "addl %eax, %ebx",
+        ] {
+            assert!(!has_implicit_reg_usage(t), "{t}");
+        }
+    }
+
+    /// `popq %r` has ONE operand and it is the destination, so the comma split
+    /// that serves every two-operand form matched no register name and reported
+    /// a partial write.  Every acceptance path above then lost the kill.
+    #[test]
+    fn popq_names_its_single_operand_as_a_full_width_destination() {
+        let info = classify_line("    popq %rcx");
+        assert!(writes_family_full(&info, "popq %rcx", 1));
+        // …and of no other family: the answer must stay exact, not "pop
+        // redefines the register file".
+        for fam in [0, 2, 3, 4, 5, 6, 7, 8, 15] {
+            assert!(!writes_family_full(&info, "popq %rcx", fam), "fam={fam}");
+        }
+        // Every GP family, both spellings the width test accepts.
+        for fam in 0..=REG_GP_MAX {
+            let q = format!("    popq {}", REG_NAMES[0][fam as usize]);
+            let info = classify_line(&q);
+            let t = q.trim();
+            assert!(writes_family_full(&info, t, fam), "{t}");
+            for other in 0..=REG_GP_MAX {
+                if other != fam {
+                    assert!(!writes_family_full(&info, t, other), "{t} fam={other}");
+                }
+            }
+        }
+    }
+
+    /// The negative half of the same contract: nothing that merely LOOKS like
+    /// `popq %r` may be promoted to a full redefinition.
+    #[test]
+    fn pop_lookalikes_are_not_full_writes() {
+        // `popfq`/`popfl` write flags, not a GP DATA family — the classifier
+        // gives them REG_NONE, so the explicit-destination arm answers nothing.
+        // They do, however, pop the stack, and the architectural implicit write
+        // set says so (`b"popf" | b"popfq" | b"popfw" | b"popfl" => (RSP, RSP)`
+        // in types.rs), so %rsp IS fully redefined.  Asserting "no family at
+        // all" here would be a test that is wrong about the ISA.
+        for t in ["popfq", "popfl"] {
+            let info = classify_line(&format!("    {t}"));
+            for fam in 0..=REG_GP_MAX {
+                if fam == REG_RSP {
+                    assert!(writes_family_full(&info, t, fam), "{t} must retire %rsp");
+                } else {
+                    assert!(!writes_family_full(&info, t, fam), "{t} fam={fam}");
+                }
+            }
+        }
+        // `pushq` reads its operand and writes no GP register.
+        let info = classify_line("    pushq %rcx");
+        assert!(!writes_family_full(&info, "pushq %rcx", 1));
+        // `popcnt` shares the prefix; its operand pair has a real destination
+        // and the source must not be mistaken for one.
+        let info = classify_line("    popcntl %ecx, %eax");
+        assert!(writes_family_full(&info, "popcntl %ecx, %eax", 0));
+        assert!(!writes_family_full(&info, "popcntl %ecx, %eax", 1));
+        // A pop into memory does not exist, but the width test must still
+        // refuse a non-register token rather than match by accident.
+        let info = classify_line("    popq (%rcx)");
+        assert!(!writes_family_full(&info, "popq (%rcx)", 1));
+    }
+
+    /// `xorl %ecx, %ecx` / `subl %ecx, %ecx` write a CONSTANT: the old value
+    /// is retired even though the family appears on the source side and the
+    /// mnemonic classifies as read-modify-write.
+    #[test]
+    fn self_zeroing_idiom_is_an_exact_full_kill() {
+        // Positive matrix: both idioms × both full widths × every GP family.
+        for mnemonic in ["xor", "sub"] {
+            for width in ["l", "q"] {
+                for fam in 0..=REG_GP_MAX {
+                    let row = if width == "q" { 0 } else { 1 };
+                    let name = REG_NAMES[row][fam as usize];
+                    let t = format!("{mnemonic}{width} {name}, {name}");
+                    assert!(self_zeroing_full_write(&t, fam), "{t}");
+                    for other in 0..=REG_GP_MAX {
+                        if other != fam {
+                            assert!(
+                                !self_zeroing_full_write(&t, other),
+                                "{t} must not kill fam={other}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Whitespace around the operands is insignificant in AT&T text.
+        assert!(self_zeroing_full_write("xorl %ecx,%ecx", 1));
+        assert!(self_zeroing_full_write("xorq  %rcx ,  %rcx", 1));
+    }
+
+    /// The negative half: everything that is NOT a constant write of the whole
+    /// family must be refused, because a true answer deletes a definition.
+    #[test]
+    fn self_zeroing_rejects_every_non_constant_or_partial_form() {
+        for t in [
+            // Partial widths leave the surviving bits of the 64-bit family
+            // observable.
+            "xorw %cx, %cx",
+            "xorb %cl, %cl",
+            "subw %cx, %cx",
+            "subb %cl, %cl",
+            // Different registers: a genuine read-modify-write of the dest.
+            "xorl %eax, %ecx",
+            "xorq %rcx, %rax",
+            "xorl %ecx, %eax",
+            // %rcx is the SOURCE here and %rax the destination: neither family
+            // is zeroed, and the reversed-operand spelling must not be mistaken
+            // for the idiom by a token-set comparison.
+            "subq %rcx, %rax",
+            // Value-preserving / flag-reading forms are not constant writes.
+            "andl %ecx, %ecx",
+            "orq %rcx, %rcx",
+            "adcl %ecx, %ecx",
+            "sbbl %ecx, %ecx",
+            // An immediate or a memory source is not the zeroing idiom (and
+            // the memory form genuinely reads through the address).
+            "xorl $0, %ecx",
+            "xorq $-1, %rcx",
+            "xorl (%rax), %eax",
+            "xorl (%rax,%rcx), %eax",
+            "subl 8(%rbp), %ebp",
+            // Packed / other mnemonics sharing the first three bytes.
+            "xorps %xmm0, %xmm0",
+            "xorpd %xmm1, %xmm1",
+            "subss %xmm0, %xmm0",
+            "subpd %xmm2, %xmm2",
+            // Suffix-less and malformed spellings.
+            "xor",
+            "xor %ecx, %ecx",
+            "xorl",
+            "xorl %ecx",
+            "",
+            "    ",
+            "xorl\t%ecx, %ecx",
+        ] {
+            for fam in 0..=REG_GP_MAX {
+                assert!(
+                    !self_zeroing_full_write(t, fam),
+                    "{t:?} must not be a self-zeroing kill of fam={fam}"
+                );
+            }
+        }
+        // Out-of-range families (XMM ids, REG_NONE) are never GP kills.
+        assert!(!self_zeroing_full_write("xorl %ecx, %ecx", REG_NONE));
+        assert!(!self_zeroing_full_write("xorl %ecx, %ecx", REG_GP_MAX + 1));
+    }
+
+    /// The two rules of the classifier, in both directions.  Data-emitting and
+    /// meaning-changing directives must block a window; pure bookkeeping must
+    /// not, because a fold blocked by a `.cfi_*` line is a lost optimisation and
+    /// nobody writes a test for those.
+    #[test]
+    fn directive_classifier_blocks_data_and_mode_changes() {
+        for t in [
+            ".byte 0xf8",
+            ".long .LBB33 - .Ljt_0",
+            ".quad 0",
+            ".zero 16",
+            ".space 8",
+            ".skip 4",
+            ".fill 1,1,0xF8",
+            ".ascii \"x\"",
+            ".inst.n 0xbf00",
+            // Fill bytes are arbitrary data: 0xf8 is `clc`, 0xcc is `int3`.
+            ".p2align 4,0xf8",
+            ".p2align 4, 0xcc",
+            ".align 16,0xcc",
+            ".balign 8, 0x90",
+            // Not data, but they change what the neighbouring lines mean.
+            ".text",
+            ".section .rodata",
+            ".pushsection .note.lccc",
+            ".popsection",
+            ".previous",
+            ".subsection 2",
+            ".code32",
+            ".code16",
+            ".arch i8086",
+            ".intel_syntax noprefix",
+            ".att_syntax prefix",
+            // Conditional assembly can delete or duplicate lines wholesale.
+            ".if 0",
+            ".else",
+            ".endif",
+            ".macro foo",
+            ".endm",
+            ".rept 4",
+            // Unrecognised is not harmless.
+            ".totally_new_directive 1",
+        ] {
+            assert!(
+                directive_emits_data(t),
+                "{t:?} must not be treated as benign"
+            );
+        }
+    }
+
+    #[test]
+    fn directive_classifier_allows_pure_bookkeeping() {
+        for t in [
+            ".cfi_startproc",
+            ".cfi_endproc",
+            ".cfi_def_cfa_offset 32",
+            // The one that used to be missing from the enumeration and is in
+            // every prologue: `.eh_frame` only, so it must never block a fold.
+            ".cfi_adjust_cfa_offset 16",
+            ".cfi_lsda 0x1b,4,.Laset0",
+            ".cfi_escape 0x2a",
+            ".p2align 4",
+            ".p2align 4,,10",
+            ".align 4",
+            ".balign 16",
+            ".loc 1 42 7",
+            ".file 1 \"x.c\"",
+            ".globl f",
+            ".type f,@function",
+            ".size f, .-f",
+            ".ident \"lccc\"",
+            ".comm x,16,16",
+            ".equ K,3",
+        ] {
+            assert!(
+                !directive_emits_data(t),
+                "{t:?} emits nothing into the current section and changes no                  neighbouring line: blocking a fold on it is a lost optimisation"
+            );
+        }
+        // Not a directive at all -> the caller's other predicates decide.
+        assert!(!directive_emits_data("nop"));
+        assert!(!directive_emits_data("  .Ltmp3:"));
+    }
+
+    #[test]
+    fn alignment_fill_lexing_distinguishes_the_two_forms() {
+        assert!(!alignment_fill_is_explicit(" 4"));
+        assert!(!alignment_fill_is_explicit(" 4,,10"));
+        assert!(!alignment_fill_is_explicit(" 4, ,10"));
+        assert!(alignment_fill_is_explicit(" 4,0xf8"));
+        assert!(alignment_fill_is_explicit(" 16, 0xcc"));
+        assert!(alignment_fill_is_explicit(" 8, 0, 16"));
+    }
+}
+
+#[cfg(test)]
+mod implicit_veto_tests {
+    use super::has_implicit_reg_usage;
+    use crate::backend::x86::codegen::peephole::types::implicit_r_w_full;
+
+    /// CONTRACT: this veto must remain a SUPERSET of the shared operand
+    /// model's write half.  It is a veto, so over-reporting only costs an
+    /// optimisation while under-reporting is a miscompile: a pass that
+    /// renames or retires a register the instruction defines anonymously
+    /// would be working from a false premise.
+    ///
+    /// The property holds today because the tail of `has_implicit_reg_usage`
+    /// consults `has_bare_implicit_gp_effect`, which asks the model
+    /// directly.  This test exists so that a future "fast reject" arm added
+    /// above that tail cannot shadow a mnemonic the model knows about --
+    /// exactly the shape of the bug this area has produced before.
+    #[test]
+    fn every_modelled_implicit_write_is_vetoed() {
+        let samples = [
+            "cltd",
+            "cqto",
+            "cqo",
+            "cwd",
+            "cdq",
+            "cltq",
+            "cdqe",
+            "cbw",
+            "cwtl",
+            "idivl %ecx",
+            "idivq %rcx",
+            "divl %ecx",
+            "divq %rcx",
+            "divb %cl",
+            "imulq %rsi",
+            "imull %esi",
+            "imulw %bx",
+            "mulq %rsi",
+            "mull %esi",
+            "mulxq %rsi, %rdi, %rdx",
+            "fnstsw %ax",
+            "rdtsc",
+            "rdtscp",
+            "rdmsr",
+            "cpuid",
+            "syscall",
+            "sysenter",
+            "sysexitq",
+            "rsm",
+            "leave",
+            "rep movsq",
+            "repne scasb",
+            "rep stosb",
+            "popa",
+            "popal",
+            "pushfq",
+            "popfq",
+            "rdpkru",
+            "rdpru",
+            "clzero",
+            "enter $8, $0",
+        ];
+        let mut missed = Vec::new();
+        for asm in samples {
+            if implicit_r_w_full(asm.as_bytes()).1 != 0 && !has_implicit_reg_usage(asm) {
+                missed.push(asm);
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "the veto does not cover modelled implicit writes: {missed:?}"
+        );
+        assert!(samples.len() >= 40);
+    }
+
+    /// The veto must accept untrimmed input; a formatting difference must
+    /// never turn a refusal into an acceptance.
+    #[test]
+    fn leading_whitespace_cannot_silence_the_veto() {
+        for asm in ["cltd", "  cltd", "\tcltd", "    idivq %rcx"] {
+            assert!(has_implicit_reg_usage(asm), "{asm:?} must be vetoed");
+        }
+    }
+
+    /// ...and pure register-to-register forms must stay optimisable, or the
+    /// passes that ask this question would stop working entirely.
+    #[test]
+    fn plain_forms_are_not_vetoed() {
+        for asm in [
+            "movq %rax, %rbx",
+            "movl %eax, %ebx",
+            "addq %rcx, %rax",
+            "imulq $3, %rax, %rbx",
+            "imulq %rsi, %rdi",
+            "leaq 8(%rdi), %rax",
+            "cmpq %rsi, %rdi",
+            "sete %al",
+            "cmovne %rax, %rbx",
+            // Shift-by-%cl names its count register, so the caller's operand
+            // scan already sees the read; vetoing it here would only cost an
+            // optimisation.  (Read-only implicit traffic is modelled by
+            // `implicit_read_refs`, which the coalescers consult.)
+            "shlq %cl, %rax",
+            "sarq %cl, %rax",
+            "xsave (%rdi)",
+            "monitor %rax, %rcx, %rdx",
+        ] {
+            assert!(!has_implicit_reg_usage(asm), "{asm} must stay optimisable");
+        }
+    }
+}

@@ -1,0 +1,27 @@
+Latest main: 7ddb770f56027e1d9e71e2bf60645bdf5c9297b2
+Candidate: 3313ef9caef5bdf910226d94cd9a69a86606c561
+Flags: -O2 -march=x86-64-v3; verifying SSA and IR on the patched compiler
+--- randomized same-TU overlap, base ---
+scalar-reference digest mismatch: 27a5e1d3
+exit=9
+--- cross-TU alias, base ---
+exit=1
+--- randomized same-TU overlap, patched ---
+loop-idiom overlap: 4238867d (8192 randomized + 288 global cases)
+exit=0
+--- cross-TU alias, patched ---
+exit=0
+--- randomized same-TU overlap, gcc ---
+loop-idiom overlap: 4238867d (8192 randomized + 288 global cases)
+exit=0
+--- cross-TU alias, gcc ---
+exit=1
+--- header bound alias, same-TU ---
+Latest main -O2: prints 'loop-idiom bound alias: 1114114', exit 1; rewrote loop to unconditional memmove.
+Candidate -O2: prints 'loop-idiom bound alias: 2', exit 0; rejects hoisting the potentially-aliased header load.
+GCC -O2: prints 'loop-idiom bound alias: 2', exit 0.
+
+Cross-TU global alias uses a GNU/ELF alias extension: GCC -O2 also returns 1
+when the alias declaration is invisible to the copy TU (GCC -O0 returns 0).
+The scalar loop, not GCC -O2's assumption about extern symbol names, is the
+reference for this cross-TU extension. Candidate LCCC returns 0.

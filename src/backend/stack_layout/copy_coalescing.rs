@@ -1,0 +1,3808 @@
+//! Copy coalescing, immediately-consumed GPR analysis, vector-store deferral.
+//!
+//! Stack coalescing is frequency-weighted conservative move coalescing on a
+//! CFG-precise, copy-aware interference graph (George/Appel; Chaitin/Briggs
+//! move rule). For `d = copy s`, `d` interferes with every value live after
+//! the copy except `s`. Unlimited stack homes ⇒ the George test collapses to
+//! “no edge”: greedy merge by execution weight is the practical maximum-
+//! weight coalescing heuristic (exact MWCP is NP-hard).
+//!
+//! Weights use the same `10^depth` loop scale as RA so inner-loop copies
+//! win ties against cold ones. CFG matches `liveness.rs` (terminators +
+//! asm-goto). Safe degradation is extra slots, never a wrong merge.
+//!
+//! Values that cannot honour the shared slot's width are excluded up front
+//! (see [`collect_unsound_coalesce_ids`]): inline-asm operands, and narrow
+//! call results, whose spill width is pinned to the ABI return register.
+
+use std::sync::OnceLock;
+
+use crate::backend::liveness::{
+    LivenessResult, for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
+};
+use crate::backend::regalloc::{PhysReg, detect_phi_coalesce_groups};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
+
+fn cfg_copy_coalesce_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_CFG_COPY_COALESCE").is_none());
+    *ENABLED
+}
+
+fn env_flag(name: &'static str) -> bool {
+    std::env::var_os(name).is_some()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoalesceClass {
+    Scalar,
+    Vector,
+}
+
+fn scalar_type(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::Ptr
+    )
+}
+
+fn scalar_const(c: IrConst) -> bool {
+    matches!(
+        c,
+        IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero
+    )
+}
+
+fn ty_lives_in_gpr_cache(ty: IrType) -> bool {
+    scalar_type(ty) && !ty.is_float() && !ty.is_128bit() && !ty.is_long_double()
+}
+
+/// `10^min(depth,6)` so an inner-loop copy outranks any nest of cold ones.
+/// Multi-def (phi / loop-carried) gets another ×10: those copies execute
+/// once per iteration and dominate stack traffic on spilled IVs.
+fn copy_weight(loop_depth: u32, touches_multi_def: bool) -> u32 {
+    let mut w = 1u32;
+    for _ in 0..loop_depth.min(6) {
+        w = w.saturating_mul(10);
+    }
+    if touches_multi_def {
+        w = w.saturating_mul(10);
+    }
+    w
+}
+
+fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
+    let mut classes: FxHashMap<u32, CoalesceClass> = FxHashMap::default();
+    let mut allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut copy_dests_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                allocas.insert(dest.0);
+            }
+            match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Cast {
+                    dest, to_ty: ty, ..
+                }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::Select { dest, ty, .. }
+                | Instruction::AtomicLoad { dest, ty, .. }
+                | Instruction::AtomicRmw { dest, ty, .. }
+                | Instruction::AtomicCmpxchg { dest, ty, .. }
+                | Instruction::ParamRef { dest, ty, .. }
+                    if scalar_type(*ty) =>
+                {
+                    classes.insert(dest.0, CoalesceClass::Scalar);
+                }
+                Instruction::Cmp { dest, .. }
+                | Instruction::GetElementPtr { dest, .. }
+                | Instruction::GlobalAddr { dest, .. }
+                | Instruction::LabelAddr { dest, .. } => {
+                    classes.insert(dest.0, CoalesceClass::Scalar);
+                }
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. }
+                    if info.dest.is_some() && scalar_type(info.return_type) =>
+                {
+                    if let Some(d) = info.dest {
+                        classes.insert(d.0, CoalesceClass::Scalar);
+                    }
+                }
+                Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                } if op.vector_home_width().is_some() => {
+                    classes.insert(d.0, CoalesceClass::Vector);
+                }
+                Instruction::Phi { dest, ty, .. } if scalar_type(*ty) => {
+                    classes.insert(dest.0, CoalesceClass::Scalar);
+                }
+                Instruction::Copy { dest, src } => {
+                    if !allocas.contains(&dest.0) && !classes.contains_key(&dest.0) {
+                        match src {
+                            Operand::Value(v) => {
+                                copy_dests_of.entry(v.0).or_default().push(dest.0);
+                            }
+                            Operand::Const(c) if scalar_const(*c) => {
+                                classes.insert(dest.0, CoalesceClass::Scalar);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut work: Vec<(u32, CoalesceClass)> = classes.iter().map(|(&id, &cls)| (id, cls)).collect();
+    while let Some((id, cls)) = work.pop() {
+        let Some(dests) = copy_dests_of.get(&id) else {
+            continue;
+        };
+        for &dest in dests {
+            if allocas.contains(&dest) || classes.contains_key(&dest) {
+                continue;
+            }
+            classes.insert(dest, cls);
+            work.push((dest, cls));
+        }
+    }
+
+    for id in allocas {
+        classes.remove(&id);
+    }
+    classes
+}
+
+fn collect_unsound_coalesce_ids(func: &IrFunction) -> FxHashSet<u32> {
+    let mut ids = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // CALL RESULTS MUST NOT SHARE A STACK SLOT.
+            //
+            // The width-class unification in `slot_assignment::resolve_copy_aliases`
+            // lets a narrow web member store through `movq` into its wide root's
+            // 8-byte slot, on the documented premise that "every access to the
+            // shared slot is 8 bytes wide and no stale upper half can survive".
+            // A call's return value breaks that premise: it is spilled straight
+            // out of the ABI return register at the *call's* return width, so a
+            // `u32`-returning call emits `movl %eax, slot` no matter how wide the
+            // shared slot is.  The upper half keeps whatever the slot held before,
+            // and the root's 8-byte `movq` reload then reads it.
+            //
+            // tests/regression/acpica_name_string_outparam.c caught exactly this:
+            // `acpi_ex_name_segment`'s `u32` status (v40) was coalesced with the
+            // `status` phi (v155, wide because its `Const(I64(2))` incoming types
+            // it I64), giving
+            //     call acpi_ex_name_segment ; movl %eax,56(%rsp)   <- 4-byte store
+            //     ...                       ; movq 56(%rsp),%r11   <- 8-byte reload
+            // so the caller read uninitialized frame bytes above the status and
+            // `acpi_ex_get_name_string` reported a garbage `out_name_length`.
+            // The value is not widenable at the spill site, so refuse the merge;
+            // the cost is one extra slot per coalesced call result.
+            //
+            // Only a NARROW return is affected. A pointer/64-bit result is
+            // already spilled with `movq`, so it fills the whole slot and can
+            // keep coalescing; that is the common case (every allocator call),
+            // so the restriction costs nothing there.
+            if let Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } = inst {
+                if let Some(dest) = info.dest {
+                    // `scalar_type` is the GPR class the coalescer works in;
+                    // within it, only a sub-8-byte return is spilled narrow.
+                    if scalar_type(info.return_type) && info.return_type.size() <= 4 {
+                        ids.insert(dest.0);
+                    }
+                }
+            }
+            if let Instruction::InlineAsm { outputs, .. } = inst {
+                for (_, v, _) in outputs {
+                    ids.insert(v.0);
+                }
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        ids.insert(v.0);
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| {
+                    ids.insert(v.0);
+                });
+            }
+        }
+    }
+    ids
+}
+
+fn collect_alloca_ids(func: &IrFunction) -> FxHashSet<u32> {
+    let mut ids = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                ids.insert(dest.0);
+            }
+        }
+    }
+    ids
+}
+
+fn for_each_instruction_value_use(inst: &Instruction, mut f: impl FnMut(u32)) {
+    for_each_operand_in_instruction(inst, |op| {
+        if let Operand::Value(v) = op {
+            f(v.0);
+        }
+    });
+    for_each_value_use_in_instruction(inst, |v| f(v.0));
+}
+
+fn for_each_terminator_value_use(term: &Terminator, mut f: impl FnMut(u32)) {
+    for_each_operand_in_terminator(term, |op| {
+        if let Operand::Value(v) = op {
+            f(v.0);
+        }
+    });
+}
+
+fn instruction_uses_value(inst: &Instruction, id: u32) -> bool {
+    let mut found = false;
+    for_each_instruction_value_use(inst, |v| {
+        if v == id {
+            found = true;
+        }
+    });
+    found
+}
+
+fn instruction_def_id(inst: &Instruction) -> Option<u32> {
+    if let Some(dest) = inst.dest() {
+        return Some(dest.0);
+    }
+    match inst {
+        Instruction::Copy { dest, .. } | Instruction::Phi { dest, .. } => Some(dest.0),
+        _ => None,
+    }
+}
+
+fn operand_is_value(op: &Operand, id: u32) -> bool {
+    matches!(op, Operand::Value(v) if v.0 == id)
+}
+
+fn operand_is_const(op: &Operand) -> bool {
+    matches!(op, Operand::Const(_))
+}
+
+/// CFG identical to `liveness.rs`: terminator edges + InlineAsm goto.
+fn build_block_cfg(func: &IrFunction) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let nblocks = func.blocks.len();
+    let mut label_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
+    label_to_idx.reserve(nblocks);
+    for (idx, block) in func.blocks.iter().enumerate() {
+        label_to_idx.insert(block.label.0, idx);
+    }
+
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+    let add_edge = |succs: &mut [Vec<usize>], from: usize, label: u32| {
+        if let Some(&to) = label_to_idx.get(&label) {
+            if !succs[from].contains(&to) {
+                succs[from].push(to);
+            }
+        }
+    };
+
+    for (idx, block) in func.blocks.iter().enumerate() {
+        match &block.terminator {
+            Terminator::Branch(target) => add_edge(&mut succs, idx, target.0),
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                add_edge(&mut succs, idx, true_label.0);
+                add_edge(&mut succs, idx, false_label.0);
+            }
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => {
+                for t in possible_targets {
+                    add_edge(&mut succs, idx, t.0);
+                }
+            }
+            Terminator::Switch { cases, default, .. } => {
+                add_edge(&mut succs, idx, default.0);
+                for (_, label) in cases {
+                    add_edge(&mut succs, idx, label.0);
+                }
+            }
+            _ => {}
+        }
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                for (_, label) in goto_labels {
+                    add_edge(&mut succs, idx, label.0);
+                }
+            }
+        }
+    }
+
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+    for (src, dests) in succs.iter().enumerate() {
+        for &d in dests {
+            preds[d].push(src);
+        }
+    }
+    (succs, preds)
+}
+
+fn cfg_postorder(succs: &[Vec<usize>]) -> Vec<usize> {
+    let n = succs.len();
+    let mut state = vec![0u8; n];
+    let mut post = Vec::with_capacity(n);
+    let mut next = vec![0usize; n];
+    for start in 0..n {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut stack = vec![start];
+        while let Some(&b) = stack.last() {
+            let i = next[b];
+            if i < succs[b].len() {
+                next[b] = i + 1;
+                let s = succs[b][i];
+                if s < n && state[s] == 0 {
+                    state[s] = 1;
+                    stack.push(s);
+                }
+            } else {
+                state[b] = 2;
+                post.push(b);
+                stack.pop();
+            }
+        }
+    }
+    post
+}
+
+/// Natural-loop depth, one increment per header (two latches ≠ nest).
+fn cheap_loop_depth(succs: &[Vec<usize>], preds: &[Vec<usize>]) -> Vec<u32> {
+    let n = succs.len();
+    let mut depth = vec![0u32; n];
+    if n == 0 {
+        return depth;
+    }
+
+    let mut state = vec![0u8; n];
+    let mut next = vec![0usize; n];
+    let mut back_headers: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for start in 0..n {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        let mut stack = vec![start];
+        while let Some(&b) = stack.last() {
+            let i = next[b];
+            if i < succs[b].len() {
+                next[b] = i + 1;
+                let s = succs[b][i];
+                if s >= n {
+                    continue;
+                }
+                match state[s] {
+                    0 => {
+                        state[s] = 1;
+                        stack.push(s);
+                    }
+                    1 => back_headers.entry(s).or_default().push(b),
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+                stack.pop();
+            }
+        }
+    }
+
+    for (&header, tails) in &back_headers {
+        let mut seen = vec![false; n];
+        seen[header] = true;
+        depth[header] = depth[header].saturating_add(1);
+        let mut work: Vec<usize> = Vec::new();
+        for &tail in tails {
+            if tail == header || seen[tail] {
+                continue;
+            }
+            seen[tail] = true;
+            depth[tail] = depth[tail].saturating_add(1);
+            work.push(tail);
+        }
+        while let Some(b) = work.pop() {
+            for &p in &preds[b] {
+                if p < n && !seen[p] {
+                    seen[p] = true;
+                    depth[p] = depth[p].saturating_add(1);
+                    work.push(p);
+                }
+            }
+        }
+    }
+    depth
+}
+
+fn loop_depth_for(func: &IrFunction, liveness: Option<&LivenessResult>) -> Vec<u32> {
+    if let Some(lr) = liveness {
+        if lr.block_loop_depth.len() == func.blocks.len() {
+            return lr.block_loop_depth.clone();
+        }
+    }
+    let (succs, preds) = build_block_cfg(func);
+    cheap_loop_depth(&succs, &preds)
+}
+
+// ── Dense bitsets ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BitSet {
+    words: Vec<u64>,
+    nbits: usize,
+}
+
+impl BitSet {
+    fn new(n: usize) -> Self {
+        Self {
+            words: vec![0; n.saturating_add(63) / 64],
+            nbits: n,
+        }
+    }
+
+    fn clear(&mut self) {
+        for w in &mut self.words {
+            *w = 0;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, i: usize) {
+        if i < self.nbits {
+            self.words[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, i: usize) {
+        if i < self.nbits {
+            self.words[i / 64] &= !(1u64 << (i % 64));
+        }
+    }
+
+    #[inline]
+    fn contains(&self, i: usize) -> bool {
+        i < self.nbits && self.words[i / 64] & (1u64 << (i % 64)) != 0
+    }
+
+    #[inline]
+    fn union_with(&mut self, other: &Self) -> bool {
+        let mut changed = false;
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            let n = *a | *b;
+            changed |= n != *a;
+            *a = n;
+        }
+        changed
+    }
+
+    #[inline]
+    fn intersects(&self, other: &Self) -> bool {
+        self.words
+            .iter()
+            .zip(other.words.iter())
+            .any(|(a, b)| a & b != 0)
+    }
+
+    #[inline]
+    fn or_and_not(&mut self, other: &Self, mask: &Self) {
+        for ((a, b), m) in self
+            .words
+            .iter_mut()
+            .zip(other.words.iter())
+            .zip(mask.words.iter())
+        {
+            *a |= *b & !*m;
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut(usize)) {
+        for (wi, &word) in self.words.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                let i = wi * 64 + b;
+                if i < self.nbits {
+                    f(i);
+                }
+                bits &= bits - 1;
+            }
+        }
+    }
+}
+
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    let mut root = x;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    while parent[x] != root {
+        let next = parent[x];
+        parent[x] = root;
+        x = next;
+    }
+    root
+}
+
+/// Worklist liveness seeded in reverse postorder (exits first), then
+/// copy-aware interference. Lattice-height cap is an impl-bug guard only.
+fn cfg_copy_interference(func: &IrFunction, dense: &FxHashMap<u32, usize>) -> Option<Vec<BitSet>> {
+    let n = dense.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let nblocks = func.blocks.len();
+    if nblocks == 0 {
+        return Some(vec![BitSet::new(n); n]);
+    }
+
+    let (succs, preds) = build_block_cfg(func);
+
+    let mut block_use: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    let mut block_def: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            for_each_instruction_value_use(inst, |value| {
+                if let Some(&id) = dense.get(&value) {
+                    if !block_def[block_idx].contains(id) {
+                        block_use[block_idx].insert(id);
+                    }
+                }
+            });
+            if let Some(dest) = instruction_def_id(inst) {
+                if let Some(&id) = dense.get(&dest) {
+                    block_def[block_idx].insert(id);
+                }
+            }
+        }
+        for_each_terminator_value_use(&block.terminator, |value| {
+            if let Some(&id) = dense.get(&value) {
+                if !block_def[block_idx].contains(id) {
+                    block_use[block_idx].insert(id);
+                }
+            }
+        });
+    }
+
+    let mut label_to_idx: FxHashMap<u32, usize> = FxHashMap::default();
+    for (idx, block) in func.blocks.iter().enumerate() {
+        label_to_idx.insert(block.label.0, idx);
+    }
+    // Unlowered phi: incoming is a use at the predecessor terminator, dest
+    // is a def at the header (same contract as liveness.rs).
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if let Some(&id) = dense.get(&dest.0) {
+                    block_def[block_idx].insert(id);
+                }
+                for (op, pred_label) in incoming {
+                    if let Operand::Value(v) = op {
+                        if let Some(&id) = dense.get(&v.0) {
+                            if let Some(&pred) = label_to_idx.get(&pred_label.0) {
+                                if !block_def[pred].contains(id) {
+                                    block_use[pred].insert(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut live_in: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    let mut live_out: Vec<BitSet> = vec![BitSet::new(n); nblocks];
+    let post = cfg_postorder(&succs);
+    let mut work: Vec<usize> = post.iter().rev().copied().collect();
+    let mut on_work = vec![false; nblocks];
+    for &b in &work {
+        on_work[b] = true;
+    }
+    for b in 0..nblocks {
+        if !on_work[b] {
+            on_work[b] = true;
+            work.push(b);
+        }
+    }
+
+    let max_steps = nblocks
+        .saturating_mul(n.saturating_add(2))
+        .saturating_add(16);
+    let mut steps = 0usize;
+    let mut scratch = BitSet::new(n);
+    let mut out = BitSet::new(n);
+
+    while let Some(block_idx) = work.pop() {
+        on_work[block_idx] = false;
+        steps += 1;
+        if steps > max_steps {
+            return None;
+        }
+
+        out.clear();
+        for &succ in &succs[block_idx] {
+            if succ < nblocks {
+                out.union_with(&live_in[succ]);
+            }
+        }
+
+        scratch.clone_from(&block_use[block_idx]);
+        scratch.or_and_not(&out, &block_def[block_idx]);
+
+        if out != live_out[block_idx] {
+            live_out[block_idx].clone_from(&out);
+        }
+        if scratch != live_in[block_idx] {
+            live_in[block_idx].clone_from(&scratch);
+            for &p in &preds[block_idx] {
+                if !on_work[p] {
+                    on_work[p] = true;
+                    work.push(p);
+                }
+            }
+        }
+    }
+
+    let mut adj = vec![BitSet::new(n); n];
+    let mut live = BitSet::new(n);
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        live.clone_from(&live_out[block_idx]);
+        for_each_terminator_value_use(&block.terminator, |value| {
+            if let Some(&id) = dense.get(&value) {
+                live.insert(id);
+            }
+        });
+        for &succ in &succs[block_idx] {
+            if succ >= nblocks {
+                continue;
+            }
+            for inst in &func.blocks[succ].instructions {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, pred_label) in incoming {
+                        if pred_label.0 == func.blocks[block_idx].label.0 {
+                            if let Operand::Value(v) = op {
+                                if let Some(&id) = dense.get(&v.0) {
+                                    live.insert(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for inst in block.instructions.iter().rev() {
+            let copy_source = match inst {
+                Instruction::Copy {
+                    src: Operand::Value(source),
+                    ..
+                } => dense.get(&source.0).copied(),
+                _ => None,
+            };
+            if let Some(dest) = instruction_def_id(inst) {
+                if let Some(&di) = dense.get(&dest) {
+                    live.for_each(|other| {
+                        if copy_source != Some(other) && other != di {
+                            adj[di].insert(other);
+                            adj[other].insert(di);
+                        }
+                    });
+                    live.remove(di);
+                }
+            }
+            for_each_instruction_value_use(inst, |value| {
+                if let Some(&id) = dense.get(&value) {
+                    live.insert(id);
+                }
+            });
+        }
+    }
+    Some(adj)
+}
+
+struct Affinity {
+    dest: u32,
+    src: u32,
+    weight: u32,
+}
+
+fn try_push_affinity(
+    out: &mut Vec<Affinity>,
+    dest: u32,
+    src: u32,
+    weight: u32,
+    classes: &FxHashMap<u32, CoalesceClass>,
+    unsound: &FxHashSet<u32>,
+    reg_assigned: &FxHashMap<u32, PhysReg>,
+) {
+    if dest == src
+        || reg_assigned.contains_key(&dest)
+        || reg_assigned.contains_key(&src)
+        || unsound.contains(&dest)
+        || unsound.contains(&src)
+    {
+        return;
+    }
+    let (Some(&dc), Some(&sc)) = (classes.get(&dest), classes.get(&src)) else {
+        return;
+    };
+    if dc != sc {
+        return;
+    }
+    out.push(Affinity { dest, src, weight });
+}
+
+fn build_cfg_copy_alias_map(
+    func: &IrFunction,
+    multi_def_values: &FxHashSet<u32>,
+    reg_assigned: &FxHashMap<u32, PhysReg>,
+    liveness: Option<&LivenessResult>,
+) -> (FxHashMap<u32, u32>, FxHashSet<u32>) {
+    let classes = collect_scalar_values(func);
+    let unsound = collect_unsound_coalesce_ids(func);
+    let depths = loop_depth_for(func, liveness);
+
+    let mut affinities: Vec<Affinity> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let depth = depths.get(bi).copied().unwrap_or(0);
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(source),
+                } => {
+                    let multi =
+                        multi_def_values.contains(&dest.0) || multi_def_values.contains(&source.0);
+                    try_push_affinity(
+                        &mut affinities,
+                        dest.0,
+                        source.0,
+                        copy_weight(depth, multi),
+                        &classes,
+                        &unsound,
+                        reg_assigned,
+                    );
+                }
+                // Virtual copies: unlowered phi incoming ≡ copy at the pred edge.
+                Instruction::Phi { dest, incoming, .. } => {
+                    for (op, pred_label) in incoming {
+                        let Operand::Value(source) = op else {
+                            continue;
+                        };
+                        let pred_depth = func
+                            .blocks
+                            .iter()
+                            .position(|b| b.label.0 == pred_label.0)
+                            .and_then(|i| depths.get(i).copied())
+                            .unwrap_or(depth);
+                        try_push_affinity(
+                            &mut affinities,
+                            dest.0,
+                            source.0,
+                            copy_weight(pred_depth, true),
+                            &classes,
+                            &unsound,
+                            reg_assigned,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Loop-phi pairs the linear-scan interval check would reject after the
+    // fact: feed them through the *same* graph. If they interfere here they
+    // are not merged (CFG proof wins). High weight so a legal pair is not
+    // blocked by an earlier cold merge.
+    if let Some(lr) = liveness {
+        for cand in detect_phi_coalesce_groups(func, lr) {
+            let depth = 4;
+            try_push_affinity(
+                &mut affinities,
+                cand.phi_dest,
+                cand.backedge_src,
+                copy_weight(depth, true),
+                &classes,
+                &unsound,
+                reg_assigned,
+            );
+        }
+    }
+
+    affinities.sort_unstable_by(|a, b| {
+        b.weight
+            .cmp(&a.weight)
+            .then(a.dest.cmp(&b.dest))
+            .then(a.src.cmp(&b.src))
+    });
+    affinities.dedup_by(|a, b| a.dest == b.dest && a.src == b.src);
+    if affinities.is_empty() {
+        return (FxHashMap::default(), FxHashSet::default());
+    }
+
+    let mut tracked: Vec<u32> = affinities.iter().flat_map(|a| [a.dest, a.src]).collect();
+    tracked.sort_unstable();
+    tracked.dedup();
+
+    let mut dense: FxHashMap<u32, usize> = FxHashMap::default();
+    dense.reserve(tracked.len());
+    for (i, &v) in tracked.iter().enumerate() {
+        dense.insert(v, i);
+    }
+    let n = tracked.len();
+
+    let Some(adj) = cfg_copy_interference(func, &dense) else {
+        return (FxHashMap::default(), FxHashSet::default());
+    };
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut members: Vec<BitSet> = (0..n)
+        .map(|i| {
+            let mut s = BitSet::new(n);
+            s.insert(i);
+            s
+        })
+        .collect();
+    let mut inter = adj;
+
+    for aff in &affinities {
+        let Some(&d) = dense.get(&aff.dest) else {
+            continue;
+        };
+        let Some(&s) = dense.get(&aff.src) else {
+            continue;
+        };
+        let dest_root = uf_find(&mut parent, d);
+        let source_root = uf_find(&mut parent, s);
+        if dest_root == source_root {
+            continue;
+        }
+        if inter[dest_root].intersects(&members[source_root])
+            || inter[source_root].intersects(&members[dest_root])
+        {
+            continue;
+        }
+        let dest_root_val = tracked[dest_root];
+        let source_root_val = tracked[source_root];
+        let owner = match (
+            multi_def_values.contains(&dest_root_val),
+            multi_def_values.contains(&source_root_val),
+        ) {
+            (true, false) => dest_root,
+            (false, true) => source_root,
+            _ => {
+                if dest_root_val <= source_root_val {
+                    dest_root
+                } else {
+                    source_root
+                }
+            }
+        };
+        let other = if owner == dest_root {
+            source_root
+        } else {
+            dest_root
+        };
+        let other_members = members[other].clone();
+        let other_inter = inter[other].clone();
+        members[owner].union_with(&other_members);
+        inter[owner].union_with(&other_inter);
+        parent[other] = owner;
+    }
+
+    let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for i in 0..n {
+        let root = uf_find(&mut parent, i);
+        groups.entry(tracked[root]).or_default().push(tracked[i]);
+    }
+
+    let mut aliases = FxHashMap::default();
+    let mut force_aliases = FxHashSet::default();
+    for (root, mut group_members) in groups {
+        group_members.sort_unstable();
+        if group_members.len() < 2 {
+            continue;
+        }
+        let preferred_root = group_members
+            .iter()
+            .copied()
+            .filter(|id| multi_def_values.contains(id))
+            .min()
+            .unwrap_or(root);
+        for member in group_members {
+            if member != preferred_root {
+                aliases.insert(member, preferred_root);
+                force_aliases.insert(member);
+            }
+        }
+    }
+
+    if env_flag("CCC_DEBUG_SLOT_COALESCE") && !aliases.is_empty() {
+        let mut pairs: Vec<(u32, u32)> = aliases.iter().map(|(&a, &b)| (a, b)).collect();
+        pairs.sort_unstable();
+        eprintln!(
+            "[CFG-SLOT-COALESCE] fn={} candidates={} aliases={} pairs={:?}",
+            func.name,
+            tracked.len(),
+            pairs.len(),
+            pairs,
+        );
+    }
+    (aliases, force_aliases)
+}
+
+/// dest_id → root_id for Copy instructions that can share a stack slot.
+///
+/// Returns `(copy_alias, phi_web_aliases, loop_phi_aliases)`:
+/// - `phi_web_aliases` need force-overwrite in `resolve_copy_aliases`
+/// - `loop_phi_aliases` skip the generic def/last-use check (legacy path)
+pub(super) fn build_copy_alias_map(
+    func: &IrFunction,
+    def_block: &FxHashMap<u32, usize>,
+    multi_def_values: &FxHashSet<u32>,
+    reg_assigned: &FxHashMap<u32, PhysReg>,
+    use_blocks_map: &FxHashMap<u32, Vec<usize>>,
+    cached_liveness: &Option<LivenessResult>,
+) -> (FxHashMap<u32, u32>, FxHashSet<u32>, FxHashSet<u32>) {
+    if cfg_copy_coalesce_enabled() {
+        let (aliases, force) = build_cfg_copy_alias_map(
+            func,
+            multi_def_values,
+            reg_assigned,
+            cached_liveness.as_ref(),
+        );
+        return (aliases, force, FxHashSet::default());
+    }
+
+    let classes = collect_scalar_values(func);
+    let unsound = collect_unsound_coalesce_ids(func);
+
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_instruction_value_use(inst, |v| {
+                *use_count.entry(v).or_insert(0) += 1;
+            });
+        }
+        for_each_terminator_value_use(&block.terminator, |v| {
+            *use_count.entry(v).or_insert(0) += 1;
+        });
+    }
+
+    let same_class = |a: u32, b: u32| -> bool {
+        match (classes.get(&a), classes.get(&b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    };
+
+    let mut raw_aliases: Vec<(u32, u32)> = Vec::new();
+    for (blk_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(src_val),
+            } = inst
+            {
+                let d = dest.0;
+                let s = src_val.0;
+                if d == s
+                    || multi_def_values.contains(&s)
+                    || reg_assigned.contains_key(&d)
+                    || reg_assigned.contains_key(&s)
+                    || unsound.contains(&d)
+                    || unsound.contains(&s)
+                    || !same_class(d, s)
+                {
+                    continue;
+                }
+                let sole_use = use_count.get(&s).copied().unwrap_or(0) == 1;
+                if !sole_use {
+                    let src_only_in_this_block = use_blocks_map
+                        .get(&s)
+                        .map(|blks| blks.iter().all(|&b| b == blk_idx))
+                        .unwrap_or(true);
+                    if !src_only_in_this_block {
+                        continue;
+                    }
+                    let mut used_after = false;
+                    for later_inst in &block.instructions[inst_idx + 1..] {
+                        if instruction_uses_value(later_inst, s) {
+                            used_after = true;
+                            break;
+                        }
+                    }
+                    if !used_after {
+                        for_each_terminator_value_use(&block.terminator, |v| {
+                            if v == s {
+                                used_after = true;
+                            }
+                        });
+                    }
+                    if used_after {
+                        continue;
+                    }
+                }
+
+                let src_in_copy_block = def_block.get(&s).copied() == Some(blk_idx);
+                let dest_cross_block = use_blocks_map
+                    .get(&d)
+                    .map(|blks| blks.iter().any(|&b| b != blk_idx))
+                    .unwrap_or(false);
+
+                if src_in_copy_block && dest_cross_block {
+                    raw_aliases.push((s, d));
+                    continue;
+                }
+
+                if multi_def_values.contains(&d) || dest_cross_block {
+                    continue;
+                }
+                raw_aliases.push((d, s));
+            }
+        }
+    }
+
+    let mut phi_web_aliases: FxHashSet<u32> = FxHashSet::default();
+    if !env_flag("CCC_NO_PHI_WEB_COALESCE") {
+        let mut phi_copies: FxHashMap<u32, Vec<(u32, usize, u32)>> = FxHashMap::default();
+        let mut dest_copy_points: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        let already_aliased: FxHashSet<u32> = raw_aliases.iter().map(|&(a, _)| a).collect();
+        {
+            let mut pp: u32 = 0;
+            for (blk_idx, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src_val),
+                    } = inst
+                    {
+                        let d = dest.0;
+                        let s = src_val.0;
+                        if multi_def_values.contains(&d)
+                            && !reg_assigned.contains_key(&s)
+                            && !reg_assigned.contains_key(&d)
+                            && !already_aliased.contains(&s)
+                            && !unsound.contains(&d)
+                            && !unsound.contains(&s)
+                            && same_class(d, s)
+                        {
+                            phi_copies.entry(d).or_default().push((s, blk_idx, pp));
+                            dest_copy_points.entry(d).or_default().push(pp);
+                        }
+                    }
+                    pp = pp.saturating_add(1);
+                }
+                pp = pp.saturating_add(1);
+            }
+        }
+
+        let interval_map: FxHashMap<u32, (u32, u32)> = cached_liveness
+            .as_ref()
+            .map(|lr| {
+                lr.intervals
+                    .iter()
+                    .map(|iv| (iv.value_id, (iv.start, iv.end)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (dest_id, sources) in &phi_copies {
+            if sources.len() < 2 || reg_assigned.contains_key(dest_id) {
+                continue;
+            }
+            let Some(all_copy_points) = dest_copy_points.get(dest_id) else {
+                continue;
+            };
+
+            for &(src_id, _src_blk, src_copy_pp) in sources {
+                if !phi_copies.contains_key(&src_id) && !multi_def_values.contains(&src_id) {
+                    continue;
+                }
+
+                let other_copy_points: Vec<u32> = all_copy_points
+                    .iter()
+                    .copied()
+                    .filter(|&pp| pp != src_copy_pp)
+                    .collect();
+
+                let interferes = if let Some(&(start, end)) = interval_map.get(&src_id) {
+                    other_copy_points.iter().any(|&pp| start <= pp && pp <= end)
+                } else {
+                    let other_def_blks: FxHashSet<usize> = sources
+                        .iter()
+                        .filter(|&&(_, _, pp)| pp != src_copy_pp)
+                        .map(|&(_, blk, _)| blk)
+                        .collect();
+
+                    let mut interferes_fallback = false;
+                    'blocks: for (blk_idx, block) in func.blocks.iter().enumerate() {
+                        if !other_def_blks.contains(&blk_idx) {
+                            continue;
+                        }
+                        for inst in &block.instructions {
+                            if let Instruction::Copy {
+                                dest: copy_dest,
+                                src: Operand::Value(copy_src),
+                            } = inst
+                            {
+                                if copy_dest.0 == *dest_id && copy_src.0 == src_id {
+                                    continue;
+                                }
+                            }
+                            if instruction_uses_value(inst, src_id) {
+                                interferes_fallback = true;
+                                break 'blocks;
+                            }
+                        }
+                        for_each_terminator_value_use(&block.terminator, |v| {
+                            if v == src_id {
+                                interferes_fallback = true;
+                            }
+                        });
+                        if interferes_fallback {
+                            break;
+                        }
+                    }
+                    interferes_fallback
+                };
+
+                if !interferes {
+                    raw_aliases.push((src_id, *dest_id));
+                    phi_web_aliases.insert(src_id);
+                }
+            }
+        }
+    }
+
+    let mut loop_phi_aliases: FxHashSet<u32> = FxHashSet::default();
+    if !env_flag("CCC_NO_LOOP_PHI_SLOT") {
+        if let Some(liveness) = cached_liveness {
+            let mut def_ty_ok: FxHashMap<u32, bool> = FxHashMap::default();
+            let mut copy_of: Vec<(u32, u32)> = Vec::new();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let (d, ok) = match inst {
+                        Instruction::BinOp { dest, ty, .. }
+                        | Instruction::UnaryOp { dest, ty, .. }
+                        | Instruction::Load { dest, ty, .. }
+                        | Instruction::Select { dest, ty, .. }
+                        | Instruction::AtomicLoad { dest, ty, .. }
+                        | Instruction::AtomicRmw { dest, ty, .. }
+                        | Instruction::AtomicCmpxchg { dest, ty, .. }
+                        | Instruction::ParamRef { dest, ty, .. } => (dest.0, scalar_type(*ty)),
+                        Instruction::Cmp { dest, .. }
+                        | Instruction::GetElementPtr { dest, .. }
+                        | Instruction::GlobalAddr { dest, .. }
+                        | Instruction::LabelAddr { dest, .. } => (dest.0, true),
+                        Instruction::Cast {
+                            dest,
+                            to_ty,
+                            from_ty,
+                            ..
+                        } => (dest.0, scalar_type(*to_ty) && scalar_type(*from_ty)),
+                        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                            match info.dest {
+                                Some(d) => (d.0, scalar_type(info.return_type)),
+                                None => continue,
+                            }
+                        }
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Const(c),
+                        } if scalar_const(*c) => (dest.0, true),
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Value(src),
+                        } => {
+                            copy_of.push((dest.0, src.0));
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    def_ty_ok.insert(d, ok);
+                }
+            }
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &(d, s) in &copy_of {
+                    let Some(&ok) = def_ty_ok.get(&s) else {
+                        continue;
+                    };
+                    match def_ty_ok.get(&d).copied() {
+                        None => {
+                            def_ty_ok.insert(d, ok);
+                            changed = true;
+                        }
+                        Some(true) if !ok => {
+                            def_ty_ok.insert(d, false);
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            let already_aliased: FxHashSet<u32> = raw_aliases.iter().map(|&(a, _)| a).collect();
+            let mut claimed_dests: FxHashSet<u32> = FxHashSet::default();
+            let debug_loop_phi = env_flag("CCC_DEBUG_LOOP_PHI");
+            for cand in detect_phi_coalesce_groups(func, liveness) {
+                let (phi_dest, backedge_src) = (cand.phi_dest, cand.backedge_src);
+                let src_ty_ok = def_ty_ok.get(&backedge_src).copied().unwrap_or(false);
+                if debug_loop_phi {
+                    eprintln!(
+                        "[LOOP_PHI] func={} pair dest=v{} src=v{} dest_reg={} src_reg={} aliased={} ty_ok={}",
+                        func.name,
+                        phi_dest,
+                        backedge_src,
+                        reg_assigned.contains_key(&phi_dest),
+                        reg_assigned.contains_key(&backedge_src),
+                        already_aliased.contains(&backedge_src),
+                        src_ty_ok,
+                    );
+                }
+                if reg_assigned.contains_key(&phi_dest)
+                    || reg_assigned.contains_key(&backedge_src)
+                    || unsound.contains(&phi_dest)
+                    || unsound.contains(&backedge_src)
+                {
+                    continue;
+                }
+                if already_aliased.contains(&backedge_src) {
+                    if src_ty_ok {
+                        loop_phi_aliases.insert(backedge_src);
+                    }
+                    continue;
+                }
+                if !src_ty_ok {
+                    continue;
+                }
+                if !claimed_dests.insert(phi_dest) {
+                    continue;
+                }
+                raw_aliases.push((backedge_src, phi_dest));
+                phi_web_aliases.insert(backedge_src);
+                loop_phi_aliases.insert(backedge_src);
+            }
+        }
+    }
+
+    const MAX_ALIAS_CHAIN_DEPTH: usize = 64;
+    let mut copy_alias: FxHashMap<u32, u32> = FxHashMap::default();
+    for (dest_id, src_id) in raw_aliases {
+        if dest_id == src_id {
+            continue;
+        }
+        let origin = src_id;
+        let mut root = src_id;
+        let mut depth = 0usize;
+        let mut refuse = false;
+        while let Some(&parent) = copy_alias.get(&root) {
+            if parent == dest_id || parent == root || parent == origin {
+                refuse = true;
+                break;
+            }
+            root = parent;
+            depth += 1;
+            if depth > MAX_ALIAS_CHAIN_DEPTH {
+                refuse = true;
+                break;
+            }
+        }
+        if !refuse && root != dest_id {
+            copy_alias.insert(dest_id, root);
+        }
+    }
+
+    let alloca_ids = collect_alloca_ids(func);
+    if !alloca_ids.is_empty() {
+        copy_alias.retain(|dest_id, root_id| {
+            !alloca_ids.contains(root_id) && !alloca_ids.contains(dest_id)
+        });
+    }
+    if !unsound.is_empty() {
+        copy_alias
+            .retain(|dest_id, root_id| !unsound.contains(dest_id) && !unsound.contains(root_id));
+    }
+
+    loop_phi_aliases.retain(|v| copy_alias.contains_key(v));
+    phi_web_aliases.retain(|v| copy_alias.contains_key(v));
+
+    if env_flag("CCC_DEBUG_SLOT_COALESCE") && !copy_alias.is_empty() {
+        let mut aliases: Vec<(u32, u32)> = copy_alias
+            .iter()
+            .map(|(&dest, &root)| (dest, root))
+            .collect();
+        aliases.sort_unstable();
+        eprintln!(
+            "[SLOT-COALESCE] fn={} aliases={} phi_web_aliases={} loop_phi_aliases={} pairs={:?}",
+            func.name,
+            aliases.len(),
+            phi_web_aliases.len(),
+            loop_phi_aliases.len(),
+            aliases,
+        );
+    }
+
+    (copy_alias, phi_web_aliases, loop_phi_aliases)
+}
+
+/// GPR values that can skip a stack slot: produced into the accumulator and
+/// consumed as the first (or uniquely-loaded) operand of the next instruction.
+///
+/// Copy is acc-preserving (`store_rax_to` leaves the cache armed). A copy
+/// source is excluded from the skip set only when some dest still needs the
+/// home — if every dest is itself skipped, the whole rename chain stays in
+/// the accumulator (0 stores).
+pub(crate) fn compute_immediately_consumed(
+    func: &IrFunction,
+    lhs_first_binop: bool,
+) -> FxHashSet<u32> {
+    let mut operand_use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut has_value_ref_use: FxHashSet<u32> = FxHashSet::default();
+    let mut copy_dests_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut non_gpr: FxHashSet<u32> = FxHashSet::default();
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *operand_use_count.entry(v.0).or_insert(0) += 1;
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                has_value_ref_use.insert(v.0);
+            });
+            match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::Select { dest, ty, .. }
+                    if !ty_lives_in_gpr_cache(*ty) =>
+                {
+                    non_gpr.insert(dest.0);
+                }
+                Instruction::Cast {
+                    dest,
+                    to_ty,
+                    from_ty,
+                    ..
+                } if !ty_lives_in_gpr_cache(*to_ty)
+                    || from_ty.is_128bit()
+                    || from_ty.is_long_double() =>
+                {
+                    non_gpr.insert(dest.0);
+                }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(v),
+                } => {
+                    copy_dests_of.entry(v.0).or_default().push(dest.0);
+                }
+                _ => {}
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *operand_use_count.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+
+    let mut work: Vec<u32> = non_gpr.iter().copied().collect();
+    while let Some(id) = work.pop() {
+        if let Some(dests) = copy_dests_of.get(&id) {
+            for &d in dests {
+                if non_gpr.insert(d) {
+                    work.push(d);
+                }
+            }
+        }
+    }
+
+    let mut result = FxHashSet::default();
+    for block in &func.blocks {
+        let insts = &block.instructions;
+        for (i, inst) in insts.iter().enumerate() {
+            let Some(dest) = inst.dest().or_else(|| match inst {
+                Instruction::Copy { dest, .. } => Some(*dest),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if non_gpr.contains(&dest.0) || has_value_ref_use.contains(&dest.0) {
+                continue;
+            }
+            if !is_gpr_acc_preserving_producer(inst) {
+                continue;
+            }
+            if operand_use_count.get(&dest.0).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+
+            if i + 1 < insts.len() {
+                if is_safe_sole_consumer(&insts[i + 1], dest.0, lhs_first_binop) {
+                    result.insert(dest.0);
+                }
+            } else if is_sole_operand_of_terminator(&block.terminator, dest.0) {
+                result.insert(dest.0);
+            }
+        }
+    }
+
+    // Copy-source keeps a slot if any dest still needs a home. Snapshot the
+    // skip set first — retain+contains is a double borrow.
+    let drop_srcs: Vec<u32> = copy_dests_of
+        .iter()
+        .filter_map(|(&src, dests)| {
+            if result.contains(&src) && dests.iter().any(|d| !result.contains(d)) {
+                Some(src)
+            } else {
+                None
+            }
+        })
+        .collect();
+    for id in drop_srcs {
+        result.remove(&id);
+    }
+
+    result
+}
+
+fn is_gpr_acc_preserving_producer(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::Load { ty, .. }
+        | Instruction::BinOp { ty, .. }
+        | Instruction::UnaryOp { ty, .. }
+        | Instruction::Select { ty, .. } => ty_lives_in_gpr_cache(*ty),
+        Instruction::Cast { from_ty, to_ty, .. } => {
+            ty_lives_in_gpr_cache(*to_ty) && !from_ty.is_128bit() && !from_ty.is_long_double()
+        }
+        // Predicate lands in a GPR via setcc; compared type may be float.
+        Instruction::Cmp { .. } => true,
+        Instruction::GetElementPtr { .. }
+        | Instruction::GlobalAddr { .. }
+        | Instruction::LabelAddr { .. } => true,
+        // store_rax_to leaves the cache holding dest.
+        Instruction::Copy {
+            src: Operand::Value(_),
+            ..
+        }
+        | Instruction::Copy {
+            src: Operand::Const(_),
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// `CCC_NO_COMMUTED_ACC`: restore the LHS-only sole-consumer contract (the
+/// commuted-RHS arm of [`is_safe_sole_consumer`] stops marking). Default OFF
+/// — the commuted arm is enabled. Same tri-state override discipline as the
+/// liveness walker's `CCC_HIDDEN_READ_COPY_CHAIN`: tests flip the atomic
+/// (edition-2024 makes `set_var` unsafe in the multithreaded harness), the
+/// environment is consulted ONCE per process (`OnceLock` — the flag cannot
+/// legitimately change mid-compilation, and this query sat in the
+/// per-instruction layout walk).
+fn commuted_acc_enabled() -> bool {
+    let o = COMMUTED_ACC_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if o >= 0 {
+        return o == 1;
+    }
+    !*COMMUTED_ACC_ENV.get_or_init(|| std::env::var_os("CCC_NO_COMMUTED_ACC").is_some())
+}
+
+/// Process-lifetime cache of the `CCC_NO_COMMUTED_ACC` environment decision
+/// (see [`commuted_acc_enabled`]).
+static COMMUTED_ACC_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Shared tri-state override for [`commuted_acc_enabled`]: -1 = follow the
+/// environment, 0 = forced LHS-only, 1 = forced commuted-RHS (tests).
+static COMMUTED_ACC_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: bool) -> bool {
+    match inst {
+        Instruction::Store {
+            val: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::Cast {
+            src: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::UnaryOp {
+            src: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::Copy {
+            src: Operand::Value(v),
+            ..
+        } => v.0 == value_id,
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } => {
+            if ty.is_float() || ty.is_long_double() {
+                return false;
+            }
+            // A value is consumed from the accumulator only when it is the LHS
+            // AND the consumer reads the LHS first: either the RHS is a
+            // constant (an immediate / materialised-const form, so the LHS is
+            // the operand staged in the accumulator), or the backend is
+            // lhs_first_binop (x86-64, RISC-V load the LHS before the RHS).
+            // A value that is the RHS of `Sub(Const, v)` is NOT safe: x86-64
+            // lowers it to `movq $0,%rax; subl <v>,%rax` where <v> is loaded
+            // into %rcx or a memory operand from its HOME. Skipping that home
+            // made the load read zero (alu_peepholes sdivm3: `0 - (v/3)`
+            // returned 0 instead of the negated quotient).
+            if operand_is_value(lhs, value_id) {
+                return operand_is_const(rhs) || lhs_first_binop;
+            }
+            // COMMUTED-RHS PRODUCERS (sha256 MAJ temporaries): on lhs-first
+            // backends the emitter commutes a commutative integer binop
+            // whose RHS is accumulator-resident — `And(c, x)` with x in %rax
+            // emits `andl <c-home>, %eax`, reading the OTHER operand from
+            // its own home — so the RHS of Add/Mul/And/Or/Xor is an equally
+            // safe sole consumer. Without this arm `a^b` and `(a^b)&c`
+            // (single-use, adjacent, RHS-consumed) were assigned deferred
+            // slots whose definition parks (`movl %eax, N(%rsp)`) are never
+            // read: pure dead stores whenever the peephole's never-read
+            // analysis fails closed on an indexed `disp(%rsp,%rX,s)` access
+            // (the LEA→memory fold creates those). The emitter's
+            // acc-resident read path already serves these consumers; the
+            // slot was write-only. Non-commutative ops keep the LHS-only
+            // contract, and so does every AccumulatorCentric backend
+            // (i686: its consumer order does not promise the commute).
+            // CCC_NO_COMMUTED_ACC restores the LHS-only contract for
+            // bisection.
+            lhs_first_binop
+                && commuted_acc_enabled()
+                && matches!(
+                    op,
+                    IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+                )
+                && operand_is_value(rhs, value_id)
+        }
+        Instruction::Cmp { lhs, rhs, ty, .. } => {
+            if ty.is_float() || ty.is_long_double() {
+                return false;
+            }
+            operand_is_value(lhs, value_id) && (operand_is_const(rhs) || lhs_first_binop)
+        }
+        _ => false,
+    }
+}
+
+fn is_sole_operand_of_terminator(term: &Terminator, value_id: u32) -> bool {
+    // A value whose single use is `Return` must NOT be skipped on backends
+    // whose return path materialises through the normal location machinery
+    // (ABI return register / slot) — a skipped home breaks the contract
+    // there.  i686 is the exception: its scalar-int return path IS the
+    // accumulator (emit_return_default → operand_to_eax → int-to-reg no-op),
+    // and the acc-preserving producer (the gate in compute_immediately_
+    // consumed) already left the value in %eax with a live cache entry —
+    // the Return consumes it with zero instructions and no home.  strlen's
+    // `p - s` tail, every leaf computation returning a folded expression.
+    // Wide/float returns are safe too: their types fail the producer gate
+    // (ty_lives_in_gpr_cache) long before reaching this point.
+    if matches!(term, Terminator::Return(_)) && !crate::common::types::target_is_32bit() {
+        return false;
+    }
+    let mut saw = false;
+    let mut extra = false;
+    for_each_terminator_value_use(term, |id| {
+        if id == value_id {
+            saw = true;
+        } else {
+            extra = true;
+        }
+    });
+    saw && !extra
+}
+
+pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::Pblendvb128
+            | O::Pblendw128
+            | O::Loadldi128
+            | O::Storeldi128
+            | O::FmaF64x2
+            | O::FmaF64x4
+            | O::FmaF64x4Hoisted
+            | O::FmaF64x4SIB
+            | O::FmaF64x4HoistedSIB
+            | O::MulAddF64x4HoistedSIB
+            | O::BroadcastLoadF64
+            | O::LoadF64x2
+            | O::LoadF64x4
+            | O::LoadI32x4
+            | O::LoadI32x8
+            | O::HorizontalAddF64x2
+            | O::HorizontalAddF64x4
+            | O::HorizontalAddI32x4
+            | O::HorizontalAddI32x8
+            | O::VecLoadF64x2
+            | O::VecLoadF64x4
+            | O::VecLoadI32x4
+            | O::VecLoadI32x8
+            | O::VecLoadStrided2I32x8
+            | O::VecLoadStrided2I32x4
+            | O::VecLoadStrided2CompactI32x4
+            | O::VecLoadI8x32
+            | O::VecLoadI16x16
+            | O::VecLoadF32x4
+            | O::VecLoadF32x8
+            // Every `VecLoad*` family reads its pointer's bytes raw. The six
+            // below were missing: a `VecLoadI64x2` (BB-SLP's 2×I64 copy) of
+            // the `dest_ptr` an SSE binary op had just DEFERRED its store to
+            // counted as the cache-aware consumer, skipped the flush, and
+            // read the slot's stale bytes (`movdqu 176(%rsp)` emitted before
+            // `movdqu %xmm0, 176(%rsp)` — `_mm_div_ps` printed garbage in
+            // agg_fwd_param_home / simd_sse_float / builtin_ia32_vector_value).
+            | O::VecLoadI64x2
+            | O::VecLoadI64x4
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+            | O::VecLoadWidenU8ToI32x4
+            | O::VecLoadI32x4Pair
+            | O::VecLoadWidenI32ToI64x2
+            | O::VecHorizontalAddF64x2
+            | O::VecHorizontalAddF64x4
+            | O::VecHorizontalAddI32x4
+            | O::VecHorizontalAddI32x8
+            | O::VecHorizontalAddF32x4
+            | O::VecHorizontalAddF32x8
+            | O::VecZeroF64x2
+            | O::VecZeroF64x4
+            | O::VecZeroI32x4
+            | O::VecZeroI32x8
+            | O::VecZeroF32x4
+            | O::VecZeroF32x8 // VecMin/VecMax/VecCmp/VecBlendv read their operands through the
+                              // register cache (avx_load_arg / vec_home / mem_source_after_
+                              // flush), never raw from a slot — classifying them as raw readers
+                              // forces a needless flush of the deferred value at every consumer
+                              // (a dead stack store + reload per iteration in min/max/select
+                              // loops).  They must NOT be listed here; the cache-aware checks
+                              // (VDEFER pos0/pos1/pos2, is_cache_aware_3op) cover them.
+    )
+}
+
+fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    // Destructive FP: the destination is also the first source, so a deferred
+    // value in %xmm0 folds into it. Shared predicate, not another copy of the
+    // op list (the duplicate lists previously lacked div/min/max).
+    if op.is_sse_fp_128_destructive_binary() {
+        return true;
+    }
+    matches!(
+        op,
+        O::Pcmpeqb128
+            | O::Pcmpeqd128
+            // Byte-lane SSE map ops are two-operand forms
+            // (`paddb`/`psubb`/`pminub`/`pmaxub`), so a deferred load in
+            // %xmm0 folds into the destination operand exactly like the
+            // dword twins below.
+            | O::VecAddI8x16
+            | O::VecSubI8x16
+            | O::VecMinU8x16
+            | O::VecMaxU8x16
+            | O::VecAddI16x8
+            | O::VecSubI16x8
+            | O::VecSubSatU16x8
+            | O::VecMulI16x8
+            | O::VecMinI16x8
+            | O::VecMaxI16x8
+            // BB-SLP families: the I64x2/I64x4 bitwise + add/sub chains
+            // (emit_sse_binary_128 / emit_avx_binary_256 two-operand
+            // forms), the byte/halfword bitwise, and the FP sub/div map
+            // ops — a deferred load in the scratch register folds into
+            // the destination operand exactly like the twins above.
+            | O::VecAddI64x2
+            | O::VecSadbwU8x16
+            | O::VecSubI64x2
+            | O::VecAndI64x2
+            | O::VecOrI64x2
+            | O::VecXorI64x2
+            // W5: the SSE4.1 signed dword min/max is a two-operand
+            // emit_sse_binary_128 form — a deferred load in args[1]
+            // folds into the VEX.128 destination exactly like the
+            // unsigned byte twins above.
+            | O::VecSminI32x4
+            | O::VecMinU32x4
+            | O::VecMaxU32x4
+            | O::VecSmaxI32x4
+            | O::VecSubI64x4
+            | O::VecAndI64x4
+            | O::VecOrI64x4
+            | O::VecXorI64x4
+            | O::VecShlvI32x8
+            | O::VecLShrvI32x8
+            | O::VecAShrvI32x8
+            | O::VecShlvI64x4
+            | O::VecLShrvI64x4
+            | O::VecShlvI32x4
+            | O::VecLShrvI32x4
+            | O::VecAShrvI32x4
+            | O::VecShlvI64x2
+            | O::VecLShrvI64x2
+            | O::VecAndI8x16
+            | O::VecOrI8x16
+            | O::VecXorI8x16
+            | O::VecAndI16x8
+            | O::VecOrI16x8
+            | O::VecXorI16x8
+            | O::VecSubF64x2
+            | O::VecSubF64x4
+            | O::VecSubF32x4
+            | O::VecSubF32x8
+            | O::VecDivF64x2
+            | O::VecDivF64x4
+            | O::VecDivF32x4
+            | O::VecDivF32x8
+            // ARX lane ops consume a 128-bit vector source directly
+            // (scratch-only emission; see the x86 emitters).
+            | O::VecRotlI32x4
+            | O::VecShufbI32x4
+            | O::VecShufdI32x4
+            | O::Psubusb128
+            | O::Psubsb128
+            | O::Por128
+            | O::Pand128
+            | O::Pxor128
+            | O::AddPs128
+            | O::SubPs128
+            | O::MulPs128
+            | O::AddPd128
+            | O::SubPd128
+            | O::MulPd128
+            | O::AndPs128
+            | O::AndnPs128
+            | O::OrPs128
+            | O::XorPs128
+            | O::AndPd128
+            | O::AndnPd128
+            | O::OrPd128
+            | O::XorPd128
+            | O::DivPs128
+            | O::MinPs128
+            | O::MaxPs128
+            | O::DivPd128
+            | O::MinPd128
+            | O::MaxPd128
+            | O::AddSs128
+            | O::SubSs128
+            | O::MulSs128
+            | O::DivSs128
+            | O::MinSs128
+            | O::MaxSs128
+            | O::AddSd128
+            | O::SubSd128
+            | O::MulSd128
+            | O::DivSd128
+            | O::MinSd128
+            | O::MaxSd128
+            | O::SqrtSd128
+            | O::Paddw128
+            | O::Psubw128
+            | O::Pmulhw128
+            | O::Pmullw128
+            | O::Pmuludq128
+            | O::Pmuldq128
+            | O::Pmulld128
+            | O::Pmaddwd128
+            | O::Pmaddubsw128
+            | O::Pcmpgtw128
+            | O::Pcmpgtb128
+            | O::Paddd128
+            | O::Psubd128
+            | O::Paddb128
+            | O::Psubb128
+            | O::Psubusw128
+            | O::Psadbw128
+            | O::Pshufb128
+            | O::Pmaxub128
+            | O::Pminub128
+            | O::Pmovzxbw128
+            | O::Pmovzxwd128
+            | O::Packssdw128
+            | O::Packsswb128
+            | O::Packuswb128
+            | O::Punpcklbw128
+            | O::Punpckhbw128
+            | O::Punpcklwd128
+            | O::Punpckhwd128
+            | O::Punpckldq128
+            | O::Punpckhdq128
+            | O::Punpcklqdq128
+            | O::Punpckhqdq128
+            | O::Pavgb128
+            | O::Pavgw128
+            | O::Pmaxsw128
+            | O::Pminsw128
+            | O::Paddsb128
+            | O::Paddsw128
+            | O::Paddusb128
+            | O::Paddusw128
+            | O::Psubsw128
+            | O::Pandn128
+            | O::Pcmpeqw128
+            | O::Pcmpgtd128
+            | O::Paddq128
+            | O::Psubq128
+            | O::HaddPs128
+            | O::HsubPs128
+            | O::AddsubPs128
+            | O::HaddPd128
+            | O::HsubPd128
+            | O::AddsubPd128
+            | O::UnpcklPs128
+            | O::UnpckhPs128
+            | O::UnpcklPd128
+            | O::UnpckhPd128
+            | O::CvtSs2Sd128
+            | O::CvtSd2Ss128
+            | O::Aesenc128
+            | O::Aesenclast128
+            | O::Aesdec128
+            | O::Aesdeclast128
+            | O::AddF64x2
+            | O::MulF64x2
+            | O::AddI32x4
+            | O::Paddb256
+            | O::Paddw256
+            | O::Paddd256
+            | O::Psubb256
+            | O::Psubw256
+            | O::Psubusw256
+            | O::Psadbw256
+            | O::Pmaddubsw256
+            | O::Pmaddwd256
+            | O::Pcmpeqb256
+            | O::Pcmpgtb256
+            | O::Pshufb256
+            | O::Pmaxub256
+            | O::Pminub256
+            | O::Pxor256
+            | O::Por256
+            | O::Pand256
+            | O::AddF64x4
+            | O::MulF64x4
+            | O::AddI32x8
+            | O::VecAddF64x4
+            | O::VecMulF64x4
+            | O::VecFmaF64x4
+            | O::VecAddI32x8
+            | O::VecMulI32x8
+            // v12 Fix F: VecMaxI32x8 is a two-operand binary (vpmaxsd) —
+            // the consumer reads the deferred vec_load from %ymm0 and folds
+            // it into the 3-operand form. Without this, the vec_load is
+            // stored to a slot every iteration (a dead 256-bit store that
+            // made the vectorized find_max SLOWER than scalar).
+            | O::VecMaxI32x8
+            | O::VecMinU32x8 | O::VecMaxU32x8
+            | O::VecMinI32x8
+            // Byte-lane arithmetic mirrors the dword policy above: the
+            // AVX2 forms fold a deferred load into the three-operand VEX
+            // encoding.  Cmp/Blendv are deliberately absent (like their
+            // dword twins) because their emitters read every operand
+            // through the register cache, never raw from a slot.
+            // Signed byte min/max and the WORD 256-bit family follow the
+            // same policy as their unsigned dword/byte twins
+            // (`vpminsb`/`vpmaxsb`/`vpaddw`/`vpmullw`/... are all
+            // `emit_avx_binary_256` consumers — see `memfold_consumer_256`)
+            // and were missing here, which denied VDEFER to their
+            // consumers (one dead 256-bit store per iteration).
+            | O::VecMinI8x32
+            | O::VecMaxI8x32
+            // Counting-reduction binaries (`vpsadbw`, `vpaddq`) ride the
+            // same `emit_avx_binary_256` 3-operand VEX discipline.
+            | O::VecSadbwU8x32
+            | O::VecAddI64x4
+            // Adler-32 epic multiply-add binaries: `vpmaddubsw`/`vpmaddwd`
+            // are the same `emit_avx_binary_256` consumers (the byte-stream
+            // register source plus a folded src2).
+            | O::VecMaddubsU8x32
+            | O::VecMaddwdI16x16
+            | O::VecAddI16x16
+            | O::VecSubI16x16
+            | O::VecSubSatU16x16
+            | O::VecMulI16x16
+            | O::VecMinI16x16
+            | O::VecMaxI16x16
+            | O::VecMinU16x16
+            | O::VecMaxU16x16
+            | O::VecAddI8x32
+            | O::VecSubI8x32
+            | O::VecMinU8x32
+            | O::VecMaxU8x32
+            | O::VecBroadcastI32x8
+            | O::VecBroadcastF32x8
+            | O::VecMulF32x8
+            | O::VecAddF32x8
+            | O::VecFmaF32x8
+            | O::VecAddF64x2
+            | O::VecMulF64x2
+            | O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFnmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF32x4
+            | O::VecAddI32x4
+            | O::VecAddF32x4
+            | O::VecMulF32x4
+            | O::VecMinF32x8
+            | O::VecMinF32x4
+            | O::VecMinF64x4
+            | O::VecMinF64x2
+            | O::VecMaxF32x8
+            | O::VecMaxF32x4
+            | O::VecMaxF64x4
+            | O::VecMaxF64x2
+            // Byte-lane two-operand forms (AVX2 32xI8): vpaddb via
+            // emit_avx_binary_256 and the vpbroadcastb producer share the
+            // dword family's deferred-%ymm0 consumer contract.
+            | O::VecBroadcastI8x32
+    )
+}
+
+fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        // Byte-lane map ops (OP-05d) all define a vector SSA value.
+        O::VecAddI8x32
+            | O::VecSubI8x32
+            | O::VecCmpI8x32
+            | O::VecMinU8x32
+            | O::VecMaxU8x32
+            | O::VecBlendvI8x32
+            | O::VecAddI8x16
+            | O::VecSubI8x16
+            | O::VecCmpI8x16
+            | O::VecMinU8x16
+            | O::VecMaxU8x16
+            | O::VecBlendvI8x16
+            | O::VecMinI8x32
+            | O::VecMaxI8x32
+            | O::VecBroadcastI8x32
+            | O::VecBroadcastI8x16
+            | O::VecAddI16x16
+            | O::VecSubI16x16
+            | O::VecSubSatU16x16
+            | O::VecMulI16x16
+            | O::VecCmpI16x16
+            | O::VecMinI16x16
+            | O::VecMaxI16x16
+            | O::VecMinU16x16
+            | O::VecMaxU16x16
+            | O::VecBlendvI16x16
+            | O::VecAddI16x8
+            | O::VecSubI16x8
+            | O::VecSubSatU16x8
+            | O::VecMulI16x8
+            | O::VecCmpI16x8
+            | O::VecMinI16x8
+            | O::VecMaxI16x8
+            | O::VecBlendvI16x8
+            | O::VecBroadcastI16x16
+            | O::VecBroadcastI16x8
+            // ARX lane producers (vec_arx): rotate/shuffle results home
+            // like other Vec* SSA values (scratch-pair contract, no
+            // deferred-store dependency).
+            | O::VecRotlI32x4
+            | O::VecShufbI32x4
+            | O::VecShufdI32x4
+            | O::VecPackI32x4
+            // Counting-reduction producers (vpsadbw/vpaddq groups, the
+            // horizontal exit's scalar is not a vector value).
+            | O::VecSadbwU8x32
+            | O::VecSadbwU8x16
+            | O::VecAddI64x4
+            // Adler-32 epic producers: the two multiply-add results and the
+            // .rodata constant table all define vector SSA values.
+            | O::VecMaddubsU8x32
+            | O::VecMaddwdI16x16
+            | O::VecConstI8x32
+            | O::VecLoadF64x2
+            | O::VecLoadF64x4
+            | O::VecLoadI32x4
+            | O::VecLoadI32x8
+            | O::VecLoadStrided2I32x8
+            | O::VecLoadStrided2I32x4
+            | O::VecLoadStrided2CompactI32x4
+            | O::VecLoadF32x4
+            | O::VecLoadF32x8
+            | O::VecAddF64x2
+            | O::VecAddF64x4
+            | O::VecFmaF64x4
+            | O::VecMaddF64x4
+            | O::VecMaddF64x4Signed(..)
+            | O::VecAddI32x4
+            | O::VecAddI32x8
+            | O::VecMulI32x8
+            | O::VecBroadcastI32x8
+            | O::VecBroadcastF32x8
+            | O::VecMulF32x8
+            | O::VecAddF32x8
+            | O::VecFmaF32x8
+            | O::VecMaddF32x8
+            | O::VecMaddF32x8Signed(..)
+            | O::VecAddF32x4
+            | O::VecMulF64x2
+            | O::VecMulF64x4
+            | O::VecMulF32x4
+            | O::VecZeroF64x2
+            | O::VecZeroF64x4
+            | O::VecZeroI32x4
+            | O::VecZeroI32x8
+            | O::VecZeroF32x4
+            | O::VecZeroF32x8
+            | O::VecMinF32x8
+            | O::VecMinF32x4
+            | O::VecMinF64x4
+            | O::VecMinF64x2
+            | O::VecMaxF32x8
+            | O::VecMaxF32x4
+            | O::VecMaxF64x4
+            | O::VecMaxF64x2
+            | O::VecCmpF32x8
+            | O::VecCmpF32x4
+            | O::VecCmpF64x4
+            | O::VecCmpF64x2
+            | O::VecBlendvF32x8
+            | O::VecBlendvF32x4
+            | O::VecBlendvF64x4
+            | O::VecBlendvF64x2
+            // Integer map lane ops: their results are SSA temporaries that
+            // live in the SIMD scratch pair until the adjacent VecStore —
+            // without this they miss the deferred-store contract and
+            // avx_store_dest dereferences the (uninitialized) value's slot
+            // content as a pointer (segfault; repro: any
+            // `d[i] = a[i] - b[i]` map loop at -march=x86-64-v3).
+            | O::VecSubI32x8
+            | O::VecSubI32x4
+            | O::VecSubI64x2
+            | O::VecAndI32x8
+            | O::VecAndI32x4
+            | O::VecOrI32x8
+            | O::VecOrI32x4
+            | O::VecXorI32x8
+            | O::VecXorI32x4
+            // Integer conditional-map results (compare masks, blends):
+            // same SSA-scratch-pair contract as the ops above.
+            | O::VecCmpI32x8
+            | O::VecCmpI32x4
+            | O::VecCmpI64x4
+            | O::VecCmpI64x2
+            | O::VecBlendvI32x8
+            | O::VecBlendvI32x4
+            // Integer min/max map results: with the exact ternary fold
+            // these now feed VecStore like the lane ops above (previously
+            // only the reduction path consumed VecMaxI32x8).
+            | O::VecMinU32x8 | O::VecMaxU32x8
+            | O::VecMinI32x8
+            | O::VecMaxI32x8
+            // Byte-lane map ops (AVX2 32xI8): same SSA-scratch-pair
+            // contract — results live in the SIMD scratch pair until the
+            // adjacent VecStore.
+            | O::VecLoadI8x32
+            | O::VecAndI8x32
+            | O::VecOrI8x32
+            | O::VecXorI8x32
+            // Halfword map ops (AVX2 16xI16): same contract.
+            | O::VecLoadI16x16
+            | O::VecAndI16x16
+            | O::VecOrI16x16
+            | O::VecXorI16x16
+            // BB-SLP producer families: the I64x2/I64x4 copy + bitwise
+            // chains, the I16x8/I8x16 byte/halfword chains, and the
+            // 2-lane gathers. Their single-use results live in the
+            // scratch register until the adjacent consumer exactly like
+            // the map ops above — without this, the 4×u64 copy paid a
+            // dead `vmovdqu %ymm0, slot` round trip after every load.
+            | O::VecLoadI64x2
+            | O::VecLoadI64x4
+            | O::VecSubI64x4
+            | O::VecAndI64x4
+            | O::VecOrI64x4
+            | O::VecXorI64x4
+            | O::VecBroadcastI64x4
+            | O::VecBroadcastI64x2
+            | O::VecAndI64x2
+            | O::VecOrI64x2
+            | O::VecXorI64x2
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+            | O::VecAndI16x8
+            | O::VecOrI16x8
+            | O::VecXorI16x8
+            | O::VecAndI8x16
+            | O::VecOrI8x16
+            | O::VecXorI8x16
+            | O::VecPackI64x2
+            | O::VecPackF64x2
+            | O::VecLoadWidenU8ToI32x4
+            | O::VecLoadI32x4Pair
+            | O::VecPackI32x4Pair
+            | O::VecZeroI64x2
+            | O::VecZeroI64x4
+            | O::VecBroadcastI32x4
+            | O::VecBroadcastF32x4
+            | O::VecBroadcastF64x2
+            | O::VecBroadcastF64x4
+            | O::VecMulI32x4
+            | O::VecMulI64x2
+            | O::VecSubF64x2
+            | O::VecSubF64x4
+            | O::VecSubF32x4
+            | O::VecSubF32x8
+            | O::VecDivF64x2
+            | O::VecDivF64x4
+            | O::VecDivF32x4
+            | O::VecDivF32x8
+            | O::VecSqrtF64x2
+            | O::VecSqrtF64x4
+            | O::VecSqrtF32x4
+            | O::VecSqrtF32x8
+            | O::VecRoundF64x2
+            | O::VecRoundF64x4
+            | O::VecRoundF32x4
+            | O::VecRoundF32x8
+            // W5: the FP-Neg sign-mask Xor composite (try_emit_fpxor_
+            // sign_mask consumes args[0] via vec_home_256/128 →
+            // avx_load_arg/sse_load_arg — never a raw slot read), the
+            // SSE4.1 signed dword min/max, and the packed immediate
+            // shifts (emit_avx_shift_imm_256 / emit_sse_shift_imm_128 —
+            // all-homed fast path, held-in-scratch path, staged fallback:
+            // every path resolves args[0] through the register cache).
+            // Without these, every single-use result of these ops paid an
+            // eager dead store to its home slot.
+            | O::VecXorF32x8
+            | O::VecXorF64x4
+            | O::VecXorF32x4
+            | O::VecXorF64x2
+            | O::VecSminI32x4
+            | O::VecMinU32x4
+            | O::VecMaxU32x4
+            | O::VecSmaxI32x4
+            | O::VecShlI16x16
+            | O::VecShlI16x8
+            | O::VecLShrI16x16
+            | O::VecLShrI16x8
+            | O::VecAShrI16x16
+            | O::VecAShrI16x8
+            | O::VecShlI32x8
+            | O::VecShlI32x4
+            | O::VecLShrI32x8
+            | O::VecLShrI32x4
+            | O::VecAShrI32x8
+            | O::VecAShrI32x4
+            | O::VecShlI64x4
+            | O::VecShlI64x2
+            | O::VecLShrI64x4
+            | O::VecLShrI64x2
+    )
+}
+
+fn is_user_store_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::Storedqu
+            | O::Storeu256
+            | O::Store256
+            | O::Storeldi128
+            | O::Movntdq
+            | O::Movntpd
+            | O::Movntps
+    )
+}
+
+/// i686 x87 top-of-stack deferral (`state.x87_defer_values`): an F64 binop
+/// result whose ONLY use is as an operand of the immediately-following F64
+/// binop, in the same block. The emitter may then store the result with a
+/// rounding `fstpl; fldl` and let the consumer take that F64 copy from st(0)
+/// (`fld %st(0)` dup or an in-place non-popping arith form). A non-popping
+/// `fstl` alone is NOT a rounding barrier for ST(0): its excess precision
+/// cannot be forwarded to an F64 consumer. The depth-one cache is safe
+/// because adjacency + single-use means no other instruction can run
+/// between the store and the consumption: nothing can clobber the slot or
+/// push/pop x87 within the window (any such instruction would be a second
+/// use or would break adjacency). The emitter still flushes defensively at
+/// every boundary, so a stale entry only ever costs a redundant store.
+pub(super) fn compute_x87_defer_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut result = FxHashSet::default();
+
+    // Total use count per value, across all instructions and terminators.
+    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *uses.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *uses.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+
+    // Adjacency window: BinOp(F64) immediately followed by BinOp(F64) that
+    // consumes the first result as one operand. classify_float_binop maps
+    // Add/Sub/Mul/SDiv/UDiv to float ops; any other op on F64 would have
+    // panicked in emit_binop, so the whitelist mirrors it exactly.
+    for block in &func.blocks {
+        let insts = &block.instructions;
+        for w in insts.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            let dest = match a {
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    ty: IrType::F64,
+                    ..
+                } => {
+                    if !matches!(
+                        op,
+                        IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::SDiv | IrBinOp::UDiv
+                    ) {
+                        continue;
+                    }
+                    dest.0
+                }
+                _ => continue,
+            };
+            let consumed = match b {
+                Instruction::BinOp {
+                    op: b_op,
+                    lhs,
+                    rhs,
+                    ty: IrType::F64,
+                    ..
+                } => {
+                    if !matches!(
+                        b_op,
+                        IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::SDiv | IrBinOp::UDiv
+                    ) {
+                        continue;
+                    }
+                    match (lhs, rhs) {
+                        (Operand::Value(l), Operand::Value(r)) => l.0 == dest || r.0 == dest,
+                        (Operand::Value(l), _) => l.0 == dest,
+                        (_, Operand::Value(r)) => r.0 == dest,
+                        (_, _) => false,
+                    }
+                }
+                _ => continue,
+            };
+            if consumed && uses.get(&dest).copied().unwrap_or(0) == 1 {
+                result.insert(dest);
+            }
+        }
+    }
+
+    result
+}
+
+/// Pure vector loads: they write no memory and define no GPR (their address
+/// is either an RA-homed GPR pair or the `%rax`/`%rcx` scratch pair).
+pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadF64x4
+            | O::VecLoadF32x8
+            | O::VecLoadI32x8
+            | O::VecLoadF64x2
+            | O::VecLoadF32x4
+            | O::VecLoadI32x4
+            | O::VecLoadI64x2
+            | O::VecLoadWidenU8ToI32x4
+            | O::VecLoadI32x4Pair
+            | O::VecLoadI64x4
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+            | O::VecLoadI8x32
+            | O::VecLoadI16x16
+    )
+}
+
+/// 256-bit loads eligible for source-operand folding (VLFOLD).
+pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadF64x4
+            | O::VecLoadF32x8
+            | O::VecLoadI32x8
+            | O::VecLoadI8x32
+            | O::VecLoadI64x4
+            | O::VecLoadI16x16
+    )
+}
+
+/// 128-bit loads eligible for source-operand folding (VEX.128 VLFOLD).
+/// The emitter additionally gates the elision on `avx2_enabled` — legacy
+/// SSE memory operands require 16-byte alignment — so under a pre-AVX2
+/// target these values are simply never elided (membership alone elides
+/// nothing; the set also only ever *removes* deferral eligibility).
+pub(crate) fn is_memfold_vec_load_128(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadF64x2
+            | O::VecLoadF32x4
+            | O::VecLoadI32x4
+            | O::VecLoadI64x2
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+    )
+}
+
+/// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
+/// the bias folds through the 213 form (`vfmadd213ps mem, %scale, %ymm0` =
+/// scale*input + mem) and the input through the 231 form
+/// (`vfmadd231ps mem, %scale, %ymm0` = scale*mem + bias).  The SIGNED
+/// families (`VecMaddF{64x4,32x8}Signed(np, na)` — the builtin-semantics
+/// `MapExpr::Fma` lowering) fold EXACTLY like the plain one: the FMA3
+/// sign structure attaches to the algebraic terms (±product ±addend),
+/// not the operand slots, so the 132→213/231 re-encode preserves every
+/// family's semantics (re-derived against the SDM for all four).
+/// Positions 0/1/2 of BOTH spellings are foldable (the multiplicands
+/// commute; the emitter picks the form and keeps the register-homed
+/// operand — typically the loop-invariant broadcast — as the VEX
+/// register source).
+pub(crate) fn memfold_consumer_madd_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecMaddF64x4 | O::VecMaddF32x8 | O::VecMaddF64x4Signed(..) | O::VecMaddF32x8Signed(..)
+    )
+}
+
+/// Three-operand vector consumers (packed FP compare / lane-mask select)
+/// whose emitters resolve the rhs/mask (argument positions 1 and 2)
+/// through the register cache — a deferred value still held in the scratch
+/// register is consumed in place (moved aside when the later load needs
+/// that register), never re-read from a possibly-stale slot.  Both the AVX
+/// and the SSE2-baseline emitters share this contract, so a deferred def
+/// of any of their operands keeps its store pending safely.
+pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecCmpF32x8
+            | O::VecCmpF32x4
+            | O::VecCmpF64x4
+            | O::VecCmpF64x2
+            | O::VecBlendvF32x8
+            | O::VecBlendvF32x4
+            | O::VecBlendvF64x4
+            | O::VecBlendvF64x2
+            | O::VecCmpI32x8
+            | O::VecCmpI32x4
+            | O::VecCmpI64x4
+            | O::VecCmpI64x2
+            | O::VecBlendvI32x8
+            | O::VecBlendvI32x4
+            // Byte/word-lane Cmp/Blendv follow their dword twins: their
+            // emitters (`emit_int_cmp`, `emit_avx_blendv_256`, the SSE
+            // blendv) resolve operands through `vec_home_256`/
+            // `avx_load_arg_to`/`sse_load_arg` — never a raw slot read —
+            // so in-body deferral is cache-aware.  Omitting them denied
+            // deferral to a byte casefold's compare-mask feeding the
+            // blend's mask position (args[2]) and to second-stream
+            // loads in the true-arm position: one eagerly emitted (dead)
+            // store per iteration, fail-closed.
+            | O::VecCmpI8x32
+            | O::VecCmpI8x16
+            | O::VecCmpI16x16
+            | O::VecCmpI16x8
+            | O::VecBlendvI8x32
+            | O::VecBlendvI8x16
+            | O::VecBlendvI16x16
+            | O::VecBlendvI16x8
+    )
+}
+
+/// BB-SLP unary+immediate consumers (packed lane shifts) are NOT
+/// memory-foldable on this target — ISA limitation, see the note on
+/// `memfold_consumer_128`.
+
+/// Two-operand 128-bit VEX.128 arithmetic intrinsics that go through
+/// `emit_sse_binary_128` and therefore can take a memory operand in the
+/// AT&T-first (r/m) slot. Returns `Some(commutative)`. Mirrors
+/// `memfold_consumer_256` for the 128-bit families; the audited-emitter
+/// discipline is the same — `emit_sse_binary_128`'s VEX path consumes the
+/// pending fold as its FIRST action (width-matched to 16).
+///
+/// ISA NOTE — immediate shifts are deliberately absent from every fold
+/// table: the VEX immediate-shift encodings (66.0F 71/72/73 /digit ib)
+/// are REGISTER-ONLY. The r/m-as-memory form exists solely under EVEX
+/// (AVX-512), which no profile below AVX-512 provides; GNU as
+/// assembles `vpslld $3,(%rdi),%xmm3` to an EVEX encoding, and hand-
+/// rolling the VEX-looking bytes encodes an INVALID instruction (SIGILL,
+/// verified on the v5 battery). The S49-era analysis admitted shift
+/// consumers whose emitters then emitted the invalid form — a latent
+/// compile-error (assembler rejection) for any 8×i32 `<<` shape with an
+/// adjacent single-use load; both the analysis entries and the emitters'
+/// fold branches are removed here for good.
+pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<bool> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    match op {
+        // Commutative: add/mul/bitwise/integer-min/max.
+        O::VecAddF64x2
+        | O::VecAddF32x4
+        | O::VecMulF64x2
+        | O::VecMulF32x4
+        | O::VecXorF64x2
+        | O::VecXorF32x4
+        | O::VecAddI64x2
+        | O::VecSadbwU8x16
+        | O::VecAddI32x4
+        | O::VecMulI32x4
+        | O::VecMulI16x8
+        | O::VecAddI16x8
+        | O::VecAddI8x16
+        | O::VecAndI64x2
+        | O::VecOrI64x2
+        | O::VecXorI64x2
+        | O::VecAndI32x4
+        | O::VecOrI32x4
+        | O::VecXorI32x4
+        | O::VecAndI16x8
+        | O::VecOrI16x8
+        | O::VecXorI16x8
+        | O::VecAndI8x16
+        | O::VecOrI8x16
+        | O::VecXorI8x16
+        // Integer min/max has none of the FP unordered/signed-zero
+        // asymmetry — commutative.
+        | O::VecMinU8x16
+        | O::VecMaxU8x16
+        | O::VecMinI16x8
+        | O::VecMaxI16x8
+        | O::VecSminI32x4
+        | O::VecMinU32x4
+        | O::VecMaxU32x4
+        | O::VecSmaxI32x4 => Some(true),
+        // Non-commutative: FP sub/div return different results under
+        // operand exchange; packed FP min/max return SRC2 on unordered and
+        // equal lanes; integer sub is src1 − src2. A fold is order-safe in
+        // the args[1] (src2) position only.
+        O::VecSubF64x2
+        | O::VecSubF32x4
+        | O::VecDivF64x2
+        | O::VecDivF32x4
+        | O::VecMinF32x4
+        | O::VecMaxF32x4
+        | O::VecMinF64x2
+        | O::VecMaxF64x2
+        | O::VecSubI64x2
+        | O::VecSubI32x4
+        | O::VecSubI16x8
+        | O::VecSubSatU16x8
+        | O::VecSubI8x16 => Some(false),
+        _ => None,
+    }
+}
+
+/// Two-operand 256-bit VEX arithmetic intrinsics that go through
+/// `emit_avx_binary_256` and therefore can take a memory operand.
+/// Returns `Some(commutative)`.
+pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<bool> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    match op {
+        O::VecAddF64x4
+        | O::VecAddF32x8
+        | O::VecMulF64x4
+        | O::VecMulF32x8
+        | O::VecXorF64x4
+        | O::VecXorF32x8
+        | O::VecAddI32x8
+        | O::VecMulI32x8
+        | O::VecMaxI32x8
+        | O::VecMinU32x8
+        | O::VecMaxU32x8
+        | O::VecMinI32x8 => Some(true),
+        O::VecSubF64x4 | O::VecSubF32x8 | O::VecDivF64x4 | O::VecDivF32x8 => Some(false),
+        // Packed min/max are NON-commutative (MINPS/MAXPS return the second
+        // source on unordered/equal lanes), so a fold is only order-safe in
+        // the args[1] (src2) position — exactly what Some(false) gates.
+        O::VecMinF32x8 | O::VecMaxF32x8 | O::VecMinF64x4 | O::VecMaxF64x4 => Some(false),
+        // Integer map lane ops: And/Or/Xor are bit-exact commutative; Sub is
+        // `src1 - src2` — a fold is only order-safe in the args[1] (src2)
+        // position (`vpsubd mem, %ymm_src1, %ymm_dst`), exactly like the
+        // packed min/max contract above.
+        O::VecAndI32x8 | O::VecOrI32x8 | O::VecXorI32x8 => Some(true),
+        O::VecSubI32x8 => Some(false),
+        // Per-lane variable shifts are `src1 << src2` / `src1 >> src2`:
+        // only the count (args[1]) may be the folded memory source
+        // (`vpsllvd mem, %ymm_src1, %ymm_dst`).
+        O::VecShlvI32x8
+        | O::VecLShrvI32x8
+        | O::VecAShrvI32x8
+        | O::VecShlvI64x4
+        | O::VecLShrvI64x4 => Some(false),
+        // Byte lanes: `vpaddb`, the bitwise byte ops, and the byte/word
+        // integer min/max are commutative (integer min/max has none of the
+        // FP unordered/signed-zero asymmetry, so either operand may carry
+        // the folded memory source); `vpsubb`/`vpsubw` are `src1 - src2`.
+        O::VecAddI8x32
+        | O::VecAndI8x32
+        | O::VecOrI8x32
+        | O::VecXorI8x32
+        | O::VecMinU8x32
+        | O::VecMaxU8x32
+        | O::VecMinI8x32
+        | O::VecMaxI8x32 => Some(true),
+        // Counting binaries: `vpsadbw(a, b)` is symmetric (sum of absolute
+        // differences), `vpaddq` commutative. The BB-SLP I64x4 family
+        // follows the same contract: add/bitwise commutative, sub
+        // src1-src2 order-gated.
+        O::VecSadbwU8x32 | O::VecAddI64x4 => Some(true),
+        O::VecAndI64x4 | O::VecOrI64x4 | O::VecXorI64x4 => Some(true),
+        O::VecSubI64x4 => Some(false),
+        // Adler-32 epic multiply-adds: `vpmaddubsw`/`vpmaddwd` are
+        // strictly order-sensitive in the ISA encoding (the signed and
+        // unsigned operand roles differ for maddubs), so a fold is only
+        // order-safe in the args[1] (src2/r/m) position — the weights
+        // slot.  The byte-stream load sits in args[0] (the register
+        // source) and is never foldable, which the Some(false) gate
+        // enforces exactly.
+        O::VecMaddubsU8x32 | O::VecMaddwdI16x16 => Some(false),
+        O::VecAddI16x16
+        | O::VecMulI16x16
+        | O::VecMinI16x16
+        | O::VecMaxI16x16
+        | O::VecMinU16x16
+        | O::VecMaxU16x16
+        | O::VecAndI16x16
+        | O::VecOrI16x16
+        | O::VecXorI16x16 => Some(true),
+        O::VecSubI16x16 | O::VecSubSatU16x16 => Some(false),
+        O::VecSubI8x32 => Some(false),
+        _ => None,
+    }
+}
+
+/// VLFOLD (the general form of IS-05): a single-use 256-bit `VecLoad*` whose
+/// only consumer is the next — or next-but-one, across another pure
+/// `VecLoad*` — two-operand VEX arithmetic intrinsic in the same block is
+/// elided entirely; the consumer folds the load's *source* memory operand
+/// (`vpaddd (%rdx,%r13), %ymm0, %ymm0`) exactly like ICX/GCC/Clang emit for
+/// `c[i] = a[i] + b[i]` and `s += a[i]`.  Before this analysis the first of
+/// two streamed loads was deferred, then flushed to its home slot when the
+/// second load claimed `%ymm0`, and the consumer re-read the slot: one
+/// store + one stack load per iteration in every map/reduction body.
+///
+/// Soundness argument (mirrors the deferred-store whitelist above):
+/// * the only instructions allowed between load and consumer are pure
+///   vector loads, which write no memory and define no GPR, so the elided
+///   load's RA-homed base/index registers still hold the same values when
+///   the consumer re-materialises the memory operand;
+/// * the emitter additionally requires base/index to be RA-homed GPRs (or a
+///   zero constant): scratch `%rax`/`%rcx` addressing would not survive the
+///   intervening load — it falls back to the ordinary load otherwise;
+/// * VEX arithmetic imposes no alignment on memory operands, so unaligned
+///   streams are legal; legacy-SSE 128-bit forms (`paddd m128`) would fault,
+///   hence the 128-bit families are eligible only under AVX2 (the VEX.128
+///   encodings) — gated at the emitter (`try_elide_vec_load`), which is the
+///   single point that actually elides;
+/// * a non-commutative consumer may only fold its second operand (AT&T
+///   `op mem, %src1, %dst` computes `src1 op mem`);
+/// * every consumer path either uses the memory operand or materialises the
+///   load (`avx_load_arg_to`/`sse_load_arg` re-issue paths), and a safety net
+///   in `emit_intrinsic_impl` materialises a pending fold before any
+///   unexpected intrinsic — including a width-mismatched consumer.
+///
+/// When both operands of a consumer are adjacent loads, the farther one is
+/// folded: the nearer load then streams through `%ymm0` under the existing
+/// deferral and the consumer becomes `op mem, %ymm0, %ymm0`.
+/// Kill switch: `CCC_NO_VLFOLD=1`.
+/// Loads whose consumer is a PLAIN two-operand 256-bit binary, i.e. one
+/// emitted by `emit_avx_binary_256`.
+///
+/// This is the subset for which eliding a REGISTER-HOMED load is provably
+/// safe.  The general set below only guarantees "some adjacent consumer
+/// folds this"; a consumer that is not in THIS set resolves its operands
+/// through raw `reg_assignments` lookups, which for an elided value name a
+/// register that was never written.  `emit_avx_binary_256_inner` instead
+/// consults `pending_vec_memfold` as its FIRST action and either emits the
+/// folded three-operand form or routes the operand through the
+/// memfold-aware loaders, so it is safe for both homed and un-homed
+/// elisions.  `emit_avx_map_fma` (the madd family, plain and Signed) and
+/// `emit_vec_fma_128` (the BB-SLP packed FMA/FMS) join it after the same
+/// audit: every operand-resolution path in both emitters now either
+/// consumes the fold (the 2XX memory-operand arm / the acc_fold 132 arm)
+/// or routes through `memfold_operand`/`avx_load_arg_to`/`sse_load_arg`,
+/// which re-issue the elided load instead of reading its phantom home.
+///
+/// Keeping this a separate, smaller set is deliberate: it turns "every
+/// operand resolver in the backend must be memfold-aware" -- an unbounded
+/// proof obligation that has now failed twice -- into "these consumers are
+/// audited", which is checkable and stays checkable as emitters are added.
+/// The 128-bit packed FMA/FMS consumers (BB-SLP contraction): the
+/// ACCUMULATOR position (args[2]) folds as the 213-form memory operand
+/// (`v{f,n}madd213{ps,pd} MEM_acc, %b, %a_dst` — 213 is the one FMA3
+/// form whose r/m slot is the ADDEND). The multiplicand positions never
+/// fold — the 132/231 forms put a MULTIPLICAND in r/m.
+pub(crate) fn memfold_consumer_fma_128(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF64x2
+            | O::VecFnmsF32x4
+    )
+}
+
+pub(super) fn compute_vector_memfold_homed_ok(func: &IrFunction) -> FxHashSet<u32> {
+    let mut ok = FxHashSet::default();
+    if env_flag("CCC_NO_VLFOLD") {
+        return ok;
+    }
+    let folded = compute_vector_memfold_values(func);
+    if folded.is_empty() {
+        return ok;
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::Intrinsic {
+                op, args, dest: _, ..
+            } = inst
+            else {
+                continue;
+            };
+            // Only the audited memfold-first emitters. The madd family
+            // (plain AND Signed — `emit_avx_map_fma` handles both with
+            // the same operand-resolution code) is now among them: every
+            // resolution path in that emitter is memfold-aware (the
+            // VLFOLD arm consumes the fold as the 2XX memory operand or
+            // declines; the fast path gates on the fold not naming its
+            // register sources; the fallback's `operand_reg_source`
+            // reports an elided value as unhomed and every load/re-issue
+            // routes through the memfold-aware `avx_load_arg_to` or the
+            // `memfold_operand` memory source). The immediate SHIFT
+            // families are NOT admitted: their VEX encodings are
+            // register-only (see memfold_consumer_unary_imm_NEVER).
+            if memfold_consumer_256(op).is_none()
+                && memfold_consumer_128(op).is_none()
+                && !memfold_consumer_fma_128(op)
+                && !memfold_consumer_madd_256(op)
+            {
+                continue;
+            }
+            for a in args {
+                if let Operand::Value(v) = a {
+                    if folded.contains(&v.0) {
+                        ok.insert(v.0);
+                    }
+                }
+            }
+        }
+    }
+    ok
+}
+
+pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut result = FxHashSet::default();
+    if env_flag("CCC_NO_VLFOLD") {
+        return result;
+    }
+
+    // Exact use census: intrinsic-argument uses are counted, every other
+    // kind of reference (non-intrinsic operand, terminator, value ref,
+    // dest_ptr) poisons the value.
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut poisoned: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Intrinsic { args, dest_ptr, .. } => {
+                    for a in args {
+                        if let Operand::Value(v) = a {
+                            *use_count.entry(v.0).or_default() += 1;
+                        }
+                    }
+                    if let Some(p) = dest_ptr {
+                        poisoned.insert(p.0);
+                    }
+                }
+                other => {
+                    for_each_operand_in_instruction(other, |op| {
+                        if let Operand::Value(v) = op {
+                            poisoned.insert(v.0);
+                        }
+                    });
+                    for_each_value_use_in_instruction(other, |v| {
+                        poisoned.insert(v.0);
+                    });
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                poisoned.insert(v.0);
+            }
+        });
+    }
+
+    let debug = env_flag("CCC_DEBUG_VLFOLD");
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let insts = &block.instructions;
+        // The elided load's width must match its consumer's family: a
+        // 128-bit consumer folds a 16-byte memory operand, a 256-bit
+        // consumer a 32-byte one. `wide` selects the matching load set.
+        let load_at = |k: usize, wide: bool| -> Option<u32> {
+            match insts.get(k) {
+                Some(Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                }) if if wide {
+                    is_memfold_vec_load(op)
+                } else {
+                    is_memfold_vec_load_128(op)
+                } =>
+                {
+                    Some(d.0)
+                }
+                _ => None,
+            }
+        };
+        let pure_load_at = |k: usize| -> bool {
+            matches!(insts.get(k), Some(Instruction::Intrinsic { op, .. }) if is_pure_vec_load(op))
+        };
+        for j in 0..insts.len() {
+            let Instruction::Intrinsic {
+                dest: Some(_),
+                op: cop,
+                args: cargs,
+                ..
+            } = &insts[j]
+            else {
+                continue;
+            };
+            // Madd `a*b + c`: every position may fold (the multiplicands
+            // commute; the emitter picks the 213/231 form and keeps the
+            // XMM-homed broadcast as the register source). 256-bit only.
+            // (Immediate-shift consumers are NOT foldable — the VEX forms
+            // are register-only; see memfold_consumer_unary_imm_NEVER.)
+            let madd = memfold_consumer_madd_256(cop);
+            // The 128-bit packed FMA/FMS consumers: [a, b, acc] — only the
+            // ACC folds (the 132 form's addend slot). Modelled as the
+            // non-commutative second position: a1 = acc (folds), a0 = b
+            // (the `eligible(d, false)` commutativity gate keeps it
+            // unfoldable). The multiplicand `a` is not offered at all.
+            let fma128 = memfold_consumer_fma_128(cop);
+            // Binary consumers: the 256-bit table (emit_avx_binary_256) or
+            // the 128-bit table (emit_sse_binary_128's VEX path). A given
+            // opcode belongs to exactly one family, so the lookups cannot
+            // disagree. `wide` carries the width to the load matcher.
+            let (commutative, wide, a0, a1) = if fma128 {
+                if cargs.len() != 3 {
+                    continue;
+                }
+                let (Operand::Value(av), Operand::Value(b), Operand::Value(acc)) =
+                    (&cargs[0], &cargs[1], &cargs[2])
+                else {
+                    continue;
+                };
+                // ALIAS-FREE REQUIREMENT (see the madd arm): the acc
+                // folds; a and b must stay independently resolvable —
+                // `r = x*s + x` contracts to args [a=x, b=s, acc=x] where
+                // the acc IS the a multiplicand as a value (the SLP pack
+                // CSE maps both to the same load pack). Without the
+                // distinctness gate the acc_fold emitter would resolve
+                // the aliased `a` through the never-written home.
+                if av.0 == b.0 || av.0 == acc.0 || b.0 == acc.0 {
+                    continue;
+                }
+                (false, false, b, acc)
+            } else if madd {
+                if cargs.len() != 3 {
+                    continue;
+                }
+                let (Operand::Value(a0), Operand::Value(a1v), Operand::Value(a2)) =
+                    (&cargs[0], &cargs[1], &cargs[2])
+                else {
+                    continue;
+                };
+                // ALIAS-FREE REQUIREMENT (the madd twin of the binary
+                // table's a0 != a1 gate, extended to all three
+                // positions): the fold names exactly ONE operand; the
+                // other two references must stay independently
+                // resolvable (register home, deferred scratch, slot, or
+                // the fold's own memory role). With an aliased pair —
+                // fma(x, x, c) or fma(x, s, s) — the elided value would
+                // have to serve two roles at once (memory operand AND
+                // register/slot source), and no consumer path can
+                // honour both: the first resolution consumes the fold,
+                // the second then reads either the never-written RA home
+                // or the never-written slot. Aliased shapes keep the
+                // (correct, merely slower) ordinary load path.
+                if a0.0 == a2.0 || a1v.0 == a0.0 || a1v.0 == a2.0 {
+                    continue;
+                }
+                (true, true, a0, a2)
+            } else {
+                let Some((commutative, wide)) = memfold_consumer_256(cop)
+                    .map(|c| (c, true))
+                    .or_else(|| memfold_consumer_128(cop).map(|c| (c, false)))
+                else {
+                    continue;
+                };
+                if cargs.len() != 2 {
+                    continue;
+                }
+                let (Operand::Value(a0), Operand::Value(a1)) = (&cargs[0], &cargs[1]) else {
+                    continue;
+                };
+                (commutative, wide, a0, a1)
+            };
+            if a0.0 == a1.0 {
+                continue;
+            }
+            let eligible = |d: u32, is_second: bool| -> bool {
+                (is_second || commutative)
+                    && !poisoned.contains(&d)
+                    && use_count.get(&d).copied() == Some(1)
+            };
+            let a_mid = match (madd, &cargs[1]) {
+                (true, Operand::Value(v)) => Some(v.0),
+                _ => None,
+            };
+            let pick_from = |d: u32| -> Option<u32> {
+                if d == a1.0 && eligible(d, true) {
+                    Some(d)
+                } else if (d == a0.0 || a_mid == Some(d)) && eligible(d, false) {
+                    Some(d)
+                } else {
+                    None
+                }
+            };
+            let mut pick = None;
+            if j >= 2 && pure_load_at(j - 1) {
+                if let Some(d) = load_at(j - 2, wide) {
+                    pick = pick_from(d);
+                }
+            }
+            if pick.is_none() && j >= 1 {
+                if let Some(d) = load_at(j - 1, wide) {
+                    pick = pick_from(d);
+                }
+            }
+            if let Some(d) = pick {
+                if debug {
+                    eprintln!(
+                        "[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}",
+                        func.name, bi, j, d, cop
+                    );
+                }
+                result.insert(d);
+            }
+        }
+    }
+    result
+}
+
+/// Defer a vector home-slot store when every def is consumed once from the
+/// last-store peephole by a cache-aware intrinsic in the same block.
+/// Values whose EXACTLY ONE use is in the same block as their definition —
+/// the destructive-form dst-homing set for the FMA memory-fold emitters.
+///
+/// Soundness: a value in this set may have its register home OVERWRITTEN by
+/// a consumer that computes its result in place (the madd VLFOLD arm's
+/// `<fam213/231> MEM, %src2, %dst` with dst = the dying operand's home).
+/// A static use-count of one is NOT sufficient for that on its own: a
+/// loop-invariant broadcast has exactly one use SITE (the loop body's madd)
+/// but is read by every dynamic iteration, so overwriting its home after the
+/// first iteration poisons the rest. The block-local definition is the
+/// missing half — when the def and the single use share a block, any dynamic
+/// re-reach of the use must re-execute the def first (the def strictly
+/// precedes the use in the same basic block), so the home is always
+/// re-written before it is re-read. Values with any second reference of any
+/// kind (non-intrinsic operand, value ref, terminator, a second intrinsic
+/// argument) are excluded by the census; so are cross-block single uses
+/// (defined in A, used in B — conservative, and the rare straight-line case
+/// merely keeps the scratch-staging spelling).
+pub(super) fn compute_vector_dying_values(func: &IrFunction) -> FxHashSet<u32> {
+    // Exact total-use census over every reference kind. A value needs
+    // exactly one use, period — the census counts intrinsic arguments,
+    // non-intrinsic instruction operands, explicit value references and
+    // terminator operands alike, so any aliasing read disqualifies.
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut use_block: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut multi_block_def: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            // Definition sites: intrinsic SSA dests (loads, broadcasts,
+            // arithmetic — the vector values the emitters home).
+            match inst {
+                Instruction::Intrinsic { dest: Some(d), .. } => {
+                    if def_block.insert(d.0, bi).is_some() {
+                        multi_block_def.insert(d.0);
+                    }
+                }
+                Instruction::BinOp { dest, .. }
+                | Instruction::UnaryOp { dest, .. }
+                | Instruction::Cast { dest, .. } => {
+                    if def_block.insert(dest.0, bi).is_some() {
+                        multi_block_def.insert(dest.0);
+                    }
+                }
+                _ => {}
+            }
+            // Use sites: every operand of every instruction, in the
+            // instruction's block.
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *use_count.entry(v.0).or_default() += 1;
+                    use_block.insert(v.0, bi);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                *use_count.entry(v.0).or_default() += 1;
+                use_block.insert(v.0, bi);
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *use_count.entry(v.0).or_default() += 1;
+                use_block.insert(v.0, bi);
+            }
+        });
+    }
+    let mut result = FxHashSet::default();
+    for (&v, &n) in &use_count {
+        if n != 1 {
+            continue;
+        }
+        // A use without a recorded def site is a parameter or an
+        // undefined reference — its "home" is not a local def's product.
+        let Some(&db) = def_block.get(&v) else {
+            continue;
+        };
+        if multi_block_def.contains(&v) {
+            continue;
+        }
+        if use_block.get(&v) == Some(&db) {
+            result.insert(v);
+        }
+    }
+    result
+}
+
+pub(super) fn compute_vector_defer_values(
+    func: &IrFunction,
+    memfold_values: &FxHashSet<u32>,
+) -> FxHashSet<u32> {
+    let mut result = FxHashSet::default();
+
+    let mut allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut volatile_allocas: FxHashSet<u32> = FxHashSet::default();
+    let mut copy_alias_roots: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca {
+                    dest,
+                    volatile,
+                    semantic_volatile,
+                    ..
+                } => {
+                    allocas.insert(dest.0);
+                    if *volatile || *semantic_volatile {
+                        volatile_allocas.insert(dest.0);
+                    }
+                }
+                Instruction::Copy {
+                    src: Operand::Value(v),
+                    ..
+                } => {
+                    copy_alias_roots.insert(v.0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut uses: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    let mut has_value_ref_use: FxHashSet<u32> = FxHashSet::default();
+    let mut non_intrinsic_arg_use: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                Instruction::Intrinsic { args, .. } => {
+                    for arg in args {
+                        if let Operand::Value(v) = arg {
+                            uses.entry(v.0).or_default().push((bi, ii));
+                        }
+                    }
+                }
+                other => {
+                    for_each_operand_in_instruction(other, |op| {
+                        if let Operand::Value(v) = op {
+                            uses.entry(v.0).or_default().push((bi, ii));
+                            non_intrinsic_arg_use.insert(v.0);
+                        }
+                    });
+                    for_each_value_use_in_instruction(other, |v| {
+                        has_value_ref_use.insert(v.0);
+                    });
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                uses.entry(v.0).or_default().push((bi, usize::MAX));
+                non_intrinsic_arg_use.insert(v.0);
+            }
+        });
+    }
+
+    // A deferred result lives only in an x86 SIMD scratch register until its
+    // consuming intrinsic. Do not carry it across an unrelated instruction
+    // that can use the same scratch registers. This is deliberately a
+    // whitelist: Copy has no type field and can be a vector/FP copy, while
+    // FP operations spill through xmm0/xmm1 under register pressure. Integer
+    // address/arithmetic instructions and integer loads are safe to cross.
+    // FP/vector loads are not: their generic lowering can use the same scratch
+    // registers. Candidates are non-escaping allocas, so the alias checks
+    // below independently reject derivations or non-intrinsic slot uses.
+    let is_vec_invalidator = crate::backend::generation::instruction_may_clobber_vector_scratch;
+
+    let mut defs: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    let mut def_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                Instruction::Intrinsic {
+                    dest_ptr: Some(d),
+                    op,
+                    ..
+                } if !is_user_store_intrinsic(op) && allocas.contains(&d.0) => {
+                    defs.entry(d.0).or_default().push((bi, ii));
+                    def_blocks.entry(d.0).or_default().insert(bi);
+                }
+                Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                } if is_vec_ssa_producer(op) => {
+                    defs.entry(d.0).or_default().push((bi, ii));
+                    def_blocks.entry(d.0).or_default().insert(bi);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let debug_vdefer = env_flag("CCC_DEBUG_VDEFER");
+
+    for (&slot, sites) in &defs {
+        if volatile_allocas.contains(&slot)
+            || copy_alias_roots.contains(&slot)
+            || has_value_ref_use.contains(&slot)
+            || non_intrinsic_arg_use.contains(&slot)
+        {
+            continue;
+        }
+
+        if let Some(use_sites) = uses.get(&slot) {
+            let written = def_blocks.get(&slot);
+            let orphan = use_sites
+                .iter()
+                .any(|&(ubi, _)| !written.map(|b| b.contains(&ubi)).unwrap_or(false));
+            if orphan {
+                continue;
+            }
+        }
+
+        let mut sites_sorted = sites.clone();
+        sites_sorted.sort_unstable();
+
+        let mut all_sites_ok = true;
+        for &(bi, i) in &sites_sorted {
+            let insts = &func.blocks[bi].instructions;
+
+            let earlier_use = uses
+                .get(&slot)
+                .is_some_and(|u| u.iter().any(|&(ubi, uii)| ubi == bi && uii <= i));
+            if earlier_use {
+                all_sites_ok = false;
+                break;
+            }
+
+            let next_def_in_block = sites_sorted
+                .iter()
+                .find(|&&(db, di)| db == bi && di > i)
+                .map(|&(_, di)| di);
+            let window_uses: Vec<usize> = uses
+                .get(&slot)
+                .map(|u| {
+                    u.iter()
+                        .filter(|&&(ubi, uii)| {
+                            ubi == bi
+                                && uii > i
+                                && next_def_in_block.map(|nd| uii < nd).unwrap_or(true)
+                        })
+                        .map(|&(_, uii)| uii)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if window_uses.len() != 1 {
+                all_sites_ok = false;
+                break;
+            }
+            let u = window_uses[0];
+            if u >= insts.len() || u <= i {
+                all_sites_ok = false;
+                break;
+            }
+
+            let mut ok = true;
+            for ik in &insts[(i + 1)..u] {
+                // A VLFOLD-elided 256-bit load never materialises: it is
+                // consumed as a memory operand by the SAME consumer `u`
+                // (`vec_load_sink` places it directly before `u`), so it
+                // cannot clobber the deferred %ymm0 value.  Should the
+                // elision bail at emit time, the fallback load flushes the
+                // pending store before touching %ymm0 (intrinsics.rs), so
+                // crossing it here is sound in both outcomes.
+                let elided_load = matches!(
+                    ik,
+                    Instruction::Intrinsic {
+                        dest: Some(ld),
+                        dest_ptr: None,
+                        op: lop,
+                        ..
+                    } if is_memfold_vec_load(lop) && memfold_values.contains(&ld.0)
+                );
+                if elided_load {
+                    continue;
+                }
+                if is_vec_invalidator(ik) || matches!(ik, Instruction::Intrinsic { .. }) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                all_sites_ok = false;
+                break;
+            }
+
+            let Some(Instruction::Intrinsic {
+                op: cop,
+                args: cargs,
+                ..
+            }) = insts.get(u)
+            else {
+                all_sites_ok = false;
+                break;
+            };
+            let pos = cargs
+                .iter()
+                .position(|a| matches!(a, Operand::Value(v) if v.0 == slot));
+            // VLFOLD: `emit_avx_map_fma` streams whichever multiplicand or
+            // bias is not folded/homed through `avx_load_arg`, which is a
+            // no-op for the deferred value (positions 1 and 2 of VecMadd*).
+            let cache_aware = match pos {
+                Some(0) => !is_raw_reader_intrinsic(cop),
+                Some(1) => {
+                    is_two_operand_binary(cop)
+                        || memfold_consumer_madd_256(cop)
+                        || is_cache_aware_3op(cop)
+                }
+                Some(2) => memfold_consumer_madd_256(cop) || is_cache_aware_3op(cop),
+                _ => false,
+            };
+            if !cache_aware {
+                all_sites_ok = false;
+                break;
+            }
+            if debug_vdefer {
+                eprintln!(
+                    "[VDEFER] slot={} def=({},{})(uses_in_window={:?}) consumer=({},{})({:?}) site-ok",
+                    slot, bi, i, window_uses, bi, u, cop
+                );
+            }
+        }
+        if all_sites_ok {
+            result.insert(slot);
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod cfg_copy_coalesce_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+
+    #[test]
+    fn unsigned_saturating_subtract_is_never_commuted_for_memfold() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        assert_eq!(memfold_consumer_128(&O::VecSubSatU16x8), Some(false));
+        assert_eq!(memfold_consumer_256(&O::VecSubSatU16x16), Some(false));
+    }
+
+    /// Every register-resident `VecLoad*` family reads its pointer's bytes
+    /// raw, so a deferred SSE/AVX result store into that slot must be
+    /// flushed first. Pinned against the IR's own read classification:
+    /// six families (I64x2, I64x4, I16x8, I8x16, I32x4Pair, WidenI32ToI64x2)
+    /// were missing, and BB-SLP's 2×I64 copy read a stale `dest_ptr` slot.
+    #[test]
+    fn every_vec_load_family_is_a_raw_reader() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        for op in [
+            O::VecLoadF64x2,
+            O::VecLoadF64x4,
+            O::VecLoadI32x4,
+            O::VecLoadI32x8,
+            O::VecLoadStrided2I32x8,
+            O::VecLoadStrided2I32x4,
+            O::VecLoadStrided2CompactI32x4,
+            O::VecLoadF32x4,
+            O::VecLoadF32x8,
+            O::VecLoadI8x32,
+            O::VecLoadI16x16,
+            O::VecLoadI64x2,
+            O::VecLoadI64x4,
+            O::VecLoadI16x8,
+            O::VecLoadI8x16,
+            O::VecLoadI32x4Pair,
+            O::VecLoadWidenI32ToI64x2,
+        ] {
+            assert!(
+                op.may_read_memory(),
+                "{op:?}: premise — the IR classifies it as a read"
+            );
+            assert!(
+                is_raw_reader_intrinsic(&op),
+                "{op:?} must flush a deferred store first"
+            );
+        }
+    }
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            source_spans: Vec::new(),
+            terminator,
+        }
+    }
+
+    fn scalar_def(dest: u32, value: i32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Const(IrConst::I32(value)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        }
+    }
+
+    #[test]
+    fn cfg_copy_coalesces_a_straight_line_copy() {
+        let mut func = IrFunction::new("straight".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 7),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let (aliases, force) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
+        assert_eq!(aliases.get(&1), Some(&0));
+        assert!(force.contains(&1));
+    }
+
+    #[test]
+    fn cfg_copy_rejects_a_phi_edge_source_live_on_another_path() {
+        let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![scalar_def(0, 11)],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(0)),
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                2,
+                vec![
+                    scalar_def(1, 22),
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(1)),
+                    },
+                ],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                vec![Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::I32,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        let mut multi_def = FxHashSet::default();
+        multi_def.insert(2);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
+        assert_ne!(aliases.get(&0), Some(&2));
+        assert_ne!(aliases.get(&2), Some(&0));
+        assert_eq!(aliases.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn cfg_copy_coalesces_loop_carried_phi_sources() {
+        let mut func = IrFunction::new("loop_phi".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    scalar_def(0, 3),
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(0)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+        ];
+        let mut multi_def = FxHashSet::default();
+        multi_def.insert(2);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
+        assert_eq!(aliases.get(&0), Some(&2));
+        assert_ne!(aliases.get(&1), Some(&2));
+    }
+
+    #[test]
+    fn cfg_copy_excludes_i128_from_scalar_slot_aliasing() {
+        let mut func = IrFunction::new("wide".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I128(1)),
+                    rhs: Operand::Const(IrConst::I128(2)),
+                    ty: IrType::I128,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        ));
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn cfg_copy_refuses_self_copy() {
+        let mut func = IrFunction::new("self".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 1),
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        ));
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn immediately_consumed_picks_adjacent_cast() {
+        let mut func = IrFunction::new("adj".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 9),
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0));
+        assert!(!skip.contains(&1));
+    }
+
+    #[test]
+    fn immediately_consumed_rejects_two_uses() {
+        let mut func = IrFunction::new("two".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 9),
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(2),
+                    op: crate::ir::reexports::IrUnaryOp::Neg,
+                    src: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(!skip.contains(&0));
+    }
+
+    #[test]
+    fn immediately_consumed_rejects_float_producer() {
+        let mut func = IrFunction::new("fp".to_string(), IrType::F64, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(0)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::F64,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(!skip.contains(&0));
+    }
+
+    #[test]
+    fn immediately_consumed_binop_const_rhs_on_x86() {
+        let mut func = IrFunction::new("imm".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 1),
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0));
+    }
+
+    /// Commuted-RHS producers (the sha256 MAJ shape `maj = (a&b) ^ ((a^b)&c)`:
+    /// `a^b` is the RHS of the And, `(a^b)&c` the RHS of the Xor). On
+    /// lhs-first backends the emitter commutes (`andl <other-home>, %eax`),
+    /// so these are safe accumulator consumers and must NOT be given
+    /// write-only deferred slots (the dead park stores).
+    #[test]
+    fn immediately_consumed_commutative_rhs_on_lhs_first() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (commuted-RHS eligibility is the behavior under test), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
+        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
+        // v1 := 6; v0 := 4; v2 := And(v1, v0)  [v0 consumed as RHS, adjacent]
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, true);
+        assert!(
+            skip.contains(&0),
+            "commutative RHS consumer must be acc-eligible on lhs-first"
+        );
+        // v1's use is the And but its def is NOT adjacent (v0 sits between):
+        // only the adjacent producer is acc-consumable.
+        assert!(!skip.contains(&1));
+    }
+
+    /// `CCC_NO_COMMUTED_ACC` (forced through the tri-state override): the
+    /// commuted-RHS arm stops marking, restoring the LHS-only contract for
+    /// bisection — the same shape as above loses its skip marking. This is
+    /// the disabled path the audit called untestable; the atomic override
+    /// makes it a first-class test citizen.
+    #[test]
+    fn ccc_no_commuted_acc_restores_lhs_only_contract() {
+        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        // The window restores the PREVIOUS override state (-1 env-follow by
+        // default) on drop — panic-safe, and it restores the DEFAULT rather
+        // than a forced-ON state, so a suite run with CCC_NO_COMMUTED_ACC
+        // set produces order-independent outcomes. Held under the shared
+        // backend-flag lock, so flip windows are mutually exclusive.
+        let _lhs_only = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 0);
+        let skip = compute_immediately_consumed(&func, true);
+        assert!(
+            !skip.contains(&0),
+            "the override must restore the LHS-only contract"
+        );
+    }
+
+    /// Sub-32-bit commuted-RHS shapes (the audit's M2 coverage gap). The
+    /// coalescer's decision is width-blind by design — the producer side
+    /// already filters to GPR-cache types (I8/I16 qualify) — and the
+    /// emitter's width guard cannot decline the no-slot class: for a
+    /// value with NO slot, `is_small_slot(v)` is false, so
+    /// `(use_32bit || !is_small_slot(v))` holds for every `ty`. The width
+    /// law lives in the established narrow-op convention (64-bit forms on
+    /// a GPR-cached value; `store_rax_to`/`store_eax_to` consult
+    /// `is_small_slot(dest)` internally for the store), so an i8/i16 MAJ
+    /// shape takes the acc path exactly like the I32 one. Pinning it
+    /// here keeps a future width filter from silently stranding the
+    /// class with no slot and no fallback.
+    #[test]
+    fn immediately_consumed_commutative_rhs_narrow_widths() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (narrow-width commuted eligibility (audit M2 coverage)), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
+        let narrow_def = |dest: u32, value: i32, ty: IrType| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Const(IrConst::I32(value)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty,
+        };
+        for (name, ty) in [("maj8", IrType::I8), ("maj16", IrType::I16)] {
+            let mut func = IrFunction::new(name.to_string(), IrType::I32, vec![], false);
+            // v1 := 6 (narrow); v0 := 4 (narrow); v2 = And v1, v0 (narrow,
+            // RHS consumed adjacent) — the same MAJ shape as the I32 test.
+            func.blocks.push(block(
+                0,
+                vec![
+                    narrow_def(1, 6, ty),
+                    narrow_def(0, 4, ty),
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::And,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Value(Value(0)),
+                        ty,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ));
+            let skip = compute_immediately_consumed(&func, true);
+            assert!(
+                skip.contains(&0),
+                "{name}: adjacent narrow commuted RHS must be acc-eligible"
+            );
+            assert!(
+                !skip.contains(&1),
+                "{name}: non-adjacent producer must not be skipped"
+            );
+        }
+    }
+
+    /// The commute contract is lhs-first-only: an AccumulatorCentric backend
+    /// (i686) keeps the LHS-only rule for the same shape.
+    #[test]
+    fn immediately_consumed_commutative_rhs_rejected_when_not_lhs_first() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (the commuted arm is what must reject here), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
+        let mut func = IrFunction::new("maj".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(
+            !skip.contains(&0),
+            "RHS consumption is NOT acc-safe without the lhs-first commute contract"
+        );
+    }
+
+    /// Non-commutative consumers (`Sub(X, v)`: x86-64 stages the LHS into
+    /// %rax and subtracts <v> loaded from its HOME) keep the LHS-only rule
+    /// even on lhs-first backends — the sdivm3 `0 - (v/3)` class.
+    #[test]
+    fn immediately_consumed_non_commutative_rhs_rejected_on_lhs_first() {
+        // Pin FORCED-COMMUTED for the duration of the test: the outcome
+        // asserted here is the commuted arm (rejection is independent of the commuted arm, but the outcome is still flag-shaped), and a concurrent
+        // flip window must not change it. Also serializes this test against
+        // the flip windows on the shared backend-flag lock.
+        let _pin = crate::test_support::TriStateFlagWindow::new(&COMMUTED_ACC_OVERRIDE, 1);
+        let mut func = IrFunction::new("sub".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(1, 6),
+                scalar_def(0, 4),
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, true);
+        assert!(
+            !skip.contains(&0),
+            "Sub RHS is not commutable: the producer needs a home"
+        );
+    }
+
+    #[test]
+    fn immediately_consumed_copy_rename_chain() {
+        let mut func = IrFunction::new("rename".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(block(
+            0,
+            vec![
+                scalar_def(0, 4),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        ));
+        let skip = compute_immediately_consumed(&func, false);
+        assert!(skip.contains(&0), "src of dead copy should stay in acc");
+        assert!(skip.contains(&1), "copy dest consumed by cast");
+    }
+}

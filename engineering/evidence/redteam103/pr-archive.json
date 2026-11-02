@@ -1,0 +1,47 @@
+{
+  "archive": "REDTEAM103-PR-REFRESH.tar.xz",
+  "bytes": 4984428,
+  "sha256": "ad9b0a5b65149f187a0326b30c0cfc56ec10d83c04c52ce8e4ba76f7a64f27f5",
+  "members": [
+    {
+      "path": "836/discussion.json",
+      "bytes": 25006,
+      "sha256": "263161ef6a3755c9f3e0841e4972f3b904522f1c451288cc73db4c9c9c892ead"
+    },
+    {
+      "path": "836/inline-comments.json",
+      "bytes": 2,
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "path": "836/metadata.json",
+      "bytes": 21784,
+      "sha256": "638db901adfbf84b1b11e37b8b8850b1ef72f546715c6af96fad2907aafb762a"
+    },
+    {
+      "path": "836/pull.patch",
+      "bytes": 8620521,
+      "sha256": "8713c5f2f3dd53c42e488f05484361a18d039c60f5f9fac275dc9a87303261aa"
+    },
+    {
+      "path": "836/reviews.json",
+      "bytes": 2,
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "path": "closed-order-proof.json",
+      "bytes": 508,
+      "sha256": "3ba8638953456b68699c2e6fe1fd77fe56e8a7730432804298e2e0425b7bc246"
+    },
+    {
+      "path": "inventory.json",
+      "bytes": 535299,
+      "sha256": "dace0a9c71904085b9a1d1dcad96eb882e528018f0b9ffe7b4a93990e59b5c71"
+    },
+    {
+      "path": "revision-check.json",
+      "bytes": 4713,
+      "sha256": "98999281e3670da113de0fcfddb5e22738f88f55d78762e2010728d5fb802b97"
+    }
+  ]
+}

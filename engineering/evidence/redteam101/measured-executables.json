@@ -1,0 +1,1168 @@
+{
+  "archive": "S101-MEASURED-EXECUTABLES.tar.xz",
+  "sha256": "bca323a53c4f3cddc2b6ae8fdb18874072f5a41ed3a879155163bf65e715b570",
+  "bytes": 1119644,
+  "unique_payloads": 232,
+  "members": [
+    {
+      "path": "performance97/native45/expat_xml_scan/main/benchmark.bin",
+      "sha256": "f99c5dd65cce50435508ccc2acbf9c2e1bf01f6ad578875ecc9947ed37933910",
+      "bytes": 7368
+    },
+    {
+      "path": "performance97/native45/expat_xml_scan/gcc/benchmark.bin",
+      "sha256": "90a4e91896a7c2f57c3ff1f8d548f78525500ac24347dd9fc2f69da0f096f0f5",
+      "bytes": 16120
+    },
+    {
+      "path": "performance97/native45/expat_xml_scan/icx/benchmark.bin",
+      "sha256": "d0a60c49d460ed0bf4c70d066dc23f9dfbd4723e00c45a268128801e835448b3",
+      "bytes": 16136
+    },
+    {
+      "path": "performance97/native45/expat_xml_scan/lccc/benchmark.bin",
+      "sha256": "751cf554279a3874076409d72873a520e970a5e8591617c82282d156f44eb139",
+      "bytes": 7304
+    },
+    {
+      "path": "performance97/native45/expat_xml_scan/clang/benchmark.bin",
+      "sha256": "a96a3f971484e58abf7f99e85adbd782a998032cc10e0ac9bfafa5e1ec4f0898",
+      "bytes": 16136
+    },
+    {
+      "path": "performance97/native45/switch_dispatch/main/benchmark.bin",
+      "sha256": "fecd1d1106bf41327179df68d6d75586c8891a87ed957c1a811ccd3297500ad8",
+      "bytes": 6272
+    },
+    {
+      "path": "performance97/native45/switch_dispatch/gcc/benchmark.bin",
+      "sha256": "ce344e5cbdbf00891377f561c14578d6afc7d24abdfa632898677594eec85409",
+      "bytes": 15968
+    },
+    {
+      "path": "performance97/native45/switch_dispatch/icx/benchmark.bin",
+      "sha256": "fc7fdbc3f5bb9a989ea5b298ba05feac04ba3968cc32f2498e6313fd943eea16",
+      "bytes": 15944
+    },
+    {
+      "path": "performance97/native45/switch_dispatch/lccc/benchmark.bin",
+      "sha256": "518b51f8ccc9f1fe2422df137602aab2f79c15bf79ca18697721a71dbbe18c36",
+      "bytes": 6272
+    },
+    {
+      "path": "performance97/native45/switch_dispatch/clang/benchmark.bin",
+      "sha256": "4802d4858cf0be45756a10274c1e5a77c23a802d69a10b7d1d13b07538e68660",
+      "bytes": 16000
+    },
+    {
+      "path": "performance97/native45/sieve/main/benchmark.bin",
+      "sha256": "16ed107db9eab47894102a2882fb8a05d1c6b334ec24bec252993801c4e9af71",
+      "bytes": 6400
+    },
+    {
+      "path": "performance97/native45/sieve/gcc/benchmark.bin",
+      "sha256": "0c6398488655f675d4900b95ea14bcf0250c06b9e7a1b6c0254b6ed687b1af06",
+      "bytes": 16072
+    },
+    {
+      "path": "performance97/native45/sieve/icx/benchmark.bin",
+      "sha256": "1e81e9ef451897dd4ab3f7bed59a3d1c7f71cd518a215db634d549e05e0c1d2b",
+      "bytes": 48560
+    },
+    {
+      "path": "performance97/native45/sieve/lccc/benchmark.bin",
+      "sha256": "de7abe810808150823aa981381181d401ab2b686994024eb6ccc32bf743297bb",
+      "bytes": 6400
+    },
+    {
+      "path": "performance97/native45/sieve/clang/benchmark.bin",
+      "sha256": "acb6453a053fda5061976d42d106ed81786a2f2fec5d1af539e2b0bcd081ee6f",
+      "bytes": 16104
+    },
+    {
+      "path": "performance97/native45/tls_seg_access/main/benchmark.bin",
+      "sha256": "bf006483a542a22bbc3ce8fbfddf72cd904008592c0cec344dd65c73b14cf1ce",
+      "bytes": 6456
+    },
+    {
+      "path": "performance97/native45/tls_seg_access/gcc/benchmark.bin",
+      "sha256": "c3fb3714e4560829fde07f13ffa575256aa28a2ef14ee6140ea8618371105e12",
+      "bytes": 16104
+    },
+    {
+      "path": "performance97/native45/tls_seg_access/icx/benchmark.bin",
+      "sha256": "dec63da38c4f9af956fa8fe4cc39bd18f1b26be37e77217597a905a9212efa03",
+      "bytes": 16120
+    },
+    {
+      "path": "performance97/native45/tls_seg_access/lccc/benchmark.bin",
+      "sha256": "a5a9166179a3c8c0f720ded1dfb9dd9c039852744797e1d7a221920b8077d4d2",
+      "bytes": 6456
+    },
+    {
+      "path": "performance97/native45/tls_seg_access/clang/benchmark.bin",
+      "sha256": "29ddcdb932476f664a1745dcc94c483d33ae4e9fc114080f29bd8d0f5c4801fd",
+      "bytes": 16168
+    },
+    {
+      "path": "performance97/native45/sha256_transform/main/benchmark.bin",
+      "sha256": "6bc5b137cf91cd91c1c822d8d0d1d651eed60ee1504b64d79489692d23ac0d02",
+      "bytes": 7888
+    },
+    {
+      "path": "performance97/native45/sha256_transform/gcc/benchmark.bin",
+      "sha256": "777f42af7744e948b0c228327d3f1f8efa7ad852d0fcb147d4536a77d16e0590",
+      "bytes": 16032
+    },
+    {
+      "path": "performance97/native45/sha256_transform/icx/benchmark.bin",
+      "sha256": "51cac1f394dd5d265e3595bce58f3de4f33f76430ff10421cc3e9d25e88fe8d3",
+      "bytes": 20112
+    },
+    {
+      "path": "performance97/native45/sha256_transform/lccc/benchmark.bin",
+      "sha256": "b4e233d4b6935b3b81f80125954fc2394a0989d4a6b4fe504f28e1fd20316e34",
+      "bytes": 7904
+    },
+    {
+      "path": "performance97/native45/sha256_transform/clang/benchmark.bin",
+      "sha256": "199f1ebb63fdc78378b51bbe2863135fd0762a48a555db5afbaed177f25ff33b",
+      "bytes": 16064
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32/main/benchmark.bin",
+      "sha256": "74453f6c2087c2f0867b645fd67e7d6390f97ec19abdf7a547d07062d28c9c85",
+      "bytes": 7392
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32/gcc/benchmark.bin",
+      "sha256": "36be496f7c20201b410b19286ce2ed90d27c67dc4946c65e7354794aa2630d1b",
+      "bytes": 16040
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32/icx/benchmark.bin",
+      "sha256": "1f7be7830de8076f11e7f345df9fe87ba94dd470d034428c247b6f0bfe26b95a",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32/lccc/benchmark.bin",
+      "sha256": "789875eb91d9bb69aa24c6d674a3f56913a5107b05156625494b0a46739c6fbd",
+      "bytes": 7392
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32/clang/benchmark.bin",
+      "sha256": "c3b09179f6cc8e37d7816744cb6705bf5abca3d8175297efbb11e49baf654464",
+      "bytes": 16040
+    },
+    {
+      "path": "performance97/native45/byte_load_reassembly/main/benchmark.bin",
+      "sha256": "529c03add4a14d7b368e755943dfa02ae83e8eafe2da559e53c0fc18e8eb7d71",
+      "bytes": 6904
+    },
+    {
+      "path": "performance97/native45/byte_load_reassembly/gcc/benchmark.bin",
+      "sha256": "7426b9f483bc527230433baae5c475f23684f177ea2e2ebbc8b94f5e7cee15b4",
+      "bytes": 16032
+    },
+    {
+      "path": "performance97/native45/byte_load_reassembly/icx/benchmark.bin",
+      "sha256": "6233f48817d015dff59ffe345a7fa0c8959882e8b59ca6b9094e30d27234ded3",
+      "bytes": 16016
+    },
+    {
+      "path": "performance97/native45/byte_load_reassembly/lccc/benchmark.bin",
+      "sha256": "90cbd6c16f984c1bfc651b15a47aab3bfbd109b65fc606737999f2590e9b7aaa",
+      "bytes": 6768
+    },
+    {
+      "path": "performance97/native45/byte_load_reassembly/clang/benchmark.bin",
+      "sha256": "e88989e5025c32c29c08459a1c0e1b232101fa62af65c4a42cade9c45b241054",
+      "bytes": 16064
+    },
+    {
+      "path": "performance97/native45/hash_table/main/benchmark.bin",
+      "sha256": "60c55f2daf88706d1a8aedd5bcad2b791d6e7bf140b382b2e9a8885db6581b04",
+      "bytes": 6776
+    },
+    {
+      "path": "performance97/native45/hash_table/gcc/benchmark.bin",
+      "sha256": "197b82641cd6600ed0c8ea5aa1dc7ef8e347426487ea096307764da5100add3e",
+      "bytes": 16104
+    },
+    {
+      "path": "performance97/native45/hash_table/icx/benchmark.bin",
+      "sha256": "a1ac54c240119255831f59cc52f2fe94e6a55d8d12ddb90c152072490312038a",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/hash_table/lccc/benchmark.bin",
+      "sha256": "aa3d7683a0f0985fa77cd0a7d8217cc668bf8e214215e6b9e480c47d5c3116bc",
+      "bytes": 6776
+    },
+    {
+      "path": "performance97/native45/hash_table/clang/benchmark.bin",
+      "sha256": "f5c0c376e51a6bbbe0d28ff9cb3c4a44a71ecfb3b73c4e6017662556c9e2d1c8",
+      "bytes": 16072
+    },
+    {
+      "path": "performance97/native45/histogram/main/benchmark.bin",
+      "sha256": "bec2886180dc448a311bc28a74b714541192edbffb3c600745aec04253b2dca9",
+      "bytes": 5984
+    },
+    {
+      "path": "performance97/native45/histogram/gcc/benchmark.bin",
+      "sha256": "fcf6f74602eea4aae1ed6ec945c4e0271e45ca206cc9b8795a7c449d94969c8b",
+      "bytes": 15896
+    },
+    {
+      "path": "performance97/native45/histogram/icx/benchmark.bin",
+      "sha256": "c9f8509f26bf37882e55fb65ec9e81317e7985779fcdf966f9444d00dd885adc",
+      "bytes": 15872
+    },
+    {
+      "path": "performance97/native45/histogram/lccc/benchmark.bin",
+      "sha256": "be10c29158d3b6929591d8b69f695bcc5f7e5c66f95ec37f9a7c8a214e30429f",
+      "bytes": 5984
+    },
+    {
+      "path": "performance97/native45/histogram/clang/benchmark.bin",
+      "sha256": "e364326dfffba89b16d9f7d9dd8ad958e0c921a19e1364aaf5cde95916007807",
+      "bytes": 15928
+    },
+    {
+      "path": "performance97/native45/sqlite_varint/main/benchmark.bin",
+      "sha256": "e4bce50f4c6940e143ff9fa66dcfae300f5af488dcf98eb9d1bec1af9a3c6b9b",
+      "bytes": 8072
+    },
+    {
+      "path": "performance97/native45/sqlite_varint/gcc/benchmark.bin",
+      "sha256": "1b49e1e0d060f5cd216672686a6e6dba810f9489e0e29d41c230c8a26eef9092",
+      "bytes": 16232
+    },
+    {
+      "path": "performance97/native45/sqlite_varint/icx/benchmark.bin",
+      "sha256": "1aeed3067878277b3e118b3e5be1abe611a3239bed1a7e48e4dcc3b335d149bc",
+      "bytes": 16128
+    },
+    {
+      "path": "performance97/native45/sqlite_varint/lccc/benchmark.bin",
+      "sha256": "44cea6cc00f93942c8b972c5da61f800fe0c606443dfeee721b1058f248e1732",
+      "bytes": 8088
+    },
+    {
+      "path": "performance97/native45/sqlite_varint/clang/benchmark.bin",
+      "sha256": "b34e678d94bd2e52bbecedc4bb7a294aa08c00fd7e1ffe32e37e8302d8d04bb4",
+      "bytes": 16216
+    },
+    {
+      "path": "performance97/native45/binary_search/main/benchmark.bin",
+      "sha256": "997341f88194920139fc1fa4206902f980234e8a44c2651f28fddad79f930793",
+      "bytes": 6016
+    },
+    {
+      "path": "performance97/native45/binary_search/gcc/benchmark.bin",
+      "sha256": "d18a9e14b5a458f55b17ef47adc478e3d00b7ef82d1f263233d33e2fca9b53f6",
+      "bytes": 15864
+    },
+    {
+      "path": "performance97/native45/binary_search/icx/benchmark.bin",
+      "sha256": "ce273ed76fce92064b55006fe907d1bb480bb8404a304ab9b313fcabf5090d43",
+      "bytes": 15848
+    },
+    {
+      "path": "performance97/native45/binary_search/lccc/benchmark.bin",
+      "sha256": "7adb8083445112b821b460c1150bb28637a4e19c31a8791281367bf379d80bc2",
+      "bytes": 6008
+    },
+    {
+      "path": "performance97/native45/binary_search/clang/benchmark.bin",
+      "sha256": "8229f107d75fd5afd14508410184f4553fc99a6e27569a2a8a95e323fde5f86d",
+      "bytes": 15896
+    },
+    {
+      "path": "performance97/native45/strlen_bench/main/benchmark.bin",
+      "sha256": "8657f8aa45741b238e87dcc18950fc1484a50c841680bc544f37b459dbb45a18",
+      "bytes": 7208
+    },
+    {
+      "path": "performance97/native45/strlen_bench/gcc/benchmark.bin",
+      "sha256": "f634e69a7906c303d9d61254a2dd7b80b5a48ce247d939a585420e240e974cfb",
+      "bytes": 16144
+    },
+    {
+      "path": "performance97/native45/strlen_bench/icx/benchmark.bin",
+      "sha256": "70c515a85fd95c4b67594c336cff51687e31b8cfcfdb40348f750ca310c9931c",
+      "bytes": 77544
+    },
+    {
+      "path": "performance97/native45/strlen_bench/lccc/benchmark.bin",
+      "sha256": "d4097634324a7e4909c12da10f01d8855a59ef1d31e9ec2c0ef8a2479524fceb",
+      "bytes": 7224
+    },
+    {
+      "path": "performance97/native45/strlen_bench/clang/benchmark.bin",
+      "sha256": "952582a10cb1d28fcb78145f7035bf26bfaaa5325c2fad539455026242be303a",
+      "bytes": 16176
+    },
+    {
+      "path": "performance97/native45/binary_trees/main/benchmark.bin",
+      "sha256": "c0806e78e99998dc811360ef4ad6af86a2bd62bc26eeeaed149533bb175a5273",
+      "bytes": 6960
+    },
+    {
+      "path": "performance97/native45/binary_trees/gcc/benchmark.bin",
+      "sha256": "f4499f4bfcf8e34ee5a75d4fe2746e83b7933570dfbf7f708f9fc945ef8ab887",
+      "bytes": 20248
+    },
+    {
+      "path": "performance97/native45/binary_trees/icx/benchmark.bin",
+      "sha256": "0107d8addc6c75cad94fc4a770bdf3a83dbffd2037641c0329477f1f78e9b3d4",
+      "bytes": 16136
+    },
+    {
+      "path": "performance97/native45/binary_trees/lccc/benchmark.bin",
+      "sha256": "40e21b0b9fd2d8f60db38c863c4420e8320a21c4615f8d4c5af90d32e0ca83f9",
+      "bytes": 6960
+    },
+    {
+      "path": "performance97/native45/binary_trees/clang/benchmark.bin",
+      "sha256": "59b019b76c87968efa9073167fec57e5af72dc120a24c3c0c9be5756771385fa",
+      "bytes": 16184
+    },
+    {
+      "path": "performance97/native45/gzip_crc32/main/benchmark.bin",
+      "sha256": "095811bdeb314e6420ea9b84ffec26f7a447230a784e8b9212f53bfcff56131a",
+      "bytes": 7568
+    },
+    {
+      "path": "performance97/native45/gzip_crc32/gcc/benchmark.bin",
+      "sha256": "c2a7f3c38655081b19f9b8287afd330c365f340ddd59469e500e320697ac52c9",
+      "bytes": 16072
+    },
+    {
+      "path": "performance97/native45/gzip_crc32/icx/benchmark.bin",
+      "sha256": "3a36c55d060a4091d04bcbf6859eda48ce12f38dffb0250aea0d9362040af7eb",
+      "bytes": 16016
+    },
+    {
+      "path": "performance97/native45/gzip_crc32/lccc/benchmark.bin",
+      "sha256": "d57dcc70b44f2f9e1b6689b6c364cdcf3f418398ee495cda9b8afd9c859f085d",
+      "bytes": 7568
+    },
+    {
+      "path": "performance97/native45/gzip_crc32/clang/benchmark.bin",
+      "sha256": "ab3192f7a06a71db94fe2152b660d4c378896a6f59e3a93b75baa81b4fd76003",
+      "bytes": 16072
+    },
+    {
+      "path": "performance97/native45/glibc_strstr/main/benchmark.bin",
+      "sha256": "5f9c37d3921cadceae68b8db978ac44b76bcdbf3d7700b351bf2716889655a4f",
+      "bytes": 6928
+    },
+    {
+      "path": "performance97/native45/glibc_strstr/gcc/benchmark.bin",
+      "sha256": "4f4c4b00e7baf081a12dd8a95e2bc5c2ff59786e216abf97e17d217939e87035",
+      "bytes": 16048
+    },
+    {
+      "path": "performance97/native45/glibc_strstr/icx/benchmark.bin",
+      "sha256": "16681b758af03581ff7bf75bc30ec8fe5cdf7369712395c285642624fd98a65c",
+      "bytes": 15976
+    },
+    {
+      "path": "performance97/native45/glibc_strstr/lccc/benchmark.bin",
+      "sha256": "285f472b936b781873bc5067b3f40e5f04e01077a9125b60bd1f310e31cb8609",
+      "bytes": 6928
+    },
+    {
+      "path": "performance97/native45/glibc_strstr/clang/benchmark.bin",
+      "sha256": "51393c20d6f8a00b043f49cde24fc8f9b3ace416d5a12a6d704a55f9c1410d79",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/double_reduction/main/benchmark.bin",
+      "sha256": "38270f33f18f51a27bdd74b618f0993f48287492fe03e4fb0776a73106c51265",
+      "bytes": 6656
+    },
+    {
+      "path": "performance97/native45/double_reduction/gcc/benchmark.bin",
+      "sha256": "b07ea19c75f440f5c937337de844856eda262ae2d137ffbdb5d88d42775b2c6a",
+      "bytes": 16040
+    },
+    {
+      "path": "performance97/native45/double_reduction/icx/benchmark.bin",
+      "sha256": "1015a29b6498c36b4c0c35ce0541ce82d7b5b03116d7fae875a00f5b66f81074",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/double_reduction/lccc/benchmark.bin",
+      "sha256": "e7cce9d135e7e377c79afd9dab4be18574d86f40cda143b19cb0cce086b57b81",
+      "bytes": 6656
+    },
+    {
+      "path": "performance97/native45/double_reduction/clang/benchmark.bin",
+      "sha256": "0a2eb8bb4fb71fbea2362cf3d18f2c2ae06e9c287c8880fdee7d64bb599c9eaa",
+      "bytes": 16072
+    },
+    {
+      "path": "performance97/native45/spectral_norm/main/benchmark.bin",
+      "sha256": "8c63370c51ecc40bebeeb4c74e263bbcbc0803a57673d734f75fb212aa106b3d",
+      "bytes": 7296
+    },
+    {
+      "path": "performance97/native45/spectral_norm/gcc/benchmark.bin",
+      "sha256": "70b77391f4894ef671356350fba886faf3bb06ee53e2731fea213dfdf32271ed",
+      "bytes": 16096
+    },
+    {
+      "path": "performance97/native45/spectral_norm/icx/benchmark.bin",
+      "sha256": "3242fd32bb360c8bca6f837a43fb5498a1c39657f05b4edcc66b3be5a3f306f1",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/spectral_norm/lccc/benchmark.bin",
+      "sha256": "91a1eff455ca1c31d71b60b158acf2e6902cb469370441bc4f455ac28e1839f5",
+      "bytes": 7280
+    },
+    {
+      "path": "performance97/native45/spectral_norm/clang/benchmark.bin",
+      "sha256": "5053324871624cca0f64688a54a2b63e1c3e90b5c4c605900b0ec4ad3672ab62",
+      "bytes": 16040
+    },
+    {
+      "path": "performance97/native45/linux_find_bit_scaled/main/benchmark.bin",
+      "sha256": "9fec4a4a268f4ed314d265110a68de5f97b47b75ccbce2f0127ccc33aa8f83ec",
+      "bytes": 6952
+    },
+    {
+      "path": "performance97/native45/linux_find_bit_scaled/gcc/benchmark.bin",
+      "sha256": "32ed2454a64f2518678c8468f387fea78e972ad80b33b3ad41252a5fc70b33e4",
+      "bytes": 16096
+    },
+    {
+      "path": "performance97/native45/linux_find_bit_scaled/icx/benchmark.bin",
+      "sha256": "10f93f8096a3cab6541d17673746468668bdbb3eb61d4a9afcfe724c7078cd08",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/linux_find_bit_scaled/lccc/benchmark.bin",
+      "sha256": "0c0c3fac1d2b4a4034a0d989dd0b593655f43559a7d78e9dba6bf92aef83c638",
+      "bytes": 6952
+    },
+    {
+      "path": "performance97/native45/linux_find_bit_scaled/clang/benchmark.bin",
+      "sha256": "bdbb132d14eb617ab38a82f4251832eb227b4da04f0b1bd56a33b7534d3ce866",
+      "bytes": 16072
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32_combine/main/benchmark.bin",
+      "sha256": "c9cd338530d7dc15ba157eb2d17b6858ba1cf775b68772ae7cdad04b0c54a9f9",
+      "bytes": 7496
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32_combine/gcc/benchmark.bin",
+      "sha256": "e0553f042f316357448cf03e515fd9518bd1e1dc6c59d17db4682be871191d49",
+      "bytes": 16064
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32_combine/icx/benchmark.bin",
+      "sha256": "60ebccc29d134fbf5c1efa1790e80416c2d230aea43bd09519124bd675586516",
+      "bytes": 16048
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32_combine/lccc/benchmark.bin",
+      "sha256": "c0552c6204590fef0c37dfad439e5165e184abcb886ada7ceab8eb2716f4d65c",
+      "bytes": 7528
+    },
+    {
+      "path": "performance97/native45/zlib_ng_adler32_combine/clang/benchmark.bin",
+      "sha256": "5dd74285f0d32842214faf0d0106752b7ca397a0f9c273386425b1d276619cfa",
+      "bytes": 16096
+    },
+    {
+      "path": "performance97/native45/bitops/main/benchmark.bin",
+      "sha256": "8981a51d21bb37e88f4a7f2e8ea468e867d4db5bd9c1f9c6d88ee8af4ff43af7",
+      "bytes": 6200
+    },
+    {
+      "path": "performance97/native45/bitops/gcc/benchmark.bin",
+      "sha256": "d4a97d1429837a25859d100494a092312825b6b5003f6c7c4cd868d7a20496a9",
+      "bytes": 15952
+    },
+    {
+      "path": "performance97/native45/bitops/icx/benchmark.bin",
+      "sha256": "41db4ea6128ef6a66b764dac38b4dc52f20c3e0a8462c1622a68c75a36516150",
+      "bytes": 15936
+    },
+    {
+      "path": "performance97/native45/bitops/lccc/benchmark.bin",
+      "sha256": "f5553cf062c737457eb4bf9e59fb0e8b2d90025c9b6ae86ace53fcd7dd560a3f",
+      "bytes": 6200
+    },
+    {
+      "path": "performance97/native45/bitops/clang/benchmark.bin",
+      "sha256": "b5a068fd9b83d3a6bd41bae87715dc631d7115643489a1b3556facf4adcaa410",
+      "bytes": 15984
+    },
+    {
+      "path": "performance97/native45/chacha20_block/main/benchmark.bin",
+      "sha256": "2117754ac17e2f400bd46b4d43ffa7f40157f1f3193f0c0579b740aa867d53a7",
+      "bytes": 7192
+    },
+    {
+      "path": "performance97/native45/chacha20_block/gcc/benchmark.bin",
+      "sha256": "3fb84911e6d502d772b788842ac747f5f5077442a92257b5be1080d869a3655d",
+      "bytes": 16032
+    },
+    {
+      "path": "performance97/native45/chacha20_block/icx/benchmark.bin",
+      "sha256": "40f7ae27a72ebf165a7e6af32220a62fc51c862ade8482383a5bc545fd7d73b5",
+      "bytes": 16032
+    },
+    {
+      "path": "performance97/native45/chacha20_block/lccc/benchmark.bin",
+      "sha256": "b9cd5c2535e843d6e73bb92160ae865327ea1f8de51d6ea53d03b93e3c639be1",
+      "bytes": 7192
+    },
+    {
+      "path": "performance97/native45/chacha20_block/clang/benchmark.bin",
+      "sha256": "da694009d77b9fad8425864728b0b4bd5f9eb577b8c847dc990a3761247ce3c5",
+      "bytes": 16088
+    },
+    {
+      "path": "performance97/native45/fannkuch/main/benchmark.bin",
+      "sha256": "d4c9a2ae4eb7c07f1a5295749dfe3503a1291fd8ee0ca3e3758ab11ca4716878",
+      "bytes": 6872
+    },
+    {
+      "path": "performance97/native45/fannkuch/gcc/benchmark.bin",
+      "sha256": "f8f263b36186034ab7c3145e5de7da3dd599205cd1112de815733674a251510a",
+      "bytes": 16112
+    },
+    {
+      "path": "performance97/native45/fannkuch/icx/benchmark.bin",
+      "sha256": "fb2055b3bd44998102f9147c1fbb83335b096018334d14fad4f70c52bfd8f89c",
+      "bytes": 16080
+    },
+    {
+      "path": "performance97/native45/fannkuch/lccc/benchmark.bin",
+      "sha256": "dc224ce4be289f742b503e7cd2f97939f52679b173bbc5efbbfb56c392cf3be2",
+      "bytes": 6904
+    },
+    {
+      "path": "performance97/native45/fannkuch/clang/benchmark.bin",
+      "sha256": "9c228062c21e8fac5a87b94e54f788e97f3a5e6ea13076c09cc765454780feef",
+      "bytes": 16128
+    },
+    {
+      "path": "performance97/native45/aarch64_select_patterns/main/benchmark.bin",
+      "sha256": "281dc193b36ecb64fec8341df180eb15970a2723c0758cd6c526b229212fbdbd",
+      "bytes": 6352
+    },
+    {
+      "path": "performance97/native45/aarch64_select_patterns/gcc/benchmark.bin",
+      "sha256": "c07d242c646f8d3c94019028d87e33d8d4bef04c872fe0b37ec30699d1019eb0",
+      "bytes": 16104
+    },
+    {
+      "path": "performance97/native45/aarch64_select_patterns/icx/benchmark.bin",
+      "sha256": "5e0d5898d7cb650a6f47820082bc46512e7bfd2437b71231ebefc9f82c3bdbdd",
+      "bytes": 16088
+    },
+    {
+      "path": "performance97/native45/aarch64_select_patterns/lccc/benchmark.bin",
+      "sha256": "ba9a221d6a9998853f28a128e7a65ab6c9e2dc2aef062773896d6409f3d0305e",
+      "bytes": 6352
+    },
+    {
+      "path": "performance97/native45/aarch64_select_patterns/clang/benchmark.bin",
+      "sha256": "bf29549c44118c0822c3a8774a22359a5e596cf5bde7d00875e4cce0c272ec08",
+      "bytes": 16136
+    },
+    {
+      "path": "performance97/native45/matmul/main/benchmark.bin",
+      "sha256": "7ec9ed3598d0c2fcba6d0c34b810d52060e2b904fd8160a1f2859d525594b66f",
+      "bytes": 6784
+    },
+    {
+      "path": "performance97/native45/matmul/gcc/benchmark.bin",
+      "sha256": "f8eeea07a979188bde78fe246bdeee80e1438855971abd290f245b0c5b6908fb",
+      "bytes": 16064
+    },
+    {
+      "path": "performance97/native45/matmul/icx/benchmark.bin",
+      "sha256": "b6de103f491242e9581043a90408df4c5c22262fe0e5a8263737b65bb8e9cd55",
+      "bytes": 16040
+    },
+    {
+      "path": "performance97/native45/matmul/lccc/benchmark.bin",
+      "sha256": "12a4acd0f29b0ce5ecb2c4cb828be3fbfcec23c9f12ba3b7aa2194b0ddfa38bd",
+      "bytes": 6864
+    },
+    {
+      "path": "performance97/native45/matmul/clang/benchmark.bin",
+      "sha256": "fce33a9505eeddebeb1562e760664653c7bbaa390d2ebdbb30a40bf724307828",
+      "bytes": 16096
+    },
+    {
+      "path": "performance97/native45/arith_loop/main/benchmark.bin",
+      "sha256": "f9f787b1a81a5b454c879e38a88d836c2192669aa86ceec66cc9da8a5b302a08",
+      "bytes": 7168
+    },
+    {
+      "path": "performance97/native45/arith_loop/gcc/benchmark.bin",
+      "sha256": "135593d8f814b5a4459836f0e87674b8b4a72de5e3a3b4136b9c26ce50ac35d3",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/arith_loop/icx/benchmark.bin",
+      "sha256": "86c9c0f37bcc90e82d496e613c1ccf8f698f8259dbf4f466324947e8a870658c",
+      "bytes": 15976
+    },
+    {
+      "path": "performance97/native45/arith_loop/lccc/benchmark.bin",
+      "sha256": "cfa90955f10eccb35018c8d7f6e5592b32844c115a0c78e266f2447761913dad",
+      "bytes": 7168
+    },
+    {
+      "path": "performance97/native45/arith_loop/clang/benchmark.bin",
+      "sha256": "89fb796ff5de9e92e5b3cb8779cad6ac2b67c64763b319c134b0787e84d4339c",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/ring_fifo/main/benchmark.bin",
+      "sha256": "4d79d3d50ad3718be8952c1e449fe5567258a48966b9a43a3d70a0e05ca2c9fa",
+      "bytes": 5888
+    },
+    {
+      "path": "performance97/native45/ring_fifo/gcc/benchmark.bin",
+      "sha256": "122b599147a6bf7e7628c70011b8028f6204a1606425055c47df73e48bafc730",
+      "bytes": 15832
+    },
+    {
+      "path": "performance97/native45/ring_fifo/icx/benchmark.bin",
+      "sha256": "4e4902796eefeb0971e713d99a44476fe23b141c7b4c5164b63a2f9b29f64b8f",
+      "bytes": 15840
+    },
+    {
+      "path": "performance97/native45/ring_fifo/lccc/benchmark.bin",
+      "sha256": "2b2d5fee33393132fa048db34bd96da3df0113a45c1ab1e84727cfd69b216b2a",
+      "bytes": 5888
+    },
+    {
+      "path": "performance97/native45/ring_fifo/clang/benchmark.bin",
+      "sha256": "3128293de785993f7edff232d29637c231c769460954385050cf0e672a5ae6f0",
+      "bytes": 15896
+    },
+    {
+      "path": "performance97/native45/glibc_memcmp/main/benchmark.bin",
+      "sha256": "c119b50e1bab741d270ada0fd0fb626d04b8d185715a419541edc64b0e9cf4d1",
+      "bytes": 7080
+    },
+    {
+      "path": "performance97/native45/glibc_memcmp/gcc/benchmark.bin",
+      "sha256": "61ee6648ba05baa02878d247ac9534c2f5e8cca5810f9b396c850344c52d5d42",
+      "bytes": 16088
+    },
+    {
+      "path": "performance97/native45/glibc_memcmp/icx/benchmark.bin",
+      "sha256": "e5663561d6b5f22d14a3ce4dabcfebf17eb3eec9f936528fb1fdc92936d607e1",
+      "bytes": 16064
+    },
+    {
+      "path": "performance97/native45/glibc_memcmp/lccc/benchmark.bin",
+      "sha256": "cfe70f4bcd32e62580360127a28e9adf57357b14af444ff10ff072159fccc2b7",
+      "bytes": 7080
+    },
+    {
+      "path": "performance97/native45/glibc_memcmp/clang/benchmark.bin",
+      "sha256": "d1455bd1cd9a9201eb9ee0fd8681227f57441f05abf3df8661c4c9977261f573",
+      "bytes": 16120
+    },
+    {
+      "path": "performance97/native45/loop_patterns/main/benchmark.bin",
+      "sha256": "c513268a0242a2355b0298d3cf837ef32d0ee33e5c913db54477dd454e4295d1",
+      "bytes": 7192
+    },
+    {
+      "path": "performance97/native45/loop_patterns/gcc/benchmark.bin",
+      "sha256": "00e2d4c3006986cbd44e1f70f71221c3b9e0f785f39d81975926ac0e2583be34",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/loop_patterns/icx/benchmark.bin",
+      "sha256": "e2b332a25dbef21d91a639e70cfa44095c7a70bd3f2aa0b8b1686af278f5edce",
+      "bytes": 16008
+    },
+    {
+      "path": "performance97/native45/loop_patterns/lccc/benchmark.bin",
+      "sha256": "6ffaffd7d83706d0527161d848a663e062100b5d090b86270eb7bed531fa544f",
+      "bytes": 7192
+    },
+    {
+      "path": "performance97/native45/loop_patterns/clang/benchmark.bin",
+      "sha256": "6ef913df5e851d8b18db76ff1b4a454d0b98851c257938303d4b86273b58ef99",
+      "bytes": 16056
+    },
+    {
+      "path": "performance97/native45/qsort/main/benchmark.bin",
+      "sha256": "5ff4f151d880d4e19edada066fcab912eb760fa88b4f2fdd241f204239e988d5",
+      "bytes": 6296
+    },
+    {
+      "path": "performance97/native45/qsort/gcc/benchmark.bin",
+      "sha256": "fe3a7783bac4658880b4239717a6b15043b03a635401925dd09aba86222ff181",
+      "bytes": 16064
+    },
+    {
+      "path": "performance97/native45/qsort/icx/benchmark.bin",
+      "sha256": "b073c201a01bc227444484bd2fe6e139973de2739d94c65edc0b08efd7bc4984",
+      "bytes": 16040
+    },
+    {
+      "path": "performance97/native45/qsort/lccc/benchmark.bin",
+      "sha256": "9c43b0b042b7368217ff3bbac237704f9b6bb35a2e5f52afea43172bd9f2cbdd",
+      "bytes": 6296
+    },
+    {
+      "path": "performance97/native45/qsort/clang/benchmark.bin",
+      "sha256": "0431aa75980cada080cca9550945385f43c628cb22c7aed3c13a78cb20f6c8ba",
+      "bytes": 16096
+    },
+    {
+      "path": "performance97/native45/ackermann/main/benchmark.bin",
+      "sha256": "c4773250669a3a6ae58bfba05065148a99f46d94aad1f7dec89b8d820d08c38e",
+      "bytes": 5928
+    },
+    {
+      "path": "performance97/native45/ackermann/gcc/benchmark.bin",
+      "sha256": "df31e8b93ec9dc8739004575963a3e96d311a229b05756255de14af2b626edc7",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/ackermann/icx/benchmark.bin",
+      "sha256": "f99ef909300644f399ab7726822a46ceae8bc79b26fc487aa0a7eccdab6b5382",
+      "bytes": 15976
+    },
+    {
+      "path": "performance97/native45/ackermann/lccc/benchmark.bin",
+      "sha256": "a87e147a042e83f30c20f734226c0a3da26896f812437525b88187f26dac665c",
+      "bytes": 5928
+    },
+    {
+      "path": "performance97/native45/ackermann/clang/benchmark.bin",
+      "sha256": "340b941801d7954fcbdb8591a327a8b2787459aab4874683713845739b05f452",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/expat_siphash24/main/benchmark.bin",
+      "sha256": "3c7b8cd039428908e76a4d1cddbfdff0af54f2d18cb46f5747a06b8c991f0b79",
+      "bytes": 10784
+    },
+    {
+      "path": "performance97/native45/expat_siphash24/gcc/benchmark.bin",
+      "sha256": "55378df47b7cf1f9e55fb83408c1818b772a28a0c24d848d3a27bb1b7c703b2b",
+      "bytes": 16112
+    },
+    {
+      "path": "performance97/native45/expat_siphash24/icx/benchmark.bin",
+      "sha256": "aff4cfe675615b1635cfd992cead353e9e17b9d3e8b2ea18bd04e1c9a748acbe",
+      "bytes": 16088
+    },
+    {
+      "path": "performance97/native45/expat_siphash24/lccc/benchmark.bin",
+      "sha256": "d1ae57e0678e46f1a1c537edad2c0bc9ebe7c9fd5508ce7da0f5b36bb812d1cb",
+      "bytes": 10784
+    },
+    {
+      "path": "performance97/native45/expat_siphash24/clang/benchmark.bin",
+      "sha256": "dafb19d932042a644c8e71eb71589852eabe987dd64771a617e3cfdf03eddfd1",
+      "bytes": 16144
+    },
+    {
+      "path": "performance97/native45/lz4_compress/main/benchmark.bin",
+      "sha256": "17f5f5b8ee7d761ca6ea17d3ee33aa8a739d56d1a3ed9d4f189b9ec02cabf766",
+      "bytes": 7960
+    },
+    {
+      "path": "performance97/native45/lz4_compress/gcc/benchmark.bin",
+      "sha256": "d16b2e6e95b15dc55e4b726a1698e203914fd20c33515e7daa858709ba462811",
+      "bytes": 16160
+    },
+    {
+      "path": "performance97/native45/lz4_compress/icx/benchmark.bin",
+      "sha256": "65ddad60f463a320ed218b91b09a3e93cff5265b4513f8062fde9c639939c6a1",
+      "bytes": 86456
+    },
+    {
+      "path": "performance97/native45/lz4_compress/lccc/benchmark.bin",
+      "sha256": "cec1d5eeba9716f427f7a439108efde4c8caf19d9089a81c6ba3ef19e27333e6",
+      "bytes": 8024
+    },
+    {
+      "path": "performance97/native45/lz4_compress/clang/benchmark.bin",
+      "sha256": "e10965218e64f153dffeb91e08fccacb4b157ab7a2d28bc2c27d853f1efd3cc8",
+      "bytes": 16144
+    },
+    {
+      "path": "performance97/native45/libm_round_family/main/benchmark.bin",
+      "sha256": "5b9cde3e2ccfe4f6c61c65d6b32fdfdc5891fc5f79b14c0bcf89905e5a2e98b5",
+      "bytes": 7904
+    },
+    {
+      "path": "performance97/native45/libm_round_family/gcc/benchmark.bin",
+      "sha256": "50410ceaccb901d8b4f041996fadb7c81cc12b086b7e53690bfeef2429f31d9a",
+      "bytes": 16280
+    },
+    {
+      "path": "performance97/native45/libm_round_family/icx/benchmark.bin",
+      "sha256": "22542ab25c036bee8a5463b86e3849d2d02455dec87d01332e72d3edf53abec5",
+      "bytes": 16264
+    },
+    {
+      "path": "performance97/native45/libm_round_family/lccc/benchmark.bin",
+      "sha256": "99b9667e054706eff59971971673f719cb4696f9203e424b859f163082f6b745",
+      "bytes": 7904
+    },
+    {
+      "path": "performance97/native45/libm_round_family/clang/benchmark.bin",
+      "sha256": "4a7e13f1e64dba4bfa1f361b6511d0e4a611c30ecff06625e0a2e62b88d086a0",
+      "bytes": 16312
+    },
+    {
+      "path": "performance97/native45/struct_copy/main/benchmark.bin",
+      "sha256": "9373b1114259be5832d65702b6718014430c5c2ec39a097b67a66370fffbc02a",
+      "bytes": 6816
+    },
+    {
+      "path": "performance97/native45/struct_copy/gcc/benchmark.bin",
+      "sha256": "5fa9550378076f4a8ce2a9b68094c6c449379aeecf48b83bd4fb43394affac23",
+      "bytes": 15960
+    },
+    {
+      "path": "performance97/native45/struct_copy/icx/benchmark.bin",
+      "sha256": "0e741a16ecb58bb14700b6defdbca5d55ac249d035f33316a6cb5985e78c176f",
+      "bytes": 15944
+    },
+    {
+      "path": "performance97/native45/struct_copy/lccc/benchmark.bin",
+      "sha256": "0c7493f9626acfe21cda6223d67a199206dfc9e9369a36c47b132777e30a7a5b",
+      "bytes": 6800
+    },
+    {
+      "path": "performance97/native45/struct_copy/clang/benchmark.bin",
+      "sha256": "7b24174e02986875a78b1afa0da0ac3f64028df46994ad29d059e66ba53ee1c2",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/nbody/main/benchmark.bin",
+      "sha256": "36be878e4b5cbeaf719face930616a389748b6e4250ce6f579039e6054bd5dd3",
+      "bytes": 7880
+    },
+    {
+      "path": "performance97/native45/nbody/gcc/benchmark.bin",
+      "sha256": "1b2f90e3d5e6d738f87e13581dc9416dd1db922012cc88e1bc96c74ac5d3fcaf",
+      "bytes": 16336
+    },
+    {
+      "path": "performance97/native45/nbody/icx/benchmark.bin",
+      "sha256": "49a2d10372e7a2bf95fcaa6b08bf1d8e0b01b0dea7b327c18c2033b25d5592e5",
+      "bytes": 20424
+    },
+    {
+      "path": "performance97/native45/nbody/lccc/benchmark.bin",
+      "sha256": "92e399ed32c9334b1824fe0177c80836f024d730a0a63effd28b97eb52885eb0",
+      "bytes": 7928
+    },
+    {
+      "path": "performance97/native45/nbody/clang/benchmark.bin",
+      "sha256": "4b4a56700dee428a60543b6cbf372aa3036ef538d0edc19cd949cd1d517a34ef",
+      "bytes": 16304
+    },
+    {
+      "path": "performance97/native45/zstd_count/main/benchmark.bin",
+      "sha256": "4ae41797b7d71d9ac4505d747450a2846e84b43e1d7b4d6f222dbd66495c3677",
+      "bytes": 6640
+    },
+    {
+      "path": "performance97/native45/zstd_count/gcc/benchmark.bin",
+      "sha256": "b1fd42c4e3f538d7468fd94cf23d2c4f43654097e83cdd9ae9643b2eaaf2de97",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/zstd_count/icx/benchmark.bin",
+      "sha256": "e9292a3e3fbb4312bbfdb808695f200abf9710fc61a124592446106e405b23ad",
+      "bytes": 15968
+    },
+    {
+      "path": "performance97/native45/zstd_count/lccc/benchmark.bin",
+      "sha256": "ab5fa1edf8b607097f01cafd619167baacb882f917991e02405066186af3edfa",
+      "bytes": 6640
+    },
+    {
+      "path": "performance97/native45/zstd_count/clang/benchmark.bin",
+      "sha256": "df5c64bfa9484f3faccb7f9570c41ecab8c12bf542f58beb3480d4880854803f",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/linux_find_bit/main/benchmark.bin",
+      "sha256": "b059a766841d1620a2b52fb1666cc7ba68f5ea7234508d876d9493263161ec71",
+      "bytes": 6952
+    },
+    {
+      "path": "performance97/native45/linux_find_bit/gcc/benchmark.bin",
+      "sha256": "e95aa92ae378fa6ff2e2eace09155141b0b10134a7de29864e479934bc3982b5",
+      "bytes": 16096
+    },
+    {
+      "path": "performance97/native45/linux_find_bit/icx/benchmark.bin",
+      "sha256": "0cd532451b537cd14c70b13925fbd8c7db2e5d61564014d0172cc972570aaa43",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/linux_find_bit/lccc/benchmark.bin",
+      "sha256": "1989bbd157000a6678dc6d7bad2abf83faa9d5f8bbbcf923881d8b1f808a4823",
+      "bytes": 6952
+    },
+    {
+      "path": "performance97/native45/linux_find_bit/clang/benchmark.bin",
+      "sha256": "f73177aa63edd36e96fa1952e18a12d8dc09182a1c9e4a5bed6790c244226290",
+      "bytes": 16072
+    },
+    {
+      "path": "performance97/native45/constant_recursion/main/benchmark.bin",
+      "sha256": "d7d9808d49b5d3f646e2c09d233b36792161d6c3f1a24cae365312d636d47188",
+      "bytes": 5928
+    },
+    {
+      "path": "performance97/native45/constant_recursion/gcc/benchmark.bin",
+      "sha256": "7b5826c5073d2eb6f94b549839cbbc91e0c0842830db4dce1b318b9f27dbfe10",
+      "bytes": 16000
+    },
+    {
+      "path": "performance97/native45/constant_recursion/icx/benchmark.bin",
+      "sha256": "73da310da043fa8558e162c370a31e90f2c61a61ade6aa90e0cec5422b4aeeb0",
+      "bytes": 15984
+    },
+    {
+      "path": "performance97/native45/constant_recursion/lccc/benchmark.bin",
+      "sha256": "760ef57fa246fa6f64fc120b03db8e267f22a2d309922ed7a9ed6e03434b37f8",
+      "bytes": 5928
+    },
+    {
+      "path": "performance97/native45/constant_recursion/clang/benchmark.bin",
+      "sha256": "c203aa3ec0852cff9bbd617f524347fec436439f287bcc815515ebe08febdbde",
+      "bytes": 16032
+    },
+    {
+      "path": "performance97/native45/percpu_ptr_walk/main/benchmark.bin",
+      "sha256": "2b3b1f66d651c1e0d0a530a26caef3bfa1ebef2aec4b4a3f940926a7bf315c06",
+      "bytes": 7256
+    },
+    {
+      "path": "performance97/native45/percpu_ptr_walk/gcc/benchmark.bin",
+      "sha256": "ec97b3acec0e2a46cf55ae7a0a2c1c8b88edca5093cd754cc25d8af9daf72fc8",
+      "bytes": 16120
+    },
+    {
+      "path": "performance97/native45/percpu_ptr_walk/icx/benchmark.bin",
+      "sha256": "64276656e0b7bb4ab7c33fca2ce4ed1499afae487f6c05978d7884a1ad2f72e2",
+      "bytes": 16088
+    },
+    {
+      "path": "performance97/native45/percpu_ptr_walk/lccc/benchmark.bin",
+      "sha256": "241b999de2ce3005db534184d669c7088b3de21c85c35d2217688a786f4e3b12",
+      "bytes": 7256
+    },
+    {
+      "path": "performance97/native45/percpu_ptr_walk/clang/benchmark.bin",
+      "sha256": "daba06a5b42f49074e048818631b885d22fe88a678e6108aef8ba32997750264",
+      "bytes": 16144
+    },
+    {
+      "path": "performance97/native45/linux_rbtree/main/benchmark.bin",
+      "sha256": "7ef5fe5a2412b85f61c6f2039f77373a624298de8cfb2f2473f31d0707743c11",
+      "bytes": 6896
+    },
+    {
+      "path": "performance97/native45/linux_rbtree/gcc/benchmark.bin",
+      "sha256": "302201572c0d4b03a5971122346d38d6fc80d0e55e531f846c29b620e864d6ff",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/linux_rbtree/icx/benchmark.bin",
+      "sha256": "d93de78c621de6c1516575bd1ad28511dfceb49743c4333bdcd7c716919d0de3",
+      "bytes": 15976
+    },
+    {
+      "path": "performance97/native45/linux_rbtree/lccc/benchmark.bin",
+      "sha256": "8ef18e7114ebc39055ab7d584750c9f004ddadd9c26688ba85b946118628c4e9",
+      "bytes": 6896
+    },
+    {
+      "path": "performance97/native45/linux_rbtree/clang/benchmark.bin",
+      "sha256": "bc497d33d8252373bdc3df36fc8fb74ec7a42a80075473a88cf240ad0763ae12",
+      "bytes": 16024
+    },
+    {
+      "path": "performance97/native45/tce_sum/main/benchmark.bin",
+      "sha256": "ef8272fe4124b76ac277507905628d6962605b9310a47e0d1d6854c9a3c59a73",
+      "bytes": 5944
+    },
+    {
+      "path": "performance97/native45/tce_sum/gcc/benchmark.bin",
+      "sha256": "1a0ff15dcb774187ce8878b53e1952832ebc1f83d2f9c072d1485b6896ee94ff",
+      "bytes": 15960
+    },
+    {
+      "path": "performance97/native45/tce_sum/icx/benchmark.bin",
+      "sha256": "2ada38b5ad2b3179e39d998500d4b115aa469b51d9b605aa27a1947ad5b0e8a6",
+      "bytes": 15936
+    },
+    {
+      "path": "performance97/native45/tce_sum/lccc/benchmark.bin",
+      "sha256": "d15d952b06c99322a2c61d2b9a9eaf8512187d2a7a0ea44f3a65bef5a362d972",
+      "bytes": 5944
+    },
+    {
+      "path": "performance97/native45/tce_sum/clang/benchmark.bin",
+      "sha256": "853ecb12dfaf8b3d19903452b3e2a893df8e8c4626d2c02bb69394dd8185d2a9",
+      "bytes": 15992
+    },
+    {
+      "path": "performance97/native45/fib/main/benchmark.bin",
+      "sha256": "35ecd60ac8626414abc220a41c6eb5e706c5018a747f1a45632741ac69670afd",
+      "bytes": 6088
+    },
+    {
+      "path": "performance97/native45/fib/gcc/benchmark.bin",
+      "sha256": "94e185288b64a801ef0350da94fd77be97b8dde8b98aead6748bae176c36b8d2",
+      "bytes": 15984
+    },
+    {
+      "path": "performance97/native45/fib/icx/benchmark.bin",
+      "sha256": "c4100551c0ec2743c43c3a3f3d68f5c8f92a18bbb9f118691545b5266b481da5",
+      "bytes": 15960
+    },
+    {
+      "path": "performance97/native45/fib/lccc/benchmark.bin",
+      "sha256": "9647f5b698e3fc068b57c6a8d5b9cca606fb91756b32910bc594f5c51d38c080",
+      "bytes": 6088
+    },
+    {
+      "path": "performance97/native45/fib/clang/benchmark.bin",
+      "sha256": "2693e43a27236ea24235f48b9c2fa3bcc1b8603e5c20a9ac38e7faaad6b44810",
+      "bytes": 16016
+    },
+    {
+      "path": "performance97/native45/ascii_case_fold/main/benchmark.bin",
+      "sha256": "343d2e2e205f8657052688a8ac9dbdbd4605b496202a1607010e06fc38ee9518",
+      "bytes": 6152
+    },
+    {
+      "path": "performance97/native45/ascii_case_fold/gcc/benchmark.bin",
+      "sha256": "5ab43debec71690ade2cb3d9b48b1ec1941b5f282fc17200e1f4bc2c00ca2c53",
+      "bytes": 15896
+    },
+    {
+      "path": "performance97/native45/ascii_case_fold/icx/benchmark.bin",
+      "sha256": "0af4932133929df7c6516d2a09a8519748432b8be5d5353e54b71d25bfefd357",
+      "bytes": 15872
+    },
+    {
+      "path": "performance97/native45/ascii_case_fold/lccc/benchmark.bin",
+      "sha256": "fbad5591bb1a286fa5978f04c49620cd86fc48bd8d8e8c1b63c7b7c533fa8a4a",
+      "bytes": 6152
+    },
+    {
+      "path": "performance97/native45/ascii_case_fold/clang/benchmark.bin",
+      "sha256": "e04f4a6a40ff5a1e4109f688f44dfb961ce0b957c79d50a9ba8245552b6c8d16",
+      "bytes": 15928
+    },
+    {
+      "path": "performance97/native45/lz4_match_extend/main/benchmark.bin",
+      "sha256": "7ec50f792be9f623fd0b03d943b8a3db3ec621f08f28cd6d167b27391bb0404c",
+      "bytes": 8040
+    },
+    {
+      "path": "performance97/native45/lz4_match_extend/gcc/benchmark.bin",
+      "sha256": "f7279b8f95a297b6fae2c7830e62ecc2d96a70bd63c6224911ce4e2d0f73666c",
+      "bytes": 16160
+    },
+    {
+      "path": "performance97/native45/lz4_match_extend/icx/benchmark.bin",
+      "sha256": "98b3e344661171eeb350aecdab48c14ea65c43ed33204026a46a86eaa470e80b",
+      "bytes": 86456
+    },
+    {
+      "path": "performance97/native45/lz4_match_extend/lccc/benchmark.bin",
+      "sha256": "70f7caec96a916b3c5167a11c6a868c056077e3671c2bc22b6ccec83209ea972",
+      "bytes": 8040
+    },
+    {
+      "path": "performance97/native45/lz4_match_extend/clang/benchmark.bin",
+      "sha256": "ffa0d0e42bd9722bb825c957ba9f412c8fcf82b72191b627bf7e956bd9cc46ad",
+      "bytes": 16144
+    },
+    {
+      "path": "performance97/native45/mandelbrot/main/benchmark.bin",
+      "sha256": "f0303bd5dac126c61699ca1045ae4868d1b97d935a18796855dfdc2fdf0546c9",
+      "bytes": 6272
+    },
+    {
+      "path": "performance97/native45/mandelbrot/gcc/benchmark.bin",
+      "sha256": "62eb9fc63eb4ae74de4ec7733fb8f2e034a81914816618b758e301424cd545bc",
+      "bytes": 15960
+    },
+    {
+      "path": "performance97/native45/mandelbrot/icx/benchmark.bin",
+      "sha256": "95f89b679ac26e77ffc1b8db90b8f0eaae0169d6f766a6dc09140d9151b9138a",
+      "bytes": 15944
+    },
+    {
+      "path": "performance97/native45/mandelbrot/lccc/benchmark.bin",
+      "sha256": "ca99e4ab3152c41baaef29b10cff72a757edb3c74f6b98c75e9f15c805694262",
+      "bytes": 6272
+    },
+    {
+      "path": "performance97/native45/mandelbrot/clang/benchmark.bin",
+      "sha256": "739753deb885646790846ab8874661b0c14920085ae819d4a6011318a23e398d",
+      "bytes": 15992
+    },
+    {
+      "path": "zstd97/driver-candidate",
+      "sha256": "b4e0bf44ff8c42fcfd3adcdadef3223d80a687ad855341d5992049906d456dfa",
+      "bytes": 755616
+    },
+    {
+      "path": "zstd97/build-candidate/programs/zstd",
+      "sha256": "0a2db0ab222d7a43d8e4d675e1114f340d0dcdb7e220389198a9647e5db0ef31",
+      "bytes": 1044496
+    },
+    {
+      "path": "zstd97/driver-main",
+      "sha256": "270b78b7ad9a020605e9a010ad6e3a94695c7385da5a3261671595ce31ddb156",
+      "bytes": 755616
+    },
+    {
+      "path": "zstd97/build-main/programs/zstd",
+      "sha256": "67c631498eaed8304eb53ac9e732035cd337e61753c34ef22ebcd821adb5cb1e",
+      "bytes": 1042256
+    },
+    {
+      "path": "zstd97/driver-gcc",
+      "sha256": "7942e20267789d58652dd25ae81eecfc7ab6852a8a8a796ec08fc24d154889bc",
+      "bytes": 1192720
+    },
+    {
+      "path": "zstd97/build-gcc/programs/zstd",
+      "sha256": "2b4af95f49aa0137313dc6363b923c36e37e0474d7634caf40ca883a6fbe1758",
+      "bytes": 1471384
+    },
+    {
+      "path": "zstd97/ms178-1.patch",
+      "sha256": "aa15486d10778c9d00a9b6273101e11feb952aca0b66432a53625dfb67390d8e",
+      "bytes": 81489
+    }
+  ]
+}

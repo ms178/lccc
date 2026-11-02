@@ -1,0 +1,10 @@
+{
+  "compiler": "0d8b2052c06e9e2b2e2f4d8658d1afd84aac5e72352dac7fa1f683fd94ab9e4f",
+  "linker": "debc472674f6118399de97b743d093a7cc57c2ec58595e91f3b6b34d13493e92",
+  "production_sources": {
+    "src/passes/mod.rs": "c1585a16e5bd469e0c644bcee2fed8e23efcc30eed7709f136576aa90a98a6ea",
+    "src/passes/vectorize.rs": "add2304e3749d7835fa5bb4d0f5c52777f9ab4233345281b5a6b5347c050b1c4",
+    "src/driver/cli.rs": "c8a9ccd47c7d1aee8eb1b3b487dc70a2ca7a3866433bbdc594d219015ae31fa5",
+    "src/driver/pipeline.rs": "9cc08e84df44b07abc2e27bd1c2e029724f63249621c0759b424c9095bf8fc7d"
+  }
+}

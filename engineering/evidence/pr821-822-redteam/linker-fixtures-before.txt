@@ -1,0 +1,115 @@
+Initial FAST linker-suite failures: diagnose fixtures before altering the linker
+note_run_merge: 7-byte allocated .rodata is real payload, not alignment padding
+There are 31 section headers, starting at offset 0x10a0:
+
+Section Headers:
+  [Nr] Name              Type            Address          Off    Size   ES Flg Lk Inf Al
+  [ 0]                   NULL            0000000000000000 000000 000000 00      0   0  0
+  [ 1] .interp           PROGBITS        0000000000000350 000350 00001c 00   A  0   0  1
+  [ 2] .gnu.hash         GNU_HASH        0000000000000370 000370 00001c 00   A  3   0  8
+  [ 3] .dynsym           DYNSYM          0000000000000390 000390 000060 18   A  4   1  8
+  [ 4] .dynstr           STRTAB          00000000000003f0 0003f0 000048 00   A  0   0  1
+  [ 5] .gnu.version      VERSYM          0000000000000438 000438 000008 02   A  3   0  2
+  [ 6] .gnu.version_r    VERNEED         0000000000000440 000440 000030 00   A  4   1  4
+  [ 7] .rela.dyn         RELA            0000000000000470 000470 000078 18   A  3   0  8
+  [ 8] .rela.plt         RELA            00000000000004e8 0004e8 000030 18  AI  3   0  8
+  [ 9] .plt              PROGBITS        0000000000001650 000650 000030 10  AX  0   0 16
+  [10] .eh_frame_hdr     PROGBITS        0000000000002680 000680 00001c 00   A  0   0  4
+  [11] .eh_frame         PROGBITS        00000000000026a0 0006a0 000064 00   A  0   0  8
+  [12] .note.gnu.property NOTE            0000000000002708 000708 000020 00   A  0   0  8
+  [13] .note.ABI-tag     NOTE            0000000000002728 000728 000020 00   A  0   0  4
+  [14] .rodata           PROGBITS        0000000000002748 000748 000007 00  AM  0   0  4
+  [15] .note.gnu.build-id NOTE            0000000000002750 000750 000024 00   A  0   0  4
+  [16] .text             PROGBITS        0000000000001520 000520 000103 00  AX  0   0 16
+  [17] .init             PROGBITS        0000000000001624 000624 000017 00  AX  0   0  4
+  [18] .fini             PROGBITS        000000000000163c 00063c 000009 00  AX  0   0  4
+  [19] .data             PROGBITS        0000000000004978 000978 000010 00  WA  0   0  8
+  [20] .tm_clone_table   PROGBITS        0000000000004988 000988 000000 00  WA  0   0  8
+  [21] .init_array       INIT_ARRAY      0000000000003778 000778 000008 08  WA  0   0  8
+  [22] .fini_array       FINI_ARRAY      0000000000003780 000780 000008 08  WA  0   0  8
+  [23] .dynamic          DYNAMIC         0000000000003788 000788 0001a0 10  WA  4   0  8
+  [24] .got              PROGBITS        0000000000003928 000928 000028 08  WA  0   0  8
+  [25] .got.plt          PROGBITS        0000000000004950 000950 000028 08  WA  0   0  8
+  [26] .bss              NOBITS          0000000000004988 000988 000001 00  WA  0   0  1
+  [27] .comment          PROGBITS        0000000000000000 000988 00001e 01  MS  0   0  1
+  [28] .symtab           SYMTAB          0000000000000000 0009a8 0003a8 18     29  10  8
+  [29] .strtab           STRTAB          0000000000000000 000d50 0001ee 00      0   0  1
+  [30] .shstrtab         STRTAB          0000000000000000 000f40 00015e 00      0   0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  D (mbind), l (large), p (processor specific)
+TLSLD GCC16 object: TLS base lookup before ARCH_SET_FS
+
+/tmp/lnk.script_tls_gd_ld_relaxation.mi0_valh/t.local-dynamic.o:     file format elf64-x86-64
+
+
+Disassembly of section .text:
+
+0000000000000000 <my_start>:
+   0:	48 83 ec 18          	sub    $0x18,%rsp
+   4:	48 8b 3d 00 00 00 00 	mov    0x0(%rip),%rdi        # b <my_start+0xb>
+			7: R_X86_64_REX_GOTPCRELX	__tls_size_sym-0x4
+   b:	48 8d 05 00 00 00 00 	lea    0x0(%rip),%rax        # 12 <my_start+0x12>
+			e: R_X86_64_PC32	.bss+0xfc
+  12:	48 89 05 00 00 00 00 	mov    %rax,0x0(%rip)        # 19 <my_start+0x19>
+			15: R_X86_64_PC32	.bss+0xfc
+  19:	48 8b 35 00 00 00 00 	mov    0x0(%rip),%rsi        # 20 <my_start+0x20>
+			1c: R_X86_64_REX_GOTPCRELX	__tdata_end-0x4
+  20:	48 2b 35 00 00 00 00 	sub    0x0(%rip),%rsi        # 27 <my_start+0x27>
+			23: R_X86_64_REX_GOTPCRELX	__tdata_start-0x4
+  27:	b8 00 00 00 00       	mov    $0x0,%eax
+  2c:	41 b8 00 00 00 00    	mov    $0x0,%r8d
+  32:	48 8d 0d 00 00 00 00 	lea    0x0(%rip),%rcx        # 39 <my_start+0x39>
+			35: R_X86_64_PC32	.bss-0x4
+  39:	48 29 f9             	sub    %rdi,%rcx
+  3c:	eb 12                	jmp    50 <my_start+0x50>
+  3e:	66 90                	xchg   %ax,%ax
+  40:	88 94 01 00 01 00 00 	mov    %dl,0x100(%rcx,%rax,1)
+  47:	48 83 c0 01          	add    $0x1,%rax
+  4b:	48 39 c7             	cmp    %rax,%rdi
+  4e:	74 15                	je     65 <my_start+0x65>
+  50:	44 89 c2             	mov    %r8d,%edx
+  53:	48 39 f0             	cmp    %rsi,%rax
+  56:	73 e8                	jae    40 <my_start+0x40>
+  58:	48 8b 15 00 00 00 00 	mov    0x0(%rip),%rdx        # 5f <my_start+0x5f>
+			5b: R_X86_64_REX_GOTPCRELX	__tdata_start-0x4
+  5f:	0f b6 14 10          	movzbl (%rax,%rdx,1),%edx
+  63:	eb db                	jmp    40 <my_start+0x40>
+  65:	48 8d 3d 00 00 00 00 	lea    0x0(%rip),%rdi        # 6c <my_start+0x6c>
+			68: R_X86_64_TLSLD	gd_a-0x4
+  6c:	e8 00 00 00 00       	call   71 <my_start+0x71>
+			6d: R_X86_64_PLT32	__tls_get_addr-0x4
+  71:	48 89 c2             	mov    %rax,%rdx
+  74:	b8 9e 00 00 00       	mov    $0x9e,%eax
+  79:	bf 02 10 00 00       	mov    $0x1002,%edi
+  7e:	48 8d 35 00 00 00 00 	lea    0x0(%rip),%rsi        # 85 <my_start+0x85>
+			81: R_X86_64_PC32	.bss+0xfc
+  85:	0f 05                	syscall
+  87:	41 b8 00 00 00 00    	mov    $0x0,%r8d
+  8d:	83 ba 00 00 00 00 0b 	cmpl   $0xb,0x0(%rdx)
+			8f: R_X86_64_DTPOFF32	gd_a
+  94:	74 32                	je     c8 <my_start+0xc8>
+  96:	41 8d 40 30          	lea    0x30(%r8),%eax
+  9a:	88 44 24 0e          	mov    %al,0xe(%rsp)
+  9e:	c6 44 24 0f 0a       	movb   $0xa,0xf(%rsp)
+  a3:	b8 01 00 00 00       	mov    $0x1,%eax
+  a8:	48 8d 74 24 0e       	lea    0xe(%rsp),%rsi
+  ad:	ba 02 00 00 00       	mov    $0x2,%edx
+  b2:	48 89 c7             	mov    %rax,%rdi
+  b5:	0f 05                	syscall
+  b7:	44 89 c7             	mov    %r8d,%edi
+  ba:	83 e7 01             	and    $0x1,%edi
+  bd:	48 83 f7 01          	xor    $0x1,%rdi
+  c1:	b8 3c 00 00 00       	mov    $0x3c,%eax
+  c6:	0f 05                	syscall
+  c8:	83 ba 00 00 00 00 16 	cmpl   $0x16,0x0(%rdx)
+			ca: R_X86_64_DTPOFF32	gd_b
+  cf:	41 0f 94 c0          	sete   %r8b
+  d3:	45 0f b6 c0          	movzbl %r8b,%r8d
+  d7:	eb bd                	jmp    96 <my_start+0x96>
+/usr/bin/x86_64-linux-gnu-ld.bfd: warning: ref.local-dynamic has a LOAD segment with RWX permissions
+out.global-dynamic returncode 0 stdout b'1\n'
+out.local-dynamic returncode -11 stdout b''
+ref.local-dynamic returncode -11 stdout b''

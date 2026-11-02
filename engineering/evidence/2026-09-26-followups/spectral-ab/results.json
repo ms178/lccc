@@ -1,0 +1,2378 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.0275498994312358,
+    "best": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.0275498994312358,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.0275498994312358,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.0275498994312358,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.0275498994312358,
+    "best": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.0275498994312358
+    },
+    "geometric_mean_ratio": 1.0275498994312358,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "spectral_norm",
+      "ratio": 1.0275498994312358
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "ccc": {
+          "binary_bytes": 7208,
+          "child_cpu_s": 0.129933,
+          "command": [
+            "/home/user/lccc/target/baseline-e5bc1911-lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2088,
+          "wall_s": 0.130253202
+        },
+        "gcc": {
+          "binary_bytes": 16096,
+          "child_cpu_s": 0.09480700000000003,
+          "command": [
+            "/usr/bin/x86_64-linux-gnu-gcc-14",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2099,
+          "wall_s": 0.42568139
+        },
+        "lccc": {
+          "binary_bytes": 7208,
+          "child_cpu_s": 0.144933,
+          "command": [
+            "/home/user/lccc/target/followup-vex-lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2088,
+          "wall_s": 0.170569289
+        }
+      },
+      "correctness": {
+        "ccc": {
+          "matches_baseline": true,
+          "output": "1.274224152",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "matches_baseline": true,
+          "output": "1.274224152",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "1.274224152",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "spectral norm / dense floating point",
+      "name": "spectral_norm",
+      "ratios_from_lccc": {
+        "ccc": {
+          "cv": 0.05041144796161017,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0007698101981502836,
+          "max": 0.04181313020326127,
+          "mean": 0.036527415933083986,
+          "median": 0.036076547127803574,
+          "median_ci95_bootstrap": [
+            0.03551191574259581,
+            0.037264544387746144
+          ],
+          "min": 0.034224695764491435,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 0.035790263599667256,
+              "round": 0
+            },
+            {
+              "ratio": 0.03517399356310122,
+              "round": 1
+            },
+            {
+              "ratio": 0.03631073401285789,
+              "round": 2
+            },
+            {
+              "ratio": 0.034224695764491435,
+              "round": 3
+            },
+            {
+              "ratio": 0.04181313020326127,
+              "round": 4
+            },
+            {
+              "ratio": 0.037264544387746144,
+              "round": 5
+            },
+            {
+              "ratio": 0.03551191574259581,
+              "round": 6
+            },
+            {
+              "ratio": 0.034725679499816434,
+              "round": 7
+            },
+            {
+              "ratio": 0.03640105445830755,
+              "round": 8
+            },
+            {
+              "ratio": 0.03604087236319739,
+              "round": 9
+            },
+            {
+              "ratio": 0.03684635732595386,
+              "round": 10
+            },
+            {
+              "ratio": 0.03879539752807361,
+              "round": 11
+            },
+            {
+              "ratio": 0.037267343119721165,
+              "round": 12
+            },
+            {
+              "ratio": 0.035668710299665264,
+              "round": 13
+            },
+            {
+              "ratio": 0.036076547127803574,
+              "round": 14
+            }
+          ],
+          "stdev": 0.0018413999274827537
+        },
+        "gcc": {
+          "cv": 0.031027999266642247,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.01232278186790392,
+          "max": 1.0912511525995394,
+          "mean": 1.0314840227244324,
+          "median": 1.0275498994312358,
+          "median_ci95_bootstrap": [
+            1.017895370969261,
+            1.0489710551220404
+          ],
+          "min": 0.9480404494009518,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.0111358254211191,
+              "round": 0
+            },
+            {
+              "ratio": 1.0165066676765635,
+              "round": 1
+            },
+            {
+              "ratio": 1.017895370969261,
+              "round": 2
+            },
+            {
+              "ratio": 1.0199411260609936,
+              "round": 3
+            },
+            {
+              "ratio": 1.054042301714229,
+              "round": 4
+            },
+            {
+              "ratio": 1.0695004262049896,
+              "round": 5
+            },
+            {
+              "ratio": 1.021099485591467,
+              "round": 6
+            },
+            {
+              "ratio": 1.0392812604235078,
+              "round": 7
+            },
+            {
+              "ratio": 1.0489710551220404,
+              "round": 8
+            },
+            {
+              "ratio": 1.0208204108375063,
+              "round": 9
+            },
+            {
+              "ratio": 1.0398726812991397,
+              "round": 10
+            },
+            {
+              "ratio": 1.0275498994312358,
+              "round": 11
+            },
+            {
+              "ratio": 1.0463522281139437,
+              "round": 12
+            },
+            {
+              "ratio": 0.9480404494009518,
+              "round": 13
+            },
+            {
+              "ratio": 1.0912511525995394,
+              "round": 14
+            }
+          ],
+          "stdev": 0.03200488550064688
+        }
+      },
+      "ratios_to_gcc": {
+        "ccc": {
+          "cv": 0.047830306919406235,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.49308624328612893,
+          "max": 30.248214961750893,
+          "mean": 28.288627338296642,
+          "median": 28.32396509580334,
+          "median_ci95_bootstrap": [
+            28.032905382987217,
+            28.81705133908947
+          ],
+          "min": 25.2084045511622,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 28.25170098581,
+              "round": 0
+            },
+            {
+              "ratio": 28.89938175069536,
+              "round": 1
+            },
+            {
+              "ratio": 28.032905382987217,
+              "round": 2
+            },
+            {
+              "ratio": 29.801320458170323,
+              "round": 3
+            },
+            {
+              "ratio": 25.2084045511622,
+              "round": 4
+            },
+            {
+              "ratio": 28.700214742372594,
+              "round": 5
+            },
+            {
+              "ratio": 28.7537144713001,
+              "round": 6
+            },
+            {
+              "ratio": 29.928320349469377,
+              "round": 7
+            },
+            {
+              "ratio": 28.81705133908947,
+              "round": 8
+            },
+            {
+              "ratio": 28.32396509580334,
+              "round": 9
+            },
+            {
+              "ratio": 28.221858462157222,
+              "round": 10
+            },
+            {
+              "ratio": 26.486386656759148,
+              "round": 11
+            },
+            {
+              "ratio": 28.07692044889119,
+              "round": 12
+            },
+            {
+              "ratio": 26.579050418031198,
+              "round": 13
+            },
+            {
+              "ratio": 30.248214961750893,
+              "round": 14
+            }
+          ],
+          "stdev": 1.3530537279194343
+        },
+        "lccc": {
+          "cv": 0.031027999266642247,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.01232278186790392,
+          "max": 1.0912511525995394,
+          "mean": 1.0314840227244324,
+          "median": 1.0275498994312358,
+          "median_ci95_bootstrap": [
+            1.017895370969261,
+            1.0489710551220404
+          ],
+          "min": 0.9480404494009518,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.0111358254211191,
+              "round": 0
+            },
+            {
+              "ratio": 1.0165066676765635,
+              "round": 1
+            },
+            {
+              "ratio": 1.017895370969261,
+              "round": 2
+            },
+            {
+              "ratio": 1.0199411260609936,
+              "round": 3
+            },
+            {
+              "ratio": 1.054042301714229,
+              "round": 4
+            },
+            {
+              "ratio": 1.0695004262049896,
+              "round": 5
+            },
+            {
+              "ratio": 1.021099485591467,
+              "round": 6
+            },
+            {
+              "ratio": 1.0392812604235078,
+              "round": 7
+            },
+            {
+              "ratio": 1.0489710551220404,
+              "round": 8
+            },
+            {
+              "ratio": 1.0208204108375063,
+              "round": 9
+            },
+            {
+              "ratio": 1.0398726812991397,
+              "round": 10
+            },
+            {
+              "ratio": 1.0275498994312358,
+              "round": 11
+            },
+            {
+              "ratio": 1.0463522281139437,
+              "round": 12
+            },
+            {
+              "ratio": 0.9480404494009518,
+              "round": 13
+            },
+            {
+              "ratio": 1.0912511525995394,
+              "round": 14
+            }
+          ],
+          "stdev": 0.03200488550064688
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "ccc"
+          ],
+          "round": 0,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.400769,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.402132171
+            },
+            "gcc": {
+              "child_cpu_s": 0.22624599999999973,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.226610503
+            },
+            "lccc": {
+              "child_cpu_s": 0.22871999999999915,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.229133998
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "ccc",
+            "gcc"
+          ],
+          "round": 1,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.619448999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.620637278
+            },
+            "gcc": {
+              "child_cpu_s": 0.22869599999999934,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.229092696
+            },
+            "lccc": {
+              "child_cpu_s": 0.2323990000000009,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.232874253
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "ccc",
+            "gcc"
+          ],
+          "round": 2,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.604385999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.606956442
+            },
+            "gcc": {
+              "child_cpu_s": 0.23516000000000048,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.235685754
+            },
+            "lccc": {
+              "child_cpu_s": 0.23938900000000274,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.239903438
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "ccc"
+          ],
+          "round": 3,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.771640999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.774545597
+            },
+            "gcc": {
+              "child_cpu_s": 0.2269539999999992,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.227323672
+            },
+            "lccc": {
+              "child_cpu_s": 0.23140700000000436,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.231856762
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "gcc",
+            "lccc"
+          ],
+          "round": 4,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.572319,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.576127108
+            },
+            "gcc": {
+              "child_cpu_s": 0.2603640000000027,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.260870421
+            },
+            "lccc": {
+              "child_cpu_s": 0.27465099999999865,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.274968459
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "gcc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.589767999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.59366583
+            },
+            "gcc": {
+              "child_cpu_s": 0.22928199999999777,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.229742735
+            },
+            "lccc": {
+              "child_cpu_s": 0.24526200000000387,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.245709953
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "gcc",
+            "lccc"
+          ],
+          "round": 6,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.639782000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.641925198
+            },
+            "gcc": {
+              "child_cpu_s": 0.23057000000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.230993641
+            },
+            "lccc": {
+              "child_cpu_s": 0.23545000000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.235867488
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "lccc",
+            "gcc"
+          ],
+          "round": 7,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.843210999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.850762042
+            },
+            "gcc": {
+              "child_cpu_s": 0.22850799999999083,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.228905664
+            },
+            "lccc": {
+              "child_cpu_s": 0.23741800000000524,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.237897367
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "ccc"
+          ],
+          "round": 8,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.59627900000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.598741316
+            },
+            "gcc": {
+              "child_cpu_s": 0.22854799999998932,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.228987388
+            },
+            "lccc": {
+              "child_cpu_s": 0.2397320000000036,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.240201142
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "ccc"
+          ],
+          "round": 9,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.559103999999991,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.560661313
+            },
+            "gcc": {
+              "child_cpu_s": 0.2312469999999962,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.231629339
+            },
+            "lccc": {
+              "child_cpu_s": 0.23598400000000197,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.236451957
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "ccc",
+            "lccc"
+          ],
+          "round": 10,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.520105000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.521833919
+            },
+            "gcc": {
+              "child_cpu_s": 0.23064100000000565,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.231091582
+            },
+            "lccc": {
+              "child_cpu_s": 0.2398420000000101,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.240305823
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "ccc"
+          ],
+          "round": 11,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.499623999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.501688501
+            },
+            "gcc": {
+              "child_cpu_s": 0.2449140000000085,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.245472838
+            },
+            "lccc": {
+              "child_cpu_s": 0.2518339999999881,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.25223559
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "ccc"
+          ],
+          "round": 12,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.455725000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.457843459
+            },
+            "gcc": {
+              "child_cpu_s": 0.22947899999999777,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.230005405
+            },
+            "lccc": {
+              "child_cpu_s": 0.24008999999999503,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.240666668
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "gcc",
+            "lccc"
+          ],
+          "round": 13,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.744715999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.747217827
+            },
+            "gcc": {
+              "child_cpu_s": 0.2533870000000036,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.253854736
+            },
+            "lccc": {
+              "child_cpu_s": 0.24024599999999907,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.240664558
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "ccc"
+          ],
+          "round": 14,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 6.957081000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 6.959605034
+            },
+            "gcc": {
+              "child_cpu_s": 0.22964600000000246,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.230083165
+            },
+            "lccc": {
+              "child_cpu_s": 0.25050099999999986,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "1.274224152",
+              "wall_s": 0.251078519
+            }
+          }
+        }
+      ],
+      "runs": {
+        "ccc": [
+          {
+            "child_cpu_s": 6.400769,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.402132171
+          },
+          {
+            "child_cpu_s": 6.619448999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.620637278
+          },
+          {
+            "child_cpu_s": 6.604385999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.606956442
+          },
+          {
+            "child_cpu_s": 6.771640999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.774545597
+          },
+          {
+            "child_cpu_s": 6.572319,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.576127108
+          },
+          {
+            "child_cpu_s": 6.589767999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.59366583
+          },
+          {
+            "child_cpu_s": 6.639782000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.641925198
+          },
+          {
+            "child_cpu_s": 6.843210999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.850762042
+          },
+          {
+            "child_cpu_s": 6.59627900000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.598741316
+          },
+          {
+            "child_cpu_s": 6.559103999999991,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.560661313
+          },
+          {
+            "child_cpu_s": 6.520105000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.521833919
+          },
+          {
+            "child_cpu_s": 6.499623999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.501688501
+          },
+          {
+            "child_cpu_s": 6.455725000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.457843459
+          },
+          {
+            "child_cpu_s": 6.744715999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.747217827
+          },
+          {
+            "child_cpu_s": 6.957081000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.959605034
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.22624599999999973,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.226610503
+          },
+          {
+            "child_cpu_s": 0.22869599999999934,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.229092696
+          },
+          {
+            "child_cpu_s": 0.23516000000000048,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.235685754
+          },
+          {
+            "child_cpu_s": 0.2269539999999992,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.227323672
+          },
+          {
+            "child_cpu_s": 0.2603640000000027,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.260870421
+          },
+          {
+            "child_cpu_s": 0.22928199999999777,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.229742735
+          },
+          {
+            "child_cpu_s": 0.23057000000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.230993641
+          },
+          {
+            "child_cpu_s": 0.22850799999999083,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.228905664
+          },
+          {
+            "child_cpu_s": 0.22854799999998932,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.228987388
+          },
+          {
+            "child_cpu_s": 0.2312469999999962,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.231629339
+          },
+          {
+            "child_cpu_s": 0.23064100000000565,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.231091582
+          },
+          {
+            "child_cpu_s": 0.2449140000000085,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.245472838
+          },
+          {
+            "child_cpu_s": 0.22947899999999777,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.230005405
+          },
+          {
+            "child_cpu_s": 0.2533870000000036,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.253854736
+          },
+          {
+            "child_cpu_s": 0.22964600000000246,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.230083165
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.22871999999999915,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.229133998
+          },
+          {
+            "child_cpu_s": 0.2323990000000009,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.232874253
+          },
+          {
+            "child_cpu_s": 0.23938900000000274,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.239903438
+          },
+          {
+            "child_cpu_s": 0.23140700000000436,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.231856762
+          },
+          {
+            "child_cpu_s": 0.27465099999999865,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.274968459
+          },
+          {
+            "child_cpu_s": 0.24526200000000387,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.245709953
+          },
+          {
+            "child_cpu_s": 0.23545000000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.235867488
+          },
+          {
+            "child_cpu_s": 0.23741800000000524,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.237897367
+          },
+          {
+            "child_cpu_s": 0.2397320000000036,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.240201142
+          },
+          {
+            "child_cpu_s": 0.23598400000000197,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.236451957
+          },
+          {
+            "child_cpu_s": 0.2398420000000101,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.240305823
+          },
+          {
+            "child_cpu_s": 0.2518339999999881,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.25223559
+          },
+          {
+            "child_cpu_s": 0.24008999999999503,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.240666668
+          },
+          {
+            "child_cpu_s": 0.24024599999999907,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.240664558
+          },
+          {
+            "child_cpu_s": 0.25050099999999986,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.251078519
+          }
+        ]
+      },
+      "runtime": {
+        "ccc": {
+          "child_cpu": {
+            "cv": 0.022433888285150663,
+            "mad": 0.07617400000000885,
+            "max": 6.957081000000002,
+            "mean": 6.624930599999999,
+            "median": 6.59627900000001,
+            "median_ci95_bootstrap": [
+              6.520105000000001,
+              6.744715999999997
+            ],
+            "min": 6.400769,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.14862295297727612
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            6.402132171,
+            6.620637278,
+            6.606956442,
+            6.774545597,
+            6.576127108,
+            6.59366583,
+            6.641925198,
+            6.850762042,
+            6.598741316,
+            6.560661313,
+            6.521833919,
+            6.501688501,
+            6.457843459,
+            6.747217827,
+            6.959605034
+          ],
+          "wall": {
+            "cv": 0.022539590055374318,
+            "mad": 0.07690739700000027,
+            "max": 6.959605034,
+            "mean": 6.6276228690000005,
+            "median": 6.598741316,
+            "median_ci95_bootstrap": [
+              6.521833919,
+              6.747217827
+            ],
+            "min": 6.402132171,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.1493839025088838
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.043901922600043566,
+            "mad": 0.0011380000000116297,
+            "max": 0.2603640000000027,
+            "mean": 0.23424279999999958,
+            "median": 0.22964600000000246,
+            "median_ci95_bootstrap": [
+              0.22854799999998932,
+              0.23516000000000048
+            ],
+            "min": 0.22624599999999973,
+            "n": 15,
+            "outlier_count_mad": 3,
+            "stdev": 0.010283709275217467
+          },
+          "quality_warnings": [
+            "3 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.226610503,
+            0.229092696,
+            0.235685754,
+            0.227323672,
+            0.260870421,
+            0.229742735,
+            0.230993641,
+            0.228905664,
+            0.228987388,
+            0.231629339,
+            0.231091582,
+            0.245472838,
+            0.230005405,
+            0.253854736,
+            0.230083165
+          ],
+          "wall": {
+            "cv": 0.04396407828439514,
+            "mad": 0.0011775009999999975,
+            "max": 0.260870421,
+            "mean": 0.2346899692666667,
+            "median": 0.230083165,
+            "median_ci95_bootstrap": [
+              0.228987388,
+              0.231629339
+            ],
+            "min": 0.226610503,
+            "n": 15,
+            "outlier_count_mad": 3,
+            "stdev": 0.010317928181402024
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.04624428699971882,
+            "mad": 0.00428200000000345,
+            "max": 0.27465099999999865,
+            "mean": 0.24152833333333418,
+            "median": 0.2397320000000036,
+            "median_ci95_bootstrap": [
+              0.23598400000000197,
+              0.24024599999999907
+            ],
+            "min": 0.22871999999999915,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.011169305565230459
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.229133998,
+            0.232874253,
+            0.239903438,
+            0.231856762,
+            0.274968459,
+            0.245709953,
+            0.235867488,
+            0.237897367,
+            0.240201142,
+            0.236451957,
+            0.240305823,
+            0.25223559,
+            0.240666668,
+            0.240664558,
+            0.251078519
+          ],
+          "wall": {
+            "cv": 0.046054659989732065,
+            "mad": 0.00433365400000002,
+            "max": 0.274968459,
+            "mean": 0.24198773166666668,
+            "median": 0.240201142,
+            "median_ci95_bootstrap": [
+              0.235867488,
+              0.240666668
+            ],
+            "min": 0.229133998,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.011144662703594852
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "tags": [
+        "synthetic",
+        "fp",
+        "loop"
+      ],
+      "warmups": {
+        "ccc": [
+          {
+            "child_cpu_s": 6.235404000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.241054804
+          },
+          {
+            "child_cpu_s": 6.4282259999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.433278946
+          },
+          {
+            "child_cpu_s": 6.209871000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 6.211811599
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.23156500000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.232042355
+          },
+          {
+            "child_cpu_s": 0.2333829999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.233865659
+          },
+          {
+            "child_cpu_s": 0.22760900000000106,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.227933743
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.2840030000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.284762435
+          },
+          {
+            "child_cpu_s": 0.24872499999999942,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.249387259
+          },
+          {
+            "child_cpu_s": 0.23234699999999897,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/spectral-ab/artifacts/spectral_norm/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "1.274224152",
+            "wall_s": 0.23277227
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "d071563d5326f5e1d0a8e3f5aa035e0079843868da16abe9cd2ee16484e3f818",
+      "executable": "/home/user/lccc/target/followup-vex-lccc",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-mtune=raptorlake"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "3f6797b8aeb721e023da1f154763a54100ab732ffb9af7a1fe6a6fb59fc45ce4",
+      "executable": "/home/user/lccc/target/baseline-e5bc1911-lccc",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-mtune=raptorlake"
+      ],
+      "key": "ccc",
+      "label": "CCC"
+    },
+    {
+      "binary_sha256": "a23ecab8ff08f09ad8c80602c2c5df7f49e09c25905cb8975902e101bf72635f",
+      "executable": "/usr/bin/x86_64-linux-gnu-gcc-14",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-mtune=raptorlake"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    }
+  ],
+  "metadata": {
+    "compiler_versions": {
+      "ccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "gcc": "x86_64-linux-gnu-gcc-14 (Debian 14.2.0-19) 14.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "e5bc19118c6ea5a54d5539d4a6cff52c97ab6baa",
+      "status": "M src/backend/x86/codegen/intrinsics.rs\n M tests/regression/check_strict_computed_recip_codegen.sh\n?? engineering/evidence/2026-09-26-followups/"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        2032608 kB\nMemFree:          693624 kB\nMemAvailable:    1764752 kB\nBuffers:            7148 kB\nCached:          1165712 kB\nSwapCached:        11172 kB\nActive:           455352 kB\nInactive:         776880 kB\nActive(anon):       6728 kB\nInactive(anon):    53332 kB\nActive(file):     448624 kB\nInactive(file):   723548 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       8388604 kB\nSwapFree:        8057044 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                44 kB\nWriteback:             0 kB\nAnonPages:         50160 kB\nMapped:            23156 kB\nShmem:               664 kB\nKReclaimable:      61388 kB\nSlab:              81284 kB\nSReclaimable:      61388 kB\nSUnreclaim:        19896 kB\nKernelStack:        2200 kB\nPageTables:         3148 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     9404908 kB\nCommitted_AS:     724420 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        7360 kB\nVmallocChunk:          0 kB\nPercpu:              640 kB\nAnonHugePages:     10240 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     1011712 kB\nDirectMap1G:     3145728 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.41",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": true,
+      "reason": "perf is not installed"
+    },
+    "python": "3.13.14 (main, Jul 14 2026, 04:45:36) [GCC 14.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t331560\t\t-2",
+    "timestamp_utc": "2026-09-26T00:38:12.693827+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Fri Jul 17 14:31:34 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 9265184768,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 9265184768,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 910290944,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 9265184768,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [
+      "-march=x86-64-v3",
+      "-mtune=raptorlake"
+    ],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 15,
+    "seed": 260926,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 3
+  },
+  "unavailable_compilers": {}
+}

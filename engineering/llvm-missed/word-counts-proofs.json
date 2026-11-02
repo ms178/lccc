@@ -1,0 +1,158 @@
+{
+  "solver": "4.16.0",
+  "scope": "Independent count identities and refusal witnesses, not a compiler certificate.",
+  "results": [
+    {
+      "name": "trailing-union",
+      "bits": 8,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "trailing-cap",
+      "bits": 8,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-union",
+      "bits": 8,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-cap",
+      "bits": 8,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "off-by-one-leading-sentinel",
+      "bits": 8,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[cap8 = 3, x8 = 3]"
+    },
+    {
+      "name": "hardware-masked-out-of-range-cap",
+      "bits": 8,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[x8 = 0, cap8 = 8]"
+    },
+    {
+      "name": "trailing-union",
+      "bits": 16,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "trailing-cap",
+      "bits": 16,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-union",
+      "bits": 16,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-cap",
+      "bits": 16,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "off-by-one-leading-sentinel",
+      "bits": 16,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[x16 = 0, cap16 = 0]"
+    },
+    {
+      "name": "hardware-masked-out-of-range-cap",
+      "bits": 16,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[x16 = 0, cap16 = 16]"
+    },
+    {
+      "name": "trailing-union",
+      "bits": 32,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "trailing-cap",
+      "bits": 32,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-union",
+      "bits": 32,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-cap",
+      "bits": 32,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "off-by-one-leading-sentinel",
+      "bits": 32,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[cap32 = 0, x32 = 0]"
+    },
+    {
+      "name": "hardware-masked-out-of-range-cap",
+      "bits": 32,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[x32 = 0, cap32 = 32]"
+    },
+    {
+      "name": "trailing-union",
+      "bits": 64,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "trailing-cap",
+      "bits": 64,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-union",
+      "bits": 64,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "leading-cap",
+      "bits": 64,
+      "expected": "unsat",
+      "result": "unsat"
+    },
+    {
+      "name": "off-by-one-leading-sentinel",
+      "bits": 64,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[cap64 = 0, x64 = 576677359315320912]"
+    },
+    {
+      "name": "hardware-masked-out-of-range-cap",
+      "bits": 64,
+      "expected": "sat",
+      "result": "sat",
+      "witness": "[x64 = 0, cap64 = 64]"
+    }
+  ]
+}

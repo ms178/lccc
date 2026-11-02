@@ -1,0 +1,19 @@
+# scripts/paired_ab.py --src tests/benchmark/programs/sha256_transform.c \
+#   --ccc target/fastbuild/lccc --cflags '-O2 -DPASSES=4 -DBLOCK_COUNT=32768' \
+#   --env-a '' --env-b 'CCC_PHI_ACYCLIC_ORDER=1' \
+#   --name-a default --name-b opt-in --rounds 25 \
+#   --json engineering/evidence/phi-acyclic-copy-order-2026-09-11/paired-sha256-transform.json
+# compiler under test: base 4f527199 + cycle-accurate phi copy resolver (opt-in);
+#   src/ as of 22772885, unchanged by the docs-only commits that froze this file
+# shared-VM wall-clock screen, 2-core, no PMU. Not a microarchitectural claim.
+sha256_transform: CCC_PHI_ACYCLIC_ORDER (PASSES=4, BLOCK_COUNT=32768)
+  arm default: /tmp/paired_ab_j0uhsr5h/arm_a
+    sha256 ae4a2187bd5d5af445fdbdd5777c4bfa0f12043d6ec5bef94d57901553365f6b   env=<default>
+  arm opt-in: /tmp/paired_ab_j0uhsr5h/arm_b
+    sha256 ec4a97f22eb19f8c2ac3dbd2742e6aefbe7a7812125bbeb98c68efd94b6e9789   env=CCC_PHI_ACYCLIC_ORDER=1
+  both arms agree: rc=0, stdout 17 bytes
+  default: min=   38.68 med=   40.30 mean=   40.91 sd=  1.84 n=25
+  opt-in: min=   40.65 med=   42.34 mean=   43.19 sd=  2.60 n=25
+  median ratio opt-in/default = 1.0508   min ratio = 1.0511   sign-test p = 0.0003
+  => default FASTER by 5.08% (median)
+  raw samples -> engineering/evidence/phi-acyclic-copy-order-2026-09-11/paired-sha256-transform.json

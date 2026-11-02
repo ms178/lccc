@@ -1,0 +1,2512 @@
+{
+ "exempt": {
+  "fcom 0xdc": "dc /2 is `FCOM m64fp`, a memory-only form; GAS's reverse match still produces the register shape",
+  "mov 0x24": "0f 24 is `mov` to/from an obsolete TR register; objdump does not decode TR at all",
+  "mov 0x26": "0f 26 is the reverse of 0f 24 (see above)",
+  "movq 0x6e": "the row is the REX.W form of `66 0f 6e`, which is `movd` without REX.W; the table does not record the W bit and objdump correctly names the spelling it sees",
+  "movq 0x7e": "the reverse of the `movq` 0f 6e row (see above)",
+  "pop 0x07": "07 is `pop %es`, which does not exist in 64-bit mode",
+  "push 0x06": "06 is `push %es`, which does not exist in 64-bit mode (the row is No64)",
+  "xchg 0x90": "90 is spelled `nop` by every disassembler"
+ },
+ "rows": [
+  {
+   "bytes": "00c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 0,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "01c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 1,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "02c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 2,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "03c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 3,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "04c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 4,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "05c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 5,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "80c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "81c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "83c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "add",
+   "objdump": "add"
+  },
+  {
+   "bytes": "08c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 8,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "09c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 9,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "0ac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 10,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "0bc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 11,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "0cc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 12,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "0dc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 13,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "80c8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 1,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "81c8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 1,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "83c8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 1,
+    "w": null
+   },
+   "mnemonic": "or",
+   "objdump": "or"
+  },
+  {
+   "bytes": "10c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 16,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "11c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 17,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "12c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 18,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "13c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 19,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "14c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 20,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "15c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 21,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "80d0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 2,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "81d0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 2,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "83d0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 2,
+    "w": null
+   },
+   "mnemonic": "adc",
+   "objdump": "adc"
+  },
+  {
+   "bytes": "18c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 24,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "19c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 25,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "1ac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 26,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "1bc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 27,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "1cc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 28,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "1dc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 29,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "80d8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 3,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "81d8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 3,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "83d8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 3,
+    "w": null
+   },
+   "mnemonic": "sbb",
+   "objdump": "sbb"
+  },
+  {
+   "bytes": "20c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 32,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "21c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 33,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "22c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 34,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "23c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 35,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "24c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 36,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "25c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 37,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "80e0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 4,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "81e0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 4,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "83e0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 4,
+    "w": null
+   },
+   "mnemonic": "and",
+   "objdump": "and"
+  },
+  {
+   "bytes": "28c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 40,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "29c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 41,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "2ac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 42,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "2bc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 43,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "2cc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 44,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "2dc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 45,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "80e8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 5,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "81e8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 5,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "83e8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 5,
+    "w": null
+   },
+   "mnemonic": "sub",
+   "objdump": "sub"
+  },
+  {
+   "bytes": "30c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 48,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "31c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 49,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "32c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 50,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "33c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 51,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "34c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 52,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "35c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 53,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "80f0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 6,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "81f0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 6,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "83f0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 6,
+    "w": null
+   },
+   "mnemonic": "xor",
+   "objdump": "xor"
+  },
+  {
+   "bytes": "38c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 56,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "39c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 57,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "3ac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 58,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "3bc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 59,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "3cc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 60,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "3dc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 61,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "80f8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 128,
+    "pp": "none",
+    "reg": 7,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "81f8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 129,
+    "pp": "none",
+    "reg": 7,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "83f8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 131,
+    "pp": "none",
+    "reg": 7,
+    "w": null
+   },
+   "mnemonic": "cmp",
+   "objdump": "cmp"
+  },
+  {
+   "bytes": "0f20c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 32,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "0f21c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 33,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "0f22c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 34,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "0f23c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 35,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "88c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 136,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "89c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 137,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "8ac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 138,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "8bc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 139,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "8cc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 140,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "8ec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 142,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "a0c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 160,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "a1c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 161,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "a2c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 162,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "a3c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 163,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "b0c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 176,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b1c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 177,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b2c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 178,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b3c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 179,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b4c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 180,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b5c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 181,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b6c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 182,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b7c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 183,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b8c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 184,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b9c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 185,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 186,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bbc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 187,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bcc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 188,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bdc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 189,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 190,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bfc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 191,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "c6c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 198,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "c7c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 199,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "mov",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "a0c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 160,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "a1c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 161,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "a2c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 162,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "a3c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 163,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "movabs"
+  },
+  {
+   "bytes": "b8c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 184,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "b9c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 185,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 186,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bbc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 187,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bcc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 188,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bdc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 189,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 190,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "bfc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 191,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movabs",
+   "objdump": "mov"
+  },
+  {
+   "bytes": "84c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 132,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "test",
+   "objdump": "test"
+  },
+  {
+   "bytes": "85c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 133,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "test",
+   "objdump": "test"
+  },
+  {
+   "bytes": "a8c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 168,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "test",
+   "objdump": "test"
+  },
+  {
+   "bytes": "a9c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 169,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "test",
+   "objdump": "test"
+  },
+  {
+   "bytes": "f6c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 246,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "test",
+   "objdump": "test"
+  },
+  {
+   "bytes": "f7c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 247,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "test",
+   "objdump": "test"
+  },
+  {
+   "bytes": "86c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 134,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "87c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 135,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "91c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 145,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "92c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 146,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "93c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 147,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "94c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 148,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "95c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 149,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "96c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 150,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "97c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 151,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "xchg",
+   "objdump": "xchg"
+  },
+  {
+   "bytes": "0fa0c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 160,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "50c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 80,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "51c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 81,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "52c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 82,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "53c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 83,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "54c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 84,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "55c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 85,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "56c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 86,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "57c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 87,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "68c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 104,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "6ac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 106,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "fff0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 255,
+    "pp": "none",
+    "reg": 6,
+    "w": null
+   },
+   "mnemonic": "push",
+   "objdump": "push"
+  },
+  {
+   "bytes": "0fa1c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 161,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "58c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 88,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "59c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 89,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "5ac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 90,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "5bc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 91,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "5cc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 92,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "5dc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 93,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "5ec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 94,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "5fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 95,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "8fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 143,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "pop",
+   "objdump": "pop"
+  },
+  {
+   "bytes": "0fc8c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 200,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "0fc9c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 201,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "0fcac0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 202,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "0fcbc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 203,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "0fccc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 204,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "0fcdc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 205,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "0fcec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 206,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "0fcfc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 207,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "bswap",
+   "objdump": "bswap"
+  },
+  {
+   "bytes": "e4c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 228,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "in",
+   "objdump": "in"
+  },
+  {
+   "bytes": "e5c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 229,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "in",
+   "objdump": "in"
+  },
+  {
+   "bytes": "ecc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 236,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "in",
+   "objdump": "in"
+  },
+  {
+   "bytes": "edc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 237,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "in",
+   "objdump": "in"
+  },
+  {
+   "bytes": "660f6ec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 110,
+    "pp": "66",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movd",
+   "objdump": "movd"
+  },
+  {
+   "bytes": "660f7ec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 126,
+    "pp": "66",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movd",
+   "objdump": "movd"
+  },
+  {
+   "bytes": "0f6ec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 110,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movd",
+   "objdump": "movd"
+  },
+  {
+   "bytes": "0f7ec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 126,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movd",
+   "objdump": "movd"
+  },
+  {
+   "bytes": "660f6fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 111,
+    "pp": "66",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movdqa",
+   "objdump": "movdqa"
+  },
+  {
+   "bytes": "660f7fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 127,
+    "pp": "66",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movdqa",
+   "objdump": "movdqa"
+  },
+  {
+   "bytes": "f30f6fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 111,
+    "pp": "f3",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movdqu",
+   "objdump": "movdqu"
+  },
+  {
+   "bytes": "f30f7fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 127,
+    "pp": "f3",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movdqu",
+   "objdump": "movdqu"
+  },
+  {
+   "bytes": "660fd6c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 214,
+    "pp": "66",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movq",
+   "objdump": "movq"
+  },
+  {
+   "bytes": "0f6fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 111,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movq",
+   "objdump": "movq"
+  },
+  {
+   "bytes": "0f7fc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 127,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movq",
+   "objdump": "movq"
+  },
+  {
+   "bytes": "0f10c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 16,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movups",
+   "objdump": "movups"
+  },
+  {
+   "bytes": "0f11c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 17,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movups",
+   "objdump": "movups"
+  },
+  {
+   "bytes": "f20f10c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 16,
+    "pp": "f2",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movsd",
+   "objdump": "movsd"
+  },
+  {
+   "bytes": "f20f11c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 17,
+    "pp": "f2",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "movsd",
+   "objdump": "movsd"
+  },
+  {
+   "bytes": "d8c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 216,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "fadd",
+   "objdump": "fadd"
+  },
+  {
+   "bytes": "dcc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 220,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "fadd",
+   "objdump": "fadd"
+  },
+  {
+   "bytes": "dec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 222,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "faddp",
+   "objdump": "faddp"
+  },
+  {
+   "bytes": "dec8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 222,
+    "pp": "none",
+    "reg": 1,
+    "w": null
+   },
+   "mnemonic": "fmulp",
+   "objdump": "fmulp"
+  },
+  {
+   "bytes": "d8d0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 216,
+    "pp": "none",
+    "reg": 2,
+    "w": null
+   },
+   "mnemonic": "fcom",
+   "objdump": "fcom"
+  },
+  {
+   "bytes": "fec0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 254,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "inc",
+   "objdump": "inc"
+  },
+  {
+   "bytes": "ffc0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 255,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "inc",
+   "objdump": "inc"
+  },
+  {
+   "bytes": "fec8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 254,
+    "pp": "none",
+    "reg": 1,
+    "w": null
+   },
+   "mnemonic": "dec",
+   "objdump": "dec"
+  },
+  {
+   "bytes": "ffc8",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 255,
+    "pp": "none",
+    "reg": 1,
+    "w": null
+   },
+   "mnemonic": "dec",
+   "objdump": "dec"
+  },
+  {
+   "bytes": "75c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "none",
+    "opcode": 117,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "jne",
+   "objdump": "jne"
+  },
+  {
+   "bytes": "0f95c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 149,
+    "pp": "none",
+    "reg": 0,
+    "w": null
+   },
+   "mnemonic": "setne",
+   "objdump": "setne"
+  },
+  {
+   "bytes": "0f45c0",
+   "encoding": {
+    "family": "legacy",
+    "map": "0f",
+    "opcode": 69,
+    "pp": "none",
+    "reg": null,
+    "w": null
+   },
+   "mnemonic": "cmovne",
+   "objdump": "cmovne"
+  }
+ ],
+ "slots": 192,
+ "tool": "/home/user/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+}

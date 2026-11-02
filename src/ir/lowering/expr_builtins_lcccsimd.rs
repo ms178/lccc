@@ -1,0 +1,941 @@
+//! Generic SIMD intrinsic family: `__lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}`.
+//!
+//! The instruction mnemonic is part of the builtin NAME; this module is the
+//! single audit point mapping mnemonic -> (emission class, IntrinsicOp).
+//! Headers call these builtins for every intrinsic that must compile to a
+//! real instruction (no scalar fallback loops).
+//!
+//! Emission classes:
+//! - Vec128/Vec256/Vec512: vector result in a fresh stack slot (pointer
+//!   returned; backend keeps the value in XMM/YMM/ZMM registers).
+//! - Scalar: scalar result in a GPR dest (mask compares, movemask, extracts...).
+//! - PtrStore: first arg is the destination pointer (masked stores, stores).
+
+use super::lower::Lowerer;
+use crate::common::types::IrType;
+use crate::frontend::parser::ast::Expr;
+use crate::frontend::sema::builtins::BuiltinIntrinsic;
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LcccSimdClass {
+    Vec128,
+    Vec256,
+    Vec512,
+    Scalar,
+    PtrStore,
+}
+
+/// mnemonic -> (class, IntrinsicOp)
+pub(super) fn lccc_simd_lookup(
+    mnemonic: &str,
+) -> Option<(LcccSimdClass, IntrinsicOp, bool, usize)> {
+    use IntrinsicOp::*;
+    use LcccSimdClass::*;
+    // (class, op, has_imm, nargs): nargs = real operands after the leading
+    // dummy/imm argument. The immediate (if any) arrives as the FIRST call
+    // argument; lowering re-appends it as the LAST intrinsic operand so all
+    // emitters use a uniform "imm = args.last()" rule.
+    let b = |c, o| Some((c, o, false, 2usize));
+    let u = |c, o| Some((c, o, false, 1usize));
+    let ui = |c, o| Some((c, o, true, 1usize));
+    let t = |c, o| Some((c, o, true, 2usize));
+    let t3 = |c, o| Some((c, o, true, 3usize));
+    let s2 = |c, o| Some((c, o, true, 2usize));
+    let s1 = |c, o| Some((c, o, false, 1usize));
+    let s1i = |c, o| Some((c, o, true, 1usize));
+    let m2 = |c, o| Some((c, o, false, 2usize));
+    let m3 = |c, o| Some((c, o, false, 3usize));
+    let m3i = |c, o| Some((c, o, true, 3usize));
+    let m2i = |c, o| Some((c, o, true, 2usize));
+    let ps = |c, o| Some((c, o, false, 2usize));
+    let ps3 = |c, o| Some((c, o, false, 3usize));
+    match mnemonic {
+        // ---- 512-bit packed integer binary ----
+        "vpaddb512" => b(Vec512, Paddb512),
+        "vpaddw512" => b(Vec512, Paddw512),
+        "vpaddd512" => b(Vec512, Paddd512),
+        "vpaddq512" => b(Vec512, Paddq512),
+        "vpsubb512" => b(Vec512, Psubb512),
+        "vpsubw512" => b(Vec512, Psubw512),
+        "vpsubd512" => b(Vec512, Psubd512),
+        "vpsubq512" => b(Vec512, Psubq512),
+        "vpaddsb512" => b(Vec512, Paddsb512),
+        "vpaddsw512" => b(Vec512, Paddsw512),
+        "vpaddusb512" => b(Vec512, Paddusb512),
+        "vpaddusw512" => b(Vec512, Paddusw512),
+        "vpsubsb512" => b(Vec512, Psubsb512),
+        "vpsubsw512" => b(Vec512, Psubsw512),
+        "vpsubusb512" => b(Vec512, Psubusb512),
+        "vpsubusw512" => b(Vec512, Psubusw512),
+        "vpavgb512" => b(Vec512, Pavgb512),
+        "vpavgw512" => b(Vec512, Pavgw512),
+        "vpmaxub512" => b(Vec512, Pmaxub512),
+        "vpminub512" => b(Vec512, Pminub512),
+        "vpmaxuw512" => b(Vec512, Pmaxuw512),
+        "vpminuw512" => b(Vec512, Pminuw512),
+        "vpmaxsb512" => b(Vec512, Pmaxsb512),
+        "vpminsb512" => b(Vec512, Pminsb512),
+        "vpmaxsw512" => b(Vec512, Pmaxsw512),
+        "vpminsw512" => b(Vec512, Pminsw512),
+        "vpmaxsd512" => b(Vec512, Pmaxsd512),
+        "vpminsd512" => b(Vec512, Pminsd512),
+        "vpmaxud512" => b(Vec512, Pmaxud512),
+        "vpminud512" => b(Vec512, Pminud512),
+        "vpmaxsq512" => b(Vec512, Pmaxsq512),
+        "vpminsq512" => b(Vec512, Pminsq512),
+        "vpmaxuq512" => b(Vec512, Pmaxuq512),
+        "vpminuq512" => b(Vec512, Pminuq512),
+        "vpcmpeqd512" => b(Vec512, Pcmpeqd512),
+        "vpcmpeqq512" => b(Vec512, Pcmpeqq512),
+        "vpcmpgtb512" => b(Vec512, Pcmpgtb512),
+        "vpcmpgtw512" => b(Vec512, Pcmpgtw512),
+        "vpcmpgtd512" => b(Vec512, Pcmpgtd512),
+        "vpcmpgtq512" => b(Vec512, Pcmpgtq512),
+        "vpsadbw512" => b(Vec512, Psadbw512),
+        "vpmaddubsw512" => b(Vec512, Pmaddubsw512),
+        "vpmaddwd512" => b(Vec512, Pmaddwd512),
+        "vpmullw512" => b(Vec512, Pmullw512),
+        "vpmulhw512" => b(Vec512, Pmulhw512),
+        "vpmulhuw512" => b(Vec512, Pmulhuw512),
+        "vpmulld512" => b(Vec512, Pmulld512),
+        "vpmuludq512" => b(Vec512, Pmuludq512),
+        "vpxorq512" => b(Vec512, Pxor512),
+        "vpxord512" => b(Vec512, Pxor512),
+        "vporq512" => b(Vec512, Por512),
+        "vpord512" => b(Vec512, Por512),
+        "vpandq512" => b(Vec512, Pand512),
+        "vpandd512" => b(Vec512, Pand512),
+        "vpandnq512" => b(Vec512, Pandn512),
+        "vpandnd512" => b(Vec512, Pandn512),
+        "vpshufb512" => b(Vec512, Pshufb512),
+        "vpabsb512" => u(Vec512, Pabsb512),
+        "vpabsw512" => u(Vec512, Pabsw512),
+        "vpabsd512" => u(Vec512, Pabsd512),
+        "vpabsq512" => u(Vec512, Pabsq512),
+        "vpunpcklbw512" => b(Vec512, Punpcklbw512),
+        "vpunpcklwd512" => b(Vec512, Punpcklwd512),
+        "vpunpckldq512" => b(Vec512, Punpckldq512),
+        "vpunpcklqdq512" => b(Vec512, Punpcklqdq512),
+        "vpunpckhbw512" => b(Vec512, Punpckhbw512),
+        "vpunpckhwd512" => b(Vec512, Punpckhwd512),
+        "vpunpckhdq512" => b(Vec512, Punpckhdq512),
+        "vpunpckhqdq512" => b(Vec512, Punpckhqdq512),
+        "vpacksswb512" => b(Vec512, Packsswb512),
+        "vpackuswb512" => b(Vec512, Packuswb512),
+        "vpackssdw512" => b(Vec512, Packssdw512),
+        "vpackusdw512" => b(Vec512, Packusdw512),
+        // ---- shifts/shuffles with immediate ----
+        "vpsllw512" => ui(Vec512, Psllwi512),
+        "vpsrlw512" => ui(Vec512, Psrlwi512),
+        "vpsraw512" => ui(Vec512, Psrawi512),
+        "vpslld512" => ui(Vec512, Psllidi512),
+        "vpsrld512" => ui(Vec512, Psrlidi512),
+        "vpsrad512" => ui(Vec512, Psradi512),
+        "vpsllq512" => ui(Vec512, Psllqi512),
+        "vpsrlq512" => ui(Vec512, Psrlqi512),
+        "vpsraq512" => ui(Vec512, Psraqi512),
+        "vpshufd512" => ui(Vec512, Pshufd512),
+        "vpshuflw512" => ui(Vec512, Pshuflw512),
+        "vpshufhw512" => ui(Vec512, Pshufhw512),
+        "vpalignr512" => t(Vec512, Palignr512),
+        "vpclmulqdq512" => t(Vec512, Vpclmulqdq512),
+        // ---- sign/zero extension (unary, LL from dest) ----
+        "vpmovzxbw512" => u(Vec512, Pmovzxbw512),
+        "vpmovzxbd512" => u(Vec512, Pmovzxbd512),
+        "vpmovzxbq512" => u(Vec512, Pmovzxbq512),
+        "vpmovzxwd512" => u(Vec512, Pmovzxwd512),
+        "vpmovzxwq512" => u(Vec512, Pmovzxwq512),
+        "vpmovzxdq512" => u(Vec512, Pmovzxdq512),
+        "vpmovsxbw512" => u(Vec512, Pmovsxbw512),
+        "vpmovsxbd512" => u(Vec512, Pmovsxbd512),
+        "vpmovsxbq512" => u(Vec512, Pmovsxbq512),
+        "vpmovsxwd512" => u(Vec512, Pmovsxwd512),
+        "vpmovsxwq512" => u(Vec512, Pmovsxwq512),
+        "vpmovsxdq512" => u(Vec512, Pmovsxdq512),
+        // ---- popcount ----
+        "vpopcntb512" => u(Vec512, Popcntb512),
+        "vpopcntw512" => u(Vec512, Popcntw512),
+        "vpopcntd512" => u(Vec512, Popcntd512),
+        "vpopcntq512" => u(Vec512, Popcntq512),
+        // ---- ternary logic ----
+        "vpternlogd512" => t3(Vec512, TernaryLogic512),
+        "vpternlogq512" => t3(Vec512, TernaryLogic512),
+        "vpternlogd256" => t3(Vec256, TernaryLogic256),
+        "vpternlogq256" => t3(Vec256, TernaryLogic256),
+        "vpternlogd128" => t3(Vec128, TernaryLogic128),
+        "vpternlogq128" => t3(Vec128, TernaryLogic128),
+        // ---- insert/extract ----
+        "vinserti32x4_512" => t(Vec512, InsertI32x4),
+        "vinserti64x2_512" => t(Vec512, InsertI64x2),
+        "vinserti32x8_512" => t(Vec512, InsertI32x8),
+        "vinserti64x4_512" => t(Vec512, InsertI64x4),
+        "vextracti32x4_512" => ui(Vec128, ExtractI32x4),
+        "vextracti64x2_512" => ui(Vec128, ExtractI64x2),
+        "vextracti32x8_512" => ui(Vec256, ExtractI32x8),
+        "vextracti64x4_512" => ui(Vec256, ExtractI64x4),
+        // ---- permutes ----
+        "vpermd512" => b(Vec512, PermutexvarEp32),
+        "vpermps512" => b(Vec512, PermutexvarEp32),
+        "vpermq_var512" => b(Vec512, PermutexvarEp64),
+        "vpermi2d512" => b(Vec512, PermutexvarEp32),
+        // ---- broadcast ----
+        "vbroadcasti32x4_512" => u(Vec512, BroadcastI32x4),
+        "vbroadcasti64x2_512" => u(Vec512, BroadcastI64x2),
+        "vbroadcasti32x8_512" => u(Vec512, BroadcastI32x8),
+        "vbroadcasti64x4_512" => u(Vec512, BroadcastI64x4),
+        "vpbroadcastb512" => u(Vec512, SetEpi8_512),
+        "vpbroadcastw512" => u(Vec512, SetEpi16_512),
+        "vpbroadcastd512" => u(Vec512, SetEpi32_512),
+        "vpbroadcastq512" => u(Vec512, SetEpi64x512),
+        // ---- casts ----
+        "vzextsi128_512" => u(Vec512, Zext128to512),
+        "vcastsi512_256" => u(Vec256, Cast512to256),
+        "vcastsi256_512" => u(Vec512, Cast256to512),
+        "vcastsi128_512" => u(Vec512, Cast128to512),
+        // ---- loads/stores ----
+        "vmovdqu64_load" => u(Vec512, Loadu512),
+        "vmovdqu64_store" => ps(PtrStore, Storeu512),
+        // ---- mask compares (scalar mask in GPR) ----
+        "vpcmpub512" => s2(Scalar, CmpeqEpu8Mask512),
+        "vpcmpb512" => s2(Scalar, CmpEpi8Mask512),
+        "vpcmpuw512" => s2(Scalar, CmpeqEpu16Mask512),
+        "vpcmpw512" => s2(Scalar, CmpEpi16Mask512),
+        "vpcmpud512" => s2(Scalar, CmpeqEpu32Mask512),
+        "vpcmpd512" => s2(Scalar, CmpEpi32Mask512),
+        "vpcmpuq512" => s2(Scalar, CmpeqEpu64Mask512),
+        "vpcmpq512" => s2(Scalar, CmpEpi64Mask512),
+        "vpcmpub256" => s2(Scalar, CmpeqEpu8Mask256),
+        "vpcmpb256" => s2(Scalar, CmpEpi8Mask256),
+        "vpcmpub128" => s2(Scalar, CmpeqEpu8Mask128),
+        "vpcmpb128" => s2(Scalar, CmpEpi8Mask128),
+        // ---- masked loads/stores ----
+        "vmovdqu8_maskz_load512" => m2(Vec512, MaskzLoaduEpi8_512),
+        "vmovdqu8_maskz_load256" => m2(Vec256, MaskzLoaduEpi8_256),
+        "vmovdqu8_maskz_load128" => m2(Vec128, MaskzLoaduEpi8_128),
+        "vmovdqu8_mask_load512" => m3(Vec512, MaskLoaduEpi8_512),
+        "vmovdqu8_mask_load256" => m3(Vec256, MaskLoaduEpi8_256),
+        "vmovdqu8_mask_load128" => m3(Vec128, MaskLoaduEpi8_128),
+        "vmovdqu8_mask_store512" => ps3(PtrStore, MaskStoreuEpi8_512),
+        "vmovdqu8_mask_store256" => ps3(PtrStore, MaskStoreuEpi8_256),
+        "vmovdqu8_mask_store128" => ps3(PtrStore, MaskStoreuEpi8_128),
+        // ---- masked arithmetic ----
+        "vpmaddubsw_maskz512" => m3(Vec512, MaskzMaddubsEpi16_512),
+        "vpbroadcastw_maskz512" => m2(Vec512, MaskzSet1Epi16_512),
+        "vpbroadcastd_maskz512" => m2(Vec512, MaskzSet1Epi32_512),
+        "vpbroadcastq_maskz512" => m2(Vec512, MaskzSet1Epi64x512),
+        "vinserti64x2_maskz512" => m3i(Vec512, MaskzInsertI64x2),
+        "vinserti32x4_maskz512" => m3i(Vec512, MaskzInsertI32x4),
+        "vextracti32x4_maskz512" => m2i(Vec128, MaskzExtractI32x4),
+        "vextracti64x4_maskz512" => m2i(Vec256, MaskzExtractI64x4),
+        "vextracti64x2_maskz512" => m2i(Vec128, MaskzExtractI64x2),
+        "vpshufb_maskz128" => m2(Vec128, MaskzShuffleEpi8_128),
+        "vpshufb_mask128" => m3(Vec128, MaskShuffleEpi8_128),
+        "vreduce_add_epu32_512" => s1(Scalar, ReduceAddEpu32_512),
+        // ---- AVX-VNNI 512 ----
+        "vpdpbusd512" => m3(Vec512, Vpdpbusd512),
+        "vpdpbusds512" => m3(Vec512, Vpdpbusds512),
+        // ---- 512-bit FP ----
+        "vaddps512" => b(Vec512, AddPs512),
+        "vsubps512" => b(Vec512, SubPs512),
+        "vmulps512" => b(Vec512, MulPs512),
+        "vdivps512" => b(Vec512, DivPs512),
+        "vminps512" => b(Vec512, MinPs512),
+        "vmaxps512" => b(Vec512, MaxPs512),
+        "vaddpd512" => b(Vec512, AddPd512),
+        "vsubpd512" => b(Vec512, SubPd512),
+        "vmulpd512" => b(Vec512, MulPd512),
+        "vdivpd512" => b(Vec512, DivPd512),
+        "vminpd512" => b(Vec512, MinPd512),
+        "vmaxpd512" => b(Vec512, MaxPd512),
+        "vsqrtps512" => u(Vec512, SqrtPs512),
+        "vsqrtpd512" => u(Vec512, SqrtPd512),
+        "vcmpps512" => s2(Vec512, CmpPs512),
+        "vcmppd512" => s2(Vec512, CmpPd512),
+        "vcvtps2pd512" => u(Vec512, CvtPs2Pd512),
+        "vcvtpd2ps512" => u(Vec256, CvtPd2Ps512),
+        "vcvtdq2ps512" => u(Vec512, CvtEp32_2Ps512),
+        "vcvtps2dq512" => u(Vec512, CvtPs2Ep32_512),
+        "vcvttps2dq512" => u(Vec512, CvttPs2Ep32_512),
+        "vcvtdq2pd512" => u(Vec512, CvtEp32_2Pd512),
+        "vcvtpd2dq512" => u(Vec256, CvtPd2Ep32_512),
+        "vcvttpd2dq512" => u(Vec256, CvttPd2Ep32_512),
+        "vfmadd132ps512" => m3(Vec512, FmaPs132v512),
+        "vfmadd213ps512" => m3(Vec512, FmaPs213v512),
+        "vfmadd231ps512" => m3(Vec512, FmaPs231v512),
+        "vfmadd132pd512" => m3(Vec512, FmaPd132v512),
+        "vfmadd213pd512" => m3(Vec512, FmaPd213v512),
+        "vfmadd231pd512" => m3(Vec512, FmaPd231v512),
+        // ---- 128-bit FP (SSE) ----
+        "divps128" => b(Vec128, DivPs128),
+        "minps128" => b(Vec128, MinPs128),
+        "maxps128" => b(Vec128, MaxPs128),
+        "sqrtps128" => u(Vec128, SqrtPs128),
+        "rcpps128" => u(Vec128, RcpPs128),
+        "rsqrtps128" => u(Vec128, RsqrtPs128),
+        "andps128" => b(Vec128, AndPs128),
+        "andnps128" => b(Vec128, AndnPs128),
+        "orps128" => b(Vec128, OrPs128),
+        "xorps128" => b(Vec128, XorPs128),
+        "addss128" => b(Vec128, AddSs128),
+        "subss128" => b(Vec128, SubSs128),
+        "mulss128" => b(Vec128, MulSs128),
+        "divss128" => b(Vec128, DivSs128),
+        "minss128" => b(Vec128, MinSs128),
+        "maxss128" => b(Vec128, MaxSs128),
+        "sqrtss128" => u(Vec128, SqrtSs128),
+        "rcpss128" => u(Vec128, RcpSs128),
+        "rsqrtss128" => u(Vec128, RsqrtSs128),
+        "cmpps128" => s2(Vec128, CmpPs128),
+        "shufps128" => s2(Vec128, ShufPs128),
+        "unpcklps128" => b(Vec128, UnpcklPs128),
+        "unpckhps128" => b(Vec128, UnpckhPs128),
+        "movmskps128" => s1(Scalar, MovemaskPs128),
+        "cvtps2dq128" => u(Vec128, CvtPs2Ep32_128),
+        "cvtdq2ps128" => u(Vec128, CvtEp32ToPs128),
+        "cvttps2dq128" => u(Vec128, CvttPs2Ep32_128),
+        "cvtps2pd128" => u(Vec128, CvtPs2Pd128),
+        "cvtpd2ps128" => u(Vec128, CvtPd2Ps128),
+        "divpd128" => b(Vec128, DivPd128),
+        "minpd128" => b(Vec128, MinPd128),
+        "maxpd128" => b(Vec128, MaxPd128),
+        "sqrtpd128" => u(Vec128, SqrtPd128),
+        "andpd128" => b(Vec128, AndPd128),
+        "andnpd128" => b(Vec128, AndnPd128),
+        "orpd128" => b(Vec128, OrPd128),
+        "xorpd128" => b(Vec128, XorPd128),
+        "addsd128" => b(Vec128, AddSd128),
+        "subsd128" => b(Vec128, SubSd128),
+        "mulsd128" => b(Vec128, MulSd128),
+        "divsd128" => b(Vec128, DivSd128),
+        "minsd128" => b(Vec128, MinSd128),
+        "maxsd128" => b(Vec128, MaxSd128),
+        "sqrtsd128" => b(Vec128, SqrtSd128),
+        "cmppd128" => s2(Vec128, CmpPd128),
+        "shufpd128" => s2(Vec128, ShufPd128),
+        "unpcklpd128" => b(Vec128, UnpcklPd128),
+        "unpckhpd128" => b(Vec128, UnpckhPd128),
+        "movmskpd128" => s1(Scalar, MovemaskPd128),
+        "cvtpd2dq128" => u(Vec128, CvtPd2Ep32_128),
+        "cvtdq2pd128" => u(Vec128, CvtEp32ToPd128),
+        "cvttpd2dq128" => u(Vec128, CvttPd2Ep32_128),
+        "movss128" => b(Vec128, Movss128),
+        "movsd128" => b(Vec128, Movsd128),
+        "cvtsi2ss128" => b(Vec128, CvtSi2Ss128),
+        "cvtsi2sd128" => b(Vec128, CvtSi2Sd128),
+        "cvtsi2ss64_128" => b(Vec128, CvtSi2Ss64_128),
+        "cvtsi2sd64_128" => b(Vec128, CvtSi2Sd64_128),
+        "cvtss2si128" => s1(Scalar, CvtSs2Si128),
+        "cvtsd2si128" => s1(Scalar, CvtSd2Si128),
+        "cvttss2si128" => s1(Scalar, CvttSs2Si128),
+        "cvttsd2si128" => s1(Scalar, CvttSd2Si128),
+        "cvtss2sd128" => b(Vec128, CvtSs2Sd128),
+        "cvtsd2ss128" => b(Vec128, CvtSd2Ss128),
+        "haddps128" => b(Vec128, HaddPs128),
+        "hsubps128" => b(Vec128, HsubPs128),
+        "addsubps128" => b(Vec128, AddsubPs128),
+        "haddpd128" => b(Vec128, HaddPd128),
+        "hsubpd128" => b(Vec128, HsubPd128),
+        "addsubpd128" => b(Vec128, AddsubPd128),
+        "movddup128" => u(Vec128, Movddup128),
+        "movsldup128" => u(Vec128, Movsldup128),
+        "movshdup128" => u(Vec128, Movshdup128),
+        "roundps128" => ui(Vec128, RoundPs128),
+        "roundpd128" => ui(Vec128, RoundPd128),
+        "blendps128" => s2(Vec128, BlendPs128),
+        "blendpd128" => s2(Vec128, BlendPd128),
+        "blendvps128" => m3(Vec128, BlendvPs128),
+        "blendvpd128" => m3(Vec128, BlendvPd128),
+        "dpps128" => s2(Vec128, DpPs128),
+        "dppd128" => s2(Vec128, DpPd128),
+        "insertps128" => s2(Vec128, InsertPs128),
+        "extractps128" => s1i(Scalar, ExtractPs128),
+        "vpermilps128" => ui(Vec128, VpermilPs128),
+        "fmadd132ps128" => m3(Vec128, FmaPs132),
+        "fmadd213ps128" => m3(Vec128, FmaPs213),
+        "fmadd231ps128" => m3(Vec128, FmaPs231),
+        "fmadd132pd128" => m3(Vec128, FmaPd132),
+        "fmadd213pd128" => m3(Vec128, FmaPd213),
+        "fmadd231pd128" => m3(Vec128, FmaPd231),
+        // ---- 256-bit FP (AVX) ----
+        "vdivps256" => b(Vec256, DivPs256),
+        "vminps256" => b(Vec256, MinPs256),
+        "vmaxps256" => b(Vec256, MaxPs256),
+        "vsqrtps256" => u(Vec256, SqrtPs256),
+        "vcmpps256" => s2(Vec256, CmpPs256),
+        "vshufps256" => s2(Vec256, ShufPs256),
+        "vunpcklps256" => b(Vec256, UnpcklPs256),
+        "vunpckhps256" => b(Vec256, UnpckhPs256),
+        "vmovmskps256" => s1(Scalar, MovemaskPs256),
+        "vcvtps2dq256" => u(Vec256, CvtPs2Ep32_256),
+        "vcvtdq2ps256" => u(Vec256, CvtEp32ToPs256),
+        "vcvttps2dq256" => u(Vec256, CvttPs2Ep32_256),
+        "vcvtps2pd256" => u(Vec256, CvtPs2Pd256),
+        "vcvtpd2ps256" => u(Vec128, CvtPd2Ps256),
+        "vdivpd256" => b(Vec256, DivPd256),
+        "vminpd256" => b(Vec256, MinPd256),
+        "vmaxpd256" => b(Vec256, MaxPd256),
+        "vsqrtpd256" => u(Vec256, SqrtPd256),
+        "vcmppd256" => s2(Vec256, CmpPd256),
+        "vshufpd256" => s2(Vec256, ShufPd256),
+        "vunpcklpd256" => b(Vec256, UnpcklPd256),
+        "vunpckhpd256" => b(Vec256, UnpckhPd256),
+        "vmovmskpd256" => s1(Scalar, MovemaskPd256),
+        "vcvtpd2dq256" => u(Vec128, CvtPd2Ep32_256),
+        "vcvtdq2pd256" => u(Vec256, CvtEp32ToPd256),
+        "vcvttpd2dq256" => u(Vec128, CvttPd2Ep32_256),
+        "vpermilpd256" => ui(Vec256, VpermilPd256),
+        "vpermilps256" => ui(Vec256, VpermilPs256),
+        "vpermilvarps256" => b(Vec256, VpermilvarPs256),
+        "vpermilvarpd256" => b(Vec256, VpermilvarPd256),
+        "vperm2f128" | "vperm2f128ps" | "vperm2f128pd" => s2(Vec256, Vperm2f128),
+        "vinsertf128" | "vinsertf128ps" | "vinsertf128pd" => s2(Vec256, Vinsertf128),
+        "vextractf128" | "vextractf128ps" | "vextractf128pd" => ui(Vec128, Vextractf128),
+        "vbroadcastss" => u(Vec256, Vbroadcastss),
+        "vbroadcastsd" => u(Vec256, Vbroadcastsd),
+        "vtestps256" => b(Scalar, TestzPs256),
+        "vroundps256" => ui(Vec256, RoundPs256),
+        "vroundpd256" => ui(Vec256, RoundPd256),
+        "vblendps256" => s2(Vec256, BlendPs256),
+        "vblendpd256" => s2(Vec256, BlendPd256),
+        "vblendvps256" => m3(Vec256, BlendvPs256),
+        "vblendvpd256" => m3(Vec256, BlendvPd256),
+        "vhaddps256" => b(Vec256, HaddPs256),
+        "vhsubps256" => b(Vec256, HsubPs256),
+        "vaddsubps256" => b(Vec256, AddsubPs256),
+        "vfmadd132ps256" => m3(Vec256, FmaPs132v256),
+        "vfmadd213ps256" => m3(Vec256, FmaPs213v256),
+        "vfmadd231ps256" => m3(Vec256, FmaPs231v256),
+        "vfmadd132pd256" => m3(Vec256, FmaPd132v256),
+        "vfmadd213pd256" => m3(Vec256, FmaPd213v256),
+        "vfmadd231pd256" => m3(Vec256, FmaPd231v256),
+        _ => None,
+    }
+}
+
+/// Legacy native helper permissions follow the encoded instruction, not the
+/// result carrier: AVX conversions can return 128 bits, and 128-bit VPERMIL
+/// is still AVX. EVEX helpers use per-instruction subset requirements; a
+/// ZMM-width result is not itself evidence that AVX-512F is the only feature.
+type SimdFeatureRequirement = (crate::common::x86_features::X86Feature, &'static str);
+
+fn legacy_simd_feature(mnemonic: &str) -> Option<SimdFeatureRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    if mnemonic.ends_with("512") {
+        return None;
+    }
+    let fma_stem = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+    let is_fma3 = ["fmadd", "fmsub", "fnmadd", "fnmsub", "fmaddsub", "fmsubadd"]
+        .iter()
+        .any(|stem| fma_stem.starts_with(stem));
+    Some(if is_fma3 {
+        (F::Fma, "-mfma")
+    } else if mnemonic.starts_with('v') {
+        (F::Avx, "-mavx")
+    } else {
+        match mnemonic {
+            "divps128" | "minps128" | "maxps128" | "sqrtps128" | "rcpps128" | "rsqrtps128"
+            | "andps128" | "andnps128" | "orps128" | "xorps128" | "addss128" | "subss128"
+            | "mulss128" | "divss128" | "minss128" | "maxss128" | "sqrtss128" | "rcpss128"
+            | "rsqrtss128" | "cmpps128" | "shufps128" | "unpcklps128" | "unpckhps128"
+            | "movmskps128" | "movss128" | "cvtsi2ss128" | "cvtsi2ss64_128" | "cvtss2si128"
+            | "cvttss2si128" => (F::Sse, "-msse"),
+            "haddps128" | "hsubps128" | "addsubps128" | "haddpd128" | "hsubpd128"
+            | "addsubpd128" | "movddup128" | "movsldup128" | "movshdup128" => (F::Sse3, "-msse3"),
+            "roundps128" | "roundpd128" | "blendps128" | "blendpd128" | "blendvps128"
+            | "blendvpd128" | "dpps128" | "dppd128" | "insertps128" | "extractps128" => {
+                (F::Sse41, "-msse4.1")
+            }
+            _ => (F::Sse2, "-msse2"),
+        }
+    })
+}
+
+/// Required subsets for the EVEX instructions actually exposed by this
+/// builtin family. Keep this list instruction-based: AVX-512F does not imply
+/// BW/DQ, and the 128/256-bit EVEX forms additionally require AVX512VL.
+fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    let is_512 = mnemonic.ends_with("512") || mnemonic.ends_with("_512");
+    let mut req = Vec::new();
+
+    let evex = is_512
+        || mnemonic.starts_with("vpternlog")
+        || mnemonic.starts_with("vpcmpb")
+        || mnemonic.starts_with("vpcmpub")
+        || mnemonic.starts_with("vmovdqu8_mask")
+        || matches!(
+            mnemonic,
+            "vpshufb_maskz128" | "vpshufb_mask128" | "vcastsi512_256"
+        );
+    if evex {
+        push_feature(&mut req, F::Avx512F, "-mavx512f");
+    }
+
+    // Byte/word integer operations are AVX512BW, including the explicit
+    // low-width EVEX forms. The list follows the helper's encoded mnemonic,
+    // not its C carrier or signedness suffix.
+    let bw = [
+        "vpaddb",
+        "vpaddw",
+        "vpsubb",
+        "vpsubw",
+        "vpaddsb",
+        "vpaddsw",
+        "vpaddusb",
+        "vpaddusw",
+        "vpsubsb",
+        "vpsubsw",
+        "vpsubusb",
+        "vpsubusw",
+        "vpavgb",
+        "vpavgw",
+        "vpmaxub",
+        "vpminub",
+        "vpmaxuw",
+        "vpminuw",
+        "vpmaxsb",
+        "vpminsb",
+        "vpmaxsw",
+        "vpminsw",
+        "vpsadbw",
+        "vpmaddubsw",
+        "vpmaddwd",
+        "vpmullw",
+        "vpmulhw",
+        "vpmulhuw",
+        "vpshufb",
+        "vpabsb",
+        "vpabsw",
+        "vpunpcklbw",
+        "vpunpcklwd",
+        "vpunpckhbw",
+        "vpunpckhwd",
+        "vpacksswb",
+        "vpackuswb",
+        "vpackssdw",
+        "vpackusdw",
+        "vpsllw",
+        "vpsrlw",
+        "vpsraw",
+        "vpalignr",
+        "vpmovzxbw",
+        "vpmovzxbd",
+        "vpmovzxbq",
+        "vpmovzxwd",
+        "vpmovzxwq",
+        "vpmovsxbw",
+        "vpmovsxbd",
+        "vpmovsxbq",
+        "vpmovsxwd",
+        "vpmovsxwq",
+        "vpbroadcastb",
+        "vpbroadcastw",
+        "vpcmpb",
+        "vpcmpub",
+        "vpcmpw",
+        "vpcmpuw",
+        "vpcmpeqb",
+        "vpcmpeqw",
+        "vpcmpgtb",
+        "vpcmpgtw",
+        "vmovdqu8_mask",
+        "vpshufb_mask",
+    ];
+    if bw.iter().any(|stem| mnemonic.starts_with(stem)) {
+        push_feature(&mut req, F::Avx512Bw, "-mavx512bw");
+    }
+
+    // The qword absolute/min/max operations exposed here are AVX512F (the
+    // `q` describes lane width, not the AVX512DQ subset). Keep DQ distinct
+    // for future helpers whose instruction pages actually require that bit.
+
+    if mnemonic.starts_with("vpopcntb") || mnemonic.starts_with("vpopcntw") {
+        push_feature(&mut req, F::Avx512BitAlg, "-mavx512bitalg");
+    }
+    if mnemonic.starts_with("vpopcntd") || mnemonic.starts_with("vpopcntq") {
+        push_feature(&mut req, F::Avx512Vpopcntdq, "-mavx512vpopcntdq");
+    }
+    if mnemonic.starts_with("vpdpbusd") {
+        push_feature(&mut req, F::Avx512Vnni, "-mavx512vnni");
+    }
+    if mnemonic.starts_with("vpternlog")
+        || mnemonic.starts_with("vpcmpb")
+        || mnemonic.starts_with("vpcmpub")
+        || mnemonic.starts_with("vpcmpw")
+        || mnemonic.starts_with("vpcmpuw")
+        || mnemonic.starts_with("vmovdqu8_mask")
+        || matches!(mnemonic, "vpshufb_maskz128" | "vpshufb_mask128")
+    {
+        if !is_512 {
+            push_feature(&mut req, F::Avx512Vl, "-mavx512vl");
+        }
+    }
+
+    // These EVEX encodings use the VPCLMULQDQ extension in addition to F.
+    if mnemonic == "vpclmulqdq512" {
+        push_feature(&mut req, F::Vpclmulqdq, "-mvpclmulqdq");
+    }
+
+    if evex {
+        req
+    } else {
+        legacy_simd_feature(mnemonic).into_iter().collect()
+    }
+}
+
+fn push_feature(
+    req: &mut Vec<SimdFeatureRequirement>,
+    feature: crate::common::x86_features::X86Feature,
+    flag: &'static str,
+) {
+    if !req.iter().any(|(seen, _)| *seen == feature) {
+        req.push((feature, flag));
+    }
+}
+
+impl Lowerer {
+    /// Keep packed FP helpers in the same register-valued IR as native vector
+    /// arithmetic. The legacy address result remains an addressable object;
+    /// whole-vector stores/loads let vec_ssa eliminate it instead of hiding
+    /// the producer behind the pointer-result instruction family.
+    fn try_native_packed_fp_helper(&mut self, op: IntrinsicOp, args: &[Expr]) -> Option<Operand> {
+        use IntrinsicOp::*;
+        let (native, element, bytes) = match op {
+            DivPs128 => (VecDivF32x4, IrType::F32, 16),
+            MinPs128 => (VecMinF32x4, IrType::F32, 16),
+            MaxPs128 => (VecMaxF32x4, IrType::F32, 16),
+            SqrtPs128 => (VecSqrtF32x4, IrType::F32, 16),
+            DivPd128 => (VecDivF64x2, IrType::F64, 16),
+            MinPd128 => (VecMinF64x2, IrType::F64, 16),
+            MaxPd128 => (VecMaxF64x2, IrType::F64, 16),
+            SqrtPd128 => (VecSqrtF64x2, IrType::F64, 16),
+            DivPs256 => (VecDivF32x8, IrType::F32, 32),
+            MinPs256 => (VecMinF32x8, IrType::F32, 32),
+            MaxPs256 => (VecMaxF32x8, IrType::F32, 32),
+            SqrtPs256 => (VecSqrtF32x8, IrType::F32, 32),
+            DivPd256 => (VecDivF64x4, IrType::F64, 32),
+            MinPd256 => (VecMinF64x4, IrType::F64, 32),
+            MaxPd256 => (VecMaxF64x4, IrType::F64, 32),
+            SqrtPd256 => (VecSqrtF64x4, IrType::F64, 32),
+            _ => return None,
+        };
+        if self.target != crate::backend::Target::X86_64 {
+            return None;
+        }
+        // The 128-bit double wrapper still crosses an I128 carrier at inline
+        // returns. Until that bridge is native, this route adds spills (the
+        // ordered FP fixture measures 74 -> 89 provider instructions). Keep
+        // its established pointer emitter; wide doubles have no I128 bridge.
+        if bytes == 16 && element == IrType::F64 {
+            return None;
+        }
+        // Resolve the complete plan before evaluating any operand. Volatile,
+        // foreign address spaces and mismatched types retain the legacy path.
+        let types: Vec<_> = args.iter().map(|arg| self.expr_ctype(arg)).collect();
+        let shape = super::vector_simd::simd_shape(types.first()?)?;
+        if shape.bytes != bytes || shape.elem_ir != element {
+            return None;
+        }
+        for (arg, ty) in args.iter().zip(&types) {
+            let other = super::vector_simd::simd_shape(ty)?;
+            if other.bytes != bytes
+                || other.elem_ir != element
+                || self.expr_access_is_volatile(arg)
+                || self.aggregate_lvalue_space(arg) != crate::common::types::AddressSpace::Default
+            {
+                return None;
+            }
+        }
+        let mut operands = Vec::with_capacity(args.len());
+        for (arg, ty) in args.iter().zip(&types) {
+            let ptr = self.vector_operand_ptr(arg, ty);
+            operands.push(Operand::Value(self.emit_vec_load(&shape, ptr)));
+        }
+        let value = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(value),
+            op: native,
+            dest_ptr: None,
+            args: operands,
+        });
+        let result = self.emit_entry_alloca(IrType::Ptr, bytes, bytes, false);
+        self.emit_vec_store(&shape, value, result);
+        Some(Operand::Value(result))
+    }
+
+    /// Lower a call to the generic SIMD family.
+    /// Name format: `__lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}`.
+    pub(super) fn lower_lccc_simd(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        let rest = name.strip_prefix("__lccc_simd")?;
+        let (width_s, rest) = rest.split_once('_')?;
+        let (_class_s, mnemonic) = rest.split_once('_')?;
+        // Table keys are "<insn><width>" (e.g. vpaddd512); some special forms
+        // carry their own suffix (e.g. vinserti32x4_512). Try both.
+        let suffixed;
+        let (canonical, (class, op, has_imm, nargs)) =
+            if let Some(spec) = lccc_simd_lookup(mnemonic) {
+                (mnemonic, spec)
+            } else {
+                suffixed = format!("{}{}", mnemonic, width_s);
+                let Some(spec) = lccc_simd_lookup(&suffixed) else {
+                    return self.reject_builtin_call(
+                        format!("unknown SIMD helper instruction '{mnemonic}' in '{name}'"),
+                        args,
+                        64,
+                    );
+                };
+                (suffixed.as_str(), spec)
+            };
+        // The table, not a caller-supplied prototype, owns this contract.
+        // Never silently truncate extra operands or hand too few to codegen.
+        if args.len() != nargs + 1 {
+            return self.reject_builtin_call(
+                format!(
+                    "'{name}' requires {} arguments including the leading control argument, but {} were provided",
+                    nargs + 1,
+                    args.len()
+                ),
+                args,
+                64,
+            );
+        }
+        let width = match class {
+            LcccSimdClass::Vec128 => 16usize,
+            LcccSimdClass::Vec256 => 32,
+            LcccSimdClass::Vec512 => 64,
+            _ => 0,
+        };
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.reject_builtin_call(
+                format!("'{name}' is not available on {}", self.target.triple()),
+                args,
+                width.max(16),
+            );
+        }
+        let feature_requirements = simd_feature_requirements(canonical);
+        let uses_avx512 = feature_requirements.iter().any(|(feature, _)| {
+            matches!(
+                feature,
+                crate::common::x86_features::X86Feature::Avx512F
+                    | crate::common::x86_features::X86Feature::Avx512Bw
+                    | crate::common::x86_features::X86Feature::Avx512Dq
+                    | crate::common::x86_features::X86Feature::Avx512Vl
+                    | crate::common::x86_features::X86Feature::Avx512Vnni
+                    | crate::common::x86_features::X86Feature::Avx512BitAlg
+                    | crate::common::x86_features::X86Feature::Avx512Vpopcntdq
+                    | crate::common::x86_features::X86Feature::Avx512Cd
+                    | crate::common::x86_features::X86Feature::Avx512Ifma
+                    | crate::common::x86_features::X86Feature::Avx512Vbmi
+                    | crate::common::x86_features::X86Feature::Avx512Vbmi2
+                    | crate::common::x86_features::X86Feature::Avx512Bf16
+                    | crate::common::x86_features::X86Feature::Avx512Fp16
+                    | crate::common::x86_features::X86Feature::Avx512Bmm
+                    | crate::common::x86_features::X86Feature::Avx512Vp2intersect
+                    | crate::common::x86_features::X86Feature::Avx512Er
+                    | crate::common::x86_features::X86Feature::Avx512Pf
+            )
+        });
+        if self.target == crate::backend::Target::I686 && uses_avx512 {
+            return self.reject_builtin_call(
+                format!("'{name}' uses an AVX-512 encoding not implemented for i686"),
+                args,
+                width.max(16),
+            );
+        }
+        for (feature, flag) in feature_requirements {
+            self.check_x86_simd_feature(feature, flag, name, args);
+        }
+        if let Some(result) = self.try_native_packed_fp_helper(op, &args[1..]) {
+            return Some(result);
+        }
+        // Drop the leading dummy/imm argument; keep exactly nargs real
+        // operands; re-append the immediate (if any) as the LAST operand.
+        let mut arg_ops: Vec<Operand> = args
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(nargs)
+            .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+            .collect();
+        if has_imm {
+            if let Some(imm_expr) = args.first() {
+                arg_ops.push(self.lower_expr(imm_expr));
+            }
+        }
+        match class {
+            LcccSimdClass::Vec128 | LcccSimdClass::Vec256 | LcccSimdClass::Vec512 => {
+                let result_alloca = self.fresh_value();
+                // Natural alignment for the vector width (Raptor Lake prefers
+                // aligned vmovdqa / store-forwarding on 16/32-byte slots).
+                let align = match width {
+                    64 => 64usize,
+                    32 => 32usize,
+                    _ => 16usize,
+                };
+                self.emit(Instruction::Alloca {
+                    dest: result_alloca,
+                    ty: IrType::Ptr,
+                    size: width,
+                    align,
+                    volatile: false,
+                    semantic_volatile: false,
+                });
+                let dest_val = self.fresh_value();
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(dest_val),
+                    op,
+                    dest_ptr: Some(result_alloca),
+                    args: arg_ops,
+                });
+                Some(Operand::Value(result_alloca))
+            }
+            LcccSimdClass::Scalar => {
+                let dest_val = self.fresh_value();
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(dest_val),
+                    op,
+                    dest_ptr: None,
+                    args: arg_ops,
+                });
+                Some(Operand::Value(dest_val))
+            }
+            LcccSimdClass::PtrStore => {
+                if arg_ops.is_empty() {
+                    return Some(Operand::Const(IrConst::I64(0)));
+                }
+                let ptr_val = self.operand_to_value(arg_ops[0].clone());
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op,
+                    dest_ptr: Some(ptr_val),
+                    args: arg_ops[1..].to_vec(),
+                });
+                Some(Operand::Const(IrConst::I64(0)))
+            }
+        }
+    }
+}
+
+// Keep the enum import used (documentation of classes).
+#[allow(dead_code)]
+fn _class_doc(c: LcccSimdClass) -> &'static str {
+    match c {
+        LcccSimdClass::Vec128 => "16-byte vector result",
+        LcccSimdClass::Vec256 => "32-byte vector result",
+        LcccSimdClass::Vec512 => "64-byte vector result",
+        LcccSimdClass::Scalar => "scalar GPR result",
+        LcccSimdClass::PtrStore => "store through dest pointer",
+    }
+}
+
+#[cfg(test)]
+mod legacy_permission_tests {
+    use super::legacy_simd_feature;
+    use crate::common::x86_features::X86Feature as F;
+
+    #[test]
+    fn every_generated_helper_prototype_agrees_with_operand_metadata() {
+        let mut checked = 0;
+        let mut unmapped = std::collections::BTreeSet::new();
+        for line in include_str!("../../../include/lcccsimd.h").lines() {
+            let line = line.trim();
+            if !line.ends_with(");") || line.contains('{') {
+                continue;
+            }
+            let Some((_, rest)) = line.split_once("__lccc_simd") else {
+                continue;
+            };
+            let (name, parameters) = rest.split_once('(').expect("helper prototype");
+            let mut fields = name.splitn(3, '_');
+            let width = fields.next().expect("width");
+            let _kind = fields.next().expect("kind");
+            let mnemonic = fields.next().expect("mnemonic");
+            let suffixed = format!("{mnemonic}{width}");
+            let canonical = if super::lccc_simd_lookup(mnemonic).is_some() {
+                mnemonic
+            } else {
+                suffixed.as_str()
+            };
+            let Some((_, _, _, operands)) = super::lccc_simd_lookup(canonical) else {
+                unmapped.insert(name);
+                continue;
+            };
+            let features = super::simd_feature_requirements(canonical);
+            assert!(
+                !features.is_empty(),
+                "{name} has no ISA permission metadata"
+            );
+            assert_eq!(parameters.split(',').count(), operands + 1, "{name}");
+            checked += 1;
+        }
+        assert!(checked > 250, "vacuous helper audit: {checked}");
+        // Explicit ratchet, not a blanket skip: these historical vector-result
+        // AVX512 declarations have no lowering. Valid calls now diagnose;
+        // SIMD-TYPE-1 records their removal or supported-contract replacement.
+        assert_eq!(
+            unmapped,
+            std::collections::BTreeSet::from(["512_i_vpcmpeqb512", "512_i_vpcmpeqw512",])
+        );
+    }
+
+    #[test]
+    fn avx512_permissions_are_subset_and_encoding_specific() {
+        use crate::common::x86_features::X86Feature as F;
+        let cases: &[(&str, &[F])] = &[
+            ("vpcmpub128", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            ("vpternlogq256", &[F::Avx512F, F::Avx512Vl]),
+            ("vpternlogd512", &[F::Avx512F]),
+            (
+                "vmovdqu8_maskz_load256",
+                &[F::Avx512F, F::Avx512Bw, F::Avx512Vl],
+            ),
+            ("vmovdqu8_mask_store512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpmaxsq512", &[F::Avx512F]),
+            ("vpabsq512", &[F::Avx512F]),
+            ("vpcmpeqb512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpcmpeqw512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpcmpgtb512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpcmpgtw512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpopcntw512", &[F::Avx512F, F::Avx512BitAlg]),
+            ("vpopcntq512", &[F::Avx512F, F::Avx512Vpopcntdq]),
+            ("vpdpbusd512", &[F::Avx512F, F::Avx512Vnni]),
+            ("vfmadd231ps512", &[F::Avx512F]),
+            ("vcastsi512_256", &[F::Avx512F]),
+            ("vfmadd231ps256", &[F::Fma]),
+            ("vfmsub231ps256", &[F::Fma]),
+            ("vfnmadd231pd256", &[F::Fma]),
+            ("vfnmsub231pd256", &[F::Fma]),
+            ("vfmaddsub231ps256", &[F::Fma]),
+            ("vfmsubadd231ps256", &[F::Fma]),
+            ("vcvtpd2ps256", &[F::Avx]),
+        ];
+        for (mnemonic, want) in cases {
+            let got: Vec<_> = super::simd_feature_requirements(mnemonic)
+                .into_iter()
+                .map(|(feature, _)| feature)
+                .collect();
+            assert_eq!(got.as_slice(), *want, "{mnemonic}");
+        }
+    }
+
+    #[test]
+    fn source_instruction_not_result_width_owns_permission() {
+        for (mnemonic, feature) in [
+            ("minps128", F::Sse),
+            ("cvtpd2ps128", F::Sse2),
+            ("haddps128", F::Sse3),
+            ("roundps128", F::Sse41),
+            ("vcvtpd2ps256", F::Avx),
+            ("vextractf128", F::Avx),
+            ("vpermilps128", F::Avx),
+            ("fmadd132ps128", F::Fma),
+        ] {
+            assert_eq!(legacy_simd_feature(mnemonic).unwrap().0, feature);
+        }
+        assert!(legacy_simd_feature("vcvtpd2ps512").is_none());
+    }
+}

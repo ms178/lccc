@@ -1,0 +1,6396 @@
+//! x86-64 peephole optimizer: pass orchestration.
+//!
+//! This module is the entry point (`peephole_optimize`) that runs all optimization
+//! passes in the correct order. The actual pass implementations live in submodules:
+//!
+//! - [`local_patterns`]: combined local pattern matching (self-move, reverse-move,
+//!   redundant jump, branch inversion, store/load, extensions) + movq/ext fusion
+//! - [`push_pop`]: push/pop pair and push/binop/pop elimination
+//! - [`relay_and_lea`]: register move-relay elimination, windowed lea folding
+//! - [`compare_branch`]: compare-and-branch fusion (cmp+setCC+test+jCC -> jCC)
+//! - [`copy_propagation`]: register copy propagation across basic blocks
+//! - [`dead_code`]: dead register moves, dead stores, never-read store elimination
+//! - [`store_forwarding`]: global store forwarding across fallthrough labels
+//! - [`loop_trampoline`]: SSA loop backedge trampoline block coalescing
+//! - [`callee_saves`]: unused callee-saved register save/restore elimination
+//! - [`memory_fold`]: fold stack loads into ALU instructions as memory operands
+//! - [`tail_call`]: convert `call; epilogue; ret` to `epilogue; jmp` for tail calls
+//! - [`frame_compact`]: stack frame compaction after dead store/callee-save elimination
+//! - [`helpers`]: shared utilities (register rewriting, label parsing, etc.)
+
+use super::types::*;
+use crate::backend::regalloc::RaConfig;
+
+// Submodule pass implementations
+mod bmi2_mask;
+mod callee_saves;
+mod compare_branch;
+mod copy_coalesce;
+mod copy_propagation;
+mod dead_code;
+mod dead_writes;
+mod ebb_reuse;
+mod epilogue_merge;
+mod flag_peepholes;
+mod fma_forms;
+mod fp_liveness;
+mod frame_compact;
+mod helpers;
+mod identical_blocks;
+mod jump_thread;
+mod lea_add_fuse;
+mod lea_narrow;
+mod liveness;
+mod load_bswap_movbe;
+mod load_mask_test;
+mod load_op_fuse;
+mod local_patterns;
+mod loop_trampoline;
+mod memory_fold;
+mod narrow_copy_fold;
+mod pow2_cmov;
+mod push_pop;
+mod pushf_elim;
+mod redundant_ext;
+mod relay_and_lea;
+mod return_bool;
+mod return_home;
+mod self_zext;
+mod sign_test;
+mod spill_deref;
+mod store_forwarding;
+mod tail_call;
+mod vector_broadcast;
+mod vector_copy;
+mod vex_promote;
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Maximum iterations for Phase 1 (local peephole passes).
+/// Local patterns rarely chain deeper than 3-4 levels, so 8 provides ample headroom.
+const MAX_LOCAL_PASS_ITERATIONS: usize = 8;
+
+/// Maximum iterations for Phase 3 (local cleanup after global passes).
+/// Post-global cleanup is shallow (mostly dead store + adjacent pairs), so 4 suffices.
+const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
+
+/// True when an assembly line, after any textual instruction prefixes, is a
+/// control transfer or trap that makes a linear peephole scan unsafe.
+///
+/// `classify_line` recognizes the unprefixed branch spellings and classifies
+/// a prefixed one (`notrack jmp *%rax`, `bnd call foo`) as opaque inline asm;
+/// this also catches the transfers and traps it leaves as `Other` (`ud2`,
+/// `syscall`, `loop`, `xbegin`, ...) and a dangling prefix.
+fn is_opaque_control_transfer(text: &str) -> bool {
+    let end = crate::backend::peephole_common::line_len_without_trailing_comment(text.as_bytes());
+    match mnemonic_after_prefixes(&text[..end]) {
+        (true, None) => true, // a dangling prefix is opaque too
+        (_, Some(mnemonic)) => is_control_transfer_mnemonic(mnemonic),
+        (false, None) => false,
+    }
+}
+
+// ── Stack-address escape pinning ─────────────────────────────────────────────
+
+/// Parse a direct `OFFSET(%rsp)`/`OFFSET(%rbp)` operand.  Indexed addresses are
+/// intentionally not guessed: a failure only forgoes a pin, while a pin is
+/// always conservative.
+fn direct_stack_slot(operand: &str) -> Option<(u8, i32)> {
+    let operand = operand.trim();
+    for (base, id) in [("(%rsp)", 4u8), ("(%rbp)", 5u8)] {
+        if let Some(pos) = operand.find(base) {
+            if pos + base.len() != operand.len() {
+                continue;
+            }
+            let offset = if pos == 0 {
+                0
+            } else {
+                operand[..pos].trim().parse::<i32>().ok()?
+            };
+            return Some((id, offset));
+        }
+    }
+    None
+}
+
+/// Mark stores to stack slots whose address is materialized with `lea` as
+/// pinned.  A later call may read or write through that pointer; text peepholes
+/// do not have escape analysis and therefore must never prove such a store dead.
+/// Parse a direct stack-slot reference embedded in a complete assembly line.
+/// Indexed operands are intentionally excluded; absence of a marker only loses
+/// an optimization opportunity, while a false marker would be unsound.
+fn direct_stack_slot_in_line(line: &str) -> Option<(u8, i32)> {
+    for base in ["(%rsp)", "(%rbp)"] {
+        if let Some(pos) = line.find(base) {
+            let end = pos + base.len();
+            let prefix = &line[..end];
+            let start = prefix
+                .rfind(|c: char| c == ' ' || c == '\t' || c == ',')
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+            if let Some(slot) = direct_stack_slot(&prefix[start..]) {
+                return Some(slot);
+            }
+        }
+    }
+    None
+}
+
+/// Mark every direct memory access to a codegen-identified volatile alloca as
+/// opaque.  Volatile access is observable even when an ordinary dataflow pass
+/// believes the slot value is available in a register.
+///
+/// SOUNDNESS: the `# LCCC_VOLATILE_SLOT` markers describe THIS function's
+/// frame only, but stack offsets repeat across functions.  A file-wide slot set
+/// demoted unrelated accesses in other functions (e.g. a `movl 24(%rsp), %eax`
+/// load in sqlite3MultiValues matched the `24(%rsp)` marker emitted by
+/// kahanBabuskaNeumaierStep).  A demoted LOAD-into-%rax was classified as
+/// `Other { dest_reg: REG_NONE }`, which combined_local_pass's rax_is_zero
+/// tracking read as "rax not written" -> the following `xorl %eax, %eax`
+/// (call-argument setup) was deemed redundant and removed, pushing stale data
+/// as a stack argument.  Two-part fix:
+///   1. Scope the volatile set to the current function (bounded by
+///      .cfi_startproc / .cfi_endproc) so markers never leak across functions.
+///   2. Preserve the destination register when demoting: a volatile load still
+///      WRITES its destination, and rax_is_zero must observe that.  Only the
+///      stack-specialized classification (StoreRbp/LoadRbp) is removed, which
+///      is what blocks slot-based forwarding/folding passes.
+/// Reclassify every line between `#APP` and `#NO_APP` as `LineKind::InlineAsm`
+/// and pin it. Inline-asm text is user-authored and must reach the assembler
+/// byte-for-byte:
+///   * kernel ALTERNATIVE() templates use deliberate "redundant" instructions
+///     (`movq %rax, %rax`) purely as length placeholders — removing one made
+///     .altinstructions record orig_len=0 ("empty alternative entry", objtool);
+///   * jump-label/static_call sites are patched at RUNTIME at the recorded
+///     offset — any byte moved or removed corrupts the patch;
+///   * label arithmetic (742b-740b) inside .pushsection depends on exact
+///     instruction extents.
+/// Every conservative fallback treats InlineAsm as clobbering everything:
+/// reg_refs = all set, has_indirect_mem = true, pinned = true. The markers
+/// themselves are comments and pass through to the assembler harmlessly.
+fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
+    let mut in_asm = false;
+    for i in 0..store.len() {
+        let trimmed = infos[i].trimmed(store.get(i));
+        if trimmed == "#APP" {
+            in_asm = true;
+            continue;
+        }
+        if trimmed == "#NO_APP" {
+            in_asm = false;
+            continue;
+        }
+        if in_asm {
+            infos[i] = opaque_line_info(infos[i].trim_start);
+        }
+    }
+}
+
+/// Pin every instruction emitted for a C `volatile` load or store.
+///
+/// The codegen brackets the text of each volatile access with
+/// `# LCCC_VOLATILE_BEGIN` / `# LCCC_VOLATILE_END` (see `generate_instruction`).
+/// Text passes see only assembly, where a volatile load looks like any other
+/// load, so `reuse_redundant_loads` turned the second of two volatile reads of
+/// `*(volatile unsigned *)p` into a register copy, and one store of two
+/// consecutive volatile stores was folded away. Each line in the region is
+/// pinned (`pinned` + `volatile_access`), so no pass reorders, deletes,
+/// reuses or rewrites it. Two authorized exceptions preserve the access:
+/// `fold_memory_rmw` fuses a load/op/store into one memory RMW, and
+/// `fuse_load_into_alu` transfers an adjacent load to a direct ALU consumer.
+/// Both retain volatile protection on the surviving memory instruction.
+/// Comment markers are consumed here; they do not appear in final assembly.
+fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
+    // Regions may nest: descriptor lowering uses an inner region to protect
+    // its special-ABI call, and that sequence may itself implement a C
+    // volatile access. A boolean would let the inner END accidentally unpin
+    // the actual volatile memory operation.
+    let mut volatile_depth = 0usize;
+    for i in 0..store.len() {
+        let trimmed = infos[i].trimmed(store.get(i));
+        // The markers are consumed here, so they are deleted from the output:
+        // a marker-free `.s` is what every other lccc path produces. Deleting
+        // them does not weaken the region: its instructions retain their real
+        // classification but are pinned below, regardless of neighbours.
+        if trimmed == "# LCCC_VOLATILE_BEGIN" {
+            volatile_depth = volatile_depth.saturating_add(1);
+            mark_nop(&mut infos[i]);
+            continue;
+        }
+        if trimmed == "# LCCC_VOLATILE_END" {
+            volatile_depth = volatile_depth.saturating_sub(1);
+            mark_nop(&mut infos[i]);
+            continue;
+        }
+        if volatile_depth == 0
+            || trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('.')
+        {
+            continue;
+        }
+        // Keep the line's real classification and pin it in place. The
+        // earlier form reclassified the line as opaque inline asm
+        // (`reg_refs: u16::MAX`), which also blocked the one rewrite that
+        // PRESERVES the volatile contract: `fold_memory_rmw` fusing a
+        // volatile load/op/store into a single `add $imm, mem`, which is
+        // exactly one read and one write (and the form GCC emits). Every
+        // pass that deletes, reuses, reorders or rewrites a line checks
+        // `pinned`, so the access itself stays untouchable; the fold
+        // recognizes the sequence through `volatile_access`.
+        infos[i].pinned = true;
+        infos[i].has_indirect_mem = true;
+        infos[i].volatile_access = true;
+    }
+}
+
+/// Pin fallback parameter-ABI reads so no text pass rewrites their source.
+///
+/// `emit_param_ref_impl` falls back to reading a parameter from its incoming
+/// ABI register when the parameter has no register home and no alloca slot.
+/// The operand of that read is a *contract*: it must stay the ABI register
+/// even when a caller-saved pre-store of a different parameter copied another
+/// value into the same register name (`movq %rdi, %rsi` for param 0 while
+/// param 1 still arrives in `%sil`). Copy propagation had no way to tell the
+/// two apart and rewrote `movzbl %sil, %eax` into `movzbl %dil, %eax`,
+/// storing the wrong parameter (sqlite VDBE `addop` corruption).
+///
+/// The `# LCCC_PARAM_ABI_READ <reg>` marker is emitted immediately before
+/// the read; this pass pins that line (opaque to source rewriting, still
+/// classified by destination so register-taint tracking keeps working) and
+/// the marker itself stays a harmless comment for the assembler.
+fn pin_param_abi_reads(store: &LineStore, infos: &mut [LineInfo]) {
+    for i in 0..store.len() {
+        let trimmed = infos[i].trimmed(store.get(i));
+        if !trimmed.starts_with("# LCCC_PARAM_ABI_READ ") {
+            continue;
+        }
+        // Pin the next real instruction line (skip other comments/labels).
+        let mut j = i + 1;
+        while j < store.len() {
+            let next_trimmed = infos[j].trimmed(store.get(j));
+            if next_trimmed.is_empty()
+                || next_trimmed.starts_with('.')
+                || next_trimmed.starts_with('#')
+            {
+                j += 1;
+                continue;
+            }
+            let dest_reg = parse_dest_reg_fast(next_trimmed);
+            infos[j].pinned = true;
+            infos[j].has_indirect_mem = true;
+            infos[j].kind = LineKind::Other { dest_reg };
+            infos[j].rbp_offset = RBP_OFFSET_NONE;
+            break;
+        }
+    }
+}
+
+fn pin_volatile_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
+    let mut volatile_slots: Vec<(u8, i32)> = Vec::new();
+    for i in 0..store.len() {
+        let trimmed = infos[i].trimmed(store.get(i));
+        // Function boundary: volatile markers are function-local.
+        if trimmed.starts_with(".cfi_startproc") {
+            volatile_slots.clear();
+            continue;
+        }
+        if let Some(slot_text) = trimmed.strip_prefix("# LCCC_VOLATILE_SLOT ") {
+            if let Some(slot) = direct_stack_slot(slot_text) {
+                volatile_slots.push(slot);
+            }
+            continue;
+        }
+        if trimmed.starts_with(".cfi_endproc") {
+            volatile_slots.clear();
+            continue;
+        }
+        if volatile_slots.is_empty() {
+            continue;
+        }
+        if let Some(slot) = direct_stack_slot_in_line(trimmed) {
+            if volatile_slots.contains(&slot) {
+                // Remove the stack-specialized classification as well as pinning.
+                // This blocks forwarding/folding of both volatile loads and stores.
+                // Keep the REAL destination register: the instruction still
+                // writes it, and register-taint tracking (rax_is_zero in
+                // combined_local_pass) depends on that.  REG_NONE here made a
+                // volatile load into %rax look like a non-rax write, letting a
+                // later `xorl %eax, %eax` be removed as "redundant" even though
+                // %rax held a live value (miscompiled call argument setup).
+                let dest_reg = parse_dest_reg_fast(trimmed);
+                infos[i].pinned = true;
+                infos[i].kind = LineKind::Other { dest_reg };
+                infos[i].has_indirect_mem = true;
+                infos[i].rbp_offset = RBP_OFFSET_NONE;
+            }
+        }
+    }
+}
+
+/// Whole-buffer variant of the address-taken slot scan. Used only when the
+/// assembly contains no `.cfi_startproc` / `.cfi_endproc` boundaries (unit
+/// snippets, or unwind-info-disabled output), where function scoping is
+/// impossible.
+fn pin_address_taken_global(store: &LineStore, infos: &mut [LineInfo]) {
+    let mut address_taken = Vec::new();
+    for i in 0..store.len() {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let trimmed = infos[i].trimmed(store.get(i));
+        let operand = if let Some(rest) = trimmed.strip_prefix("leaq ") {
+            rest.split_once(',').map(|(op, _)| op)
+        } else if let Some(rest) = trimmed.strip_prefix("lea ") {
+            rest.split_once(',').map(|(op, _)| op)
+        } else {
+            None
+        };
+        if let Some(slot) = operand.and_then(direct_stack_slot) {
+            address_taken.push(slot);
+        }
+    }
+    if address_taken.is_empty() {
+        return;
+    }
+    for i in 0..store.len() {
+        if !matches!(
+            infos[i].kind,
+            LineKind::StoreRbp { .. } | LineKind::LoadRbp { .. }
+        ) {
+            continue;
+        }
+        let trimmed = infos[i].trimmed(store.get(i));
+        let operand = match infos[i].kind {
+            LineKind::StoreRbp { .. } => trimmed.rsplit_once(',').map(|(_, op)| op),
+            LineKind::LoadRbp { .. } => trimmed.split_once(',').map(|(op, _)| op),
+            _ => None,
+        };
+        let is_taken = operand
+            .map(str::trim)
+            .and_then(direct_stack_slot)
+            .is_some_and(|slot| address_taken.contains(&slot));
+        if is_taken {
+            infos[i].pinned = true;
+        }
+    }
+}
+
+fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
+    // Frame-slot addresses are function-local; the taken-slot set is
+    // collected per function and never bleeds across `.cfi_startproc` /
+    // `.cfi_endproc` boundaries. A previous global list let a
+    // `leaq -112(%rbp), %rax` in one function pin every -112(%rbp) access
+    // in every other function in the TU (intrinsic TUs with dozens of tiny
+    // functions each lost exactly one store→load forwarding that way).
+    // No CFI function boundaries (unit-test snippets, or output with frame
+    // unwind info disabled): fall back to the translation-unit-wide scan.
+    // The cross-function bleed this avoids is impossible to scope without
+    // boundaries, and such TUs contain at most one emitted function.
+    let has_any_startproc = (0..store.len()).any(|k| {
+        !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_startproc")
+    });
+    if !has_any_startproc {
+        pin_address_taken_global(store, infos);
+        return;
+    }
+    let mut start = 0;
+    while start < store.len() {
+        // Find the next .cfi_startproc.
+        while start < store.len()
+            && !infos[start]
+                .trimmed(store.get(start))
+                .starts_with(".cfi_startproc")
+        {
+            start += 1;
+        }
+        if start >= store.len() {
+            break;
+        }
+        let mut end = start + 1;
+        while end < store.len()
+            && !infos[end]
+                .trimmed(store.get(end))
+                .starts_with(".cfi_endproc")
+        {
+            end += 1;
+        }
+        let slot_of = |k: usize| -> Option<(u8, i32)> {
+            let trimmed = infos[k].trimmed(store.get(k));
+            let operand = trimmed
+                .strip_prefix("leaq ")
+                .and_then(|r| r.split_once(',').map(|(op, _)| op))
+                .or_else(|| {
+                    trimmed
+                        .strip_prefix("lea ")
+                        .and_then(|r| r.split_once(',').map(|(op, _)| op))
+                });
+            operand.and_then(direct_stack_slot)
+        };
+        // A leaq may sit textually after the cold-block access it
+        // dominates, so collect first, apply second.
+        let taken: Vec<(u8, i32)> = (start..end)
+            .filter(|&k| !infos[k].is_nop())
+            .filter_map(slot_of)
+            .collect();
+        if !taken.is_empty() {
+            for i in start..end {
+                // Pin BOTH stores and loads of address-taken slots:
+                // through the escaped pointer another call can write the
+                // slot, so a load must not be folded/forwarded from an
+                // earlier store, and the store must not be dropped as dead.
+                if !matches!(
+                    infos[i].kind,
+                    LineKind::StoreRbp { .. } | LineKind::LoadRbp { .. }
+                ) {
+                    continue;
+                }
+                let trimmed = infos[i].trimmed(store.get(i));
+                let operand = match infos[i].kind {
+                    LineKind::StoreRbp { .. } => trimmed.rsplit_once(',').map(|(_, op)| op),
+                    LineKind::LoadRbp { .. } => trimmed.split_once(',').map(|(op, _)| op),
+                    _ => None,
+                };
+                let is_taken = operand
+                    .map(str::trim)
+                    .and_then(direct_stack_slot)
+                    .is_some_and(|slot| taken.contains(&slot));
+                if is_taken {
+                    infos[i].pinned = true;
+                }
+            }
+        }
+        start = end;
+    }
+}
+
+// ── Main entry point ─────────────────────────────────────────────────────────
+
+/// Run peephole optimization on x86-64 assembly text.
+/// Returns the optimized assembly string.
+///
+/// Pass structure for speed:
+/// 1. Run cheap local passes iteratively until convergence (max `MAX_LOCAL_PASS_ITERATIONS`).
+///    These are O(n) single-scan passes that only look at adjacent/nearby lines.
+/// 2. Run expensive global passes once. `global_store_forwarding` is O(n) but with
+///    higher constant factor due to tracking slot→register mappings. It subsumes
+///    the functionality of local store-load forwarding across wider windows.
+/// 3. Run local passes one more time to clean up opportunities exposed by the
+///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
+/// Cheap line estimate: count newline bytes (no allocation, no splitting).
+/// Used by the size-adaptive peephole gate; for LF-terminated text the
+/// newline count equals the line count, and the gate only needs a bound.
+fn line_count_estimate(asm: &str) -> usize {
+    asm.as_bytes().iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Full peephole pipeline followed by the final VEX promotion.  The
+/// promotion runs on whatever text the pipeline returns — including the
+/// early-return paths (huge inputs, `-O0`) — because the AVX/SSE transition
+/// penalty it removes is independent of the optimisation level.
+/// Compatibility entry point for isolated peephole tests. Production code
+/// passes the driver-owned policy through [`peephole_optimize_with_config`].
+pub fn peephole_optimize(asm: String) -> String {
+    peephole_optimize_with_config(asm, &RaConfig::default(), false)
+}
+
+/// Full peephole pipeline using the RA/codegen policy captured by the driver.
+pub(crate) fn peephole_optimize_with_config(
+    asm: String,
+    ra_config: &RaConfig,
+    optimize_for_size: bool,
+) -> String {
+    let mut out = peephole_optimize_inner(asm, ra_config, optimize_for_size);
+    if std::env::var("CCC_NO_VEX_PROMOTE").is_err() {
+        let _ = vex_promote::promote_legacy_sse_to_vex(&mut out);
+    }
+    out
+}
+
+// ── Dual-layout metric pairs ──────────────────────────────────────────────
+//
+// The scheduling policy, the candidate labels and the counters are shared by
+// every backend in `crate::backend::metric_pair`; this module only supplies the
+// x86-64 metric peephole itself (it needs the RA config and size policy) and
+// the instrument suffixes that read the shared candidate label.
+
+/// Insert the current candidate's suffix before the extension, so an explored
+/// function keeps both candidates instead of one silently replacing the other.
+fn candidate_path(path: &str) -> std::path::PathBuf {
+    let suffix = crate::backend::metric_pair::metric_candidate_suffix();
+    let mut out = std::path::PathBuf::from(path);
+    if suffix.is_empty() {
+        return out;
+    }
+    let stem = out
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let name = match out.extension() {
+        Some(ext) => format!("{stem}{suffix}.{}", ext.to_string_lossy()),
+        None => format!("{stem}{suffix}"),
+    };
+    out.set_file_name(name);
+    out
+}
+
+/// Optimize two independent dual-layout candidates, concurrently when the pair
+/// is worth splitting (policy in `crate::backend::metric_pair`).
+///
+/// The metric inputs are temporary function fragments, so this affects neither
+/// whole-file peephole ordering nor emitted assembly: the output is a pure
+/// function of each fragment and the policy, exactly as for the serial path.
+pub(crate) fn peephole_optimize_pair_with_config(
+    first: String,
+    second: String,
+    ra_config: &RaConfig,
+    optimize_for_size: bool,
+) -> (String, String) {
+    // The closure captures a shared reference and a bool, so it is `Copy` and
+    // `Send` (`RaConfig` is plain data): the worker borrows the caller's policy
+    // instead of cloning it per pair.
+    crate::backend::metric_pair::run_metric_pair("x86-64", first, second, |text| {
+        peephole_optimize_with_config(text, ra_config, optimize_for_size)
+    })
+}
+
+/// Delete GP pure writes whose value is provably dead, to a local fixpoint:
+/// retiring one relay can expose the next in an `mov A,B; mov B,C; ...` chain
+/// (each proof sees the reads the previous deletion removed).  Shared by the
+/// post-Phase-1 orphan sweeps: every global fold (copy propagation's consumer
+/// retargets, the relay/memory folds, stack-slot DSE, trampoline removal)
+/// orphans staging copies whose value became dead, and Phase 1's
+/// `eliminate_dead_pure_writes`/`eliminate_dead_flag_writes` never run again afterwards.
+/// `CCC_PEEPHOLE_SKIP=dead_pure_writes` disables every site (Phase 1 and
+/// these sweeps alike).
+fn retire_dead_pure_writes(
+    store: &LineStore,
+    infos: &mut [LineInfo],
+    flag_writes_enabled: bool,
+) -> bool {
+    let mut any = false;
+    loop {
+        // Joint fixpoint, not two independent ones: retiring a dead
+        // flag-writing arithmetic (`shlq $2, %r13`) is what makes the pure
+        // write that fed it (`movl %r10d, %r13d`) provably dead, so each pass
+        // exposes work for the other.  `flag_writes_enabled` comes from the
+        // once-parsed `CCC_PEEPHOLE_SKIP` set (`dead_flag_writes`), keeping the
+        // pass itself free of per-call environment reads.
+        let pure = dead_writes::eliminate_dead_pure_writes(store, infos);
+        let flagged = flag_writes_enabled && dead_writes::eliminate_dead_flag_writes(store, infos);
+        if !pure && !flagged {
+            break;
+        }
+        any = true;
+    }
+    any
+}
+
+/// Hide every `-g` line row (`.loc`) from the passes by marking it deleted;
+/// `LineStore::build_result_with_debug_rows` puts each back where it stood.
+///
+/// `.loc` emits no bytes, but a window that stops at it -- or only fuses
+/// physically adjacent lines -- optimized `-g` code less: 36 of the 1162
+/// x86-64 regression sources compiled to different code with `-g` (a
+/// copy-coalesce `movl %eax, %r10d` / `op` split by a row, a dead spill a
+/// row kept alive). Teaching each of the hundreds of walkers the
+/// steppable-directive law would be a law every new pass must remember;
+/// hiding the rows makes the passes see the non-`-g` text by construction.
+fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
+    let mut rows = vec![false; infos.len()];
+    for (i, info) in infos.iter_mut().enumerate() {
+        if info.kind == LineKind::Directive
+            && crate::backend::peephole_common::is_loc_directive(info.trimmed(store.get(i)))
+        {
+            mark_nop(info);
+            rows[i] = info.is_nop();
+        }
+    }
+    rows
+}
+
+fn peephole_optimize_inner(
+    mut asm: String,
+    ra_config: &RaConfig,
+    optimize_for_size: bool,
+) -> String {
+    // ms178 debug: dump pre-peephole asm
+    if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
+        let _ = std::fs::write(path, &asm);
+    }
+    // Always-on, provably-safe pass: eliminate redundant pushfq/popfq pairs
+    // (flag-neutral window). Runs before the peephole gate.
+    if std::env::var("CCC_NO_PUSHF_ELIM").is_err() {
+        let _ = pushf_elim::eliminate_redundant_pushfq(&mut asm);
+    }
+    // Always-on, provably-safe pass: eliminate redundant zero-extensions
+    // only when the tracked value already fits the source width. Runs before
+    // gate; CCC_NO_REDUNDANT_EXT=1 disables it for miscompile bisection.
+    if std::env::var("CCC_NO_REDUNDANT_EXT").is_err() {
+        let _ = redundant_ext::eliminate_redundant_zero_extend(&mut asm);
+    }
+    // the peephole optimizer is now ENABLED BY DEFAULT with a curated,
+    // gzip-validated safe subset. The two passes that were proven to miscompile
+    // gzip 1.14 (full 30-test suite) are skipped by default: `store_fwd`
+    // (global store-load forwarding) and `combined` (combined_local_pass).
+    // All other passes individually pass gzip's 30-test suite, and the union
+    // of the enabled passes passes 30/30 with a 2.1% text-size reduction and a
+    // ~12% runtime improvement on gzip compress over the pushfq-only baseline.
+    // Disable entirely with CCC_NO_PEEPHOLE=1; override the skip set with
+    // CCC_PEEPHOLE_SKIP=pass1,pass2,...
+    if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
+        return asm;
+    }
+    // Size-adaptive gate: pathological machine-generated files (the torture
+    // memcpy-ax corpus expands to ~486k asm lines / ~246k instructions) pay a
+    // full pass-mix sweep measured at ~58 s while the output is byte-identical
+    // to the un-peepholed text — straight-line constant-size memset/memcpy
+    // expansions contain none of the staging/relay patterns the passes match.
+    // Real-world objects are orders of magnitude smaller (gzip -O2 links from
+    // ~20k asm lines), so a 150k-line threshold keeps every realistic file on
+    // the full pass mix while bounding worst-case compile time. Opt back in
+    // with CCC_FORCE_PEEPHOLE=1 (bisection hook, mirrors CCC_PEEPHOLE_PHASE4).
+    if line_count_estimate(&asm) > 150_000 && std::env::var("CCC_FORCE_PEEPHOLE").is_err() {
+        return asm;
+    }
+    let skip_phase1 = std::env::var("CCC_NO_PEEPHOLE_PHASE1").is_ok();
+    let skip_phase2 = std::env::var("CCC_NO_PEEPHOLE_PHASE2").is_ok();
+    let skip_phase3 = std::env::var("CCC_NO_PEEPHOLE_PHASE3").is_ok();
+    // Phase 4 (loop rotation / trampoline elimination / late hoisting) is
+    // DISABLED BY DEFAULT: it has a register-renaming bug that miscompiles
+    // valid programs (found via differential fuzzing on generated C; gzip was
+    // unaffected but other code with certain loop shapes was). It also does not
+    // help gzip (measured slower/larger). Opt in with CCC_PEEPHOLE_PHASE4=1.
+    let skip_phase4 = std::env::var("CCC_PEEPHOLE_PHASE4").is_err() || !ra_config.no_machinst; // Phase 4 renaming is not MachInst-safe
+    let skip_phase5 = std::env::var("CCC_NO_PEEPHOLE_PHASE5").is_ok();
+    let skip_phase6 = std::env::var("CCC_NO_PEEPHOLE_PHASE6").is_ok();
+    let skip_phase7 = std::env::var("CCC_NO_PEEPHOLE_PHASE7").is_ok();
+
+    let mut store = LineStore::new(asm);
+    let line_count = store.len();
+    let mut infos: Vec<LineInfo> = (0..line_count)
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    let debug_rows = hide_debug_rows(&store, &mut infos);
+    pin_inline_asm_regions(&store, &mut infos);
+    pin_volatile_access_regions(&store, &mut infos);
+    pin_volatile_stack_slots(&store, &mut infos);
+    pin_address_taken_stack_slots(&store, &mut infos);
+    pin_param_abi_reads(&store, &mut infos);
+
+    // ms178: pushfq/popfq are now classified as Push{REG_NONE}/Pop{REG_NONE}
+    // (see types.rs) and all passes treat Push/Pop as barriers, so they can no
+    // longer corrupt slot-offset tracking. The old global `has_pushfq` gate —
+    // which skipped Phase 2/3 for the ENTIRE file whenever ANY function used a
+    // Select (the origin of pushfq) — is removed. That gate silently disabled
+    // the whole global peephole for files like gzip's deflate.c (longest_match
+    // uses pushfq), leaving 28+ store→load→deref round-trips per hot loop
+    // unoptimized.
+    let skip_phase1 = skip_phase1;
+    let skip_phase2 = skip_phase2;
+    let skip_phase3 = skip_phase3;
+    let max_phase1_iters = MAX_LOCAL_PASS_ITERATIONS;
+    // CCC_TIME_PEEPHOLE=1: per-iteration/per-phase wall-time trace on stderr.
+    // The optimizer is text-based, so pathological generated files (e.g. the
+    // torture memcpy-ax corpus: ~486k asm lines) make per-pass cost visible;
+    // this is the measurement hook for keeping the pass mix linear-ish.
+    let time_peephole = std::env::var("CCC_TIME_PEEPHOLE").is_ok();
+    let peephole_total = if time_peephole {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
+    // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
+    // that appear in the prologue area (before the first function call).
+    // These save function parameters to callee-saved registers and must never
+    // be removed by any peephole pass, since the ABI arg registers get
+    // clobbered by subsequent calls.
+    {
+        let mut in_prologue = false;
+        for idx in 0..line_count {
+            let trimmed = infos[idx].trimmed(store.get(idx));
+            if trimmed.starts_with(".cfi_startproc") {
+                in_prologue = true;
+                continue;
+            }
+            if !in_prologue {
+                continue;
+            }
+            if matches!(infos[idx].kind, LineKind::Call) {
+                in_prologue = false;
+                continue;
+            }
+            // A genuine parameter pre-store always appears in the straight-line
+            // entry block, BEFORE any branch/loop. Once we hit a branch (or an
+            // indirect jump), the function body has begun and later
+            // `movq %arg_reg, %callee_saved` copies (e.g. phi copy-backs in the
+            // epilogue) are NOT parameter saves. Stop pinning here — otherwise
+            // such copies get pinned and block legitimate peephole passes,
+            // which can miscompile (see coalesce_phi_register_copies).
+            if matches!(
+                infos[idx].kind,
+                LineKind::Jmp | LineKind::JmpIndirect | LineKind::CondJmp
+            ) {
+                in_prologue = false;
+                continue;
+            }
+            // Pin movq from arg regs to callee-saved regs
+            if trimmed.starts_with("movq %") {
+                let is_param_prestore = (trimmed.contains("%rdi")
+                    || trimmed.contains("%rsi")
+                    || trimmed.contains("%rdx")
+                    || trimmed.contains("%rcx")
+                    || trimmed.contains("%r8")
+                    || trimmed.contains("%r9"))
+                    && (trimmed.ends_with("%rbx")
+                        || trimmed.ends_with("%r12")
+                        || trimmed.ends_with("%r13")
+                        || trimmed.ends_with("%r14")
+                        || trimmed.ends_with("%r15"));
+                if is_param_prestore {
+                    infos[idx].pinned = true;
+                }
+            }
+        }
+    }
+
+    // CCC_PEEPHOLE_SKIP=pass1,pass2,... to disable specific sub-passes.
+    //
+    // ALL peephole passes are now ENABLED BY DEFAULT. The previously-disabled
+    // passes were fixed properly (not merely skipped):
+    //   - copy_prop: clear copy state at every barrier (incl. CondJmp).
+    //   - store_relay: use the STORE's width, do not widen a 32-bit zero-extension
+    //     to a 64-bit store, and fix the double-'%' register names.
+    //   - store_fwd: frame-pointer-aware — do not treat `(%rbp)` as a stack slot
+    //     when rbp is a general data register under -fomit-frame-pointer; also
+    //     invalidate at CondJmp and calls.
+    //   - gen_relay/leaq_relay/load_relay/cltq_relay/ext_relay: fixed the shared
+    //     is_rax_dead_after liveness check (only a call truly clobbers rax).
+    //   - gpr_hoist: place the hoisted load in the true preheader (replace the
+    //     entry jmp), not in the dead gap after the header label.
+    //   - dead_stores: frame-pointer-aware (never treat `(%rbp)` as a stack slot
+    //     when rbp is a data register) and Cmp/test lines now carry memory
+    //     operands so a compare read is not missed.
+    //   - combined: dead `xorl` elimination refuses to drop it when the next
+    //     instruction READS %rax (e.g. `movl %eax,%eax`), and the pass is gated
+    //     by the skip set in phase 3.
+    //   - identical_blocks: only merge blocks with IDENTICAL predecessor sets.
+    //   - acc_alu: barrier no longer treated as "src reg safe".
+    //   - phi_coalesce: TMP must not be written between copy-out and copy-back,
+    //     and the chain register must not be read before its defining movslq.
+    // Validation: differential fuzz (gen2, all passes ON, vs GCC -O2) and gzip 1.14
+    // (30/30) and regression (7/7). expat 2.8.2 fails identically with and without
+    // peephole (a base-backend codegen issue, not a peephole bug).
+    let skip_set: crate::common::fx_hash::FxHashSet<String> = std::env::var("CCC_PEEPHOLE_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+    #[cfg(test)]
+    let skip_set = {
+        let mut set = skip_set;
+        test_skips::extend(&mut set);
+        set
+    };
+    let sk = |name: &str| -> bool { skip_set.contains(name) };
+
+    // CCC_PEEPHOLE_RELAY is read ONCE, here, rather than at its two use sites:
+    // both are inside the phase-1 fixed-point loop, so the knob cost an
+    // `environ` scan per pass per iteration (up to `MAX_LOCAL_PASS_ITERATIONS`
+    // of them) for a decision that cannot change while the function compiles.
+    let relay_opt_in = std::env::var("CCC_PEEPHOLE_RELAY").is_ok();
+
+    // CCC_PEEPHOLE_TRACE=<dir>: write the assembly text after every phase-1
+    // sub-pass that reported a change, as <dir>/<seq>-p<iter>-<pass>.s.  The
+    // skip-set bisection (`CCC_PEEPHOLE_SKIP`) gives MISLEADING culprits when
+    // passes enable one another — the pass that fires only because an
+    // earlier one rewrote its input shows up as the "cause".  The trace is
+    // the reliable instrument: assemble+run consecutive dumps and the first
+    // one that breaks the program names the faulty rewrite
+    // (`scripts/peephole_trace_bisect.py` automates it).  Zero cost unset.
+    let trace_dir = std::env::var_os("CCC_PEEPHOLE_TRACE").map(std::path::PathBuf::from);
+    let mut trace_seq = 0u32;
+    let mut trace =
+        |name: &str, iter: usize, changed: bool, store: &LineStore, infos: &[LineInfo]| {
+            if !changed {
+                return;
+            }
+            if let Some(dir) = &trace_dir {
+                let _ = std::fs::create_dir_all(dir);
+                let path = dir.join(format!(
+                    "{:03}-p{}-{}{}.s",
+                    trace_seq,
+                    iter,
+                    name,
+                    crate::backend::metric_pair::metric_candidate_suffix()
+                ));
+                let _ = std::fs::write(path, store.build_result(|i| infos[i].is_nop()));
+                trace_seq += 1;
+            }
+        };
+
+    // Phase 1: Iterative cheap local passes.
+    let mut changed = true;
+    let mut pass_count = 0;
+    while changed && pass_count < max_phase1_iters && !skip_phase1 {
+        let iter_start = if time_peephole {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        changed = false;
+        let local_changed = if sk("combined") {
+            false
+        } else {
+            local_patterns::combined_local_pass(&mut store, &mut infos)
+        };
+        trace(
+            "combined_local_pass",
+            pass_count,
+            local_changed,
+            &store,
+            &infos,
+        );
+        changed |= local_changed;
+        if !sk("lea_mem_sib") {
+            {
+                let c = local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+                trace("fold_lea_into_memory_op", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("scaled_index_temp") {
+            let c = relay_and_lea::fold_scaled_index_temp_into_mem(&mut store, &mut infos);
+            trace(
+                "fold_scaled_index_temp_into_mem",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
+        }
+        if !sk("lea_all_uses") {
+            {
+                let c = local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
+                trace("fold_lea_all_uses_in_block", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("staged_imm_alu") {
+            {
+                let c = local_patterns::fold_staged_imm_into_alu(&mut store, &mut infos);
+                trace("fold_staged_imm_into_alu", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("shl_sib") {
+            // Index scaling: `shl $k,%idx; addq %idx,%base` -> a scaled SIB
+            // operand, which the LEA-splicing passes then fold into whatever
+            // consumes the address.  With `mem_rmw` this is what turns
+            // `table[idx]++` into one `addq $1,(base,idx,8)`.
+            let c = local_patterns::fold_shift_into_sib(&mut store, &mut infos);
+            trace("fold_shift_into_sib", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("mem_rmw") {
+            // Memory read-modify-write: `mov MEM,%d; <inc %d>; mov %d,MEM`
+            // -> `add $imm,MEM`.  The `table[idx]++` shape.
+            let c = memory_fold::fold_memory_rmw(&mut store, &mut infos);
+            trace("fold_memory_rmw", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("fuse_movq_ext") {
+            {
+                let c = local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+                trace("fuse_movq_ext_truncation", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+            // VEX 3-operand exploitation: `movsd %A,%D; vOP %S,%D,%D` ->
+            // `vOP %S,%A,%D`. Removes the 2-operand-ISA staging copy the
+            // scalar FP emitters insert before every binary op.
+            {
+                let c = local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos);
+                trace(
+                    "fuse_mov_scalar_fp_into_vex_op",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            // Memory-source half: fold a dead staged load into a commutative
+            // scalar VEX op's memory operand slot.
+            {
+                let c = local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos);
+                trace(
+                    "fold_scalar_fp_memory_into_vex_op",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            // Broadcast half: fold a dead staged scalar load into an AVX
+            // broadcast-from-memory (`vmovsd MEM,%xmmD; vbroadcastsd %xmmD,%ymmM`
+            // -> `vbroadcastsd MEM,%ymmM`). Same skip key: one VEX mem-fold family.
+            {
+                let c = local_patterns::fold_broadcast_load_into_broadcast(&mut store, &mut infos);
+                trace(
+                    "fold_broadcast_load_into_broadcast",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("fp_roundtrips") {
+            {
+                let c = local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+                trace("eliminate_fp_xmm_roundtrips", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("fp_mem_fold") {
+            {
+                let c = memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+                trace("fold_fp_memory_operands", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("fp_reg_mem_fold") {
+            {
+                let c = memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+                trace("fold_fp_register_loads", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // Fold a single-use scalar FP load into an adjacent scalar FMA's
+        // memory operand — any role the form algebra can put there (the
+        // dot-product src2 shape is just the most common one).
+        if !sk("fma_mem_fold") {
+            {
+                let c = memory_fold::fold_fma_memory_operand(&mut store, &mut infos);
+                trace("fold_fma_memory_operand", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // Constant-accumulator FMA shaping: 213-form with a just-loaded
+        // multiplier becomes the 132 form with the load folded into the
+        // memory slot, and repeated %xmm0 zeroings die block-locally.
+        if !sk("fma132_zero") {
+            {
+                let c = memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos);
+                trace(
+                    "fold_zero_addend_fma213_to_132",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            {
+                let c = memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
+                trace(
+                    "eliminate_redundant_xmm0_zeroing",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        // Repeated RIP-relative loads of the same FP pool constant become a
+        // single register materialization (leaf functions only; harvested
+        // NOP slot must dominate all uses by fall-through).
+        if !sk("fp_const_hoist") {
+            {
+                let c = memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
+                trace(
+                    "hoist_repeated_fp_constant_loads",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
+        // masked interaction with expat test_multichar_cdata_utf16 under the
+        // full pass mix — root cause still open, so keep it off by default.
+        if relay_opt_in && !sk("load_copy_relay") {
+            {
+                let c = memory_fold::fold_load_copy_relay(&mut store, &mut infos);
+                trace("fold_load_copy_relay", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("rcx_copy") {
+            {
+                let c = local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+                trace("eliminate_rcx_address_copy", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("ptr_deref") {
+            {
+                let c = local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+                trace(
+                    "fold_ptr_deref_through_stack",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("fp_spill") {
+            {
+                let c = local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
+                trace(
+                    "eliminate_fp_spill_around_load",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("fuse_copy_op") {
+            {
+                let c = local_patterns::fuse_copy_and_operation(&mut store, &mut infos);
+                trace("fuse_copy_and_operation", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("staged_add_lea") {
+            {
+                let c = local_patterns::fuse_staged_add_and_relay(&mut store, &mut infos);
+                trace("fuse_staged_add_and_relay", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("load_lea_add") {
+            {
+                let c = local_patterns::fuse_load_lea_add(&mut store, &mut infos);
+                trace("fuse_load_lea_add", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("load_lea_base") {
+            {
+                let c = local_patterns::fuse_load_lea_into_base(&mut store, &mut infos);
+                trace("fuse_load_lea_into_base", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("fp_hoist") {
+            {
+                let c = local_patterns::promote_loop_invariant_fp_load(&mut store, &mut infos);
+                trace(
+                    "promote_loop_invariant_fp_load",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("dead_signext") {
+            {
+                let c = local_patterns::eliminate_dead_sign_extensions(&mut store, &mut infos);
+                trace(
+                    "eliminate_dead_sign_extensions",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("dead_leaq") {
+            {
+                let c = local_patterns::eliminate_redundant_leaq(&store, &mut infos);
+                trace("eliminate_redundant_leaq", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // Symbol-LEA CSE for every GPR and generic load->ALU memory-operand
+        // fusion (any addressing mode, liveness-proved dead scratch); see
+        // load_op_fuse.rs for the soundness argument.
+        if !sk("symbol_lea_cse") {
+            {
+                let c = load_op_fuse::eliminate_redundant_symbol_lea(&store, &mut infos);
+                trace(
+                    "eliminate_redundant_symbol_lea",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("recurrence_inplace") {
+            {
+                let c = load_op_fuse::fold_recurrence_update(&mut store, &mut infos);
+                trace("fold_recurrence_update", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("copy_dying_operand") {
+            {
+                let c = load_op_fuse::fold_copy_into_dying_operand(&mut store, &mut infos);
+                trace(
+                    "fold_copy_into_dying_operand",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("load_alu_fuse") {
+            let c = load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
+            trace("fuse_load_into_alu", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        // Load -> LEA-add in-place (`mov MEM,%t; leaq (%acc,%t,1),%s` ->
+        // `add MEM,%acc` + rename the chain uses). One transform, one switch:
+        // `CCC_PEEPHOLE_SKIP=load_lea_inplace` bisects it independently of the
+        // sibling above AND of `local_patterns::fuse_load_lea_add` (which owns
+        // the pre-existing `load_lea_add` switch; see load_op_fuse.rs for this
+        // transform's soundness argument).
+        if !sk("load_lea_inplace") {
+            let c = load_op_fuse::fuse_load_into_lea_add(&mut store, &mut infos);
+            trace("fuse_load_into_lea_add", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        // `fuse_zero_ext_cmp` has its OWN skip name. It used to share
+        // `load_alu_fuse` with `fuse_load_into_alu`, which made the two
+        // inseparable in an A/B: `CCC_PEEPHOLE_SKIP=load_alu_fuse` turned off
+        // both, so a differential attributed to this fold could actually have
+        // been the sibling's win. One transform, one switch.
+        if !sk("zero_ext_cmp") {
+            let c = load_op_fuse::fuse_zero_ext_cmp(&mut store, &mut infos);
+            trace("fuse_zero_ext_cmp", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("zero_ext_imm_cmp") {
+            let c = load_op_fuse::narrow_zero_ext_imm_cmp(&mut store, &mut infos);
+            trace("narrow_zero_ext_imm_cmp", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        // Generic move-relay elimination and windowed lea->memory folding.
+        // Both are block-local; see relay_and_lea.rs for the two deadness
+        // proofs (block-local write-before-read, whole-function uniqueness).
+        if !sk("move_relay") {
+            {
+                let c = relay_and_lea::eliminate_move_relays(&mut store, &mut infos);
+                trace("eliminate_move_relays", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("lea_load_window") {
+            // Dead in-place extensions FIRST (same phase): `cltq` is an
+            // implicit-register instruction, so a surviving one aborts the
+            // window scan below and blocks the fold that would otherwise
+            // absorb the staged address (csv/rbtree main's
+            // `leaq 4(%r13),%r10; …; cltq; movl %eax,(%r10)` chain).
+            {
+                let c = narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos);
+                trace("eliminate_dead_inplace_ext", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+            {
+                let c = relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
+                trace("fold_lea_into_load", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+            if !sk("cse_symbol_lea") {
+                let c = relay_and_lea::cse_symbol_lea(&mut store, &mut infos);
+                trace("cse_symbol_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // Flags-aware cleanups: copy+add -> lea (also removes a flags write
+        // from between a comparison and its consumer), the setcc/movzbl/test
+        // boolean round-trip in front of a cmov, and copy+mask -> movzx.
+        if !sk("producer_retarget") {
+            {
+                let c = relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos);
+                trace("retarget_producer_into_copy", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // Loop-latch shape the two passes above decline: the copy dest is
+        // live across the back edge and the producer reg is read after the
+        // copy. Retargets `lea D(%rA), %rB; mov %rB, %rA` into
+        // `lea D(%rA), %rA` with a liveness-proved, rollback-guarded rename
+        // of the following %rB reads.
+        if !sk("lea_base_fold") {
+            {
+                let c = relay_and_lea::fold_copy_into_lea_base(&mut store, &mut infos);
+                trace("fold_copy_into_lea_base", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("copy_add_lea") {
+            {
+                let c = flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
+                trace("fold_copy_add_into_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("lea_add_lea") {
+            {
+                let c = flag_peepholes::fold_lea_add_into_lea(&mut store, &mut infos);
+                trace("fold_lea_add_into_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("inplace_add_copy_lea") {
+            {
+                let c = flag_peepholes::fold_inplace_add_copy_into_lea(&mut store, &mut infos);
+                trace(
+                    "fold_inplace_add_copy_into_lea",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("copy_shift_lea") {
+            {
+                let c = flag_peepholes::fold_copy_shift_into_lea(&mut store, &mut infos);
+                trace("fold_copy_shift_into_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("setcc_cmov") {
+            {
+                let c = flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos);
+                trace("fold_setcc_test_cmov", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("conditional_increment") {
+            let c = flag_peepholes::fold_conditional_increment(&mut store, &mut infos);
+            trace("fold_conditional_increment", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        // Sound dead-write elimination (LEAs, widened copies, setCC) and
+        // repeated-load reuse; both use the relay/lea deadness proofs.
+        // Whole-function copy coalescing: rename the destination family to the
+        // source family when the source dies at the copy (kills the parameter
+        // shuffle the allocator emits at every function entry).
+        if !sk("copy_coalesce") {
+            {
+                let c = copy_coalesce::coalesce_register_copies(&mut store, &mut infos);
+                trace("coalesce_register_copies", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // The vector counterpart of the two GP copy passes above.  The codegen
+        // routes every scalar FP value through a fresh temporary, so the text
+        // carries copy-in/copy-out brackets that `copy_propagation` (parses
+        // movq/movl), `coalesce_register_copies` (requires a literal "movq ")
+        // and `eliminate_dead_pure_writes` (GP pure-write prefixes) all decline
+        // by construction.  Bracket first: it deletes both copies of the
+        // pattern, and what it leaves behind is a single-use copy that
+        // propagation then feeds to the dead-copy sweep.
+        // A narrow copy into a private temporary cannot serve the packed reads
+        // that follow it, which is what keeps copysign's copies alive; widening
+        // it first lets the two passes below do their work.
+        // A copied scalar splatted in place (`movapd %A,%T; unpcklpd %T,%T`)
+        // is one `pshufd` of `%A`: the copy exists only because the unpack
+        // form needs a destination, and `pshufd` does not.  Runs before the
+        // copy bracket and propagation passes so they never see the pair.
+        {
+            let c = vector_broadcast::fold_broadcast_copies(&mut store, &mut infos);
+            trace("fold_broadcast_copies", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("vector_copy_widen") {
+            {
+                let c = vector_copy::widen_private_vector_copies(&mut store, &mut infos);
+                trace("widen_private_vector_copies", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // The FMA accumulator bracket.  Every FMA form reads its destination as
+        // the accumulator, so this is the one bracket the pass below cannot
+        // retarget: `return __builtin_fma(a, b, c);` reaches the assembler as
+        // copy-in / vfmadd231 / copy-out, three instructions where GCC emits one
+        // vfmadd132sd and Clang and ICX one vfmadd213sd.  Rotating the encoding
+        // puts the result register in a role it can legally play.  Runs after
+        // widening so the copy spellings it matches are already normalised.
+        if !sk("vector_copy_fma") {
+            {
+                let c = vector_copy::coalesce_packed_fma_prefix(&mut store, &mut infos);
+                trace("coalesce_packed_fma_prefix", pass_count, c, &store, &infos);
+                changed |= c;
+                let c = vector_copy::reassociate_fma_accumulator(&mut store, &mut infos);
+                trace("reassociate_fma_accumulator", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_retarget") {
+            {
+                let c = vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos);
+                trace(
+                    "fold_composed_dword_shuffles",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+                let c = vector_copy::fold_uniform_vector_shift(&mut store, &mut infos);
+                trace("fold_uniform_vector_shift", pass_count, c, &store, &infos);
+                changed |= c;
+                let c = vector_copy::retarget_vex_result(&mut store, &mut infos);
+                trace("retarget_vex_result", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_bracket") {
+            {
+                let c = vector_copy::coalesce_vector_brackets(&mut store, &mut infos);
+                trace("coalesce_vector_brackets", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_prop") {
+            {
+                let c = vector_copy::propagate_vector_copies(&mut store, &mut infos);
+                trace("propagate_vector_copies", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vector_copy_dead") {
+            {
+                let c = vector_copy::eliminate_dead_vector_copies(&store, &mut infos);
+                trace(
+                    "eliminate_dead_vector_copies",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("vzeroupper_entry_state") {
+            {
+                let c = vector_copy::elide_vzeroupper_without_upper_writes(&store, &mut infos);
+                trace(
+                    "elide_vzeroupper_without_upper_writes",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("dead_pure_writes") {
+            {
+                let c = dead_writes::eliminate_dead_pure_writes(&store, &mut infos);
+                trace("eliminate_dead_pure_writes", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("dead_flag_writes") {
+            {
+                let c = dead_writes::eliminate_dead_flag_writes(&store, &mut infos);
+                trace("eliminate_dead_flag_writes", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // Give the stronger branch fusion first ownership of materialized
+        // booleans, before load/test folding erases the reload it proves.
+        if !sk("cmp_branch") {
+            let c = compare_branch::fuse_compare_and_branch(&mut store, &mut infos);
+            trace("fuse_compare_and_branch", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("load_test_cmp") {
+            {
+                let c = dead_writes::fold_load_test_into_cmp(&mut store, &mut infos);
+                trace("fold_load_test_into_cmp", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // After the load/test fold, so `movsbq m, %r; testb; setne; movzbl;
+        // add` first becomes `cmpb $0, m` and then `cmpb $1, m; sbb $-1`
+        // (in the other order the register compare would strand the load).
+        if !sk("setcc_increment") {
+            let c = flag_peepholes::fold_setcc_increment(&mut store, &mut infos);
+            trace("fold_setcc_increment", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("acc_roundtrip") {
+            {
+                let c = dead_writes::fold_accumulator_roundtrip(&mut store, &mut infos);
+                trace("fold_accumulator_roundtrip", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("load_reuse") {
+            {
+                let c = dead_writes::reuse_redundant_loads(&mut store, &mut infos);
+                trace("reuse_redundant_loads", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("flags_compare") {
+            {
+                let c = flag_peepholes::fold_redundant_flags_compare(&store, &mut infos);
+                trace(
+                    "fold_redundant_flags_compare",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        // Dedicated switch: the sign-CMOV fold has its own flag-lifetime
+        // proof and must be bisectable without also disabling the general
+        // self-test elimination below (whose licence is a ZF-only consumer
+        // walk, not the sign/SF proof this one performs).
+        if !sk("sign_test_cmov") {
+            {
+                let c = flag_peepholes::fold_arithmetic_test_sign_cmov(&mut store, &mut infos);
+                trace(
+                    "fold_arithmetic_test_sign_cmov",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("self_test") {
+            {
+                let c = flag_peepholes::eliminate_redundant_self_test(&mut store, &mut infos);
+                trace(
+                    "eliminate_redundant_self_test",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("narrow_signext") {
+            {
+                let c = flag_peepholes::narrow_dead_sign_extension(&mut store, &mut infos);
+                trace("narrow_dead_sign_extension", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("copy_mask_movz") {
+            {
+                let c = flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);
+                trace(
+                    "fold_copy_and_mask_into_movz",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("copy_mask_test") {
+            {
+                let c = flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
+                trace(
+                    "fold_copy_and_mask_into_test",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("load_mask_test") {
+            let c = load_mask_test::fold_load_mask_into_memory_test(&mut store, &mut infos);
+            trace(
+                "fold_load_mask_into_memory_test",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
+        }
+        if !sk("base_index") {
+            {
+                let c = local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+                trace("fold_base_index_addressing", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("acc_alu") {
+            {
+                let c = local_patterns::fold_accumulator_alu_store(&mut store, &mut infos);
+                trace("fold_accumulator_alu_store", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("phi_coalesce") {
+            {
+                let c = local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+                trace(
+                    "coalesce_phi_register_copies",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if !sk("signext_move") {
+            {
+                let c = local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+                trace("fuse_signext_and_move", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("ext_chain") {
+            // `ext S,%X; ext %X_w,%Y` -> `ext S,%Y`; runs first so the
+            // narrowing below sees the collapsed form.
+            let c = local_patterns::collapse_extension_chains(&mut store, &mut infos);
+            trace("collapse_extension_chains", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("signext_narrow") {
+            // `movsbq SRC,%rA; movl %eA,%eB` -> `movsbl SRC,%eB` (%rA dead).
+            let c = local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos);
+            trace(
+                "narrow_signext_into_32bit_copy",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
+        }
+        if !sk("inc_chain") {
+            {
+                let c = local_patterns::collapse_increment_chain(&mut store, &mut infos);
+                trace("collapse_increment_chain", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        // add_signext (fuse_add_sign_extend) REMOVED: it rewrote
+        // `addl %X,%X; movslq %X,%DST` into `addl %X,%DSTd`, which (a) reads
+        // an uninitialized %DSTd — its own SAFETY comment required "DST was
+        // initialized with the same value" but never checked it — and
+        // (b) drops the sign extension (addl zero-extends the upper half).
+        // expat xmlparse.c reportProcessingInstruction: the PI-target length
+        // became garbage and XmlNameLength walked off the buffer (SIGSEGV).
+        // A sound fusion saves nothing (still needs init + sext), so the
+        // pass is deleted rather than gated.
+        if !sk("copy_shift_back") {
+            {
+                let c = local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
+                trace("fold_copy_shift_copyback", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("shift_signext") {
+            let c = local_patterns::fold_copy_logical_shift_signext(&mut store, &mut infos);
+            trace(
+                "fold_copy_logical_shift_signext",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
+        }
+        if !sk("xor_move_fold") {
+            {
+                let c = local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);
+                trace(
+                    "fold_zero_extended_xor_moves",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        // Copy-into-RMW coalescing: `mov %S,%D` feeding a read-modify-write
+        // consumer that destinations `%D`. Placed AFTER every copy+ALU
+        // specialist on purpose (specific before general): `copy_add_lea` /
+        // `copy_shift_lea` (flag-free `lea`), `copy_mask_movz` / `narrow_signext`
+        // (`movzx`), `xor_move_fold` and `copy_coalesce` all produce
+        // structurally better code than a retargeted ALU op wherever they
+        // match, and `load_alu_fuse` (which runs first) already takes the
+        // commutative dying-operand shapes — this pass takes the remainder.
+        if !sk("copy_rmw_coalesce") {
+            {
+                let c = relay_and_lea::coalesce_copy_into_rmw(&mut store, &mut infos);
+                trace("coalesce_copy_into_rmw", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("rotate_idiom") {
+            {
+                let c = local_patterns::fold_rotate_idiom(&mut store, &mut infos);
+                trace("fold_rotate_idiom", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("vec_self_move") {
+            {
+                let c = local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
+                trace("eliminate_vector_self_moves", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("cascaded_shifts") {
+            {
+                let c = local_patterns::fold_cascaded_shifts(&mut store, &mut infos);
+                trace("fold_cascaded_shifts", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
+        if !sk("gpr_hoist") {
+            {
+                let c = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+                trace(
+                    "hoist_loop_invariant_gpr_load",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
+        if local_changed || pass_count == 0 {
+            if !sk("push_pop") {
+                {
+                    let c = push_pop::eliminate_push_pop_pairs(&store, &mut infos);
+                    trace("eliminate_push_pop_pairs", pass_count, c, &store, &infos);
+                    changed |= c;
+                }
+            }
+            if !sk("highbit_sub") {
+                let c = local_patterns::fold_highbit_subs(&mut store, &mut infos);
+                trace("fold_highbit_subs", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+            if !sk("guarded_scan") {
+                let c = local_patterns::fold_guarded_scan_selects(&mut store, &mut infos);
+                trace("fold_guarded_scan_selects", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+            if !sk("scan_copy") {
+                let c = local_patterns::retarget_preloaded_scan_copies(&mut store, &mut infos);
+                trace(
+                    "retarget_preloaded_scan_copies",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            if !sk("dead_scratch_saves") {
+                let c = push_pop::eliminate_dead_scratch_saves(&store, &mut infos);
+                trace(
+                    "eliminate_dead_scratch_saves",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            if !sk("binop_push_pop") {
+                {
+                    let c = push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
+                    trace(
+                        "eliminate_binop_push_pop_pattern",
+                        pass_count,
+                        c,
+                        &store,
+                        &infos,
+                    );
+                    changed |= c;
+                }
+            }
+        }
+        if let Some(s) = iter_start {
+            eprintln!(
+                "[PEEPHOLE-TIME] phase1 iteration {}: {:.1} ms",
+                pass_count,
+                s.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        pass_count += 1;
+    }
+
+    // Phase 2: Expensive global passes (run once)
+    let phase2_start = if time_peephole {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let global_changed = if skip_phase2 {
+        false
+    } else {
+        let mut global_changed = false;
+        if !sk("store_fwd") {
+            global_changed |= store_forwarding::global_store_forwarding(&mut store, &mut infos);
+        }
+        // Store forwarding replaces same-register scalar reloads with an
+        // exact zeroing `movq %xmmN, %xmmN`; drop the ones whose upper-half
+        // zeroing nothing observes.
+        if !sk("zeroing_self_move") {
+            global_changed |=
+                vector_copy::eliminate_unobserved_zeroing_self_moves(&store, &mut infos);
+        }
+        if !sk("spill_deref") {
+            global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos);
+        }
+        // ms178: XMM/vector save→clobber→reload round-trips (double_reduction
+        // class): the reload re-executes the original memory load instead of
+        // the frame slot, freeing the slot and the spill store entirely.
+        if !sk("savreload") {
+            global_changed |= spill_deref::fold_save_reload_roundtrip(&mut store, &mut infos);
+        }
+        if !sk("private_spill_cycle") {
+            global_changed |= spill_deref::fold_private_spill_cycle(&mut store, &mut infos);
+        }
+        if !sk("entry_load_relay") {
+            global_changed |= spill_deref::fold_entry_load_relay(&mut store, &mut infos);
+        }
+        if !sk("copy_prop") {
+            global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos);
+        }
+        // After copy propagation (64-bit chains) and before dead-code removal,
+        // so the copies this fold orphans are retired in the same round.
+        if !sk("copy_fold") {
+            global_changed |= narrow_copy_fold::fold_register_copies(&mut store, &mut infos);
+        }
+        // Producer→copy-back staging (the loop-induction update shapes):
+        // `movq 8(%rdx), %rax; movq %rax, %rdx` and
+        // `leaq 8(%rsi), %rax; movq %rax, %rsi` redirect the producer's
+        // destination into the copy target, delete the copy and rewrite
+        // the staging register's remaining uses — GCC's single-register
+        // induction update (hash chains, match loops, rotate counters).
+        if !sk("copyback_fold") {
+            global_changed |= narrow_copy_fold::fold_induction_copyback(&mut store, &mut infos);
+        }
+        // Global passes can re-expose dead `cltq` shapes (store-forwarding
+        // substitutions, spill-deref folds); Phase 1's copy before the LEA
+        // window fold is the primary site, this is the mop-up. Idempotent.
+        if !sk("dead_inplace_ext") {
+            global_changed |= narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos);
+        }
+        if !sk("dead_regs") {
+            global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+            global_changed |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+            global_changed |= self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
+        }
+        if !sk("lea_narrow") {
+            global_changed |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
+        }
+        if !sk("dead_stores") {
+            global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos);
+        }
+        if !sk("cmp_branch") {
+            global_changed |= compare_branch::fuse_compare_and_branch(&mut store, &mut infos);
+        }
+        // Preserve fusion's original spill/reload census, then forward any
+        // remaining GP loads. The existing combined-pass skip controls this
+        // local rewrite too, retaining ablation semantics.
+        if !sk("combined") {
+            global_changed |=
+                local_patterns::forward_adjacent_gp_stack_loads(&mut store, &mut infos);
+        }
+        if !sk("mem_fold") {
+            global_changed |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+        }
+        if !sk("load_relay") {
+            global_changed |= memory_fold::fold_load_relay(&mut store, &mut infos);
+        }
+        if !sk("leaq_relay") {
+            global_changed |= memory_fold::fold_leaq_relay(&mut store, &mut infos);
+        }
+        if !sk("cltq_relay") {
+            global_changed |= memory_fold::fold_cltq_relay(&mut store, &mut infos);
+        }
+        if !sk("ext_relay") {
+            global_changed |= memory_fold::fold_extend_relay(&mut store, &mut infos);
+        }
+        if !sk("slq_relay") {
+            global_changed |= memory_fold::fold_movslq_relay(&mut store, &mut infos);
+        }
+        if !sk("gen_relay") {
+            global_changed |= memory_fold::fold_general_relay(&mut store, &mut infos);
+        }
+        if !sk("store_relay") {
+            global_changed |= memory_fold::fold_store_relay(&mut store, &mut infos);
+        }
+        // ms178: a dead `mov %reg, slot` followed by an ALU reading the slot as
+        // a memory operand folds into a pure-register ALU and drops the store.
+        if !sk("store_alu_fold") {
+            global_changed |= memory_fold::fold_store_alu_memop(&mut store, &mut infos);
+        }
+        // Orphan retirement: every fold above can leave a staging copy whose
+        // value became dead.  Sweep them to a local fixpoint in the same
+        // round — the comment at `copy_fold` promised this retirement and the
+        // only instrument that can prove it (`FileLiveness`) sat in Phase 1.
+        if !sk("dead_pure_writes") {
+            global_changed |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+        }
+        global_changed
+    };
+    if let Some(s) = phase2_start {
+        eprintln!(
+            "[PEEPHOLE-TIME] phase2: {:.1} ms",
+            s.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // Phase 3: One more local cleanup if global passes made changes.
+    if global_changed && !skip_phase3 {
+        let mut changed2 = true;
+        let mut pass_count2 = 0;
+        // Phase 2b: ONE second store-forwarding round, taken only after the
+        // local fixpoint above has gone quiet.
+        //
+        // Phase 2 runs the forwarder once, and it has to answer "may this slot
+        // load be replaced by the register that was just stored into it?"
+        // against the text it was handed. The blocker it most often finds is a
+        // register write between store and load -- but that write is very often
+        // itself removed later in this same function, by phase 2's copy
+        // propagation and by phase 3's folds (`movzbl (%r9,%rsi), %eax;
+        // movzbl %al, %esi` retires into `movzbl (%r9,%rsi), %esi`, and the
+        // `%eax` write that blocked forwarding is gone). Nothing re-asks the
+        // forwarding question afterwards, so the pair survives into the final
+        // assembly: gzip's longest_match kept `movl %eax, 12(%rsp)` /
+        // `movl 12(%rsp), %eax` around its byte compare for exactly this
+        // reason (`lm.raw.s` -> `lm.s`, one store and one load per surviving
+        // candidate in the hottest branch of the program).
+        //
+        // Bounded deliberately: one extra round only, and only if the first
+        // round changed something (i.e. there is a fixpoint to re-reach). A
+        // forwarder that keeps finding work would otherwise re-scan the
+        // function until MAX_POST_GLOBAL_ITERATIONS with no new information.
+        let mut phase2b_pending = !sk("phase2b");
+        while pass_count2 < MAX_POST_GLOBAL_ITERATIONS && (changed2 || phase2b_pending) {
+            if !changed2 {
+                phase2b_pending = false;
+                let mut refed = store_forwarding::global_store_forwarding(&mut store, &mut infos);
+                if !sk("dead_pure_writes") {
+                    refed |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+                }
+                if !refed {
+                    break;
+                }
+            }
+            changed2 = false;
+            // Gated: previously combined_local_pass ran UNGATED here, so it
+            // executed even when the user skipped `combined` — this caused
+            // interaction miscompiles (e.g. redundant `xorl %eax,%eax` removal
+            // across loop boundaries). Honor the skip set.
+            if !sk("combined") {
+                changed2 |= local_patterns::combined_local_pass(&mut store, &mut infos);
+            }
+            if !sk("lea_mem_sib") {
+                changed2 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+            }
+            if !sk("lea_all_uses") {
+                changed2 |= local_patterns::fold_lea_all_uses_in_block(&mut store, &mut infos);
+            }
+            // Phase 2's copy propagation creates the LEA→memory shapes
+            // phase 1's windowed folder never saw: `leaq K(%rax), %rax;
+            // movq %rax, %rsi; movq $0, (%rsi)` loses the relay there
+            // (`movq $0, (%rax)`), and only a fold round AFTER that point
+            // can absorb the LEA into the displacement
+            // (`movq $0, K(%rax)` — the strength-reduced marching-pointer
+            // stores of slot-homed address webs). Idempotent and
+            // liveness-checked; the self-base re-execution veto is inside
+            // the pass.
+            if !sk("lea_window") {
+                changed2 |= relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
+            }
+            // Phase 2's copy propagation can expose the same scaled-index
+            // temporaries (see `fold_scaled_index_temp_into_mem`).
+            if !sk("scaled_index_temp") {
+                changed2 |= relay_and_lea::fold_scaled_index_temp_into_mem(&mut store, &mut infos);
+            }
+            // Phase 2's copy propagation retires the other readers of a
+            // copied value (`movq %rax, %r10; addq %r10, %r12` becomes
+            // `addq %rax, %r12`), leaving the mask as the copy's only reader
+            // only now: hot_web_loop's `(h & 255) == 0` reaches `testb %al,
+            // %al` here, never in phase 1.  Idempotent and liveness-checked.
+            if !sk("copy_mask_test") {
+                changed2 |= flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
+            }
+            if !sk("load_mask_test") {
+                changed2 |= load_mask_test::fold_load_mask_into_memory_test(&mut store, &mut infos);
+            }
+            changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+            changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+            if !sk("fp_reg_mem_fold") {
+                changed2 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+            }
+            if !sk("fp_const_hoist") {
+                changed2 |= memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
+            }
+            if relay_opt_in && !sk("load_copy_relay") {
+                changed2 |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
+            }
+            changed2 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+            // Phase 2's copy propagation and relay passes keep creating
+            // copy+add(+copy) chains; re-run the staged-add fold so those
+            // late shapes also reach the single-LEA form. Idempotent and
+            // liveness-checked.
+            if !sk("staged_add_lea") {
+                changed2 |= local_patterns::fuse_staged_add_and_relay(&mut store, &mut infos);
+            }
+            if !sk("load_lea_add") {
+                changed2 |= local_patterns::fuse_load_lea_add(&mut store, &mut infos);
+            }
+            if !sk("load_lea_base") {
+                changed2 |= local_patterns::fuse_load_lea_into_base(&mut store, &mut infos);
+            }
+            changed2 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+            changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
+            if !sk("dead_regs") {
+                changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+                changed2 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+                changed2 |= self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
+            }
+            if !sk("lea_narrow") {
+                changed2 |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
+            }
+            // A redundant self-zext deleted above can be the only line
+            // separating a `mov MEM,%d; <inc %d>; mov %d,MEM` trio (the
+            // emitter re-zero-extends a 32-bit index before each access),
+            // and Phase 1's `mem_rmw` never runs again: re-try the fold here.
+            if !sk("mem_rmw") {
+                changed2 |= memory_fold::fold_memory_rmw(&mut store, &mut infos);
+            }
+            if !sk("dead_stores") {
+                changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
+            }
+            if !sk("mem_fold") {
+                changed2 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            }
+            if !sk("load_relay") {
+                changed2 |= memory_fold::fold_load_relay(&mut store, &mut infos);
+            }
+            if !sk("leaq_relay") {
+                changed2 |= memory_fold::fold_leaq_relay(&mut store, &mut infos);
+            }
+            if !sk("cltq_relay") {
+                changed2 |= memory_fold::fold_cltq_relay(&mut store, &mut infos);
+            }
+            if !sk("ext_relay") {
+                changed2 |= memory_fold::fold_extend_relay(&mut store, &mut infos);
+            }
+            if !sk("gen_relay") {
+                changed2 |= memory_fold::fold_general_relay(&mut store, &mut infos);
+            }
+            if !sk("store_relay") {
+                changed2 |= memory_fold::fold_store_relay(&mut store, &mut infos);
+            }
+            if !sk("store_alu_fold") {
+                changed2 |= memory_fold::fold_store_alu_memop(&mut store, &mut infos);
+            }
+            if !sk("base_index") {
+                changed2 |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
+            }
+            if !sk("phi_coalesce") {
+                changed2 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+            }
+            if !sk("signext_move") {
+                changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            }
+            if !sk("ext_chain") {
+                changed2 |= local_patterns::collapse_extension_chains(&mut store, &mut infos);
+            }
+            if !sk("signext_narrow") {
+                changed2 |= local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos);
+            }
+            changed2 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+            if !sk("copy_shift_back") {
+                changed2 |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
+            }
+            if !sk("xor_move_fold") {
+                changed2 |= local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);
+            }
+            if !sk("rotate_idiom") {
+                changed2 |= local_patterns::fold_rotate_idiom(&mut store, &mut infos);
+            }
+            if !sk("vec_self_move") {
+                changed2 |= local_patterns::eliminate_vector_self_moves(&mut store, &mut infos);
+            }
+            // Orphan retirement inside the fixpoint: folds above orphan pure
+            // writes; retiring them lets the next iteration see the cleaner
+            // code (and the while-changed loop then converges).
+            if !sk("dead_pure_writes") {
+                changed2 |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+            }
+            pass_count2 += 1;
+        }
+    }
+
+    // Phase 3b: Fuse addl+movslq in loops (must run BEFORE trampoline elimination,
+    // which may remove the conditional back-edge that this pass uses to detect loops).
+    // fuse_add_sign_extend removed (unsound: uninitialized dest + dropped sext).
+
+    // Phase 3c: the producer retarget whose sources may name either register,
+    // once the local fixpoints have converged (see
+    // `retarget_producer_into_copy_aliasing` for why not inside them).
+    // A late rename can make an identity adjacent that the converged local
+    // fixpoint never saw (`xor $K,%a; mov %a,%b; xor $K,%b` renamed into
+    // `%b`); the highbit XOR pair is the one such identity cancelled here.
+    let mut renamed_late = false;
+    if !skip_phase1
+        && !sk("producer_retarget")
+        && relay_and_lea::retarget_producer_into_copy_aliasing(&mut store, &mut infos)
+    {
+        renamed_late = true;
+        if !sk("dead_regs") {
+            self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
+            dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+        }
+        if !sk("lea_narrow") {
+            lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
+        }
+    }
+    // Phase 3d: the windowed chain rename (`leal …, %T; addl …, %T; movl %T,
+    // %eax` -> computed in %eax), same phase discipline as 3c.
+    if !skip_phase1
+        && !sk("chain_retarget")
+        && relay_and_lea::rename_chain_into_copy(&mut store, &mut infos)
+    {
+        renamed_late = true;
+        if !sk("dead_regs") {
+            self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
+            dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+        }
+    }
+    if renamed_late && !sk("combined") {
+        local_patterns::cancel_highbit_double_xors(&store, &mut infos);
+    }
+    if renamed_late && !sk("highbit_sub") {
+        local_patterns::fold_highbit_subs(&mut store, &mut infos);
+    }
+    if renamed_late && !sk("guarded_scan") {
+        local_patterns::fold_guarded_scan_selects(&mut store, &mut infos);
+    }
+    if renamed_late && !sk("scan_copy") {
+        local_patterns::retarget_preloaded_scan_copies(&mut store, &mut infos);
+    }
+
+    // Phase 4: Eliminate loop backedge trampoline blocks.
+    let trampoline_changed = if skip_phase4 || sk("loop_trampoline") {
+        false
+    } else {
+        loop_trampoline::eliminate_loop_trampolines(&mut store, &mut infos)
+    };
+
+    // Phase 4b: If trampoline elimination made changes, do another round of local cleanup.
+    if trampoline_changed && !skip_phase4 {
+        let mut changed3 = true;
+        let mut pass_count3 = 0;
+        while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
+            changed3 = false;
+            changed3 |= local_patterns::combined_local_pass(&mut store, &mut infos);
+            if !sk("lea_mem_sib") {
+                changed3 |= local_patterns::fold_lea_into_memory_op(&mut store, &mut infos);
+            }
+            changed3 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            changed3 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
+            changed3 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
+            if !sk("fp_reg_mem_fold") {
+                changed3 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+            }
+            changed3 |= local_patterns::eliminate_rcx_address_copy(&mut store, &mut infos);
+            changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
+            if !sk("dead_regs") {
+                changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+                changed3 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
+                changed3 |= self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
+            }
+            if !sk("lea_narrow") {
+                changed3 |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
+            }
+            // A redundant self-zext deleted above can be the only line
+            // separating a `mov MEM,%d; <inc %d>; mov %d,MEM` trio (the
+            // emitter re-zero-extends a 32-bit index before each access),
+            // and Phase 1's `mem_rmw` never runs again: re-try the fold here.
+            if !sk("mem_rmw") {
+                changed3 |= memory_fold::fold_memory_rmw(&mut store, &mut infos);
+            }
+            if !sk("dead_stores") {
+                changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);
+            }
+            if !sk("mem_fold") {
+                changed3 |= memory_fold::fold_memory_operands(&mut store, &mut infos);
+            }
+            if !sk("load_relay") {
+                changed3 |= memory_fold::fold_load_relay(&mut store, &mut infos);
+            }
+            if !sk("leaq_relay") {
+                changed3 |= memory_fold::fold_leaq_relay(&mut store, &mut infos);
+            }
+            if !sk("cltq_relay") {
+                changed3 |= memory_fold::fold_cltq_relay(&mut store, &mut infos);
+            }
+            if !sk("ext_relay") {
+                changed3 |= memory_fold::fold_extend_relay(&mut store, &mut infos);
+            }
+            if !sk("gen_relay") {
+                changed3 |= memory_fold::fold_general_relay(&mut store, &mut infos);
+            }
+            changed3 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
+            if !sk("signext_move") {
+                changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            }
+            if !sk("ext_chain") {
+                changed3 |= local_patterns::collapse_extension_chains(&mut store, &mut infos);
+            }
+            if !sk("signext_narrow") {
+                changed3 |= local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos);
+            }
+            changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
+            // Orphan retirement inside the fixpoint (see phase 3).
+            if !sk("dead_pure_writes") {
+                changed3 |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+            }
+            pass_count3 += 1;
+        }
+    }
+
+    // Phase 4c: Late loop-invariant hoisting.
+    if !skip_phase4 && !sk("gpr_hoist") {
+        local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+    }
+
+    // Phase 4d: Loop rotation — move condition from header to latch.
+    if !skip_phase4 && !sk("loop_rotation") {
+        local_patterns::rotate_loops(&mut store, &mut infos);
+    }
+
+    // Phase 4e: extended-basic-block reuse. Delete copies and compares a
+    // single-predecessor path already established (`ebb_reuse`), then move a
+    // copy only the fall-through arm reads past its `jcc`; retire whatever
+    // the deletions left dead. `CCC_PEEPHOLE_SKIP=ebb_reuse` / `copy_sink`.
+    if !sk("ebb_reuse") && ebb_reuse::reuse_ebb_copies_and_flags(&mut store, &mut infos) {
+        retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+    }
+    if !sk("copy_sink") {
+        ebb_reuse::sink_copies_into_fallthrough(&mut store, &mut infos);
+    }
+
+    // Phase 5: Tail call optimization.
+    if !skip_phase5 {
+        tail_call::optimize_tail_calls(&mut store, &mut infos);
+    }
+
+    // Phase 5b: Global dead store elimination for never-read stack slots.
+    if !skip_phase5 {
+        dead_code::eliminate_never_read_stores(&store, &mut infos);
+    }
+
+    // Select a native mask only from an already-BMI2, low-byte-saturating
+    // sequence. Run before save/frame cleanup so dead temporaries do not
+    // leave unnecessary callee-save traffic behind.
+    if !sk("bmi2_mask") {
+        bmi2_mask::fuse_masks(&mut store, &mut infos);
+    }
+
+    // Stack forwarding can expose adjacent shuffles only after Phase 1.
+    // Revisit them before frame cleanup so frontend-generated chains benefit,
+    // not just already-adjacent assembly fragments.
+    if !sk("vector_copy_retarget") {
+        vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos);
+    }
+
+    // Phase 6: Eliminate unused callee-saved register saves/restores.
+    if !skip_phase6 {
+        callee_saves::eliminate_unused_callee_saves(&mut store, &mut infos);
+        callee_saves::eliminate_unused_callee_saves_fpo(&mut store, &mut infos);
+    }
+
+    // Phase 7: Compact stack frames.
+    if !skip_phase7 {
+        frame_compact::compact_frame(&mut store, &mut infos);
+        // Never-referenced leaf frames (`subq $N, %rsp` with no body
+        // reference to %rsp): slots the allocator reserved and later
+        // passes retired. GCC's leaf functions carry no such frame.
+        frame_compact::remove_dead_leaf_frame(&mut store, &mut infos);
+    }
+
+    // Phase 7a: `load` + `bswap` on one register -> one MOVBE.
+    //
+    // It runs HERE, not with the phase-1 folds, because the pair does not
+    // exist until the copy/relay passes have settled: isel emits the byte swap
+    // against its own operand and the allocator's copies are still in place
+    // (`movq (%rdi), %rax; movq %rax, %rdi; bswapq %rdi`), so a phase-1
+    // matcher sees `load; copy` and nothing to fuse.  Measured for the oracle
+    // at -march=x86-64-v3: GCC 16.2 and ICX emit `movbeq (%rdi), %rax` where
+    // LCCC emitted `movq` + `bswapq`, and Clang 23.1 emits a twelve-instruction
+    // `vpmovzxbq`/`vpsllvq`/`vpor` chain.  Its own skip name (`movbe_fuse`) and
+    // its own `X86Isa::movbe` permission (`-mno-movbe`, `-march=x86-64`), so
+    // the A/B is one flag and the target contract is the driver's.
+    if !sk("movbe_fuse") {
+        load_bswap_movbe::fuse_load_bswap(
+            &mut store,
+            &mut infos,
+            crate::backend::x86::isa::current().movbe,
+        );
+    }
+
+    // Phase 7b: Narrow `movabsq/movq $imm` to `movl` where zero-extension
+    // yields the identical 64-bit value (BACKLOG PF-16). Runs after every
+    // pattern pass so no earlier matcher has to know both spellings.
+    if !sk("narrow_imm") {
+        load_op_fuse::narrow_wide_immediates(&mut store, &mut infos);
+    }
+
+    // Phase 8: Merge identical basic blocks (phi trampoline deduplication).
+    // Must run after all other transformations to catch final identical patterns.
+    if !sk("identical_blocks") {
+        identical_blocks::merge_identical_blocks(&mut store, &mut infos);
+    }
+
+    // Dead copies can leave branch-only blocks after the IR CFG cleanup.
+    // Retarget their direct edges while lines are still individually parsed.
+    // Only relays it orphans go (no mention anywhere in the file), so
+    // computed gotos and address identity stay intact.
+    // Retargeting can widen a rel8 branch while retaining its relay. Until
+    // exact layout proves non-growth, preserve size mode rather than guess.
+    if !optimize_for_size && !sk("jump_thread") {
+        jump_thread::run(&mut store, &mut infos);
+    }
+
+    if let Some(s) = peephole_total {
+        eprintln!(
+            "[PEEPHOLE-TIME] total: {:.1} ms",
+            s.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // Phase 8b: terminal epilogue cross-jumping.  Every frame/callee-save,
+    // trampoline, tail-call, and identical-block rewrite has now settled, so
+    // the pass sees the largest set of compatible suffixes.  It deliberately
+    // runs after all structured LineStore passes: its synthetic `label +\n\
+    // instruction` replacement is assembler text, not an input for another
+    // line classifier.
+    if !sk("epilogue_merge") {
+        let _ = epilogue_merge::merge_epilogue_tails(&mut store, &mut infos);
+    }
+
+    // Final orphan sweep: phases 4c–8b (hoisting, rotation, tail calls, slot
+    // DSE, callee-save elimination, frame compaction, block merging) can each
+    // orphan a pure write after the last fixpoint loop above.  This restores
+    // the pipeline's terminal invariant: no provably-dead GP pure write
+    // leaves the peephole.
+    if !sk("dead_pure_writes") {
+        let _ = retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+    }
+
+    // Phase 8b: index-only lea + add fused into one SIB address, so the
+    // terminal window the next phase walks already sees the shorter chain.
+    // `CCC_PEEPHOLE_SKIP=lea_add_fuse` disables it for bisection.
+    if !sk("lea_add_fuse") {
+        lea_add_fuse::run(&mut store, &mut infos);
+    }
+
+    // Phase 8c: terminal return-home coalescing.  Runs after every rewrite
+    // that can still grow or shrink the tail (epilogue cross-jump, final dead
+    // sweep) and before `return_bool`, whose cmp/setcc shapes never carry a
+    // return copy for it to fold anyway.  `CCC_PEEPHOLE_SKIP=return_home`
+    // disables it for bisection.
+    if !sk("return_home") {
+        return_home::run(&mut store, &mut infos);
+    }
+
+    // Phase 8d: the signed power-of-two division bias-add identity into the
+    // conditional-add/cmov machine idiom — four instructions, no sign
+    // scratch, and the arms land directly in the return register on terminal
+    // paths because `return_home` already ran.  `CCC_PEEPHOLE_SKIP=pow2_cmov`
+    // disables it for bisection.
+    if !sk("pow2_cmov") {
+        pow2_cmov::run(&mut store, &mut infos);
+    }
+
+    if !sk("return_bool") {
+        return_bool::run(&mut store, &mut infos);
+    }
+
+    // Phase 8d': sign tests as a shift of the sign bit (`xorl; testl; setl`
+    // -> `movl; shrl $31`).  Unconditional and this late because its inputs
+    // are final only here: the setcc pre-zeroing and the mask-to-memory test
+    // folds produce them, and Phase 3 does not run when no global pass
+    // changed anything.  Before 8e, whose same-line marker blocks the
+    // liveness oracle cannot read.  `CCC_PEEPHOLE_SKIP=sign_test`.
+    if !sk("sign_test") {
+        sign_test::materialize_sign_tests(&mut store, &mut infos);
+    }
+    // Phase 8e: conditional sibling calls (`je .L; ... .L: jmp sym` ->
+    // `je sym`).  Terminal: the rewritten `jcc` carries the tail call's
+    // marker block on the same store line, which only the Phase 9 re-parse
+    // splits back into lines the liveness oracles read.
+    // `CCC_PEEPHOLE_SKIP=cond_tail_call` disables it for bisection.
+    // Phase 8e also hoists identical arm heads above their `jcc` first
+    // (`CCC_PEEPHOLE_SKIP=arm_head_hoist`): it turns `jcc .L; .LF: mov; jmp
+    // f; .L: mov; jmp g` into a relay the conditional tail call can absorb.
+    if !sk("arm_head_hoist") {
+        jump_thread::hoist_common_arm_heads(&mut store, &mut infos);
+    }
+    if !sk("cond_tail_call") {
+        jump_thread::fold_conditional_tail_calls(&mut store, &mut infos);
+    }
+
+    // Phase 9: Re-run the always-on text passes on the FINAL text. The early
+    // pushfq/popfq elimination is conservative about rsp-relative memory
+    // operands, and the local passes frequently remove/rewrite exactly those
+    // instructions — leaving windows that are now flag-neutral and safe to
+    // strip. Same for redundant zero-extensions exposed by relay folding.
+    if std::env::var("CCC_NO_PEEPHOLE_RERUN").is_ok() {
+        return store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows);
+    }
+    let mut result = store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows);
+    let _ = compare_branch::fuse_late_compare_bool_spills(&mut result);
+    let _ = pushf_elim::eliminate_redundant_pushfq(&mut result);
+    let _ = redundant_ext::eliminate_redundant_zero_extend(&mut result);
+    result
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod whitespace_invariance;
+
+/// Wrap a peephole test fragment in a complete function: a `.cfi_startproc`
+/// / `.cfi_endproc` pair and a `ret` whose `%rax` is freshly zeroed.  The
+/// passes that delete a definition prove its register dead with the CFG
+/// liveness oracle, which only answers inside a real function: a bare
+/// fragment says nothing about what its (unknown) continuation reads.
+#[cfg(test)]
+fn in_function(body: &[&str]) -> String {
+    let mut out = String::from("f:\n.cfi_startproc\n");
+    for line in body {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("    xorl %eax, %eax\n    ret\n.cfi_endproc\n");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::metric_pair::{MetricCandidate, pair_counters, tag_metric_candidate};
+
+    // ── `-g` invariance: hidden line rows ──────────────────────────────────
+
+    /// `body` with `per_line` `.loc` rows before every line.
+    fn with_rows(body: &[&str], per_line: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for (n, line) in body.iter().enumerate() {
+            for k in 0..per_line {
+                out.push(format!(".loc 1 {} {k}", n + 1));
+            }
+            out.push((*line).to_string());
+        }
+        out
+    }
+
+    fn code_of(asm: &str) -> String {
+        asm.lines()
+            .filter(|l| !crate::backend::peephole_common::is_loc_directive(l.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_g_invariant(body: &[&str], per_line: usize) -> String {
+        let plain = peephole_optimize(in_function(body));
+        let rows = with_rows(body, per_line);
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let debug = peephole_optimize(in_function(&rows));
+        assert_eq!(code_of(&debug), code_of(&plain), "-g changed the code");
+        // A row whose lines were all deleted is superseded; some must stay.
+        assert!(debug.contains(".loc 1 "), "rows were dropped:\n{debug}");
+        plain
+    }
+
+    /// Dead-store elimination's window is 64 *live* lines: rows (or lines
+    /// earlier passes deleted) no longer shrink it, so a store overwritten 40
+    /// instructions later dies with and without `-g` (it survived `-g` at
+    /// -O0 in simd_defer_chain.c, where rows pushed the overwrite past 64
+    /// raw lines).
+    #[test]
+    fn dead_store_window_ignores_debug_rows() {
+        let mut body = vec![
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    subq $32, %rsp",
+            "    movq %rdi, -8(%rbp)",
+        ];
+        body.extend(std::iter::repeat_n("    addq %rsi, %rdx", 40));
+        body.extend([
+            "    movq %rdx, -8(%rbp)",
+            "    movq -8(%rbp), %rax",
+            "    leave",
+            "    ret",
+        ]);
+        let plain = assert_g_invariant(&body, 2);
+        assert!(!plain.contains("movq %rdi, -8(%rbp)"), "{plain}");
+    }
+
+    /// The FP constant hoist plants its materialization in a NOP slot; a
+    /// hidden row is not one, or `-g` alone would hoist.
+    #[test]
+    fn fp_constant_hoist_does_not_take_a_debug_row_slot() {
+        assert_g_invariant(
+            &[
+                "    movsd (%rdi), %xmm2",
+                "    mulsd .LCFP_3(%rip), %xmm2",
+                "    movsd 8(%rdi), %xmm5",
+                "    mulsd .LCFP_3(%rip), %xmm5",
+                "    addsd %xmm5, %xmm2",
+                "    movapd %xmm2, %xmm0",
+            ],
+            1,
+        );
+    }
+
+    /// A row between a copy and its consumer must not block the coalesce
+    /// (36 regression sources compiled differently with `-g` before rows
+    /// were hidden).
+    #[test]
+    fn copy_coalesce_ignores_debug_rows() {
+        assert_g_invariant(
+            &[
+                "    movl %edi, %eax",
+                "    movl %eax, %r10d",
+                "    xorl $255, %r10d",
+                "    movl %r10d, %eax",
+                "    ret",
+            ],
+            1,
+        );
+    }
+
+    /// A row right before the barrier that ends the sign-extension scan must
+    /// not hide the liveness proof (`-O2 -g` kept three `movslq` in
+    /// packed_mask_shifts.c once the closing-brace row preceded the epilogue).
+    #[test]
+    fn dead_sign_extension_proof_ignores_debug_rows() {
+        let plain = assert_g_invariant(
+            &["    movslq %edi, %rcx", "    movl %ecx, (%rsi)", "    ret"],
+            1,
+        );
+        assert!(!plain.contains("movslq"), "{plain}");
+    }
+
+    // ── Dual-layout metric pair: scheduling, determinism, instruments ──────
+
+    fn metric_candidate(name: &str, immediate: i32, padding: usize) -> String {
+        let mut text = format!(".text\n{name}:\n.cfi_startproc\n    movl ${immediate}, %eax\n");
+        for _ in 0..padding {
+            text.push_str("    nop\n");
+        }
+        text.push_str("    ret\n.cfi_endproc\n");
+        text
+    }
+
+    /// Identical candidates cannot produce different results (the pipeline is a
+    /// pure function of text plus policy), so the second pass is skipped — and
+    /// the counter proves the shortcut, not just the output.
+    #[test]
+    fn identical_candidates_are_peepholized_once() {
+        let config = RaConfig::default();
+        let text = metric_candidate("same", 17, 1200);
+        let expected = peephole_optimize_with_config(text.clone(), &config, false);
+        let before = pair_counters().2;
+        let (first, second) =
+            peephole_optimize_pair_with_config(text.clone(), text, &config, false);
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        assert!(
+            pair_counters().2 > before,
+            "the dedupe counter must advance (deltas only: it is process-global)"
+        );
+    }
+
+    /// End to end through the production entry point, on fragments large
+    /// enough to cross the parallel gate. Each side must equal its independent
+    /// serial result in both size modes; the candidates stay observably
+    /// distinct, so returning one result twice cannot satisfy the assertions.
+    #[test]
+    fn dual_layout_pair_is_byte_identical_to_serial_metrics() {
+        let config = RaConfig::default();
+        for optimize_for_size in [false, true] {
+            let first = metric_candidate("first", 17, 1200);
+            let second = metric_candidate("second", 29, 1200);
+            let expected_first =
+                peephole_optimize_with_config(first.clone(), &config, optimize_for_size);
+            let expected_second =
+                peephole_optimize_with_config(second.clone(), &config, optimize_for_size);
+            assert_ne!(
+                expected_first, expected_second,
+                "the candidates must stay distinguishable"
+            );
+            let (actual_first, actual_second) =
+                peephole_optimize_pair_with_config(first, second, &config, optimize_for_size);
+            assert_eq!(actual_first, expected_first, "size={optimize_for_size}");
+            assert_eq!(actual_second, expected_second, "size={optimize_for_size}");
+        }
+    }
+
+    /// Both candidates of a pair must reach distinct instrument files, or the
+    /// second silently replaces the first and the survivor depends on which
+    /// side of the pair finished last.
+    #[test]
+    fn candidate_path_keeps_both_candidates_of_a_pair() {
+        assert_eq!(
+            candidate_path("/tmp/dump.s"),
+            std::path::PathBuf::from("/tmp/dump.s"),
+            "no label, no suffix"
+        );
+        let chain = tag_metric_candidate(MetricCandidate::Chain, || candidate_path("/tmp/dump.s"));
+        let orig =
+            tag_metric_candidate(MetricCandidate::Original, || candidate_path("/tmp/dump.s"));
+        assert_eq!(chain, std::path::PathBuf::from("/tmp/dump-chain.s"));
+        assert_eq!(orig, std::path::PathBuf::from("/tmp/dump-orig.s"));
+        assert_ne!(chain, orig);
+        assert_eq!(
+            tag_metric_candidate(MetricCandidate::Chain, || candidate_path("/tmp/dump")),
+            std::path::PathBuf::from("/tmp/dump-chain"),
+            "a path without an extension still gains the suffix"
+        );
+    }
+
+    #[test]
+    fn test_never_read_store_eliminated_in_six_push_nofp_function() {
+        // No-FP functions push rbp as an ordinary callee-saved register, so
+        // the `subq $N,%rsp` prologue marker is separated from the .cfi
+        // directives by the whole push chain.  The old form-1 failure path
+        // skipped past the subq and the form-2 window missed the directives,
+        // disabling dead-store elimination for such functions entirely
+        // (gzip CRC kernel: a never-read `movq %rax, 8(%rsp)` survived).
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    pushq %r13\n",
+            "    pushq %r14\n",
+            "    pushq %r15\n",
+            "    pushq %rbp\n",
+            "    subq $24, %rsp\n",
+            ".cfi_def_cfa_offset 80\n",
+            "    movabsq $4294967295, %r13\n",
+            ".L1:\n",
+            "    movl (%rsi), %eax\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    addl %eax, %r13d\n",
+            "    jmp .L1\n",
+            ".Lend:\n",
+            "    addq $24, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %r15\n",
+            "    popq %r14\n",
+            "    popq %r13\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size main, .-main\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rax, 8(%rsp)"),
+            "never-read slot store must be eliminated:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_parse_frame_mem_plain_sib_and_none() {
+        let f = |s: &str| parse_frame_mem(s);
+        let m = f("    movl -24(%rsp, %r10, 4), %edx").unwrap();
+        assert_eq!((m.base, m.disp, m.sib), (b's', -24, true));
+        let m = f("    movq %rax, 16(%rsp)").unwrap();
+        assert_eq!((m.base, m.disp, m.sib), (b's', 16, false));
+        let m = f("    addl (%rbp, %r8, 4), %eax").unwrap();
+        assert_eq!((m.base, m.disp, m.sib), (b'b', 0, true));
+        assert!(f("    movl (%rsi, %r11, 4), %eax").is_none());
+        assert!(f("    movq %rax, %rbx").is_none());
+    }
+
+    /// sha256_transform-shaped frame: a leaq floor for the w[] buffer at
+    /// 40(%rsp), bounded sliding-window SIB reads with shifted (negative)
+    /// displacements indexed by a proven induction register, and a main
+    /// loop with an upward SIB floor. The dead counter home-slot store at
+    /// 16(%rsp) must be deleted while a store inside the escaped w[] region
+    /// is retained.
+    #[test]
+    fn test_never_read_store_below_sib_array_is_eliminated() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    pushq %r13\n",
+            "    pushq %r14\n",
+            "    pushq %r15\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 368\n",
+            "    movq %rdi, 296(%rsp)\n",
+            "    leaq 40(%rsp), %rax\n",
+            "    movq %rdi, 48(%rsp)\n",
+            "    movq $16, %r10\n",
+            ".Lwhdr:\n",
+            "    cmpq $64, %r10\n",
+            "    jge .Lwout\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    movl -20(%rsp, %r10, 4), %esi\n",
+            "    movl 12(%rsp, %r10, 4), %edx\n",
+            "    movl 32(%rsp, %r10, 4), %edx\n",
+            "    addq $1, %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            ".Lwout:\n",
+            "    xorl %r8d, %r8d\n",
+            ".Lmhdr:\n",
+            "    cmpq $64, %r8\n",
+            "    jge .Lmout\n",
+            ".Lmbody:\n",
+            "    movl 40(%rsp, %r8, 4), %esi\n",
+            "    movq %r8, %rax\n",
+            "    leaq 1(%r8), %rax\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    movq %rax, %r8\n",
+            "    cmpq $64, %r8\n",
+            "    jl .Lmbody\n",
+            ".Lmout:\n",
+            "    movq 296(%rsp), %rcx\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %r15\n",
+            "    popq %r14\n",
+            "    popq %r13\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rax, 16(%rsp)"),
+            "dead home-slot store below the w[] region must be eliminated:\n{result}"
+        );
+        assert!(
+            result.contains("movq %rdi, 48(%rsp)"),
+            "a store at/above the escaped w[] floor must be retained:\n{result}"
+        );
+        assert!(
+            result.contains("movq %rdi, 296(%rsp)") || result.contains("movq"),
+            "sanity: output retains code:\n{result}"
+        );
+    }
+
+    /// Adversarial: a shifted-displacement SIB read with an UNBOUNDED index
+    /// (loaded from memory, no induction shape) can reach the low home slots,
+    /// so the never-read pass must fail closed for the whole function.
+    #[test]
+    fn test_unbounded_negative_sib_pins_dead_store() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq (%rsi), %r10\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    addl %edx, %eax\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    jmp .Lwbody\n",
+            ".Lmout:\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 16(%rsp)"),
+            "unbounded negative SIB reach must pin the home-slot store:\n{result}"
+        );
+    }
+
+    /// Variable-stride index (`leaq (%rX,%rY), %rX`) cannot prove the
+    /// induction bounds; a negative-displacement SIB read then fails closed
+    /// and pins the low home-slot store.
+    #[test]
+    fn test_variable_stride_sib_pins_home_slot() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq $16, %r10\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    leaq (%r10,%r9), %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 16(%rsp)"),
+            "variable-stride index must fail closed for negative-disp SIB:\n{result}"
+        );
+    }
+
+    /// A bit-string op through a frame SIB operand can reach the next
+    /// operand word; the suffix width must not bound it.
+    #[test]
+    fn test_bt_bitstring_sib_pins_home_slot() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq $16, %r10\n",
+            ".Lwbody:\n",
+            "    btsq %r11, -24(%rsp, %r10, 4)\n",
+            "    addq $1, %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            "    movq %rax, 16(%rsp)\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 16(%rsp)"),
+            "bit-string SIB reach must fail closed:\n{result}"
+        );
+    }
+
+    /// A positive scale-stride self-lea IS a provable (monotone) induction
+    /// step; the bounded interval still proves and a below-range home store
+    /// dies. (The interval is a safe over-approximation of the sparse
+    /// visited indices.)
+    #[test]
+    fn test_scale_stride_self_lea_is_bounded() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq $4, %r10\n",
+            ".Lwbody:\n",
+            "    movl 16(%rsp, %r10, 4), %edx\n",
+            "    leaq (%r10,%r10,4), %r10\n",
+            "    cmpq $16, %r10\n",
+            "    jl .Lwbody\n",
+            "    movq %rcx, 8(%rsp)\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        // Bounded interval starts at 16 + 4*4 = 32; a home store at 8 never
+        // meets it and is dead.
+        assert!(
+            !result.contains("movq %rcx, 8(%rsp)"),
+            "bounded scale-stride induction must free the below-range slot:\n{result}"
+        );
+    }
+
+    /// Adversarial near-miss: a store whose bytes overlap a bounded SIB read
+    /// range must be retained even though no plain LoadRbp reads it.
+    #[test]
+    fn test_store_inside_bounded_sib_range_is_retained() {
+        let asm = concat!(
+            "sha:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %rbp\n",
+            "    subq $312, %rsp\n",
+            ".cfi_def_cfa_offset 336\n",
+            "    movq %rdi, 48(%rsp)\n",
+            "    movq $16, %r10\n",
+            ".Lwbody:\n",
+            "    movl -24(%rsp, %r10, 4), %edx\n",
+            "    addl %edx, %eax\n",
+            "    addq $1, %r10\n",
+            "    cmpq $64, %r10\n",
+            "    jl .Lwbody\n",
+            "    addq $312, %rsp\n",
+            "    popq %rbp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size sha, .-sha\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, 48(%rsp)"),
+            "store bytes inside the bounded SIB read range must survive:\n{result}"
+        );
+    }
+
+    /// Inline asm naming a FIXED frame slot (`vstmxcsr 48(%rsp)`) pins only
+    /// that slot's region, not unrelated low home slots.
+    #[test]
+    fn test_inline_asm_plain_frame_slot_is_local_pessimization() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    subq $64, %rsp\n",
+            "#APP\n",
+            "    vstmxcsr 48(%rsp)\n",
+            "#NO_APP\n",
+            "    movl 48(%rsp), %r11d\n",
+            "    movl $21, %edx\n",
+            "#APP\n",
+            "    leaq (%rdx,%rdx), %rcx\n",
+            "#NO_APP\n",
+            "    movq %rcx, 8(%rsp)\n",
+            "    movq %rcx, %rax\n",
+            "    movq %rcx, %rdx\n",
+            "    addq $64, %rsp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size main, .-main\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rcx, 8(%rsp)"),
+            "a fixed-slot asm operand must not pin an unrelated home slot:\n{result}"
+        );
+        assert!(
+            result.contains("vstmxcsr 48(%rsp)"),
+            "inline asm itself must never be touched:\n{result}"
+        );
+    }
+
+    /// Adversarial: inline asm with an SIB frame operand uses raw, C-UB-free
+    /// index values that can reach every lower slot — fail closed.
+    #[test]
+    fn test_inline_asm_sib_frame_pins_home_slot() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    subq $64, %rsp\n",
+            "    movq (%rsi), %rcx\n",
+            "#APP\n",
+            "    movl 40(%rsp,%rcx,4), %eax\n",
+            "#NO_APP\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    addq $64, %rsp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".size main, .-main\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, 8(%rsp)"),
+            "SIB frame indexing inside raw asm must pin lower home slots:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_cfg_retargets_accumulator_update_copyback() {
+        let asm = concat!(
+            "f:\n",
+            "    movq %rcx, %rax\n",
+            "    incl %eax\n",
+            "    movl %eax, %ecx\n",
+            "    movq $0, %rax\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("incl %ecx"), "{result}");
+        assert!(
+            !result.contains("movq %rcx, %rax\n    incl %eax"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn test_copy_propagates_into_source_clobbering_address_load() {
+        let asm = concat!(
+            "f:\n",
+            "    movq %rax, %rcx\n",
+            "    movsbl (%rcx), %eax\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movsbl (%rax), %eax"), "{result}");
+        assert!(!result.contains("movq %rax, %rcx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_into_scalar_store() {
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdx, %rcx\n",
+            "    movq %rax, (%rcx)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movq %rax, (%rdx)"), "{result}");
+        assert!(!result.contains("movq %rdx, %rcx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_into_store_keeps_live_rcx() {
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdx, %rcx\n",
+            "    movq %rax, (%rcx)\n",
+            "    addq $1, %rcx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movq %rdx, %rcx"), "{result}");
+        assert!(result.contains("(%rcx)"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_preserves_later_reused_source() {
+        // The first load uses %rcx as a temporary address register.  The
+        // later identical stack load can be folded to `movq %rcx, %rax` by
+        // reuse_redundant_loads, so the defining copy must not be removed just
+        // because the immediate dereference does not read %rcx afterwards.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq -8(%rbp), %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rax, -16(%rbp)\n",
+            "    movq -8(%rbp), %rax\n",
+            "    movq %rax, -24(%rbp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq -8(%rbp), %rcx"),
+            "the address-copy definition was removed before its later use: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_register_source_with_later_use() {
+        // The register-source spelling of the same contract — and the exact
+        // shape the matcher fires on (`movq %<gpr>, %rcx`): a later reload
+        // use of %rcx after the dereference must keep the defining copy.
+        // The one-instruction lookahead this pass used to have answered
+        // "dead" here by only inspecting the first following line.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rax, -16(%rbp)\n",
+            "    movq %rcx, %rax\n",
+            "    movq %rax, -24(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "the address copy was removed before its later %rcx use: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_cmov_is_not_a_kill() {
+        // cmovCC conditionally PRESERVES the old destination (it is a
+        // read-modify-write of %rcx), so the copied value stays observable
+        // through it even though the destination token is the full family.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    cmovz %rbx, %rcx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "cmov was treated as a full kill of %rcx: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_setcc_is_not_a_kill() {
+        // `sete %cl` redefines only the low byte: the surviving upper bits
+        // of the copied 64-bit value stay observable for the later shift.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    sete %cl\n",
+            "    shrq $8, %rcx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "setCC %cl was treated as a full kill of the %rcx family: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_movw_is_not_a_kill() {
+        // A word-granular destination redefines only the low 16 bits; the
+        // upper 48 bits of the copied value survive to the later store.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movw %ax, %cx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "movw to %cx was treated as a full kill of the %rcx family: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_full_kill_still_eliminates() {
+        // Positive control: a genuine full-width unconditional redefinition
+        // (`movq %rbx, %rcx`) kills the value, so the copy is eliminated
+        // and the dereference reads through the original source register.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rbx, %rcx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded through the source register: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the dead address copy was not eliminated: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_full_kill_ignores_trailing_whitespace() {
+        // `LineStore::get` hands back the RAW line slice, so trailing blanks
+        // from an externally supplied .s survive into the trimmed view.  The
+        // kill test must therefore split the source operand on the last comma
+        // rather than by cutting `dest_token.len()` bytes off the end of a
+        // *trimmed* tail: with four or more trailing blanks that arithmetic
+        // walks the boundary back into the destination itself, the source side
+        // then appears to mention %rcx, and a genuine full-width kill is
+        // reported as a use.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rbx, %rcx    \n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "trailing whitespace on the kill suppressed the fold: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_high_byte_use_is_not_a_kill() {
+        // `movzbl %ch, %ecx` READS bits 8..15 of the copied value and only
+        // then redefines the family, so the copy is live across it.  The
+        // high-byte spellings alias their family exactly like the low byte:
+        // `scan_register_refs` has always mapped `%ch` to family 1 (its own
+        // comment names `%ah`), `compare_branch` refuses to fuse across `%ah`
+        // for that reason, `relay_and_lea` refuses to relay across `%dh`, and
+        // the i686 backend's alias table lists `%ch` under REG_ECX.  When the
+        // source-side veto did not see the alias, the rest of the conjunction
+        // scored the line a genuine kill -- `%ecx` is an exact full-width
+        // spelling, `movzbl` is write-only per `is_read_modify_write`, and the
+        // line names no implicit operand -- the address copy was deleted, and
+        // the `movzbl` then read the CALLER's %rcx high byte instead of the
+        // copied address.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movzbl %ch, %ecx\n",
+            "    movq %rcx, -16(%rbp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a high-byte READ of the copied value was treated as a kill and the \
+             address copy was eliminated: {result}"
+        );
+        assert!(
+            !result.contains("movq (%rdi), %rax"),
+            "the dereference was folded through a source register whose high \
+             byte is still read below: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_ret_ends_the_region() {
+        // A `ret` terminates the region: nothing after it runs on this path,
+        // and the only way to reach the following code is a branch, which the
+        // barrier refuses to fold across.  The walk used to step over the
+        // terminator (a bare `ret` names no register, so the family bitmask
+        // skipped it) and then answer "live" at the NEXT function's label or at
+        // its unrelated use of the incoming %rcx — losing the fold in every
+        // leaf-shaped return.  `dead_code.rs` already relies on exactly this
+        // reasoning for the same family.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    ret\n",
+            ".size f, .-f\n",
+            "g:\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size g, .-g\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded at a leaf return: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy that a `ret` retires was not eliminated: {result}"
+        );
+        // Soundness half: the following function reads the INCOMING %rcx, which
+        // the fold must not touch — its value never came from f's copy.
+        assert!(
+            result.contains("movq %rcx, %rdx"),
+            "the fold leaked across the return into the next function: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_use_before_ret_still_blocks() {
+        // The terminator only retires what comes AFTER it.  A use between the
+        // dereference and the `ret` observes the copied value, so the copy must
+        // survive — otherwise the `ret` arm would be a fold-across-a-use bug
+        // dressed up as a liveness improvement.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a use before the return lost its definition: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_self_zeroing_xor_is_a_kill() {
+        // `xorl %ecx, %ecx` writes a CONSTANT.  It mentions the family on its
+        // source side and classifies as read-modify-write, so both vetoes in
+        // the general conjunction fired and the canonical zeroing idiom kept a
+        // dead address copy alive.  Neither veto is about the RESULT, which is
+        // 0 regardless of the old value.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    xorl %ecx, %ecx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded across the zeroing idiom: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy a self-xor retires was not eliminated: {result}"
+        );
+        // The zeroing itself, and the consumer that reads the zero, must both
+        // survive: the fold removes the COPY, never the redefinition.
+        assert!(result.contains("xorl %ecx, %ecx"), "{result}");
+        assert!(result.contains("movq %rcx, %rdx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_self_zeroing_sub_is_a_kill() {
+        // `sub r, r` is the second idiom whose result is independent of the old
+        // value; the 64-bit spelling is included so the width rule is exercised
+        // on both accepted suffixes.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    subq %rcx, %rcx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy a self-subtract retires was not eliminated: {result}"
+        );
+        assert!(result.contains("subq %rcx, %rcx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_partial_self_zeroing_is_not_a_kill() {
+        // `xorw %cx, %cx` clears 16 bits and LEAVES the upper 48 bits of the
+        // copied value observable to the following 64-bit read.  A width rule
+        // that accepted it would ship the pointer's high half as garbage.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    xorw %cx, %cx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a 16-bit self-xor was accepted as a full kill: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rcx_address_copy_mixed_operand_self_zeroing_is_not_a_kill() {
+        // `xorl %eax, %ecx` is a genuine read-modify-write of %rcx: its result
+        // DEPENDS on the copied value, so deleting the copy would xor into the
+        // incoming register.  Identical-operand identity is what makes the
+        // idiom a constant write, and this is the case that proves the test is
+        // not a mnemonic-prefix heuristic.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    xorl %eax, %ecx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a two-register xor was accepted as a constant write: {result}"
+        );
+        assert!(result.contains("xorl %eax, %ecx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_value_preserving_self_op_is_not_a_kill() {
+        // `andl %ecx, %ecx` / `orq %rcx, %rcx` name the same register twice but
+        // PRESERVE the old value, so they are uses, not kills.  The predicate
+        // accepts `xor`/`sub` only, and this pins the exclusion.
+        for op in ["andl %ecx, %ecx", "orq %rcx, %rcx"] {
+            let asm = format!(
+                "f:\n    movq %rdi, %rcx\n    movq (%rcx), %rax\n    {op}\n    movq %rcx, %rdx\n    ret\n.size f, .-f\n"
+            );
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains("movq %rdi, %rcx"),
+                "`{op}` was accepted as a constant write: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rcx_address_copy_popq_is_a_kill() {
+        // `popq %rcx` has ONE operand and it is the destination: the value is
+        // redefined from the stack and no register source is read, so the copy
+        // is dead.  The walk used to answer "live" here twice over — the comma
+        // split handed `"popq %rcx"` to the width test, and
+        // `is_read_modify_write` answers conservatively for every mnemonic it
+        // does not know.  The arm is exact because `Pop { reg }` carries
+        // `reg_refs = 1 << reg`, so only the family itself reaches it.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    popq %rcx\n",
+            "    movq %rcx, %rdx\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq (%rdi), %rax"),
+            "the dereference was not folded across the pop: {result}"
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "the address copy a `popq %rcx` retires was not eliminated: {result}"
+        );
+        assert!(result.contains("popq %rcx"), "{result}");
+    }
+
+    #[test]
+    fn test_rcx_address_copy_popq_of_another_family_is_not_a_kill() {
+        // The mirror image: a pop of a DIFFERENT family says nothing about
+        // %rcx, so the copy must survive.  (It never reaches the kill arm at
+        // all — the family bitmask filters it — but the contract is worth
+        // pinning because the arm matches on the classified register.)
+        //
+        // The later consumer returns %rcx in %rax: a result register stays live
+        // across the `ret` (`dead_code.rs` keeps RAX/RDX there on purpose), so
+        // the copied value is genuinely observable and the whole chain must
+        // survive.  An unobserved consumer would be removed legitimately by the
+        // dead-move scan and the test would stop testing the pop arm.
+        let asm = concat!(
+            "f:\n",
+            "    movq %rdi, %rcx\n",
+            "    movq (%rcx), %rdx\n",
+            "    popq %rsi\n",
+            "    movq %rcx, %rax\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rdi, %rcx"),
+            "a pop of another family was treated as a kill of %rcx: {result}"
+        );
+        assert!(
+            result.contains("movq %rcx, %rax"),
+            "the live consumer of the copied value disappeared: {result}"
+        );
+    }
+
+    #[test]
+    fn test_stack_top_store_consumed_by_ret_survives_dse() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $16, %rsp\n",
+            ".Lset:\n",
+            "    movq %rdx, (%rsp)\n",
+            "    ret\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movq %rdx, (%rsp)"), "{result}");
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_rax() {
+        let asm = "    movq -32(%rbp), %rax\n    movq %rax, %xmm0\n".to_string();
+        let result = peephole_optimize(asm);
+        eprintln!("fp_roundtrip result: {:?}", result);
+        assert!(
+            result.contains("movsd -32(%rbp), %xmm0"),
+            "should eliminate rax roundtrip: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %rax, %xmm0"),
+            "movq rax->xmm should be gone: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_rcx() {
+        let asm = in_function(&[
+            "    movq -40(%rbp), %rcx",
+            "    movq %rcx, %xmm1",
+            "    movsd %xmm1, (%rdi)",
+        ]);
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movsd -40(%rbp), %xmm1"),
+            "should eliminate rcx roundtrip: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_store() {
+        let asm = "    movq %xmm0, %rax\n    movq %rax, -48(%rbp)\n".to_string();
+        let result = peephole_optimize(asm);
+        eprintln!("fp_store result: {:?}", result);
+        assert!(
+            result.contains("movsd %xmm0, -48(%rbp)"),
+            "should eliminate store roundtrip: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_store_any_xmm_reg() {
+        // The accumulator-based FP emitter rotates through %xmm2..%xmm13;
+        // every spill through those registers must fold to a direct movsd,
+        // not just %xmm0.
+        let asm = "    movq %xmm4, %rax\n    movq %rax, 296(%rsp)\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movsd %xmm4, 296(%rsp)"),
+            "should fold movq %xmm4->rax + store: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %xmm4, %rax"),
+            "GPR bridge should be gone: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_store_high_xmm_reg() {
+        let asm = "    movq %xmm13, %rax\n    movq %rax, 112(%rbp)\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movsd %xmm13, 112(%rbp)"),
+            "should fold high xmm register: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_keeps_live_bridge() {
+        // Pattern A rewrites the LOAD, deleting the bridge GPR's definition.
+        // With %rax still read afterwards the fold must NOT happen.
+        let asm = "    movq -24(%rbp), %rax\n    movq %rax, %xmm7\n    addq $7, %rax\n".to_string();
+        let result = peephole_optimize(asm);
+        let defined = result.contains("movq -24(%rbp), %rax");
+        let read = result.contains("addq $7, %rax");
+        assert!(
+            !(read && !defined),
+            "folded away a LIVE %rax definition:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_rcx_keeps_live_bridge() {
+        let asm = "    movq -8(%rbp), %rcx\n    movq %rcx, %xmm3\n    addq $1, %rcx\n".to_string();
+        let result = peephole_optimize(asm);
+        let defined = result.contains("movq -8(%rbp), %rcx");
+        let read = result.contains("addq $1, %rcx");
+        assert!(
+            !(read && !defined),
+            "folded away a LIVE %rcx definition:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_xmm_roundtrip_load_any_xmm_reg() {
+        let asm = "    movq -24(%rbp), %rax\n    movq %rax, %xmm7\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movsd -24(%rbp), %xmm7"),
+            "should fold load into any xmm register: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %rax, %xmm7"),
+            "bridge movq should be gone: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_memory_fold_mulsd() {
+        let asm = ["    movsd -40(%rbp), %xmm1", "    mulsd %xmm1, %xmm0"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("mulsd -40(%rbp), %xmm0"),
+            "should fold movsd+mulsd: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_register_load_folds_into_vex_op() {
+        let asm = [
+            "    movsd 8(%rsi), %xmm5",
+            "    vsubsd %xmm5, %xmm4, %xmm4",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("vsubsd 8(%rsi), %xmm4, %xmm4"),
+            "single-use load should become a memory source: {}",
+            result
+        );
+        assert!(
+            !result.contains("movsd 8(%rsi), %xmm5"),
+            "folded load should be deleted: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_register_load_kept_when_source_used_later() {
+        let asm = [
+            "    movss (%rdi), %xmm5",
+            "    vaddss %xmm5, %xmm4, %xmm4",
+            "    vmulss %xmm5, %xmm6, %xmm6",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movss (%rdi), %xmm5"),
+            "multi-use source load must remain: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_register_load_kept_for_destructive_self_source() {
+        let asm = [
+            "    movsd (%rdi), %xmm5",
+            "    vmulsd %xmm5, %xmm5, %xmm5",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movsd (%rdi), %xmm5"),
+            "destination's old value depends on this load: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_fp_register_name_boundary_xmm1_vs_xmm10() {
+        // `%xmm1` is redefined by the memory-source load before `ret`
+        // (a two-double return materialisation), so the value loaded at
+        // the top is dead after the `vaddsd` — PROVIDED the `%xmm10`
+        // mention in between is not mistaken for `%xmm1`.
+        let asm = [
+            "    movsd (%rdi), %xmm1",
+            "    vaddsd %xmm1, %xmm4, %xmm4",
+            "    movsd %xmm10, %xmm11",
+            "    movapd %xmm4, %xmm0",
+            "    movsd (%rsi), %xmm1",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("vaddsd (%rdi), %xmm4, %xmm4"),
+            "xmm10 must not count as a later xmm1 use: {}",
+            result
+        );
+    }
+
+    /// Exact -O1 sqlite3GenerateColumnNames shape (LCCC-SQLITE-COLNAMES-O1):
+    /// the fold must SUM the consumer displacement into the SIB operand.
+    #[test]
+    fn test_lea_sib_fold_sums_consumer_displacement() {
+        let asm = in_function(&[
+            "    leaq 8(%r13, %r10), %r9",
+            "    movq 8(%r9), %rcx",
+            "    movq %rcx, (%rdi)",
+        ]);
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(local_patterns::fold_lea_into_memory_op(
+            &mut store, &mut infos
+        ));
+        assert_eq!(store.get(3).trim(), "movq 16(%r13, %r10), %rcx");
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("88("),
+            "displacements glued as text: {result}"
+        );
+    }
+
+    /// Same bug class in the multi-use fold: every use keeps its own offset.
+    #[test]
+    fn test_lea_all_uses_fold_sums_each_displacement() {
+        let asm = in_function(&[
+            "    leaq 8(%r13, %r10), %r9",
+            "    movq 8(%r9), %rcx",
+            "    movl (%r9), %edx",
+            "    movq %rax, 16(%r9)",
+        ]);
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(local_patterns::fold_lea_all_uses_in_block(
+            &mut store, &mut infos
+        ));
+        assert!(infos[2].is_nop());
+        assert_eq!(store.get(3).trim(), "movq 16(%r13, %r10), %rcx");
+        assert_eq!(store.get(4).trim(), "movl 8(%r13, %r10), %edx");
+        assert_eq!(store.get(5).trim(), "movq %rax, 24(%r13, %r10)");
+    }
+
+    /// A definition at the bottom of a loop whose value is read at the TOP of
+    /// the loop (earlier in the text, reached around the back edge) is live.
+    /// The old forward-only text scan saw no later read and deleted the LEA,
+    /// leaving the next iteration to dereference the stale `%r9`.
+    #[test]
+    fn test_lea_fold_respects_back_edge_liveness() {
+        let asm = [
+            "foo:",
+            ".cfi_startproc",
+            "    leaq 8(%rsi), %r9",
+            ".LBB1:",
+            "    movq (%r9), %rax",
+            "    testq %rax, %rax",
+            "    je .LBB2",
+            "    leaq 8(%r13, %r10), %r9",
+            "    movq (%r9), %rcx",
+            "    addq %rcx, %rdx",
+            "    jmp .LBB1",
+            ".LBB2:",
+            "    movq %rdx, %rax",
+            "    ret",
+            ".cfi_endproc",
+        ]
+        .join("\n")
+            + "\n";
+        for pass in [
+            local_patterns::fold_lea_into_memory_op as fn(&mut LineStore, &mut [LineInfo]) -> bool,
+            local_patterns::fold_lea_all_uses_in_block,
+        ] {
+            let mut store = LineStore::new(asm.clone());
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            pass(&mut store, &mut infos);
+            let lea = (0..store.len())
+                .find(|&n| store.get(n).contains("leaq 8(%r13, %r10), %r9"))
+                .expect("LEA line present");
+            assert!(!infos[lea].is_nop(), "loop-carried LEA deleted");
+        }
+        let result = peephole_optimize(asm);
+        assert!(result.contains("leaq 8(%r13, %r10), %r9"), "{result}");
+    }
+
+    #[test]
+    fn test_lea_into_indexed_load() {
+        let asm = in_function(&[
+            "    leaq (%r12, %r9), %rdi",
+            "    movsbq (%rdi), %rsi",
+            "    movq %rsi, (%rdx)",
+        ]);
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movsbq (%r12, %r9), %rsi"),
+            "should fold LEA into SIB load: {}",
+            result
+        );
+        assert!(
+            !result.contains("leaq (%r12, %r9), %rdi"),
+            "temporary LEA should be removed: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lea_copy_into_indexed_store() {
+        let asm = in_function(&[
+            "    leaq (%r12, %r9), %rdi",
+            "    movq %rdi, %rcx",
+            "    movb $0, (%rcx)",
+        ]);
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movb $0, (%r12, %r9)"),
+            "should fold LEA/copy into SIB store: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %rdi, %rcx"),
+            "temporary address copy should be removed: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_lea_fold_keeps_sib_index_producer_live() {
+        // This is the exact shape from Expat's corpus tail fill.  Once the
+        // load/store uses r8 as a folded SIB index, dead-register elimination
+        // must still observe r8 as a read and preserve its defining move.
+        let asm = in_function(&[
+            "    movq %rax, %r8",
+            "    leaq (%rdx, %r8), %r9",
+            "    movb $0x20, (%r9)",
+        ]);
+        assert_ne!(
+            scan_register_refs(b"movb $0x20, (%rdx,%r8)") & (1u16 << 8),
+            0,
+            "SIB index must be represented in the cached register-reference mask"
+        );
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(local_patterns::fold_lea_into_memory_op(
+            &mut store, &mut infos
+        ));
+        assert_ne!(
+            infos[4].reg_refs & (1u16 << 8),
+            0,
+            "rewritten SIB store must retain r8 in LineInfo: {}",
+            store.get(4)
+        );
+        assert_eq!(
+            helpers::get_dest_reg(&infos[4]),
+            REG_NONE,
+            "SIB memory operands do not write their base/index registers"
+        );
+        assert!(
+            !dead_code::eliminate_dead_reg_moves(&store, &mut infos),
+            "index producer must not become dead after SIB fold"
+        );
+        // Pipeline level: the index is either kept in %r8 together with its
+        // producer, or copy-propagated from %rax once %r8 is proven dead.
+        let result = peephole_optimize(asm);
+        assert!(
+            (result.contains("movb $0x20, (%rdx, %r8)") && result.contains("movq %rax, %r8"))
+                || result.contains("movb $0x20, (%rdx, %rax)"),
+            "SIB index must stay defined after folding: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_redundant_store_load() {
+        let asm = "    movq %rax, -8(%rbp)\n    movq -8(%rbp), %rax\n".to_string();
+        let result = peephole_optimize(asm);
+        assert_eq!(result.trim(), "movq %rax, -8(%rbp)");
+    }
+
+    #[test]
+    fn test_store_load_different_reg() {
+        let asm = "    movq %rax, -8(%rbp)\n    movq -8(%rbp), %rcx\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movq %rax, -8(%rbp)"));
+        assert!(result.contains("movq %rax, %rcx"));
+        assert!(!result.contains("movq -8(%rbp), %rcx"));
+    }
+
+    #[test]
+    fn test_redundant_jump() {
+        let asm = "    jmp .Lfoo\n.Lfoo:\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(!result.contains("jmp"));
+        assert!(result.contains(".Lfoo:"));
+    }
+
+    #[test]
+    fn test_gpr_hoist_skips_multi_entry_loop() {
+        // Regression: hoisting a loop-invariant GPR load into the preheader is
+        // sound only when the header has a SINGLE forward entry edge (the entry
+        // jmp). A conditional `je <header>` from a different predecessor enters
+        // the loop directly, bypassing the preheader, and would observe a stale
+        // destination register. (gzip deflate: the `rsync` guard's `je` into the
+        // hash-table loop header left `head` unloaded in %rcx, so
+        // `head[ins_h]=strstart` wrote through `&rsync`, corrupted globals, and
+        // SIGSEGV'd under PGO builds.)
+        let asm = [
+            "    movq 16(%rsp), %rcx",
+            "    movslq (%rcx), %rax",
+            "    testq %rax, %rax",
+            "    je .LBB1",
+            ".LBB2:",
+            "    movl (%rbx), %eax",
+            "    jmp .LBB1",
+            ".p2align 4",
+            ".LBB1:",
+            "    movl (%rbx), %edi",
+            "    movq 304(%rsp), %rcx",
+            "    addq %rcx, %rax",
+            "    jne .LBB1",
+        ]
+        .join("\n")
+            + "\n";
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+        assert!(
+            !changed,
+            "must not hoist when the header has a second forward entry edge"
+        );
+        let result = store.build_result(|i| infos[i].is_nop());
+        assert!(
+            result.contains("jmp .LBB1"),
+            "entry jmp must be preserved: {}",
+            result
+        );
+        assert!(
+            result.contains("movq 304(%rsp), %rcx"),
+            "invariant load must stay in the loop: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_gpr_hoist_single_entry() {
+        // Positive control: with a single forward entry edge (the entry jmp),
+        // the invariant load SHOULD still be hoisted into the preheader.
+        let asm = [
+            ".LBB2:",
+            "    movl (%rbx), %eax",
+            "    jmp .LBB1",
+            ".LBB1:",
+            "    movl (%rbx), %edi",
+            "    movq 304(%rsp), %rcx",
+            "    addq %rcx, %rax",
+            "    jne .LBB1",
+        ]
+        .join("\n")
+            + "\n";
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = local_patterns::hoist_loop_invariant_gpr_load(&mut store, &mut infos);
+        assert!(
+            changed,
+            "single-entry loop should still hoist the invariant load"
+        );
+        let result = store.build_result(|i| infos[i].is_nop());
+        assert!(
+            !result.contains("jmp .LBB1"),
+            "entry jmp should be replaced by the hoisted load: {}",
+            result
+        );
+        assert!(
+            result.contains("movq 304(%rsp), %rcx"),
+            "hoisted load must be present in the preheader: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_push_pop_elimination() {
+        let asm = "    pushq %rax\n    movq %rax, %rcx\n    popq %rax\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(!result.contains("pushq"));
+        assert!(!result.contains("popq"));
+        assert!(result.contains("movq %rax, %rcx"));
+    }
+
+    #[test]
+    fn test_self_move() {
+        let asm = "    movq %rax, %rax\n".to_string();
+        let result = peephole_optimize(asm);
+        assert_eq!(result.trim(), "");
+    }
+
+    #[test]
+    fn test_parse_store_to_rbp() {
+        assert!(parse_store_to_rbp_str("movq %rax, -8(%rbp)").is_some());
+        assert!(parse_store_to_rbp_str("movl %eax, -16(%rbp)").is_some());
+        assert!(parse_store_to_rbp_str("movq $5, -8(%rbp)").is_none());
+    }
+
+    #[test]
+    fn test_parse_load_from_rbp() {
+        assert!(parse_load_from_rbp_str("movq -8(%rbp), %rax").is_some());
+        assert!(parse_load_from_rbp_str("movslq -8(%rbp), %rax").is_some());
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_with_matched_store_load() {
+        let asm = [
+            "    .cfi_startproc",
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    subq $32, %rsp",
+            "    cmpq %rcx, %rax",
+            "    setl %al",
+            "    movzbq %al, %rax",
+            "    movq %rax, -24(%rbp)",
+            "    movq -24(%rbp), %rax",
+            "    testq %rax, %rax",
+            "    jne .LBB2",
+            "    jmp .LBB4",
+            ".LBB2:",
+            "    movl $1, %eax",
+            "    leave",
+            "    ret",
+            ".LBB4:",
+            "    movl $2, %eax",
+            "    leave",
+            "    ret",
+            "    .cfi_endproc",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(result.contains("cmpq %rcx, %rax"), "should keep the cmp");
+        assert!(
+            has_fused_branch(&result, "jl .LBB2", "jge .LBB4"),
+            "should fuse to jl .LBB2 (or its mirror jge .LBB4): {}",
+            result
+        );
+        assert!(!result.contains("setl"), "should eliminate setl");
+    }
+
+    #[test]
+    fn test_compare_branch_does_not_fuse_setcc_in_other_reg_with_rax_test() {
+        // zlib-ng zng_deflateSetParams: `size < 4` setb was movzbl'd into
+        // %r12d, then a later `testq %rax, %rax` tested a *different*
+        // value (slotted new_strategy). Fusing those produced `jae` on the
+        // size compare and reported Z_BUF_ERROR for a valid 4-byte buffer.
+        let asm = [
+            "    cmpq $4, %r8",
+            "    setb %al",
+            "    movzbl %al, %r12d",
+            "    movq 64(%rsp), %rax",
+            "    testq %rax, %rax",
+            "    je .Lelse",
+            "    jmp .Lthen",
+            ".Lelse:",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("setb %al"),
+            "must keep setb when the boolean is not in %rax: {result}"
+        );
+        assert!(
+            !result.contains("jae ") && !result.contains("jb "),
+            "must not fuse size-cmp flags with a later rax test: {result}"
+        );
+        assert!(result.contains("testq %rax, %rax"), "{result}");
+    }
+
+    /// A fused `cmp`+`test`+`jcc` may be re-oriented by the later layout
+    /// passes: branching to the FALSE label with the inverted condition is the
+    /// same branch when the true block falls through (`jge .Lfalse` ==
+    /// `jl .Ltrue`).  Both orientations encode the same predicate, so accept
+    /// either -- but only the pair: an inverted condition on the WRONG label
+    /// still fails the test.
+    fn has_fused_branch(result: &str, want_true: &str, want_false: &str) -> bool {
+        result
+            .lines()
+            .any(|l| l.trim_start().starts_with(want_true))
+            || result
+                .lines()
+                .any(|l| l.trim_start().starts_with(want_false))
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_short() {
+        // A real function frame: the fusion deletes the `test`, so the flags
+        // at the branch are the `cmp`'s only after the rewrite, and the guard
+        // must be able to PROVE nothing later reads them.  Both successors end
+        // in `ret`, so the flags are dead on both paths -- the shape real
+        // codegen produces.  (A bare fragment without `.cfi_startproc` cannot
+        // prove that and is refused by design.)
+        let asm = [
+            "    .cfi_startproc",
+            "    cmpq %rcx, %rax",
+            "    setl %al",
+            "    movzbq %al, %rax",
+            "    testq %rax, %rax",
+            "    jne .LBB2",
+            "    jmp .LBB4",
+            ".LBB2:",
+            "    movl $1, %eax",
+            "    ret",
+            ".LBB4:",
+            "    movl $2, %eax",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            has_fused_branch(&result, "jl .LBB2", "jge .LBB4"),
+            "should fuse to jl .LBB2 (or its mirror jge .LBB4): {}",
+            result
+        );
+        assert!(!result.contains("setl"), "should eliminate setl");
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_je() {
+        let asm = [
+            "    .cfi_startproc",
+            "    cmpq %rcx, %rax",
+            "    setl %al",
+            "    movzbq %al, %rax",
+            "    testq %rax, %rax",
+            "    je .Lfalse",
+            "    jmp .Ltrue",
+            ".Lfalse:",
+            "    movl $1, %eax",
+            "    ret",
+            ".Ltrue:",
+            "    movl $2, %eax",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            has_fused_branch(&result, "jge .Lfalse", "jl .Ltrue"),
+            "should fuse to jge .Lfalse (or its mirror jl .Ltrue): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_non_adjacent_store_load_same_reg() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rax, -24(%rbp)",
+            "    movq %rcx, -32(%rbp)",
+            "    movq -24(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("-24(%rbp), %rax"),
+            "should eliminate the load: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_non_adjacent_store_load_diff_reg() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rax, -24(%rbp)",
+            "    movq %rcx, -32(%rbp)",
+            "    movq -24(%rbp), %rdx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, %rdx"),
+            "should forward to reg-reg: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_non_adjacent_store_load_reg_modified() {
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    movq -32(%rbp), %rax",
+            "    movq -24(%rbp), %rcx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-24(%rbp), %rcx") || result.contains("%rax, %rcx"),
+            "should not forward since rax was modified: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_redundant_cltq() {
+        let asm = "    movslq -8(%rbp), %rax\n    cltq\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movslq"), "should keep movslq");
+        assert!(
+            !result.contains("cltq"),
+            "should eliminate redundant cltq: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_redundant_cltq_after_narrow_sign_extensions() {
+        for producer in [
+            "movsbq %dil, %rax",
+            "movsbq %al, %rax",
+            "movsbq -8(%rbp), %rax",
+            "movswq %di, %rax",
+            "movswq %ax, %rax",
+            "movswq -8(%rbp), %rax",
+        ] {
+            let asm = format!("    {producer}\n    cltq\n");
+            let result = peephole_optimize(asm);
+            assert!(result.contains(producer), "lost producer: {result}");
+            assert!(
+                !result.contains("cltq"),
+                "{producer} already sign-extends to 64 bits: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_narrow_sign_extension_does_not_hide_rax_clobber_from_cltq() {
+        for producer in ["movsbq %dil, %rax", "movswq %di, %rax"] {
+            let asm = format!("    {producer}\n    addl $1, %eax\n    cltq\n");
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains("cltq"),
+                "intervening eax write must retain cltq after {producer}: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dead_store_elimination() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rax, -24(%rbp)",
+            "    movq %rcx, -24(%rbp)",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("%rax, -24(%rbp)"),
+            "first store should be dead: {}",
+            result
+        );
+        assert!(
+            result.contains("%rcx, -24(%rbp)"),
+            "second store should remain: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_condition_codes() {
+        for (cc, expected_jcc) in &[
+            ("e", "je"),
+            ("ne", "jne"),
+            ("l", "jl"),
+            ("g", "jg"),
+            ("le", "jle"),
+            ("ge", "jge"),
+            ("b", "jb"),
+            ("a", "ja"),
+        ] {
+            let asm = format!(
+                "    .cfi_startproc\n    cmpq %rcx, %rax\n    set{} %al\n    movzbq %al, %rax\n    testq %rax, %rax\n    jne .LBB1\n    movl $0, %eax\n    ret\n.LBB1:\n    movl $1, %eax\n    ret\n    .cfi_endproc\n",
+                cc
+            );
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains(&format!("{} .LBB1", expected_jcc)),
+                "cc={} should produce {}: {}",
+                cc,
+                expected_jcc,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_global_store_forward_qword_to_dword() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rdi, -24(%rbp)",
+            "    movl -24(%rbp), %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movl %edi, %eax"),
+            "qword-to-dword forwarding must retain movl semantics: {}",
+            result
+        );
+        assert!(!result.contains("-24(%rbp), %eax"), "{}", result);
+    }
+
+    #[test]
+    fn test_global_store_forward_qword_to_same_dword_reg() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rax, -24(%rbp)",
+            "    movl -24(%rbp), %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // movl %eax,%eax is not a no-op: it clears RAX's upper half.
+        assert!(result.contains("movl %eax, %eax"), "{}", result);
+    }
+
+    #[test]
+    fn test_global_store_forward_across_fallthrough_label() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rax, -24(%rbp)",
+            "    movq %rcx, -32(%rbp)",
+            ".Lfallthrough:",
+            "    movq -24(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("-24(%rbp), %rax"),
+            "should forward across fallthrough label: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_global_store_forward_blocked_at_jump_target() {
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    jmp .Lskip",
+            ".Ltarget:",
+            "    movq -24(%rbp), %rax",
+            ".Lskip:",
+            "    ret",
+            "    jmp .Ltarget",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-24(%rbp), %rax") || result.contains("-24(%rbp),"),
+            "should NOT forward across jump target: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_global_store_forward_across_cond_branch() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rax, -24(%rbp)",
+            "    cmpq %rcx, %rax",
+            "    jne .Lother",
+            "    movq -24(%rbp), %rdx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq %rax, %rdx"),
+            "should forward on fallthrough after cond branch: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_global_store_forward_invalidated_by_call() {
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    callq some_func",
+            "    movq -24(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "should not forward across call (rax clobbered): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_global_store_forward_callee_saved_across_call() {
+        let asm = [
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    movq %rbx, -24(%rbp)",
+            "    callq some_func",
+            "    movq -24(%rbp), %rbx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // A callee may write through an escaped pointer to this slot. Preserve
+        // the reload until escape analysis exists; callee-saved register status
+        // alone does not prove memory is unchanged.
+        assert!(
+            result.contains("-24(%rbp), %rbx"),
+            "must not forward a stack slot across a call: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_global_store_forward_invalidated_by_unrecognized_rbp_write() {
+        let asm = [
+            "    movl %eax, -8(%rbp)",
+            "    movntil %ecx, -8(%rbp)",
+            "    movl -8(%rbp), %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-8(%rbp), %eax"),
+            "must not eliminate load after unrecognized write to same slot: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_classify_line() {
+        let info = classify_line("    movq %rax, -8(%rbp)");
+        assert!(matches!(
+            info.kind,
+            LineKind::StoreRbp {
+                reg: 0,
+                offset: -8,
+                size: MoveSize::Q
+            }
+        ));
+
+        let info = classify_line("    movq -16(%rbp), %rcx");
+        assert!(matches!(
+            info.kind,
+            LineKind::LoadRbp {
+                reg: 1,
+                offset: -16,
+                size: MoveSize::Q
+            }
+        ));
+
+        let info = classify_line(".Lfoo:");
+        assert_eq!(info.kind, LineKind::Label);
+
+        let info = classify_line("    jmp .LBB1");
+        assert_eq!(info.kind, LineKind::Jmp);
+
+        let info = classify_line("    ret");
+        assert_eq!(info.kind, LineKind::Ret);
+    }
+
+    #[test]
+    fn test_parse_rbp_offset() {
+        assert_eq!(parse_rbp_offset("leaq -24(%rbp), %rax"), -24);
+        assert_eq!(parse_rbp_offset("addq (%rbp), %rax"), 0);
+        assert_eq!(parse_rbp_offset("movq 16(%rbp), %rdx"), 16);
+        assert_eq!(parse_rbp_offset("movq %rax, %rcx"), RBP_OFFSET_NONE);
+        assert_eq!(
+            parse_rbp_offset("movq -8(%rbp), -16(%rbp)"),
+            RBP_OFFSET_NONE
+        );
+        assert_eq!(parse_rbp_offset("addq -8(%rbp), -8(%rbp)"), -8);
+    }
+
+    #[test]
+    fn test_fast_parse_i32_int32_min_no_panic() {
+        // Kernel constant folding emits genuine INT32_MIN immediands
+        // (`addq $-2147483648, %rax`); parsing must not overflow and
+        // must yield exactly i32::MIN.
+        assert_eq!(fast_parse_i32("-2147483648"), i32::MIN);
+        assert_eq!(fast_parse_i32("2147483648"), i32::MIN); // wrapping digits
+        assert_eq!(fast_parse_i32("-8"), -8);
+        assert_eq!(fast_parse_i32("0"), 0);
+        assert_eq!(parse_rbp_offset("addq $-2147483648, 40(%rsp)"), 40);
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_no_fuse_cross_block_store() {
+        let asm = [
+            "    cmpq $0, %rbx",
+            "    sete %al",
+            "    movzbq %al, %rax",
+            "    movq %rax, -40(%rbp)",
+            "    testq %rax, %rax",
+            "    jne .LBB8",
+            "    jmp .LBB10",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-40(%rbp)"),
+            "must preserve cross-block store: {}",
+            result
+        );
+        assert!(
+            result.contains("sete"),
+            "must preserve sete for cross-block store: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_jmp_star_reg_classified_as_indirect() {
+        let asm = [
+            "    movq %rax, -40(%rbp)",
+            "    jmp *%rcx",
+            ".LBB21:",
+            "    movq -40(%rbp), %rax",
+            "    movq %rax, -160(%rbp)",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-40(%rbp), %rax"),
+            "must NOT eliminate load after indirect jump target label: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_jmpq_star_reg_classified_as_indirect() {
+        let asm = [
+            "    movq %rax, -40(%rbp)",
+            "    jmpq *%rax",
+            ".LBB5:",
+            "    movq -40(%rbp), %rax",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-40(%rbp), %rax"),
+            "must NOT eliminate load after jmpq* indirect jump target: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_inline_asm_rdmsr_invalidates_store_forwarding() {
+        let asm = [
+            "    leaq -16(%rbp), %rax",
+            "    movq %rax, -40(%rbp)",
+            "    movabsq $27, %rcx",
+            "    1: rdmsr ; xor %esi,%esi",
+            "    pushq %rcx",
+            "    movq -40(%rbp), %rcx",
+            "    movl %esi, (%rcx)",
+            "    popq %rcx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-40(%rbp), %rcx"),
+            "must NOT forward rax across rdmsr (rax clobbered by inline asm): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_semicolon_multi_instruction_invalidates_mappings() {
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    xorl %eax, %eax ; movl $1, %ecx",
+            "    movq -24(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "must not forward across multi-instruction line with ';': {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rdmsr_standalone_invalidates_mappings() {
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    rdmsr",
+            "    movq -24(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "must not forward across rdmsr (implicit clobber of rax/rdx): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cpuid_invalidates_mappings() {
+        let asm = [
+            "    movq %rax, -24(%rbp)",
+            "    cpuid",
+            "    movq -24(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-24(%rbp), %rax"),
+            "must not forward across cpuid (implicit clobber of rax/rbx/rcx/rdx): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_setcc_non_al_invalidates_store_forwarding() {
+        let asm = [
+            "    movl %ecx, -8(%rbp)",
+            "    sete %cl",
+            "    movl -8(%rbp), %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-8(%rbp), %eax"),
+            "must NOT forward ecx across sete %%cl (ecx clobbered): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_setcc_al_still_invalidates_rax() {
+        let asm = [
+            "    movq %rax, -16(%rbp)",
+            "    sete %al",
+            "    movq -16(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-16(%rbp), %rax"),
+            "must NOT forward rax across sete %%al (rax clobbered): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_syscall_invalidates_mappings() {
+        let asm = [
+            "    movq %rcx, -16(%rbp)",
+            "    syscall",
+            "    movq -16(%rbp), %rcx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-16(%rbp), %rcx"),
+            "must NOT forward rcx across syscall (rcx clobbered): {}",
+            result
+        );
+    }
+
+    #[test]
+    #[ignore = "AUD-ARM-GSF-1: trampoline coalescing does not trigger on this pattern yet"]
+    fn test_loop_trampoline_simple_coalesce() {
+        let asm = [
+            ".LBB1:",
+            "    movq %r9, %rax",
+            "    movq %r9, %r14",
+            "    addq $320, %r14",
+            "    testq %rax, %rax",
+            "    jne .LBB2",
+            "    ret",
+            ".LBB2:",
+            "    movq %r14, %r9",
+            "    jmp .LBB1",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("addq $320, %r9"),
+            "should rewrite addq to target %r9 directly: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r9, %r14"),
+            "should eliminate the initial copy: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r14, %r9"),
+            "should eliminate the trampoline copy: {}",
+            result
+        );
+        assert!(
+            result.contains("jne .LBB1"),
+            "should redirect branch to loop header: {}",
+            result
+        );
+    }
+
+    #[test]
+    #[ignore = "AUD-ARM-GSF-1: trampoline coalescing does not trigger on this pattern yet"]
+    fn test_loop_trampoline_two_copies() {
+        let asm = [
+            ".LBB10:",
+            "    movq %r9, %rax",
+            "    movq %r10, %rcx",
+            "    movq %r9, %r14",
+            "    addq $320, %r14",
+            "    movq %r10, %r15",
+            "    addl %r8d, %r15d",
+            "    testq %rax, %rax",
+            "    jne .LBB20",
+            "    ret",
+            ".LBB20:",
+            "    movq %r14, %r9",
+            "    movq %r15, %r10",
+            "    jmp .LBB10",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("addq $320, %r9"),
+            "should rewrite dest addq to %r9: {}",
+            result
+        );
+        assert!(
+            result.contains("addl %r8d, %r10d"),
+            "should rewrite frac addl to %r10d: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r9, %r14"),
+            "should eliminate dest copy: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq %r10, %r15"),
+            "should eliminate frac copy: {}",
+            result
+        );
+        assert!(
+            result.contains("jne .LBB10"),
+            "should redirect branch to loop header: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_condbranch_inversion_fallthrough() {
+        let asm = [
+            "    cmpl %r8d, %eax",
+            "    jl .LBB2",
+            "    jmp .LBB4",
+            ".LBB2:",
+            "    movq %rax, %rcx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("jge .LBB4"),
+            "should invert jl to jge: {}",
+            result
+        );
+        assert!(
+            !result.contains("jl .LBB2"),
+            "should remove original jl: {}",
+            result
+        );
+        assert!(
+            !result.contains("jmp .LBB4"),
+            "should remove the jmp: {}",
+            result
+        );
+        assert!(
+            result.contains(".LBB2:"),
+            "should keep the label: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_condbranch_inversion_je_to_jne() {
+        let asm = [
+            "    testq %rax, %rax",
+            "    je .Ltrue",
+            "    jmp .Lfalse",
+            ".Ltrue:",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("jne .Lfalse"),
+            "should invert je to jne: {}",
+            result
+        );
+        assert!(
+            !result.contains("jmp .Lfalse"),
+            "should remove the jmp: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_condbranch_no_inversion_when_not_fallthrough() {
+        let asm = [
+            "    cmpl %r8d, %eax",
+            "    jl .LBB5",
+            "    jmp .LBB4",
+            ".LBB2:",
+            "    movq %rax, %rcx",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("jl .LBB5"),
+            "should keep jl when not fallthrough: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_back_to_back_cltq() {
+        let asm = "    cltq\n    cltq\n".to_string();
+        let result = peephole_optimize(asm);
+        assert_eq!(
+            result.matches("cltq").count(),
+            1,
+            "should keep only one cltq: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cltq_backward_scan_over_non_rax_write() {
+        let asm = [
+            "    movslq -8(%rbp), %rax",
+            "    movq %rax, %r8",
+            "    cltq",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("cltq"),
+            "cltq should be eliminated after movslq past non-rax-write: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cltq_backward_scan_blocked_by_rax_write() {
+        let asm = ["    movslq -8(%rbp), %rax", "    addl $1, %eax", "    cltq"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("cltq"),
+            "cltq should NOT be eliminated when rax is modified: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cltq_before_call_is_dead_after_call_rewrites_rax() {
+        // A call WRITES %rax (the return-value register: every callee is
+        // entitled to clobber it, and a void callee leaves it undefined).
+        // The first cltq's widened bits therefore die at the call with no
+        // reader in between -- it is dead and must go. The second cltq
+        // survives: `ret` conservatively reads %rax, and nothing between
+        // the second cltq and the ret rewrites it.
+        let asm = ["    cltq", "    call foo", "    cltq"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(
+            result.matches("cltq").count(),
+            1,
+            "only the post-call cltq should survive: {}",
+            result
+        );
+        assert!(
+            result.trim_end().ends_with("cltq"),
+            "the surviving cltq must be the one after the call: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cltq_backward_scan_with_store_rbp() {
+        let asm = [
+            "    cltq",
+            "    movq %rax, -16(%rbp)",
+            "    movq %rax, %r9",
+            "    cltq",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(
+            result.matches("cltq").count(),
+            1,
+            "second cltq should be eliminated past store and mov: {}",
+            result
+        );
+    }
+
+    // ── Memory operand folding tests ──────────────────────────────────────
+
+    #[test]
+    fn test_mem_fold_addq_rcx() {
+        let asm = ["    movq -48(%rbp), %rcx", "    addq %rcx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("addq -48(%rbp), %rax"),
+            "should fold load+add into memory operand: {}",
+            result
+        );
+        assert!(
+            !result.contains("movq -48(%rbp), %rcx"),
+            "load should be eliminated: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_subl_ecx() {
+        let asm = ["    movq -64(%rbp), %rcx", "    subl %ecx, %eax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("subl -64(%rbp), %eax"),
+            "should fold load+sub into memory operand: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_cmpq_rcx() {
+        let asm = ["    movq -8(%rbp), %rcx", "    cmpq %rcx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("cmpq -8(%rbp), %rax"),
+            "should fold load+cmp into memory operand: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_testq_rcx() {
+        let asm = ["    movq -16(%rbp), %rcx", "    testq %rcx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("testq -16(%rbp), %rax"),
+            "should fold load+test into memory operand: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_no_fold_when_dest_is_loaded_reg() {
+        let asm = ["    movq -48(%rbp), %rcx", "    addq %rax, %rcx"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq -48(%rbp), %rcx") || result.contains("addq %rax, %rcx"),
+            "should not fold when loaded reg is destination: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_no_fold_for_callee_saved() {
+        let asm = ["    movq -48(%rbp), %rbx", "    addq %rbx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("addq -48(%rbp), %rax"),
+            "should not fold callee-saved register loads: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_andq() {
+        let asm = ["    movq -16(%rbp), %rcx", "    andq %rcx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("andq -16(%rbp), %rax"),
+            "should fold load+and into memory operand: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_xorq() {
+        let asm = ["    movq -24(%rbp), %rcx", "    xorq %rcx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("xorq -24(%rbp), %rax"),
+            "should fold load+xor into memory operand: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_load_rax_into_add_with_reg_dest() {
+        let asm = ["    movq -32(%rbp), %rax", "    addq %rax, %r12"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("addq -32(%rbp), %r12"),
+            "should fold rax load into add with callee-saved dest: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_orq() {
+        let asm = ["    movq -16(%rbp), %rcx", "    orq %rcx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("orq -16(%rbp), %rax"),
+            "should fold load+or into memory operand: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mem_fold_with_empty_line_between() {
+        let asm = ["    movq -48(%rbp), %rcx", "", "    addq %rcx, %rax"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("addq -48(%rbp), %rax"),
+            "should fold with empty lines between: {}",
+            result
+        );
+    }
+
+    // ── Redundant xorl elimination tests ─────────────────────────────────
+
+    #[test]
+    fn test_redundant_xorl_after_zero_store() {
+        let asm = [
+            "    xorl %eax, %eax",
+            "    movq %rax, -8(%rbp)",
+            "    xorl %eax, %eax",
+            "    movq %rax, -16(%rbp)",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            1,
+            "second xorl should be eliminated: {}",
+            result
+        );
+        assert!(
+            result.contains("movq %rax, -8(%rbp)"),
+            "first store should remain: {}",
+            result
+        );
+        assert!(
+            result.contains("movq %rax, -16(%rbp)"),
+            "second store should remain: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_redundant_xorl_chain_of_four() {
+        let asm = [
+            "    xorl %eax, %eax",
+            "    movq %rax, -8(%rbp)",
+            "    xorl %eax, %eax",
+            "    movq %rax, -16(%rbp)",
+            "    xorl %eax, %eax",
+            "    movq %rax, -24(%rbp)",
+            "    xorl %eax, %eax",
+            "    movq %rax, -32(%rbp)",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            1,
+            "only first xorl should survive: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_xorl_not_eliminated_after_rax_write() {
+        let asm = [
+            "    xorl %eax, %eax",
+            "    movq %rax, -8(%rbp)",
+            "    movq -16(%rbp), %rax",
+            "    xorl %eax, %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // The load to %rax invalidates rax_is_zero, so both xorls are needed
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            2,
+            "both xorls should survive after rax modification: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_xorl_not_eliminated_after_label() {
+        let asm = [
+            "    xorl %eax, %eax",
+            "    movq %rax, -8(%rbp)",
+            ".LBB1:",
+            "    xorl %eax, %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            2,
+            "xorl after label should NOT be eliminated: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_xorl_not_eliminated_after_call() {
+        let asm = [
+            "    xorl %eax, %eax",
+            "    movq %rax, -8(%rbp)",
+            "    call some_func",
+            "    xorl %eax, %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert_eq!(
+            result.matches("xorl %eax, %eax").count(),
+            2,
+            "xorl after call should NOT be eliminated: {}",
+            result
+        );
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    /// Regression test: dead store elimination must not use a stale pattern_bytes
+    /// buffer when checking multi-byte stores. The sub-byte-offset scan for a Q
+    /// (8-byte) store was overwriting pattern_bytes with the last sub-offset
+    /// (store_offset + 7), and subsequent scans within the same store's window
+    /// would reuse the stale pattern instead of the original store_offset.
+    ///
+    /// Pattern from oniguruma regparse.c: a store to -144(%rbp) was followed by
+    /// an Other instruction (movl %eax, %eax), then a Cmp with -144(%rbp) as a
+    /// memory operand (from memory_fold), then another store to -144(%rbp). The
+    /// sub-byte scan for the Other instruction overwrote pattern_bytes from
+    /// "-144(%rbp)" to "-137(%rbp)", causing the Cmp line's pattern check to fail,
+    /// and the later store marked the original as dead.
+    #[test]
+    fn test_dead_store_not_eliminated_when_cmp_reads_slot() {
+        // The critical pattern after memory_fold transforms the comparison:
+        //   movq %rax, -144(%rbp)     # store data[x*2]
+        //   movq -128(%rbp), %rax     # load to+1 (clobbers rax)
+        //   movl %eax, %eax           # truncate (Other, no rbp ref)
+        //   movq %rax, -136(%rbp)     # store to+1
+        //   cmpl -144(%rbp), %eax     # memory-folded cmp reads -144!
+        //   setae %al
+        //   movzbq %al, %rax
+        //   movq %rax, %rsi
+        //   movq %r11, %rax
+        //   addl $1, %eax
+        //   cltq
+        //   movq %rax, -144(%rbp)     # later store overwrites -144
+        //
+        // The bug: dead_stores saw the overwrite at the end, but missed the
+        // cmp read because pattern_bytes had been corrupted by the sub-byte
+        // offset scan for movl %eax, %eax.
+        let asm = [
+            "func:",
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    subq $160, %rsp",
+            // ... setup ...
+            "    movl (%rcx), %eax",
+            "    movq %rax, -144(%rbp)", // store data[x*2]
+            "    movq -128(%rbp), %rax", // load to+1 (clobbers rax)
+            "    movl %eax, %eax",       // truncate
+            "    movq %rax, -136(%rbp)", // store to+1
+            "    cmpl -144(%rbp), %eax", // memory-folded cmp (Cmp kind)
+            "    setae %al",
+            "    movzbq %al, %rax",
+            "    movq %rax, %rsi",
+            "    movq %r11, %rax",
+            "    addl $1, %eax",
+            "    cltq",
+            "    movq %rax, -144(%rbp)", // later overwrite of -144
+            "    ret",
+            ".size func, .-func",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // After optimization, there must still be a store to -144(%rbp) before
+        // the cmpl that reads it. The cmpl must compare the correct value.
+        let lines: Vec<&str> = result.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "cmpl -144(%rbp), %eax" {
+                // Scan backward for a store to -144
+                let mut found_store = false;
+                for k in (0..idx).rev() {
+                    let prev = lines[k].trim();
+                    if prev.ends_with("-144(%rbp)") && prev.starts_with("mov") {
+                        found_store = true;
+                        break;
+                    }
+                    if prev.ends_with(':') {
+                        break;
+                    }
+                }
+                assert!(
+                    found_store,
+                    "cmpl -144(%rbp) has no preceding store in same block!\nResult:\n{}",
+                    result
+                );
+                return;
+            }
+        }
+        // If the cmpl was not folded, check it exists in some form
+        assert!(
+            result.contains("cmpl") || result.contains("setae"),
+            "No comparison found\nResult:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_store_forward_param_ref_gep() {
+        // This pattern comes from:
+        //   void f(struct state *s) { ... s->member[i] = 0; ... }
+        // The codegen emits:
+        //   movq %rdi, -8(%rbp)    # store param
+        //   movq -8(%rbp), %rax    # paramref load
+        //   movq %rax, -8(%rbp)    # paramref store-back (redundant)
+        //   movq -8(%rbp), %rax    # GEP base load
+        //   leaq 208(%rax), %rax   # GEP offset
+        // After peephole, rax must still be set correctly before the leaq.
+        let asm = [
+            "func:",
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    subq $16, %rsp",
+            "    movq %rdi, -8(%rbp)",
+            "    movq -8(%rbp), %rax",
+            "    movq %rax, -8(%rbp)",
+            "    movq -8(%rbp), %rax",
+            "    leaq 208(%rax), %rax",
+            "    movq %rax, %r14",
+            "    ret",
+            ".size func, .-func",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // After optimization, rax must be loaded from rdi or from the stack
+        // before the leaq instruction.
+        // The correct result should be something like:
+        //   movq %rdi, -8(%rbp) or movq %rdi, %rax + leaq 208(%rax)...
+        // NOT: leaq 208(%rax) with rax uninitialized!
+        eprintln!("Result:\n{}", result);
+        assert!(
+            result.contains("movq %rdi, %rax")
+                || result.contains("movq -8(%rbp), %rax")
+                || result.contains("leaq 208(%rdi)"),
+            "rax must be set from rdi before leaq 208(%rax): {}",
+            result
+        );
+    }
+
+    /// Regression test: frame_compact must not NOP a store when a read overlaps
+    /// it at a different offset. Example: a struct param stored as
+    /// `movq %rsi, -8(%rbp)` (8 bytes at [-8, 0)) has a field read via
+    /// `movl -4(%rbp), %eax` (4 bytes at [-4, 0)). The store and read overlap
+    /// but have different offsets, so exact-offset matching would miss the
+    /// dependency and incorrectly NOP the store.
+    #[test]
+    fn test_frame_compact_overlapping_store_read() {
+        let asm = [
+            "func:",
+            "    pushq %rbp",
+            "    .cfi_def_cfa_offset 16",
+            "    .cfi_offset %rbp, -16",
+            "    movq %rsp, %rbp",
+            "    .cfi_def_cfa_register %rbp",
+            "    subq $48, %rsp",
+            "    movq %rbx, -48(%rbp)",
+            "    movq %r12, -40(%rbp)",
+            "    movq %r13, -32(%rbp)",
+            "    movq %r14, -24(%rbp)",
+            "    movq %r15, -16(%rbp)",
+            // Store 8-byte struct param at -8(%rbp) covering bytes [-8, 0)
+            "    movq %rsi, -8(%rbp)",
+            // Read a 4-byte field at -4(%rbp) covering bytes [-4, 0)
+            "    movl -4(%rbp), %eax",
+            "    movq %rax, %r14",
+            "    movq %rdi, %rdi",
+            "    call some_func",
+            // Epilogue
+            "    movq %r14, %rax",
+            "    movq -48(%rbp), %rbx",
+            "    movq -40(%rbp), %r12",
+            "    movq -32(%rbp), %r13",
+            "    movq -24(%rbp), %r14",
+            "    movq -16(%rbp), %r15",
+            "    movq %rbp, %rsp",
+            "    popq %rbp",
+            "    ret",
+            ".size func, .-func",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // The store to -8(%rbp) must survive because the read at -4(%rbp) overlaps it.
+        // The load must also survive.
+        let lines: Vec<&str> = result.lines().map(|l| l.trim()).collect();
+        let has_store = lines
+            .iter()
+            .any(|l| l.contains("%rsi") && l.contains("(%rbp)"));
+        // The load may be folded by relay elimination: movl -4(%rbp),%eax + movq %rax,%r14
+        // becomes movl -4(%rbp),%r14d — so accept either %eax or %r14d as the destination.
+        let has_load = lines.iter().any(|l| {
+            l.starts_with("movl")
+                && l.contains("(%rbp)")
+                && (l.contains("%eax") || l.contains("%r14d"))
+        });
+        assert!(
+            has_store,
+            "store of struct param must survive frame compaction (overlapping read exists): {}",
+            result
+        );
+        assert!(has_load, "load of struct field must survive: {}", result);
+    }
+
+    /// Regression test: frame compaction must NOP out dead stores that conflict
+    /// with relocated callee-save offsets. Without this fix, a dead store like
+    /// `movq %rax, -64(%rbp)` can clobber a callee-saved register that was
+    /// relocated to -64(%rbp) during frame compaction.
+    ///
+    /// Pattern from tre-compile.c: tre_ast_to_tnfa has 5 callee saves at
+    /// -112..-80 and body reads down to -56, with a dead store at -64.
+    /// Compaction moves callee saves to -96..-64, but -64 conflicts with
+    /// the dead store.
+    #[test]
+    fn test_frame_compact_dead_store_noped() {
+        let asm = [
+            "func:",
+            "    pushq %rbp",
+            "    .cfi_def_cfa_offset 16",
+            "    .cfi_offset %rbp, -16",
+            "    movq %rsp, %rbp",
+            "    .cfi_def_cfa_register %rbp",
+            "    subq $112, %rsp",
+            "    movq %rbx, -112(%rbp)",
+            "    movq %r12, -104(%rbp)",
+            "    movq %r13, -96(%rbp)",
+            "    movq %r14, -88(%rbp)",
+            "    movq %r15, -80(%rbp)",
+            // Body: reads at -8, -56; dead store at -64
+            "    movq %rdi, -8(%rbp)",
+            "    movq -8(%rbp), %rax",
+            "    movq %rax, -56(%rbp)",
+            "    movq -56(%rbp), %rdi",
+            "    call some_func",
+            "    movq %rax, -64(%rbp)", // dead store - never read
+            "    movq %rax, %r14",
+            // Epilogue
+            "    movq %r14, %rax",
+            "    movq -112(%rbp), %rbx",
+            "    movq -104(%rbp), %r12",
+            "    movq -96(%rbp), %r13",
+            "    movq -88(%rbp), %r14",
+            "    movq -80(%rbp), %r15",
+            "    movq %rbp, %rsp",
+            "    popq %rbp",
+            "    ret",
+            ".size func, .-func",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // After compaction:
+        // - Frame should be smaller than 112
+        // - Dead store at -64 should be NOP'd (not present in output)
+        // - Callee saves should be at new offsets
+        assert!(result.contains("subq $"), "should have subq: {}", result);
+        assert!(
+            !result.contains("subq $112"),
+            "frame should be compacted from 112: {}",
+            result
+        );
+        // The dead store to -64 must not appear in the output
+        // (it would clobber the relocated callee save)
+        assert!(
+            !result.contains("-64(%rbp)") ||
+                // -64 might appear as a new callee-save offset in saves/restores which is OK
+                (result.contains("movq %r15, -64(%rbp)") || result.contains("movq -64(%rbp), %r15")),
+            "dead store to -64 must be eliminated or -64 used only for callee save: {}",
+            result
+        );
+    }
+
+    /// Regression test: a struct stored with movq at -8(%rbp) that is read
+    /// field-by-field via movl at -4(%rbp) must NOT be NOP'd by frame_compact.
+    /// The store covers bytes [-8, 0) and the read at -4 falls within that range.
+    #[test]
+    fn test_frame_compact_struct_suboffset_read() {
+        let asm = [
+            "release_entry:",
+            "    pushq %rbp",
+            "    .cfi_def_cfa_offset 16",
+            "    .cfi_offset %rbp, -16",
+            "    movq %rsp, %rbp",
+            "    .cfi_def_cfa_register %rbp",
+            "    subq $48, %rsp",
+            "    movq %rbx, -48(%rbp)",
+            "    movq %r12, -40(%rbp)",
+            "    movq %r13, -32(%rbp)",
+            "    movq %r14, -24(%rbp)",
+            "    movq %r15, -16(%rbp)",
+            // Struct param stored as a whole at -8(%rbp)
+            "    movq %rdi, %r14",
+            "    movq %rsi, -8(%rbp)",
+            // Read individual field at sub-offset -4 within the struct
+            "    movl -4(%rbp), %eax",
+            "    movq %rax, %rsi",
+            "    call printf",
+            // Epilogue
+            "    movq -48(%rbp), %rbx",
+            "    movq -40(%rbp), %r12",
+            "    movq -32(%rbp), %r13",
+            "    movq -24(%rbp), %r14",
+            "    movq -16(%rbp), %r15",
+            "    movq %rbp, %rsp",
+            "    popq %rbp",
+            "    ret",
+            ".size release_entry, .-release_entry",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // The struct store at -8(%rbp) must be preserved because -4(%rbp) is read
+        assert!(
+            result.contains("movq %rsi, -8(%rbp)"),
+            "struct param store at -8(%rbp) must NOT be NOP'd when -4(%rbp) is read: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_sib_indexed_store_via_copy() {
+        // Pattern: movq %idx, %rax; addq %base, %rax; movq %rax, %tmp; store (%tmp)
+        let asm = super::in_function(&[
+            "    movq %r14, %rax",
+            "    addq %rcx, %rax",
+            "    movq %rax, %rcx",
+            "    movb $0, (%rcx)",
+        ]);
+        // Pass level: fold_base_index_addressing owns this shape.
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(super::local_patterns::fold_base_index_addressing(
+            &mut store, &mut infos
+        ));
+        assert_eq!(store.get(5).trim(), "movb $0, (%rcx, %r14)");
+        // Pipeline level: with exact liveness an earlier pass may retarget
+        // the add onto %rcx first (`addq %r14, %rcx; movb $0, (%rcx)`); either
+        // way the accumulator round-trip must be gone.
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("addq %rcx, %rax") && !result.contains("%rax"),
+            "accumulator round-trip should be eliminated: {}",
+            result
+        );
+    }
+
+    /// The fold deletes the `movq/addq` pair that defined %rax, so a consumer
+    /// that also READS %rax outside the substituted operand must block it.
+    #[test]
+    fn test_sib_fold_rejects_consumer_reading_the_address_register() {
+        let asm = super::in_function(&[
+            "    movq %r14, %rax",
+            "    addq %rbx, %rax",
+            "    addq (%rax), %rax",
+            "    movq %rax, (%rdi)",
+        ]);
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!super::local_patterns::fold_base_index_addressing(
+            &mut store, &mut infos
+        ));
+    }
+
+    /// Back-edge liveness for the accumulator form: %rax is read at the loop
+    /// head, which the old forward text scan never saw.
+    #[test]
+    fn test_sib_fold_respects_back_edge_liveness() {
+        let asm = [
+            "f:",
+            ".cfi_startproc",
+            "    movq %rsi, %rax",
+            ".LBB1:",
+            "    movq (%rax), %rdx",
+            "    testq %rdx, %rdx",
+            "    je .LBB2",
+            "    movq %r14, %rax",
+            "    addq %rbx, %rax",
+            "    movb $0, (%rax)",
+            "    jmp .LBB1",
+            ".LBB2:",
+            "    xorl %eax, %eax",
+            "    ret",
+            ".cfi_endproc",
+        ]
+        .join("\n")
+            + "\n";
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!super::local_patterns::fold_base_index_addressing(
+            &mut store, &mut infos
+        ));
+    }
+
+    #[test]
+    fn test_sib_indexed_store_direct_rax() {
+        // Pattern: movq %idx, %rax; addq %base, %rax; store (%rax)
+        let asm = super::in_function(&[
+            "    movq %r14, %rax",
+            "    addq %rbx, %rax",
+            "    movb $0, (%rax)",
+        ]);
+        let result = peephole_optimize(asm);
+        eprintln!("sib_direct result: {:?}", result);
+        // Scale 1 and neither register is %rsp: base and index commute (the
+        // copy+add fold may form the lea as (%r14,%rbx) before this fold).
+        assert!(
+            ["(%rbx, %r14)", "(%rbx,%r14)", "(%r14, %rbx)", "(%r14,%rbx)"]
+                .iter()
+                .any(|a| result.contains(&format!("movb $0, {a}"))),
+            "should fold to SIB indexed addressing: {}",
+            result
+        );
+        assert!(
+            !result.contains("(%rax)"),
+            "store still through %rax: {result}"
+        );
+    }
+
+    #[test]
+    fn test_volatile_slot_is_quarantined_from_peephole() {
+        let asm = [
+            "    # LCCC_VOLATILE_SLOT -24(%rbp)",
+            "    movq %rax, -24(%rbp)",
+            "    movq -24(%rbp), %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let store = LineStore::new(asm.clone());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        pin_volatile_stack_slots(&store, &mut infos);
+        assert!(infos[1].pinned && infos[2].pinned);
+        assert!(matches!(
+            infos[1].kind,
+            LineKind::Other { dest_reg: REG_NONE }
+        ));
+        let result = peephole_optimize(asm);
+        assert!(result.contains("movq %rax, -24(%rbp)"), "{}", result);
+        assert!(result.contains("movq -24(%rbp), %rax"), "{}", result);
+    }
+
+    #[test]
+    fn test_volatile_unknown_dest_invalidates_rax_zero_fact() {
+        // pin_volatile_stack_slots deliberately turns the load into opaque
+        // Other{REG_NONE}. It still writes eax, so the second zeroing operation
+        // is required before pushq. This is the reduced sqlite3MultiValues
+        // outgoing-stack-argument corruption pattern.
+        let asm = [
+            "    # LCCC_VOLATILE_SLOT 8(%rsp)",
+            "    xorl %eax, %eax",
+            "    movl 8(%rsp), %eax",
+            "    xorl %eax, %eax",
+            "    pushq %rax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        // The first zeroing is dead because the volatile load overwrites eax.
+        // The important invariant is that the *second* zeroing survives after
+        // the opaque load; otherwise pushq would consume the volatile value.
+        assert_eq!(result.matches("xorl %eax, %eax").count(), 1, "{}", result);
+        let load = result
+            .find("movl 8(%rsp), %eax")
+            .expect("volatile load kept");
+        let zero = result
+            .rfind("xorl %eax, %eax")
+            .expect("post-load zero kept");
+        assert!(
+            load < zero,
+            "post-load zero must follow volatile load: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_combined_preserves_address_taken_rsp_slot() {
+        // The first slot's address escapes to memcpy. A local FP bitcast fold
+        // may remove the independent second slot, but it must not make the
+        // address-taken first store dead.
+        let asm = [
+            "    movq %rax, 56(%rsp)",
+            "    movq %rax, 24(%rsp)",
+            "    movsd 24(%rsp), %xmm0",
+            "    leaq 56(%rsp), %rsi",
+            "    call memcpy",
+        ]
+        .join("\n")
+            + "\n";
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        pin_address_taken_stack_slots(&store, &mut infos);
+        assert!(infos[0].pinned, "address-taken store must be pinned");
+        while local_patterns::combined_local_pass(&mut store, &mut infos) {}
+        let local = store.build_result(|i| infos[i].is_nop());
+        assert!(local.contains("movq %rax, 56(%rsp)"), "{}", local);
+
+        let full = peephole_optimize(
+            [
+                "    movq %rax, 56(%rsp)",
+                "    movq %rax, 24(%rsp)",
+                "    movsd 24(%rsp), %xmm0",
+                "    leaq 56(%rsp), %rsi",
+                "    call memcpy",
+            ]
+            .join("\n")
+                + "\n",
+        );
+        assert!(full.contains("movq %rax, 56(%rsp)"), "{}", full);
+    }
+
+    #[test]
+    fn test_global_store_forward_callee_saved_loop_header_is_not_forwarded() {
+        // The back-edge changes RBX but not the stack slot.  At the next
+        // iteration the load must still observe the original slot value; a
+        // textual scan that carries a callee-saved mapping across .LBB200
+        // would turn it into `movq %rbx,%rax` and miscompile the loop.
+        let asm = [
+            "    movq $1, %rbx",
+            "    movq %rbx, -8(%rsp)",
+            ".LBB200:",
+            "    movq -8(%rsp), %rax",
+            "    movq $2, %rbx",
+            "    jmp .LBB200",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movq -8(%rsp), %rax"),
+            "CFG-join reload must not forward a stale callee-saved register: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_copy_shift_copyback_fold() {
+        let asm =
+            "    movq %rsi, %rbp\n    shll $5, %ebp\n    movl %ebp, %esi\n    movq $0, %rbp\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("shll $5, %esi"), "{}", out);
+        assert!(!out.contains("movq %rsi, %rbp"), "{}", out);
+        assert!(!out.contains("movl %ebp, %esi"), "{}", out);
+    }
+
+    #[test]
+    fn test_copy_shift_copyback_keeps_live_tmp() {
+        let asm =
+            "    movq %rsi, %rbp\n    shll $5, %ebp\n    movl %ebp, %esi\n    addq %rbp, %rax\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("movq %rsi, %rbp"), "{}", out);
+    }
+
+    #[test]
+    fn test_zero_extended_xor_move_fold() {
+        let asm = "    shll $5, %esi\n    movl %edi, %r15d\n    movq %rsi, %rdi\n    xorq %r15, %rdi\n    andq $32767, %rdi\n    movq $0, %r15\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("xorl %esi, %edi"), "{}", out);
+        assert!(!out.contains("xorq %r15, %rdi"), "{}", out);
+    }
+    #[test]
+    fn test_zero_extended_xor_keeps_live_flags() {
+        let asm = "    shll $5, %esi\n    movl %edi, %r15d\n    movq %rsi, %rdi\n    xorq %r15, %rdi\n    jne .Lx\n    movq $0, %r15\n.Lx:\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("xorq %r15, %rdi"), "{}", out);
+    }
+
+    #[test]
+    fn test_rotate_idiom_fold() {
+        let asm = "    movq %r9, %rsi\n    shlq $13, %rsi\n    movq %r9, %rdx\n    shrq $51, %rdx\n    movq %rsi, %r9\n    orq %rdx, %r9\n    addq %rax, %rbx\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("rolq $13, %r9"), "{}", out);
+        assert!(!out.contains("shrq $51"), "{}", out);
+    }
+
+    #[test]
+    fn test_compare_branch_rsp_signed_byte_reload() {
+        let asm = ".cfi_startproc\nsubq $400, %rsp\n    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\n    jmp .Lyes\n.Lno:\nmovl $10, %eax\naddq $400, %rsp\nret\n.Lyes:\nmovl $20, %eax\naddq $400, %rsp\nret\n.cfi_endproc\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("jae .Lno") || out.contains("jb .Lyes"),
+            "{}",
+            out
+        );
+        assert!(!out.contains("setb"), "{}", out);
+        assert!(!out.contains("movsbq 384"), "{}", out);
+    }
+
+    #[test]
+    fn test_late_compare_bool_rsp_spill() {
+        let mut asm=".cfi_startproc\nsubq $400, %rsp\n    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lno\nmovl $10, %eax\naddq $400, %rsp\nret\n.Lno:\nmovl $20, %eax\naddq $400, %rsp\nret\n.cfi_endproc\n".to_string();
+        assert!(compare_branch::fuse_late_compare_bool_spills(&mut asm));
+        assert!(asm.contains("jae .Lno"), "{}", asm);
+        assert!(!asm.contains("setb"), "{}", asm);
+    }
+
+    #[test]
+    fn test_late_compare_phi_false_keeps_shared_join() {
+        let mut asm="    cmpl %edx, %esi\n    setb %al\n    movzbl %al, %eax\n    movq %rax, 384(%rsp)\n.Ljoin:\n    movsbq 384(%rsp), %rax\n    testq %rax, %rax\n    je .Lfalse_target\n.Lother:\n    ret\n.Lpred_false:\n    xorl %eax, %eax\n    movq %rax, 384(%rsp)\n    jmp .Ljoin\n.Lfalse_target:\n    ret\n".to_string();
+        // This fragment returns the materialized RAX value and has a shared
+        // join. The historical raw-text redirect deleted observable state.
+        let original = asm.clone();
+        assert!(!compare_branch::fuse_late_compare_bool_spills(&mut asm));
+        assert_eq!(asm, original);
+    }
+
+    #[test]
+    fn test_movslq_not_eliminated_when_next_insn_reads_64bit_index() {
+        // Pattern 3b: `movslq %edi, %rdi` must NOT be eliminated when the next
+        // instruction writes %edi but also READS %rdi as a SIB index
+        // (`movzbl (%rcx,%rdi),%edi`). Removing the movslq misaddresses the
+        // load for negative indices (zlib/zigzag byte-compare shape).
+        let asm = [
+            "    movslq %edi, %rdi",
+            "    movzbl (%rcx, %rdi), %edi",
+            "    movzbl (%rsi), %eax",
+        ]
+        .join("\n")
+            + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movslq %edi, %rdi"),
+            "movslq must be kept when the byte-load reads %rdi as index: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_movslq_eliminated_when_next_insn_only_writes_reg() {
+        // Control: `movslq %edi, %rdi` followed by a pure 32-bit write of %edi
+        // (no 64-bit read) is still safe to eliminate.
+        let asm = ["    movslq %edi, %rdi", "    movl %eax, %edi"].join("\n") + "\n";
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("movslq %edi, %rdi"),
+            "movslq should be eliminated after a pure 32-bit overwrite: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_vector_self_move_eliminated() {
+        let asm = ["    vmovdqu %ymm0, %ymm0", "    vmovdqu %ymm0, 240(%rsp)"].join("\n") + "\n";
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            !out.contains("vmovdqu %ymm0, %ymm0"),
+            "self-move must be removed: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_vex_xmm_self_move_kept_when_wider_zmm_read_follows() {
+        let asm = [
+            "    movdqu 80(%rsp), %xmm0",
+            "    vmovdqu %xmm0, %xmm0",
+            "    vmovdqu64 %zmm0, (%rax)",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("vmovdqu %xmm0, %xmm0") || out.contains("vmovdqu 80(%rsp), %xmm0"),
+            "upper-zeroing VEX write before %zmm0 read must survive: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_vector_self_move_kept_for_different_regs() {
+        // The bug this pins: a self-move eliminator that matched the destination
+        // spelling twice read `vmovdqu %ymm1, %ymm0` as a move of %ymm0 onto
+        // itself, dropped it, and lost the value the store below needs.
+        //
+        // Vector copy propagation now folds the copy into its only consumer,
+        // which is a strictly better answer to the same bug — the value still
+        // reaches 240(%rsp), with one instruction fewer doing it.  So the
+        // property asserted is the one that was actually violated: either the
+        // copy survives, or the store is retargeted onto the copy's source.
+        // What must never happen is the copy disappearing and the store still
+        // naming a register nothing defined.
+        let asm = ["    vmovdqu %ymm1, %ymm0", "    vmovdqu %ymm0, 240(%rsp)"].join("\n") + "\n";
+        let out = peephole_optimize(asm.to_string());
+        let folded = out.contains("vmovdqu %ymm1, 240(%rsp)");
+        let kept = out.contains("vmovdqu %ymm1, %ymm0") && out.contains("vmovdqu %ymm0, 240(%rsp)");
+        assert!(
+            folded || kept,
+            "the value must reach the slot, by copy or by fold: {}",
+            out
+        );
+        assert!(
+            out.contains("240(%rsp)"),
+            "the store itself must survive: {}",
+            out
+        );
+        assert!(
+            !out.contains("vmovdqu %ymm0, %ymm0"),
+            "a genuine self-move is still removed: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn xmm_source_is_not_indexed_as_a_gpr_in_extension_fusion() {
+        let asm = "    movq %xmm2, %rax\n    movl %eax, %eax\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains("%xmm2"));
+    }
+    #[test]
+    fn fpo_dead_callee_save_is_dropped_and_cfa_rewritten() {
+        let asm = concat!(
+            "isort:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    leaq 4(%rdi), %rbx\n",
+            "    movl $1, %r12d\n",
+            ".LBB1:\n",
+            "    addl %r12d, %ebx\n",
+            "    cmpl %esi, %r12d\n",
+            "    jl .LBB1\n",
+            "    popq %r13\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size isort, .-isort\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(out.contains("pushq %rbx"), "{out}");
+        assert!(out.contains("pushq %r12"), "{out}");
+        assert!(out.contains(".cfi_def_cfa_offset 24"), "{out}");
+        assert_eq!(out.matches("popq").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn fpo_dead_callee_save_kept_when_function_calls() {
+        // A removed push would misalign %rsp at the call site.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    movl %edi, %ebx\n",
+            "    call g\n",
+            "    addl %ebx, %eax\n",
+            "    popq %r13\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("pushq %r13"), "{out}");
+        assert!(out.contains("popq %r13"), "{out}");
+        assert!(out.contains(".cfi_def_cfa_offset 24"), "{out}");
+    }
+
+    /// A save whose register is never NAMED is still live when an
+    /// instruction writes it implicitly (`cpuid` -> %ebx) or opaque inline
+    /// asm sits in the body; dropping it would corrupt the caller's %rbx.
+    #[test]
+    fn fpo_save_kept_for_implicit_and_inline_asm_writes() {
+        for body in ["    cpuid\n", "#APP\n    .byte 0x0f, 0xa2\n#NO_APP\n"] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    pushq %rbx\n    .cfi_def_cfa_offset 16\n    \
+                 .cfi_offset %rbx, -16\n    movl %edi, %eax\n    xorl %ecx, %ecx\n{body}    \
+                 popq %rbx\n    .cfi_def_cfa_offset 8\n    ret\n.cfi_endproc\n"
+            );
+            let out = peephole_optimize(asm);
+            assert!(
+                out.contains("pushq %rbx") && out.contains("popq %rbx"),
+                "{out}"
+            );
+            assert!(out.contains(".cfi_offset %rbx, -16"), "{out}");
+        }
+    }
+
+    /// With a prologue `subq` the frame-preserving form applies: the frame
+    /// total, and with it every `%rsp`-relative (aligned) slot, is unchanged.
+    #[test]
+    fn fpo_dead_callee_save_dropped_with_aligned_vector_stack_traffic() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    subq $32, %rsp\n",
+            "    vmovaps %ymm0, (%rsp)\n",
+            "    vmovaps (%rsp), %ymm1\n",
+            "    addq $32, %rsp\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(out.contains("subq $40, %rsp"), "{out}");
+        assert!(out.contains("addq $40, %rsp"), "{out}");
+        assert!(out.contains("vmovaps %ymm0, (%rsp)"), "{out}");
+    }
+
+    /// Without a `subq` the push must go outright, which moves `%rsp`:
+    /// `%rsp`-relative data refuses.
+    #[test]
+    fn fpo_dead_callee_save_kept_without_subq_when_rsp_addresses_data() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    vmovaps %xmm0, -24(%rsp)\n",
+            "    vmovaps -24(%rsp), %xmm1\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("pushq %r13"), "{out}");
+        assert!(out.contains("popq %r13"), "{out}");
+    }
+
+    /// A dead save in a framed function whose body moves `%rsp` transiently
+    /// (the SSE1 scalar GPR/XMM bridge) is still removed: the preserving
+    /// strategy grows `subq`/`addq` by the push's 8 bytes, so `%rsp` in the
+    /// body, and with it every `%rsp`-relative slot, is unchanged. Codegen
+    /// writes no CFI (`cfi_synth` derives it afterwards), so the same input
+    /// reaches this pass with and without unwind tables.
+    #[test]
+    fn fpo_dead_save_removed_across_transient_rsp_writes() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    subq $8, %rsp\n",
+            "    leaq -8(%rsp), %rsp\n",
+            "    movq %rax, (%rsp)\n",
+            "    movss (%rsp), %xmm0\n",
+            "    leaq 8(%rsp), %rsp\n",
+            "    addq $8, %rsp\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(
+            out.contains("subq $16, %rsp") && out.contains("addq $16, %rsp"),
+            "{out}"
+        );
+        for bridge in [
+            "leaq -8(%rsp), %rsp",
+            "movq %rax, (%rsp)",
+            "leaq 8(%rsp), %rsp",
+        ] {
+            assert!(out.contains(bridge), "{bridge}: {out}");
+        }
+    }
+
+    /// Call-argument pushes and their `addq` cleanup are balanced around
+    /// the call, so they do not block a dead save either (the shape of
+    /// `struct_by_value.c`'s `main`: a 48-byte struct passed by value).
+    /// `%rsp` is unchanged at every body instruction, which keeps the
+    /// call's 16-byte alignment and every `%rsp`-relative slot.
+    #[test]
+    fn fpo_dead_save_removed_across_call_argument_pushes() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    subq $112, %rsp\n",
+            "    leaq 64(%rsp), %rax\n",
+            "    pushq 40(%rax)\n",
+            "    pushq 32(%rax)\n",
+            "    pushq 24(%rax)\n",
+            "    pushq 16(%rax)\n",
+            "    pushq 8(%rax)\n",
+            "    pushq 0(%rax)\n",
+            "    leaq 64(%rsp), %rdi\n",
+            "    call id@PLT\n",
+            "    addq $48, %rsp\n",
+            "    movl 16(%rsp), %eax\n",
+            "    addq $112, %rsp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size main, .-main\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%rbx"), "{out}");
+        assert!(
+            out.contains("subq $120, %rsp") && out.contains("addq $120, %rsp"),
+            "{out}"
+        );
+        assert!(
+            out.contains("addq $48, %rsp") && out.contains("movl 16(%rsp), %eax"),
+            "{out}"
+        );
+    }
+
+    /// chacha20_core as emitted: per-push CFI, a frame, an epilogue with
+    /// its own CFA steps and the post-`ret` re-statement of the frame CFA.
+    #[test]
+    fn fpo_dead_saves_in_a_framed_leaf_keep_exact_cfi() {
+        let asm = concat!(
+            "chacha20_core:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    .cfi_offset %rbx, -16\n",
+            "    pushq %r12\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    .cfi_offset %r12, -24\n",
+            "    subq $72, %rsp\n",
+            "    .cfi_def_cfa_offset 96\n",
+            "    movdqu %xmm0, 8(%rsp)\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB2\n",
+            "    movdqu 8(%rsp), %xmm1\n",
+            "    movdqu %xmm1, (%rsi)\n",
+            "    addq $72, %rsp\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    popq %r12\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            "    .cfi_def_cfa_offset 96\n",
+            ".LBB2:\n",
+            "    addq $72, %rsp\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    popq %r12\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size chacha20_core, .-chacha20_core\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%rbx") && !out.contains("%r12"), "{out}");
+        // The interspersed `.cfi_offset` directives no longer make the
+        // prologue backscan skip never-read DSE for the whole function. The
+        // only frame resident was the xmm0 spill, whose reload on the
+        // fall-through path forwards directly (xmm0 is untouched between the
+        // spill and reload), so the leaf is now frameless: no frame
+        // adjustment and no body CFA/CFI-offset directives survive.
+        for gone in [
+            "subq ",
+            "addq ",
+            ".cfi_def_cfa_offset",
+            ".cfi_offset",
+            "8(%rsp)",
+        ] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        // The 16 bytes are still stored through %rsi on the fall-through
+        // path, and the branch keeps both returns distinct.
+        assert!(out.contains("movdqu %xmm0, %xmm1"), "{out}");
+        assert!(out.contains("movdqu %xmm1, (%rsi)"), "{out}");
+        assert_eq!(
+            out.lines().filter(|l| l.trim() == "ret").count(),
+            2,
+            "{out}"
+        );
+        assert!(out.contains("je .LBB2"), "{out}");
+    }
+
+    /// zstd_count's `main`: a dead save between live ones, calls in the
+    /// body. `%rbp`'s slot and the CFA after its push move up by 8; the
+    /// frame CFA and every `%rsp` offset stay.
+    #[test]
+    fn fpo_dead_save_between_live_ones_in_a_calling_function() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    .cfi_offset %rbx, -16\n",
+            "    pushq %r15\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    .cfi_offset %r15, -24\n",
+            "    pushq %rbp\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    .cfi_offset %rbp, -32\n",
+            "    subq $16, %rsp\n",
+            "    .cfi_def_cfa_offset 48\n",
+            "    movq %rdi, %rbx\n",
+            "    movq %rsi, %rbp\n",
+            "    movq %rax, 0(%rsp)\n",
+            "    call g\n",
+            "    addq 0(%rsp), %rbx\n",
+            "    leaq (%rbx,%rbp), %rax\n",
+            "    addq $16, %rsp\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    popq %rbp\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    popq %r15\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size main, .-main\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r15"), "{out}");
+        assert!(out.contains("subq $24, %rsp"), "{out}");
+        assert!(out.contains("addq $24, %rsp"), "{out}");
+        assert!(out.contains(".cfi_offset %rbx, -16"), "{out}");
+        assert!(out.contains(".cfi_offset %rbp, -24"), "{out}");
+        assert!(out.contains(".cfi_def_cfa_offset 48"), "{out}");
+        assert!(!out.contains(".cfi_def_cfa_offset 32"), "{out}");
+        assert!(
+            out.contains("movq %rax, 0(%rsp)") || out.contains("movq %rax, (%rsp)"),
+            "{out}"
+        );
+        let epi = &out[out.find("addq $24, %rsp").unwrap()..];
+        let order: Vec<&str> = epi
+            .lines()
+            .filter(|l| l.trim().starts_with("popq"))
+            .collect();
+        assert_eq!(order, ["    popq %rbp", "    popq %rbx"], "{out}");
+    }
+
+    /// Each gate of the frame-preserving form refuses on its own.
+    #[test]
+    fn fpo_frame_preserving_refusals() {
+        let shape = |subq: &str, addq: &str, extra_cfi: &str, pops: &str| {
+            format!(
+                "f:\n.cfi_startproc\n    pushq %rbx\n    .cfi_def_cfa_offset 16\n    .cfi_offset %rbx, -16\n    pushq %r13\n    .cfi_def_cfa_offset 24\n    .cfi_offset %r13, -24\n{extra_cfi}    {subq}\n    movq %rdi, %rbx\n    call g\n    movq %rbx, %rax\n    {addq}\n{pops}    ret\n.cfi_endproc\n.size f, .-f\n"
+            )
+        };
+        let mirror = "    popq %r13\n    popq %rbx\n";
+        let ok = shape("subq $8, %rsp", "addq $8, %rsp", "", mirror);
+        assert!(!peephole_optimize(ok).contains("%r13"), "control must fire");
+        let cases = [
+            // 4088 + 8 reaches a page: would need a stack-clash probe.
+            shape("subq $4088, %rsp", "addq $4088, %rsp", "", mirror),
+            // Epilogue does not restore through the matching addq.
+            shape("subq $8, %rsp", "leaq 8(%rsp), %rsp", "", mirror),
+            // CFI for a register outside the push set.
+            shape(
+                "subq $8, %rsp",
+                "addq $8, %rsp",
+                "    .cfi_offset %r14, -40\n",
+                mirror,
+            ),
+            // Pops not in mirror order.
+            shape(
+                "subq $8, %rsp",
+                "addq $8, %rsp",
+                "",
+                "    popq %rbx\n    popq %r13\n",
+            ),
+        ];
+        for (n, asm) in cases.into_iter().enumerate() {
+            let out = peephole_optimize(asm);
+            assert!(out.contains("pushq %r13"), "case {n}: {out}");
+        }
+    }
+
+    /// gcc.c-torture postmod-1.c at -O1: the prologue pinned
+    /// `movq %r9, %rbx` as a "parameter pre-store" (r9 was really a scratch
+    /// holding `(long)x`).  `fold_movslq_relay` retargeted the extension to
+    /// %rbx, then `mark_nop` refused to delete the pinned copy, leaving
+    /// `movslq %edi, %rbx; movq %r9, %rbx` — %rbx loaded from an undefined
+    /// %r9 and the loop dereferenced garbage.
+    fn slq_relay_lines(pin_copy: bool) -> (LineStore, Vec<LineInfo>) {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movslq %edi, %r9\n",
+            "    movq %r9, %rbx\n",
+            "    shlq $2, %rbx\n",
+            "    leaq array0(%rip), %r9\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        if pin_copy {
+            infos[3].pinned = true;
+        }
+        (store, infos)
+    }
+
+    #[test]
+    fn movslq_relay_fold_refuses_a_pinned_copy() {
+        let (mut store, mut infos) = slq_relay_lines(true);
+        assert!(!memory_fold::fold_movslq_relay(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(
+            out.contains("movslq %edi, %r9\n    movq %r9, %rbx"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn movslq_relay_fold_still_fires_on_an_unpinned_copy() {
+        let (mut store, mut infos) = slq_relay_lines(false);
+        assert!(memory_fold::fold_movslq_relay(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("movslq %edi, %rbx"), "{out}");
+        assert!(!out.contains("movq %r9, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn prologue_prestore_shape_never_reads_an_undefined_scratch() {
+        // End to end through the driver's own pinning: whatever the passes
+        // do, a surviving `movq %r9, %rbx` must still be preceded by the
+        // definition of %r9.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    movslq %edi, %r9\n",
+            "    movq %r9, %rbx\n",
+            "    shlq $2, %rbx\n",
+            "    leaq array0(%rip), %r9\n",
+            "    addq %rbx, %r9\n",
+            "    movss (%r9), %xmm0\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        if let Some(copy) = out.find("movq %r9, %rbx") {
+            assert!(out[..copy].contains("movslq %edi, %r9"), "{out}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug_adjacency_tests;
+
+#[cfg(test)]
+mod scalar_transfer_tests;
+
+/// Test-only, per-thread counterpart of `CCC_PEEPHOLE_SKIP` (the env var is
+/// process-global and races between parallel tests). Pipeline tests that pin
+/// one pass's refusal use it to keep a LATER pass from rewriting the shape
+/// they assert on; the later pass gets its own tests on the same shapes.
+#[cfg(test)]
+pub(crate) mod test_skips {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SKIPS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Restores the thread's skip set on drop (panics included).
+    pub(crate) struct SkipGuard(usize);
+
+    impl Drop for SkipGuard {
+        fn drop(&mut self) {
+            SKIPS.with(|s| s.borrow_mut().truncate(self.0));
+        }
+    }
+
+    /// Disable the named `sk()` passes on this thread until the guard drops.
+    #[must_use]
+    pub(crate) fn skip_passes(names: &[&'static str]) -> SkipGuard {
+        SKIPS.with(|s| {
+            let mut v = s.borrow_mut();
+            let mark = v.len();
+            v.extend_from_slice(names);
+            SkipGuard(mark)
+        })
+    }
+
+    pub(super) fn extend(set: &mut crate::common::fx_hash::FxHashSet<String>) {
+        SKIPS.with(|s| set.extend(s.borrow().iter().map(|n| (*n).to_string())));
+    }
+}

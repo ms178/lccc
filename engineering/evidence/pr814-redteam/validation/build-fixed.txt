@@ -1,0 +1,7 @@
+NAME                        TYPE SIZE USED PRIO
+/home/user/.cache/lccc.swap file   4G 6.3M   -2
+Rust toolchain: stable (rustc 1.99.0 (b940084d7 2026-09-28))
+Cargo jobs: 2 (fixed research policy)
+Building LCCC (fastbuild profile: -O1, no LTO, incremental)
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 2m 46s

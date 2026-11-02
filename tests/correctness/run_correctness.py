@@ -1,0 +1,1613 @@
+#!/usr/bin/env python3
+"""
+LCCC Correctness Test Suite
+Compiles C programs with LCCC and GCC, verifies identical output.
+Tests cover edge cases, integer overflow, bitops, unions, enums,
+multi-file, preprocessor, and other tricky patterns.
+
+Usage:
+    python3 run_correctness.py           # run all
+    python3 run_correctness.py -v        # verbose (show failures)
+    python3 run_correctness.py --filter bitfield  # filter by name
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).parent.parent.parent
+LCCC = Path(os.environ.get("LCCC_BIN", REPO_ROOT / "target" / "release" / "lccc"))
+GCC_COMPILER = os.environ.get("GCC_BIN", "/usr/bin/gcc")
+GCC_INC = subprocess.check_output(
+    [GCC_COMPILER, "-print-file-name=include"], text=True
+).strip()
+
+COMPILERS = {
+    "LCCC": (str(LCCC), [f"-I{GCC_INC}", "-O2"]),
+    "GCC": (GCC_COMPILER, ["-O2"]),
+}
+
+BOLD = "\033[1m"; DIM = "\033[2m"; RED = "\033[31m"
+GRN = "\033[32m"; YLW = "\033[33m"; RST = "\033[0m"
+
+def c(code, text):
+    return f"{code}{text}{RST}" if sys.stdout.isatty() else text
+
+# Each test: (name, source_code, extra_compile_flags, expected_exit_code)
+# If expected_exit_code is None, we just check LCCC output == GCC output
+# Shared source for the packed-compare predicate matrix.  The AVX2 and
+# SSE2 entries below compile the SAME program at different ISA baselines
+# so the two emitter families (three-operand VEX vs two-operand legacy)
+# are held to one reference output and can never drift apart.
+_CMP_PREDICATE_MATRIX_SRC = r"""
+#include <stdio.h>
+#include <string.h>
+#define N 1033
+
+/* ---- 32-bit lanes, constant right-hand side ------------------------- */
+static void d_eq (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v==7  ? v+1000 : v-1000;}}
+static void d_ne (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=7  ? v+1000 : v-1000;}}
+static void d_lt (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<7   ? v+1000 : v-1000;}}
+static void d_le (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<=7  ? v+1000 : v-1000;}}
+static void d_gt (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v>7   ? v+1000 : v-1000;}}
+static void d_ge (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v>=7  ? v+1000 : v-1000;}}
+static void d_ultc(const unsigned*a,unsigned*b,int n){for(int i=0;i<n;i++){unsigned v=a[i];b[i]= v<3000000000u ? v+7u : v-7u;}}
+static void d_ulec(const unsigned*a,unsigned*b,int n){for(int i=0;i<n;i++){unsigned v=a[i];b[i]= v<=3000000000u ? v+7u : v-7u;}}
+/* the negation of a fused window: exercises `ne` on a mask-producing tree */
+static void d_nz (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=0 ? -v : v;}}
+
+/* ---- 32-bit lanes, two streams (both operands register-homed) ------- */
+static void s_eq (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]==c[i] ? a[i]+5 : c[i]-5;}}
+static void s_ne (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]!=c[i] ? a[i]+5 : c[i]-5;}}
+static void s_lt (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<c[i]  ? a[i]+5 : c[i]-5;}}
+static void s_le (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<=c[i] ? a[i]+5 : c[i]-5;}}
+static void s_gt (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]>c[i]  ? a[i]+5 : c[i]-5;}}
+static void s_ge (const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){b[i]= a[i]>=c[i] ? a[i]+5 : c[i]-5;}}
+static void s_ult(const unsigned*a,const unsigned*c,unsigned*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<c[i]  ? a[i]+5u : c[i]-5u;}}
+static void s_ule(const unsigned*a,const unsigned*c,unsigned*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<=c[i] ? a[i]+5u : c[i]-5u;}}
+
+/* ---- 8-bit lanes, constant rhs (OP-05d byte demotion) --------------- */
+static void y_eq (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v==7  ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_ne (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v!=7  ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_lt (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v<200 ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_le (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v<=200? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_gt (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v>200 ? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+static void y_ge (const unsigned char*a,unsigned char*b,int n){for(int i=0;i<n;i++){unsigned char v=a[i];b[i]= v>=200? (unsigned char)(v+100) : (unsigned char)(v-100);}}
+/* signed char: the signed byte compare path, negative constants */
+static void z_lt (const signed char*a,signed char*b,int n){for(int i=0;i<n;i++){signed char v=a[i];b[i]= v< -40 ? (signed char)(v+7) : (signed char)(v-7);}}
+static void z_le (const signed char*a,signed char*b,int n){for(int i=0;i<n;i++){signed char v=a[i];b[i]= v<=-40 ? (signed char)(v+7) : (signed char)(v-7);}}
+static void z_ne (const signed char*a,signed char*b,int n){for(int i=0;i<n;i++){signed char v=a[i];b[i]= v!=-40 ? (signed char)(v+7) : (signed char)(v-7);}}
+
+/* ---- 8-bit lanes, two streams --------------------------------------- */
+static void w_ne (const unsigned char*a,const unsigned char*c,unsigned char*b,int n){for(int i=0;i<n;i++){b[i]= a[i]!=c[i] ? a[i] : c[i];}}
+static void w_le (const unsigned char*a,const unsigned char*c,unsigned char*b,int n){for(int i=0;i<n;i++){b[i]= a[i]<=c[i] ? a[i] : c[i];}}
+
+static int ia[N], ic[N], ib[N];
+static unsigned ua[N], uc[N], ub[N];
+static unsigned char ya[N], yc[N], yb[N];
+static signed char za[N], zb[N];
+
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+
+int main(void){
+  unsigned s=20260908u;
+  for(int i=0;i<N;i++){
+    s=s*1664525u+1013904223u;
+    ia[i]=(int)(s%17)-8; ic[i]=(int)((s>>8)%17)-8;
+    ua[i]=s; uc[i]=s>>3;
+    ya[i]=(unsigned char)(i<256?i:s); yc[i]=(unsigned char)(s>>5);
+    za[i]=(signed char)(i<256?i:s);
+  }
+  /* pin the interesting points at low indices so short trip counts see them */
+  ia[0]=7; ia[1]=6; ia[2]=8; ia[3]=0; ia[4]=-1; ia[5]=-2147483647-1; ia[6]=2147483647;
+  ic[0]=7; ic[1]=7; ic[2]=-2147483647-1; ic[3]=2147483647;
+  ua[0]=0u; ua[1]=1u; ua[2]=2999999999u; ua[3]=3000000000u; ua[4]=3000000001u; ua[5]=4294967295u;
+  uc[0]=0u; uc[1]=4294967295u; uc[2]=3000000000u;
+  ya[0]=0; ya[1]=7; ya[2]=8; ya[3]=199; ya[4]=200; ya[5]=201; ya[6]=255;
+  yc[0]=0; yc[1]=7; yc[2]=255; yc[3]=200;
+  za[0]=-128; za[1]=-41; za[2]=-40; za[3]=-39; za[4]=0; za[5]=127;
+
+#define RUNI(f)  do{ memset(ib,0xAB,sizeof ib); f(ia,ib,N);        printf(#f " %08x\n", h(ib,sizeof ib)); }while(0)
+#define RUNU(f)  do{ memset(ub,0xAB,sizeof ub); f(ua,ub,N);        printf(#f " %08x\n", h(ub,sizeof ub)); }while(0)
+#define RUNS(f)  do{ memset(ib,0xAB,sizeof ib); f(ia,ic,ib,N);     printf(#f " %08x\n", h(ib,sizeof ib)); }while(0)
+#define RUNSU(f) do{ memset(ub,0xAB,sizeof ub); f(ua,uc,ub,N);     printf(#f " %08x\n", h(ub,sizeof ub)); }while(0)
+#define RUNY(f)  do{ memset(yb,0xAB,sizeof yb); f(ya,yb,N);        printf(#f " %08x\n", h(yb,sizeof yb)); }while(0)
+#define RUNZ(f)  do{ memset(zb,0xAB,sizeof zb); f(za,zb,N);        printf(#f " %08x\n", h(zb,sizeof zb)); }while(0)
+#define RUNW(f)  do{ memset(yb,0xAB,sizeof yb); f(ya,yc,yb,N);     printf(#f " %08x\n", h(yb,sizeof yb)); }while(0)
+
+  RUNI(d_eq); RUNI(d_ne); RUNI(d_lt); RUNI(d_le); RUNI(d_gt); RUNI(d_ge); RUNI(d_nz);
+  RUNU(d_ultc); RUNU(d_ulec);
+  RUNS(s_eq); RUNS(s_ne); RUNS(s_lt); RUNS(s_le); RUNS(s_gt); RUNS(s_ge);
+  RUNSU(s_ult); RUNSU(s_ule);
+  RUNY(y_eq); RUNY(y_ne); RUNY(y_lt); RUNY(y_le); RUNY(y_gt); RUNY(y_ge);
+  RUNZ(z_lt); RUNZ(z_le); RUNZ(z_ne);
+  RUNW(w_ne); RUNW(w_le);
+
+  /* Trip-count sweep: packed body, scalar remainder, empty loop -- for one
+     kernel of every emitter path (dword const / dword stream / byte const /
+     byte stream / signed byte / unsigned biased). */
+  for(int n=0;n<=40;n++){
+    memset(ib,0xAB,sizeof ib); d_ne(ia,ib,n);      printf("t%d.a %08x\n", n, h(ib,n*4));
+    memset(ib,0xAB,sizeof ib); s_le(ia,ic,ib,n);   printf("t%d.b %08x\n", n, h(ib,n*4));
+    memset(yb,0xAB,sizeof yb); y_ne(ya,yb,n);      printf("t%d.c %08x\n", n, h(yb,n));
+    memset(yb,0xAB,sizeof yb); w_le(ya,yc,yb,n);   printf("t%d.d %08x\n", n, h(yb,n));
+    memset(zb,0xAB,sizeof zb); z_ne(za,zb,n);      printf("t%d.e %08x\n", n, h(zb,n));
+    memset(ub,0xAB,sizeof ub); d_ulec(ua,ub,n);    printf("t%d.f %08x\n", n, h(ub,n*4));
+  }
+  return 0;
+}
+"""
+
+TESTS = [
+    # ── Integer edge cases ──────────────────────────────────────────────
+    ("int_overflow_signed", r'''
+#include <stdio.h>
+#include <limits.h>
+int main(void) {
+    unsigned int a = UINT_MAX;
+    printf("UINT_MAX=%u UINT_MAX+1=%u\n", a, a + 1);
+    int b = INT_MAX;
+    unsigned int c = (unsigned int)b + 1;
+    printf("INT_MAX=%d cast=%u\n", b, c);
+    printf("INT_MIN=%d\n", INT_MIN);
+    return 0;
+}
+''', [], None),
+
+    ("unsigned_division", r'''
+#include <stdio.h>
+int main(void) {
+    unsigned int a = 0xFFFFFFFF;
+    unsigned int b = 3;
+    printf("%u / %u = %u rem %u\n", a, b, a/b, a%b);
+    unsigned long long c = 0xFFFFFFFFFFFFFFFFULL;
+    unsigned long long d = 7;
+    printf("%llu / %llu = %llu rem %llu\n", c, d, c/d, c%d);
+    return 0;
+}
+''', [], None),
+
+    ("signed_division_negative", r'''
+#include <stdio.h>
+int main(void) {
+    printf("%d %d\n", -7 / 2, -7 % 2);
+    printf("%d %d\n", 7 / -2, 7 % -2);
+    printf("%d %d\n", -7 / -2, -7 % -2);
+    long long a = -9223372036854775807LL - 1;
+    printf("%lld / -1 is tricky\n", a);
+    return 0;
+}
+''', [], None),
+
+    ("shift_edge_cases", r'''
+#include <stdio.h>
+int main(void) {
+    unsigned int a = 1;
+    printf("%u %u %u\n", a << 0, a << 15, a << 31);
+    unsigned int b = 0x80000000;
+    printf("%u %u\n", b >> 0, b >> 31);
+    int c = -1;
+    printf("%d %d\n", c >> 1, c >> 31);  // arithmetic shift
+    return 0;
+}
+''', [], None),
+
+    ("integer_conversions", r'''
+#include <stdio.h>
+int main(void) {
+    // Narrowing
+    int a = 0x12345678;
+    short b = (short)a;
+    char d = (char)a;
+    printf("narrow: %hd %hhd\n", b, d);
+    // Widening
+    signed char e = -42;
+    int f = e;
+    unsigned int g = (unsigned int)e;
+    printf("widen: %d %u\n", f, g);
+    // Zero-extend vs sign-extend
+    unsigned char h = 200;
+    int i = h;
+    int j = (signed char)h;
+    printf("extend: %d %d\n", i, j);
+    return 0;
+}
+''', [], None),
+
+    # ── Bitfield tests ──────────────────────────────────────────────────
+    ("bitfield_basic", r'''
+#include <stdio.h>
+struct S {
+    unsigned int a : 3;
+    unsigned int b : 5;
+    unsigned int c : 8;
+    unsigned int d : 16;
+};
+int main(void) {
+    struct S s = {7, 31, 255, 65535};
+    printf("%u %u %u %u\n", s.a, s.b, s.c, s.d);
+    s.a = 0; s.b = 1;
+    printf("%u %u\n", s.a, s.b);
+    printf("sizeof=%zu\n", sizeof(struct S));
+    return 0;
+}
+''', [], None),
+
+    ("bitfield_signed", r'''
+#include <stdio.h>
+struct S {
+    int a : 4;
+    int b : 1;
+    unsigned int c : 3;
+};
+int main(void) {
+    struct S s;
+    s.a = -4; s.b = -1; s.c = 7;
+    printf("%d %d %u\n", s.a, s.b, s.c);
+    s.a = 7;
+    printf("%d\n", s.a);  // 7 in 4-bit signed = 7
+    return 0;
+}
+''', [], None),
+
+    # ── Union tests ─────────────────────────────────────────────────────
+    ("union_type_punning", r'''
+#include <stdio.h>
+#include <string.h>
+union U { int i; float f; unsigned char bytes[4]; };
+int main(void) {
+    union U u;
+    u.i = 0x40490FDB;  // pi as float bits
+    printf("int=%d float=%.4f\n", u.i, u.f);
+    u.f = 1.0f;
+    printf("bytes:");
+    for (int k = 0; k < 4; k++) printf(" %02x", u.bytes[k]);
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    ("union_sizeof", r'''
+#include <stdio.h>
+union A { char c; int i; double d; };
+union B { char arr[20]; int i; };
+int main(void) {
+    printf("A=%zu B=%zu\n", sizeof(union A), sizeof(union B));
+    return 0;
+}
+''', [], None),
+
+    # ── Enum tests ──────────────────────────────────────────────────────
+    ("enum_values", r'''
+#include <stdio.h>
+enum Color { RED, GREEN = 5, BLUE, YELLOW = -1 };
+enum Big { A = 100000000, B };
+int main(void) {
+    printf("%d %d %d %d\n", RED, GREEN, BLUE, YELLOW);
+    printf("%d %d\n", A, B);
+    enum Color c = BLUE;
+    printf("blue=%d size=%zu\n", c, sizeof(c));
+    return 0;
+}
+''', [], None),
+
+    # ── Typedef and complex types ───────────────────────────────────────
+    ("typedef_complex", r'''
+#include <stdio.h>
+typedef int (*BinOp)(int, int);
+typedef struct { BinOp ops[4]; int count; } OpTable;
+
+static int add(int a, int b) { return a + b; }
+static int sub(int a, int b) { return a - b; }
+static int mul(int a, int b) { return a * b; }
+static int my_div(int a, int b) { return a / b; }
+
+int main(void) {
+    OpTable t = {{add, sub, mul, my_div}, 4};
+    for (int i = 0; i < t.count; i++)
+        printf("%d ", t.ops[i](10, 3));
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    # ── Array and pointer patterns ──────────────────────────────────────
+    ("multidim_array", r'''
+#include <stdio.h>
+int main(void) {
+    int a[3][4] = {{1,2,3,4},{5,6,7,8},{9,10,11,12}};
+    int sum = 0;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 4; j++)
+            sum += a[i][j];
+    printf("sum=%d a[1][2]=%d\n", sum, a[1][2]);
+    int (*p)[4] = a;
+    printf("p[2][3]=%d\n", p[2][3]);
+    return 0;
+}
+''', [], None),
+
+    ("array_decay", r'''
+#include <stdio.h>
+void print_arr(int *p, int n) {
+    for (int i = 0; i < n; i++) printf("%d ", p[i]);
+    printf("\n");
+}
+int main(void) {
+    int a[] = {10, 20, 30, 40, 50};
+    print_arr(a, 5);
+    print_arr(a + 2, 3);
+    printf("diff=%td\n", (a+4) - (a+1));
+    return 0;
+}
+''', [], None),
+
+    ("void_pointer_arith", r'''
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    int arr[5] = {1, 2, 3, 4, 5};
+    void *p = arr;
+    // Cast through char* for arithmetic
+    int *q = (int *)((char *)p + 2 * sizeof(int));
+    printf("%d\n", *q);
+    return 0;
+}
+''', [], None),
+
+    # ── String literal and const ────────────────────────────────────────
+    ("string_literals", r'''
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    const char *s1 = "hello";
+    const char *s2 = "hello";
+    printf("eq=%d len=%zu\n", s1 == s2, strlen(s1));
+    char buf[] = "world";
+    buf[0] = 'W';
+    printf("%s\n", buf);
+    // Concatenation
+    printf("%s\n", "foo" "bar" "baz");
+    // Escape sequences
+    printf("%d %d %d\n", '\n', '\t', '\0');
+    const int *w1 = L"wide";
+    const int *w2 = L"wide";
+    const unsigned short *u1 = u"utf16";
+    const unsigned short *u2 = u"utf16";
+    printf("wide_eq=%d utf16_eq=%d\n", w1 == w2, u1 == u2);
+    return 0;
+}
+''', [], None),
+
+    # ── Control flow edge cases ─────────────────────────────────────────
+    ("goto_label", r'''
+#include <stdio.h>
+int main(void) {
+    int i = 0;
+    loop:
+    if (i >= 5) goto done;
+    printf("%d ", i);
+    i++;
+    goto loop;
+    done:
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    ("nested_switch", r'''
+#include <stdio.h>
+int main(void) {
+    for (int i = 0; i < 3; i++) {
+        switch (i) {
+            case 0:
+                switch (i + 1) {
+                    case 1: printf("0-1 "); break;
+                    default: printf("0-? "); break;
+                }
+                break;
+            case 1: printf("1 "); break;
+            case 2: printf("2 "); break;
+        }
+    }
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    ("switch_fallthrough", r'''
+#include <stdio.h>
+int main(void) {
+    for (int i = 0; i < 5; i++) {
+        int v = 0;
+        switch (i) {
+            case 0: v += 1;
+            case 1: v += 10;
+            case 2: v += 100; break;
+            case 3: v += 1000; break;
+            default: v = -1;
+        }
+        printf("%d ", v);
+    }
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    ("do_while", r'''
+#include <stdio.h>
+int main(void) {
+    int i = 0, sum = 0;
+    do { sum += i; i++; } while (i < 10);
+    printf("sum=%d\n", sum);
+    // do-while with break
+    i = 0;
+    do { if (i == 5) break; i++; } while (1);
+    printf("i=%d\n", i);
+    return 0;
+}
+''', [], None),
+
+    # C11 6.3.2.1p4: a *function designator* in a value context converts to a
+    # pointer to the function, exactly like an array decay.  The comma operator
+    # is a value context, so `(0, f)` is a function pointer and every context
+    # below must treat it as one -- the sema-side type must agree with what
+    # codegen materialises (the address), or the two disagree about what the
+    # expression is.  Differential against the reference compiler.
+    ("comma_operator_designator_decay", r'''
+#include <stdio.h>
+static int inc(int x) { return x + 1; }
+static int arr[4];
+static int (*plain(void))(int) { return inc; }
+int main(void) {
+    int (*fp)(int) = (0, inc);
+    printf("%d\n", fp(41));
+    printf("%d\n", (0, inc)(1));
+    int (*same)(int) = (0, plain());
+    printf("%d\n", same(2) == fp(2));
+    /* the decayed pointer survives a comparison and a cast */
+    printf("%d\n", (0, inc) == inc);
+    printf("%d\n", ((int (*)(int))(0, inc))(3));
+    int (*ap)[4] = (0, &arr);
+    (*ap)[2] = 7;
+    printf("%d %d\n", arr[2], (0, arr) == arr);
+    printf("%zu %zu %zu\n", sizeof(arr), sizeof((0, arr)), sizeof(ap));
+    return 0;
+}
+''', [], None),
+
+    # Lvalue conversion (C11 6.3.2.1p2-p4) applies to the *values* of the
+    # comma and conditional operators, so an array or function-designator
+    # operand of either decays even though sizeof's array exception
+    # (C11 6.5.3.4p4) protects the operand as written. Every row below is a
+    # shape that GCC and LCCC must agree on, for the size AND for the value
+    # (the decayed address has to remain usable, not merely be sized right).
+    # The `_Generic`/`typeof` rows pin the same rule in the *type* domain, and
+    # the string-literal and `(void)` rows pin the cases where the operand's
+    # CType is not literally an array (a literal already has `char *` type, and
+    # void takes GCC's `sizeof == 1` extension).
+    ("comma_conditional_decay_matrix", r'''
+#include <stdio.h>
+static int arr[4] = {10, 20, 30, 40};
+static int arr2[2] = {7, 8};
+struct s { char c[17]; int a[3]; };
+static struct s sv;
+static int inc(int x) { return x + 1; }
+static int dec(int x) { return x - 1; }
+static int (*plain(void))(int) { return inc; }
+
+int main(void) {
+    int *p = (0, arr);
+    printf("%d %zu\n", p[2], sizeof((0, arr)));
+    printf("%zu %zu %zu\n", sizeof(arr), sizeof((arr, 0)), sizeof((arr, arr)));
+    printf("%zu %zu\n", sizeof(1 ? arr : arr2), sizeof(0 ? arr : arr2));
+    printf("%zu %zu\n", sizeof(1 ? (0, arr) : arr2), sizeof(1 ? plain() : dec));
+    printf("%zu %zu\n", sizeof(1 ? arr : 0), sizeof(1 ? (int *)0 : arr));
+    printf("%zu %zu %zu\n", sizeof((0, sv.c)), sizeof(1 ? sv.c : sv.c), sizeof(sv.c));
+    printf("%zu %zu\n", sizeof((0, sv.a)), sizeof(sv.a));
+    printf("%zu %zu %zu\n", sizeof((0, "abc")), sizeof(1 ? "abc" : "def"), sizeof("abc"));
+    printf("%zu %zu\n", sizeof((0, (void)0)), sizeof((void)0));
+    printf("%d %d\n",
+        _Generic((0, arr), int *: 1, default: 2),
+        _Generic(1 ? arr : arr, int *: 1, default: 2));
+    printf("%zu %zu\n", sizeof(typeof((0, arr))), sizeof(typeof(1 ? arr : arr)));
+    char *cp = (0, sv.c);
+    cp[3] = 'q';
+    printf("%d %c\n", (0, sv.c)[3], sv.c[3]);
+    int *mp = 1 ? sv.a : sv.a;
+    mp[1] = 5;
+    printf("%d %d\n", sv.a[1], (1 ? sv.a : sv.a)[1]);
+    printf("%d %d %d\n", (0, inc)(4), (1 ? inc : dec)(4), (0 ? inc : dec)(4));
+    int (*f)(int) = 1 ? inc : dec;
+    printf("%d\n", f(10));
+    printf("%d %d\n", *((0, arr) + 1), *(1 ? arr : arr + 1));
+    printf("%zu %zu %zu\n", sizeof(*(&arr)), sizeof(&arr), sizeof("abc"));
+    return 0;
+}
+''', [], None),
+
+    ("comma_operator", r'''
+#include <stdio.h>
+int main(void) {
+    int a = (1, 2, 3);
+    printf("%d\n", a);
+    int b = 0, d = 0;
+    for (int i = 0, j = 10; i < 5; i++, j--) {
+        b += i; d += j;
+    }
+    printf("%d %d\n", b, d);
+    return 0;
+}
+''', [], None),
+
+    ("ternary_nested", r'''
+#include <stdio.h>
+int main(void) {
+    for (int i = 0; i < 10; i++) {
+        int v = i < 3 ? 1 : i < 6 ? 2 : i < 8 ? 3 : 4;
+        printf("%d ", v);
+    }
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    # ── Struct/memory patterns ──────────────────────────────────────────
+    ("struct_padding", r'''
+#include <stdio.h>
+struct A { char c; int i; char d; };
+struct B { int i; char c; char d; };
+struct C { char c; short s; int i; };
+int main(void) {
+    printf("A=%zu B=%zu C=%zu\n", sizeof(struct A), sizeof(struct B), sizeof(struct C));
+    return 0;
+}
+''', [], None),
+
+    ("struct_return_large", r'''
+#include <stdio.h>
+typedef struct { long a, b, c, d; } Big;
+Big make_big(int x) {
+    Big b = { x, x*2, x*3, x*4 };
+    return b;
+}
+int main(void) {
+    Big b = make_big(10);
+    printf("%ld %ld %ld %ld\n", b.a, b.b, b.c, b.d);
+    return 0;
+}
+''', [], None),
+
+    ("flexible_array_member", r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+struct Msg { int len; char data[]; };
+int main(void) {
+    struct Msg *m = malloc(sizeof(struct Msg) + 6);
+    m->len = 5;
+    memcpy(m->data, "hello", 6);
+    printf("len=%d data=%s\n", m->len, m->data);
+    free(m);
+    return 0;
+}
+''', [], None),
+
+    ("nested_struct_init", r'''
+#include <stdio.h>
+struct Inner { int x, y; };
+struct Outer { struct Inner a; struct Inner b; int z; };
+int main(void) {
+    struct Outer o = {{1, 2}, {3, 4}, 5};
+    printf("%d %d %d %d %d\n", o.a.x, o.a.y, o.b.x, o.b.y, o.z);
+    return 0;
+}
+''', [], None),
+
+    # ── Floating point edge cases ───────────────────────────────────────
+    ("float_special", r'''
+#include <stdio.h>
+#include <math.h>
+int main(void) {
+    double inf = 1.0 / 0.0;
+    double nan_val = 0.0 / 0.0;
+    printf("inf=%f -inf=%f\n", inf, -inf);
+    printf("nan=%d inf=%d\n", isnan(nan_val), isinf(inf));
+    printf("1.0/3.0=%.17g\n", 1.0/3.0);
+    // Float vs double precision
+    float f = 1.0f / 3.0f;
+    double d = 1.0 / 3.0;
+    printf("f=%.9g d=%.17g\n", f, d);
+    return 0;
+}
+''', ["-lm"], None),
+
+    ("float_cast", r'''
+#include <stdio.h>
+int main(void) {
+    double d = 3.99;
+    int i = (int)d;
+    printf("d=%.2f i=%d\n", d, i);
+    d = -3.99;
+    i = (int)d;
+    printf("d=%.2f i=%d\n", d, i);
+    float f = 1e10f;
+    long long ll = (long long)f;
+    printf("f=%g ll=%lld\n", f, ll);
+    unsigned int u = 3000000000u;
+    double d2 = (double)u;
+    printf("u=%u d=%.0f\n", u, d2);
+    return 0;
+}
+''', [], None),
+
+    # ── Preprocessor patterns ───────────────────────────────────────────
+    ("preprocessor_stringize", r'''
+#include <stdio.h>
+#define STR(x) #x
+#define CONCAT(a, b) a##b
+#define XSTR(x) STR(x)
+#define VERSION 42
+int main(void) {
+    printf("%s\n", STR(hello world));
+    int CONCAT(my, var) = 10;
+    printf("%d\n", myvar);
+    printf("version=%s\n", XSTR(VERSION));
+    return 0;
+}
+''', [], None),
+
+    ("preprocessor_variadic", r'''
+#include <stdio.h>
+#define LOG(fmt, ...) printf("[LOG] " fmt "\n", ##__VA_ARGS__)
+int main(void) {
+    LOG("hello %s", "world");
+    LOG("number %d and %d", 1, 2);
+    LOG("no args");
+    return 0;
+}
+''', [], None),
+
+    # ── Recursion and stack patterns ────────────────────────────────────
+    ("mutual_recursion", r'''
+#include <stdio.h>
+static int is_even(int n);
+static int is_odd(int n);
+static int is_even(int n) { return n == 0 ? 1 : is_odd(n - 1); }
+static int is_odd(int n)  { return n == 0 ? 0 : is_even(n - 1); }
+int main(void) {
+    for (int i = 0; i < 10; i++)
+        printf("%d:%d ", i, is_even(i));
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    # ── VLA (variable-length array) ─────────────────────────────────────
+    ("vla_basic", r'''
+#include <stdio.h>
+void fill(int n) {
+    int arr[n];
+    for (int i = 0; i < n; i++) arr[i] = i * i;
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += arr[i];
+    printf("n=%d sum=%d\n", n, sum);
+}
+int main(void) {
+    fill(5);
+    fill(10);
+    fill(1);
+    return 0;
+}
+''', [], None),
+
+    # ── Static and global patterns ──────────────────────────────────────
+    ("static_local", r'''
+#include <stdio.h>
+int counter(void) {
+    static int n = 0;
+    return ++n;
+}
+int main(void) {
+    for (int i = 0; i < 5; i++)
+        printf("%d ", counter());
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    ("global_init_order", r'''
+#include <stdio.h>
+int a = 10;
+int b = 20;
+int arr[] = {1, 2, 3, 4, 5};
+const char *msg = "hello";
+int main(void) {
+    printf("a=%d b=%d arr[2]=%d msg=%s\n", a, b, arr[2], msg);
+    a += b;
+    printf("a=%d\n", a);
+    return 0;
+}
+''', [], None),
+
+    # ── Alignment and sizeof ────────────────────────────────────────────
+    ("sizeof_types", r'''
+#include <stdio.h>
+int main(void) {
+    printf("char=%zu short=%zu int=%zu long=%zu llong=%zu\n",
+        sizeof(char), sizeof(short), sizeof(int), sizeof(long), sizeof(long long));
+    printf("float=%zu double=%zu ldouble=%zu\n",
+        sizeof(float), sizeof(double), sizeof(long double));
+    printf("ptr=%zu\n", sizeof(void *));
+    return 0;
+}
+''', [], None),
+
+    # ── Compound literal ────────────────────────────────────────────────
+    ("compound_literal", r'''
+#include <stdio.h>
+struct Point { int x, y; };
+void print_point(struct Point p) { printf("(%d,%d)\n", p.x, p.y); }
+int main(void) {
+    print_point((struct Point){3, 4});
+    int *p = (int[]){10, 20, 30};
+    printf("%d %d %d\n", p[0], p[1], p[2]);
+    return 0;
+}
+''', [], None),
+
+    # ── Designated initializer ──────────────────────────────────────────
+    ("designated_init", r'''
+#include <stdio.h>
+struct S { int a, b, c, d; };
+int main(void) {
+    struct S s = { .c = 30, .a = 10 };
+    printf("%d %d %d %d\n", s.a, s.b, s.c, s.d);
+    int arr[10] = { [3] = 33, [7] = 77 };
+    for (int i = 0; i < 10; i++) printf("%d ", arr[i]);
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    # ── Long long arithmetic ────────────────────────────────────────────
+    ("long_long_arith", r'''
+#include <stdio.h>
+int main(void) {
+    long long a = 1000000000LL * 1000000000LL;
+    printf("%lld\n", a);
+    unsigned long long b = 18446744073709551615ULL;
+    printf("%llu\n", b);
+    printf("%llu\n", b / 3);
+    long long c = -9223372036854775807LL - 1;
+    printf("%lld\n", c);
+    return 0;
+}
+''', [], None),
+
+    # ── Inline functions ────────────────────────────────────────────────
+    ("inline_func", r'''
+#include <stdio.h>
+static inline int square(int x) { return x * x; }
+static inline int max(int a, int b) { return a > b ? a : b; }
+int main(void) {
+    int sum = 0;
+    for (int i = 0; i < 10; i++)
+        sum += square(i) + max(i, 5);
+    printf("sum=%d\n", sum);
+    return 0;
+}
+''', [], None),
+
+    # ── Volatile ────────────────────────────────────────────────────────
+    ("volatile_access", r'''
+#include <stdio.h>
+int main(void) {
+    volatile int x = 42;
+    int y = x;
+    x = y + 1;
+    printf("%d\n", (int)x);
+    volatile int arr[5] = {1, 2, 3, 4, 5};
+    int sum = 0;
+    for (int i = 0; i < 5; i++) sum += arr[i];
+    printf("%d\n", sum);
+    return 0;
+}
+''', [], None),
+
+    # ── Complex expressions ─────────────────────────────────────────────
+    ("complex_expressions", r'''
+#include <stdio.h>
+int main(void) {
+    int a = 5, b = 3;
+    // Chained comparisons via &&
+    printf("%d\n", (a > b) && (b > 1) && (a < 10));
+    // Short-circuit
+    int x = 0;
+    int r = (x != 0) && (10 / x > 0);
+    printf("%d\n", r);
+    r = (x == 0) || (10 / x > 0);
+    printf("%d\n", r);
+    // Conditional with side effects
+    int c = 0;
+    (a > b) ? (c = 1) : (c = 2);
+    printf("%d\n", c);
+    return 0;
+}
+''', [], None),
+
+    # ── Pointer to function returning pointer ───────────────────────────
+    ("complex_decl", r'''
+#include <stdio.h>
+static int val = 42;
+int *get_ptr(void) { return &val; }
+int main(void) {
+    int *(*fp)(void) = get_ptr;
+    printf("%d\n", *fp());
+    // Array of function pointers
+    int *(*fps[1])(void) = { get_ptr };
+    printf("%d\n", *fps[0]());
+    return 0;
+}
+''', [], None),
+
+    # ── Multi-file compilation ──────────────────────────────────────────
+    # This one is special - we handle it separately in the runner
+
+    # ── Large switch (jump table test) ──────────────────────────────────
+    ("large_switch", r'''
+#include <stdio.h>
+int decode(int x) {
+    switch (x) {
+        case 0: return 100;  case 1: return 101;  case 2: return 104;
+        case 3: return 109;  case 4: return 116;  case 5: return 125;
+        case 6: return 136;  case 7: return 149;  case 8: return 164;
+        case 9: return 181;  case 10: return 200; case 11: return 221;
+        case 12: return 244; case 13: return 269; case 14: return 296;
+        case 15: return 325; case 16: return 356; case 17: return 389;
+        case 18: return 424; case 19: return 461; default: return -1;
+    }
+}
+int main(void) {
+    int sum = 0;
+    for (int i = -1; i <= 20; i++) sum += decode(i);
+    printf("sum=%d\n", sum);
+    return 0;
+}
+''', [], None),
+
+    # ── Recursive struct (linked list variants) ─────────────────────────
+    ("doubly_linked_list", r'''
+#include <stdio.h>
+#include <stdlib.h>
+typedef struct Node { int val; struct Node *prev, *next; } Node;
+int main(void) {
+    Node *head = NULL, *tail = NULL;
+    for (int i = 1; i <= 5; i++) {
+        Node *n = (Node *)malloc(sizeof(Node));
+        n->val = i; n->next = NULL; n->prev = tail;
+        if (tail) tail->next = n; else head = n;
+        tail = n;
+    }
+    // Forward
+    for (Node *p = head; p; p = p->next) printf("%d ", p->val);
+    printf("| ");
+    // Backward
+    for (Node *p = tail; p; p = p->prev) printf("%d ", p->val);
+    printf("\n");
+    // Cleanup
+    Node *p = head;
+    while (p) { Node *next = p->next; free(p); p = next; }
+    return 0;
+}
+''', [], None),
+
+    # ── Variadic function edge cases ────────────────────────────────────
+    ("varargs_mixed_types", r'''
+#include <stdio.h>
+#include <stdarg.h>
+double sum_mixed(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    double total = 0;
+    for (int i = 0; i < count; i++) {
+        if (i % 2 == 0)
+            total += va_arg(ap, int);
+        else
+            total += va_arg(ap, double);
+    }
+    va_end(ap);
+    return total;
+}
+int main(void) {
+    printf("%.1f\n", sum_mixed(4, 10, 2.5, 20, 3.5));
+    printf("%.1f\n", sum_mixed(2, 100, 0.5));
+    return 0;
+}
+''', [], None),
+
+    # ── Snprintf / sprintf ──────────────────────────────────────────────
+    ("snprintf_test", r'''
+#include <stdio.h>
+int main(void) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%d + %d = %d", 10, 20, 30);
+    printf("%s (len=%d)\n", buf, n);
+    n = snprintf(buf, 10, "long string that gets truncated");
+    printf("%s (len=%d)\n", buf, n);
+    return 0;
+}
+''', [], None),
+
+    # ── Sizeof expression vs type ───────────────────────────────────────
+    ("sizeof_expr", r'''
+#include <stdio.h>
+int main(void) {
+    int arr[10];
+    printf("arr=%zu elem=%zu count=%zu\n",
+           sizeof(arr), sizeof(arr[0]), sizeof(arr) / sizeof(arr[0]));
+    char *p = "hello";
+    printf("ptr=%zu\n", sizeof(p));
+    printf("literal=%zu\n", sizeof("hello"));
+    // sizeof doesn't evaluate
+    int x = 5;
+    printf("before=%d sizeof=%zu after=%d\n", x, sizeof(x++), x);
+    return 0;
+}
+''', [], None),
+
+    # ── Null pointer patterns ───────────────────────────────────────────
+    ("null_pointer", r'''
+#include <stdio.h>
+#include <stdlib.h>
+int main(void) {
+    int *p = NULL;
+    printf("null=%d\n", p == NULL);
+    printf("null=%d\n", p == 0);
+    printf("notnull=%d\n", p != NULL);
+    void *v = NULL;
+    printf("void_null=%d\n", v == NULL);
+    // Null function pointer
+    int (*fp)(void) = NULL;
+    printf("fp_null=%d\n", fp == NULL);
+    return 0;
+}
+''', [], None),
+
+    # ── Cast between pointer types ──────────────────────────────────────
+    ("pointer_casts", r'''
+#include <stdio.h>
+#include <stdint.h>
+int main(void) {
+    int x = 0x41424344;
+    char *cp = (char *)&x;
+    printf("first byte: %d\n", *cp);
+    // Round-trip pointer -> int -> pointer
+    intptr_t ip = (intptr_t)&x;
+    int *p2 = (int *)ip;
+    printf("round trip: %d\n", *p2 == x);
+    return 0;
+}
+''', [], None),
+
+    # ── Array of strings ────────────────────────────────────────────────
+    ("string_array", r'''
+#include <stdio.h>
+int main(void) {
+    const char *days[] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+    for (int i = 0; i < 7; i++) printf("%s ", days[i]);
+    printf("\n");
+    // 2D char array
+    char names[][10] = {"Alice", "Bob", "Charlie"};
+    for (int i = 0; i < 3; i++) printf("%s ", names[i]);
+    printf("\n");
+    return 0;
+}
+''', [], None),
+
+    # ── Conditional-map vectorization (integer lane compares + selects) ──
+    # Exercises the packed integer compare (vpcmpeqd/vpcmpgtd, unsigned via
+    # 0x80000000 sign-bias), the lane-mask selects (vblendvps / pand-pandn-por),
+    # the exact integer min/max fold (vpminsd/vpmaxsd), the FP selects, and the
+    # remainder-loop mirrors, across every predicate shape and signedness.
+    # Differential by construction: both compilers print result hashes.
+    ("vectorize_int_conditional_map", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_slt (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<k ? v*5-3 : v+k;}}
+static void t_sle (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<=k ? v*5-3 : v+k;}}
+static void t_sgt (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v>k ? v*5-3 : v+k;}}
+static void t_sge (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v>=k ? v*5-3 : v+k;}}
+static void t_eq  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v==k ? v*5-3 : v+k;}}
+static void t_ne  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=k ? v*5-3 : v+k;}}
+static void t_ult (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v<k ? v*5u-3u : v+k;}}
+static void t_ule (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v<=k ? v*5u-3u : v+k;}}
+static void t_ugt (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v>k ? v*5u-3u : v+k;}}
+static void t_uge (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v>=k ? v*5u-3u : v+k;}}
+static void t_clamp(const int*a,int*b,int n,int lo,int hi){for(int i=0;i<n;i++){int v=a[i];b[i]= v<lo?lo:(v>hi?hi:v);}}
+static void t_min  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<k ? v : k;}}
+static void t_max  (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v>k ? v : k;}}
+static void t_nested(const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<k ? v+1 : v-1) * (v>k?2:3);}}
+static void t_bits (const int*a,int*b,int n,int m){for(int i=0;i<n;i++){int v=a[i];b[i]= (v&m) ? (v|m) : (v^m);}}
+static void t_abs  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<0 ? -v : v;}}
+static void t_fsel (const double*a,double*b,int n,double k){for(int i=0;i<n;i++){double v=a[i];b[i]= v<k ? v*2.0 : v+1.0;}}
+#define N 2051
+static int a[N]; static unsigned ua[N]; static double da[N];
+static int b[N]; static unsigned ub[N]; static double db[N];
+static unsigned h(const void*p,int bytes){const unsigned char*c=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=c[i];x*=16777619u;}return x;}
+typedef void (*ifn)(const int*,int*,int,int);
+typedef void (*ufn)(const unsigned*,unsigned*,unsigned,unsigned);
+int main(void){
+  unsigned s=12345;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)s; ua[i]=s; da[i]=(double)(int)s/977.0; }
+  int ks[]={-7,0,1,17,2147483647,-2147483647-1,100000};
+  unsigned uk[]={0u,1u,17u,4294967295u,2147483648u,100000u};
+  ifn fns[]={t_slt,t_sle,t_sgt,t_sge,t_eq,t_ne};
+  for(int j=0;j<7;j++) for(int q=0;q<6;q++){ memset(b,0xAB,sizeof b); fns[q](a,b,N,ks[j]); printf("s%d %08x\n", q, h(b,sizeof b)); }
+  ufn ufns[]={t_ult,t_ule,t_ugt,t_uge};
+  for(int j=0;j<6;j++) for(int q=0;q<4;q++){ memset(ub,0xAB,sizeof ub); ufns[q](ua,ub,N,uk[j]); printf("u%d %08x\n", q, h(ub,sizeof ub)); }
+  memset(b,0xAB,sizeof b); t_clamp(a,b,N,-100,100); printf("clamp %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_clamp(a,b,N,50,-50); printf("clampsw %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_min(a,b,N,17); printf("min %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_max(a,b,N,-17); printf("max %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_nested(a,b,N,33); printf("nested %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_bits(a,b,N,0xF0); printf("bits %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_abs(a,b,N); printf("abs %08x\n",h(b,sizeof b));
+  memset(db,0xAB,sizeof db); t_fsel(da,db,N,3.5); printf("fsel %016llx\n",(unsigned long long)h(db,sizeof db));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_clamp(a,b,n,-3,7); printf("n%d %08x\n",n,h(b,n*4)); }
+  for(int n=2047;n<=2051;n++){ memset(b,0xAB,sizeof b); t_ult(a,(int*)ub,n,12345); printf("m%d %08x\n",n,h(ub,n*4)); }
+  return 0;
+}
+""", ["-O3", "-march=x86-64-v3"], None),
+
+    # Same kernels on the SSE2 4-lane baseline: exercises the pand/pandn/por
+    # blend, the legacy pcmpgtd orientations, and the 16-byte-aligned
+    # lane-constant / vector-slot requirements of the legacy encodings.
+    ("vectorize_int_conditional_map_sse2", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_slt (const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= v<k ? v*5-3 : v+k;}}
+static void t_ult (const unsigned*a,unsigned*b,unsigned n,unsigned k){for(unsigned i=0;i<n;i++){unsigned v=a[i];b[i]= v<k ? v*5u-3u : v+k;}}
+static void t_clamp(const int*a,int*b,int n,int lo,int hi){for(int i=0;i<n;i++){int v=a[i];b[i]= v<lo?lo:(v>hi?hi:v);}}
+static void t_fsel (const double*a,double*b,int n,double k){for(int i=0;i<n;i++){double v=a[i];b[i]= v<k ? v*2.0 : v+1.0;}}
+#define N 2051
+static int a[N]; static unsigned ua[N]; static double da[N];
+static int b[N]; static unsigned ub[N]; static double db[N];
+static unsigned h(const void*p,int bytes){const unsigned char*c=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=c[i];x*=16777619u;}return x;}
+int main(void){
+  unsigned s=12345;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)s; ua[i]=s; da[i]=(double)(int)s/977.0; }
+  int ks[]={-7,0,1,17,2147483647,-2147483647-1,100000};
+  for(int j=0;j<7;j++){ memset(b,0xAB,sizeof b); t_slt(a,b,N,ks[j]); printf("s %08x\n", h(b,sizeof b)); }
+  unsigned uk[]={0u,1u,17u,4294967295u,2147483648u,100000u};
+  for(int j=0;j<6;j++){ memset(ub,0xAB,sizeof ub); t_ult(ua,ub,N,uk[j]); printf("u %08x\n", h(ub,sizeof ub)); }
+  memset(b,0xAB,sizeof b); t_clamp(a,b,N,-100,100); printf("clamp %08x\n",h(b,sizeof b));
+  memset(db,0xAB,sizeof db); t_fsel(da,db,N,3.5); printf("fsel %016llx\n",(unsigned long long)h(db,sizeof db));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_clamp(a,b,n,-3,7); printf("n%d %08x\n",n,h(b,n*4)); }
+  return 0;
+}
+""", ["-O3", "-mno-avx2"], None),
+
+    # ── Exact abs fold: `v<0 ? -v : v` → max(v, -v) ──
+    # Positive shapes (the fold MUST fire and stay bit-exact, INT_MIN
+    # included: -INT_MIN wraps to INT_MIN and max(INT_MIN,INT_MIN) is
+    # INT_MIN, identical to the ternary): slt, sle, and abs nested in a
+    # larger expression. Anti-miscompile shapes (must NOT fold): the true
+    # arm negating anything other than the compared value — `0-(v+1)`,
+    # or negating a different lane `w<0 ? 0-v : w` — plus `!=` (not a
+    # lt/le predicate). The small-n sweeps exercise the remainder-loop
+    # mirrors of the same shapes. Differential by construction.
+    ("vectorize_abs_fold_subtrahend", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_abs  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<0 ? -v : v;}}
+static void t_absle(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<=0 ? -v : v;}}
+static void t_absadd(const int*a,int*b,int n,int k){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<0?-v:v)+k;}}
+static void t_negsucc(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<0 ? 0-(v+1) : v;}}
+static void t_negother(const int*a,const int*c,int*b,int n){for(int i=0;i<n;i++){int v=a[i];int w=c[i];b[i]= w<0 ? 0-v : w;}}
+static void t_nezero(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v!=0 ? -v : v;}}
+#define N 2051
+static int a[N]; static int c[N]; static int b[N];
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+int main(void){
+  unsigned s=777;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)s; c[i]=(int)(s>>3); }
+  a[0]=-2147483647-1; a[1]=2147483647; a[2]=0; a[3]=-1; a[4]=1; a[5]=-2;
+  c[0]=-2147483647-1; c[1]=0; c[2]=-3;
+  memset(b,0xAB,sizeof b); t_abs(a,b,N); printf("abs %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_absle(a,b,N); printf("absle %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_absadd(a,b,N,-11); printf("absadd %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_negsucc(a,b,N); printf("negsucc %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_negother(a,c,b,N); printf("negother %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_nezero(a,b,N); printf("nezero %08x\n",h(b,sizeof b));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_abs(a,b,n); printf("a%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_negsucc(a,b,n); printf("s%d %08x\n",n,h(b,n*4)); }
+  return 0;
+}
+""", ["-O3", "-march=x86-64-v3"], None),
+
+    # ── Mask conjunction/disjunction in maps: `(c1 && c2) ? t : f` and
+    # `(c1 || c2) ? t : f` over compare masks fold to one packed And/Or
+    # of the two masks and a single blend, instead of two chained
+    # selects (two blends). Positive shapes: range fold (&& of two
+    # compares against constants), the || negated-range form, and eq||eq
+    # over lane values. Anti-shapes: `0-(v+1)` under an && (must not be
+    # abs-folded — the true arm is not the negation of the compared
+    # value), and a nested select whose arms are NOT shared (the fold
+    # must not fuse them; the result stays a plain nested select or the
+    # scalar mirror, either way bit-exact). The n=0..33 sweeps exercise
+    # the remainder-loop scalar mirrors of every shape.
+    ("vectorize_mask_conj", r"""
+#include <stdio.h>
+#include <string.h>
+static void t_range (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v>=65 && v<=90) ? v+32 : v;}}
+static void t_orneg  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<65 || v>90) ? v : v+32;}}
+static void t_eqor   (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v==32 || v==9) ? 45 : v;}}
+static void t_absin  (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v<0 && v<-1) ? 0-(v+1) : v;}}
+static void t_noshare(const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= v<10 ? (v<5 ? v+1 : v+2) : v+3;}}
+static void t_ornest (const int*a,int*b,int n){for(int i=0;i<n;i++){int v=a[i];b[i]= (v>0 || (v<-100 && v>-200)) ? v*2 : v;}}
+#define N 2051
+static int a[N]; static int b[N];
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+int main(void){
+  unsigned s=424242;
+  for(int i=0;i<N;i++){ s=s*1664525u+1013904223u; a[i]=(int)(s%251)-125; }
+  a[0]=64; a[1]=65; a[2]=90; a[3]=91; a[4]=32; a[5]=9; a[6]=45; a[7]=-2147483647-1; a[8]=2147483647; a[9]=0;
+  memset(b,0xAB,sizeof b); t_range(a,b,N); printf("range %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_orneg(a,b,N); printf("orneg %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_eqor(a,b,N); printf("eqor %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_absin(a,b,N); printf("absin %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_noshare(a,b,N); printf("noshare %08x\n",h(b,sizeof b));
+  memset(b,0xAB,sizeof b); t_ornest(a,b,N); printf("ornest %08x\n",h(b,sizeof b));
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_range(a,b,n); printf("r%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_orneg(a,b,n); printf("o%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_absin(a,b,n); printf("i%d %08x\n",n,h(b,n*4)); }
+  for(int n=0;n<=33;n++){ memset(b,0xAB,sizeof b); t_noshare(a,b,n); printf("x%d %08x\n",n,h(b,n*4)); }
+  return 0;
+}
+""", ["-O3", "-march=x86-64-v3"], None),
+
+    # ── FMA-transform remainder coverage: N=257/259 leave tail columns
+    # after the 4-wide vector loop; the scalar remainder must recompute
+    # the same row bases the vector body used (the remainder-reference
+    # planner rematerializes the in-loop GEP chain into the vector-exit
+    # block). Two instances in one program: the second covers the
+    # inlined-transform shape that exposed the FmaF64x4HoistedSIB
+    # scratch-collision miscompile (a C-row home in %rsi clobbered by the
+    # spilled j-offset's fixed %rsi reload → `vmovupd (%rsi,%rsi)`,
+    # segfault at 2*j; see engineering/FOLLOWUP-2026-09-08-S04 §4).
+    # ── Packed integer COMPARE PREDICATE MATRIX (emit_int_cmp contract).
+    #
+    # x86 has only `pcmpeq` and `pcmpgt` below AVX-512, so `emit_int_cmp`
+    # synthesises the other predicates: `le`/`ne` need an inversion against
+    # an all-ones vector, and the unsigned forms need a sign-biased copy of
+    # BOTH operands.  Each of those is a separate emitter path, and each path
+    # exists twice more -- once for 32-bit lanes and once for the 8-bit lanes
+    # of OP-05d, and once again for the register-to-register "all-homed"
+    # three-operand VEX form versus the %ymm0/%ymm1 staging form.
+    #
+    # This case pins every cell of that matrix.  It is not decoration: the
+    # all-homed fast path shipped guarded by `(eq || !invert)` where it
+    # needed `!invert`, so `ne` (which is `eq` PLUS an inversion) fell into
+    # the `eq` arm and emitted a bare `vpcmpeqd`.  `v != 0 ? -v : v` then
+    # computed `v == 0 ? -v : v`.  Every one of the 720 regression tests
+    # passed, because none of them used a `!=` mask on a vectorizable map at
+    # AVX2.
+    #
+    # Coverage per lane width: the six predicates the vectorizer can emit
+    # (eq, ne, lt.s, le.s, and the unsigned lt/le that reach the biased
+    # path), each in BOTH operand orders (so the `gt`/`ge` normalisation
+    # swap is exercised), each against a loop-invariant constant AND against
+    # a second stream (a second stream keeps both compare operands in
+    # registers, which is what selects the all-homed path).  Both arms of
+    # every select are distinguishable, so a dropped inversion changes the
+    # hash rather than cancelling out.
+    #
+    # Data covers the signed extremes, zero, +-1, and the unsigned wrap
+    # boundary, so a predicate that is only wrong on one side of the sign
+    # bit still shows up.  The n=0..40 sweep runs each kernel through the
+    # packed body, the scalar remainder and the empty loop.
+    ("vectorize_cmp_predicate_matrix", _CMP_PREDICATE_MATRIX_SRC,
+     ["-O3", "-march=x86-64-v3"], None),
+
+    # Same matrix at the SSE2 baseline: the 128-bit emitter is a separate
+    # code path (two-operand forms, `pcmpeq`/`pcmpgt` with an in-place
+    # destination, `movdqa` staging) and has its own inversion and
+    # sign-bias sequences.  VF is 4/16 instead of 8/32, so the remainder
+    # sweep also lands on different boundaries.
+    ("vectorize_cmp_predicate_matrix_sse2", _CMP_PREDICATE_MATRIX_SRC,
+     ["-O3", "-march=x86-64"], None),
+
+    ("vectorize_fma_remainder_257", r"""
+#include <stdio.h>
+#include <string.h>
+static double C1[257][257], A1[257][257], B1[257][257];
+static double C2[259][259], A2[259][259], B2[259][259];
+static void mm1(void){ for (int i=0;i<257;i++) for (int k=0;k<257;k++) for (int j=0;j<257;j++) C1[i][j] += A1[i][k]*B1[k][j]; }
+static void mm2(void){ for (int i=0;i<259;i++) for (int k=0;k<259;k++) for (int j=0;j<259;j++) C2[i][j] += A2[i][k]*B2[k][j]; }
+static unsigned h(const void*p,int bytes){const unsigned char*q=p;unsigned x=2166136261u;for(int i=0;i<bytes;i++){x^=q[i];x*=16777619u;}return x;}
+int main(void){
+  for(int i=0;i<257;i++) for(int j=0;j<257;j++){ A1[i][j]=(double)(((i*31+j*7)%13)-6); B1[i][j]=(double)(((i*5+j*11)%11)-5); C1[i][j]=(double)((i+j)%7); }
+  for(int i=0;i<259;i++) for(int j=0;j<259;j++){ A2[i][j]=(double)(((i*13+j*3)%17)-8); B2[i][j]=(double)(((i*7+j*5)%19)-9); C2[i][j]=(double)((i+2*j)%5); }
+  mm1(); mm2();
+  printf("m1 %08x\n", h(C1, sizeof C1));
+  printf("m2 %08x\n", h(C2, sizeof C2));
+  return 0;
+}
+""", ["-O2"], None),
+
+    # ── C23 decimal FP (F30/F31) ──────────────────────────────────────────
+    # Implicit int<->decimal conversions at init/assign/return/call-arg/
+    # compound/ternary sites; each check folds into `fails` (exit code).
+    # lccc and GCC must both print `fails=0`.
+    ("decimal_implicit_conversions", r'''
+// F30 targeted runtime tests: implicit int<->decimal conversions at
+// init/assign/return/call-arg/compound/ternary sites. Each check folds into
+// `fails` via exact decimal comparison; exit code = fails (0 = all green).
+#include <stdio.h>
+
+static _Decimal32 g32;
+static _Decimal64 g64;
+static int fails = 0;
+#define CHK(c) do { if (!(c)) { fails++; printf("FAIL line %d: %s\n", __LINE__, #c); } } while (0)
+
+static _Decimal32 id32(_Decimal32 x) { return x; }
+static _Decimal64 id64(_Decimal64 x) { return x; }
+static _Decimal128 id128(_Decimal128 x) { return x; }
+static double idd(double x) { return x; }
+static _Decimal32 const32(void) { return 7; }          // S3: int -> DF return
+static _Decimal64 const64(void) { return 1.5; }        // S3: double -> DF return
+static int toint(_Decimal32 x) { return (int)(x); }   // explicit (control)
+
+int main(void) {
+    // S1: init from int/double/DF
+    _Decimal32 a = 5;              CHK(a == 5.0DF);
+    _Decimal32 b = 1.5;            CHK(b == 1.5DF);
+    _Decimal64 c = 1000000;        CHK(c == 1000000.0DD);
+    _Decimal64 d = a;              CHK(d == 5.0DD);          // DF widen (control-ish)
+    // S2: assign from int/double/DF
+    a = 42;                        CHK(a == 42.0DF);
+    a = -3.25;                     CHK(a == -3.25DF);
+    g32 = 9;                       CHK(g32 == 9.0DF);
+    g64 = -17;                     CHK(g64 == -17.0DD);
+    // S3: return conversions
+    CHK(const32() == 7.0DF);
+    CHK(const64() == 1.5DD);
+    // S4: call args (decimal param from int/double; double param from decimal)
+    CHK(id32(11) == 11.0DF);
+    CHK(id32(2.5) == 2.5DF);
+    CHK(id64(-8) == -8.0DD);
+    CHK(id128(13) == 13.0DL);
+    { _Decimal128 e = 5; e += 2; CHK(e == 7.0DL); CHK(id128(e) == 7.0DL); }
+    CHK(idd(a) == (double)a);      // decimal -> double param
+    CHK(toint(9.0DF) == 9);
+    // S5: compound assign
+    a = 10.0DF; a += 5;            CHK(a == 15.0DF);
+    a += 0.5DF;                    CHK(a == 15.5DF);
+    a -= 0.5DF;                    CHK(a == 15.0DF);
+    a *= 2;                        CHK(a == 30.0DF);
+    a /= 4;                        CHK(a == 7.5DF);
+    c = 100.0DD; c += 1;           CHK(c == 101.0DD);
+    c -= 2.5DD;                    CHK(c == 98.5DD);
+    { int i = 100; i += 5.0DF; CHK(i == 105); }      // int lhs, decimal rhs
+    { int j = 7; j *= 3.0DF; CHK(j == 21); }
+    // S6: ternary, runtime + const cond, mixed arms
+    { int k = 1; _Decimal32 t = k ? 3.0DF : 4;     CHK(t == 3.0DF); }
+    { int k = 0; _Decimal32 t = k ? 3.0DF : 4;     CHK(t == 4.0DF); }
+    { int k = 1; _Decimal32 t = k ? 8 : 9.5DF;     CHK(t == 8.0DF); }
+    { _Decimal32 t = 1 ? 2.5DF : 99;               CHK(t == 2.5DF); }  // const cond
+    { _Decimal32 t = 0 ? 99 : 2.5DF;               CHK(t == 2.5DF); }
+    { int k = 2; _Decimal32 t = k ? 1.5DF : 2;      CHK(t == 1.5DF); }
+    // GNU ?: including -0DF truthiness
+    { _Decimal32 z = 0.0DF; _Decimal32 t = z ?: 6.0DF; CHK(t == 6.0DF); }
+    { _Decimal32 z = -0.0DF; _Decimal32 t = z ?: 6.0DF; CHK(t == 6.0DF); }
+    { _Decimal32 z = 5.0DF; _Decimal32 t = z ?: 6.0DF; CHK(t == 5.0DF); }
+    { int k = 0; _Decimal32 t = k ?: 7.5DF;        CHK(t == 7.5DF); }  // int cond
+    printf("fails=%d\n", fails);
+    return fails;
+}
+    ''', [], None),
+
+    # ── Segment address space: base-register retention ──────────────────
+    # Regression (miscompile, -O2 hang): the link-time-constant address map
+    # (backend/generation.rs `const_addr_vals`) treated a LOOP-CARRIED value
+    # as a constant because its preheader definition was `Copy(Const 0)`,
+    # pinning the segment pointer to 0; every field access then emitted the
+    # direct `movq %gs:8` form with the base register DROPPED and the walk
+    # never reached its terminator.  gcc: 526832.
+    ("seg_loop_carried_ptr_base", r'''
+#include <stdio.h>
+#include <stdint.h>
+
+#define CHAIN 16U
+#define END_OFF ((unsigned long)(CHAIN * sizeof (struct node)))
+
+struct node { unsigned long hits, miss, next; };
+
+static struct node nodes[CHAIN] __attribute__((aligned(64)));
+
+static long
+set_gs_base (void *base)
+{
+  register long code __asm__ ("rdi") = 0x1001;   /* ARCH_SET_GS */
+  register void *addr __asm__ ("rsi") = base;
+  register long nr __asm__ ("rax") = 158;        /* SYS_arch_prctl */
+  __asm__ volatile ("syscall" : "+r" (nr) : "r" (code), "r" (addr)
+                    : "rcx", "r11", "memory");
+  return nr;
+}
+
+__attribute__((noinline)) static unsigned long
+walk (unsigned long start_off)
+{
+  unsigned long acc = 0;
+  unsigned long off = start_off;          /* literal 0 at the call site */
+  while (off != END_OFF)
+    {
+      struct node __seg_gs *p = (struct node __seg_gs *)(uintptr_t)off;
+      acc += p->hits;
+      acc ^= p->miss;
+      off = p->next;
+    }
+  return acc;
+}
+
+int
+main (void)
+{
+  if (set_gs_base (nodes) != 0)
+    { printf ("seg-loop-carried-ptr: no-gs\\n"); return 0; }
+  for (unsigned i = 0; i < CHAIN; i++)
+    {
+      nodes[i].hits = (i * 2654435761UL) & 0xffff;
+      nodes[i].miss = (i * 40503UL) & 0xff;
+      nodes[i].next = (i + 1 < CHAIN)
+                        ? (unsigned long)((i + 1) * sizeof (nodes[0]))
+                        : END_OFF;
+    }
+  printf ("seg-loop-carried-ptr: %lu\\n", walk (0));
+  return 0;
+}
+    ''', [], None),
+
+    # ── Segment address space: object storage vs pointee ────────────────
+    # Regression (miscompile): the storage slot was filled from
+    # `decl.address_space` unconditionally, so an array whose POINTER came
+    # from the declarator (`int __seg_gs *arr[4]`) became a segment-relative
+    # OBJECT: every element access read `%gs:arr+8(%rip)` (segment base +
+    # symbol offset) instead of `arr+8(%rip)`.  Both the element load and
+    # the pointee dereference are exercised: gcc prints `deref 90 plain 60`.
+    ("seg_ptr_array_storage", r'''
+#include <stdio.h>
+#include <stdint.h>
+
+/* The GS base sits 4096 bytes INTO this object, so gs-relative offset X and
+   the plain address &gs_storage + X are different addresses: a dropped or
+   spurious %gs: prefix changes the observed value. */
+static unsigned char gs_storage[8192] __attribute__((aligned(64)));
+static int __seg_gs *arr[4];
+
+static long
+set_gs_base (void *base)
+{
+  register long code __asm__ ("rdi") = 0x1001;
+  register void *addr __asm__ ("rsi") = base;
+  register long nr __asm__ ("rax") = 158;
+  __asm__ volatile ("syscall" : "+r" (nr) : "r" (code), "r" (addr)
+                    : "rcx", "r11", "memory");
+  return nr;
+}
+
+int
+main (void)
+{
+  if (set_gs_base (gs_storage + 4096) != 0)
+    { printf ("seg-ptr-array-storage: no-gs\\n"); return 0; }
+  gs_storage[4096 + 64] = 0x5a;   /* gs-relative 64, the real target      */
+  gs_storage[64] = 0x3c;          /* decoy a dropped %gs: prefix reads    */
+  arr[2] = (int __seg_gs *)(uintptr_t)64;
+  printf ("seg-ptr-array-storage: deref %d plain %d\\n", *arr[2],
+          gs_storage[64]);
+  return 0;
+}
+    ''', [], None),
+]
+
+# Multi-file test (handled specially)
+MULTI_FILE_A = r'''
+int add(int a, int b) { return a + b; }
+int mul(int a, int b) { return a * b; }
+'''
+
+MULTI_FILE_B = r'''
+#include <stdio.h>
+extern int add(int, int);
+extern int mul(int, int);
+int main(void) {
+    printf("%d %d\n", add(3, 4), mul(3, 4));
+    return 0;
+}
+'''
+
+def run_test(name, src, extra_flags, verbose, tmpdir):
+    """Compile and run a single test with both compilers, compare output."""
+    tmp = Path(tmpdir)
+    src_file = tmp / f"{name}.c"
+    src_file.write_text(src)
+
+    results = {}
+    for cname, (exe, flags) in COMPILERS.items():
+        out = tmp / f"{name}_{cname}"
+        cmd = [exe] + flags + extra_flags + ["-o", str(out), str(src_file)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            results[cname] = ("COMPILE_TIMEOUT", "", "")
+            continue
+        if r.returncode != 0:
+            results[cname] = ("COMPILE_FAIL", r.stderr.strip(), "")
+            continue
+        try:
+            r2 = subprocess.run([str(out)], capture_output=True, text=True, timeout=10)
+            results[cname] = ("OK", r2.stdout.strip(), r2.stderr.strip())
+        except subprocess.TimeoutExpired:
+            results[cname] = ("RUN_TIMEOUT", "", "")
+        except Exception as e:
+            results[cname] = ("RUN_ERROR", str(e), "")
+
+    gcc_status, gcc_out, _ = results.get("GCC", ("MISSING", "", ""))
+    lccc_status, lccc_out, lccc_err = results.get("LCCC", ("MISSING", "", ""))
+
+    if gcc_status != "OK":
+        return "SKIP", f"GCC {gcc_status}"
+    if lccc_status == "COMPILE_FAIL":
+        return "COMPILE_FAIL", results["LCCC"][1][:200]
+    if lccc_status == "COMPILE_TIMEOUT":
+        return "COMPILE_TIMEOUT", ""
+    if lccc_status == "RUN_TIMEOUT":
+        return "RUN_TIMEOUT", ""
+    if lccc_status == "RUN_ERROR":
+        return "RUN_ERROR", results["LCCC"][1]
+    if lccc_status != "OK":
+        return "ERROR", lccc_status
+    if gcc_out == lccc_out:
+        return "PASS", ""
+    return "MISMATCH", f"GCC: {gcc_out[:80]}\nLCCC: {lccc_out[:80]}"
+
+def run_multi_file_test(verbose, tmpdir):
+    """Test multi-file compilation (separate compile + link)."""
+    tmp = Path(tmpdir)
+    a_src = tmp / "multi_a.c"
+    b_src = tmp / "multi_b.c"
+    a_src.write_text(MULTI_FILE_A)
+    b_src.write_text(MULTI_FILE_B)
+
+    for cname, (exe, flags) in COMPILERS.items():
+        a_obj = tmp / f"multi_a_{cname}.o"
+        b_obj = tmp / f"multi_b_{cname}.o"
+        out = tmp / f"multi_{cname}"
+
+        # Compile each file separately
+        r1 = subprocess.run([exe] + flags + ["-c", "-o", str(a_obj), str(a_src)],
+                           capture_output=True, text=True, timeout=30)
+        if r1.returncode != 0:
+            if cname == "LCCC":
+                return "COMPILE_FAIL", f"LCCC -c failed: {r1.stderr[:100]}"
+            return "SKIP", "GCC -c failed"
+
+        r2 = subprocess.run([exe] + flags + ["-c", "-o", str(b_obj), str(b_src)],
+                           capture_output=True, text=True, timeout=30)
+        if r2.returncode != 0:
+            if cname == "LCCC":
+                return "COMPILE_FAIL", f"LCCC -c failed: {r2.stderr[:100]}"
+            return "SKIP", "GCC -c failed"
+
+        # Link
+        r3 = subprocess.run([exe] + flags + ["-o", str(out), str(a_obj), str(b_obj)],
+                           capture_output=True, text=True, timeout=30)
+        if r3.returncode != 0:
+            if cname == "LCCC":
+                return "LINK_FAIL", f"LCCC link failed: {r3.stderr[:100]}"
+            return "SKIP", "GCC link failed"
+
+    # Run both and compare
+    gcc_r = subprocess.run([str(tmp / "multi_GCC")], capture_output=True, text=True, timeout=10)
+    lccc_r = subprocess.run([str(tmp / "multi_LCCC")], capture_output=True, text=True, timeout=10)
+
+    if gcc_r.stdout.strip() == lccc_r.stdout.strip():
+        return "PASS", ""
+    return "MISMATCH", f"GCC: {gcc_r.stdout.strip()}\nLCCC: {lccc_r.stdout.strip()}"
+
+def main():
+    p = argparse.ArgumentParser(description="LCCC correctness test suite")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--filter", help="only run tests matching this substring")
+    args = p.parse_args()
+
+    if not LCCC.exists():
+        print(c(RED, f"ERROR: LCCC not found at {LCCC}"))
+        sys.exit(1)
+
+    print(c(BOLD, "\nLCCC Correctness Test Suite"))
+    print(f"  LCCC: {LCCC}")
+    print(f"  GCC include: {GCC_INC}")
+    print()
+
+    pass_count = 0
+    fail_count = 0
+    skip_count = 0
+    compile_fail_count = 0
+    failures = []
+
+    with tempfile.TemporaryDirectory(prefix="lccc_test_") as tmpdir:
+        for name, src, extra_flags, expected_exit in TESTS:
+            if args.filter and args.filter not in name:
+                continue
+
+            status, detail = run_test(name, src, extra_flags, args.verbose, tmpdir)
+
+            if status == "PASS":
+                print(f"  {c(GRN, 'PASS')}  {name}")
+                pass_count += 1
+            elif status == "SKIP":
+                print(f"  {c(YLW, 'SKIP')}  {name}: {detail}")
+                skip_count += 1
+            elif status == "COMPILE_FAIL":
+                print(f"  {c(RED, 'FAIL')}  {name} (compile failed)")
+                if args.verbose:
+                    print(f"         {detail}")
+                compile_fail_count += 1
+                failures.append((name, "COMPILE_FAIL", detail))
+            elif status == "MISMATCH":
+                print(f"  {c(RED, 'FAIL')}  {name} (output mismatch)")
+                if args.verbose:
+                    for line in detail.split('\n'):
+                        print(f"         {line}")
+                fail_count += 1
+                failures.append((name, "MISMATCH", detail))
+            else:
+                print(f"  {c(RED, 'FAIL')}  {name} ({status})")
+                if args.verbose and detail:
+                    print(f"         {detail}")
+                fail_count += 1
+                failures.append((name, status, detail))
+
+        # Multi-file test
+        if not args.filter or "multi_file" in (args.filter or ""):
+            status, detail = run_multi_file_test(args.verbose, tmpdir)
+            name = "multi_file_compile_link"
+            if status == "PASS":
+                print(f"  {c(GRN, 'PASS')}  {name}")
+                pass_count += 1
+            elif status == "SKIP":
+                print(f"  {c(YLW, 'SKIP')}  {name}: {detail}")
+                skip_count += 1
+            else:
+                print(f"  {c(RED, 'FAIL')}  {name} ({status})")
+                if args.verbose and detail:
+                    print(f"         {detail}")
+                fail_count += 1
+                failures.append((name, status, detail))
+
+    total = pass_count + fail_count + compile_fail_count + skip_count
+    print(f"\n{'='*60}")
+    print(f"  Results: {c(GRN, str(pass_count))} passed, "
+          f"{c(RED, str(fail_count + compile_fail_count))} failed "
+          f"({compile_fail_count} compile, {fail_count} runtime), "
+          f"{c(YLW, str(skip_count))} skipped — {total} total")
+
+    if failures:
+        print(f"\n  {c(RED, 'Failed tests:')}")
+        for name, status, detail in failures:
+            print(f"    {name}: {status}")
+            if detail:
+                for line in detail.split('\n')[:3]:
+                    print(f"      {line}")
+
+    sys.exit(1 if (fail_count + compile_fail_count) > 0 else 0)
+
+if __name__ == "__main__":
+    main()

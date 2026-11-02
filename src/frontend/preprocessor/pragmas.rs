@@ -1,0 +1,361 @@
+//! Pragma directive handling.
+//!
+//! Handles #pragma once, pack, push_macro/pop_macro, weak,
+//! redefine_extname, and GCC visibility directives.
+
+use std::path::Path;
+
+use super::pipeline::Preprocessor;
+
+impl Preprocessor {
+    /// Record a file as protected by `#pragma once`.
+    pub(super) fn record_pragma_once(&mut self, path: &Path) {
+        self.pragma_once_files.insert(path.to_path_buf());
+        if let Some(id) = Self::file_identity(path) {
+            self.pragma_once_identities.insert(id);
+        }
+    }
+
+    /// Return true if a resolved include path has previously used `#pragma once`.
+    pub(super) fn is_pragma_once_file(&self, path: &Path) -> bool {
+        self.pragma_once_files.contains(path)
+            || Self::file_identity(path).is_some_and(|id| self.pragma_once_identities.contains(&id))
+    }
+
+    /// Linux file identity for robust #pragma once tracking.
+    fn file_identity(path: &Path) -> Option<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    pub(super) fn handle_pragma(
+        &mut self,
+        rest: &str,
+        line_num: usize,
+        col: usize,
+    ) -> Option<String> {
+        let rest = rest.trim();
+        if rest.starts_with("STDC") && rest.split_whitespace().eq(["STDC", "FENV_ACCESS", "ON"]) {
+            self.fenv_access_requested = true;
+            return None;
+        }
+        if rest == "once" {
+            // Mark the current file as "include once".  Track both canonical
+            // path and device/inode so the same file included through a symlink
+            // or hardlink is still skipped, matching GCC/Clang behavior.
+            if let Some(current_file) = self.include_stack.last().cloned() {
+                self.record_pragma_once(&current_file);
+            }
+            return None;
+        }
+
+        // Handle #pragma pack directives (suppress in asm mode since these
+        // emit synthetic __ccc_pack_* tokens that the assembler can't parse)
+        if let Some(pack_content) = rest.strip_prefix("pack") {
+            if self.macros.asm_mode {
+                return None;
+            }
+            return self.handle_pragma_pack(pack_content.trim());
+        }
+
+        // Handle #pragma push_macro("name") / pop_macro("name")
+        if let Some(push_content) = rest.strip_prefix("push_macro") {
+            self.handle_pragma_push_macro(push_content.trim());
+            return None;
+        }
+        if let Some(pop_content) = rest.strip_prefix("pop_macro") {
+            self.handle_pragma_pop_macro(pop_content.trim());
+            return None;
+        }
+
+        // Handle #pragma weak symbol [= alias]
+        if let Some(weak_content) = rest.strip_prefix("weak") {
+            self.handle_pragma_weak(weak_content.trim());
+            return None;
+        }
+
+        // Handle #pragma redefine_extname old new
+        if let Some(redefine_content) = rest.strip_prefix("redefine_extname") {
+            self.handle_pragma_redefine_extname(redefine_content.trim());
+            return None;
+        }
+
+        // Handle #pragma GCC visibility push(hidden|default|protected|internal) / pop
+        // Suppressed in asm mode: synthetic __ccc_visibility_* tokens are C parser-
+        // specific and would cause assembler errors when preprocessing .S files.
+        if let Some(gcc_content) = rest.strip_prefix("GCC") {
+            let gcc_content = gcc_content.trim();
+            if let Some(vis_content) = gcc_content.strip_prefix("visibility") {
+                if self.macros.asm_mode {
+                    return None;
+                }
+                return self.handle_pragma_gcc_visibility(vis_content.trim());
+            }
+            if let Some(dep_content) = gcc_content.strip_prefix("dependency") {
+                self.handle_pragma_gcc_dependency(dep_content.trim(), line_num, col);
+                return None;
+            }
+        }
+
+        // Other pragmas (GCC, diagnostic, etc.) are silently ignored
+        None
+    }
+
+    /// Handle `#pragma GCC dependency FILENAME [MESSAGE]` (GCC extension).
+    ///
+    /// GCC semantics, which Clang's corpus pins: the filename is NOT
+    /// macro-expanded (a bare macro name is an error) and must be a
+    /// complete `"..."` or `<...>` token; the file is searched like a
+    /// quoted/chevron include and a missing file is a hard error. When the
+    /// dependency exists but is NEWER than the current source file, GCC
+    /// warns (regeneration needed), appending any trailing message text.
+    /// The dependency is checked only, never inserted.
+    fn handle_pragma_gcc_dependency(&mut self, content: &str, line_num: usize, col: usize) {
+        let (filename, is_system, rest_after) = if let Some(r) = content.strip_prefix('"') {
+            match r.find('"') {
+                Some(end) => (r[..end].to_string(), false, &r[end + 1..]),
+                None => {
+                    self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        file: self.current_file(),
+                        line: line_num,
+                        col,
+                        message: "expected \"FILENAME\" or <FILENAME>".to_string(),
+                    });
+                    return;
+                }
+            }
+        } else if let Some(r) = content.strip_prefix('<') {
+            match r.find('>') {
+                Some(end) => (r[..end].to_string(), true, &r[end + 1..]),
+                None => {
+                    self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                        file: self.current_file(),
+                        line: line_num,
+                        col,
+                        message: "expected \"FILENAME\" or <FILENAME>".to_string(),
+                    });
+                    return;
+                }
+            }
+        } else {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: "expected \"FILENAME\" or <FILENAME>".to_string(),
+            });
+            return;
+        };
+        let Some(resolved) = self.resolve_include_path(&filename, is_system) else {
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: format!("'{}' file not found", filename),
+            });
+            return;
+        };
+        // Staleness check: warn when the dependency is newer than the
+        // current source (its generated content may be out of date). Any
+        // trailing text after the filename is GCC's optional message.
+        let message = rest_after.trim();
+        let dep_newer = match (
+            std::fs::metadata(&resolved).and_then(|m| m.modified()),
+            std::fs::metadata(self.current_file()).and_then(|m| m.modified()),
+        ) {
+            (Ok(dep), Ok(cur)) => dep > cur,
+            _ => false,
+        };
+        if dep_newer {
+            let text = if message.is_empty() {
+                format!("\"{}\" is newer than the current file", filename)
+            } else {
+                format!(
+                    "\"{}\" is newer than the current file: {}",
+                    filename, message
+                )
+            };
+            self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col,
+                message: text,
+            });
+        }
+    }
+
+    /// Handle #pragma GCC visibility push(hidden|default|protected|internal) / pop.
+    /// Emits synthetic tokens for the parser to track default visibility.
+    fn handle_pragma_gcc_visibility(&mut self, content: &str) -> Option<String> {
+        let content = content.trim();
+        if content == "pop" {
+            return Some("__ccc_visibility_pop ;\n".to_string());
+        }
+        if let Some(rest) = content.strip_prefix("push") {
+            let rest = rest.trim();
+            if rest.starts_with('(') {
+                let inner = rest.trim_start_matches('(').trim_end_matches(')').trim();
+                match inner {
+                    "hidden" | "default" | "protected" | "internal" => {
+                        return Some(format!("__ccc_visibility_push_{} ;\n", inner));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Handle #pragma push_macro("name") - save the current definition of macro.
+    fn handle_pragma_push_macro(&mut self, content: &str) {
+        if let Some(name) = Self::extract_pragma_macro_name(content) {
+            let saved = self.macros.get(&name).cloned();
+            self.macro_save_stack.entry(name).or_default().push(saved);
+        }
+    }
+
+    /// Handle #pragma pop_macro("name") - restore the previously saved definition.
+    fn handle_pragma_pop_macro(&mut self, content: &str) {
+        if let Some(name) = Self::extract_pragma_macro_name(content) {
+            if let Some(stack) = self.macro_save_stack.get_mut(&name) {
+                if let Some(saved) = stack.pop() {
+                    match saved {
+                        Some(def) => self.macros.define(def),
+                        None => self.macros.undefine(&name),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract macro name from pragma argument like ("name").
+    fn extract_pragma_macro_name(content: &str) -> Option<String> {
+        let content = content.trim();
+        if !content.starts_with('(') {
+            return None;
+        }
+        let inner = content.trim_start_matches('(').trim_end_matches(')').trim();
+        // Strip quotes
+        let name = inner.trim_matches('"');
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
+    /// Handle #pragma weak directives.
+    /// Forms:
+    ///   #pragma weak symbol         - mark symbol as weak
+    ///   #pragma weak symbol = target - symbol becomes a weak alias for target
+    fn handle_pragma_weak(&mut self, content: &str) {
+        let content = content.trim();
+        if content.is_empty() {
+            return;
+        }
+        if let Some(eq_pos) = content.find('=') {
+            let symbol = content[..eq_pos].trim().to_string();
+            let target = content[eq_pos + 1..].trim().to_string();
+            if !symbol.is_empty() && !target.is_empty() {
+                self.weak_pragmas.push((symbol, Some(target)));
+            }
+        } else {
+            // Just mark the symbol as weak
+            let symbol = content.split_whitespace().next().unwrap_or("").to_string();
+            if !symbol.is_empty() {
+                self.weak_pragmas.push((symbol, None));
+            }
+        }
+    }
+
+    /// Handle #pragma redefine_extname old new
+    /// Redirects external symbol 'old' to 'new' (non-weak alias).
+    fn handle_pragma_redefine_extname(&mut self, content: &str) {
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let old_name = parts[0].to_string();
+            let new_name = parts[1].to_string();
+            // Redirect external references from old_name to new_name.
+            self.redefine_extname_pragmas.push((old_name, new_name));
+        }
+    }
+
+    /// Handle #pragma pack directives and emit synthetic tokens for the parser.
+    /// Supported forms:
+    ///   #pragma pack(N)        - set alignment to N
+    ///   #pragma pack()         - reset to default alignment
+    ///   #pragma pack(push, N)  - push current and set to N
+    ///   #pragma pack(push)     - push current (no change)
+    ///   #pragma pack(pop)      - restore previous alignment
+    fn handle_pragma_pack(&mut self, content: &str) -> Option<String> {
+        let content = content.trim();
+        // Must start with '('
+        if !content.starts_with('(') {
+            return None;
+        }
+        let inner = content.trim_start_matches('(').trim_end_matches(')').trim();
+
+        if inner.is_empty() {
+            // #pragma pack() - reset
+            return Some("__ccc_pack_reset ;\n".to_string());
+        }
+
+        // Check for push/pop
+        if inner == "pop" {
+            return Some("__ccc_pack_pop ;\n".to_string());
+        }
+
+        if let Some(rest) = inner.strip_prefix("push") {
+            let rest = rest.trim().trim_start_matches(',').trim();
+            if rest.is_empty() {
+                // #pragma pack(push) - push current alignment, don't change
+                return Some("__ccc_pack_push_only ;\n".to_string());
+            }
+            // #pragma pack(push, N) - push current and set to N (0 means default)
+            if let Ok(n) = rest.parse::<usize>() {
+                return Some(format!("__ccc_pack_push_{} ;\n", n));
+            }
+            return None;
+        }
+
+        // #pragma pack(N) - set alignment
+        if let Ok(n) = inner.parse::<usize>() {
+            return Some(format!("__ccc_pack_set_{} ;\n", n));
+        }
+
+        None
+    }
+}
+
+#[cfg(test)]
+mod fp_environment_tests {
+    use super::*;
+
+    #[test]
+    fn active_fp_environment_pragmas_are_monotone_and_tu_local() {
+        for (source, expected) in [
+            ("int x;", false),
+            ("#pragma STDC FENV_ACCESS OFF\nint x;", false),
+            ("#if 0\n#pragma STDC FENV_ACCESS ON\n#endif\nint x;", false),
+            ("#pragma STDC FENV_ACCESS ON\nint x;", true),
+            (
+                "#pragma STDC FENV_ACCESS ON\n#pragma STDC FENV_ACCESS OFF\nint x;",
+                true,
+            ),
+            ("_Pragma(\"STDC FENV_ACCESS ON\")\nint x;", true),
+        ] {
+            let mut pp = Preprocessor::new();
+            let _ = pp.preprocess(source);
+            assert!(pp.errors().is_empty());
+            assert_eq!(pp.fenv_access_requested, expected, "{source}");
+        }
+        assert!(!Preprocessor::new().fenv_access_requested);
+    }
+}

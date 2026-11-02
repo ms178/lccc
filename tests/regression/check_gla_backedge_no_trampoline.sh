@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# RA-GLA-03 / structural safety: a source-less global address feeding a loop
+# latch phi must NEVER be rematerialized through a BACK edge. Edge
+# trampolines exist solely for forward fan-out; splicing one into a latch
+# would clone a definition on the hottest edge of a loop nest.
+#
+# The companion source (gla_backedge_no_trampoline.c) builds a real latch
+# phi with the global base redefined on the looping edge and a distinct
+# incoming on the forward edge, under heavy register pressure. We force
+# EVERY admitting knob maximally open (reach 999, segment cap 1024, weight
+# cap 64) and still require:
+#   * the GLA trace reports "0 trampolines" on all four targets,
+#   * gate-off vs forced-wide binaries emit byte-identical stdout.
+# This is the regression encoding of the red-team result that the back-edge
+# trampoline shape is unreachable (phi-feeding weight >= 10 > weight cap,
+# plus the one-live-segment cap); see engineering/DECISIONS.md RA-GLA-03.
+set -euo pipefail
+
+# Visible skip when the i386 multilib is absent: CI installs gcc-multilib
+# + libc6-dev-i386 and runs the m32 legs for real; a headerless host
+# (container sandboxes without root) cannot run them at all, and a hard
+# failure there reports the ENVIRONMENT, not the code.
+i386_headers_ok() {
+    # Rootless hosts can point LCCC_I686_SYSROOT at an unpacked multilib
+    # sysroot (the regression suite's convention): exporting it as
+    # LCCC_SYSROOT makes both this probe and the i686 legs below run for
+    # real instead of skipping. CI installs gcc-multilib and never sets
+    # the variable, so its path is unchanged.
+    if [ -n "${LCCC_I686_SYSROOT:-}" ] && [ -d "$LCCC_I686_SYSROOT" ]; then
+        export LCCC_SYSROOT="$LCCC_I686_SYSROOT"
+    fi
+    # -fsyntax-only (WO-4 closed, 2026-09-18): the driver now stops after
+    # preprocess + parse + semantic analysis for ANY input kind, so the
+    # probe checks that the headers actually PARSE — strictly stronger
+    # than the -E workaround it replaces (which only expanded them).
+    if ! printf '#include <stdio.h>\n' | "$1" -x c - -fsyntax-only 2>/dev/null; then
+        # A host whose own gcc -m32 parses the headers must not skip: the
+        # probe failing there is a compiler defect, not a missing sysroot.
+        if printf '#include <stdio.h>\n' | gcc -m32 -x c - -fsyntax-only >/dev/null 2>&1; then
+            echo "FAIL: i686 probe ($1) cannot parse <stdio.h> though gcc -m32 can" >&2
+            exit 1
+        fi
+        echo "SKIP: i686 leg ($1) - no i386 libc headers on this host (CI installs gcc-multilib)"
+        return 1
+    fi
+}
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+dir=$repo/tests/regression
+src=$dir/gla_backedge_no_trampoline.c
+x64=$repo/target/fastbuild/lccc
+m32=$repo/target/fastbuild/lccc-i686
+arm=$repo/target/fastbuild/lccc-arm
+rv=$repo/target/fastbuild/lccc-riscv
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# Every admitting knob open at once; the structural gates are what remain.
+FORCE=(CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_REACH=999
+       CCC_GLA_REMAT_MAX_SEGMENTS=1024 CCC_RA_REMAT_MAX_USES=64 CCC_GLA_TRACE=1)
+
+fail=0
+# assert_zero_trampolines LABEL CC INCLUDE OPT
+assert_zero_trampolines() {
+  local label=$1 cc=$2 inc=$3 opt=$4
+  env "${FORCE[@]}" "$cc" ${inc:+-I"$inc"} "$opt" -S "$src" -o "$tmp/$label.s" \
+      >"$tmp/$label.trace" 2>&1
+  # A nonzero trampoline count (", N trampolines" with N in 1..9) is the
+  # failure shape; the applied line must end in "0 trampolines".
+  if grep -Eq ', [1-9][0-9]* trampolines' "$tmp/$label.trace"; then
+      echo "FAIL: $label $opt produced a back-edge trampoline"; cat "$tmp/$label.trace"; fail=1
+  fi
+  if grep -q 'applied:' "$tmp/$label.trace" && ! grep -q '0 trampolines' "$tmp/$label.trace"; then
+      echo "FAIL: $label $opt trace missing '0 trampolines'"; fail=1
+  fi
+  echo "ok: $label $opt back-edge trampolines = 0"
+}
+
+# Host: the shape survives lowering at -O0 and -O1 (the opts at which GLA
+# engages it); -O2/-O3 must never show a nonzero count either.
+[ -x "$x64" ] || { echo "SKIP: $x64 missing"; exit 0; }
+for opt in -O0 -O1 -O2 -O3; do
+  assert_zero_trampolines "x64" "$x64" "$(gcc -print-file-name=include)" "$opt"
+done
+
+# Cross targets: trace-level pin (no execution needed); skip absent bins.
+if [ -x "$arm" ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+  assert_zero_trampolines "aarch64" "$arm" \
+    "$(aarch64-linux-gnu-gcc -print-file-name=include)" -O1
+fi
+if [ -x "$rv" ] && command -v riscv64-linux-gnu-gcc >/dev/null 2>&1; then
+  assert_zero_trampolines "riscv64" "$rv" \
+    "$(riscv64-linux-gnu-gcc -print-file-name=include)" -O1
+fi
+if [ -x "$m32" ] && i386_headers_ok "$m32"; then
+  assert_zero_trampolines "i686" "$m32" "" -O1
+fi
+
+# Runtime equivalence: forcing every knob open must not change the result.
+CCC_RA_GLOBAL_LOCATION=0 "$x64" -O1 "$src" -o "$tmp/off.bin" 2>/dev/null
+env "${FORCE[@]}" "$x64" -O1 "$src" -o "$tmp/on.bin" 2>/dev/null
+"$tmp/off.bin" > "$tmp/off.out"; "$tmp/on.bin" > "$tmp/on.out"
+if ! cmp -s "$tmp/off.out" "$tmp/on.out"; then
+  echo "FAIL: forced-wide vs gate-off output differs"; fail=1
+else
+  echo "ok: forced-wide output == gate-off ($(cat "$tmp/off.out"))"
+fi
+
+if [ "$fail" -ne 0 ]; then exit 1; fi
+echo "back-edge no-trampoline pin passes"

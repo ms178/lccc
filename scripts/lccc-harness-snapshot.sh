@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# DEPRECATED (AUD-DOC-1) for patch delivery.  This script builds a single-file
+# Vite HTML bundle for the web-app harness; it does NOT publish or verify
+# ms178-1.patch.  The canonical, gate-aware patch snapshot is
+# `scripts/lccc-snapshot.sh`.
+# ============================================================================
+# LCCC session snapshot for the Vite/web-app harness ("Kontinuität v3").
+#
+# ROOT CAUSE of lost snapshots in earlier sessions: in this harness the ONLY
+# artefact guaranteed to reach the user is the single-file Vite build
+# (dist/index.html produced by vite-plugin-singlefile).  Files written under
+# /home/user/artifacts or the repo worktree are invisible to the user and are
+# wiped together with the sandbox.
+#
+# Therefore every validated improvement is materialised INSIDE the web
+# bundle's source tree so `npm run build` inlines it into the delivered HTML:
+#
+#   $SANDBOX/public/patches/ms178-1.patch           (static copy)
+#   $SANDBOX/public/patches/ms178-1.<tag>.patch     (per-snapshot copy)
+#   $SANDBOX/src/generated/patch.ts                 (patch as a TS string,
+#                                                    bundled into index.html)
+#   $SANDBOX/src/generated/ledger.json              (machine-readable ledger)
+#   $SANDBOX/src/generated/docs.json                (follow-up docs, bundled)
+#   $SANDBOX/src/generated/evidence.json            (codegen evidence table)
+#
+# The web app offers the patch as a Blob download, shows its SHA-256, the
+# ledger and the docs, so the deliverable survives even if only the HTML
+# survives.  All writes are atomic (tmp + rename) so a mid-write kill can
+# never leave a truncated deliverable.
+#
+# Usage:  scripts/lccc-harness-snapshot.sh "<slug>" "<one-line description>"
+# Env:    LCCC_REPO      (default /home/user/lccc)
+#         LCCC_SANDBOX   (auto: /home/user/sandbox (Vite) or /app (Next.js))
+#         LCCC_BASE_REF  (upstream commit the session is rebased on; recorded
+#                         once in $GEN/.base_ref and reused afterwards)
+#         LCCC_SNAPSHOT_DOCS  (extra space-separated repo-relative doc paths)
+#         LCCC_SKIP_WEB_BUILD=1  (skip `npm run build`; useful while a cargo
+#                         build is saturating the 2 cores)
+# ============================================================================
+set -euo pipefail
+
+REPO=${LCCC_REPO:-/home/user/lccc}
+# Sandbox auto-detection: the Vite harness mounts the web app at
+# /home/user/sandbox, the Next.js harness at /app.  Either way the ONLY
+# user-visible tree is that directory, so the deliverable must land there.
+if [[ -z "${LCCC_SANDBOX:-}" ]]; then
+  if [[ -f /home/user/sandbox/package.json ]]; then LCCC_SANDBOX=/home/user/sandbox
+  elif [[ -f /app/package.json ]]; then LCCC_SANDBOX=/app
+  else LCCC_SANDBOX=/home/user/sandbox; fi
+fi
+SANDBOX=$LCCC_SANDBOX
+GEN="$SANDBOX/src/generated"
+PUB="$SANDBOX/public/patches"
+LEDGER="$GEN/ledger.json"
+BASE_REF_FILE="$GEN/.base_ref"
+
+slug=${1:-snapshot}
+desc=${2:-"session snapshot"}
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+
+mkdir -p "$GEN/docs" "$PUB"
+cd "$REPO"
+
+if [[ -f "$BASE_REF_FILE" ]]; then
+  BASE=$(cat "$BASE_REF_FILE")
+else
+  BASE=${LCCC_BASE_REF:-$(git rev-parse HEAD)}
+  printf '%s\n' "$BASE" > "$BASE_REF_FILE"
+fi
+
+# Commit pending work (deterministic identity).  Build outputs, caches and
+# oracle artefacts are excluded via .gitignore; never `git add -f` here.
+if ! git diff --quiet || ! git diff --cached --quiet || \
+   [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  git add -A
+  git -c user.name='LCCC Agent' -c user.email='agent@lccc.local' \
+      commit -q -m "$slug: $desc" || true
+fi
+HEAD_SHA=$(git rev-parse HEAD)
+
+atomic_write() { local dest=$1 tmp="$1.tmp.$$"; cat > "$tmp"; sync -f "$tmp" 2>/dev/null || true; mv -f "$tmp" "$dest"; }
+
+# Sequence number from the ledger.
+seq=1
+if [[ -f "$LEDGER" ]]; then
+  seq=$(( $(python3 -c "import json;print(len(json.load(open('$LEDGER'))['snapshots']))") + 1 ))
+fi
+tag=$(printf 'S%02d-%s' "$seq" "$slug")
+
+# 1. The patch (base..HEAD, binary-safe).
+patch_tmp=$(mktemp)
+git diff --binary --no-color "$BASE" HEAD > "$patch_tmp"
+bytes=$(wc -c < "$patch_tmp")
+sha=$(sha256sum "$patch_tmp" | cut -d' ' -f1)
+atomic_write "$PUB/ms178-1.patch" < "$patch_tmp"
+atomic_write "$PUB/ms178-1.$tag.patch" < "$patch_tmp"
+
+# 2. Verify it applies to the base.
+verdict="EMPTY"
+if [[ "$bytes" -gt 0 ]]; then
+  tmpd=$(mktemp -d)
+  if git worktree add -q --detach "$tmpd" "$BASE" 2>/dev/null; then
+    if git -C "$tmpd" apply --check "$patch_tmp" 2>/dev/null; then verdict="APPLIES-CLEAN"; else verdict="APPLY-FAILED"; fi
+    git worktree remove --force "$tmpd" 2>/dev/null || true
+  else
+    verdict="UNVERIFIED"
+  fi
+  rm -rf "$tmpd"
+fi
+
+# 3. Embed as TypeScript (bundled into the single-file HTML).
+python3 - "$patch_tmp" "$GEN/patch.ts" "$tag" "$sha" "$bytes" "$BASE" "$HEAD_SHA" "$stamp" "$verdict" <<'PY'
+import json, os, sys
+src, dst, tag, sha, bytes_, base, head, stamp, verdict = sys.argv[1:]
+text = open(src, encoding='utf-8', errors='surrogateescape').read()
+meta = dict(tag=tag, sha256=sha, bytes=int(bytes_), base=base, head=head, stamp=stamp, verdict=verdict)
+body = ("// AUTO-GENERATED by scripts/lccc-harness-snapshot.sh — do not edit.\n"
+        "export const PATCH_META = " + json.dumps(meta, indent=2) + " as const;\n"
+        "export const PATCH_TEXT: string = " + json.dumps(text) + ";\n")
+tmp = dst + ".tmp"
+open(tmp, "w", encoding="utf-8", errors="surrogateescape").write(body)
+os.replace(tmp, dst)
+PY
+
+# 4. Ledger (JSON, appended).
+python3 - "$LEDGER" "$seq" "$stamp" "$tag" "$desc" "$bytes" "$sha" "$verdict" "$BASE" "$HEAD_SHA" "$(git diff --shortstat "$BASE" HEAD | sed 's/^ *//')" <<'PY'
+import json, os, sys
+path, seq, stamp, tag, desc, bytes_, sha, verdict, base, head, stat = sys.argv[1:]
+led = {"base": base, "snapshots": []}
+if os.path.exists(path):
+    led = json.load(open(path))
+led["base"] = base
+led["snapshots"].append(dict(seq=int(seq), utc=stamp, tag=tag, description=desc,
+                             bytes=int(bytes_), sha256=sha, verdict=verdict, head=head, diffstat=stat))
+tmp = path + ".tmp"
+json.dump(led, open(tmp, "w"), indent=2); os.replace(tmp, path)
+PY
+
+# 5. Bundle docs that must reach the user: every follow-up / audit document
+#    touched by this session (base..HEAD) plus anything listed explicitly.
+docs=$(git diff --name-only "$BASE" HEAD -- 'engineering/*.md' 'engineering/agent/*.md' 'docs/*.md' 'scripts/*.md' 2>/dev/null || true)
+for d in $docs ${LCCC_SNAPSHOT_DOCS:-}; do
+  [[ -f "$d" ]] && cp -f "$d" "$GEN/docs/$(echo "$d" | tr '/' '_')"
+done
+( cd "$GEN/docs" && python3 -c "
+import json,glob,os
+print(json.dumps({os.path.basename(f): open(f, encoding='utf-8', errors='replace').read() for f in sorted(glob.glob('*.md'))}))" ) | atomic_write "$GEN/docs.json"
+
+# 5b. Codegen evidence table for the web console (optional; produced by
+#     scripts/codegen_oracle.py --rank --json or hand-curated per session).
+ev=${LCCC_EVIDENCE_JSON:-engineering/evidence/session/evidence.json}
+if [[ -f "$ev" ]]; then
+  atomic_write "$GEN/evidence.json" < "$ev"
+elif [[ ! -f "$GEN/evidence.json" ]]; then
+  printf '{"generated":"n/a","rows":[],"notes":[]}\n' | atomic_write "$GEN/evidence.json"
+fi
+
+# 5c. Session benchmark before/after table for the web console.  Produced
+#     from tests/benchmark/run_benchmarks.py --json evidence (ranked with
+#     scripts/bench_rank.py) or hand-curated per session (schema: title,
+#     generated_utc, note, before[], after[] with name/lccc_ms/gcc_ms/
+#     ratio/status).  A stub keeps the bundle type-checking before the first
+#     measurement lands.
+bj=${LCCC_BENCH_JSON:-engineering/evidence/session/bench.json}
+if [[ -f "$bj" ]]; then
+  atomic_write "$GEN/bench.json" < "$bj"
+elif [[ ! -f "$GEN/bench.json" ]]; then
+  printf '{"title":"Benchmark evidence","generated_utc":"n/a","note":"no measurement recorded yet","before":[],"after":[]}\n' \
+    | atomic_write "$GEN/bench.json"
+fi
+
+rm -f "$patch_tmp"
+
+# 6. Rebuild the single-file web bundle so dist/index.html carries this
+#    snapshot even if the session dies before the harness's final build.
+#    Next.js harness: the platform builds the app itself and serves
+#    public/patches/*.patch statically, so a per-snapshot `next build`
+#    (minutes on a 2-core box) buys nothing; opt in with LCCC_WEB_BUILD=1.
+if [[ "${LCCC_SKIP_WEB_BUILD:-0}" == "1" ]]; then
+  web="web build skipped (LCCC_SKIP_WEB_BUILD=1)"
+elif ls "$SANDBOX"/next.config.* >/dev/null 2>&1 && [[ "${LCCC_WEB_BUILD:-0}" != "1" ]]; then
+  web="Next.js harness: static public/patches copy is the deliverable (LCCC_WEB_BUILD=1 to also run next build)"
+elif [[ -f "$SANDBOX/package.json" ]]; then
+  ( cd "$SANDBOX" && npm run build >/dev/null 2>&1 ) && web="dist rebuilt" || web="WARN: web build failed"
+else
+  web="no sandbox package.json"
+fi
+sync 2>/dev/null || true
+echo "SNAPSHOT $tag"
+echo "  base       : $BASE"
+echo "  head       : $HEAD_SHA"
+echo "  patch      : $PUB/ms178-1.patch ($bytes bytes, sha256 $sha) [$verdict]"
+echo "  embedded   : $GEN/patch.ts ($web)"

@@ -1,0 +1,17 @@
+WARNING: heuristic loop selection; same-work/hot-loop equivalence is NOT verified.
+ ratio  benchmark        function               lccc insn/B         best  oracle
+---------------------------------------------------------------------------------
+ 24.00  sqlite_varint    sqlite_put_varint           6.0000       0.2500  clang (6 insn / 1 B)
+  7.20  linux_find_bit   main                        2.2500       0.3125  clang (18 insn / 8 B)
+  2.71  sqlite_varint    main                        2.3750       0.8750  icx (19 insn / 8 B)
+  2.13  gzip_crc32       main                        8.0000       3.7500  icx (8 insn / 1 B)
+  1.42  glibc_memcmp     main                        2.0000       1.4062  icx (16 insn / 8 B)
+  1.05  glibc_memcmp     glibc_memcmp_common_alignment      0.6562       0.6250  gcc16.2 (21 insn / 32 B)
+  1.00  expat_siphash24  sip24_update               10.0000      10.0000  gcc16.2 (10 insn / 1 B)
+  0.75  expat_siphash24  main                        1.0312       1.3750  clang (33 insn / 32 B)
+  0.13  zlib_ng_adler32  main                        0.4375       3.2500  icx (14 insn / 32 B)
+---------------------------------------------------------------------------------
+compared: 9 kernels | LCCC ahead on 2 | behind on 7 | uncomparable: 3
+geometric mean of LCCC/best density ratio: 1.7461  (lower is better)
+wrote engineering/evidence/2026-10-14C-relocation-audit/density.json
+wrote engineering/evidence/2026-10-14C-relocation-audit/density.md

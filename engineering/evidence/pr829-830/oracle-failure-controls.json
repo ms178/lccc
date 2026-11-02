@@ -1,0 +1,105 @@
+{
+  "baseline": "790e220c975ca2daede85462d8d04cd1e8e14bb3",
+  "kind": "hermetic negative transplants; no vendor requests",
+  "tests": [
+    {
+      "test": "test_density_remote_failure_marks_incomplete",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_density_local_failure_marks_incomplete",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_density_partial_vendor_set_is_never_ranked",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_tune_remote_failure_is_not_success",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_tune_missing_requested_function_is_not_success",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_alignment_group_selects_strongest_unconditional_in_either_order",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_explicit_fill_does_not_hide_max_skip",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_byte_emitting_directive_breaks_alignment_group",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    },
+    {
+      "test": "test_comments_do_not_create_alignment_directives",
+      "S31": {
+        "failures": 1,
+        "errors": 0
+      },
+      "fixed": {
+        "failures": 0,
+        "errors": 0
+      }
+    }
+  ]
+}

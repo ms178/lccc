@@ -1,0 +1,62 @@
+compiler           : /tmp/lccc-u776
+sources            : 106 across 5 corpora
+TU/opt/arch combos : 636
+scope              : directives strictly between .cfi_startproc/.cfi_endproc
+
+directive            in-body count  class     first seen
+.cfi_def_cfa_offset          16647  benign    tests/bench/driver.c -O1  | .cfi_def_cfa_offset 32
+.p2align                      5904  benign    tests/bench/driver.c -O1  | .p2align 4,,10
+.cfi_offset                   5188  benign    tests/bench/driver.c -O1  | .cfi_offset %rbx, -16
+.long                          400  DATA      tests/benchmark/programs/sqlite_varint.c -O1  | .long .LBB33 - .Ljt_0
+.section                        68  benign    tests/benchmark/programs/sqlite_varint.c -O1  | .section .rodata
+.align                          34  benign    tests/benchmark/programs/sqlite_varint.c -O1  | .align 4
+.cfi_def_cfa_register             4  benign    tests/benchmark/programs/matmul.c -O2  | .cfi_def_cfa_register %rbp
+.cfi_def_cfa                     4  benign    tests/benchmark/programs/matmul.c -O2  | .cfi_def_cfa %rsp, 8
+
+DATA-emitting directives with non-zero in-body reach: ['long']
+  .2byte      in-body count = 0
+  .4byte      in-body count = 0
+  .8byte      in-body count = 0
+  .ascii      in-body count = 0
+  .asciz      in-body count = 0
+  .byte       in-body count = 0
+  .double     in-body count = 0
+  .fill       in-body count = 0
+  .float      in-body count = 0
+  .insn       in-body count = 0
+  .inst       in-body count = 0
+  .long       in-body count = 400
+  .quad       in-body count = 0
+  .skip       in-body count = 0
+  .sleb128    in-body count = 0
+  .space      in-body count = 0
+  .string     in-body count = 0
+  .uleb128    in-body count = 0
+  .value      in-body count = 0
+  .word       in-body count = 0
+  .zero       in-body count = 0
+
+INTERPRETATION
+--------------
+1. The four directives moved from the benign set to the data set by this audit
+   (.zero, .skip, .space, .fill) have in-body reach 0 across all 636
+   compiled combinations, so the correction refuses no real fold.  Confirmed
+   end to end, not just by this census: the 636-comparison static A/B
+   (106 sources x {-O1,-O2,-O3} x {x86-64,i686}) between the tree with and
+   without PR #725 + this correction is byte-identical -- 0 smaller, 0 larger,
+   0 same-size-different-code, total insns 133830 -> 133830, stack 32723 ->
+   32723.
+
+2. `.long` is the only DATA directive with non-zero in-body count (400), and it
+   is NOT instruction text: every instance is a jump-table entry emitted into
+   .rodata that falls lexically between .cfi_startproc and .cfi_endproc
+   (first seen: sqlite_varint.c, `.long .LBB33 - .Ljt_0`; 68 `.section
+   .rodata` switches appear in the same window).  PR #725 already classifies
+   `.long` as data, and item 1's byte-identical A/B shows that classification
+   costs nothing either -- no fold in the corpus is refused because of it.
+
+3. The benign directives actually emitted inside bodies are exactly the ones
+   PR #725 lists: .cfi_def_cfa_offset (16647), .p2align (5904),
+   .cfi_offset (5188), .section (68), .align (34), .cfi_def_cfa_register (4),
+   .cfi_def_cfa (4).  No benign directive LCCC emits is missing from its
+   allowlist, so the classifier does not over-refuse on this corpus.

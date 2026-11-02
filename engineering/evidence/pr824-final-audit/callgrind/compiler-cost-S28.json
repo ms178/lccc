@@ -1,0 +1,260 @@
+{
+  "complete": true,
+  "metric": "compiler simulated Ir and assembled object section bytes; NOT wall time",
+  "results": {
+    "byte_load_reassembly": {
+      "source": "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "ref": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/byte_load_reassembly-ref.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/gather-fixed-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/byte_load_reassembly-ref.s"
+        ],
+        "env": [],
+        "compiler_sha256": "f37de45bb50523f1fcbda0117fce6b9b3f7fa054be2c27f0d0ad0abe8f695a80",
+        "ir": 645242420,
+        "sections": {
+          ".text": 784,
+          ".data": 0,
+          ".bss": 4116,
+          ".rodata": 14,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 120
+        },
+        "assembly_sha256": "b3c5677d68825b3e91c560bec77453f3ea799a8a14a4ef5f40bc55400233437b"
+      },
+      "mine": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/byte_load_reassembly-mine.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/packed-validated-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/byte_load_reassembly.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/byte_load_reassembly-mine.s"
+        ],
+        "env": [],
+        "compiler_sha256": "aa249365e1f947906bebb5dc96e9fb3fda52db726ab9021285d9079035cb76a0",
+        "ir": 542976317,
+        "sections": {
+          ".text": 741,
+          ".data": 0,
+          ".bss": 4116,
+          ".rodata": 14,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 64
+        },
+        "assembly_sha256": "97c36d7dfeb9bb151ac51d5f6748849d83f0b672192a44db5054ed5bd11f5c98"
+      },
+      "compiler_ir_ratio": 0.8415074709440213
+    },
+    "expat_xml_scan": {
+      "source": "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "ref": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/expat_xml_scan-ref.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/gather-fixed-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-DXML_SIZE=16384",
+          "-DPASSES=4",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/expat_xml_scan-ref.s"
+        ],
+        "env": [],
+        "compiler_sha256": "f37de45bb50523f1fcbda0117fce6b9b3f7fa054be2c27f0d0ad0abe8f695a80",
+        "ir": 766394655,
+        "sections": {
+          ".text": 895,
+          ".data": 0,
+          ".bss": 16384,
+          ".rodata": 94,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 128
+        },
+        "assembly_sha256": "e270ef9bfacb3b3517acf72a9d5da3618eab4d1990953af23b66347d0692b171"
+      },
+      "mine": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/expat_xml_scan-mine.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/packed-validated-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-DXML_SIZE=16384",
+          "-DPASSES=4",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/expat_xml_scan.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/expat_xml_scan-mine.s"
+        ],
+        "env": [],
+        "compiler_sha256": "aa249365e1f947906bebb5dc96e9fb3fda52db726ab9021285d9079035cb76a0",
+        "ir": 756986636,
+        "sections": {
+          ".text": 882,
+          ".data": 0,
+          ".bss": 16384,
+          ".rodata": 94,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 128
+        },
+        "assembly_sha256": "b06acac38c4190f9f348b2f578c381e9d037edf657db817095b84edab2b0582e"
+      },
+      "compiler_ir_ratio": 0.987724315483385
+    },
+    "sha256_transform": {
+      "source": "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "ref": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/sha256_transform-ref.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/gather-fixed-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-DBLOCK_COUNT=256",
+          "-DPASSES=2",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/sha256_transform-ref.s"
+        ],
+        "env": [],
+        "compiler_sha256": "f37de45bb50523f1fcbda0117fce6b9b3f7fa054be2c27f0d0ad0abe8f695a80",
+        "ir": 840185391,
+        "sections": {
+          ".text": 1427,
+          ".data": 0,
+          ".bss": 0,
+          ".rodata": 336,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 184
+        },
+        "assembly_sha256": "cc996128b6f03aa55e9052e9667623a550b93faf6b58fb25d9e44ae1b58f98c9"
+      },
+      "mine": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/sha256_transform-mine.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/packed-validated-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-DBLOCK_COUNT=256",
+          "-DPASSES=2",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/sha256_transform.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/sha256_transform-mine.s"
+        ],
+        "env": [],
+        "compiler_sha256": "aa249365e1f947906bebb5dc96e9fb3fda52db726ab9021285d9079035cb76a0",
+        "ir": 1039493940,
+        "sections": {
+          ".text": 1443,
+          ".data": 0,
+          ".bss": 0,
+          ".rodata": 336,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 184
+        },
+        "assembly_sha256": "27a74134564ab039bdedc5237d393a2202c45c9f7770c1473d4c2d188ff7f6bc"
+      },
+      "compiler_ir_ratio": 1.2372197269019165
+    },
+    "spectral_norm": {
+      "source": "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "ref": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/spectral_norm-ref.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/gather-fixed-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-DN=128",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/spectral_norm-ref.s"
+        ],
+        "env": [],
+        "compiler_sha256": "f37de45bb50523f1fcbda0117fce6b9b3f7fa054be2c27f0d0ad0abe8f695a80",
+        "ir": 902813961,
+        "sections": {
+          ".text": 1009,
+          ".data": 0,
+          ".bss": 0,
+          ".rodata": 32,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 144
+        },
+        "assembly_sha256": "41d002d474167e5fd841b19559b9c9196c23f76e9eb815c58a9f6f5a4d19871d"
+      },
+      "mine": {
+        "command": [
+          "valgrind",
+          "--tool=callgrind",
+          "--callgrind-out-file=/home/user/.cache/pr824-measurements/compiler-cost/spectral_norm-mine.cg",
+          "--error-exitcode=97",
+          "/home/user/.cache/pr824-measurements/packed-validated-lccc",
+          "-O2",
+          "-march=x86-64-v3",
+          "-fwrapv",
+          "-DN=128",
+          "-S",
+          "/home/user/.cache/lccc/tests/benchmark/programs/spectral_norm.c",
+          "-o",
+          "/home/user/.cache/pr824-measurements/compiler-cost/spectral_norm-mine.s"
+        ],
+        "env": [],
+        "compiler_sha256": "aa249365e1f947906bebb5dc96e9fb3fda52db726ab9021285d9079035cb76a0",
+        "ir": 752652305,
+        "sections": {
+          ".text": 1012,
+          ".data": 0,
+          ".bss": 0,
+          ".rodata": 48,
+          ".note.GNU-stack": 0,
+          ".eh_frame": 120
+        },
+        "assembly_sha256": "01ffeabf6ddd13c27d20b25a5b12a5592546987c7213a7ddc85355c13c4c8362"
+      },
+      "compiler_ir_ratio": 0.8336737550738873
+    }
+  }
+}

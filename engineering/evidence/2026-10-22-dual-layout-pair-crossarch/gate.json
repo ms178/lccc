@@ -1,0 +1,234 @@
+{
+  "arches": {
+    "aarch64": {
+      "pairs": 10,
+      "sources": {
+        "tests/regression/peephole_pair/chain_wide.c -O1": {
+          "assembly_sha256": "655a31dcd36caa9b4810d249d7052d906efb73e5aa2478a5769ea2f6a63d1aee",
+          "counters_auto": [
+            10,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ]
+        }
+      }
+    },
+    "i686": {
+      "pairs": 10,
+      "sources": {
+        "tests/regression/peephole_pair/chain_wide.c -O1": {
+          "assembly_sha256": "517b3404315082ee942220d43e833f704b7216c96dc89f55fd9307f2c569c24d",
+          "counters_auto": [
+            10,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ]
+        }
+      }
+    },
+    "riscv64": {
+      "pairs": 10,
+      "sources": {
+        "tests/regression/peephole_pair/chain_wide.c -O1": {
+          "assembly_sha256": "94e577a6f6a8251b2d3ac60ce5dfcb850f15427c7ece8b978bdd083f30eef021",
+          "counters_auto": [
+            10,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ]
+        }
+      }
+    },
+    "x86-64": {
+      "pairs": 20,
+      "sources": {
+        "tests/benchmark/programs/expat_siphash24.c -O1": {
+          "assembly_sha256": "ed46e8e31686eaafdce889d9149c2a30708085680d4ab637901b56ff6642efb6",
+          "counters_auto": [
+            2,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel"
+          ]
+        },
+        "tests/benchmark/programs/expat_siphash24.c -O2": {
+          "assembly_sha256": "2ed03fa9511717d0709bbb605abeb525f1f89d9b71d27180cab20140155e2c0e",
+          "counters_auto": [
+            1,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel"
+          ]
+        },
+        "tests/benchmark/programs/glibc_memcmp.c -O1": {
+          "assembly_sha256": "5120f13f427a0d8e417c1214ec58e6bc753eb512b3ac1cb294aa1cb8a2899dd4",
+          "counters_auto": [
+            3,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel",
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel",
+            "parallel"
+          ]
+        },
+        "tests/benchmark/programs/glibc_memcmp.c -O2": {
+          "assembly_sha256": "f84866098cdb5693dca883c8069421ee71e9b994a4fe041ed335dde54f779fe5",
+          "counters_auto": [
+            3,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel",
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel",
+            "parallel"
+          ]
+        },
+        "tests/regression/peephole_pair/chain_wide.c -O1": {
+          "assembly_sha256": "6346c4c4a13ae80518cd289a655f0f17a639934e216c8c556f41d0125c8e1e12",
+          "counters_auto": [
+            10,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel",
+            "parallel"
+          ]
+        },
+        "tests/regression/peephole_pair/chain_wide.c -O2": {
+          "assembly_sha256": "71630e2fcecad1b39e5042206e34b6a261c35207f0286c039ef9a973fa3f92e7",
+          "counters_auto": [
+            1,
+            0,
+            0
+          ],
+          "pairs_auto": [
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel"
+          ]
+        }
+      }
+    }
+  },
+  "effective_threads": 2,
+  "total_pairs": 50
+}

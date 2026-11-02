@@ -1,0 +1,23 @@
+{
+  "baseline_compiler": "0d8b2052c06e9e2b2e2f4d8658d1afd84aac5e72352dac7fa1f683fd94ab9e4f",
+  "final_compiler": "7f73735c167c5bc73a0e3e1d59e85f48eb20fe45783dc116593ba4d5a0eb5dc7",
+  "final_linker": "bcb5fa1128c1d2030e5b57532b56b28c9653f0158409b50b3b18cf79a06e8b99",
+  "production_sources": {
+    "src/passes/mod.rs": "f9fb6359032076bc0515aa455d8047f540e8b015cd1858308762ca7a97adf5d5",
+    "src/passes/vectorize.rs": "f4646ed6c74915419794f0f973ebc591a3166f769fcd048f488c0806cd927bd7",
+    "src/driver/cli.rs": "c8a9ccd47c7d1aee8eb1b3b487dc70a2ca7a3866433bbdc594d219015ae31fa5",
+    "src/driver/pipeline.rs": "9cc08e84df44b07abc2e27bd1c2e029724f63249621c0759b424c9095bf8fc7d"
+  },
+  "all_measured_elfs_regenerated_identically": true,
+  "existing_i32_native_gates_pass": true,
+  "strict_fp_native_arms": 40,
+  "strict_fp_native_cases": 24240,
+  "measured_compiler": "aaafa0ac1251410cfbfb027bc4fcb1fdb974c3ef97c7b22634e884bae96c7e93",
+  "measured_production_sources": {
+    "src/passes/mod.rs": "f9fb6359032076bc0515aa455d8047f540e8b015cd1858308762ca7a97adf5d5",
+    "src/passes/vectorize.rs": "d823e6e273c7690a1fe8100eb45409a434e298273d40e22376d717fef28545c0",
+    "src/driver/cli.rs": "c8a9ccd47c7d1aee8eb1b3b487dc70a2ca7a3866433bbdc594d219015ae31fa5",
+    "src/driver/pipeline.rs": "9cc08e84df44b07abc2e27bd1c2e029724f63249621c0759b424c9095bf8fc7d"
+  },
+  "shared_admission_refactor_regenerates_all_nine_measured_elfs_identically": true
+}

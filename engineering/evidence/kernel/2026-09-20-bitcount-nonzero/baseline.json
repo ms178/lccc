@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "source": "tests/regression/vectorize_isa_gate.c",
+  "source_sha256": "5f5205ad82f18c069aa80c0e3669516e4861b16f7295186d4afe0fd41830583b",
+  "function": "branch_index_store",
+  "remote_flags": "-O2",
+  "local_flags": "-O2",
+  "oracles": [
+    {
+      "key": "lccc",
+      "id": "target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O2",
+      "instructions": 17
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2",
+      "instructions": 16
+    },
+    {
+      "key": "clang",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2",
+      "instructions": 19
+    },
+    {
+      "key": "icc",
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": "",
+      "flags": "-O2",
+      "instructions": 20
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O2",
+      "instructions": 16
+    }
+  ]
+}

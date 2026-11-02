@@ -1,0 +1,3 @@
+NAME                   TYPE SIZE   USED PRIO
+/lccc-swapfile         file   2G 238.4M   -2
+/lccc-audit-extra.swap file   4G   1.8M   -3

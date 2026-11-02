@@ -1,0 +1,425 @@
+{
+  "compiler_sha256": "a55ce8c817b324f82739f2ab9fc3d5a6b379e323213d6ebac3397b7c88023553",
+  "codegen_identity_after_comment_only_freeze": {
+    "mandelbrot": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          15479,
+          15479
+        ],
+        "d1_misses": [
+          1882,
+          1882
+        ],
+        "i1_misses": [
+          1355,
+          1355
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 6005509,
+        "ir_ratio": 1.0,
+        "ir_ref": 6005509,
+        "ll_misses": [
+          2895,
+          2895
+        ]
+      }
+    },
+    "lz4_match_extend": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          8263,
+          8263
+        ],
+        "d1_misses": [
+          14187,
+          14187
+        ],
+        "i1_misses": [
+          1407,
+          1407
+        ],
+        "indirect_mispredicts": [
+          244,
+          244
+        ],
+        "ir_mine": 1153751,
+        "ir_ratio": 1.0,
+        "ir_ref": 1153751,
+        "ll_misses": [
+          4407,
+          4407
+        ]
+      }
+    },
+    "linux_find_bit": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          11854,
+          11854
+        ],
+        "d1_misses": [
+          137232,
+          137232
+        ],
+        "i1_misses": [
+          1358,
+          1358
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 5957942,
+        "ir_ratio": 1.0,
+        "ir_ref": 5957942,
+        "ll_misses": [
+          6995,
+          6995
+        ]
+      }
+    },
+    "expat_siphash24": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          116265,
+          116265
+        ],
+        "d1_misses": [
+          1895,
+          1895
+        ],
+        "i1_misses": [
+          1417,
+          1417
+        ],
+        "indirect_mispredicts": [
+          1429,
+          1429
+        ],
+        "ir_mine": 15208931,
+        "ir_ratio": 1.0,
+        "ir_ref": 15208931,
+        "ll_misses": [
+          2964,
+          2964
+        ]
+      }
+    },
+    "zlib_ng_adler32_combine": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          5515,
+          5515
+        ],
+        "d1_misses": [
+          1909,
+          1909
+        ],
+        "i1_misses": [
+          1381,
+          1381
+        ],
+        "indirect_mispredicts": [
+          234,
+          234
+        ],
+        "ir_mine": 21844482,
+        "ir_ratio": 1.0,
+        "ir_ref": 21844482,
+        "ll_misses": [
+          2941,
+          2941
+        ]
+      }
+    },
+    "linux_find_bit_scaled": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          36562,
+          36562
+        ],
+        "d1_misses": [
+          530616,
+          530616
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 22941799,
+        "ir_ratio": 1.0,
+        "ir_ref": 22941799,
+        "ll_misses": [
+          6998,
+          6998
+        ]
+      }
+    },
+    "spectral_norm": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          8565,
+          8565
+        ],
+        "d1_misses": [
+          1933,
+          1933
+        ],
+        "i1_misses": [
+          1422,
+          1421
+        ],
+        "indirect_mispredicts": [
+          233,
+          233
+        ],
+        "ir_mine": 5161063,
+        "ir_ratio": 0.6249362629703569,
+        "ir_ref": 8258543,
+        "ll_misses": [
+          2967,
+          2965
+        ]
+      }
+    },
+    "binary_trees": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          207627,
+          207627
+        ],
+        "d1_misses": [
+          54330,
+          54330
+        ],
+        "i1_misses": [
+          1378,
+          1378
+        ],
+        "indirect_mispredicts": [
+          238,
+          238
+        ],
+        "ir_mine": 31600147,
+        "ir_ratio": 1.0,
+        "ir_ref": 31600147,
+        "ll_misses": [
+          4967,
+          4967
+        ]
+      }
+    },
+    "strlen_bench": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          132008,
+          132008
+        ],
+        "d1_misses": [
+          221242,
+          221242
+        ],
+        "i1_misses": [
+          1385,
+          1385
+        ],
+        "indirect_mispredicts": [
+          251,
+          251
+        ],
+        "ir_mine": 9285354,
+        "ir_ratio": 1.0,
+        "ir_ref": 9285354,
+        "ll_misses": [
+          5361,
+          5361
+        ]
+      }
+    },
+    "sqlite_varint": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          12574,
+          12574
+        ],
+        "d1_misses": [
+          2233,
+          2233
+        ],
+        "i1_misses": [
+          1375,
+          1375
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2054
+        ],
+        "ir_mine": 822567,
+        "ir_ratio": 1.0,
+        "ir_ref": 822567,
+        "ll_misses": [
+          3204,
+          3204
+        ]
+      }
+    },
+    "byte_load_reassembly": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          23352,
+          23352
+        ],
+        "d1_misses": [
+          1956,
+          1956
+        ],
+        "i1_misses": [
+          1382,
+          1382
+        ],
+        "indirect_mispredicts": [
+          237,
+          237
+        ],
+        "ir_mine": 82410573,
+        "ir_ratio": 1.0,
+        "ir_ref": 82410573,
+        "ll_misses": [
+          2987,
+          2987
+        ]
+      }
+    },
+    "sha256_transform": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          4874,
+          4874
+        ],
+        "d1_misses": [
+          1897,
+          1897
+        ],
+        "i1_misses": [
+          1382,
+          1382
+        ],
+        "indirect_mispredicts": [
+          236,
+          236
+        ],
+        "ir_mine": 1822066,
+        "ir_ratio": 1.0,
+        "ir_ref": 1822066,
+        "ll_misses": [
+          2927,
+          2927
+        ]
+      }
+    },
+    "sieve": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          3526,
+          3526
+        ],
+        "d1_misses": [
+          51851,
+          51851
+        ],
+        "i1_misses": [
+          1360,
+          1360
+        ],
+        "indirect_mispredicts": [
+          242,
+          242
+        ],
+        "ir_mine": 1622312,
+        "ir_ratio": 1.0,
+        "ir_ref": 1622312,
+        "ll_misses": [
+          4463,
+          4463
+        ]
+      }
+    },
+    "switch_dispatch": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          3287,
+          3287
+        ],
+        "d1_misses": [
+          1878,
+          1878
+        ],
+        "i1_misses": [
+          1356,
+          1356
+        ],
+        "indirect_mispredicts": [
+          18994,
+          18994
+        ],
+        "ir_mine": 552941,
+        "ir_ratio": 1.0,
+        "ir_ref": 552941,
+        "ll_misses": [
+          2895,
+          2895
+        ]
+      }
+    },
+    "expat_xml_scan": {
+      "identical_generated_binary": true,
+      "metrics": {
+        "conditional_mispredicts": [
+          25493,
+          25493
+        ],
+        "d1_misses": [
+          2184,
+          2184
+        ],
+        "i1_misses": [
+          1364,
+          1364
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 1666645,
+        "ir_ratio": 1.0,
+        "ir_ref": 1666645,
+        "ll_misses": [
+          3159,
+          3159
+        ]
+      }
+    }
+  }
+}

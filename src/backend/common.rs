@@ -1,0 +1,4961 @@
+//! Shared backend utilities for assembler, linker, and data emission.
+//!
+//! All four backends (x86-64, i686, AArch64, RISC-V 64) share identical logic for:
+//! - Assembling via an external toolchain (gcc/cross-gcc)
+//! - Linking via an external toolchain
+//! - Emitting assembly data directives (.data, .bss, .rodata, string literals, constants)
+//!
+//! This module extracts that shared logic, parameterized only by:
+//! - The toolchain command name (e.g., "gcc" vs "aarch64-linux-gnu-gcc")
+//! - The 64-bit data directive (`.quad` vs `.xword` vs `.dword`)
+//! - Extra assembler/linker flags
+
+use super::global_alignment::DataAlignment;
+use crate::backend::elf::{EM_386, EM_AARCH64, EM_RISCV, EM_X86_64};
+use crate::common::types::IrType;
+use crate::ir::reexports::{GlobalInit, IrConst, IrGlobal, IrModule};
+#[cfg(any(feature = "gcc_assembler", feature = "gcc_linker"))]
+use std::process::Command;
+#[cfg(any(feature = "gcc_assembler", feature = "gcc_linker"))]
+use std::sync::Once;
+
+/// Print a one-time warning when using a GCC-backed assembler.
+///
+/// This fires when the `gcc_assembler` feature is enabled and GCC is
+/// being used as the assembler. The warning is printed at most once per
+/// process to avoid flooding stderr on large builds.
+#[cfg(feature = "gcc_assembler")]
+fn warn_gcc_assembler(command: &str) {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        eprintln!(
+            "WARNING: Using GCC-backed assembler ({}) [gcc_assembler feature enabled]",
+            command
+        );
+    });
+}
+
+/// Print a one-time warning when using GCC as the linker driver.
+///
+/// This fires when the `gcc_linker` feature is enabled and GCC is
+/// being used as the linker. The warning is printed at most once per process.
+#[cfg(feature = "gcc_linker")]
+fn warn_gcc_linker(command: &str) {
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        eprintln!(
+            "WARNING: Using GCC-backed linker ({}) [gcc_linker feature enabled]",
+            command
+        );
+    });
+}
+
+/// Configuration for an external assembler.
+#[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))] // Only constructed/used when gcc_assembler enabled
+pub struct AssemblerConfig {
+    /// The assembler command (e.g., "gcc", "aarch64-linux-gnu-gcc")
+    pub command: &'static str,
+    /// Extra flags to pass (e.g., ["-march=rv64gc", "-mabi=lp64d"] for RISC-V)
+    pub extra_args: &'static [&'static str],
+}
+
+/// Configuration for an external linker.
+///
+/// The `command` and `extra_args` fields are only used when linking via GCC
+/// (`gcc_linker` feature). The built-in linker dispatches by `expected_elf_machine`.
+#[cfg_attr(not(feature = "gcc_linker"), expect(dead_code))] // `command`/`extra_args` fields only read under gcc_linker feature
+pub struct LinkerConfig {
+    /// The linker command (e.g., "gcc", "aarch64-linux-gnu-gcc")
+    pub command: &'static str,
+    /// Extra flags (e.g., ["-static"] for cross-compiled targets, ["-no-pie"] for x86)
+    pub extra_args: &'static [&'static str],
+    /// Expected ELF e_machine value for this target (e.g., EM_X86_64=62, EM_RISCV=243).
+    /// Used to validate input .o files before linking and produce clear error messages
+    /// when stale/wrong-arch objects are accidentally passed to the linker.
+    pub expected_elf_machine: u16,
+    /// Human-readable architecture name for error messages (e.g., "RISC-V", "x86-64").
+    pub arch_name: &'static str,
+}
+
+/// Assemble text to an object file using GCC as the assembler.
+///
+/// Only available when the `gcc_assembler` Cargo feature is enabled.
+/// The `extra_dynamic_args` are appended after the config's static extra_args,
+/// allowing runtime overrides (e.g., -mabi=lp64 from CLI flags).
+#[cfg(feature = "gcc_assembler")]
+pub fn assemble_with_extra(
+    config: &AssemblerConfig,
+    asm_text: &str,
+    output_path: &str,
+    extra_dynamic_args: &[String],
+) -> Result<(), String> {
+    use crate::common::temp_files::TempFile;
+
+    warn_gcc_assembler(config.command);
+
+    let keep_asm = std::env::var("CCC_KEEP_ASM").is_ok();
+
+    let asm_file = if keep_asm {
+        let mut f = TempFile::with_path(format!("{}.s", output_path).into());
+        f.set_keep(true);
+        f
+    } else {
+        let stem = std::path::Path::new(output_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("asm");
+        TempFile::try_new("ccc_asm", stem, "s").map_err(|error| error.to_string())?
+    };
+    std::fs::write(asm_file.path(), asm_text)
+        .map_err(|e| format!("Failed to write assembly: {}", e))?;
+
+    let mut cmd = Command::new(config.command);
+    cmd.args(config.extra_args);
+    cmd.args(extra_dynamic_args);
+    cmd.args(["-c", "-o", output_path]);
+    cmd.arg(asm_file.path());
+
+    let result = cmd
+        .output()
+        .map_err(|e| format!("Failed to run assembler ({}): {}", config.command, e))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("Assembly failed ({}): {}", config.command, stderr));
+    }
+
+    Ok(())
+}
+
+/// Map an ELF e_machine value to a human-readable architecture name.
+fn elf_machine_name(em: u16) -> &'static str {
+    match em {
+        EM_386 => "i386",
+        40 => "ARM",
+        EM_X86_64 => "x86-64",
+        EM_AARCH64 => "aarch64",
+        EM_RISCV => "RISC-V",
+        _ => "unknown",
+    }
+}
+
+/// Validate that all .o files in a list match the expected ELF e_machine.
+/// Returns Ok(()) if all files match or are not ELF objects (archives, shared libs, etc.).
+/// Returns Err with a diagnostic listing the mismatched files.
+fn validate_object_architectures(
+    files: impl Iterator<Item: AsRef<str>>,
+    expected_machine: u16,
+    arch_name: &str,
+) -> Result<(), String> {
+    use std::io::Read;
+    let mut mismatched = Vec::new();
+
+    for path_ref in files {
+        let path = path_ref.as_ref();
+        // Only check .o files (not .a, .so, -l flags, -Wl, flags, etc.)
+        if !path.ends_with(".o") {
+            continue;
+        }
+        // Read the ELF header: first 20 bytes contain e_ident (16) + e_type (2) + e_machine (2)
+        let mut buf = [0u8; 20];
+        let Ok(mut f) = std::fs::File::open(path) else {
+            continue;
+        };
+        let Ok(n) = f.read(&mut buf) else { continue };
+        if n < 20 {
+            continue;
+        }
+        // Verify ELF magic
+        if &buf[0..4] != b"\x7fELF" {
+            continue;
+        }
+        // e_machine is at offset 18, always 2 bytes.
+        // Determine endianness from EI_DATA (byte 5): 1=LE, 2=BE
+        let is_le = buf[5] == 1;
+        let em = if is_le {
+            u16::from_le_bytes([buf[18], buf[19]])
+        } else {
+            u16::from_be_bytes([buf[18], buf[19]])
+        };
+        if em != expected_machine {
+            mismatched.push((path.to_string(), em));
+        }
+    }
+
+    if mismatched.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = format!(
+        "Object file architecture mismatch: target is {} (ELF e_machine={}) but these files are for a different architecture:\n",
+        arch_name, expected_machine
+    );
+    for (path, em) in &mismatched {
+        msg.push_str(&format!(
+            "  {} ({}; e_machine={})\n",
+            path,
+            elf_machine_name(*em),
+            em
+        ));
+    }
+    msg.push_str("Hint: these look like stale objects from a previous build. Try running 'make clean' before rebuilding.");
+    Err(msg)
+}
+
+/// Link object files into an executable (or shared library), with additional user-provided linker args.
+///
+/// When the `gcc_linker` Cargo feature is enabled, uses GCC as the linker
+/// driver (with a warning). When disabled (default), uses the built-in native
+/// linker for all supported architectures.
+pub fn link_with_args(
+    config: &LinkerConfig,
+    object_files: &[&str],
+    output_path: &str,
+    user_args: &[String],
+) -> Result<(), String> {
+    // Validate that all input .o files match the target architecture.
+    validate_object_architectures(
+        object_files
+            .iter()
+            .copied()
+            .chain(user_args.iter().map(|s| s.as_str())),
+        config.expected_elf_machine,
+        config.arch_name,
+    )?;
+
+    let is_shared = user_args.iter().any(|a| a == "-shared");
+    let is_nostdlib = user_args.iter().any(|a| a == "-nostdlib");
+    let is_relocatable = user_args.iter().any(|a| a == "-r");
+    #[allow(unused_variables)] // Only used in the non-gcc_linker path below
+    let is_static = user_args.iter().any(|a| a == "-static");
+
+    // When gcc_linker feature is enabled, use GCC for ALL linking
+    #[cfg(feature = "gcc_linker")]
+    {
+        link_with_gcc(
+            config,
+            object_files,
+            output_path,
+            user_args,
+            is_shared,
+            is_nostdlib,
+            is_relocatable,
+        )
+    }
+
+    // Default (gcc_linker disabled): use the built-in native linker
+    #[cfg(not(feature = "gcc_linker"))]
+    {
+        if is_relocatable {
+            // Native `ld -r`: merge ET_REL inputs into one ET_REL output.
+            // Only x86-64 has the emitter today; other arches keep the old error.
+            if config.expected_elf_machine == EM_X86_64 {
+                let mut inputs: Vec<(String, bool)> = Vec::new();
+                for f in object_files {
+                    inputs.push((f.to_string(), false));
+                }
+                // Track --whole-archive / --no-whole-archive state in
+                // command-line order (both bare and -Wl, spellings). glibc
+                // builds libc_pic.os with
+                //   `$(CC) -r -Wl,--whole-archive libc_pic.a -o libc_pic.os`
+                // — with the flag ignored, the archive was loaded
+                // *selectively* against an empty undefined-symbol set, so
+                // nothing was pulled in and objcopy failed with "input file
+                // has no sections".
+                let mut whole_archive = false;
+                for a in user_args {
+                    match a.as_str() {
+                        "--whole-archive" | "-Wl,--whole-archive" => whole_archive = true,
+                        "--no-whole-archive" | "-Wl,--no-whole-archive" => whole_archive = false,
+                        _ if !a.starts_with('-')
+                            && std::path::Path::new(a).exists()
+                            // glibc object suffixes: .o (static), .os (PIC),
+                            // .oS (static-PIC for libc_nonshared.a). The
+                            // librtld.map link passes dl-allobjs.os — with
+                            // only .o/.a accepted it was silently dropped and
+                            // the selective libc_pic.a search resolved
+                            // nothing.
+                            && (a.ends_with(".o")
+                                || a.ends_with(".os")
+                                || a.ends_with(".oS")
+                                || a.ends_with(".a")) =>
+                        {
+                            inputs.push((a.clone(), whole_archive && a.ends_with(".a")));
+                        }
+                        _ => {}
+                    }
+                }
+                let mut objects = Vec::new();
+                // Only `.o`/`.os`/`.oS`/`.a` inputs are collected above, so no
+                // linker script can reach the loader here and its `-l` search
+                // path is provably unused; glibc's rtld link passes no `-L`.
+                crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects, &[], &[])?;
+                crate::backend::x86::linker::emit_rel::link_relocatable(&objects, output_path)?;
+                // `-Map FILE` (any spelling): glibc's elf/Makefile builds
+                // librtld.map with `$(reloc-link) ... -Wl,-Map,$@T` and then
+                // scrapes lines of the form `<path>/libc_pic.a(member.os)` to
+                // learn which archive members the rtld link pulled in. Emit
+                // one line per loaded object (archive members already carry
+                // their GNU `archive(member)` source name), matching the
+                // `^[0-9a-f ]*PATH(MEMBER) *.*$` sed pattern.
+                let mut map_path: Option<String> = None;
+                let mut it = user_args.iter().peekable();
+                while let Some(a) = it.next() {
+                    if let Some(v) = a.strip_prefix("-Wl,-Map,") {
+                        map_path = Some(v.to_string());
+                    } else if let Some(v) = a.strip_prefix("-Wl,-Map=") {
+                        map_path = Some(v.to_string());
+                    } else if let Some(v) = a.strip_prefix("-Map=") {
+                        map_path = Some(v.to_string());
+                    } else if a == "-Map" {
+                        if let Some(v) = it.peek() {
+                            map_path = Some((*v).clone());
+                        }
+                    }
+                }
+                if let Some(map_path) = map_path {
+                    let mut map = String::from("Archive member included in relocatable link\n\n");
+                    for obj in &objects {
+                        map.push_str(&obj.source_name);
+                        map.push('\n');
+                    }
+                    std::fs::write(&map_path, map)
+                        .map_err(|e| format!("cannot write link map '{}': {}", map_path, e))?;
+                }
+                return Ok(());
+            }
+            return Err("Relocatable linking (-r) requires the gcc_linker feature. \
+                       Rebuild with: cargo build --features gcc_linker"
+                .to_string());
+        }
+
+        // Look up the architecture config by ELF machine number
+        let arch = match config.expected_elf_machine {
+            EM_X86_64 => &DIRECT_LD_X86_64,
+            EM_AARCH64 => &DIRECT_LD_AARCH64,
+            EM_RISCV => &DIRECT_LD_RISCV64,
+            EM_386 => &DIRECT_LD_I686,
+            _ => {
+                return Err(format!(
+                    "No built-in linker for ELF machine {} ({}). \
+                     Rebuild with: cargo build --features gcc_linker",
+                    config.expected_elf_machine, config.arch_name
+                ));
+            }
+        };
+
+        link_builtin_native(
+            arch,
+            object_files,
+            output_path,
+            user_args,
+            is_nostdlib,
+            is_static,
+            is_shared,
+        )
+    }
+}
+
+/// Link using GCC as the linker driver (fallback path).
+///
+/// Only compiled when the `gcc_linker` Cargo feature is enabled.
+#[cfg(feature = "gcc_linker")]
+fn link_with_gcc(
+    config: &LinkerConfig,
+    object_files: &[&str],
+    output_path: &str,
+    user_args: &[String],
+    is_shared: bool,
+    is_nostdlib: bool,
+    is_relocatable: bool,
+) -> Result<(), String> {
+    warn_gcc_linker(config.command);
+    let ld_command = config.command;
+
+    let mut cmd = Command::new(ld_command);
+    let skip_extra = is_shared || is_relocatable;
+    for arg in config.extra_args {
+        if skip_extra && (*arg == "-no-pie" || *arg == "-pie" || *arg == "-static") {
+            continue;
+        }
+        cmd.arg(arg);
+    }
+    cmd.arg("-o").arg(output_path);
+    if !is_relocatable {
+        cmd.arg("-Wl,-z,noexecstack");
+    }
+
+    for obj in object_files {
+        cmd.arg(obj);
+    }
+
+    for arg in user_args {
+        cmd.arg(arg);
+    }
+
+    // `-nodefaultlibs` (forwarded to gcc above, which then drops libgcc as
+    // well) also suppresses the C and math libraries added here.
+    let is_nodefaultlibs = user_args.iter().any(|a| a == "-nodefaultlibs");
+    if !is_nostdlib && !is_nodefaultlibs && !is_shared {
+        cmd.arg("-lc");
+        cmd.arg("-lm");
+    }
+
+    let result = cmd
+        .output()
+        .map_err(|e| format!("Failed to run linker ({}): {}", ld_command, e))?;
+
+    if !result.stdout.is_empty() {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&result.stdout);
+    }
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("Linking failed ({}): {}", ld_command, stderr));
+    }
+
+    Ok(())
+}
+
+/// Per-architecture configuration for direct ld invocation and built-in linker
+/// CRT/library discovery.
+///
+/// Each architecture has different CRT/GCC library paths, emulation mode,
+/// dynamic linker path, etc. This struct captures all those differences
+/// so a single generic function can handle all backends.
+#[cfg(not(feature = "gcc_linker"))]
+#[expect(dead_code)] // Some fields (emulation, dynamic_linker, etc.) are stored for documentation/future use
+struct DirectLdArchConfig {
+    /// Human-readable architecture name for error messages (e.g., "x86-64", "RISC-V")
+    arch_name: &'static str,
+    /// ELF e_machine value (e.g., EM_X86_64=62, EM_RISCV=243).
+    /// Used to dispatch to the correct backend linker.
+    elf_machine: u16,
+    /// ld emulation mode (e.g., "elf_x86_64", "elf64lriscv", "elf_i386", "aarch64linux")
+    emulation: &'static str,
+    /// Dynamic linker path (e.g., "/lib64/ld-linux-x86-64.so.2")
+    dynamic_linker: &'static str,
+    /// Base paths to search for GCC lib dir (containing crtbegin.o)
+    gcc_lib_base_paths: &'static [&'static str],
+    /// Candidate directories for system CRT objects (crt1.o)
+    crt_dir_candidates: &'static [&'static str],
+    /// Standard system library directories for -L paths
+    system_lib_dirs: &'static [&'static str],
+    /// Extra ld flags specific to this architecture (e.g., AArch64 erratum workarounds)
+    extra_ld_flags: &'static [&'static str],
+    /// Extra GCC flags to skip when converting user args (e.g., "-m32" for i686)
+    extra_skip_flags: &'static [&'static str],
+    /// If true, crti.o and crtn.o are found in the GCC lib dir rather than the CRT dir.
+    /// This is the case for RISC-V cross-compilation where the CRT dir only has crt1.o.
+    crti_from_gcc_dir: bool,
+    /// Package hint for CRT not-found error messages
+    crt_package_hint: &'static str,
+    /// Package hint for GCC lib not-found error messages
+    gcc_package_hint: &'static str,
+    /// Multilib sub-directories probed beneath each `gcc_multilib_base_paths`
+    /// entry.  A native amd64 host with `gcc-multilib` installed (the standard
+    /// Debian/Ubuntu 32-bit build environment, and the layout this compiler
+    /// must support when driving its own i686 code generator with host
+    /// CRT/libgcc) keeps the 32-bit support libraries at
+    /// `/usr/lib/gcc/x86_64-linux-gnu/<ver>/32/` — crtbegin.o/crtend.o,
+    /// libgcc.a and libgcc_eh.a all live there.  Without probing that
+    /// sub-directory the i686 built-in linker resolves no GCC library dir at
+    /// all and every static link dies with undefined
+    /// `__letf2`/`__unordtf2`/`__udivti3` (soft-float TF and 128-bit integer
+    /// helpers that only libgcc.a provides).
+    /// Empty for the 64-bit-only targets, whose support libraries never live
+    /// in a multilib subdir.
+    gcc_multilib_subdirs: &'static [&'static str],
+    /// Base paths probed ONLY through their multilib sub-directories
+    /// (`gcc_multilib_subdirs`), never through the plain `<base>/<version>`
+    /// directory itself.  This is what makes the i686-on-amd64 discovery safe:
+    /// the 64-bit GCC dir must never satisfy the i686 probe even though it
+    /// contains crtbegin.o — linking 32-bit objects against 64-bit libgcc
+    /// would produce an ELF-class mismatch.  Only `<base>/<ver>/32` (etc.) is
+    /// accepted from these bases.
+    gcc_multilib_base_paths: &'static [&'static str],
+}
+
+#[cfg(not(feature = "gcc_linker"))]
+const DIRECT_LD_X86_64: DirectLdArchConfig = DirectLdArchConfig {
+    arch_name: "x86-64",
+    elf_machine: EM_X86_64,
+    emulation: "elf_x86_64",
+    dynamic_linker: "/lib64/ld-linux-x86-64.so.2",
+    gcc_lib_base_paths: &[
+        "/usr/lib/gcc/x86_64-linux-gnu",
+        "/usr/lib/gcc/x86_64-redhat-linux",
+        "/usr/lib/gcc/x86_64-pc-linux-gnu",
+        "/usr/lib64/gcc/x86_64-linux-gnu",
+        "/usr/lib64/gcc/x86_64-redhat-linux",
+    ],
+    crt_dir_candidates: &[
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/lib/x86_64-linux-gnu",
+        "/lib64",
+    ],
+    system_lib_dirs: &[
+        "/lib/x86_64-linux-gnu",
+        "/lib/../lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/../lib",
+    ],
+    extra_ld_flags: &[],
+    extra_skip_flags: &[],
+    crti_from_gcc_dir: false,
+    crt_package_hint: "Is the libc development package installed?",
+    gcc_package_hint: "Is the GCC development package installed?",
+    // Native amd64 support libs never live in a multilib sub-directory.
+    gcc_multilib_subdirs: &[],
+    gcc_multilib_base_paths: &[],
+};
+
+#[cfg(not(feature = "gcc_linker"))]
+const DIRECT_LD_RISCV64: DirectLdArchConfig = DirectLdArchConfig {
+    arch_name: "RISC-V",
+    elf_machine: EM_RISCV,
+    emulation: "elf64lriscv",
+    dynamic_linker: "/lib/ld-linux-riscv64-lp64d.so.1",
+    gcc_lib_base_paths: &[
+        "/usr/lib/gcc-cross/riscv64-linux-gnu",
+        "/usr/lib/gcc/riscv64-linux-gnu",
+        "/usr/lib/gcc/riscv64-redhat-linux",
+        "/usr/lib64/gcc/riscv64-linux-gnu",
+    ],
+    crt_dir_candidates: &[
+        "/usr/riscv64-linux-gnu/lib",
+        "/usr/lib/riscv64-linux-gnu",
+        "/lib/riscv64-linux-gnu",
+    ],
+    system_lib_dirs: &["/lib/riscv64-linux-gnu", "/usr/lib/riscv64-linux-gnu"],
+    extra_ld_flags: &[],
+    extra_skip_flags: &[],
+    crti_from_gcc_dir: true,
+    crt_package_hint: "Is the riscv64-linux-gnu libc development package installed? \
+        (e.g., libc6-dev-riscv64-cross)",
+    gcc_package_hint: "Is the riscv64-linux-gnu GCC cross-compiler installed? \
+        (e.g., gcc-riscv64-linux-gnu)",
+    gcc_multilib_subdirs: &[],
+    gcc_multilib_base_paths: &[],
+};
+
+#[cfg(not(feature = "gcc_linker"))]
+const DIRECT_LD_I686: DirectLdArchConfig = DirectLdArchConfig {
+    arch_name: "i686",
+    elf_machine: EM_386,
+    emulation: "elf_i386",
+    dynamic_linker: "/lib/ld-linux.so.2",
+    gcc_lib_base_paths: &[
+        "/usr/lib/gcc-cross/i686-linux-gnu",
+        "/usr/lib/gcc/i686-linux-gnu",
+        "/usr/lib/gcc/i686-redhat-linux",
+        "/usr/lib/gcc/i686-pc-linux-gnu",
+        "/usr/lib/gcc/i386-linux-gnu",
+        "/usr/lib/gcc/i386-redhat-linux",
+    ],
+    crt_dir_candidates: &[
+        "/usr/lib/i386-linux-gnu",
+        "/usr/i686-linux-gnu/lib",
+        "/usr/lib32",
+        "/lib/i386-linux-gnu",
+        "/lib32",
+    ],
+    system_lib_dirs: &[
+        "/lib/i386-linux-gnu",
+        "/lib/../lib",
+        "/usr/lib/i386-linux-gnu",
+        "/usr/lib/../lib",
+        "/usr/i686-linux-gnu/lib",
+    ],
+    extra_ld_flags: &[],
+    extra_skip_flags: &["-m32"],
+    crti_from_gcc_dir: false,
+    crt_package_hint: "Is the libc-dev-i386-cross or libc6-dev-i386 package installed?",
+    gcc_package_hint: "Is the gcc-i686-linux-gnu package installed?",
+    // Debian/Ubuntu `gcc-multilib` keeps the 32-bit support libraries
+    // (crtbegin.o, libgcc.a, libgcc_eh.a) in the `32/` sub-directory of the
+    // *64-bit* GCC lib dir.  Without probing that layout, a native i686
+    // static link cannot resolve libgcc at all and dies on undefined
+    // __udivti3/__letf2-class helper symbols.  The x86_64 base is probed
+    // multilib-only so its 64-bit crtbegin.o can never satisfy the i686
+    // probe (that would link 32-bit code against 64-bit libgcc).
+    gcc_multilib_subdirs: &["32"],
+    gcc_multilib_base_paths: &["/usr/lib/gcc/x86_64-linux-gnu"],
+};
+
+#[cfg(not(feature = "gcc_linker"))]
+const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
+    arch_name: "AArch64",
+    elf_machine: EM_AARCH64,
+    emulation: "aarch64linux",
+    dynamic_linker: "/lib/ld-linux-aarch64.so.1",
+    gcc_lib_base_paths: &[
+        "/usr/lib/gcc-cross/aarch64-linux-gnu",
+        "/usr/lib/gcc/aarch64-linux-gnu",
+        "/usr/lib/gcc/aarch64-redhat-linux",
+        "/usr/lib/gcc/aarch64-unknown-linux-gnu",
+        "/usr/lib64/gcc/aarch64-linux-gnu",
+        "/usr/lib64/gcc/aarch64-redhat-linux",
+    ],
+    crt_dir_candidates: &[
+        "/usr/aarch64-linux-gnu/lib",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib64",
+        "/lib/aarch64-linux-gnu",
+        "/lib64",
+    ],
+    system_lib_dirs: &[
+        "/lib/aarch64-linux-gnu",
+        "/lib/../lib",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib/../lib",
+        "/usr/aarch64-linux-gnu/lib",
+    ],
+    extra_ld_flags: &["-EL", "-X", "--fix-cortex-a53-843419"],
+    extra_skip_flags: &[],
+    crti_from_gcc_dir: false,
+    crt_package_hint: "Is the libc-dev-arm64-cross package installed?",
+    gcc_package_hint: "Is the gcc-aarch64-linux-gnu package installed?",
+    gcc_multilib_subdirs: &[],
+    gcc_multilib_base_paths: &[],
+};
+
+// ── LCCC_SYSROOT: prefix-aware multilib discovery ────────────────────────────
+//
+// Rootless research sandboxes and reproducible CI images frequently install
+// their 32-bit / cross multilib trees as *unpacked packages* under a private
+// prefix instead of the canonical FHS locations. When LCCC_SYSROOT is set,
+// every absolute discovery candidate below is first probed beneath that
+// prefix (mirroring GNU ld's --sysroot semantics); the un-prefixed host path
+// remains a fallback so behaviour on normal installations is unchanged.
+//
+//   LCCC_SYSROOT=/home/user/i686-root \
+//       target/fastbuild/lccc-i686 -O2 t.c -lm -o t
+// then discovers crt1.o under $LCCC_SYSROOT/usr/lib32 and crtbegin.o under
+// $LCCC_SYSROOT/usr/lib/gcc/i686-linux-gnu/<ver> when those exist.
+
+/// The sysroot a driver was given on its command line, if any.
+///
+/// `lccc-ld` used to publish `--sysroot=DIR` by calling `std::env::set_var`,
+/// laundering a parsed command-line argument through `environ` so that callees
+/// could find it again.  That is the one thing this tree forbids outside
+/// `src/test_support.rs` (see `tests/regression/check_env_test_hygiene.sh`):
+/// glibc's `setenv` may reallocate the `environ` array another thread's
+/// `getenv` is walking, which is precisely why edition 2024 made the call
+/// `unsafe`.  The override carries the same information without the mutation:
+/// one write before any input is read, immutable afterwards, and reading it
+/// costs an atomic load instead of an `environ` scan plus a `String`.
+static SYSROOT_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record `--sysroot=DIR` for this process.
+///
+/// Called once from `main`, before any input is read.  GNU ld's "last one wins"
+/// is already resolved by the caller (`sysroot_arg` in `lccc-ld`), and
+/// `--sysroot=/` never arrives here: it is the host root and changes no path.
+/// Trailing slashes are stripped once, at install time, rather than on every
+/// candidate path the process resolves.
+pub(crate) fn set_sysroot_override(root: &str) {
+    let root = root.trim_end_matches('/');
+    if !root.is_empty() {
+        let _ = SYSROOT_OVERRIDE.set(root.to_string());
+    }
+}
+
+/// The active sysroot, trailing slashes stripped: the command-line override,
+/// else `LCCC_SYSROOT`.  `None` when neither is set, which is the normal case
+/// and the one that allocates nothing.
+pub(crate) fn sysroot() -> Option<std::borrow::Cow<'static, str>> {
+    if let Some(root) = SYSROOT_OVERRIDE.get() {
+        return Some(std::borrow::Cow::Borrowed(root.as_str()));
+    }
+    let root = std::env::var("LCCC_SYSROOT").ok()?;
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    Some(std::borrow::Cow::Owned(root.to_string()))
+}
+
+/// Map an absolute candidate path onto the active sysroot (if any).
+// NOTE: deliberately NOT gated on `not(feature = "gcc_linker")`: the always-
+// compiled i686 shared-library linker (linker/shared.rs) resolves NEEDED
+// libraries through the sysroot helpers under every feature combination.
+pub(crate) fn with_sysroot_prefix(path: &str) -> String {
+    match sysroot() {
+        Some(root) => format!("{root}{path}"),
+        None => path.to_string(),
+    }
+}
+
+/// If `path` is already rooted beneath the active sysroot, return its
+/// equivalent absolute host path. Require a path-component boundary: a sysroot
+/// `/opt/root` must not match `/opt/root-old/file` and turn the suffix into a
+/// relative path.
+pub(crate) fn strip_sysroot_prefix(path: &str) -> Option<String> {
+    let root = sysroot()?;
+    strip_sysroot_prefix_from(path, &root)
+}
+
+fn strip_sysroot_prefix_from(path: &str, root: &str) -> Option<String> {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    let stripped = path.strip_prefix(root)?;
+    if !stripped.starts_with('/') {
+        return None;
+    }
+    Some(stripped.to_string())
+}
+
+#[cfg(test)]
+mod sysroot_prefix_tests {
+    use super::strip_sysroot_prefix_from;
+
+    #[test]
+    fn strips_only_a_complete_sysroot_path_component() {
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root/usr/lib/libc.so", "/opt/lccc-root"),
+            Some("/usr/lib/libc.so".to_string())
+        );
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root/usr/lib/libc.so", "/opt/lccc-root/"),
+            Some("/usr/lib/libc.so".to_string())
+        );
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root-old/usr/lib/libc.so", "/opt/lccc-root"),
+            None
+        );
+        assert_eq!(
+            strip_sysroot_prefix_from("/opt/lccc-root", "/opt/lccc-root"),
+            None
+        );
+    }
+}
+
+/// Resolve the directory that actually contains `file`: the
+/// LCCC_SYSROOT-prefixed candidate first, then the host path; `None` when
+/// neither root carries the file.
+///
+/// Probing the file and resolving the directory MUST be one atomic step.
+/// The previous shape — an `exists()` on the file followed by an independent
+/// dir-level preference for the sysroot — answered the existence question
+/// from one root and the *path* question from another. A partial sysroot
+/// tree (for example a 32-bit-only multilib unpack that carries
+/// `$SYSROOT/usr/lib/gcc/x86_64-linux-gnu/14/` as a directory but no 64-bit
+/// `crtbegin.o`/`libgcc.a` inside it) then satisfied the dir-existence
+/// test, every x86-64 link resolved its GCC lib dir under the sysroot,
+/// never saw the host's 64-bit `libgcc.a`, silently fell back to the
+/// host `libgcc_s.so.1` in the generic search dirs, and died with
+/// undefined `__bid_*` decimal-FP symbols — while a complete sysroot and
+/// a sysroot-less host both linked fine. The fused probe returns the same
+/// root that carried the evidence, so a sysroot can only ever ADD
+/// resolution capability, never remove the host's.
+#[cfg(not(feature = "gcc_linker"))]
+fn resolve_sysroot_file_dir(dir: &str, file: &str) -> Option<String> {
+    let prefixed = with_sysroot_prefix(dir);
+    if prefixed != dir
+        && std::path::Path::new(&format!("{}/{}", prefixed.trim_end_matches('/'), file)).exists()
+    {
+        return Some(prefixed);
+    }
+    if std::path::Path::new(&format!("{}/{}", dir.trim_end_matches('/'), file)).exists() {
+        return Some(dir.to_string());
+    }
+    None
+}
+
+/// Enumerate numeric GCC versions, newest first, from actual installations.
+/// A fixed list ending at GCC 14 silently missed Debian GCC 16 multilib.
+/// Keep sysroot and host candidates together, but resolve each required file
+/// through the existing same-root probe; a directory alone is not a runtime.
+/// Shared by the built-in linker probes and the gcc_linker search paths, so
+/// multilib eligibility stays an architecture property, never a version.
+fn installed_gcc_versions(roots: &[std::path::PathBuf]) -> Vec<String> {
+    let mut versions = std::collections::BTreeMap::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let key: Option<Vec<u64>> = name
+                .split('.')
+                .map(|part| {
+                    if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()) {
+                        None
+                    } else {
+                        part.parse().ok()
+                    }
+                })
+                .collect();
+            if let Some(key) = key {
+                versions.insert((key, name.clone()), name);
+            }
+        }
+    }
+    versions.into_iter().rev().map(|(_, name)| name).collect()
+}
+
+pub(crate) fn gcc_versions_at(base: &str) -> Vec<String> {
+    let mut roots = vec![std::path::PathBuf::from(base)];
+    let prefixed = with_sysroot_prefix(base);
+    if prefixed != base {
+        roots.push(prefixed.into());
+    }
+    installed_gcc_versions(&roots)
+}
+
+/// Discover GCC's library directory by probing well-known paths.
+/// Returns the path containing crtbegin.o (e.g., "/usr/lib/gcc/x86_64-linux-gnu/13").
+/// Honouring LCCC_SYSROOT: the returned directory always points at the same
+/// root whose crtbegin.o satisfied the probe.
+#[cfg(not(feature = "gcc_linker"))]
+fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
+    // Plain bases: `<base>/<ver>` itself is eligible, plus any multilib
+    // sub-directory variants (only relevant when the base is multilib-aware).
+    if let Some(resolved) =
+        probe_gcc_bases(arch.gcc_lib_base_paths, arch.gcc_multilib_subdirs, true)
+    {
+        return Some(resolved);
+    }
+    // Multilib-only bases: the plain `<base>/<ver>` directory belongs to a
+    // different ELF class (e.g. the amd64 GCC dir when targeting i686), so
+    // only its `<ver>/<subdir>` variants may satisfy the probe.
+    probe_gcc_bases(
+        arch.gcc_multilib_base_paths,
+        arch.gcc_multilib_subdirs,
+        false,
+    )
+}
+
+/// Probe `<base>/<ver>[/<subdir>]` directories for crtbegin.o, newest GCC
+/// version first. `native` admits the plain `<base>/<ver>` directory itself;
+/// multilib-only bases must never admit their native crtbegin.o (it has the
+/// wrong ELF class).
+#[cfg(not(feature = "gcc_linker"))]
+fn probe_gcc_bases(bases: &[&str], subdirs: &[&str], native: bool) -> Option<String> {
+    for base in bases {
+        for ver in gcc_versions_at(base) {
+            let dir = format!("{base}/{ver}");
+            if native {
+                if let Some(resolved) = resolve_sysroot_file_dir(&dir, "crtbegin.o") {
+                    return Some(resolved);
+                }
+            }
+            for sub in subdirs {
+                if let Some(resolved) =
+                    resolve_sysroot_file_dir(&format!("{dir}/{sub}"), "crtbegin.o")
+                {
+                    return Some(resolved);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(test, not(feature = "gcc_linker")))]
+mod gcc_directory_tests {
+    use super::*;
+
+    #[test]
+    fn gcc16_multilib_discovery_preserves_class_and_newest_priority() -> std::io::Result<()> {
+        let temp = crate::common::temp_files::TempFile::try_new("gcc_probe", "v16", "dir")?;
+        let base = temp.to_str()?;
+        let native = format!("{base}/16");
+        let multilib = format!("{native}/32");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(format!("{native}/crtbegin.o"), b"probe marker").unwrap();
+        let wrong_class = probe_gcc_bases(&[base], &["32"], false);
+        std::fs::create_dir_all(&multilib).unwrap();
+        std::fs::write(format!("{multilib}/crtbegin.o"), b"probe marker").unwrap();
+        let selected = probe_gcc_bases(&[base], &["32"], false);
+        std::fs::create_dir_all(format!("{base}/14/32")).unwrap();
+        std::fs::write(format!("{base}/14/32/crtbegin.o"), b"old probe marker").unwrap();
+        let preferred = probe_gcc_bases(&[base], &["32"], false);
+        // A newer version directory without the runtime must not shadow it.
+        std::fs::create_dir_all(format!("{base}/17/32")).unwrap();
+        let not_shadowed = probe_gcc_bases(&[base], &["32"], false);
+        let short = probe_gcc_bases(&[base], &[], true);
+        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(
+            wrong_class, None,
+            "native crt must not satisfy a multilib probe"
+        );
+        assert_eq!(selected, Some(multilib.clone()));
+        assert_eq!(preferred, Some(multilib.clone()));
+        assert_eq!(not_shadowed, Some(multilib));
+        assert_eq!(short, Some(native));
+        Ok(())
+    }
+}
+
+/// Discover the system CRT directory containing crt1.o.
+/// Returns the path (e.g., "/usr/lib/x86_64-linux-gnu"); LCCC_SYSROOT-aware.
+#[cfg(not(feature = "gcc_linker"))]
+fn find_crt_dir(arch: &DirectLdArchConfig) -> Option<String> {
+    for dir in arch.crt_dir_candidates {
+        if let Some(resolved) = resolve_sysroot_file_dir(dir, "crt1.o") {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// Resolve CRT objects and library paths for a built-in linker using DirectLdArchConfig.
+///
+/// This shared helper is used by all four built-in linker wrappers
+/// (x86-64, i686, AArch64, RISC-V) to avoid duplicating CRT/library
+/// discovery logic. Returns:
+/// - `crt_before`: CRT objects to link before user objects
+/// - `crt_after`: CRT objects to link after user objects
+/// - `lib_paths`: Combined library search paths (user -L first, then system paths)
+/// - `needed_libs`: Default libraries to link
+#[cfg(not(feature = "gcc_linker"))]
+struct BuiltinLinkSetup {
+    crt_before: Vec<String>,
+    crt_after: Vec<String>,
+    lib_paths: Vec<String>,
+    needed_libs: Vec<String>,
+}
+
+#[cfg(not(feature = "gcc_linker"))]
+fn resolve_builtin_link_setup(
+    arch: &DirectLdArchConfig,
+    user_args: &[String],
+    is_nostdlib: bool,
+    is_static: bool,
+) -> BuiltinLinkSetup {
+    let gcc_lib_dir = find_gcc_lib_dir(arch);
+    let crt_dir = find_crt_dir(arch);
+
+    // System library paths
+    let mut system_lib_paths: Vec<String> = Vec::new();
+    if let Some(ref gcc) = gcc_lib_dir {
+        system_lib_paths.push(gcc.clone());
+    }
+    if let Some(ref crt) = crt_dir {
+        system_lib_paths.push(crt.clone());
+    }
+    for dir in arch.system_lib_dirs {
+        // Additive, never substitutive: when a sysroot carries this search
+        // directory, the host twin stays searchable right behind it. A
+        // partial sysroot (e.g. a 32-bit-only multilib unpack) must not
+        // shadow host libraries it does not carry; a complete one wins by
+        // search order — exactly the additive intent of the
+        // "un-prefixed host path remains a fallback" policy above.
+        let prefixed = with_sysroot_prefix(dir);
+        if prefixed != *dir && std::path::Path::new(&prefixed).exists() {
+            system_lib_paths.push(prefixed);
+        }
+        if std::path::Path::new(dir).exists() {
+            system_lib_paths.push(dir.to_string());
+        }
+    }
+
+    // User-provided -L paths from args
+    let mut user_lib_paths: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < user_args.len() {
+        let arg = &user_args[i];
+        if let Some(path) = arg.strip_prefix("-L") {
+            if path.is_empty() {
+                if i + 1 < user_args.len() {
+                    i += 1;
+                    user_lib_paths.push(user_args[i].clone());
+                }
+            } else {
+                user_lib_paths.push(path.to_string());
+            }
+        } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
+            for part in wl_arg.split(',') {
+                if let Some(lpath) = part.strip_prefix("-L") {
+                    user_lib_paths.push(lpath.to_string());
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // `-nostartfiles` and `-nodefaultlibs` are the other two GNU link-file
+    // switches and they are complementary: with `-nostartfiles` the startup
+    // objects go and the libraries stay; with `-nodefaultlibs` the startup
+    // objects stay and EVERY default library goes, libgcc included -- gcc's
+    // spec is `%{!nostdlib:%{!nodefaultlibs:%(link_gcc_c_sequence)}}`, and
+    // `__udivti3` is an undefined reference under `-nodefaultlibs` with
+    // GCC 14.2 and 16.2 alike (measured; collect2 gets no `-l` at all).
+    // Code that wants libgcc there says `-lgcc`, as kernels and firmware
+    // do. Derived from `user_args`, the same single source `is_nostdlib`
+    // already uses.
+    let is_nostartfiles = user_args.iter().any(|a| a == "-nostartfiles");
+    let is_nodefaultlibs = user_args.iter().any(|a| a == "-nodefaultlibs");
+
+    // CRT objects
+    let mut crt_before: Vec<String> = Vec::new();
+    let mut crt_after: Vec<String> = Vec::new();
+
+    if !is_nostdlib && !is_nostartfiles {
+        // crt1.o comes from the CRT dir
+        if let Some(ref crt) = crt_dir {
+            crt_before.push(format!("{}/crt1.o", crt));
+        }
+        // crti.o: from GCC dir for cross-compilation (e.g., RISC-V), otherwise from CRT dir
+        if arch.crti_from_gcc_dir {
+            if let Some(ref gcc) = gcc_lib_dir {
+                crt_before.push(format!("{}/crti.o", gcc));
+            }
+        } else if let Some(ref crt) = crt_dir {
+            crt_before.push(format!("{}/crti.o", crt));
+        }
+        // crtbegin: use crtbeginT.o for static linking, crtbegin.o for dynamic
+        if let Some(ref gcc) = gcc_lib_dir {
+            if is_static {
+                let crtbegin_t = format!("{}/crtbeginT.o", gcc);
+                if std::path::Path::new(&crtbegin_t).exists() {
+                    crt_before.push(crtbegin_t);
+                } else {
+                    crt_before.push(format!("{}/crtbegin.o", gcc));
+                }
+            } else {
+                crt_before.push(format!("{}/crtbegin.o", gcc));
+            }
+        }
+        if let Some(ref gcc) = gcc_lib_dir {
+            crt_after.push(format!("{}/crtend.o", gcc));
+        }
+        // crtn.o: from GCC dir for cross-compilation, otherwise from CRT dir
+        if arch.crti_from_gcc_dir {
+            if let Some(ref gcc) = gcc_lib_dir {
+                crt_after.push(format!("{}/crtn.o", gcc));
+            }
+        } else if let Some(ref crt) = crt_dir {
+            crt_after.push(format!("{}/crtn.o", crt));
+        }
+    }
+
+    // Default libraries: none under `-nostdlib`/`-nodefaultlibs` (see above).
+    let needed_libs: Vec<String> = if is_nostdlib || is_nodefaultlibs {
+        vec![]
+    } else {
+        vec!["gcc".to_string(), "c".to_string(), "m".to_string()]
+    };
+
+    // Combined paths: user first, then system
+    let mut lib_paths: Vec<String> = user_lib_paths;
+    lib_paths.extend(system_lib_paths);
+
+    BuiltinLinkSetup {
+        crt_before,
+        crt_after,
+        lib_paths,
+        needed_libs,
+    }
+}
+
+/// The driver reports the SAME target-specific search paths as the linker.
+#[cfg(not(feature = "gcc_linker"))]
+pub(crate) fn builtin_library_paths(target: super::Target) -> Vec<String> {
+    let arch = match target {
+        super::Target::X86_64 => &DIRECT_LD_X86_64,
+        super::Target::I686 => &DIRECT_LD_I686,
+        super::Target::Aarch64 => &DIRECT_LD_AARCH64,
+        super::Target::Riscv64 => &DIRECT_LD_RISCV64,
+    };
+    resolve_builtin_link_setup(arch, &[], true, false).lib_paths
+}
+
+/// Add architecture-specific extra libraries after "gcc" in the needed libs list.
+///
+/// This mirrors the GCC driver's libgcc spec: the unwinder (`_Unwind_*`,
+/// `__gcc_personality_v0`, `__register_frame_info`, ...) comes from the
+/// static `libgcc_eh.a` only for `-static` links; dynamic executables take it
+/// from `libgcc_s.so` (DT_NEEDED is recorded only when a symbol actually
+/// resolves there, i.e. `--as-needed` semantics).
+/// - x86-64: nothing to add -- the x86-64 linker resolves leftover undefined
+///   symbols against libgcc_s.so.1 itself.
+/// - everything else: gcc_eh for static, gcc_s for dynamic.
+///
+/// A dynamic executable must never carry a private static unwinder: glibc's
+/// pthread_exit/pthread_cancel dlopen libgcc_s.so.1 and drive the forced
+/// unwind with *that* unwinder, which then calls the personality routine the
+/// CIEs name.  If `DW.ref.__gcc_personality_v0` binds to a static copy linked
+/// into the executable, the two libgcc instances disagree about the unwind
+/// context, and the personality routine aborts() on the first frame with a
+/// cleanup.  (libgcc.a alone already provides the i386 64-bit division
+/// helpers such as __divmoddi4; libgcc_eh.a holds only the unwinder,
+/// personality, emutls and nested-function trampoline support.)
+#[cfg(not(feature = "gcc_linker"))]
+fn add_arch_extra_libs(setup: &mut BuiltinLinkSetup, elf_machine: u16, is_static: bool) {
+    if elf_machine == EM_X86_64 {
+        return;
+    }
+    if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
+        let extra = if is_static { "gcc_eh" } else { "gcc_s" };
+        setup.needed_libs.insert(pos + 1, extra.to_string());
+    }
+}
+
+/// Convert a `BuiltinLinkSetup` into borrowed slices for passing to backend linkers.
+///
+/// Avoids repeating the same 4-line `.iter().map(|s| s.as_str()).collect()` pattern.
+#[cfg(not(feature = "gcc_linker"))]
+struct LinkSetupRefs<'a> {
+    lib_paths: Vec<&'a str>,
+    needed_libs: Vec<&'a str>,
+    crt_before: Vec<&'a str>,
+    crt_after: Vec<&'a str>,
+}
+
+#[cfg(not(feature = "gcc_linker"))]
+impl BuiltinLinkSetup {
+    fn as_refs(&self) -> LinkSetupRefs<'_> {
+        LinkSetupRefs {
+            lib_paths: self.lib_paths.iter().map(|s| s.as_str()).collect(),
+            needed_libs: self.needed_libs.iter().map(|s| s.as_str()).collect(),
+            crt_before: self.crt_before.iter().map(|s| s.as_str()).collect(),
+            crt_after: self.crt_after.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
+/// The position-independent variant of a CRT object list, as gcc's startfile
+/// spec picks it for `-shared` and `-pie`: `crtbeginS.o`/`crtendS.o` for
+/// `crtbegin.o`/`crtend.o`, and `start` (`Scrt1.o` for a PIE) in place of
+/// `crt1.o` -- dropped when `None` (a shared object has no entry code).
+/// The plain objects are non-PIC (`crtbegin.o` addresses `__TMC_END__` with
+/// R_X86_64_32, `crt1.o` may address `main` absolutely), so a PIE linked
+/// from them holds link-time addresses the loader never relocates.
+#[cfg(not(feature = "gcc_linker"))]
+fn pic_crt_objects(objs: &[String], start: Option<&str>) -> Vec<String> {
+    objs.iter()
+        .filter_map(|p| {
+            if let Some(d) = p.strip_suffix("/crt1.o") {
+                return start.map(|s| format!("{d}/{s}"));
+            }
+            Some(
+                p.strip_suffix("/crtbegin.o")
+                    .map(|d| format!("{d}/crtbeginS.o"))
+                    .or_else(|| {
+                        p.strip_suffix("/crtend.o")
+                            .map(|d| format!("{d}/crtendS.o"))
+                    })
+                    .unwrap_or_else(|| p.clone()),
+            )
+        })
+        .collect()
+}
+
+/// Link using the built-in native ELF linker for any supported architecture.
+///
+/// This is the fully native path: no external ld binary is needed. The linker
+/// reads ELF .o files and .a archives, resolves symbols against system shared
+/// libraries (libc.so.6), handles relocations, and produces a dynamically-linked
+/// ELF executable. Dispatches to the correct per-architecture backend based on
+/// the `arch.elf_machine` value.
+///
+/// For shared library output (-shared), delegates to the per-arch `link_shared`
+/// entry point with gcc's `-shared` startup objects and default libraries.
+///
+/// PIE intent of a final link, as decided by the linker: the last of
+/// `-pie`/`-no-pie` in the user's linker arguments wins, defaulting to
+/// non-PIE.  Shared by the link setup (below) and the driver, which needs
+/// the same answer at codegen time to decide whether the translation unit
+/// will end up in a position-fixed ET_EXEC (fast jump tables) or a
+/// position-dependent ET_DYN (portable jump tables).
+pub fn linker_pie_effective(linker_args: &[String]) -> bool {
+    for a in linker_args.iter().rev() {
+        let mut pie_opt = None;
+        if let Some(wl) = a.strip_prefix("-Wl,") {
+            for tok in wl.split(',') {
+                match tok {
+                    "-pie" | "--pie" | "--pic-executable" => pie_opt = Some(true),
+                    "-no-pie" | "--no-pie" | "--no-pic-executable" => pie_opt = Some(false),
+                    _ => {}
+                }
+            }
+        } else {
+            match a.as_str() {
+                "-pie" | "--pie" | "--pic-executable" => pie_opt = Some(true),
+                "-no-pie" | "--no-pie" | "--no-pic-executable" => pie_opt = Some(false),
+                _ => {}
+            }
+        }
+        if let Some(v) = pie_opt {
+            return v;
+        }
+    }
+    false
+}
+
+#[cfg(not(feature = "gcc_linker"))]
+fn link_builtin_native(
+    arch: &DirectLdArchConfig,
+    object_files: &[&str],
+    output_path: &str,
+    user_args: &[String],
+    is_nostdlib: bool,
+    is_static: bool,
+    is_shared: bool,
+) -> Result<(), String> {
+    use crate::backend::{arm, i686, riscv, x86};
+
+    // `-b binary` / `--format=binary` inputs named in the linker options
+    // become wrapper objects before anything parses those options
+    // (`binary_input`); `binary_objects` removes them when the link returns.
+    let mut binary_objects = crate::backend::linker_common::binary_input::BinaryObjects::default();
+    let rewritten = crate::backend::linker_common::binary_input::rewrite_driver_args(
+        user_args,
+        arch.elf_machine,
+        crate::backend::linker_common::VALUE_TAKING,
+        &mut binary_objects,
+    )?;
+    let user_args: &[String] = rewritten.as_deref().unwrap_or(user_args);
+
+    // `--oformat`: `binary` is implemented (the same flat-image conversion
+    // `lccc-ld --oformat=binary` uses), and every other spelling must name the
+    // encoding this backend actually writes. The driver used to accept
+    // `-Wl,--oformat=binary` and then store an ELF image under the requested
+    // name -- a zero exit status with the wrong artifact, which is worse than
+    // a refusal because the build never notices.
+    let link_args = crate::backend::linker_common::parse_linker_args(user_args);
+    let oformat = link_args.oformat.clone();
+    let native = match arch.elf_machine {
+        EM_X86_64 => "elf64-x86-64",
+        EM_386 => "elf32-i386",
+        EM_AARCH64 => "elf64-littleaarch64",
+        EM_RISCV => "elf64-littleriscv",
+        _ => "elf64",
+    };
+    if let Some(format) = oformat.as_deref()
+        && format != "binary"
+        && format != "default"
+        && format != native
+    {
+        return Err(format!(
+            "--oformat={format} is not implemented: the {arch_name} backend writes {native} \
+             (or `binary` for executables)",
+            arch_name = arch.arch_name
+        ));
+    }
+    if is_shared && oformat.as_deref() == Some("binary") {
+        return Err(
+            "--oformat=binary cannot be combined with -shared: a flat image has no headers, \
+             so nothing can load it as a shared object"
+                .to_string(),
+        );
+    }
+
+    if is_shared {
+        let setup = resolve_builtin_link_setup(arch, user_args, true, false);
+        let refs = setup.as_refs();
+        // gcc's -shared spec (measured, riscv64/aarch64/i686 alike):
+        // crti.o crtbeginS.o ... -lgcc --as-needed -lgcc_s -lc ... crtendS.o
+        // crtn.o; `-nostartfiles` drops the objects, `-nodefaultlibs` every
+        // library (the backends apply the per-library linking mode).
+        // Without crtbeginS.o the object has no `__dso_handle`, so
+        // `atexit`/`__cxa_atexit` registrations in it cannot be tied to its
+        // unloading (and libc_nonshared.a's `atexit` does not link).
+        let has = |f: &str| user_args.iter().any(|a| a == f);
+        let no_start_files = is_nostdlib || has("-nostartfiles");
+        let no_default_libs = is_nostdlib || has("-nodefaultlibs");
+        let crt = resolve_builtin_link_setup(arch, user_args, no_start_files, false);
+        let before = pic_crt_objects(&crt.crt_before, None);
+        let after = pic_crt_objects(&crt.crt_after, None);
+        let before: Vec<&str> = before.iter().map(String::as_str).collect();
+        let after: Vec<&str> = after.iter().map(String::as_str).collect();
+        let libs: &[&str] = if no_default_libs {
+            &[]
+        } else {
+            &["gcc", "gcc_s", "c"]
+        };
+        let linked = match arch.elf_machine {
+            EM_X86_64 => x86::linker::link_shared(
+                object_files,
+                &[], // the driver's own objects: `input_as_needed`
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
+            EM_AARCH64 => arm::linker::link_shared(
+                object_files,
+                &[], // the driver's own objects: `input_as_needed`
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
+            EM_RISCV => riscv::linker::link_shared(
+                object_files,
+                &[], // the driver's own objects: `input_as_needed`
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
+            EM_386 => i686::linker::link_shared(
+                object_files,
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
+            _ => Err(format!(
+                "No shared library linker for {} (elf_machine={})",
+                arch.arch_name, arch.elf_machine
+            )),
+        };
+        linked?;
+        crate::backend::linker_common::check_rwx_segments(
+            output_path,
+            link_args.warn_rwx_segments,
+            link_args.fatal_warnings,
+        )?;
+        return Ok(());
+    }
+
+    let mut setup = resolve_builtin_link_setup(arch, user_args, is_nostdlib, is_static);
+    add_arch_extra_libs(&mut setup, arch.elf_machine, is_static);
+    // `-pie` (the last of `-pie`/`-no-pie` wins, as for the linker) takes
+    // gcc's PIE startfiles on both x86-64 and i686.
+    let is_pie = linker_pie_effective(user_args);
+    if matches!(arch.elf_machine, EM_X86_64 | EM_386) && is_pie && !is_static {
+        setup.crt_before = pic_crt_objects(&setup.crt_before, Some("Scrt1.o"));
+        setup.crt_after = pic_crt_objects(&setup.crt_after, None);
+    }
+    let refs = setup.as_refs();
+
+    let linked = match arch.elf_machine {
+        EM_X86_64 => x86::linker::link_builtin(
+            object_files,
+            &[], // the driver's own objects: `input_as_needed`
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
+        ),
+        EM_386 => i686::linker::link_builtin(
+            object_files,
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
+        ),
+        EM_AARCH64 => arm::linker::link_builtin(
+            object_files,
+            &[], // the driver's own objects: `input_as_needed`
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
+            is_static,
+        ),
+        EM_RISCV => riscv::linker::link_builtin(
+            object_files,
+            &[], // the driver's own objects: `input_as_needed`
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
+        ),
+        _ => Err(format!(
+            "No built-in linker for {} (elf_machine={})",
+            arch.arch_name, arch.elf_machine
+        )),
+    };
+    linked?;
+    crate::backend::linker_common::check_rwx_segments(
+        output_path,
+        link_args.warn_rwx_segments,
+        link_args.fatal_warnings,
+    )?;
+    if oformat.as_deref() == Some("binary") {
+        crate::backend::linker_common::convert_elf_file_to_flat_binary(output_path)?;
+    }
+    Ok(())
+}
+
+/// Assembly output buffer with helpers for emitting text.
+///
+/// Besides the generic `emit` and `emit_fmt` methods, this provides specialized
+/// fast-path emitters for common patterns that avoid `core::fmt` overhead.
+/// The fast integer writer (`write_i64`) uses direct digit extraction instead
+/// of going through `Display`/`write_fmt` machinery.
+pub struct AsmOutput {
+    pub buf: String,
+    /// Monotonic label counter — the ONE label allocator for every emitter
+    /// path.  `CodegenState::fresh_label`/`next_label_id` and the const-pool
+    /// labels all delegate here, so a label can never be handed out twice, and
+    /// the MachInst emitter (which has no `CodegenState`) can name its own
+    /// guard/done labels instead of hand-writing `1:`/`2:`.
+    label_counter: u32,
+    /// When true, stack slot references use RSP-relative addressing instead of RBP.
+    /// Set when the frame pointer is omitted (-fomit-frame-pointer).
+    pub use_rsp_addressing: bool,
+    /// Total frame size (needed to convert rbp-relative offsets to rsp-relative).
+    /// RBP-relative: offset(%rbp) where offset is negative
+    /// RSP-relative: (frame_size + offset)(%rsp) since RSP = RBP - frame_size
+    pub rsp_frame_size: i64,
+    /// DEBUG-ONLY shadow epoch of instructions that write any part of %rax.
+    ///
+    /// Every public emit method ends in `debug_scan_tail()`, so each completed
+    /// line is classified exactly once by [`asm_line_writes_rax`] and a write
+    /// bumps this counter. The accumulator cache (`RegCache::acc`) records the
+    /// epoch at every park; every consume site asserts the epochs still match
+    /// (`CodegenState::acc_has_verified`). A missed `invalidate_acc()` anywhere
+    /// — present or future — therefore turns the silent dead-%rax-read
+    /// miscompile class into a loud debug assertion in CI, with zero per-site
+    /// discipline and zero release cost (the field does not exist in release).
+    /// This is the mechanical enforcement of the invariant the acc-resident
+    /// fast paths (slot-independent sourcing, commuted-RHS) run on.
+    #[cfg(debug_assertions)]
+    pub(crate) rax_write_epoch: u64,
+    /// DEBUG-ONLY: whether the %rax shadow-epoch machinery is active for the
+    /// target being generated. Only the targets whose accumulator cache
+    /// tracks the %rax-family register — x86-64 and i686 — opt in (their
+    /// constructors call `CodegenState::enable_rax_epoch_discipline`); the
+    /// field is `false` by construction for every other target.
+    ///
+    /// The opt-in is load-bearing for soundness of the ASSERTION (not of the
+    /// cache): the sink classifier speaks AT&T x86 only, and foreign-ISA
+    /// vocabularies can false-positive it. A RISC-V `call foo` line shares
+    /// its mnemonic with the x86 implicit-%rax writer, and RISC-V `mul`/
+    /// `div` would hit the implicit table before any operand check — on a
+    /// target where the cached register is `a0`, not `%rax`. With the flag
+    /// off, `debug_scan_tail` is inert and the epoch can never move, so a
+    /// foreign-ISA compilation can neither false-assert nor silently corrupt
+    /// an x86-64 function's epochs (each function generation owns its own
+    /// `CodegenState`). The generic pass layer (generate_load/store,
+    /// remat_indexed_acc_safe, generate_copy) runs for every target and
+    /// speaks the verified API; the flag — not the call sites — is what
+    /// scopes the semantics to the x86 family.
+    #[cfg(debug_assertions)]
+    pub(crate) rax_epoch_active: bool,
+    /// DEBUG-ONLY: the %rcx shadow epoch — the %rcx mirror of
+    /// [`rax_write_epoch`](Self::rax_write_epoch), bumped by the same
+    /// [`debug_scan_tail`](Self::debug_scan_tail) pass for every line that
+    /// writes any part of %rcx. The secondary-cache verifier
+    /// (`CodegenState::sec_has_verified`) snapshots it at park time and
+    /// asserts stillness at consume time; gated by the same
+    /// `rax_epoch_active` opt-in (the flag means "x86-family target whose
+    /// cached registers are %rax/%rcx"). Does not exist in release.
+    #[cfg(debug_assertions)]
+    pub(crate) rcx_write_epoch: u64,
+    /// DEBUG-ONLY: the most recent classified %rax-writing line (trimmed),
+    /// for the acc-epoch assertion's context. Where `last_unclassified`
+    /// names the line the analyzer could NOT place (usually `None` when
+    /// the clobberer is a plain classified write), this names the actual
+    /// clobberer — the triage hint that closes the gap.
+    #[cfg(debug_assertions)]
+    pub(crate) last_rax_write: Option<String>,
+    /// DEBUG-ONLY: the most recent classified %rcx-writing line (trimmed),
+    /// for the sec-epoch assertion's context. The %rcx mirror of
+    /// `last_rax_write`.
+    #[cfg(debug_assertions)]
+    pub(crate) last_rcx_write: Option<String>,
+    /// DEBUG-ONLY: byte offset through which the sink's line classifier has
+    /// consumed the buffer. `debug_scan_tail` classifies every complete line
+    /// not yet covered (not just the last one — an emit may carry embedded
+    /// newlines, and the exploratory dual-layout truncation rewinds the
+    /// tail), so this and `buf.len()` differ exactly while a line is mid-
+    /// construction. The module handoff asserts equality: "every public
+    /// emit method ends in `debug_scan_tail()`" is machine-checked, not
+    /// taken on trust — the escape-hatch class (`emit_cmp_zero_mem_sized`
+    /// pushed complete lines without a scan) fails this assert by
+    /// construction. Inert for non-opted-in targets (see `rax_epoch_active`).
+    #[cfg(debug_assertions)]
+    pub(crate) scanned_len: usize,
+    /// DEBUG-ONLY: the most recent complete line carrying an unclassified
+    /// mnemonic, recorded by `debug_scan_tail` at the point of classification
+    /// where the line text is at hand. STREAM-scoped by design: a diagnostic
+    /// about this stream's lines belongs to this stream, and the thread-local
+    /// this field replaces was hidden global state — its only test was
+    /// order-independent by luck (every read followed a same-test write), and
+    /// any future read-first test would inherit whatever the previous test on
+    /// the reused thread left behind. Surfaced through the acc-epoch
+    /// assertion's "last unclassified emitted line" context.
+    #[cfg(debug_assertions)]
+    pub(crate) last_unclassified: Option<String>,
+    /// DEBUG-ONLY: every mnemonic this stream's lines carried that the
+    /// analyzer met outside the explicit tables, deduplicated in encounter
+    /// order. Surfaced through the acc-epoch assertion message so the first
+    /// thing a triager reads is the vocabulary to audit into a table — the
+    /// list the assert's "extend the analyzer tables" instruction names but
+    /// which, before this field, was written to a never-read thread-local
+    /// and never printed anywhere.
+    #[cfg(debug_assertions)]
+    pub(crate) unclassified_mnemonics: Vec<String>,
+}
+
+/// Write an i64 directly into a String buffer using manual digit extraction.
+/// This is ~3-4x faster than `write!(buf, "{}", val)` for the common case
+/// because it avoids the `core::fmt` vtable dispatch and `pad_integral` overhead.
+#[inline]
+fn write_i64_fast(buf: &mut String, val: i64) {
+    if val == 0 {
+        buf.push('0');
+        return;
+    }
+    let mut tmp = [0u8; 20]; // i64 max is 19 digits + sign
+    let negative = val < 0;
+    // Work with absolute value using wrapping to handle i64::MIN correctly
+    let mut v = if negative {
+        (val as u64).wrapping_neg()
+    } else {
+        val as u64
+    };
+    let mut pos = 20;
+    while v > 0 {
+        pos -= 1;
+        tmp[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    if negative {
+        pos -= 1;
+        tmp[pos] = b'-';
+    }
+    // All bytes are ASCII digits and optionally '-', which is always valid UTF-8.
+    let s = std::str::from_utf8(&tmp[pos..20]).expect("integer formatting produced non-UTF8");
+    buf.push_str(s);
+}
+
+/// Write a u64 directly into a String buffer.
+#[inline]
+fn write_u64_fast(buf: &mut String, val: u64) {
+    if val == 0 {
+        buf.push('0');
+        return;
+    }
+    let mut tmp = [0u8; 20]; // u64 max is 20 digits
+    let mut v = val;
+    let mut pos = 20;
+    while v > 0 {
+        pos -= 1;
+        tmp[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let s = std::str::from_utf8(&tmp[pos..20]).expect("integer formatting produced non-UTF8");
+    buf.push_str(s);
+}
+
+// ── %rax shadow-epoch analyzer (debug builds) ───────────────────────────
+//
+// The accumulator cache's truthfulness rests on ~40 hand-placed
+// `invalidate_acc()` calls across the emitters. Since the slot-independent
+// acc fast paths (PR #635) that cache is load-bearing for correctness, not
+// merely for speed: one missed invalidation anywhere reads a dead %rax.
+// Rather than demanding new per-site discipline (an epoch bump per emitter
+// is exactly as forgettable as the invalidation it guards), the validator
+// is MECHANICAL: every emitted line passes through AsmOutput exactly once,
+// so the sink itself classifies the line and bumps the shadow epoch. The
+// consume sites assert park-epoch == current-epoch, and a missed
+// invalidation becomes a loud CI failure naming the offending line.
+
+/// Register tokens that name part of architectural %rax. The high bytes
+/// alias the family exactly as the low bytes do (bits 8..15 of the same
+/// register — see `register_family_at` in the peephole for the same law).
+const RAX_FAMILY: [&str; 5] = ["rax", "eax", "ax", "al", "ah"];
+
+/// Mnemonics (already prefix-stripped, suffix-normalized) that write some
+/// part of %rax implicitly, regardless of their explicit operands.
+const IMPLICIT_RAX_WRITES: [&str; 23] = [
+    "div",
+    "idiv",
+    "mul",     // one-operand forms: quotient/product in rax:rdx
+    "call",    // caller-saved clobber, direct or through memory/`*%reg`
+    "lods",    // lodsb/lodsw/lodsl/lodsq: al/ax/eax/rax = [rsi]
+    "cmpxchg", // may reload rax from the destination on compare failure
+    "syscall",
+    "sysenter",
+    "cpuid",
+    "rdtsc",
+    "rdtscp",
+    "xgetbv",
+    "rdmsr",
+    "lahf", // ah = flags
+    "cdqe", // rax = sign-extend(eax)
+    "cltq",
+    "cwde",
+    "cbw",
+    "cwtl", // aliases of the same extension family
+    "cmpxchg8b",
+    "cmpxchg16b", // rdx:rax rewritten
+    "fstsw",
+    "fnstsw", // x87 status word INTO %ax (the lone x87 rax writer)
+];
+
+/// Mnemonics that name %rax-family registers among their operands without
+/// ever writing %rax: compare/test write flags only, push reads, jumps and
+/// returns read or transfer control, and the cqo/cdq family extends %rax
+/// INTO %rdx while leaving %rax itself intact.
+const NEVER_RAX_WRITES: [&str; 13] = [
+    "cmp", "test", "push", "jmp", "ret", "leave", "cqo", "cqto", "cdq", "cltd", "cwd", "cwtd",
+    "enter",
+];
+
+/// Mnemonics where BOTH operands are written (xchg swaps; xadd adds the
+/// source into the destination and returns the old destination in the
+/// source). Either operand naming %rax therefore writes %rax.
+const BOTH_OPERAND_WRITES: [&str; 2] = ["xchg", "xadd"];
+
+/// `mulx` writes its TWO explicit destinations (last two operands); the
+/// implicit register (%rdx) is the source.
+const LAST_TWO_WRITES: [&str; 3] = ["mulx", "mulxl", "mulxq"];
+
+/// The %rcx family: full/32/16/8-bit names (including the high-byte %ch,
+/// which has no REX form but is still a %rcx write).
+const RCX_FAMILY: [&str; 5] = ["rcx", "ecx", "cx", "cl", "ch"];
+
+/// Mnemonics (already prefix-stripped, suffix-normalized) that write some
+/// part of %rcx implicitly, regardless of their explicit operands. The %rcx
+/// mirror of [`IMPLICIT_RAX_WRITES`] — deliberately NOT a copy: most
+/// one-operand %rax writers (div/idiv/mul/lods/cmpxchg/rdtsc/xgetbv/rdmsr,
+/// the cwtl family, cmpxchg8b/16b, fstsw) never touch %rcx, while the
+/// `loop` family writes the %rcx COUNTER without naming it. The `rep`-ed
+/// string ops are likewise counter writers, but that rule lives in the
+/// prefix chain ([`classify_rcx_line`]), not here: bare `stos`/`movs` leave
+/// %rcx alone, so only a `rep*` prefix on a string-op base turns them into
+/// writers — exactly like the hardware (and `rep ret`/`rep nop`, where the
+/// prefix is a hint the CPU ignores, are NOT writers).
+const IMPLICIT_RCX_WRITES: [&str; 10] = [
+    "call",     // caller-saved clobber includes %rcx (direct and indirect)
+    "syscall",  // saves RIP into %rcx
+    "sysenter", // saves return state; %rcx clobbered
+    "cpuid",    // writes eax:ebx:ecx:edx
+    "rdtscp",   // writes edx:eax AND ecx (IA32_TSC_AUX) — unlike rdtsc
+    "loop", "loope", "loopz", "loopne", "loopnz", // the counter family
+];
+
+/// String-op bases for the `rep*`-prefix rule: with a `rep*` prefix these
+/// consume the %rcx counter (a write); without one they leave %rcx alone.
+/// Checked against both the exact token and the suffix-normalized base.
+/// (`lods` is included for totality — `rep lods` consumes the counter
+/// like every other string op — even though no sane emitter produces it
+/// (only the last load survives); bare `lods` still classifies `false`
+/// through the zero-operand rule, exactly like `stos` without `rep`.)
+const REP_STRING_BASES: [&str; 7] = ["movs", "stos", "cmps", "scas", "ins", "outs", "lods"];
+
+/// Mnemonics that name %rcx-family registers among their operands without
+/// ever writing %rcx: compare/test write flags only, push reads, jumps and
+/// returns read or transfer control, and the cqo/cdq family extends %rax
+/// INTO %rdx while leaving %rcx itself intact. The %rcx mirror of
+/// [`NEVER_RAX_WRITES`] — every entry is equally %rcx-silent.
+const NEVER_RCX_WRITES: [&str; 13] = [
+    "cmp", "test", "push", "jmp", "ret", "leave", "cqo", "cqto", "cdq", "cltd", "cwd", "cwtd",
+    "enter",
+];
+
+#[inline]
+fn is_mnemonic_byte(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+}
+
+/// Split an operand list on top-level commas (paren-aware): SIB memory
+/// operands `disp(%base,%idx,s)` carry commas inside the parens and must
+/// stay one operand.
+fn split_operands_top_level(rest: &str) -> Vec<&str> {
+    let mut out = Vec::with_capacity(4);
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&rest[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&rest[start..]);
+    out
+}
+
+/// A pure register operand: exactly `%reg` — no memory parens, no immediate
+/// `$`, no segment `:` — whose register token names a %rax family member.
+fn pure_rax_reg(op: &str) -> bool {
+    let op = op.trim();
+    if !op.starts_with('%') || op.len() < 2 {
+        return false;
+    }
+    if op[1..].contains(|c: char| !is_mnemonic_byte(c)) {
+        return false;
+    }
+    RAX_FAMILY.contains(&&op[1..])
+}
+
+/// Does an operand token (register or memory) REFERENCE %rax at all — used
+/// only by the both-operand and last-two write classes, where a memory
+/// operand can never appear (xchg/xadd/mulx register forms).
+fn operand_references_rax(op: &str) -> bool {
+    let op = op.trim();
+    let bytes = op.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let mut j = i + 1;
+            while j < bytes.len() && is_mnemonic_byte(bytes[j] as char) {
+                j += 1;
+            }
+            if RAX_FAMILY.contains(&&op[i + 1..j]) {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// A pure register operand: exactly `%reg` — no memory parens, no immediate
+/// `$`, no segment `:` — whose register token names a %rcx family member.
+/// The %rcx mirror of [`pure_rax_reg`].
+fn pure_rcx_reg(op: &str) -> bool {
+    let op = op.trim();
+    if !op.starts_with('%') || op.len() < 2 {
+        return false;
+    }
+    if op[1..].contains(|c: char| !is_mnemonic_byte(c)) {
+        return false;
+    }
+    RCX_FAMILY.contains(&&op[1..])
+}
+
+/// Does an operand token (register or memory) REFERENCE %rcx at all — used
+/// only by the both-operand and last-two write classes, where a memory
+/// operand can never appear (xchg/xadd/mulx register forms). The %rcx
+/// mirror of [`operand_references_rax`].
+fn operand_references_rcx(op: &str) -> bool {
+    let op = op.trim();
+    let bytes = op.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let mut j = i + 1;
+            while j < bytes.len() && is_mnemonic_byte(bytes[j] as char) {
+                j += 1;
+            }
+            if RCX_FAMILY.contains(&&op[i + 1..j]) {
+                return true;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Normalize a mnemonic token: drop the AT&T width suffix for table
+/// lookups (`movq` → `mov`), keeping the exact token as a fallback so
+/// suffixed rows (`cltq`) never lose their identity.
+#[inline]
+fn mnemonic_base(token: &str) -> &str {
+    match token.as_bytes().last() {
+        Some(b'b') | Some(b'w') | Some(b'l') | Some(b'q') => &token[..token.len() - 1],
+        _ => token,
+    }
+}
+
+/// Does this AT&T-syntax assembly line write any part of %rax?
+///
+/// Classifies one line for the %rax shadow-epoch analyzer: does the line
+/// write any part of the %rax family, and — when the write is answered by
+/// the generic dest-last rule with a rax-shaped destination — which
+/// mnemonic token carried it (the analyzer's only per-line record of
+/// having used its fallback rule rather than an explicit table).
+///
+/// The classifier is PURE: it never mutates diagnostic state. An UNKNOWN
+/// mnemonic carrying operands is treated as a write (fail-loud): a false
+/// "write" only risks a debug assertion naming the line for the table,
+/// while a missed write would silently defeat the validator. Labels
+/// (trailing `:`), assembler directives (leading `.`) and empty lines are
+/// ignored.
+///
+/// AT&T-only: every scanned line is AT&T by construction (the emitters
+/// speak AT&T natively, and GCC dialect alternatives in inline asm resolve
+/// to the first — AT&T — branch), so dest-last reading is total. There is
+/// no `.intel_syntax` mode anywhere in the pipeline; an Intel-shaped line
+/// would misclassify, and must never be produced.
+///
+/// The `(writes_rax, unclassified_mnemonic)` pair is what the caller —
+/// `AsmOutput::debug_scan_tail`, the only production caller — records INTO
+/// THE OUTPUT STREAM it is scanning. Stream-scoped, not thread-scoped:
+/// diagnostics about a stream's lines belong to the stream, and a
+/// thread-local record was the one remaining piece of hidden global state
+/// in the analyzer (its test could only be order-independent because every
+/// read happened to follow a same-test write; any future read-first test
+/// would inherit whatever the previous test on the reused thread left).
+fn classify_rax_line(line: &str) -> (bool, Option<String>) {
+    let line = line.trim_start();
+    if line.is_empty() || line.ends_with(':') || line.starts_with('.') {
+        return (false, None);
+    }
+    let mut rest = line;
+    // Prefix chain: lock/rep/segment/bnd hints precede the real mnemonic.
+    loop {
+        let end = rest
+            .find(|c: char| !is_mnemonic_byte(c))
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        match token {
+            "lock" | "rep" | "repe" | "repz" | "repne" | "repnz" | "bnd" | "data16" | "notrack"
+            | "xacquire" | "xrelease" | "cs" | "ds" | "es" | "ss" => {
+                rest = rest[end..].trim_start();
+                if rest.is_empty() {
+                    return (false, None);
+                }
+            }
+            _ => break,
+        }
+    }
+    let end = rest
+        .find(|c: char| !is_mnemonic_byte(c))
+        .unwrap_or(rest.len());
+    let token = &rest[..end];
+    let operands_part = rest[end..].trim_start();
+    let base = mnemonic_base(token);
+
+    if IMPLICIT_RAX_WRITES.contains(&token) || IMPLICIT_RAX_WRITES.contains(&base) {
+        return (true, None);
+    }
+    if NEVER_RAX_WRITES.contains(&token) || NEVER_RAX_WRITES.contains(&base) {
+        return (false, None);
+    }
+    // Jump family (ja/jb/jmp/jcc/jecxz/loop*/...): control transfer only.
+    if base.starts_with('j') {
+        return (false, None);
+    }
+    // x87 operates on st(0)/memory and never touches GP registers (fstsw is
+    // answered by the implicit table above); prefetch streams to memory.
+    if base.starts_with('f') || base.starts_with("prefetch") || base == "bt" {
+        return (false, None);
+    }
+    if BOTH_OPERAND_WRITES.contains(&token) || BOTH_OPERAND_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return (ops.iter().any(|o| operand_references_rax(o)), None);
+    }
+    if LAST_TWO_WRITES.contains(&token) || LAST_TWO_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return (
+            ops.len() >= 2 && ops[ops.len() - 2..].iter().any(|o| pure_rax_reg(o)),
+            None,
+        );
+    }
+    // imul's one-operand form multiplies INTO rax:rdx; its two/three-operand
+    // forms write only the explicit destination (handled by the generic rule).
+    if (token == "imul" || base == "imul") && !operands_part.is_empty() {
+        let ops = split_operands_top_level(operands_part);
+        if ops.len() == 1 {
+            return (true, None);
+        }
+    }
+    if operands_part.is_empty() {
+        // Zero-operand instruction outside every table (vzeroupper, wait,
+        // fchs, ...): none of the emitted vocabulary writes %rax.
+        return (false, None);
+    }
+    // Generic AT&T rule: the destination is the LAST operand, and a write
+    // to %rax happens exactly when that operand is a pure %rax-family
+    // register. Memory destinations (parens) and immediates never write —
+    // for ANY AT&T instruction, known or not (implicit writers are the
+    // table's job, answered above). An UNKNOWN mnemonic whose destination
+    // is rax-shaped still reports the write (dest-last is universal) and
+    // is recorded so the table can name it; an unknown mnemonic with a
+    // non-rax destination is soundly `false`.
+    //
+    // NOTE: "unknown mnemonic with a non-rax destination is false" does NOT
+    // by itself make foreign-ISA assembly safe here — table hits above are
+    // unconditional on operands (RISC-V `call`/`mul`/`div` share x86
+    // mnemonics), and only the x86-64/i686 targets opt into scanning at all
+    // (`AsmOutput::rax_epoch_active`). Within an opted-in target every
+    // emitted line IS AT&T x86, which is the contract this classifier is
+    // written against.
+    let ops = split_operands_top_level(operands_part);
+    match ops.last() {
+        Some(last) if pure_rax_reg(last) => {
+            let known = IMPLICIT_RAX_WRITES.contains(&token)
+                || IMPLICIT_RAX_WRITES.contains(&base)
+                || NEVER_RAX_WRITES.contains(&token)
+                || NEVER_RAX_WRITES.contains(&base)
+                || BOTH_OPERAND_WRITES.contains(&token)
+                || BOTH_OPERAND_WRITES.contains(&base)
+                || LAST_TWO_WRITES.contains(&token)
+                || LAST_TWO_WRITES.contains(&base)
+                || base.starts_with('j')
+                || base.starts_with('f')
+                || base.starts_with("prefetch")
+                || base == "bt"
+                || base == "imul";
+            (true, (!known).then(|| token.to_string()))
+        }
+        _ => (false, None),
+    }
+}
+
+/// Pure classification predicate over one emitted line (see
+/// [`classify_rax_line`] for the full contract). Tests assert through this
+/// thin wrapper; production records through `debug_scan_tail`, which owns
+/// the diagnostics the old thread-local write side effect produced.
+pub(crate) fn asm_line_writes_rax(line: &str) -> bool {
+    classify_rax_line(line).0
+}
+
+/// True when a short-`movs` mnemonic with explicit operands is MOVSX rather
+/// than a string op: exactly two operands with a PURE register destination
+/// (`movsl %eax,%ebx`, `movsl (%rax),%ebx` — the CPU ignores any `rep`
+/// prefix there). Memory-memory (`movsl (%esi),(%edi)`, GAS-accepted with
+/// or without `rep`, encoding A5) IS the string op — `rep` counts %rcx
+/// there — as is anything that is not two operands with a register dst
+/// (conservative: every real MOVSX has one, ISA fact). Only the four
+/// ambiguous spellings qualify — `movslq` never reaches the rep rule (its
+/// base is `movsl`, not `movs`), and the other string bases (`stos`,
+/// `cmps`, ...) have no MOVSX reading.
+fn movs_is_movsx(token: &str, operands_part: &str) -> bool {
+    if !matches!(token, "movsb" | "movsw" | "movsl" | "movsq") {
+        return false;
+    }
+    let ops = split_operands_top_level(operands_part);
+    if ops.len() != 2 {
+        return false;
+    }
+    // A pure register destination: exactly `%reg` — no memory parens, no
+    // segment `:` (`%ds:(%esi)` is memory despite the leading `%`); the
+    // same shape test as `pure_rax_reg`, minus the family membership.
+    let dst = ops[1].trim();
+    dst.starts_with('%') && dst.len() >= 2 && !dst[1..].contains(|c: char| !is_mnemonic_byte(c))
+}
+
+/// Does this AT&T-syntax assembly line write any part of %rcx?
+///
+/// The %rcx mirror of [`classify_rax_line`] (same purity, same fail-loud
+/// contract: an UNKNOWN mnemonic carrying operands is treated as a write;
+/// labels, directives and empty lines are ignored). Shares the helpers
+/// (`split_operands_top_level`, `mnemonic_base`, the both-operand and
+/// last-two tables); differs where the ISA differs.
+///
+/// AT&T-only, like the %rax side: Intel-syntax lines never occur (GCC
+/// dialect alternatives in inline asm resolve to the first — AT&T —
+/// branch, and the emitters speak AT&T natively), so dest-last reading is
+/// total here, exactly as there.
+///
+/// * The implicit table is NOT a copy: one-operand div/idiv/mul, lods,
+///   cmpxchg, rdtsc, xgetbv, rdmsr, the cwtl family, cmpxchg8b/16b and
+///   fstsw all write %rax-family state while leaving %rcx alone, so none
+///   of them is an implicit %rcx writer. Conversely `syscall` (RIP into
+///   %rcx), `cpuid`, `rdtscp` (IA32_TSC_AUX into %ecx) and the `loop`
+///   family (the %rcx counter) are.
+/// * `rep*`-prefixed string ops write the %rcx counter — but the prefix is
+///   only a counter-user on string-op bases. `rep ret` / `rep nop`
+///   (`pause`) carry an ignored hint prefix and fall through to normal
+///   classification instead of reporting a write, and so do short-`movs`
+///   spellings with a register destination (`rep movsl %eax,%ebx` is
+///   MOVSX with an ignored prefix — no counter traffic — not a string
+///   op; memory-memory `rep movsl (%esi),(%edi)` IS the string op and
+///   reports the counter).
+/// * One-operand `mul`/`div`/`idiv` and one-operand `imul` multiply INTO
+///   the implicit rax:rdx pair: their explicit operand is the SOURCE, so a
+///   `%rcx`-looking operand there must NOT report a write (the dest-last
+///   generic rule would false-positive it). Mirrored inversely from the
+///   %rax side, where one-operand `imul` reports `true`.
+fn classify_rcx_line(line: &str) -> (bool, Option<String>) {
+    let line = line.trim_start();
+    if line.is_empty() || line.ends_with(':') || line.starts_with('.') {
+        return (false, None);
+    }
+    let mut rest = line;
+    let mut saw_rep = false;
+    // Prefix chain: lock/rep/segment/bnd hints precede the real mnemonic.
+    loop {
+        let end = rest
+            .find(|c: char| !is_mnemonic_byte(c))
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        match token {
+            "rep" | "repe" | "repz" | "repne" | "repnz" => {
+                saw_rep = true;
+                rest = rest[end..].trim_start();
+                if rest.is_empty() {
+                    return (false, None);
+                }
+            }
+            "lock" | "bnd" | "data16" | "notrack" | "xacquire" | "xrelease" | "cs" | "ds"
+            | "es" | "ss" => {
+                rest = rest[end..].trim_start();
+                if rest.is_empty() {
+                    return (false, None);
+                }
+            }
+            _ => break,
+        }
+    }
+    let end = rest
+        .find(|c: char| !is_mnemonic_byte(c))
+        .unwrap_or(rest.len());
+    let token = &rest[..end];
+    let operands_part = rest[end..].trim_start();
+    let base = mnemonic_base(token);
+
+    // A `rep*` prefix on a string-op base consumes the %rcx counter. Any
+    // other base (`rep ret`, `rep nop`) ignores the prefix: fall through.
+    // Short-`movs` spellings with a register destination are MOVSX, not
+    // string ops — the CPU ignores `rep` there, so only the explicit
+    // destination can be a %rcx write (`rep movsl %eax,%ebx` touches no
+    // part of %rcx); memory-memory is the string op (`rep` counts).
+    if saw_rep
+        && (REP_STRING_BASES.contains(&token) || REP_STRING_BASES.contains(&base))
+        && !movs_is_movsx(token, operands_part)
+    {
+        return (true, None);
+    }
+    if IMPLICIT_RCX_WRITES.contains(&token) || IMPLICIT_RCX_WRITES.contains(&base) {
+        return (true, None);
+    }
+    if NEVER_RCX_WRITES.contains(&token) || NEVER_RCX_WRITES.contains(&base) {
+        return (false, None);
+    }
+    // Jump family (ja/jb/jmp/jcc/jecxz/jrcxz/...): control transfer only.
+    // (`loop*` never reaches here: it is answered by the implicit table.)
+    if base.starts_with('j') {
+        return (false, None);
+    }
+    // x87 operates on st(0)/memory and never touches GP registers;
+    // prefetch streams to memory. (No x87 mnemonic writes %rcx — fstsw
+    // targets %ax, which is the RAX table's business, not this one's.)
+    if base.starts_with('f') || base.starts_with("prefetch") || base == "bt" {
+        return (false, None);
+    }
+    if BOTH_OPERAND_WRITES.contains(&token) || BOTH_OPERAND_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return (ops.iter().any(|o| operand_references_rcx(o)), None);
+    }
+    if LAST_TWO_WRITES.contains(&token) || LAST_TWO_WRITES.contains(&base) {
+        let ops = split_operands_top_level(operands_part);
+        return (
+            ops.len() >= 2 && ops[ops.len() - 2..].iter().any(|o| pure_rcx_reg(o)),
+            None,
+        );
+    }
+    // mul/div/idiv have ONLY one-operand AT&T forms, multiplying/dividing
+    // INTO the implicit rax:rdx pair: the explicit operand is the source,
+    // never a %rcx destination. Unconditional: no multi-operand form can
+    // reach the generic rule below.
+    if token == "mul"
+        || base == "mul"
+        || token == "div"
+        || base == "div"
+        || token == "idiv"
+        || base == "idiv"
+    {
+        return (false, None);
+    }
+    // imul's one-operand form multiplies INTO rax:rdx (its explicit operand
+    // is the source, so NOT a %rcx write); its two/three-operand forms
+    // write only the explicit destination (handled by the generic rule).
+    if (token == "imul" || base == "imul") && !operands_part.is_empty() {
+        let ops = split_operands_top_level(operands_part);
+        if ops.len() == 1 {
+            return (false, None);
+        }
+    }
+    if operands_part.is_empty() {
+        // Zero-operand instruction outside every table (vzeroupper, wait,
+        // fchs, ...): none of the emitted vocabulary writes %rcx.
+        return (false, None);
+    }
+    // Generic AT&T rule: the destination is the LAST operand, and a write
+    // to %rcx happens exactly when that operand is a pure %rcx-family
+    // register. Memory destinations (parens) and immediates never write —
+    // for ANY AT&T instruction, known or not (implicit writers are the
+    // table's job, answered above). An UNKNOWN mnemonic whose destination
+    // is rcx-shaped still reports the write (dest-last is universal) and
+    // is recorded so the table can name it; an unknown mnemonic with a
+    // non-rcx destination is soundly `false`. (Foreign-ISA safety is the
+    // opt-in flag's job — see `classify_rax_line` — not this rule's.)
+    let ops = split_operands_top_level(operands_part);
+    match ops.last() {
+        Some(last) if pure_rcx_reg(last) => {
+            let known = IMPLICIT_RCX_WRITES.contains(&token)
+                || IMPLICIT_RCX_WRITES.contains(&base)
+                || NEVER_RCX_WRITES.contains(&token)
+                || NEVER_RCX_WRITES.contains(&base)
+                || BOTH_OPERAND_WRITES.contains(&token)
+                || BOTH_OPERAND_WRITES.contains(&base)
+                || LAST_TWO_WRITES.contains(&token)
+                || LAST_TWO_WRITES.contains(&base)
+                || base.starts_with('j')
+                || base.starts_with('f')
+                || base.starts_with("prefetch")
+                || base == "bt"
+                || base == "imul"
+                || base == "mul"
+                || base == "div"
+                || base == "idiv"
+                || REP_STRING_BASES.contains(&token)
+                || REP_STRING_BASES.contains(&base);
+            (true, (!known).then(|| token.to_string()))
+        }
+        _ => (false, None),
+    }
+}
+
+/// Pure classification predicate over one emitted line (see
+/// [`classify_rcx_line`] for the full contract). Tests assert through this
+/// thin wrapper; production records through `debug_scan_tail`, which owns
+/// the diagnostics. The %rcx mirror of [`asm_line_writes_rax`].
+pub(crate) fn asm_line_writes_rcx(line: &str) -> bool {
+    classify_rcx_line(line).0
+}
+
+impl AsmOutput {
+    pub fn new() -> Self {
+        // Pre-allocate 256KB to avoid repeated reallocations during codegen.
+        Self {
+            buf: String::with_capacity(256 * 1024),
+            label_counter: 0,
+            use_rsp_addressing: false,
+            rsp_frame_size: 0,
+            #[cfg(debug_assertions)]
+            rax_write_epoch: 0,
+            #[cfg(debug_assertions)]
+            rcx_write_epoch: 0,
+            #[cfg(debug_assertions)]
+            rax_epoch_active: false,
+            #[cfg(debug_assertions)]
+            scanned_len: 0,
+            #[cfg(debug_assertions)]
+            last_unclassified: None,
+            #[cfg(debug_assertions)]
+            last_rax_write: None,
+            #[cfg(debug_assertions)]
+            last_rcx_write: None,
+            #[cfg(debug_assertions)]
+            unclassified_mnemonics: Vec::new(),
+        }
+    }
+
+    /// DEBUG-ONLY: classify every emitted-but-not-yet-classified complete
+    /// line and bump the shadow epoch for each %rax write. A no-op compiled
+    /// out of release builds (the call sites stay unconditional; this body
+    /// collapses to nothing).
+    ///
+    /// Multi-line by design: a scan call covers everything from the last
+    /// scanned offset, so a method that pushes two lines before scanning,
+    /// or an `emit` carrying an embedded newline, is classified exactly
+    /// once per line instead of silently losing the earlier ones. The tail
+    /// form ("classify just the line just completed") is subsumed: the
+    /// common case is exactly one pending line.
+    #[inline]
+    pub(crate) fn debug_scan_tail(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            // Inert unless the target opted in (x86-64, i686). Foreign-ISA
+            // lines must never move the epoch: the classifier's vocabulary
+            // is AT&T x86, and a RISC-V `call`/`mul`/`div` line would
+            // false-positive the implicit-write table (see
+            // `rax_epoch_active` for the full argument).
+            if !self.rax_epoch_active {
+                return;
+            }
+            // The exploratory dual-layout emission truncates the buffer and
+            // re-emits from the mark; the replaced tail was already counted,
+            // so rewind the scan offset to the truncation point.
+            if self.scanned_len > self.buf.len() {
+                self.scanned_len = self.buf.len();
+            }
+            let start = self.scanned_len;
+            if start >= self.buf.len() {
+                return;
+            }
+            let mut writes = 0u64;
+            let mut end = start;
+            for line in self.buf[start..].split_inclusive('\n') {
+                if let Some(complete) = line.strip_suffix('\n') {
+                    // Stream-scoped diagnostics: the classifier is pure; the
+                    // record lives ON the stream it describes. The trimmed
+                    // form matches the assertion message's convention (no
+                    // indentation noise), and the vocabulary list dedups so
+                    // the message names each new mnemonic exactly once.
+                    // Both shadow epochs ride the SAME line walk: one split of
+                    // the tail, two pure classifications (a line may write
+                    // both registers — `xchg %rax,%rcx` — and must then move
+                    // both epochs). The unclassified vocabulary is shared:
+                    // either classifier's fallback records the mnemonic, so
+                    // the assertion's "extend the analyzer tables"
+                    // instruction names it exactly once.
+                    let (writes_rax, unclassified) = classify_rax_line(complete);
+                    let (writes_rcx, unclassified_rcx) = classify_rcx_line(complete);
+                    if writes_rax {
+                        writes += 1;
+                        self.last_rax_write = Some(complete.trim_start().to_string());
+                    }
+                    if writes_rcx {
+                        self.rcx_write_epoch += 1;
+                        self.last_rcx_write = Some(complete.trim_start().to_string());
+                    }
+                    if let Some(token) = unclassified {
+                        self.last_unclassified = Some(complete.trim_start().to_string());
+                        if !self.unclassified_mnemonics.iter().any(|m| m == &token) {
+                            self.unclassified_mnemonics.push(token);
+                        }
+                    }
+                    if let Some(token) = unclassified_rcx {
+                        self.last_unclassified = Some(complete.trim_start().to_string());
+                        if !self.unclassified_mnemonics.iter().any(|m| m == &token) {
+                            self.unclassified_mnemonics.push(token);
+                        }
+                    }
+                    end += line.len();
+                }
+                // A trailing fragment without its newline is mid-construction;
+                // its completer's scan classifies it.
+            }
+            self.rax_write_epoch += writes;
+            self.scanned_len = end;
+        }
+    }
+
+    /// DEBUG-ONLY: assert that every byte pushed to the buffer has been
+    /// classified — i.e. no emit method completed a line without a
+    /// `debug_scan_tail()`. Called once at the module handoff, where the
+    /// buffer is final. This is the mechanical form of the "every public
+    /// emit method ends in `debug_scan_tail()`" banner: a future sink that
+    /// pushes lines without scanning fails here instead of silently
+    /// blinding the epoch validator. Scoped to opted-in targets (foreign
+    /// ISAs never scan by design).
+    #[inline]
+    pub(crate) fn debug_assert_fully_scanned(&self) {
+        #[cfg(debug_assertions)]
+        {
+            if !self.rax_epoch_active {
+                return;
+            }
+            assert_eq!(
+                self.scanned_len,
+                self.buf.len(),
+                "x86 codegen: {} unclassified output byte(s) at module handoff — an emit \
+                 method pushed a complete line without debug_scan_tail(). The epoch \
+                 validator is blind to that text; route the push through a scanned \
+                 emit method (first offender from the handoff point: {:?}).",
+                self.buf.len() - self.scanned_len,
+                self.buf[self.scanned_len..].lines().next(),
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = self;
+        }
+    }
+
+    /// DEBUG-ONLY: the current %rax shadow epoch (always 0 in release).
+    #[inline]
+    pub(crate) fn debug_rax_epoch(&self) -> u64 {
+        #[cfg(debug_assertions)]
+        {
+            self.rax_write_epoch
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
+    }
+
+    /// DEBUG-ONLY: the current %rcx shadow epoch (always 0 in release).
+    /// The %rcx mirror of [`debug_rax_epoch`](Self::debug_rax_epoch).
+    #[inline]
+    pub(crate) fn debug_rcx_epoch(&self) -> u64 {
+        #[cfg(debug_assertions)]
+        {
+            self.rcx_write_epoch
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            0
+        }
+    }
+
+    /// DEBUG-ONLY: this stream's most recent classified %rax-writing line,
+    /// for the acc-epoch assertion's context (the actual clobberer, where
+    /// `last_unclassified` can only name lines the analyzer could NOT
+    /// place). `None` when no %rax write has been scanned yet.
+    #[inline]
+    pub(crate) fn debug_last_rax_write(&self) -> Option<String> {
+        #[cfg(debug_assertions)]
+        {
+            self.last_rax_write.clone()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
+        }
+    }
+
+    /// DEBUG-ONLY: this stream's most recent classified %rcx-writing line,
+    /// for the sec-epoch assertion's context. The %rcx mirror of
+    /// [`debug_last_rax_write`](Self::debug_last_rax_write).
+    #[inline]
+    pub(crate) fn debug_last_rcx_write(&self) -> Option<String> {
+        #[cfg(debug_assertions)]
+        {
+            self.last_rcx_write.clone()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
+        }
+    }
+
+    /// DEBUG-ONLY: this stream's most recent unclassified line, for the
+    /// acc-epoch assertion's context. Stream-scoped: recorded by
+    /// `debug_scan_tail` into `last_unclassified` — the thread-local this
+    /// used to read was hidden global state whose value depended on which
+    /// tests had run before on the same reused thread, and the AsmOutput
+    /// field before THAT was declared but never written (the assertion's
+    /// context always printed None).
+    #[inline]
+    pub(crate) fn debug_last_unclassified(&self) -> Option<String> {
+        #[cfg(debug_assertions)]
+        {
+            self.last_unclassified.clone()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
+        }
+    }
+
+    /// DEBUG-ONLY: this stream's deduplicated vocabulary of unclassified
+    /// mnemonics, for the acc-epoch assertion's "extend the analyzer tables"
+    /// instruction. Empty in release builds (the assert is compiled out too).
+    #[inline]
+    pub(crate) fn debug_unclassified_mnemonics(&self) -> &[String] {
+        #[cfg(debug_assertions)]
+        {
+            &self.unclassified_mnemonics
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            &[]
+        }
+    }
+
+    /// Emit a line of assembly.
+    #[inline]
+    pub fn emit(&mut self, s: &str) {
+        self.buf.push_str(s);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit formatted assembly directly into the buffer (no temporary String).
+    #[inline]
+    pub fn emit_fmt(&mut self, args: std::fmt::Arguments<'_>) {
+        std::fmt::Write::write_fmt(&mut self.buf, args).unwrap();
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    // ── Fast-path emitters ──────────────────────────────────────────────
+    //
+    // These avoid the overhead of `format_args!` + `core::fmt::write` for
+    // the most common codegen patterns. Each one directly pushes bytes into
+    // the buffer using `push_str` and our fast integer writer.
+
+    /// Emit: `    {mnemonic} ${imm}, %{reg}`
+    /// Used for movq/movl/movabsq with immediate to register.
+    #[inline]
+    pub fn emit_instr_imm_reg(&mut self, mnemonic: &str, imm: i64, reg: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" $");
+        write_i64_fast(&mut self.buf, imm);
+        self.buf.push_str(", %");
+        self.buf.push_str(reg);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} %{src}, %{dst}`
+    /// Used for movq/movl/xorq register-to-register.
+    #[inline]
+    pub fn emit_instr_reg_reg(&mut self, mnemonic: &str, src: &str, dst: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" %");
+        self.buf.push_str(src);
+        self.buf.push_str(", %");
+        self.buf.push_str(dst);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} {offset}(%rbp), %{reg}`
+    /// Used for loads from stack slots.
+    #[inline]
+    pub fn emit_instr_rbp_reg(&mut self, mnemonic: &str, offset: i64, reg: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push(' ');
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp), %");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp), %");
+        }
+        self.buf.push_str(reg);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit a stack-slot reference after a `pushq` scratch-save has lowered RSP.
+    ///
+    /// The inline-asm output store-back uses a `pushq`/`popq` pair to protect a
+    /// scratch register while loading the destination pointer from a stack slot.
+    /// With RSP-relative addressing (frame pointer omitted, `use_rsp_addressing`),
+    /// the push lowers RSP by 8, so the slot offset must be bumped by 8 or the
+    /// load reads the slot 8 bytes early (corrupting outputs and, for the last
+    /// store in a sequence, dereferencing a garbage pointer). RBP-relative
+    /// addressing is unaffected by the push.
+    #[inline]
+    pub fn emit_instr_rbp_reg_after_push(&mut self, mnemonic: &str, offset: i64, reg: &str) {
+        if self.use_rsp_addressing {
+            self.emit_instr_rbp_reg(mnemonic, offset + 8, reg);
+        } else {
+            self.emit_instr_rbp_reg(mnemonic, offset, reg);
+        }
+    }
+
+    /// Emit: `    cmpl $0, {offset}(%rbp)` (or rsp-relative when the frame
+    /// pointer is omitted). Tests a 4-byte stack slot against zero without
+    /// touching any register — used to test boolean conditions in place
+    /// (bools are stored as zero-extended I32, so `cmpl` reads exactly the
+    /// slot and leaves the upper bytes of the containing register untouched).
+    #[inline]
+    pub fn emit_cmp_zero_mem(&mut self, offset: i64) {
+        self.emit_cmp_zero_mem_sized(offset, "cmpl");
+    }
+
+    /// Sized variant of [`Self::emit_cmp_zero_mem`]: `    {mnem} $0, {offset}(%rbp)`
+    /// (or rsp-relative when the frame pointer is omitted). The caller picks
+    /// the compare width from the value's recorded IR type. The width rule is
+    /// directional: a compare may read FEWER bytes than the slot's storing
+    /// operations defined (the low bytes of any stored value are always
+    /// defined — `cmpb` on a zero-extended I32 store reads a defined byte),
+    /// but reading MORE than the store defined reads stale frame bytes. An
+    /// 8-byte slot holding an I64 whose low 4 bytes are zero is nonzero, yet
+    /// the historical unconditional `cmpl` reported zero — the same
+    /// under-wide-test disease PR #368 fixed for register-direct conditions,
+    /// in its stack-slot sibling.
+    #[inline]
+    pub fn emit_cmp_zero_mem_sized(&mut self, offset: i64, mnem: &str) {
+        self.buf.push_str("    ");
+        self.buf.push_str(mnem);
+        self.buf.push_str(" $0, ");
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp)\n");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp)\n");
+        }
+        // This method is the sink that falsified the "every public emit
+        // method ends in debug_scan_tail()" banner (PR #637 audit, F2): a
+        // completed line without a scan is a line the epoch validator is
+        // blind to — and `debug_assert_fully_scanned` now fails the module
+        // handoff if any such sink exists. Today the line is a `cmp` (flags
+        // only, no %rax write); the scan is what keeps that true
+        // mechanically if the method ever grows a %rax-writing form.
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} %{reg}, {offset}(%rbp)` (or rsp-relative when frame pointer omitted)
+    /// Used for stores to stack slots.
+    #[inline]
+    pub fn emit_instr_reg_rbp(&mut self, mnemonic: &str, reg: &str, offset: i64) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" %");
+        self.buf.push_str(reg);
+        self.buf.push_str(", ");
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp)");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp)");
+        }
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit a block label line: `.LBB{id}:`
+    #[inline]
+    pub fn emit_block_label(&mut self, block_id: u32) {
+        self.buf.push_str(".LBB");
+        write_u64_fast(&mut self.buf, block_id as u64);
+        self.buf.push(':');
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    jmp .LBB{block_id}`
+    #[inline]
+    pub fn emit_jmp_block(&mut self, block_id: u32) {
+        self.buf.push_str("    jmp .LBB");
+        write_u64_fast(&mut self.buf, block_id as u64);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {jcc} .LBB{block_id}` (conditional jump to block label)
+    #[inline]
+    pub fn emit_jcc_block(&mut self, jcc: &str, block_id: u32) {
+        // Callers pass the bare condition mnemonic (`jne`, `Self::invert_jcc`
+        // results), unlike the pre-indented `mnemonic` arguments of the
+        // other helpers here.
+        self.buf.push_str("    ");
+        self.buf.push_str(jcc);
+        self.buf.push_str(" .LBB");
+        write_u64_fast(&mut self.buf, block_id as u64);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} {reg}`  (single-register instruction like push/pop)
+    #[inline]
+    pub fn emit_instr_reg(&mut self, mnemonic: &str, reg: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" %");
+        self.buf.push_str(reg);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} ${imm}`  (single-immediate instruction like push)
+    #[inline]
+    pub fn emit_instr_imm(&mut self, mnemonic: &str, imm: i64) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" $");
+        write_i64_fast(&mut self.buf, imm);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Write an i64 into the buffer without newline. Useful for building
+    /// custom format patterns that include integers.
+    #[inline]
+    pub fn write_i64(&mut self, val: i64) {
+        write_i64_fast(&mut self.buf, val);
+    }
+
+    /// Write a u64 into the buffer without newline.
+    #[inline]
+    pub fn write_u64(&mut self, val: u64) {
+        write_u64_fast(&mut self.buf, val);
+    }
+
+    /// Emit: `    {mnemonic} {offset}(%rbp)` (single rbp-offset operand, e.g. fldt/fstpt)
+    #[inline]
+    pub fn emit_instr_rbp(&mut self, mnemonic: &str, offset: i64) {
+        self.buf.push_str(mnemonic);
+        self.buf.push(' ');
+        if self.use_rsp_addressing {
+            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
+            self.buf.push_str("(%rsp)");
+        } else {
+            write_i64_fast(&mut self.buf, offset);
+            self.buf.push_str("(%rbp)");
+        }
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Allocate the next label id.  Every label in the emitted text is named
+    /// from this counter, so two labels can never collide even when two
+    /// different emitter paths build a sequence for the same function.
+    pub fn next_label_id(&mut self) -> u32 {
+        let id = self.label_counter;
+        self.label_counter += 1;
+        id
+    }
+
+    /// Allocate a fresh named label: `.L{prefix}_{id}`.
+    pub fn fresh_label(&mut self, prefix: &str) -> String {
+        format!(".L{}_{}", prefix, self.next_label_id())
+    }
+
+    /// Emit a named label definition: `{label}:`
+    #[inline]
+    pub fn emit_named_label(&mut self, label: &str) {
+        self.buf.push_str(label);
+        self.buf.push(':');
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    jmp {label}` (jump to named label)
+    #[inline]
+    pub fn emit_jmp_label(&mut self, label: &str) {
+        self.buf.push_str("    jmp ");
+        self.buf.push_str(label);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {jcc} {label}` (conditional jump to named label)
+    #[inline]
+    pub fn emit_jcc_label(&mut self, jcc: &str, label: &str) {
+        self.buf.push_str(jcc);
+        self.buf.push(' ');
+        self.buf.push_str(label);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    call {target}` (direct call to named function/label)
+    #[inline]
+    pub fn emit_call(&mut self, target: &str) {
+        self.buf.push_str("    call ");
+        self.buf.push_str(target);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} {offset}(%{base}), %{reg}` (memory to register with arbitrary base)
+    #[inline]
+    pub fn emit_instr_mem_reg(&mut self, mnemonic: &str, offset: i64, base: &str, reg: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push(' ');
+        if offset != 0 {
+            write_i64_fast(&mut self.buf, offset);
+        }
+        self.buf.push_str("(%");
+        self.buf.push_str(base);
+        self.buf.push_str("), %");
+        self.buf.push_str(reg);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} %{reg}, {offset}(%{base})` (register to memory with arbitrary base)
+    #[inline]
+    pub fn emit_instr_reg_mem(&mut self, mnemonic: &str, reg: &str, offset: i64, base: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" %");
+        self.buf.push_str(reg);
+        self.buf.push_str(", ");
+        if offset != 0 {
+            write_i64_fast(&mut self.buf, offset);
+        }
+        self.buf.push_str("(%");
+        self.buf.push_str(base);
+        self.buf.push(')');
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} ${imm}, {offset}(%{base})` (immediate to memory with arbitrary base)
+    #[inline]
+    pub fn emit_instr_imm_mem(&mut self, mnemonic: &str, imm: i64, offset: i64, base: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" $");
+        write_i64_fast(&mut self.buf, imm);
+        self.buf.push_str(", ");
+        if offset != 0 {
+            write_i64_fast(&mut self.buf, offset);
+        }
+        self.buf.push_str("(%");
+        self.buf.push_str(base);
+        self.buf.push(')');
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} {symbol}(%{base}), %{reg}` (symbol-relative addressing)
+    /// Used for RIP-relative loads like `leaq table_label(%rip), %rcx`.
+    #[inline]
+    pub fn emit_instr_sym_base_reg(&mut self, mnemonic: &str, symbol: &str, base: &str, reg: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push(' ');
+        self.buf.push_str(symbol);
+        self.buf.push_str("(%");
+        self.buf.push_str(base);
+        self.buf.push_str("), %");
+        self.buf.push_str(reg);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Emit: `    {mnemonic} ${symbol}, %{reg}` (symbol as immediate)
+    /// Used for absolute symbol addressing like `movq $name, %rax`.
+    #[inline]
+    pub fn emit_instr_sym_imm_reg(&mut self, mnemonic: &str, symbol: &str, reg: &str) {
+        self.buf.push_str(mnemonic);
+        self.buf.push_str(" $");
+        self.buf.push_str(symbol);
+        self.buf.push_str(", %");
+        self.buf.push_str(reg);
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+
+    /// Push a string slice without newline.
+    #[inline]
+    pub fn write_str(&mut self, s: &str) {
+        self.buf.push_str(s);
+    }
+
+    /// Push a newline to end the current line.
+    #[inline]
+    pub fn newline(&mut self) {
+        self.buf.push('\n');
+        self.debug_scan_tail();
+    }
+}
+
+/// Emit formatted assembly directly into the output buffer, avoiding temporary
+/// String allocations from `format!()`. Usage: `emit!(state, "    mov {}, {}", src, dst)`
+#[macro_export]
+macro_rules! emit {
+    ($state:expr_2021, $($arg:tt)*) => {
+        $state.emit_fmt(format_args!($($arg)*))
+    };
+}
+
+/// The only arch-specific difference in data emission: the name of the 64-bit pointer directive.
+/// x86 uses `.quad`, AArch64 uses `.xword`, RISC-V uses `.dword`.
+#[derive(Clone, Copy)]
+pub enum PtrDirective {
+    Quad,  // x86-64
+    Long,  // i686 (32-bit)
+    Xword, // AArch64
+    Dword, // RISC-V 64
+}
+
+impl PtrDirective {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PtrDirective::Quad => ".quad",
+            PtrDirective::Long => ".long",
+            PtrDirective::Xword => ".xword",
+            PtrDirective::Dword => ".dword",
+        }
+    }
+
+    /// Returns true if this is an x86 target directive (x86-64 or i686).
+    /// Used to select x87 80-bit extended precision format for long double constants.
+    pub fn is_x86(self) -> bool {
+        matches!(self, PtrDirective::Quad | PtrDirective::Long)
+    }
+
+    /// Returns true if this is a 32-bit pointer directive.
+    pub fn is_32bit(self) -> bool {
+        matches!(self, PtrDirective::Long)
+    }
+
+    /// Returns true if this is the RISC-V target directive.
+    /// RISC-V stores full IEEE binary128 long doubles in memory (allocas and globals).
+    pub fn is_riscv(self) -> bool {
+        matches!(self, PtrDirective::Dword)
+    }
+
+    /// Returns true if this is the AArch64 target directive.
+    /// AArch64 stores full IEEE binary128 long doubles in memory (allocas and globals).
+    pub fn is_arm(self) -> bool {
+        matches!(self, PtrDirective::Xword)
+    }
+
+    /// Convert a byte alignment value to the correct `.align` argument for this target.
+    /// On x86-64, `.align N` means N bytes. On ARM and RISC-V, `.align N` means 2^N bytes,
+    /// so we must emit log2(N) instead.
+    pub fn align_arg(self, bytes: usize) -> usize {
+        debug_assert!(
+            bytes == 0 || bytes.is_power_of_two(),
+            "alignment must be power of 2"
+        );
+        match self {
+            PtrDirective::Quad | PtrDirective::Long => bytes,
+            PtrDirective::Xword | PtrDirective::Dword => {
+                if bytes <= 1 {
+                    0
+                } else {
+                    bytes.trailing_zeros() as usize
+                }
+            }
+        }
+    }
+}
+
+/// Emit all data sections (rodata for string literals, .data and .bss for globals).
+///
+/// In PIC/PIE code, const-qualified globals that contain address relocations
+/// are emitted to `.data.rel.ro` instead of `.rodata`.  The dynamic linker must
+/// write those relocations at load time; keeping them in `.rodata` makes GNU ld
+/// create DT_TEXTREL and can fail hardened builds.  `.data.rel.ro` is writable
+/// during relocation and becomes read-only under RELRO.
+pub fn emit_data_sections(
+    out: &mut AsmOutput,
+    module: &IrModule,
+    ptr_dir: PtrDirective,
+    pic_mode: bool,
+    optimize_size: bool,
+) {
+    // String literals in .rodata
+    if !module.string_literals.is_empty()
+        || !module.wide_string_literals.is_empty()
+        || !module.char16_string_literals.is_empty()
+    {
+        out.emit(".section .rodata");
+        for (label, value) in &module.string_literals {
+            out.emit_fmt(format_args!("{}:", label));
+            emit_string_bytes(out, value);
+        }
+        // Wide string literals (L"..."): each char is a 4-byte wchar_t value
+        for (label, chars) in &module.wide_string_literals {
+            out.emit_fmt(format_args!(".align {}", ptr_dir.align_arg(4)));
+            out.emit_fmt(format_args!("{}:", label));
+            for &ch in chars {
+                out.emit_fmt(format_args!("  .long {}", ch));
+            }
+        }
+        // char16_t string literals (u"..."): each char is a 2-byte char16_t value
+        for (label, chars) in &module.char16_string_literals {
+            out.emit_fmt(format_args!(".align {}", ptr_dir.align_arg(2)));
+            out.emit_fmt(format_args!("{}:", label));
+            for &ch in chars {
+                out.emit_fmt(format_args!("  .short {}", ch));
+            }
+        }
+        out.emit("");
+    }
+
+    // Global variables
+    let alignment = DataAlignment::new(module, ptr_dir, optimize_size);
+    emit_globals(out, &module.globals, ptr_dir, pic_mode, &alignment);
+}
+
+/// Emit a zero-initialized global variable (used in .bss, .tbss, and custom section zero-init).
+fn emit_zero_global(
+    out: &mut AsmOutput,
+    g: &IrGlobal,
+    obj_type: &str,
+    ptr_dir: PtrDirective,
+    alignment: &DataAlignment,
+) {
+    emit_symbol_directives(out, g);
+    out.emit_fmt(format_args!(
+        ".align {}",
+        ptr_dir.align_arg(alignment.effective(g))
+    ));
+    out.emit_fmt(format_args!(".type {}, {}", g.name, obj_type));
+    out.emit_fmt(format_args!(".size {}, {}", g.name, g.size));
+    out.emit_fmt(format_args!("{}:", g.name));
+    out.emit_fmt(format_args!("    .zero {}", g.size));
+}
+
+/// Target section classification for a global variable.
+///
+/// Each global is classified exactly once into one of these categories,
+/// which determines which assembly section it belongs to.
+#[derive(PartialEq, Eq)]
+enum GlobalSection {
+    /// Extern (undefined) symbol -- only needs visibility directive, no storage.
+    Extern,
+    /// Has `__attribute__((section(...)))` -- emitted in its custom section.
+    Custom,
+    /// Const-qualified, non-TLS, initialized, non-zero-size -> `.rodata`.
+    Rodata,
+    /// Const-qualified initialized globals that contain address relocations in
+    /// PIC/PIE mode -> `.data.rel.ro` (relocated then read-only under RELRO).
+    DataRelRo,
+    /// Thread-local, initialized, non-zero-size -> `.tdata`.
+    Tdata,
+    /// Non-const, non-TLS, initialized, non-zero-size -> `.data`.
+    Data,
+    /// Zero-initialized, `is_common` flag set -> `.comm` directive.
+    Common,
+    /// Thread-local, zero-initialized (or zero-size) -> `.tbss`.
+    Tbss,
+    /// Non-TLS, zero-initialized (or zero-size with init) -> `.bss`.
+    Bss,
+}
+
+/// Return true if an initializer contains an address that becomes an ELF
+/// relocation in the object file.  In PIC/PIE shared links, such relocations
+/// must not live in `.rodata` because the dynamic loader has to write them.
+fn global_init_needs_dynamic_reloc(init: &GlobalInit) -> bool {
+    match init {
+        GlobalInit::GlobalAddr(_) | GlobalInit::GlobalAddrOffset(_, _) => true,
+        GlobalInit::Compound(items) => items.iter().any(global_init_needs_dynamic_reloc),
+        // Label differences are assembled as link-time constants for computed
+        // goto/jump-table style data and do not require runtime dynamic writes.
+        GlobalInit::GlobalLabelDiff(_, _, _) => false,
+        _ => false,
+    }
+}
+
+/// Classify a global variable into the section it should be emitted to.
+///
+/// The classification priority matches GCC behavior:
+/// 1. Extern symbols get no storage (just visibility directives).
+/// 2. Custom section overrides all other placement.
+/// 3. TLS globals go to .tdata (initialized) or .tbss (zero-init).
+/// 4. Const globals with address relocations go to .data.rel.ro in PIC/PIE.
+/// 5. Other const globals go to .rodata.
+/// 6. Non-zero initialized non-const globals go to .data.
+/// 7. Zero-initialized common globals go to .comm.
+/// 8. Zero-initialized non-common globals go to .bss.
+fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
+    classify_global_impl(g, pic_mode, true)
+}
+
+/// `classify_global` without the `retain` override: the section a retained
+/// object would otherwise land in, which is the base of its per-object section
+/// name. Taking a flag instead of cloning the global keeps this allocation-free
+/// on a hot path (every global of every module).
+fn classify_global_impl(g: &IrGlobal, pic_mode: bool, honour_retain: bool) -> GlobalSection {
+    if g.is_extern {
+        return GlobalSection::Extern;
+    }
+    // `retain` also forces the Custom path: GCC gives a retained object its own
+    // section (`<default>.<name>`) so that SHF_GNU_RETAIN protects exactly that
+    // object from `--gc-sections`.
+    if g.section.is_some() || (honour_retain && g.is_retain) {
+        return GlobalSection::Custom;
+    }
+    let is_zero = matches!(g.init, GlobalInit::Zero);
+    let has_nonzero_init = !is_zero && g.size > 0;
+    if g.is_thread_local {
+        return if has_nonzero_init {
+            GlobalSection::Tdata
+        } else {
+            GlobalSection::Tbss
+        };
+    }
+    if has_nonzero_init {
+        return if g.is_const {
+            if pic_mode && global_init_needs_dynamic_reloc(&g.init) {
+                GlobalSection::DataRelRo
+            } else {
+                GlobalSection::Rodata
+            }
+        } else {
+            GlobalSection::Data
+        };
+    }
+    // Zero-initialized (or zero-size with init)
+    if g.is_common && is_zero {
+        return GlobalSection::Common;
+    }
+    GlobalSection::Bss
+}
+
+/// The section a `retain`-ed object gets when it has no explicit `section`
+/// attribute: its default section with `.<name>` appended, which is what GCC
+/// 16.2 emits (measured: `.data.keep`, `.bss.keep_bss`, both with SHF_GNU_RETAIN).
+fn retained_section_name(g: &IrGlobal, pic_mode: bool) -> String {
+    let base = match classify_global_impl(g, pic_mode, false) {
+        GlobalSection::Rodata => ".rodata",
+        GlobalSection::DataRelRo => ".data.rel.ro",
+        GlobalSection::Tdata => ".tdata",
+        GlobalSection::Tbss => ".tbss",
+        GlobalSection::Common | GlobalSection::Bss => ".bss",
+        GlobalSection::Custom | GlobalSection::Extern => ".data",
+        GlobalSection::Data => ".data",
+    };
+    format!("{base}.{}", g.name)
+}
+
+/// Emit global variable definitions, grouped by target section.
+///
+/// Classifies each global once via `classify_global`, then emits all globals
+/// for each section in a fixed order: extern visibility, custom sections,
+/// .rodata, .tdata, .data, .comm, .tbss, .bss.
+fn emit_globals(
+    out: &mut AsmOutput,
+    globals: &[IrGlobal],
+    ptr_dir: PtrDirective,
+    pic_mode: bool,
+    alignment: &DataAlignment,
+) {
+    // Phase 1: classify every global into its target section.
+    let classified: Vec<GlobalSection> = globals
+        .iter()
+        .map(|g| classify_global(g, pic_mode))
+        .collect();
+
+    // Phase 2: emit each section group in order.
+
+    // Extern visibility directives (needed for PIC code so the assembler/linker knows
+    // these symbols are resolved within the link unit).
+    for (g, sect) in globals.iter().zip(&classified) {
+        if matches!(sect, GlobalSection::Extern) {
+            emit_visibility_directive(out, &g.name, &g.visibility);
+            // For extern TLS variables, emit .type @tls_object so the assembler
+            // creates a TLS-typed undefined symbol. Without this, the linker
+            // reports "TLS definition mismatches non-TLS reference" when the
+            // defining TU has the symbol in .tdata but this TU's reference
+            // lacks TLS type information (defaults to STT_NOTYPE).
+            if g.is_thread_local {
+                out.emit_fmt(format_args!(".type {}, @tls_object", g.name));
+            }
+        }
+    }
+
+    // Custom section globals: each gets its own .section directive since they
+    // may target different sections.
+    for (g, sect) in globals.iter().zip(&classified) {
+        if !matches!(sect, GlobalSection::Custom) {
+            continue;
+        }
+        let section_name = g
+            .section
+            .clone()
+            .unwrap_or_else(|| retained_section_name(g, pic_mode));
+        let section_name = &section_name;
+        // TLS templates must be writable, even for C `const` objects: the
+        // loader constructs a writable per-thread image. PIC constants with
+        // address relocations likewise need writable storage until relocated
+        // (normally .data.rel.ro), including in explicit custom sections.
+        let needs_write = g.is_thread_local
+            || (pic_mode && global_init_needs_dynamic_reloc(&g.init))
+            || !(g.is_const || section_name.contains("rodata"));
+        let mut flags = if needs_write { "aw" } else { "a" }.to_string();
+        if g.is_thread_local {
+            flags.push('T');
+        }
+        // SHF_GNU_RETAIN: `.section NAME,"awR",@progbits`. GNU as maps the "R"
+        // flag to SHF_GNU_RETAIN, which the linker honours under --gc-sections.
+        if g.is_retain {
+            flags.push('R');
+        }
+        // GCC parity (verified against GCC 16.2 / GAS 2.47): a C `section`
+        // attribute on a zero-initialized global still materializes PROGBITS
+        // zero bytes — GCC never emits @nobits for a section attribute. Both
+        // `static int done __section(".init.data");` and initialized members
+        // like `initcall_levels[]` therefore coexist in ONE PROGBITS
+        // `.init.data`. The kernel depends on this for `.init.data`,
+        // `.data..percpu` and `.data..read_mostly` (all mix zero-initialized
+        // and initialized members within a TU). The old shortcut that marked
+        // every zero-initialized writable custom section @nobits collided
+        // with a later PROGBITS member of the SAME section
+        // ("changed section type for .init.data", kernel boot build).
+        //
+        // NOBITS stays correct only for .bss-named sections: GNU as assigns
+        // them SHT_NOBITS by name regardless of the directive, and `.zero`
+        // inside a NOBITS section legitimately grows the size without file
+        // content (kernel `.bss..page_aligned` style layouts).
+        // Well-known section names (.data, .text, .rodata, ...) are handled
+        // by the writer's fixed-type table anyway: GNU as assigns them a
+        // fixed type, and the kernel's `static int lines __section(".data")`
+        // pattern shares .data with relocatable pointer data — a NOBITS
+        // .data silently drops that content (compressed misc.c boot hang).
+        // `.noinit` and `.tbss` sections are also NOBITS. In particular a
+        // retained zero TLS object lives in `.tbss.<name>`; making it PROGBITS
+        // changes the TLS image and may place initialized data after BSS.
+        let section_type = if section_name.starts_with(".bss")
+            || section_name.starts_with(".tbss")
+            || section_name == ".noinit"
+        {
+            "@nobits"
+        } else {
+            "@progbits"
+        };
+        out.emit_fmt(format_args!(
+            ".section {},\"{}\",{}",
+            section_name, flags, section_type
+        ));
+        if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
+            let obj_type = if g.is_thread_local {
+                "@tls_object"
+            } else {
+                "@object"
+            };
+            emit_zero_global(out, g, obj_type, ptr_dir, alignment);
+        } else {
+            emit_global_def(out, g, ptr_dir, alignment);
+        }
+        out.emit("");
+    }
+
+    // .rodata: const-qualified initialized globals with no runtime relocations.
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Rodata,
+        ".section .rodata",
+        false,
+        ptr_dir,
+        alignment,
+    );
+
+    // .data.rel.ro: const-qualified globals that need runtime relocation in
+    // PIC/PIE mode.  GNU ld places this in RELRO, eliminating DT_TEXTREL.
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::DataRelRo,
+        ".section .data.rel.ro,\"aw\",@progbits",
+        false,
+        ptr_dir,
+        alignment,
+    );
+
+    // .tdata: thread-local initialized globals
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Tdata,
+        ".section .tdata,\"awT\",@progbits",
+        false,
+        ptr_dir,
+        alignment,
+    );
+
+    // .data: non-const initialized globals
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Data,
+        ".section .data",
+        false,
+        ptr_dir,
+        alignment,
+    );
+
+    // .comm: zero-initialized common globals (weak linkage, linker merges duplicates).
+    // .comm alignment is always in bytes on all platforms, unlike .align.
+    for (g, sect) in globals.iter().zip(&classified) {
+        if matches!(sect, GlobalSection::Common) {
+            out.emit_fmt(format_args!(
+                ".comm {},{},{}",
+                g.name,
+                g.size,
+                alignment.effective(g)
+            ));
+        }
+    }
+
+    // .tbss: thread-local zero-initialized globals
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Tbss,
+        ".section .tbss,\"awT\",@nobits",
+        true,
+        ptr_dir,
+        alignment,
+    );
+
+    // .bss: non-TLS zero-initialized globals (includes zero-size globals with
+    // empty initializers like `Type arr[0] = {}` to avoid address overlap).
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Bss,
+        ".section .bss",
+        true,
+        ptr_dir,
+        alignment,
+    );
+}
+
+/// Emit all globals matching `target` section, with a section header on first match.
+/// If `is_zero` is true, emits as zero-initialized; otherwise as initialized data.
+fn emit_section_group(
+    out: &mut AsmOutput,
+    globals: &[IrGlobal],
+    classified: &[GlobalSection],
+    target: &GlobalSection,
+    section_header: &str,
+    is_zero: bool,
+    ptr_dir: PtrDirective,
+    alignment: &DataAlignment,
+) {
+    let mut emitted_header = false;
+    for (g, sect) in globals.iter().zip(classified) {
+        if sect != target {
+            continue;
+        }
+        if !emitted_header {
+            out.emit(section_header);
+            emitted_header = true;
+        }
+        if is_zero {
+            let obj_type = if g.is_thread_local {
+                "@tls_object"
+            } else {
+                "@object"
+            };
+            emit_zero_global(out, g, obj_type, ptr_dir, alignment);
+        } else {
+            emit_global_def(out, g, ptr_dir, alignment);
+        }
+    }
+    if emitted_header {
+        out.emit("");
+    }
+}
+
+/// Emit a visibility directive (.hidden, .protected, .internal) for a symbol if applicable.
+fn emit_visibility_directive(out: &mut AsmOutput, name: &str, visibility: &Option<String>) {
+    if let Some(vis) = visibility {
+        match vis.as_str() {
+            "hidden" => out.emit_fmt(format_args!(".hidden {}", name)),
+            "protected" => out.emit_fmt(format_args!(".protected {}", name)),
+            "internal" => out.emit_fmt(format_args!(".internal {}", name)),
+            _ => {} // "default" or unknown: no directive needed
+        }
+    }
+}
+
+/// Emit linkage directives (.globl or .weak) for a non-static symbol.
+fn emit_linkage_directive(out: &mut AsmOutput, name: &str, is_static: bool, is_weak: bool) {
+    if !is_static {
+        if is_weak {
+            out.emit_fmt(format_args!(".weak {}", name));
+        } else {
+            out.emit_fmt(format_args!(".globl {}", name));
+        }
+    }
+}
+
+/// Emit both linkage (.globl/.weak) and visibility (.hidden/.protected/.internal) directives.
+fn emit_symbol_directives(out: &mut AsmOutput, g: &IrGlobal) {
+    emit_linkage_directive(out, &g.name, g.is_static, g.is_weak);
+    emit_visibility_directive(out, &g.name, &g.visibility);
+}
+
+/// Emit a single global variable definition.
+fn emit_global_def(
+    out: &mut AsmOutput,
+    g: &IrGlobal,
+    ptr_dir: PtrDirective,
+    alignment: &DataAlignment,
+) {
+    emit_symbol_directives(out, g);
+    out.emit_fmt(format_args!(
+        ".align {}",
+        ptr_dir.align_arg(alignment.effective(g))
+    ));
+    let obj_type = if g.is_thread_local {
+        "@tls_object"
+    } else {
+        "@object"
+    };
+    out.emit_fmt(format_args!(".type {}, {}", g.name, obj_type));
+    out.emit_fmt(format_args!(".size {}, {}", g.name, g.size));
+    out.emit_fmt(format_args!("{}:", g.name));
+
+    emit_init_data(out, &g.init, g.ty, g.size, ptr_dir);
+}
+
+/// Emit the data for a single GlobalInit element.
+///
+/// Handles all init variants: scalars, arrays, strings, global addresses, label diffs,
+/// and compound initializers (which recurse into this function for each element).
+/// `fallback_ty` is the declared element type of the enclosing global/array, used to
+/// widen narrow constants (e.g., IrConst::I32(0) in a pointer array emits .quad 0).
+/// `total_size` is the declared size of the enclosing global for padding calculations.
+fn emit_init_data(
+    out: &mut AsmOutput,
+    init: &GlobalInit,
+    fallback_ty: IrType,
+    total_size: usize,
+    ptr_dir: PtrDirective,
+) {
+    match init {
+        GlobalInit::Zero => {
+            out.emit_fmt(format_args!("    .zero {}", total_size));
+        }
+        GlobalInit::Scalar(c) => {
+            emit_const_data(out, c, fallback_ty, ptr_dir);
+        }
+        GlobalInit::Array(values) => {
+            // Coalesce consecutive zero-valued elements into .zero directives
+            // to avoid emitting millions of individual `.byte 0` lines for
+            // large partially-initialized arrays like `char x[500000]={'a'}`.
+            let mut i = 0;
+            while i < values.len() {
+                let val = &values[i];
+                let const_ty = const_natural_type(val, fallback_ty);
+                // Only widen integer constants to fallback_ty (e.g., I32(0) in a pointer
+                // array should emit .quad 0). Float constants (F32, F64, LongDouble) must
+                // keep their natural size -- complex arrays store F32 pairs where each zero
+                // imaginary slot is exactly 4 bytes, not pointer-sized.
+                let elem_ty = if fallback_ty.size() > const_ty.size() && const_ty.is_integer() {
+                    fallback_ty
+                } else {
+                    const_ty
+                };
+
+                // `is_all_zero_bits`, NOT `is_zero`: the latter is C
+                // truthiness, under which `-0.0` is zero. Collapsing a
+                // `-0.0f` element into `.zero 4` drops its sign bit (a real
+                // miscompile: `static const float t[] = {-0.0f}` read back
+                // as `+0.0f`, so `1/t[0]` gave `+inf` and `signbit` said 0).
+                if val.is_all_zero_bits() {
+                    // Count consecutive zero elements and emit as a single .zero
+                    let elem_size = elem_ty.size();
+                    let mut zero_count = 1usize;
+                    while i + zero_count < values.len() && values[i + zero_count].is_all_zero_bits()
+                    {
+                        zero_count += 1;
+                    }
+                    let zero_bytes = zero_count * elem_size;
+                    if zero_bytes > 0 {
+                        out.emit_fmt(format_args!("    .zero {}", zero_bytes));
+                    }
+                    i += zero_count;
+                } else {
+                    emit_const_data(out, val, elem_ty, ptr_dir);
+                    i += 1;
+                }
+            }
+        }
+        GlobalInit::String(s) => {
+            let string_chars = s.chars().count();
+            let string_bytes_with_nul = string_chars + 1;
+            if string_bytes_with_nul <= total_size {
+                // NUL terminator fits: use .asciz (emits string + NUL)
+                out.emit_fmt(format_args!("    .asciz \"{}\"", escape_string(s)));
+                if total_size > string_bytes_with_nul {
+                    out.emit_fmt(format_args!(
+                        "    .zero {}",
+                        total_size - string_bytes_with_nul
+                    ));
+                }
+            } else {
+                // NUL terminator doesn't fit (C11 6.7.9 p14): truncate to array size.
+                // Use .ascii (no implicit NUL) with the string truncated to total_size chars.
+                let truncated: String = s.chars().take(total_size).collect();
+                out.emit_fmt(format_args!("    .ascii \"{}\"", escape_string(&truncated)));
+            }
+        }
+        GlobalInit::WideString(chars) => {
+            emit_wide_string(out, chars);
+            let wide_bytes = (chars.len() + 1) * 4;
+            if total_size > wide_bytes {
+                out.emit_fmt(format_args!("    .zero {}", total_size - wide_bytes));
+            }
+        }
+        GlobalInit::Char16String(chars) => {
+            emit_char16_string(out, chars);
+            let char16_bytes = (chars.len() + 1) * 2;
+            if total_size > char16_bytes {
+                out.emit_fmt(format_args!("    .zero {}", total_size - char16_bytes));
+            }
+        }
+        GlobalInit::GlobalAddr(label) => {
+            out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), label));
+        }
+        GlobalInit::GlobalAddrOffset(label, offset) => {
+            if *offset >= 0 {
+                out.emit_fmt(format_args!(
+                    "    {} {}+{}",
+                    ptr_dir.as_str(),
+                    label,
+                    offset
+                ));
+            } else {
+                out.emit_fmt(format_args!("    {} {}{}", ptr_dir.as_str(), label, offset));
+            }
+        }
+        GlobalInit::GlobalLabelDiff(lab1, lab2, byte_size) => {
+            emit_label_diff(out, lab1, lab2, *byte_size);
+        }
+        GlobalInit::Compound(elements) => {
+            for elem in elements {
+                // Compound elements are self-typed: each element knows its own size.
+                // For Scalar elements, use the constant's natural type (falling back
+                // to the enclosing global's type for I64/wider constants).
+                emit_compound_element(out, elem, fallback_ty, ptr_dir);
+            }
+        }
+    }
+}
+
+/// Emit a single element within a Compound initializer.
+///
+/// Most variants delegate to the shared emit_init_data. Scalar elements use the
+/// constant's natural type rather than the enclosing global's type, since compound
+/// elements may have heterogeneous types (e.g., struct with int and pointer fields).
+fn emit_compound_element(
+    out: &mut AsmOutput,
+    elem: &GlobalInit,
+    fallback_ty: IrType,
+    ptr_dir: PtrDirective,
+) {
+    match elem {
+        GlobalInit::Scalar(c) => {
+            // In compound initializers, each element may have a different type.
+            // Use the constant's own type, falling back to fallback_ty for I64 and wider.
+            let elem_ty = const_natural_type(c, fallback_ty);
+            emit_const_data(out, c, elem_ty, ptr_dir);
+        }
+        GlobalInit::Zero => {
+            // Zero element in compound: emit a single pointer-sized zero
+            out.emit_fmt(format_args!("    {} 0", ptr_dir.as_str()));
+        }
+        GlobalInit::Compound(elements) => {
+            // Nested compound: recurse into each element
+            for inner in elements {
+                emit_compound_element(out, inner, fallback_ty, ptr_dir);
+            }
+        }
+        // All other variants (GlobalAddr, GlobalAddrOffset, WideString, etc.)
+        // delegate to the shared handler with zero total_size (no padding).
+        other => emit_init_data(out, other, fallback_ty, 0, ptr_dir),
+    }
+}
+
+/// Get the natural IR type of a constant, falling back to `default_ty` for
+/// types that don't have a narrower representation (I64, I128, etc.).
+fn const_natural_type(c: &IrConst, default_ty: IrType) -> IrType {
+    match c {
+        IrConst::I8(_) => IrType::I8,
+        IrConst::I16(_) => IrType::I16,
+        IrConst::I32(_) => IrType::I32,
+        IrConst::F32(_) => IrType::F32,
+        IrConst::F64(_) => IrType::F64,
+        IrConst::LongDouble(..) => IrType::F128,
+        _ => default_ty,
+    }
+}
+
+/// Emit a wide string (wchar_t) as .long directives with null terminator.
+fn emit_wide_string(out: &mut AsmOutput, chars: &[u32]) {
+    for &ch in chars {
+        out.emit_fmt(format_args!("    .long {}", ch));
+    }
+    out.emit("    .long 0"); // null terminator
+}
+
+/// Emit a char16_t string as .short directives with null terminator.
+fn emit_char16_string(out: &mut AsmOutput, chars: &[u16]) {
+    for &ch in chars {
+        out.emit_fmt(format_args!("    .short {}", ch));
+    }
+    out.emit("    .short 0"); // null terminator
+}
+
+/// Emit a label difference as a sized assembly directive (`.long lab1-lab2`, etc.).
+fn emit_label_diff(out: &mut AsmOutput, lab1: &str, lab2: &str, byte_size: usize) {
+    let dir = match byte_size {
+        1 => ".byte",
+        2 => ".short",
+        4 => ".long",
+        _ => ".quad",
+    };
+    out.emit_fmt(format_args!("    {} {}-{}", dir, lab1, lab2));
+}
+
+/// Emit a 64-bit value as two `.long` directives in little-endian order.
+/// Used on i686 (32-bit) targets where 64-bit values must be split.
+#[inline]
+fn emit_u64_as_long_pair(out: &mut AsmOutput, bits: u64) {
+    out.emit_fmt(format_args!("    .long {}", bits as u32));
+    out.emit_fmt(format_args!("    .long {}", (bits >> 32) as u32));
+}
+
+pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: PtrDirective) {
+    match c {
+        // Integer constants: all share the same widening/narrowing logic.
+        // The value is sign-extended to i64, then emitted at the target type's width.
+        IrConst::I8(v) => emit_int_data(out, *v as i64, ty, ptr_dir),
+        IrConst::I16(v) => emit_int_data(out, *v as i64, ty, ptr_dir),
+        IrConst::I32(v) => emit_int_data(out, *v as i64, ty, ptr_dir),
+        IrConst::I64(v) => emit_int_data(out, *v, ty, ptr_dir),
+        IrConst::F32(v) => {
+            out.emit_fmt(format_args!("    .long {}", v.to_bits()));
+        }
+        // Decimal FP constants are emitted as raw BID bit patterns at the
+        // carrier width (identical layout to the integer emission path).
+        IrConst::D32(v) => {
+            out.emit_fmt(format_args!("    .long {}", v));
+        }
+        IrConst::D64(v) => {
+            if ptr_dir.is_32bit() {
+                emit_u64_as_long_pair(out, *v);
+            } else {
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), v));
+            }
+        }
+        IrConst::F64(v) => {
+            let bits = v.to_bits();
+            if ptr_dir.is_32bit() {
+                emit_u64_as_long_pair(out, bits);
+            } else {
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), bits));
+            }
+        }
+        IrConst::LongDouble(f64_val, f128_bytes) => {
+            if ptr_dir.is_x86() {
+                // x86: convert f128 bytes to x87 80-bit extended precision for emission.
+                // x87 80-bit format = 10 bytes: 8 bytes (significand+exp low) + 2 bytes (exp high+sign)
+                let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+                let lo = u64::from_le_bytes(x87[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes([x87[8], x87[9], 0, 0, 0, 0, 0, 0]);
+                if ptr_dir.is_32bit() {
+                    emit_u64_as_long_pair(out, lo);
+                    // x87 80-bit: third .long holds the upper 2 bytes
+                    out.emit_fmt(format_args!("    .long {}", hi as u32));
+                } else {
+                    out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), lo as i64));
+                    out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), hi as i64));
+                }
+            } else if ptr_dir.is_riscv() || ptr_dir.is_arm() {
+                // RISC-V and ARM64: f128 bytes are already in IEEE 754 binary128 format.
+                let lo = u64::from_le_bytes(f128_bytes[0..8].try_into().unwrap());
+                let hi = u64::from_le_bytes(f128_bytes[8..16].try_into().unwrap());
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), lo as i64));
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), hi as i64));
+            } else {
+                // Fallback: store f64 approximation (should not normally be reached).
+                let f64_bits = f64_val.to_bits();
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), f64_bits as i64));
+                out.emit_fmt(format_args!("    {} 0", ptr_dir.as_str()));
+            }
+        }
+        IrConst::I128(v) => {
+            let lo = *v as u64;
+            let hi = (*v >> 64) as u64;
+            if ptr_dir.is_32bit() {
+                emit_u64_as_long_pair(out, lo);
+                emit_u64_as_long_pair(out, hi);
+            } else {
+                // 64-bit targets: emit as two 64-bit values (little-endian: low quad first)
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), lo as i64));
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), hi as i64));
+            }
+        }
+        IrConst::Zero => {
+            let size = ty.size();
+            out.emit_fmt(format_args!(
+                "    .zero {}",
+                if size == 0 { 4 } else { size }
+            ));
+        }
+    }
+}
+
+/// Emit an integer constant at the width specified by `ty`.
+/// Truncates or sign-extends `val` (an i64) as needed to match the target width.
+fn emit_int_data(out: &mut AsmOutput, val: i64, ty: IrType, ptr_dir: PtrDirective) {
+    match ty {
+        IrType::I8 | IrType::U8 => out.emit_fmt(format_args!("    .byte {}", val as u8)),
+        IrType::I16 | IrType::U16 => out.emit_fmt(format_args!("    .short {}", val as u16)),
+        IrType::I32 | IrType::U32 => out.emit_fmt(format_args!("    .long {}", val as u32)),
+        // Decimal carriers holding an integer constant (leniency paths that
+        // decline BID conversion): emit at the CARRIER width, never the
+        // catch-all 8 bytes (a D32 global is 4 bytes since the G3 fix).
+        IrType::D32 => out.emit_fmt(format_args!("    .long {}", val as u32)),
+        IrType::D64 => {
+            if ptr_dir.is_32bit() {
+                emit_u64_as_long_pair(out, val as u64);
+            } else {
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), val));
+            }
+        }
+        // On i686 (32-bit), pointers are 4 bytes -- emit a single .long, not two.
+        IrType::Ptr if ptr_dir.is_32bit() => {
+            out.emit_fmt(format_args!("    .long {}", val as u32));
+        }
+        _ => {
+            if ptr_dir.is_32bit() {
+                emit_u64_as_long_pair(out, val as u64);
+            } else {
+                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), val));
+            }
+        }
+    }
+}
+
+/// Emit string literal as .byte directives with null terminator.
+/// Each char in the string is treated as a raw byte value (0-255),
+/// not as a UTF-8 encoded character. This is correct for C narrow
+/// string literals where \xNN escapes produce single bytes.
+///
+/// Writes directly into the output buffer without any intermediate
+/// heap allocations (no per-byte String, no Vec, no join). Uses
+/// a pre-computed lookup table to convert bytes to decimal strings
+/// without fmt::Write overhead.
+pub fn emit_string_bytes(out: &mut AsmOutput, s: &str) {
+    // Chunk output into lines of at most 32 bytes each to avoid
+    // extremely long lines that can cause parser performance issues.
+    let mut count: usize = 0;
+    for c in s.chars() {
+        if count.is_multiple_of(32) {
+            if count > 0 {
+                out.buf.push('\n');
+            }
+            out.buf.push_str("    .byte ");
+        } else {
+            out.buf.push_str(", ");
+        }
+        push_u8_decimal(&mut out.buf, c as u8);
+        count += 1;
+    }
+    // Null terminator
+    if count % 32 == 0 {
+        if count > 0 {
+            out.buf.push('\n');
+        }
+        out.buf.push_str("    .byte 0\n");
+    } else {
+        out.buf.push_str(", 0\n");
+    }
+}
+
+/// Append a u8 value as a decimal string directly into the buffer.
+/// Avoids fmt::Write overhead by using direct digit extraction.
+#[inline]
+fn push_u8_decimal(buf: &mut String, v: u8) {
+    if v >= 100 {
+        buf.push((b'0' + v / 100) as char);
+        buf.push((b'0' + (v / 10) % 10) as char);
+        buf.push((b'0' + v % 10) as char);
+    } else if v >= 10 {
+        buf.push((b'0' + v / 10) as char);
+        buf.push((b'0' + v % 10) as char);
+    } else {
+        buf.push((b'0' + v) as char);
+    }
+}
+
+/// Escape a string for use in assembly .asciz directives.
+pub fn escape_string(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '\\' => result.push_str("\\\\"),
+            '"' => result.push_str("\\\""),
+            '\n' => result.push_str("\\n"),
+            '\t' => result.push_str("\\t"),
+            '\r' => result.push_str("\\r"),
+            '\0' => result.push_str("\\000"),
+            c if c.is_ascii_graphic() || c == ' ' => result.push(c),
+            c => {
+                // Emit the raw byte value (char as u8), not UTF-8 encoding
+                use std::fmt::Write;
+                let _ = write!(result, "\\{:03o}", c as u8);
+            }
+        }
+    }
+    result
+}
+
+// ── Value type map (single source of truth for materialisation width) ────────
+
+/// The IR type the codegen will assume when it materialises a value.
+///
+/// The x86-64 emitters pick a value's spill/reload WIDTH from this map
+/// (`X86Codegen::value_types`): a value typed `I8..U32`/`F32` is stored with
+/// `movb`/`movw`/`movl` and reloaded with the matching extension, everything
+/// else — including values ABSENT from the map, which default to `IrType::I64`
+/// — is moved with `movq`.
+///
+/// The stack layout's small-slot (4-byte) narrowing must agree with it.
+/// Sizing a slot from the defining instruction's `result_type()` alone is not
+/// enough: `Copy`/`Phi` carry no result type, so their dest's type is
+/// PROPAGATED from an incoming/source value, and that propagated type can be
+/// wider than the dest's own declared type. When that happens the value got a
+/// 4-byte slot (narrow `result_type()`) while the emitters reload it with
+/// `movq` — reading four bytes of a neighbouring slot into the upper half.
+///
+/// That mismatch is the root cause of the lccc-built preboot ZSTD decompressor
+/// reporting "ZSTD-compressed data is corrupt" at -O2: `ZSTD_decodeLiteralsBlock`
+/// stored one CFG path's value with `movl %eax, 80(%rsp)` and the join block
+/// reloaded it with `movq 80(%rsp), %rax`, so the high half was whatever the
+/// frame happened to hold (`errcode=20` at
+/// `zstd_decompress_block.c:242`, `HUF_isError(hufSuccess)`).
+///
+/// Seeded from each defining instruction's `result_type()`, then propagated
+/// to a **fixed point** along three strong-evidence edges, then completed
+/// with `ParamRef`'s declared type — the exact rule the emitters rely on:
+///
+/// * **Copy/Phi sources**: a Copy dest materialises at its source's width
+///   (and vice versa); a Phi's declared type is authoritative for its dest
+///   and every incoming edge. Constant seeds cover the unambiguous spellings
+///   (`I8`/`I16`/`I32`/`I128`/floats/decimals) but NOT `I64`, which is
+///   from_i64's zero-extended storage form for U32/U16/U8 as well as a real
+///   64-bit payload — its width must come from context evidence instead.
+/// * **Consuming contexts**: an operand value materialises at the width its
+///   consuming instruction declares (BinOp/Cmp operand at the op type,
+///   Store value at the store type, call argument at the ABI type, Cast
+///   source at the pre-cast type, pointers at `Ptr`, return value at the
+///   declared return type, ...). Without this, a real 64-bit value whose
+///   only def is a constant would lose its width when the `I64` constant
+///   seed went weak.
+/// * **Phi type**: see the Copy/Phi edge (the phi `ty` subsumes the
+///   per-edge constant seeds, which only ever produced narrower types).
+///
+/// Why a fixed point (and why the widest type wins):
+/// * Phi destinations can be fed from a value **defined later** (forward
+///   reference) or on a **back edge** whose block precedes the header in a
+///   single forward walk (loop-carried `%p = phi [%init][%p_next]` with
+///   `%p_next` defined in the body). A single pass leaves such a dest
+///   untyped, so the slot classifier would give it a 4-byte slot while a
+///   wider consumer reloads it with `movq`.
+/// * The same SSA name can be defined on several paths (phi elimination
+///   lowers phis to per-predecessor Copies that reuse one dest id). The
+///   *widest* of those definitions is the materialisation width the emitters
+///   must honour, so a narrow late definition must never overwrite a wider
+///   earlier one.
+///
+/// A value with NO evidence stays untyped; every consumer treats untyped as
+/// the conservative wide default (emitter `movq`, 8-byte slot) — the
+/// pre-change behavior for such values, so the weak `I64` seed is a pure
+/// precision gain, never a regression.
+///
+/// Types are only ever added, never removed or narrowed, so the fixpoint
+/// terminates after at most `O(#values)` sweeps; the per-sweep work is one
+/// pass over the (already-dense) instruction list.
+pub(crate) fn compute_value_type_map(
+    func: &crate::ir::reexports::IrFunction,
+) -> crate::common::fx_hash::FxHashMap<u32, IrType> {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::ir::reexports::{Instruction, IrConst, Operand, Terminator};
+
+    /// Merge `ty` into `map[dest]` keeping the WIDER of the two.
+    fn widen(map: &mut FxHashMap<u32, IrType>, dest: u32, ty: IrType) {
+        match map.get(&dest) {
+            Some(&old) if old.size() >= ty.size() => {}
+            _ => {
+                map.insert(dest, ty);
+            }
+        }
+    }
+
+    /// The semantic type of a constant operand (the def-site seed for
+    /// otherwise untyped Copy dests). `Zero` is context-typed and stays
+    /// unknown on purpose.
+    ///
+    /// `I64` is deliberately UNKNOWN: `IrConst::from_i64` stores U32/U16/U8
+    /// constants zero-extended in an `I64` payload to preserve unsigned
+    /// semantics, so an `I64` constant spelling cannot distinguish "a real
+    /// 64-bit value" from "a 32-bit value in zero-extended storage". Seeding
+    /// `I64` from the spelling is how `u32 err = 0;` in a loop got typed
+    /// 64-bit on every path: the preheader init `Copy v <- Const(I64(0))`
+    /// widened the accumulator, i686's `collect_non_gpr_values` then excluded
+    /// it from GPR allocation entirely, and the slot traffic followed. The
+    /// value's real width comes from strong context evidence instead (the
+    /// consuming instruction's declared types, propagated below); a value
+    /// with no such evidence stays untyped, which every consumer treats as
+    /// the conservative wide default.
+    fn const_type(c: &IrConst) -> Option<IrType> {
+        Some(match c {
+            IrConst::I8(_) => IrType::I8,
+            IrConst::I16(_) => IrType::I16,
+            IrConst::I32(_) => IrType::I32,
+            IrConst::I128(_) => IrType::I128,
+            IrConst::F32(_) => IrType::F32,
+            IrConst::F64(_) => IrType::F64,
+            IrConst::D32(_) => IrType::D32,
+            IrConst::D64(_) => IrType::D64,
+            IrConst::LongDouble(..) => IrType::F128,
+            IrConst::I64(_) | IrConst::Zero => return None,
+        })
+    }
+
+    let mut value_types: FxHashMap<u32, IrType> = FxHashMap::default();
+
+    // Seed: ParamRef carries the declared parameter type. Doing this up-front
+    // lets a Copy/Phi *in an earlier block* propagate a parameter type even
+    // though the ParamRef's own block may be visited later in program order.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::ParamRef { dest, ty, .. } = inst {
+                widen(&mut value_types, dest.0, *ty);
+            }
+        }
+    }
+
+    // Fixpoint: seed from defs, then propagate Copy/Phi source types until
+    // no new (or wider) type appears. Values reachable from a wide source
+    // through any path — including loop-carried phi cycles and forward
+    // references — are therefore typed wide before the classifier runs.
+    //
+    // CONSUMING contexts are strong width evidence in their own right: the
+    // emitters read a value at the width the consuming instruction declares
+    // (an operand of a 64-bit BinOp is reloaded `movq`-wide even when its
+    // def is a constant), so every declared type propagates to its operand
+    // values. This is what makes the I64 constant seed (see `const_type`)
+    // safe to leave weak: a value whose only evidence is `Const(I64)` —
+    // from_i64's zero-extended U32/U16/U8 storage — is typed narrow when
+    // its contexts say narrow, and stays wide when a real 64-bit context
+    // (64-bit binop operand, U64 store, I64 phi, 64-bit call argument,
+    // 64-bit return) proves it. A value with no evidence at all stays
+    // untyped; every consumer treats untyped as the conservative wide
+    // default (emitter `movq`, 8-byte slot), exactly the pre-change
+    // behavior.
+    let widen_to = |map: &mut FxHashMap<u32, IrType>, dest: u32, ty: IrType| -> bool {
+        let old = map.get(&dest).copied();
+        if old.is_none_or(|o| o.size() < ty.size()) {
+            map.insert(dest, ty);
+            true
+        } else {
+            false
+        }
+    };
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                // Seed every producing instruction's result type (widest wins
+                // across multi-def webs).
+                if let Some(ty) = inst.result_type() {
+                    if let Some(dest) = inst.dest() {
+                        changed |= widen_to(&mut value_types, dest.0, ty);
+                    }
+                }
+                match inst {
+                    Instruction::BinOp { lhs, rhs, ty, .. }
+                    | Instruction::Cmp { lhs, rhs, ty, .. } => {
+                        // Operands materialise at the operation's width.
+                        for op in [lhs, rhs] {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
+                            }
+                        }
+                    }
+                    Instruction::UnaryOp { src, ty, .. } => {
+                        if let Operand::Value(v) = src {
+                            changed |= widen_to(&mut value_types, v.0, *ty);
+                        }
+                    }
+                    Instruction::Load { ptr, .. } => {
+                        changed |= widen_to(&mut value_types, ptr.0, IrType::Ptr);
+                    }
+                    Instruction::AtomicLoad { ptr, .. } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                    }
+                    Instruction::Store { val, ptr, ty, .. } => {
+                        if let Operand::Value(v) = val {
+                            changed |= widen_to(&mut value_types, v.0, *ty);
+                        }
+                        changed |= widen_to(&mut value_types, ptr.0, IrType::Ptr);
+                    }
+                    Instruction::Select {
+                        cond,
+                        true_val,
+                        false_val,
+                        ty,
+                        ..
+                    } => {
+                        if let Operand::Value(v) = cond {
+                            changed |= widen_to(&mut value_types, v.0, IrType::I8);
+                        }
+                        for op in [true_val, false_val] {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
+                            }
+                        }
+                    }
+                    Instruction::Cast { src, from_ty, .. } => {
+                        // The source is read at its own (pre-cast) width.
+                        if let Operand::Value(v) = src {
+                            changed |= widen_to(&mut value_types, v.0, *from_ty);
+                        }
+                    }
+                    Instruction::Copy { dest, src } => {
+                        // A copy asserts both sides materialise at the same
+                        // width: propagate in both directions.
+                        let t = match src {
+                            Operand::Value(v) => value_types.get(&v.0).copied(),
+                            Operand::Const(c) => const_type(c),
+                        };
+                        if let Some(t) = t {
+                            changed |= widen_to(&mut value_types, dest.0, t);
+                        }
+                        if let (Operand::Value(v), Some(t)) =
+                            (src, value_types.get(&dest.0).copied())
+                        {
+                            changed |= widen_to(&mut value_types, v.0, t);
+                        }
+                    }
+                    Instruction::Phi { dest, incoming, ty } => {
+                        // The phi's declared type is authoritative for the
+                        // dest and for every incoming edge (each edge's value
+                        // is converted to it); it subsumes the per-edge
+                        // constant seeds, which only ever produced narrower
+                        // types.
+                        changed |= widen_to(&mut value_types, dest.0, *ty);
+                        for (op, _) in incoming {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
+                            }
+                        }
+                    }
+                    Instruction::GlobalAddr { dest, .. }
+                    | Instruction::LabelAddr { dest, .. }
+                    | Instruction::Alloca { dest, .. }
+                    | Instruction::DynAlloca { dest, .. }
+                    | Instruction::StackSave { dest }
+                    | Instruction::GetStaticChain { dest } => {
+                        changed |= widen_to(&mut value_types, dest.0, IrType::Ptr);
+                    }
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => {
+                        changed |= widen_to(&mut value_types, dest.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, base.0, IrType::Ptr);
+                        if let Operand::Value(v) = offset {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                    }
+                    Instruction::Call { info, .. } => {
+                        // Arguments materialise at their declared ABI width.
+                        for (idx, arg) in info.args.iter().enumerate() {
+                            if let (Operand::Value(v), Some(&ty)) = (arg, info.arg_types.get(idx)) {
+                                changed |= widen_to(&mut value_types, v.0, ty);
+                            }
+                        }
+                    }
+                    Instruction::CallIndirect { func_ptr, info, .. } => {
+                        if let Operand::Value(v) = func_ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                        for (idx, arg) in info.args.iter().enumerate() {
+                            if let (Operand::Value(v), Some(&ty)) = (arg, info.arg_types.get(idx)) {
+                                changed |= widen_to(&mut value_types, v.0, ty);
+                            }
+                        }
+                    }
+                    Instruction::Memcpy { dest, src, .. } => {
+                        changed |= widen_to(&mut value_types, dest.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, src.0, IrType::Ptr);
+                    }
+                    Instruction::VaArg { va_list_ptr, .. }
+                    | Instruction::VaStart { va_list_ptr }
+                    | Instruction::VaEnd { va_list_ptr } => {
+                        changed |= widen_to(&mut value_types, va_list_ptr.0, IrType::Ptr);
+                    }
+                    Instruction::VaArgStruct {
+                        dest_ptr,
+                        va_list_ptr,
+                        ..
+                    } => {
+                        changed |= widen_to(&mut value_types, dest_ptr.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, va_list_ptr.0, IrType::Ptr);
+                    }
+                    Instruction::VaCopy { dest_ptr, src_ptr } => {
+                        changed |= widen_to(&mut value_types, dest_ptr.0, IrType::Ptr);
+                        changed |= widen_to(&mut value_types, src_ptr.0, IrType::Ptr);
+                    }
+                    Instruction::AtomicRmw { ptr, val, ty, .. } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                        if let Operand::Value(v) = val {
+                            changed |= widen_to(&mut value_types, v.0, *ty);
+                        }
+                    }
+                    Instruction::AtomicInc { ptr, .. } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                    }
+                    Instruction::AtomicCmpxchg {
+                        ptr,
+                        expected,
+                        desired,
+                        ty,
+                        ..
+                    } => {
+                        if let Operand::Value(v) = ptr {
+                            changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                        }
+                        for op in [expected, desired] {
+                            if let Operand::Value(v) = op {
+                                changed |= widen_to(&mut value_types, v.0, *ty);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Terminator operand evidence: the return value materialises at
+            // the declared return width, an indirect branch target at
+            // pointer width.
+            match &block.terminator {
+                Terminator::Return(Some(Operand::Value(v))) => {
+                    changed |= widen_to(&mut value_types, v.0, func.return_type);
+                }
+                Terminator::IndirectBranch { target, .. } => {
+                    if let Operand::Value(v) = target {
+                        changed |= widen_to(&mut value_types, v.0, IrType::Ptr);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    value_types
+}
+
+/// Value ids whose codegen materialisation width exceeds four bytes.
+///
+/// Used by the stack layout to veto the 4-byte small-slot narrowing: a value
+/// in this set is moved with `movq`, so its slot must be at least eight bytes
+/// or the reload reads a neighbour's bytes (see
+/// [`compute_value_type_map`] for the miscompile this prevented).
+pub(crate) fn wide_typed_values(
+    func: &crate::ir::reexports::IrFunction,
+) -> crate::common::fx_hash::FxHashSet<u32> {
+    compute_value_type_map(func)
+        .into_iter()
+        .filter(|(_, ty)| ty.size() > 4)
+        .map(|(v, _)| v)
+        .collect()
+}
+
+#[cfg(test)]
+mod value_type_map_tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+    };
+
+    fn func_with_blocks(blocks: Vec<BasicBlock>, next_id: u32) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        f.blocks = blocks;
+        f.next_value_id = next_id;
+        f
+    }
+
+    fn i32_add(dest: Value, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I32,
+        }
+    }
+
+    fn i64_add(dest: Value, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        }
+    }
+
+    fn block(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(id),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    /// A loop-carried phi whose incoming value is defined LATER in program
+    /// order (the loop body comes after the header in the block list). A
+    /// single forward pass leaves the phi dest untyped; the fixpoint must
+    /// type it I64 (so the slot classifier refuses a 4-byte slot).
+    #[test]
+    fn loop_phi_back_edge_reaches_fixpoint() {
+        // header: v0 = phi [v1(entry-const, I32)] [v2(back edge)]   -> v2 wide
+        // body:   v2 = v0 + 1 (I64)
+        let header = block(
+            0,
+            vec![Instruction::Phi {
+                dest: Value(0),
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(99)), // preheader
+                    (Operand::Value(Value(2)), BlockId(1)),         // back edge
+                ],
+                ty: IrType::I64,
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![i64_add(
+                Value(2),
+                Operand::Value(Value(0)),
+                Operand::Const(IrConst::I64(1)),
+            )],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        let f = func_with_blocks(vec![header, body], 3);
+
+        let map = compute_value_type_map(&f);
+        // v0 (the phi) must be typed wide: it is fed from wide v2 on the back
+        // edge even though the only *forward* constant seed was I32.
+        let t0 = map.get(&0).copied().expect("phi dest v0 typed");
+        assert_eq!(
+            t0.size(),
+            8,
+            "phi dest must inherit the wide back-edge type: {map:?}"
+        );
+        let t2 = map.get(&2).copied().expect("body value typed");
+        assert_eq!(t2.size(), 8);
+    }
+
+    /// The SAME dest id defined on several paths with different widths must
+    /// resolve to the WIDEST definition (phi elimination reuses dest ids
+    /// across predecessor copies).
+    #[test]
+    fn widest_def_wins_across_multi_def() {
+        let b = block(
+            0,
+            vec![
+                i64_add(
+                    Value(0),
+                    Operand::Const(IrConst::I64(1)),
+                    Operand::Const(IrConst::I64(2)),
+                ),
+                // A later narrow redefinition of the same id must not narrow it.
+                i32_add(
+                    Value(0),
+                    Operand::Const(IrConst::I32(3)),
+                    Operand::Const(IrConst::I32(4)),
+                ),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        );
+        let f = func_with_blocks(vec![b], 1);
+        let map = compute_value_type_map(&f);
+        assert_eq!(map.get(&0).copied().map(|t| t.size()), Some(8));
+    }
+
+    /// Copy-from-parameter: the ParamRef lives in the LAST block but a Copy
+    /// in the FIRST block consumes it — the up-front ParamRef seed lets the
+    /// fixpoint type the Copy dest without a second whole-function pass
+    /// needing to revisit block order.
+    #[test]
+    fn param_seeded_before_copy_in_earlier_block() {
+        let b0 = block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Value(Value(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let b1 = block(
+            1,
+            vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I64,
+            }],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        let f = func_with_blocks(vec![b0, b1], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(8));
+        assert_eq!(map.get(&0).copied().map(|t| t.size()), Some(8));
+    }
+
+    /// A genuinely narrow web stays narrow (no spurious widening).
+    #[test]
+    fn narrow_copy_web_stays_narrow() {
+        let b0 = block(
+            0,
+            vec![
+                i32_add(
+                    Value(0),
+                    Operand::Const(IrConst::I32(1)),
+                    Operand::Const(IrConst::I32(2)),
+                ),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        let f = func_with_blocks(vec![b0], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(map.get(&0).copied().map(|t| t.size()), Some(4));
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(4));
+        let wide = wide_typed_values(&f);
+        assert!(!wide.contains(&0) && !wide.contains(&1));
+    }
+
+    fn call_with_i32_arg(arg: Operand) -> Instruction {
+        use crate::ir::instruction::CallInfo;
+        Instruction::Call {
+            func: "callee".to_string(),
+            info: CallInfo {
+                dest: None,
+                args: vec![arg],
+                arg_types: vec![IrType::I32],
+                return_type: IrType::I32,
+                is_variadic: false,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: vec![],
+                struct_arg_riscv_float_classes: vec![],
+                struct_arg_is_f128_sse: vec![],
+                ret_is_f128_sse: false,
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                assume_library: false,
+                ret_eightbyte_classes: vec![],
+                cold: false,
+            },
+        }
+    }
+
+    /// The exact `check_cpuflags` defect, replayed at IR level: a u32 loop
+    /// accumulator whose preheader init is `Copy v <- Const(I64(0))` — the
+    /// zero-extended `from_i64` storage form for U32 — must resolve to 4
+    /// bytes from its consuming context (the 32-bit BinOp) alone. Before the
+    /// weak-`I64`-seed fix, the const seed widened the whole copy web, i686's
+    /// `collect_non_gpr_values` excluded the accumulator from GPRs, and the
+    /// 21-use slot traffic followed.
+    #[test]
+    fn i64_stored_const_seed_resolves_to_operand_width() {
+        // pre:   v0 = copy Const(I64(0))       (u32 acc init)
+        // body:  v1 = v0 | 1 (I32)             (err |= 1<<i)
+        // latch: v0 = copy v1                  (back edge)
+        let pre = block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::Or,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I64(1)),
+                ty: IrType::I32,
+            }],
+            Terminator::Branch(BlockId(2)),
+        );
+        let latch = block(
+            2,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Value(Value(1)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let f = func_with_blocks(vec![pre, body, latch], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(4),
+            "accumulator web must be 32-bit: {map:?}"
+        );
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(4));
+        let wide = wide_typed_values(&f);
+        assert!(!wide.contains(&0) && !wide.contains(&1));
+    }
+
+    /// The same `Const(I64)` seed must stay WIDE when the value has a
+    /// genuine 64-bit consumer: width resolution is context-based, not
+    /// blanket narrowing. (A real `u64 x = 5;` must keep an 8-byte slot.)
+    #[test]
+    fn i64_stored_const_seed_stays_wide_for_64bit_consumer() {
+        let pre = block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![i64_add(
+                Value(1),
+                Operand::Value(Value(0)),
+                Operand::Const(IrConst::I64(1)),
+            )],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        let f = func_with_blocks(vec![pre, body], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(8),
+            "64-bit operand context must keep v0 wide: {map:?}"
+        );
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(8));
+        let wide = wide_typed_values(&f);
+        assert!(wide.contains(&0) && wide.contains(&1));
+    }
+
+    /// A value whose only evidence is an ambiguous `Const(I64)` seed (dead
+    /// store to nowhere, never copied, never consumed) must stay UNTYPED:
+    /// every consumer (the non-GPR classifier, the i686 compact-slot gate,
+    /// the x86-64 emitters) treats untyped as the conservative wide default.
+    /// Typing it from the spelling alone would be the bug the weak seed
+    /// removed.
+    #[test]
+    fn unused_i64_stored_const_seed_stays_untyped() {
+        let b = block(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            Terminator::Return(None),
+        );
+        let f = func_with_blocks(vec![b], 1);
+        let map = compute_value_type_map(&f);
+        assert!(map.get(&0).is_none(), "no context => untyped: {map:?}");
+    }
+
+    /// A phi with a declared 32-bit type takes incoming `Const(I64)` edges:
+    /// the declared type is authoritative (each edge value is converted to
+    /// it), so the dest must be 4 bytes even though the spelling says 8.
+    #[test]
+    fn phi_type_subsumes_wider_const_incoming() {
+        let header = block(
+            0,
+            vec![Instruction::Phi {
+                dest: Value(0),
+                incoming: vec![
+                    (Operand::Const(IrConst::I64(0)), BlockId(99)),
+                    (Operand::Value(Value(1)), BlockId(1)),
+                ],
+                ty: IrType::I32,
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I64(7)),
+            }],
+            Terminator::Branch(BlockId(0)),
+        );
+        let f = func_with_blocks(vec![header, body], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(4),
+            "declared phi type must govern: {map:?}"
+        );
+        // The back-edge copy dest inherits the phi edge type too.
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(4));
+    }
+
+    /// A call argument materialises at its declared ABI width: a value
+    /// whose only other evidence is an ambiguous `Const(I64)` seed resolves
+    /// to the argument type. (i386 passes u32 by value in a GPR — the whole
+    /// point of getting this right.)
+    #[test]
+    fn call_arg_width_seeds_operand() {
+        let b = block(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(42)),
+                },
+                call_with_i32_arg(Operand::Value(Value(0))),
+            ],
+            Terminator::Return(None),
+        );
+        let f = func_with_blocks(vec![b], 1);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&0).copied().map(|t| t.size()),
+            Some(4),
+            "ABI width must seed the argument: {map:?}"
+        );
+    }
+
+    /// A store materialises its value at the store type: a `Const(I64)`-
+    /// seeded value stored through a u32 pointer resolves to 4 bytes.
+    #[test]
+    fn store_width_seeds_operand() {
+        let b = block(
+            0,
+            vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::U32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I64(7)),
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(1)),
+                    ptr: Value(0),
+                    ty: IrType::U32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            Terminator::Return(None),
+        );
+        let f = func_with_blocks(vec![b], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(
+            map.get(&1).copied().map(|t| t.size()),
+            Some(4),
+            "store type must seed the value: {map:?}"
+        );
+        // The alloca dest is pointer-width (thread-local target size).
+        assert_eq!(map.get(&0).copied(), Some(IrType::Ptr), "ptr: {map:?}");
+    }
+}
+
+#[cfg(test)]
+mod rax_epoch_analyzer_tests {
+    use super::{AsmOutput, asm_line_writes_rax};
+
+    #[test]
+    fn explicit_destination_writes() {
+        for line in [
+            "    movq %rbx, %rax",
+            "    addl %ecx, %eax",
+            "    movl $5, %eax",
+            "    movslq %eax, %rax",
+            "    movzbl %al, %eax",
+            "    xorl %eax, %eax",
+            "    shlq %cl, %rax",
+            "    leaq 48(%rbp,%rcx,8), %rax",
+            "    bswap %eax",
+            "    negq %rax",
+            "    imulq %rcx, %rax",
+            "    imulq $3, %rcx, %rax",
+            "    popq %rax",
+            "    sete %al",
+            "    movd %xmm0, %eax",
+            "    pextrb $0, %xmm2, %eax",
+            "    vcvttsd2siq %xmm0, %rax",
+            "    vpmovmskb %xmm1, %eax",
+            "    movabsq $8826686330870431363, %rax",
+            "    movl %fs:0, %eax",
+            "    btsq %rcx, %rax",
+            "    movq %rbx, %rax",
+        ] {
+            assert!(asm_line_writes_rax(line), "must WRITE rax: {line:?}");
+        }
+    }
+
+    #[test]
+    fn implicit_writes() {
+        for line in [
+            "    divq %rcx",
+            "    idivl %esi",
+            "    divb %cl",
+            "    mulq %rcx",
+            "    imulq %rcx",
+            "    call printf",
+            "    call *%r10",
+            "    call __x86_indirect_thunk_r10",
+            "    syscall",
+            "    cmpxchgq %rcx, (%rbx)",
+            "    lock xaddl %eax, (%rsp)",
+            "    xchgq %rax, %rbx",
+            "    xchgq %rax, (%rbx)",
+            "    cltq",
+            "    cdqe",
+            "    fnstsw %ax",
+            "    fstsw %ax",
+            "    mulxq %rbx, %rax, %rcx",
+            "    rdrand %eax",
+        ] {
+            assert!(asm_line_writes_rax(line), "must WRITE rax: {line:?}");
+        }
+    }
+
+    #[test]
+    fn non_writes() {
+        for line in [
+            "    movq %rax, -8(%rbp)",
+            "    movl %eax, 16(%rsp)",
+            "    movq %rbx, (%rsp,%rax,8)",
+            "    orq %rax, (%rbx)",
+            "    movq %rax, %fs:8(%rbx)",
+            "    cmpq %rax, %rbx",
+            "    cmpq $0, %rax",
+            "    testb %al, %al",
+            "    pushq %rax",
+            "    jmpq *%rax",
+            "    jne .L3",
+            "    ret",
+            "    retq",
+            "    leave",
+            "    cqto",
+            "    cltd",
+            "    cdq",
+            "    vzeroupper",
+            "    movq %rax, %xmm3",
+            "    movsd %xmm8, %xmm0",
+            "    fstpl (%esp)",
+            "    fnstcw (%rsp)",
+            "    fldl (%rax)",
+            "    btl $1, %eax",
+            "    prefetcht0 (%rax)",
+            "    rep stosq",
+            "    sahf",
+            "    nop",
+            "    endbr64",
+            ".p2align 4",
+            ".LCFP_3:",
+            "",
+            "    ",
+        ] {
+            assert!(!asm_line_writes_rax(line), "must NOT write rax: {line:?}");
+        }
+    }
+
+    #[test]
+    fn att_syntax_contract_intel_shaped_lines() {
+        // The classifier reads dest-LAST (AT&T). An Intel reader would flip
+        // every verdict below — but Intel-syntax lines never occur (GCC
+        // dialect alternatives resolve to the AT&T branch, and the emitters
+        // speak AT&T natively), so these pin the contract, not a dialect.
+        for line in [
+            "    movq %rax, %rbx",
+            "    movl %eax, %ebx",
+            "    addq %rax, %rbx",
+            "    leaq (%rax), %rbx",
+        ] {
+            assert!(!asm_line_writes_rax(line), "AT&T dest-last: {line:?}");
+        }
+        assert!(asm_line_writes_rax("    movq %rbx, %rax"));
+    }
+
+    #[test]
+    fn unknown_mnemonics_fail_loud() {
+        // An unclassified mnemonic whose DESTINATION is rax-shaped still
+        // reports a write (dest-last is universal in AT&T) and is recorded
+        // for the assertion message.
+        assert!(asm_line_writes_rax("    zkshift $1, %rax"));
+        // With a non-rax destination the answer is soundly false — memory
+        // and immediate destinations cannot write rax for any AT&T
+        // instruction, and implicit writers are the table's job.
+        assert!(!asm_line_writes_rax("    frobnicate x0, x1, x2"));
+        assert!(!asm_line_writes_rax("    add x0, x1, x2"));
+        assert!(!asm_line_writes_rax("    ldr w0, [sp, #8]"));
+        // Directives and labels never reach the analyzer's instruction path.
+        assert!(!asm_line_writes_rax(".quad 1"));
+        assert!(!asm_line_writes_rax("Lfoo:"));
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod rax_epoch_sink_coverage_tests {
+    use super::{AsmOutput, asm_line_writes_rax};
+
+    /// F2 regression (PR #637 audit): `emit_cmp_zero_mem` used to complete
+    /// its line WITHOUT a `debug_scan_tail()` — the one sink that falsified
+    /// the "every public emit method ends in debug_scan_tail()" banner. The
+    /// contract now: the method scans (so a future %rax-writing form of it
+    /// cannot slip past the epoch validator), the epoch does not move (a
+    /// compare writes flags only), and the module-handoff completeness
+    /// assert (`debug_assert_fully_scanned`) sees full byte coverage.
+    #[test]
+    fn cmp_zero_mem_is_scanned_and_moves_no_epoch() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        let before = out.debug_rax_epoch();
+        out.emit("    movq %rbx, %rax"); // a real write first
+        let after_write = out.debug_rax_epoch();
+        assert_eq!(after_write, before + 1);
+        out.emit_cmp_zero_mem(-16);
+        out.emit_cmp_zero_mem_sized(-24, "cmpq");
+        assert_eq!(
+            out.debug_rax_epoch(),
+            after_write,
+            "compares write flags only — the epoch must not move"
+        );
+        // Byte coverage: nothing pending at handoff time.
+        out.debug_assert_fully_scanned();
+    }
+
+    /// The completeness assert catches the escape-hatch class by
+    /// construction: a raw buf push of a complete line without any scan
+    /// leaves unscanned bytes that the handoff assert refuses, and the
+    /// next scan covers them (no double-count).
+    #[test]
+    fn unscanned_sink_is_caught_and_next_scan_recovers() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        out.emit("    movq $1, %rax");
+        let scanned_ok = out.scanned_len;
+        // Simulate the F2 class: a raw complete-line push, no scan.
+        out.buf.push_str("    movq $2, %rax\n");
+        let epoch_before = out.debug_rax_epoch();
+        assert_eq!(epoch_before, 1, "the raw push is invisible until scanned");
+        // The handoff assert must refuse.
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            out.debug_assert_fully_scanned();
+        }));
+        assert!(refused.is_err(), "unscanned bytes must fail the handoff");
+        // A subsequent scan classifies the pending line exactly once.
+        out.emit("    movq %rbx, %rcx"); // benign line, triggers the scan
+        assert_eq!(
+            out.debug_rax_epoch(),
+            2,
+            "the pending write is counted once"
+        );
+        assert_eq!(
+            out.scanned_len,
+            scanned_ok + "    movq $2, %rax\n".len() + "    movq %rbx, %rcx\n".len()
+        );
+        out.debug_assert_fully_scanned();
+    }
+
+    /// An `emit` carrying an embedded newline classifies BOTH lines (the
+    /// old tail-only scan silently lost the first).
+    #[test]
+    fn embedded_newline_emits_classify_every_line() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        out.emit("    pushq %rax\n    popq %rax");
+        assert_eq!(
+            out.debug_rax_epoch(),
+            1,
+            "pushq reads (NEVER table), popq writes — exactly one epoch bump"
+        );
+        out.debug_assert_fully_scanned();
+    }
+
+    /// The classifier reports unknown mnemonics with a rax-shaped
+    /// destination through the pure `(writes, unclassified)` pair, and a
+    /// scan records them ONTO THE STREAM: `debug_last_unclassified` names
+    /// the trimmed line, `debug_unclassified_mnemonics` dedups the
+    /// vocabulary — the data the acc-epoch assertion prints (line first,
+    /// then the vocabulary to audit into a table).
+    ///
+    /// Stream-scoped by construction: every observation is driven through
+    /// this test's own `AsmOutput`, so the result cannot depend on which
+    /// tests ran before on the same reused thread (the old thread-local
+    /// record's reads were order-safe only because every read happened to
+    /// follow a same-test write).
+    #[test]
+    fn unknown_mnemonic_line_is_recorded_on_the_stream() {
+        // NB: the probe must avoid the f- prefix (x87 quiet rule) and j-
+        // prefix (jump family) — any other unknown token is fail-loud.
+        assert!(asm_line_writes_rax("    zbork %rax"));
+        assert!(!asm_line_writes_rax("    zbork %rbx"));
+        // A fresh stream records nothing: the diagnostic is per-stream
+        // state, not a global a previous test could have left set.
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        assert_eq!(out.debug_last_unclassified(), None);
+        assert!(out.debug_unclassified_mnemonics().is_empty());
+        // Two lines through the real emit path: both hit the generic
+        // dest-last rule with out-of-table mnemonics, so both are recorded
+        // (line: most recent wins; vocabulary: deduplicated, order kept).
+        out.emit("    zbork %rax");
+        out.emit("    movq %rbx, %rax");
+        out.debug_assert_fully_scanned();
+        assert_eq!(
+            out.debug_last_unclassified().as_deref(),
+            // The record holds the trimmed form (no indentation noise).
+            Some("movq %rbx, %rax"),
+            "the most recent generic-rule line is what the assertion names"
+        );
+        assert_eq!(
+            out.debug_unclassified_mnemonics(),
+            // `mov`/`movq` sit outside the explicit tables by design — that
+            // rule is what covers the regular vocabulary (mov/add/...), and
+            // a NEW vocabulary member appearing here is the signal to audit
+            // it into a table.
+            &["zbork".to_string(), "movq".to_string()],
+            "the assertion names the vocabulary to audit, once per mnemonic"
+        );
+        // A table-covered line (cmp: NEVER_RAX_WRITES) leaves both records
+        // untouched — the records only carry generic-rule verdicts.
+        out.emit("    cmpq %rbx, %rax");
+        out.debug_assert_fully_scanned();
+        assert_eq!(
+            out.debug_last_unclassified().as_deref(),
+            Some("movq %rbx, %rax")
+        );
+        assert_eq!(out.debug_unclassified_mnemonics().len(), 2);
+    }
+}
+
+/// The %rcx shadow-epoch analyzer's tests: the %rcx mirror of
+/// `rax_epoch_analyzer_tests`. Same shape (explicit writes, implicit
+/// writes, non-writes, shared-scan integration); the line lists differ
+/// exactly where the ISA differs (see `classify_rcx_line`).
+#[cfg(test)]
+mod rcx_epoch_analyzer_tests {
+    use super::asm_line_writes_rcx;
+
+    #[test]
+    fn rcx_explicit_destination_writes() {
+        for line in [
+            "    movq %rbx, %rcx",
+            "    addl %eax, %ecx",
+            "    movl $5, %ecx",
+            "    movslq %ecx, %rcx",
+            "    movzbl %cl, %ecx",
+            "    xorl %ecx, %ecx",
+            "    shlq $3, %rcx",
+            "    leaq 48(%rbp,%rax,8), %rcx",
+            "    bswap %ecx",
+            "    negq %rcx",
+            "    imulq %rax, %rcx",
+            "    imulq $3, %rax, %rcx",
+            "    popq %rcx",
+            "    sete %cl",
+            "    movd %xmm0, %ecx",
+            "    vcvttsd2siq %xmm0, %rcx",
+            "    movabsq $8826686330870431363, %rcx",
+            "    movq %fs:0, %rcx",
+            // bts/btr/btc WRITE the destination bit (unlike bt, which only
+            // reads — see the non-writes list).
+            "    btsq %rax, %rcx",
+            "    btrq %rax, %rcx",
+            "    mulxq %rbx, %rax, %rcx",
+            "    rdrand %ecx",
+            // Short-`movs` with operands is MOVSX (the `rep` is ignored):
+            // a write here comes from the explicit %rcx destination alone.
+            "    rep movsl %eax, %ecx",
+            "    rep movsb %al, %cl",
+        ] {
+            assert!(asm_line_writes_rcx(line), "must WRITE rcx: {line:?}");
+        }
+    }
+
+    #[test]
+    fn rcx_implicit_writes() {
+        for line in [
+            "    call printf",
+            "    call *%r10",
+            "    call __x86_indirect_thunk_r10",
+            "    syscall",
+            "    sysenter",
+            "    cpuid",
+            "    rdtscp",
+            // The counter family writes %rcx without naming it.
+            "    loop .L1",
+            "    loope .L2",
+            "    loopz .L2",
+            "    loopne .L3",
+            "    loopnz .L3",
+            // `rep*` on a string-op base consumes the %rcx counter.
+            "    rep stosq",
+            "    rep movsb",
+            "    rep movsl",
+            "    rep movsq",
+            "    repz cmpsb",
+            "    repne scasb",
+            "    rep lodsl",
+            // Memory-memory short-`movs` IS the string op (GAS-accepted,
+            // encoding A4/A5): `rep` counts %rcx despite the operands.
+            "    rep movsl (%esi),(%edi)",
+            "    rep movsl %ds:(%esi),%es:(%edi)",
+            "    rep movsb (%esi),(%edi)",
+            // Both-operand class with a %rcx operand.
+            "    lock xaddl %ecx, (%rsp)",
+            "    xchgq %rax, %rcx",
+            "    xchgq %rcx, (%rbx)",
+        ] {
+            assert!(asm_line_writes_rcx(line), "must WRITE rcx: {line:?}");
+        }
+    }
+
+    #[test]
+    fn rcx_non_writes() {
+        for line in [
+            "    movq %rcx, -8(%rbp)",
+            "    movl %ecx, 16(%rsp)",
+            "    movq %rbx, (%rsp,%rcx,8)",
+            "    orq %rcx, (%rbx)",
+            "    movq %rcx, %fs:8(%rbx)",
+            "    cmpq %rcx, %rbx",
+            "    cmpq $0, %rcx",
+            "    testb %cl, %cl",
+            "    pushq %rcx",
+            "    jmpq *%rcx",
+            "    jne .L3",
+            "    ret",
+            // The `rep` prefix on a non-string base is an ignored hint.
+            "    rep ret",
+            "    rep nop",
+            // Short-`movs` with a register destination is MOVSX, not a
+            // string op: the `rep` is ignored and a non-%rcx destination
+            // writes nothing (memory sources included).
+            "    rep movsl %eax, %ebx",
+            "    rep movsw %ax, %dx",
+            "    rep movsq %rax, %rbx",
+            "    rep movsl (%rax), %ebx",
+            "    rep movsb %al, %bl",
+            // One-operand mul/div/idiv/imul write the implicit rax:rdx
+            // pair; the explicit %rcx-looking operand is the SOURCE.
+            "    divq %rcx",
+            "    idivl %ecx",
+            "    divb %cl",
+            "    mulq %rcx",
+            "    imulq %rcx",
+            // %rax-family writers that leave %rcx alone.
+            "    lodsq",
+            "    cmpxchgq %rcx, (%rbx)",
+            "    cltq",
+            "    fnstsw %ax",
+            "    rdtsc",
+            "    xgetbv",
+            "    rdmsr",
+            "    cqo",
+            // bt reads the bit (unlike bts/btr/btc, which write it).
+            "    btq %rax, %rcx",
+            // Control transfer that only READS %rcx.
+            "    jecxz .L4",
+            "    jrcxz .L5",
+            // Both-operand / last-two class WITHOUT a %rcx operand.
+            "    xchgq %rax, %rbx",
+            "    xaddl %eax, (%rsp)",
+            "    mulxq %rbx, %rax, %rdx",
+            // %rax writes are NOT %rcx writes (epoch independence).
+            "    movq %rbx, %rax",
+            "    leaq (%rcx), %rax",
+        ] {
+            assert!(!asm_line_writes_rcx(line), "must NOT write rcx: {line:?}");
+        }
+    }
+
+    #[test]
+    fn rcx_att_syntax_contract_intel_shaped_lines() {
+        // Dest-LAST (AT&T) reading, like the %rax side: an Intel reader
+        // would flip every verdict. Intel-syntax lines never occur (see
+        // `classify_rcx_line`), so these pin the contract, not a dialect.
+        for line in [
+            "    movq %rcx, %rbx",
+            "    movl %ecx, %ebx",
+            "    addq %rcx, %rbx",
+            "    leaq (%rcx), %rbx",
+        ] {
+            assert!(!asm_line_writes_rcx(line), "AT&T dest-last: {line:?}");
+        }
+        assert!(asm_line_writes_rcx("    movq %rbx, %rcx"));
+    }
+}
+
+/// The %rcx scan-integration test: the %rcx mirror of the
+/// `rax_epoch_sink_coverage_tests` scan tests. Debug-gated like them:
+/// it drives the scan machinery (`rax_epoch_active`, the epochs), which
+/// does not exist in release builds.
+#[cfg(all(test, debug_assertions))]
+mod rcx_epoch_sink_coverage_tests {
+    use super::AsmOutput;
+
+    /// Both shadow epochs ride the SAME line walk: a %rcx write moves only
+    /// the %rcx epoch, a %rax write only the %rax epoch, and a
+    /// both-operand write (`xchg %rax,%rcx`) moves both. The last-write
+    /// records name the actual clobberer for the assertion's context.
+    #[test]
+    fn rcx_epoch_rides_the_shared_scan() {
+        let mut out = AsmOutput::new();
+        out.rax_epoch_active = true;
+        out.emit("    movq %rbx, %rcx");
+        assert_eq!(out.debug_rcx_epoch(), 1);
+        assert_eq!(
+            out.debug_rax_epoch(),
+            0,
+            "a %rcx write must not move the %rax epoch"
+        );
+        out.emit("    movq %rbx, %rax");
+        assert_eq!(out.debug_rax_epoch(), 1);
+        assert_eq!(
+            out.debug_rcx_epoch(),
+            1,
+            "a %rax write must not move the %rcx epoch"
+        );
+        out.emit("    xchgq %rax, %rcx");
+        assert_eq!(out.debug_rax_epoch(), 2);
+        assert_eq!(out.debug_rcx_epoch(), 2);
+        assert_eq!(
+            out.debug_last_rcx_write().as_deref(),
+            Some("xchgq %rax, %rcx")
+        );
+        assert_eq!(
+            out.debug_last_rax_write().as_deref(),
+            Some("xchgq %rax, %rcx")
+        );
+        // A read is silent on both epochs.
+        out.emit("    pushq %rcx");
+        assert_eq!(out.debug_rcx_epoch(), 2);
+        assert_eq!(out.debug_rax_epoch(), 2);
+        out.debug_assert_fully_scanned();
+    }
+}
+
+#[cfg(test)]
+mod gcc_version_discovery_tests {
+    use super::installed_gcc_versions;
+    #[test]
+    fn installed_versions_are_numeric_complete_names_not_a_release_allowlist() {
+        let owner = crate::common::temp_files::TempFile::try_new("test", "gcc-versions", "dir")
+            .expect("reserve GCC discovery test directory");
+        let root = owner.path().to_path_buf();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        std::fs::create_dir(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        for name in [
+            "9", "14", "16", "17.1.2", "17.1.10", "17junk", "18..1", "includes",
+        ] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::fs::write(root.join("99"), b"not a directory").unwrap();
+        assert_eq!(
+            installed_gcc_versions(&[root.clone(), root]),
+            ["17.1.10", "17.1.2", "16", "14", "9"]
+        );
+    }
+}

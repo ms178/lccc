@@ -1,0 +1,100 @@
+[
+  {
+    "binary": "bzhi-_O0__march=x86_64_v3",
+    "sha256": "90d61e445af51e7c8d89eb228344b9358561fb2c2131d3f45312ce859cfdcb30",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--quiet",
+      "--error-exitcode=99",
+      "/home/user/.cache/redteam91/bzhi-_O0__march=x86_64_v3"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "binary": "bzhi-_O2__m32__mbmi2",
+    "sha256": "5c31138da3f5b03f7520b040da7895d26a1cb50bd53225612e8f81cfd9c2c580",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--quiet",
+      "--error-exitcode=99",
+      "/home/user/.cache/redteam91/bzhi-_O2__m32__mbmi2"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "binary": "bzhi-_O2__m32__mno_bmi2",
+    "sha256": "5c31138da3f5b03f7520b040da7895d26a1cb50bd53225612e8f81cfd9c2c580",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--quiet",
+      "--error-exitcode=99",
+      "/home/user/.cache/redteam91/bzhi-_O2__m32__mno_bmi2"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "binary": "bzhi-_O2__march=x86_64__mno_bmi2",
+    "sha256": "9738d992495ac1a7cd25a0ba583688a43729412d46558b4fdb2aa20a09a06c6c",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--quiet",
+      "--error-exitcode=99",
+      "/home/user/.cache/redteam91/bzhi-_O2__march=x86_64__mno_bmi2"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "binary": "bzhi-_O2__march=x86_64_v3",
+    "sha256": "6fc3652def5993411fd599a04b51f9e21d8674391d17d7f0e2e6b523a7a46b12",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--quiet",
+      "--error-exitcode=99",
+      "/home/user/.cache/redteam91/bzhi-_O2__march=x86_64_v3"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "binary": "bzhi-_O3__march=x86_64_v3",
+    "sha256": "6fc3652def5993411fd599a04b51f9e21d8674391d17d7f0e2e6b523a7a46b12",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--quiet",
+      "--error-exitcode=99",
+      "/home/user/.cache/redteam91/bzhi-_O3__march=x86_64_v3"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "binary": "bzhi-gcc",
+    "sha256": "2954e4160ebe2720402aa61c90da17773a15a9179d01186bdb1f52adf8cf803c",
+    "command": [
+      "valgrind",
+      "--tool=memcheck",
+      "--quiet",
+      "--error-exitcode=99",
+      "/home/user/.cache/redteam91/bzhi-gcc"
+    ],
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  }
+]

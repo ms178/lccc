@@ -1,0 +1,2337 @@
+//! Shared codegen state, slot addressing types, and register value cache.
+//!
+//! All four backends use the same `CodegenState` to track stack slot assignments,
+//! alloca metadata, label generation, and the register value cache during code generation.
+//! The `SlotAddr` enum captures the 3-way addressing pattern (over-aligned alloca /
+//! direct alloca / indirect) that repeats across store, load, GEP, and memcpy emission.
+//!
+//! The `RegCache` tracks which IR values are currently known to be in registers,
+//! enabling backends to skip redundant stack loads. This is the foundation for
+//! eventually replacing the pure stack-slot model with a register allocator.
+
+use super::common::AsmOutput;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{BlockId, IrCmpOp, Operand, Value};
+use std::sync::Arc;
+
+/// Stack slot location for a value. Interpretation varies by arch:
+/// - x86: negative offset from %rbp
+/// - ARM: positive offset from sp
+/// - RISC-V: negative offset from s0
+#[derive(Debug, Clone, Copy)]
+pub struct StackSlot(pub i64);
+
+/// Sibling-call conversion bookkeeping (TODO-3 / §5b of the codegen-gaps
+/// ledger). `Armed` is set at a qualifying call site before emission; the
+/// argument setup phases run unchanged and the `call` text is suppressed
+/// at Phase 4, recording the resolved tail target as `Ready`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SibcallPending {
+    Armed {
+        /// A YMM/ZMM argument must reach the tail callee with every lane
+        /// intact. The return path therefore must not clean upper lanes.
+        preserve_upper_vector_lanes: bool,
+    },
+    Ready {
+        target: SibcallTarget,
+        preserve_upper_vector_lanes: bool,
+    },
+}
+
+/// The resolved tail target's emission form. `Direct` holds the symbol
+/// reference text (with `@PLT` where the ABI wants it); `RipSlot` a
+/// memory-indirect `sym+off(%rip)` cell; `Reg` a register already holding
+/// the target (the Phase 0 `%r10` spill).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SibcallTarget {
+    Direct(String),
+    RipSlot(String),
+    Reg(&'static str),
+}
+
+/// Out-of-line edge block for an `asm goto` statement with output operands.
+/// The template branches to `label`; this block materializes the outputs and
+/// then transfers to the original C label `target`.
+#[derive(Debug, Clone)]
+pub struct PendingAsmGotoTrampoline {
+    pub label: BlockId,
+    pub target: BlockId,
+    pub outputs: Vec<(crate::backend::inline_asm::AsmOperand, Value, String)>,
+}
+
+/// Per-instruction sibling-call shape hint, computed by the generation
+/// driver. `instruction_index` is the exact call's index in its block. The
+/// driver publishes the hint only while emitting that instruction: result
+/// ids (and especially `None` for void calls) are not site identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SibcallHint {
+    pub instruction_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitLocation {
+    Reg(crate::backend::regalloc::PhysReg),
+    Accumulator,
+}
+
+/// Register cache entry: tracks which IR value is known to be in a register.
+/// The `is_alloca` flag distinguishes whether the register holds the alloca's
+/// address (leaq/adr) or the value loaded from the stack slot (movq/ldr).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegCacheEntry {
+    pub value_id: u32,
+    pub is_alloca: bool,
+}
+
+/// Register value cache. Tracks which IR values are currently in the accumulator
+/// and secondary registers, avoiding redundant stack loads.
+///
+/// The cache is conservative: it is invalidated on any operation that might clobber
+/// a register (calls, inline asm, complex operations that use scratch registers).
+/// This is safe because a stale entry would just cause a redundant load (the same
+/// behavior as before the cache existed), while a missing invalidation could cause
+/// incorrect code by skipping a needed load.
+///
+/// Since PR #635 the missing-invalidation direction is no longer merely
+/// "incorrect code by skipping a needed load": the slot-independent acc
+/// fast paths SOURCE THE VALUE FROM %rax with no slot fallback. A stale
+/// entry is a dead-register read. The epoch field above mechanically
+/// enforces the invalidation discipline in debug builds; see
+/// `CodegenState::acc_has_verified`.
+#[derive(Debug, Default)]
+pub struct RegCache {
+    /// Which value is currently in the primary accumulator register (%rax on x86).
+    pub acc: Option<RegCacheEntry>,
+    /// Which value is currently in the secondary register (%rcx on x86).
+    /// Tracked so that operand_to_rax can use `movq %rcx, %rax` instead of
+    /// a stack reload when the value was recently loaded to %rcx.
+    pub sec: Option<RegCacheEntry>,
+    /// Which value's **64-bit canonical** form is currently in `%rax`.
+    ///
+    /// The backend's narrow-integer invariant guarantees only that an i8/i16
+    /// home holds the producer's 8/16-bit value extended to *32* bits (a
+    /// signed narrow producer may have written with `movswl`). Cross-coupling
+    /// such a value into the 64-bit accumulator therefore needs an extend —
+    /// `movswq %cx, %rax` — but only when the accumulator does not already
+    /// hold the canonical form: an extending slot load, an extend this file
+    /// emitted, or a zero-extending load of an unsigned narrow value all
+    /// leave the full 64-bit value in place, and re-extending it is a wasted
+    /// µop in the hot narrow-store path.
+    ///
+    /// Cleared by `set_acc`/`invalidate_acc`/`invalidate_all`, i.e. by the
+    /// same choke points the debug epoch machinery already forces every
+    /// `%rax` write through (`CodegenState::park_acc`, and see the epoch
+    /// documentation above). A stale marker is therefore impossible: the
+    /// marker names the value the cache says is in `%rax`, and any new value
+    /// parked there drops it.
+    pub acc_canonical64: Option<u32>,
+    /// The `%rcx` mirror of [`Self::acc_canonical64`].
+    pub sec_canonical64: Option<u32>,
+    /// DEBUG-ONLY: the `AsmOutput` %rax shadow epoch at the moment `acc`
+    /// was last (re)written. Every park on an epoch-enabled target
+    /// (x86-64, i686 — see `AsmOutput::rax_epoch_active`) goes through
+    /// `CodegenState::park_acc` (which syncs this) and every consume goes
+    /// through `CodegenState::acc_has_verified` (which asserts it).
+    /// An emitter that writes %rax without `invalidate_acc` leaves the
+    /// epochs unequal at the next consume — the dead-%rax-read miscompile
+    /// class becomes a loud debug assertion naming the value and the last
+    /// unclassified line. Release builds compile the field away.
+    #[cfg(debug_assertions)]
+    pub(crate) acc_park_epoch: u64,
+    /// DEBUG-ONLY: the `AsmOutput` %rcx shadow epoch at the moment `sec`
+    /// was last (re)written. The %rcx mirror of `acc_park_epoch`: every
+    /// park on an epoch-enabled target (x86-64, i686) goes through
+    /// `CodegenState::park_sec` (which syncs this) and every consume goes
+    /// through `CodegenState::sec_has_verified` (which asserts it). An
+    /// emitter that writes %rcx without `invalidate_sec` leaves the epochs
+    /// unequal at the next consume — the dead-%rcx-read miscompile class
+    /// (CC-O0CALL-1: the SIGSEGV-via-garbage-address family) becomes a
+    /// loud debug assertion naming the value and the clobbering line.
+    /// Release builds compile the field away.
+    #[cfg(debug_assertions)]
+    pub(crate) sec_park_epoch: u64,
+}
+
+impl RegCache {
+    /// Record that the accumulator now holds the given value. The
+    /// 64-bit-canonical marker is dropped: the caller must re-establish it
+    /// with [`Self::mark_acc_canonical64`] when it knows the content is the
+    /// value's full 64-bit form.
+    #[inline]
+    pub fn set_acc(&mut self, value_id: u32, is_alloca: bool) {
+        self.acc = Some(RegCacheEntry {
+            value_id,
+            is_alloca,
+        });
+        self.acc_canonical64 = None;
+    }
+
+    /// Record that the secondary register now holds the given value.
+    #[inline]
+    pub fn set_sec(&mut self, value_id: u32, is_alloca: bool) {
+        self.sec = Some(RegCacheEntry {
+            value_id,
+            is_alloca,
+        });
+        self.sec_canonical64 = None;
+    }
+
+    /// Record that `%rax` holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn mark_acc_canonical64(&mut self, value_id: u32) {
+        self.acc_canonical64 = Some(value_id);
+    }
+
+    /// Record that `%rcx` holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn mark_sec_canonical64(&mut self, value_id: u32) {
+        self.sec_canonical64 = Some(value_id);
+    }
+
+    /// True when `%rax` already holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn acc_is_canonical64(&self, value_id: u32) -> bool {
+        self.acc_canonical64 == Some(value_id)
+    }
+
+    /// True when `%rcx` already holds the 64-bit canonical form of `value_id`.
+    #[inline]
+    pub fn sec_is_canonical64(&self, value_id: u32) -> bool {
+        self.sec_canonical64 == Some(value_id)
+    }
+
+    /// Check if the accumulator holds the given value (with matching alloca status).
+    #[inline]
+    pub fn acc_has(&self, value_id: u32, is_alloca: bool) -> bool {
+        self.acc
+            == Some(RegCacheEntry {
+                value_id,
+                is_alloca,
+            })
+    }
+
+    /// Check if the secondary register holds the given value.
+    #[inline]
+    pub fn sec_has(&self, value_id: u32, is_alloca: bool) -> bool {
+        self.sec
+            == Some(RegCacheEntry {
+                value_id,
+                is_alloca,
+            })
+    }
+
+    /// Invalidate the accumulator cache.
+    #[inline]
+    pub fn invalidate_acc(&mut self) {
+        self.acc = None;
+        self.acc_canonical64 = None;
+    }
+
+    /// Invalidate the secondary register cache.
+    #[inline]
+    pub fn invalidate_sec(&mut self) {
+        self.sec = None;
+        self.sec_canonical64 = None;
+    }
+
+    /// Invalidate all cached register values. Called on operations that may
+    /// clobber any register (calls, inline asm, etc.).
+    #[inline]
+    pub fn invalidate_all(&mut self) {
+        self.acc = None;
+        self.sec = None;
+        self.acc_canonical64 = None;
+        self.sec_canonical64 = None;
+    }
+}
+
+thread_local! {
+    /// True while the backend emits an exploratory (metric-only) copy of a
+    /// function for the dual-layout selection. Debug traces fire per
+    /// emission; count-based assertions over those traces
+    /// (`check_demorgan_branch_split` expects exactly one fire per site)
+    /// would double under exploration, so the load-bearing debug helpers stay
+    /// silent while this is set. The exploratory text never leaves the
+    /// compiler.
+    ///
+    /// Thread-local: emission is single-threaded per translation unit, but
+    /// unit tests emit concurrently on one process's thread pool, and a
+    /// process-wide flag let one test's exploratory phase suppress another's
+    /// committed facts.
+    pub(crate) static EXPLORATORY_EMISSION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// A VLFOLD-elided vector load awaiting its consumer.
+/// See `CodegenState::pending_vec_memfold` for the width contract.
+#[derive(Clone, Debug)]
+pub struct PendingVecMemfold {
+    /// Value id of the elided load's result.
+    pub val: u32,
+    /// The load's source memory operand (already rendered as AT&T text).
+    pub mem: String,
+    /// The load mnemonic (`vmovdqu`, `vmovups`, `vmovupd`) for
+    /// materialisation / re-issue.
+    pub mnemonic: &'static str,
+    /// Access width in bytes: 16 (VEX.128 fold) or 32 (VEX.256 fold).
+    pub width: u32,
+}
+
+pub struct CodegenState {
+    pub out: AsmOutput,
+    /// Set from CodegenOptions for -O0 non-SSA correctness.
+    pub disable_regalloc: bool,
+    /// Immutable RA/codegen policy captured once before this invocation enters
+    /// per-function code generation.
+    pub ra_config: Arc<crate::backend::regalloc::RaConfig>,
+    pub stack_offset: i64,
+    pub value_locations: FxHashMap<u32, StackSlot>,
+    /// x86-64 by-value parameter allocas whose object IS the incoming stack
+    /// argument. Positive virtual-frame offsets; never allocated or coalesced
+    /// into the local frame. Populated only after ABI/alignment/extent checks.
+    pub incoming_byval_slots: FxHashMap<u32, StackSlot>,
+    /// Emergency spill slot offset, allocated downward from the bottom of the frame.
+    /// Used when store_rax_to encounters a value with no register or stack slot.
+    /// Values that are allocas (their stack slot IS the data, not a pointer to data).
+    pub alloca_values: FxHashSet<u32>,
+    /// Direct allocas declared volatile in the source.  Their memory accesses
+    /// are observable and must be quarantined from text peephole rewrites.
+    pub volatile_alloca_values: FxHashSet<u32>,
+    /// Type associated with each alloca (for type-aware loads/stores).
+    pub alloca_types: FxHashMap<u32, IrType>,
+    /// Alloca values that need runtime alignment > 16 bytes.
+    pub alloca_alignments: FxHashMap<u32, usize>,
+    /// Values that are 128-bit integers (need 16-byte copy).
+    pub i128_values: FxHashSet<u32>,
+    /// Values that are 64-bit types on 32-bit targets (F64, I64/U64).
+    /// These values don't fit in a single 32-bit GPR and need special
+    /// copy handling (e.g., x87 fldl/fstpl for F64, two-word copy for I64).
+    /// Only populated on i686; empty on 64-bit targets.
+    pub wide_values: FxHashSet<u32>,
+    /// Vector values (produced by Vec* intrinsics like VecZeroF64x4, VecLoadF64x4, etc.).
+    /// These should be addressed via leaq (to get stack slot address) instead of movq
+    /// (which would load scalar bytes), because they hold 128/256-bit vector data.
+    pub vector_values: FxHashSet<u32>,
+    /// 128-bit (SSE-class) vector values. Same addressing rules as
+    /// `vector_values`, but their home slots are 16 bytes wide rather than 32.
+    /// Populated together with `vector_values` by the stack-layout pre-scan for
+    /// SIMD homes selected by `IntrinsicOp::vector_home_width` on instructions
+    /// with an actual destination. `vector_result_width` instead describes
+    /// actual result widths; source-home metadata on stores does not create
+    /// a result or make a store pure.
+    pub vector128_values: FxHashSet<u32>,
+    /// Vector-register peephole: the stack slot offset that the last
+    /// `avx_store_dest`/`sse_store_dest` wrote from %ymm0/%xmm0, and whether
+    /// that register still provably holds the value. When the very next vector
+    /// operand load targets the same slot, the load is skipped and the register
+    /// is reused directly (kills the store→reload round-trip that the
+    /// slot-based vector codegen otherwise emits for every intrinsic result).
+    /// Cleared conservatively at every call/asm/atomic/memcpy emission (all of
+    /// which may clobber the vector register) and on any actual vector load.
+    pub vec_last_store_slot: Option<i64>,
+    /// The IR value that was stored to `vec_last_store_slot`. The peephole is
+    /// only sound when the subsequent load reads the SAME value: stack slots
+    /// are coalesced/reused across different values, so a slot match alone is
+    /// not enough (a store of A followed by a load of B from the same slot
+    /// must NOT reuse the register).
+    pub vec_last_store_val: Option<u32>,
+    pub vec_last_store_reg: bool,
+    /// Which vector register provably holds `vec_last_store_val` (always
+    /// "ymm0" for the AVX path today; kept as a name so the loaders can rename
+    /// reg-to-reg without a memory round trip).
+    pub vec_last_store_reg_name: Option<&'static str>,
+    /// For 128-bit register peephole (xmm0 variant), same as above.
+    pub sse_last_store_slot: Option<i64>,
+    pub sse_last_store_val: Option<u32>,
+    pub sse_last_store_reg: bool,
+    /// Which xmm register provably holds `sse_last_store_val`. The pblendvb
+    /// handler stores its result from %xmm2; generalizing the tracking to all
+    /// source registers (not just xmm0) makes the reload-skip sound for those
+    /// results too (the "pblendvb xmm2" fix).
+    pub sse_last_store_reg_name: Option<&'static str>,
+    /// Values whose vector result store may be DEFERRED (skipped entirely):
+    /// computed by the v5 IR analysis (`compute_vector_defer_values`) — the
+    /// value's single use is as args[0]/args[1] of the immediately-following
+    /// intrinsic, so the register it was computed in is the only home it ever
+    /// needs. When the store is skipped the value stays in the register and
+    /// the consumer's load becomes a no-op (accumulator renaming).
+    pub vector_defer_values: FxHashSet<u32>,
+    /// VLFOLD: 256-bit `VecLoad*` results whose single use is the adjacent
+    /// two-operand VEX arithmetic intrinsic (`compute_vector_memfold_values`).
+    /// The load is not emitted; the consumer folds its source memory operand.
+    pub vector_memfold_values: FxHashSet<u32>,
+    /// Subset of `vector_memfold_values` whose consumer is a plain
+    /// two-operand 256-bit binary (`emit_avx_binary_256`).  Only these may be
+    /// elided when the load's destination carries a register home; see
+    /// `compute_vector_memfold_homed_ok`.
+    pub vector_memfold_homed_ok: FxHashSet<u32>,
+    /// Values with EXACTLY ONE use, that use in the same block as their
+    /// definition (`compute_vector_dying_values`): a destructive-form
+    /// emitter may compute its result into such an operand's register home
+    /// — no dynamic execution can read the home afterwards, because the
+    /// definition re-executes before any re-reach of the use. The
+    /// loop-invariant broadcast is the counter-example this set excludes:
+    /// one STATIC use site, read by every iteration.
+    pub vector_dying_values: FxHashSet<u32>,
+    /// The elided load awaiting its consumer. Consumed as a memory operand
+    /// by the audited memfold-first emitters, or re-issued as a real load by
+    /// the memfold-aware loaders; the safety net in `emit_intrinsic_impl`
+    /// materialises it before any other intrinsic.
+    ///
+    /// `width` is the access width in BYTES (16 for a VEX.128 fold, 32 for a
+    /// VEX.256 fold). A materialisation or re-issue must read EXACTLY that
+    /// many bytes: a 32-byte read of a 16-byte object can cross a page the
+    /// program never touched (the source object is only guaranteed to span
+    /// `width` bytes), and a 16-byte read of a 32-bit object would load
+    /// garbage lanes. Every consumer site checks the width matches its own
+    /// vector family before consuming.
+    pub pending_vec_memfold: Option<PendingVecMemfold>,
+    /// Lazy-flush half of the deferred-store mechanism: a skipped vector
+    /// result store is kept PENDING here (value id, holding register, 256-bit
+    /// flag) instead of being dropped. If the consumer really receives the
+    /// value through the last-store cache, the entry is silently discarded
+    /// (pure win: no store ever emitted). Otherwise the store is flushed just
+    /// before anything clobbers the holding register, reads the slot, or
+    /// leaves the block — so a deferred store can never be observed missing.
+    /// This makes deferred stores sound by construction, independent of the
+    /// IR analysis' adjacency precision.
+    pub pending_vec_store: Option<(u32, &'static str, bool)>,
+    /// i686 x87 top-of-stack cache (the FP twin of `pending_vec_store`).
+    /// `x87_pending == Some(v)` means: st(0) holds a copy of the F64 value
+    /// `v`, rounded through `fstpl; fldl` so the register equals the F64
+    /// slot (a bare `fstl` does not round ST(0)). No foreign x87 instruction
+    /// has executed since. `emit_float_binop` sets it
+    /// so the next consumer of `v` can dup the register copy (`fld %st(0)`)
+    /// or consume it in place (non-popping `fsub %st(1), %st` forms)
+    /// instead of reloading from the slot. Flushed (`fstp %st(0)`) by the
+    /// central hook in `emit`/`emit_fmt` before any other x87-mutating or
+    /// label line, at block labels, calls, inline asm, and returns — so the
+    /// x87 stack depth stays bounded by construction and the slot copy is
+    /// always correct for ordinary memory readers.
+    pub x87_pending: Option<u32>,
+    /// F64 binop results whose single use is the operand of the
+    /// immediately-following F64 binop (`compute_x87_defer_values`). Only
+    /// these may leave a rounded copy on the x87 stack via `fstpl; fldl`,
+    /// because the adjacency guarantee means no other instruction
+    /// can observe or clobber the window between store and consumption.
+    pub x87_defer_values: FxHashSet<u32>,
+    /// Suppresses the central x87-pending flush while `emit_float_binop`
+    /// emits its own controlled x87 sequences (dup / arith / store/reload).
+    /// Never set across an early-return boundary without being reset.
+    pub x87_suppress: bool,
+    /// Scalar FP value already resident in the SysV return register xmm0.
+    /// Set only by exact direct-result intrinsics immediately before Return.
+    pub direct_fp_result: Option<u32>,
+    /// Sibling-call conversion state (TODO-3 / §5b of the codegen-gaps
+    /// ledger). `Armed` is set at a qualifying call site before its
+    /// emission starts (argument setup runs unchanged); `Ready(target)`
+    /// once the call text itself has been suppressed and the tail target
+    /// resolved. `emit_return_impl` consumes `Ready` to emit
+    /// `<epilogue>; jmp target` instead of `<materialise>; epilogue; ret`.
+    /// Only the x86-64 backend arms it; other backends leave it `None`.
+    pub pending_sibcall: Option<SibcallPending>,
+    /// Driver-side per-block hint: the trailing call's dest value id (or
+    /// `None` for a void call) when this block's tail is a sibling-call
+    /// shape -- last instruction is the call, the terminator returns
+    /// exactly its result (or `Return(None)` for a void call), and the
+    /// result has no other use anywhere in the function. Set once per
+    /// block by the generation driver; consulted by the Call arms to arm
+    /// the backend. `None` in every other block.
+    pub sibcall_hint: Option<SibcallHint>,
+    /// The call-site marker lines (`# LCCC_CALL_ARGS`, `# LCCC_CHAIN_CALL`,
+    /// `# LCCC_CALL_FP`, ...) of the sibling call in flight, captured as
+    /// they are published at the suppressed call text. `emit_return_impl`
+    /// re-publishes them after the tail `jmp` behind `# LCCC_TAIL_CALL`,
+    /// which is what lets the peephole liveness oracle model that `jmp`
+    /// as a call-plus-return instead of an unknown transfer.
+    pub sibcall_marker_lines: Vec<String>,
+    /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
+    /// provably holds the vector data (128-bit vector register allocation).
+    pub vec_live_regs: FxHashMap<u32, &'static str>,
+    /// True once this function emitted any 256/512-bit vector instruction.
+    /// Dirty upper YMM halves trigger the AVX-SSE transition penalty in
+    /// callers that use legacy SSE encodings; the epilogue emits
+    /// `vzeroupper` before `ret` when this is set (IS-20).
+    pub dirty_upper_ymm: bool,
+    /// True once any function emitted a nested-function trampoline. The
+    /// stack must be executable for trampolines to work; the output's
+    /// .note.GNU-stack section is emitted with the "x" flag.
+    pub requires_executable_stack: bool,
+    /// Fully-formed `.section .data.rel.ro` template/slot blocks for i686
+    /// nested-function trampolines. Collected while functions emit code and
+    /// flushed once at the end of the module (AFTER the last text byte) —
+    /// switching sections in the middle of a function body interleaves
+    /// data directives into the peephole/assembler stream and corrupted
+    /// instruction/label mapping at -O1 (see 20000822-1).
+    pub trampoline_data_blocks: Vec<String>,
+    /// Whether any position-independent code generation is enabled. Backends
+    /// that do not distinguish PIE from full PIC retain this conservative bit.
+    pub pic_mode: bool,
+    /// Position-independent executable mode. x86-64 may address ordinary
+    /// executable data directly; full PIC and weak extern data still use GOT.
+    pub pie_mode: bool,
+    /// `-fno-plt`: call external/interposable functions indirectly via GOT.
+    pub no_plt: bool,
+    /// Shared-object output (`-shared`).
+    pub shared_lib: bool,
+    /// Driver-confirmed position-fixed ET_EXEC final link for this
+    /// invocation (see `CodegenOptions::fixed_exec_link`): absolute
+    /// link-time-resolvable forms (SIB-scale-8 switch tables) are allowed.
+    pub fixed_exec_link: bool,
+    /// Compilation-wide TLS model inputs: shared-library code (`-fPIC`/
+    /// `-fpic`/`-shared`) and the `-ftls-model=` floor.
+    pub tls_policy: crate::common::tls::TlsPolicy,
+    /// Final access model of every TLS symbol of the module
+    /// (`common::tls::model_table`, filled by `collect_symbol_sets`). Its key
+    /// set equals `tls_symbols`. Query through [`CodegenState::tls_model`].
+    pub tls_models: FxHashMap<String, crate::common::tls::TlsModel>,
+    /// Set of symbol names that are locally defined (not extern) and have internal
+    /// linkage (static) — these can use direct addressing even in PIC mode.
+    pub local_symbols: FxHashSet<String>,
+    /// Set of symbol names defined in this translation unit (functions, globals,
+    /// aliases, IFUNCs) — non-preemptible in `-fPIE` / `-fno-pic` executables.
+    pub defined_symbols: FxHashSet<String>,
+    /// Extern function linker names. Their addresses cannot use ELF data copy
+    /// relocations, so default-visibility function pointers remain GOT-based
+    /// in PIE even though ordinary extern data addresses may be direct.
+    pub extern_function_symbols: FxHashSet<String>,
+    /// Symbols declared `__attribute__((noplt))` and left undefined here:
+    /// their calls must not be routed through a PLT stub. Per-symbol form of
+    /// the compiled-in `-fno-plt` (`no_plt`), which stays the blanket switch.
+    pub noplt_symbols: FxHashSet<String>,
+    /// Compare-replay records: Cmp instructions whose boolean result is
+    /// consumed by exactly one Select or CondBranch that is NOT adjacent to
+    /// the Cmp (so pending-flag fusion cannot fire — an intervening ALU op
+    /// like `sub` clobbers the flags). The Cmp emitter skips setcc/movzbl;
+    /// the consumer re-emits `cmp` from the recorded operands and uses
+    /// `cmovcc`/`jcc` directly. Recorded per-function, keyed by Cmp dest.
+    pub cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    /// Symbols defined by numeric `.set sym, <number>` directives in top-level
+    /// asm (glibc-style absolute markers). Their address is a link-time
+    /// constant: emitted as `movq $sym`, never via GOT.
+    pub absolute_symbols: FxHashSet<String>,
+    /// Set of symbol names that are thread-local (_Thread_local / __thread).
+    /// These require TLS-specific access patterns (e.g., %fs:x@TPOFF on x86-64).
+    pub tls_symbols: FxHashSet<String>,
+    /// Whether the current function contains DynAlloca instructions.
+    /// When true, the epilogue must restore SP from the frame pointer instead of
+    /// adding back the compile-time frame size.
+    pub has_dyn_alloca: bool,
+    /// Whether to omit the frame pointer for this function.
+    /// When true, %rbp is not used for stack frame addressing and can be
+    /// used as a general-purpose register. Stack slots use %rsp-relative addressing.
+    pub omit_frame_pointer: bool,
+    /// The user's `-fomit-frame-pointer` / `-fno-omit-frame-pointer` request.
+    /// Module-wide: NOT cleared by `reset_for_function` (unlike
+    /// `omit_frame_pointer`, which is derived per function from this flag plus
+    /// the function's own constraints). Without this the CLI flag was dropped
+    /// entirely and `-fno-omit-frame-pointer` silently did nothing.
+    pub fpo_requested: bool,
+    /// Total frame size (for RSP-relative addressing when omit_frame_pointer is true).
+    /// Set after calculate_stack_space completes.
+    pub frame_size: i64,
+    /// Register value cache: tracks which IR values are in the accumulator and
+    /// secondary registers to skip redundant loads.
+    pub reg_cache: RegCache,
+    /// GEP decomposition: maps GEP result value ID → (base_value_id, offset_value_id).
+    /// Populated during instruction generation for GEPs with variable offsets.
+    /// Used by the FMA intrinsic codegen to detect SIB addressing opportunities.
+    pub gep_base_offset: FxHashMap<u32, (u32, u32)>,
+    /// Set of GEP result value IDs whose instructions were folded into Load/Store
+    /// and skipped during codegen. These values are never emitted — their registers
+    /// are uninitialized. MachInst must not use these as pointers.
+    pub folded_gep_values: FxHashSet<u32>,
+    /// Values proven never-materialized before slot assignment (foldable
+    /// GlobalAddr on i686 non-PIC): no register, no slot.
+    pub never_materialized_values: FxHashSet<u32>,
+    /// GlobalAddr values the prologue PROMOTED out of the never-materialized
+    /// set (PF-07: PIC indexed-symbol bases defined at a shallower loop depth
+    /// than their consumers). The instruction-generation dead-address scan
+    /// must NOT skip these: they carry a register home that
+    /// `emit_global_addr` materializes once and the SIB consumers read.
+    pub promoted_global_addr_homes: FxHashSet<u32>,
+    /// TLS `GlobalAddr` roots the generic emitter OMITTED for the current
+    /// function (value id -> symbol): every use is a load the backend's
+    /// direct-load hook must fold, since nothing materializes the address.
+    /// Backends whose hook only pays off for omitted roots consult this.
+    pub omitted_tls_roots: FxHashMap<u32, String>,
+    /// Name of the function currently being code-generated (diagnostics).
+    pub current_func_name: String,
+    /// Total use count for each value ID across the entire function.
+    /// Used by MachInst flush to determine if a buffer-defined vreg is live-out.
+    pub value_use_counts: Vec<u32>,
+    /// Width-qualified selector bounds, recomputed after phi lowering for
+    /// each function. They never license dropping width normalization.
+    pub switch_unsigned_bounds: FxHashMap<u32, (u32, u64)>,
+    /// Module-scoped permission, resolved once before function generation.
+    /// Preserved across function resets; facts themselves are always cleared.
+    pub switch_bounds_enabled: bool,
+    /// Use counts within the current block (set before block codegen).
+    /// Compared with value_use_counts to detect live-out values.
+    pub block_use_counts: FxHashMap<u32, u32>,
+    /// Loads whose single use is an adjacent `Cmp { Eq|Ne, rhs = imm }` and
+    /// that are therefore folded into a memory compare (`cmpb/cmpw/cmpl $imm,
+    /// (mem)`) by the backend. Keyed by the Load's dest value id; the value
+    /// maps to (pointer value id, loaded type, compare immediate) so the Cmp
+    /// can re-stage the address and emit the immediate. Cleared per block.
+    /// Only the i686 backend sets `supports_load_cmp_mem_fold`.
+    pub pending_load_cmp: FxHashMap<u32, (u32, IrType, i64)>,
+    /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern).
+    /// Used by the Linux kernel for Spectre v2 (retbleed) mitigation.
+    pub function_return_thunk: bool,
+    /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern).
+    /// Used by the Linux kernel for Spectre v2 (retpoline) mitigation.
+    pub indirect_branch_thunk: bool,
+    /// -mindirect-branch=thunk-inline: emit the full retpoline sequence at
+    /// every indirect call/jump site instead of calling an external
+    /// __x86_indirect_thunk_REG. The kernel vDSO needs this: it is userspace
+    /// code that cannot reference kernel-internal thunk symbols.
+    pub indirect_branch_thunk_inline: bool,
+    /// Is the call currently being emitted a call to a VARIADIC callee?
+    ///
+    /// Set by the generic `emit_call` before argument setup. SysV AMD64 3.5.7
+    /// only requires %al to carry the number of live SSE argument registers
+    /// when the callee is variadic; for a prototyped non-variadic callee the
+    /// `xorl %eax,%eax` is pure waste. GCC omits it there.
+    pub call_is_variadic: bool,
+    /// Does the call being emitted pass a 256/512-bit vector in a YMM/ZMM
+    /// register (`CallArgClass::StructXmmReg` wider than 16 bytes)?
+    ///
+    /// Set by the generic `emit_call` from the authoritative classification.
+    /// A function with dirty upper YMM state cleans it with `vzeroupper`
+    /// before an ordinary call (GCC 16.2 / Clang 23.1.4 do the same), except
+    /// at such a call: `vzeroupper` would zero the argument's upper lanes.
+    /// The sibcall exit applies the identical test
+    /// (`SibcallPending::preserve_upper_vector_lanes`).
+    pub call_passes_wide_vector: bool,
+    /// Was a `SetStaticChain` emitted since the last call/transfer emission?
+    ///
+    /// The nested-call lowering stages the static chain into %r10 directly
+    /// before the call (the IR inserts `SetStaticChain` immediately ahead of
+    /// every nested call site). The next `Call`/`CallIndirect` consumes this
+    /// flag and publishes `# LCCC_CHAIN_CALL` after the call text, mirroring
+    /// `call_is_variadic`'s marker contract: the late text peephole's
+    /// liveness oracles then model the ABI-invisible %r10 read ONLY at chain
+    /// calls, instead of at every call (which pinned every %r10-scratch
+    /// value across calls and blocked the LEA→memory window fold on the
+    /// RA's favorite scratch register).
+    pub chain_call: bool,
+    /// Number of leading x86-64 SysV GP argument registers the call being
+    /// emitted actually reads (0..=6).  Set by the x86-64 argument emitter
+    /// from the authoritative `CallArgClass` classification and published
+    /// as `# LCCC_CALL_ARGS <n>` after the call text (the same authority
+    /// contract as `call_is_variadic` / `chain_call`): the late text
+    /// peephole's GP liveness oracle conservatively modeled EVERY call as
+    /// reading all six argument registers, which pinned any value the RA
+    /// homed in %rdx/%rcx/... across calls and blocked the load→compare
+    /// fold whenever the chase scratch landed in an argument register
+    /// (the hash-chain kernel after the two-block unroller's profitability
+    /// gate shifted its register allocation).  6 = the conservative
+    /// default (i686, hand-written fragments, non-argument call paths).
+    pub call_gp_arg_count: usize,
+    /// Number of leading x86-64 SysV SSE argument registers the call being
+    /// emitted actually reads (0..=8).  Armed by the x86-64 register-argument
+    /// phase from the same authoritative `CallArgClass` classification and
+    /// published as `# LCCC_CALL_FP <n>` after the call text (the same
+    /// authority contract as `call_gp_arg_count`).  The FP liveness oracle's
+    /// fallback (no marker) reconstructs the set from the `movb $N, %al`
+    /// census or the staged-move window — but the census is DELETED by the
+    /// GP dead-write pass for non-variadic callees (legitimately: %al is
+    /// dead there), and the window walk is a heuristic; a call site that
+    /// stages FP arguments across a hazard-area release (`addq $K, %rsp`)
+    /// or a deep relay chain was modeled as reading NO xmm register, and
+    /// `eliminate_dead_vector_copies` deleted live argument staging
+    /// (found via PR #584's CI: a 10-double call lost 7 of 8 register
+    /// arguments).  `None` = the marker is not published (hand-written
+    /// fragments, raw `call` emissions, MachInst calls) and the oracle
+    /// falls back to the census/window heuristics; `Some(n)` is exact.
+    pub call_fp_arg_count: Option<usize>,
+    /// Patchable function entry: (total_nops, nops_before_entry).
+    /// When set, emits NOP padding around function entry points and records
+    /// them in __patchable_function_entries for runtime patching (ftrace).
+    pub patchable_function_entry: Option<(u32, u32)>,
+    /// Function-entry mcount instrumentation (-pg / -mfentry / -mrecord-mcount /
+    /// -mnop-mcount). When set, emits a 5-byte call (or NOP) at function entry,
+    /// optionally recorded in __mcount_loc for the runtime patcher.
+    pub mcount: Option<crate::backend::McountInstrumentation>,
+    /// Set by generate_function for classic (non-fentry) mcount: the `call
+    /// mcount` must be emitted AFTER the frame is established (push %rbp; mov
+    /// %rsp, %rbp) — GCC measures to the same shape and the classic mcount ABI
+    /// reads the parent PC through the frame. Holds the site label when the
+    /// site is recorded in __mcount_loc. The backend prologue consumes
+    /// (take()s) the label right after frame setup.
+    pub pending_classic_mcount_label: Option<String>,
+    /// One-shot warning latch: -pg requested on a target whose backend does
+    /// not yet emit mcount sites (honest degradation, never silent).
+    pub mcount_unsupported_warned: bool,
+    /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
+    pub cf_protection_branch: bool,
+    /// `-fstack-clash-protection` enabled for this compilation unit.
+    pub stack_clash_protection: bool,
+    /// Resolved stack-protector guard configuration for `IntrinsicOp::LoadStackGuard`.
+    pub stack_protector_guard: Option<crate::backend::stack_protector::EffectiveStackGuard>,
+    /// Current program point during codegen (incremented per instruction).
+    /// Used by Phase 2b selective caller-save save/restore.
+    pub current_program_point: u32,
+    /// Maps an F128 value ID to the memory location it was loaded from.
+    /// This enables full-precision F128 operations (casts, comparisons, stores)
+    /// by reloading directly from the original memory location instead of using
+    /// a lossy f64 intermediate.
+    ///
+    /// The tuple is `(source_value_id, byte_offset, is_indirect)`:
+    /// - `source_value_id`: The alloca or pointer value whose slot contains the data.
+    /// - `byte_offset`: Offset from the source slot's base address.
+    /// - `is_indirect`: If true, the source slot holds a pointer that must be
+    ///   dereferenced. If false, the F128 data is directly at the slot.
+    ///
+    /// x86 uses this for x87 `fldt` from original memory (typically offset=0, is_indirect=false).
+    /// ARM/RISC-V use this for IEEE binary128 soft-float operations with full 16-byte precision.
+    pub f128_load_sources: FxHashMap<u32, (u32, i64, bool)>,
+    /// Values whose 16-byte slots contain full x87 80-bit data (via fstpt),
+    /// not a pointer. These are F128 call results or other values where
+    /// full precision was preserved directly in the slot.
+    pub f128_direct_slots: FxHashSet<u32>,
+    /// The current text section name for this function. Defaults to ".text" but
+    /// may be a custom section (e.g., ".init.text") for functions with
+    /// __attribute__((section("..."))). Used to restore the correct section
+    /// after emitting data (e.g., jump tables) in other sections.
+    pub current_text_section: String,
+    /// Retain is part of a text section's identity: GAS permits same-named
+    /// retained and non-retained sections, and both must be restored exactly
+    /// after a jump table or per-function constant pool.
+    pub current_text_retain: bool,
+    /// Whether to use the kernel code model (-mcmodel=kernel). All symbols
+    /// are assumed to be in the negative 2GB of the virtual address space.
+    /// Uses absolute sign-extended 32-bit addressing (movq $symbol) for
+    /// global address references, producing R_X86_64_32S relocations.
+    pub code_model_kernel: bool,
+    /// Whether to disable jump table emission for switch statements (-fno-jump-tables).
+    pub no_jump_tables: bool,
+    /// Set of symbol names declared as weak extern (e.g., `extern __weak`).
+    /// On AArch64, these need GOT-indirect addressing because the linker
+    /// rejects R_AARCH64_ADR_PREL_PG_HI21 against symbols that may bind externally.
+    pub weak_extern_symbols: FxHashSet<String>,
+    /// SSA values that use 4-byte (32-bit) stack slots instead of the default 8-byte.
+    /// On 64-bit targets, I32/U32/F32 and smaller types can use 4-byte slots,
+    /// reducing stack frame sizes by ~40%. Store/load paths check this set to
+    /// emit 4-byte instructions (movl, sw/lw, str/ldr w-reg) instead of 8-byte.
+    pub small_slot_values: FxHashSet<u32>,
+    /// Explicit non-stack homes. Register and accumulator residency share one
+    /// location contract rather than parallel convention sets.
+    pub explicit_locations: FxHashMap<u32, ExplicitLocation>,
+    /// Allocator-issued accumulator homes for the current function.
+    pub ra_accumulator_values: FxHashSet<u32>,
+    /// Values that are promoted InlineAsm output results. Like allocas, their
+    /// stack slot holds the value directly (not a pointer). The asm emitter
+    /// stores the output register to this slot after the asm, and subsequent
+    /// uses load the value from it.
+    pub asm_output_values: FxHashSet<u32>,
+    /// Values whose stack slots must not be reused for other values.
+    /// This includes DynAlloca results (which hold pointers to dynamically
+    /// allocated stack space) and other vectorization-critical values.
+    /// The backend's slot allocation must preserve these values' slots for
+    /// their entire live range to prevent corruption.
+    pub protected_slot_values: FxHashSet<u32>,
+    /// Whether to emit .file/.loc debug directives for source-level debugging.
+    pub debug_info: bool,
+    /// `-g`: the closing brace's `.loc`, set while a `return` is emitted and
+    /// placed by the epilogue (GCC's row), so a debugger stops at `}`.
+    pub pending_epilogue_loc: Option<String>,
+    /// Pre-computed parameter classifications for the current function.
+    /// Populated by `emit_store_params` so that `emit_param_ref` can access them.
+    pub param_classes: Vec<crate::backend::call_abi::ParamClass>,
+    /// Number of function parameters (for ParamRef bounds checking).
+    pub num_params: usize,
+    /// Whether the current function is variadic (for ParamRef ABI handling).
+    pub func_is_variadic: bool,
+    /// Stack slots for parameter allocas, indexed by param_idx.
+    /// Populated by `emit_store_params` so that `emit_param_ref` can load the
+    /// parameter value from its alloca slot (where emit_store_params saved it)
+    /// instead of reading from ABI registers that may have been clobbered.
+    /// Over-aligned-param homing-store elision: (store value id = ParamRef
+    /// dest, alloca value id) pairs for `store %p, %a` instructions whose
+    /// effect the prologue capture already performed (it wrote the incoming
+    /// value to the alloca's EFFECTIVE aligned address). Emitting the store
+    /// would re-load the dest slot and re-write the alloca — two memory ops
+    /// per over-aligned parameter. `emit_store_impl` elides them.
+    pub param_homing_stores: FxHashSet<(u32, u32)>,
+    /// x86-64 only: rematerialize constant-offset addresses of ordinary
+    /// allocas as direct frame operands instead of reloading a spilled copy.
+    pub frame_gep_direct: bool,
+    /// Single-definition `GEP(alloca, const)` values -> (alloca, byte offset),
+    /// valid for the current function (see `stack_layout`).
+    pub frame_offset_aliases: FxHashMap<u32, (u32, i64)>,
+    /// ParamRef dests whose ONLY use was the elided homing store: dead after
+    /// the elision. `emit_param_ref_impl` skips them entirely.
+    pub dead_param_ref_dests: FxHashSet<u32>,
+    /// Per-parameter alloca home: (slot, alloca IR type, alloca value id).
+    /// The value id lets ParamRef resolve over-aligned (>16) parameter
+    /// allocas through `alloca_over_align` / `emit_alloca_addr_to`, whose
+    /// effective address differs from the raw slot by the alignment pad.
+    pub param_alloca_slots: Vec<Option<(StackSlot, IrType, u32)>>,
+    /// Set of param indices whose values have been pre-stored directly to a
+    /// callee-saved register during `emit_store_params`. `emit_param_ref` can
+    /// skip the alloca load for these and just emit a no-op (the value is
+    /// already in the register-allocated destination).
+    pub param_pre_stored: FxHashSet<usize>,
+    /// Entry-prefix `VecLoad` results whose value the prologue already moved
+    /// from the incoming `%xmmN`/`%ymmN` argument register into the load's
+    /// register home (`regalloc_helpers::x86_vector_param_loads`). The load
+    /// instruction itself emits nothing.
+    pub vec_param_preloaded: FxHashSet<u32>,
+    /// Whether the current function returns a struct via hidden pointer (sret).
+    /// On i386 SysV ABI, such functions must use `ret $4` to pop the hidden
+    /// pointer argument from the caller's stack.
+    pub uses_sret: bool,
+    /// Whether to place each function in its own section (-ffunction-sections).
+    pub function_sections: bool,
+    /// Whether to place each data object in its own section (-fdata-sections).
+    pub data_sections: bool,
+    /// Whether any 64-bit division/modulo runtime helper (i686: lccc's private
+    /// `__lccc_divdi3` family) was referenced during code generation.
+    /// When true, the i686 backend emits weak implementations of these functions
+    /// so that standalone builds (without libgcc) can link successfully.
+    pub needs_divdi3_helpers: bool,
+    /// Whether to emit CFI directives (.cfi_startproc, .cfi_endproc, etc.)
+    /// for generating .eh_frame unwind tables. Enabled by default (like GCC).
+    pub emit_cfi: bool,
+    /// Emit bare `.cfi_startproc`/`.cfi_endproc` around every function and
+    /// no other CFI; the backend derives the unwind info from the final code
+    /// after its peephole (`cfi_synth`) or strips the markers when `emit_cfi`
+    /// is off. The x86 peephole delimits functions by these two directives:
+    /// its exact liveness and every whole-function proof answer only inside
+    /// a delimited function, and its input is now identical with and
+    /// without unwind tables (previously `-fno-asynchronous-unwind-tables`
+    /// disabled those passes: +21% instructions on SQLite's select.c, while
+    /// prologue CFI in the default mode blocked callee-save elimination).
+    pub fn_boundary_markers: bool,
+    /// Functions that received the codegen's boundary markers. Only these
+    /// are rewritten after the peephole (the `.cfi_startproc` right after
+    /// `NAME:` through the `.cfi_endproc` right before `.size NAME, .-NAME`),
+    /// so CFI the user writes in top-level asm is never touched.
+    pub fn_boundary_marked: FxHashSet<String>,
+    /// `-g`: each function's entry line row `(file, line, column)` -- the
+    /// body's opening brace -- keyed by its label. Not emitted inline:
+    /// the peephole's and CFI synthesis's entry matchers rely on the exact
+    /// `NAME:` / `.cfi_startproc` / prologue shape, so the `.loc` is
+    /// inserted after all of them by [`crate::backend::insert_fn_entry_locs`].
+    pub fn_entry_locs: FxHashMap<String, (u32, u32, u32)>,
+    /// i686: bytes a directly called function pops on return (`ret $N`:
+    /// the i386 SysV hidden struct-return pointer, the stack arguments of a
+    /// fastcall callee), keyed by callee symbol. The call's text does not
+    /// say so, yet %esp after the call depends on it: the codegen folds the
+    /// pop into its cleanup (`addl $12` after a 16-byte sret call), so
+    /// `cfi_synth` needs it to keep the CFA exact past such a call. `None`:
+    /// call sites disagree (incompatible declarations of one function), so
+    /// no single amount describes every call.
+    pub callee_pops_direct: FxHashMap<String, Option<u32>>,
+    /// i686: per function, the bytes each indirect call pops, in emission
+    /// order (`None`: not knowable, e.g. `__builtin_apply`'s call).
+    pub callee_pops_indirect: FxHashMap<String, Vec<Option<u32>>>,
+
+    /// Floating-point constant pool: maps bit pattern → label name.
+    /// FP constants are emitted as .rodata entries and loaded via
+    /// `movsd .LCFPxx(%rip), %xmm` instead of `movabsq + movq`.
+    pub fp_const_pool: FxHashMap<u64, String>,
+    /// Full-width VECTOR constant pool (16/32 bytes, little-endian) for
+    /// emitters that fold a constant vector as a VEX memory operand.
+    pub vec_const_pool: FxHashMap<Vec<u8>, String>,
+    /// Label emitted immediately after the current block, if any. Used to
+    /// elide unconditional jumps on the hot fall-through path.
+    pub next_block_label: Option<BlockId>,
+    /// Next globally unused block-label number reserved for backend-generated
+    /// asm-goto output trampolines.
+    next_synthetic_block_id: u32,
+    /// Output-materialization trampolines queued by inline asm emission and
+    /// drained after the function's ordinary IR blocks have been emitted.
+    pub pending_asm_goto_trampolines: Vec<PendingAsmGotoTrampoline>,
+    /// CondBranch condition values whose truth is the live x86 condition
+    /// flags produced by an immediately preceding asm-goto flag output,
+    /// mapped to the full `jcc` mnemonic to emit. The x86 backend consumes
+    /// these to branch directly without a cmp/test.
+    pub asm_cc_branch_values: FxHashMap<u32, String>,
+    /// Condition-code output pointers whose only IR reads are certified
+    /// branches in `asm_cc_branch_values`; their setcc/store is dead.
+    pub asm_cc_branch_output_ptrs: FxHashSet<u32>,
+    /// Output offset immediately after the current observable block's label.
+    /// `None` means its address is not observed. Owned by the shared block
+    /// driver; reset between functions, never inferred from assembly labels.
+    observable_block_start: Option<usize>,
+}
+
+impl CodegenState {
+    /// Record what the callee of the call just emitted pops on return; see
+    /// `callee_pops_direct`. `direct` is the callee symbol, `None` for an
+    /// indirect call. Every call is recorded, pop or not: a direct callee's
+    /// sites must agree, and the indirect list must line up with the
+    /// indirect calls of the final code.
+    pub fn record_call_pop(&mut self, direct: Option<&str>, pops: Option<u32>) {
+        self.record_call_pop_for_emission(
+            direct,
+            pops,
+            EXPLORATORY_EMISSION.with(std::cell::Cell::get),
+        );
+    }
+
+    fn record_call_pop_for_emission(
+        &mut self,
+        direct: Option<&str>,
+        pops: Option<u32>,
+        exploratory: bool,
+    ) {
+        // Dual-layout probes discard their assembly. Their call-site facts
+        // must be discarded too, or an indirect pop list describes three
+        // emitted bodies while the final stream contains only one.
+        if exploratory {
+            return;
+        }
+        match direct {
+            Some(name) => match self.callee_pops_direct.get_mut(name) {
+                Some(seen) => {
+                    if *seen != pops {
+                        *seen = None;
+                    }
+                }
+                None => {
+                    self.callee_pops_direct.insert(name.to_string(), pops);
+                }
+            },
+            None => self
+                .callee_pops_indirect
+                .entry(self.current_func_name.clone())
+                .or_default()
+                .push(pops),
+        }
+    }
+
+    /// Convenience constructor for direct backend/unit-test users. The normal
+    /// driver path calls [`Self::new_with_ra_config`] with its one captured
+    /// configuration object instead.
+    pub fn new() -> Self {
+        Self::new_with_ra_config(Arc::new(
+            crate::backend::regalloc::RaConfig::from_process_env(),
+        ))
+    }
+
+    pub fn new_with_ra_config(ra_config: Arc<crate::backend::regalloc::RaConfig>) -> Self {
+        Self {
+            out: AsmOutput::new(),
+            disable_regalloc: false,
+            ra_config,
+            stack_offset: 0,
+            value_locations: FxHashMap::default(),
+            incoming_byval_slots: FxHashMap::default(),
+            alloca_values: FxHashSet::default(),
+            volatile_alloca_values: FxHashSet::default(),
+            alloca_types: FxHashMap::default(),
+            alloca_alignments: FxHashMap::default(),
+            i128_values: FxHashSet::default(),
+            wide_values: FxHashSet::default(),
+            vector_values: FxHashSet::default(),
+            vector128_values: FxHashSet::default(),
+            vec_last_store_slot: None,
+            vec_last_store_val: None,
+            vec_last_store_reg: false,
+            vec_last_store_reg_name: None,
+            sse_last_store_slot: None,
+            sse_last_store_val: None,
+            sse_last_store_reg: false,
+            sse_last_store_reg_name: None,
+            vector_defer_values: FxHashSet::default(),
+            vector_memfold_values: FxHashSet::default(),
+            vector_memfold_homed_ok: FxHashSet::default(),
+            vector_dying_values: FxHashSet::default(),
+            pending_vec_memfold: None,
+            pending_vec_store: None,
+            x87_pending: None,
+            x87_defer_values: FxHashSet::default(),
+            x87_suppress: false,
+            direct_fp_result: None,
+            pending_sibcall: None,
+            sibcall_hint: None,
+            sibcall_marker_lines: Vec::new(),
+            vec_live_regs: FxHashMap::default(),
+            dirty_upper_ymm: false,
+            requires_executable_stack: false,
+            trampoline_data_blocks: Vec::new(),
+            pic_mode: false,
+            shared_lib: false,
+            fixed_exec_link: false,
+            tls_policy: crate::common::tls::TlsPolicy::default(),
+            tls_models: FxHashMap::default(),
+            pie_mode: false,
+            no_plt: false,
+            local_symbols: FxHashSet::default(),
+            defined_symbols: FxHashSet::default(),
+            extern_function_symbols: FxHashSet::default(),
+            noplt_symbols: FxHashSet::default(),
+            cmp_replay: FxHashMap::default(),
+            absolute_symbols: FxHashSet::default(),
+            tls_symbols: FxHashSet::default(),
+            has_dyn_alloca: false,
+            omit_frame_pointer: false,
+            fpo_requested: true, // -fomit-frame-pointer is the default at -O1+
+            frame_size: 0,
+            reg_cache: RegCache::default(),
+            gep_base_offset: FxHashMap::default(),
+            folded_gep_values: FxHashSet::default(),
+            never_materialized_values: FxHashSet::default(),
+            promoted_global_addr_homes: FxHashSet::default(),
+            omitted_tls_roots: FxHashMap::default(),
+            current_func_name: String::new(),
+            value_use_counts: Vec::new(),
+            switch_unsigned_bounds: FxHashMap::default(),
+            switch_bounds_enabled: false,
+            block_use_counts: FxHashMap::default(),
+            pending_load_cmp: FxHashMap::default(),
+            function_return_thunk: false,
+            indirect_branch_thunk: false,
+            indirect_branch_thunk_inline: false,
+            call_is_variadic: false,
+            call_passes_wide_vector: false,
+            chain_call: false,
+            call_gp_arg_count: 6,
+            call_fp_arg_count: None,
+            patchable_function_entry: None,
+            mcount: None,
+            pending_classic_mcount_label: None,
+            mcount_unsupported_warned: false,
+            cf_protection_branch: false,
+            stack_clash_protection: false,
+            stack_protector_guard: None,
+            current_program_point: 0,
+            f128_load_sources: FxHashMap::default(),
+            f128_direct_slots: FxHashSet::default(),
+            current_text_section: ".text".to_string(),
+            current_text_retain: false,
+            code_model_kernel: false,
+            no_jump_tables: false,
+            weak_extern_symbols: FxHashSet::default(),
+            small_slot_values: FxHashSet::default(),
+            explicit_locations: FxHashMap::default(),
+            ra_accumulator_values: FxHashSet::default(),
+            asm_output_values: FxHashSet::default(),
+            protected_slot_values: FxHashSet::default(),
+            debug_info: false,
+            pending_epilogue_loc: None,
+            param_classes: Vec::new(),
+            num_params: 0,
+            func_is_variadic: false,
+            param_alloca_slots: Vec::new(),
+            param_homing_stores: FxHashSet::default(),
+            frame_gep_direct: false,
+            frame_offset_aliases: FxHashMap::default(),
+            dead_param_ref_dests: FxHashSet::default(),
+            param_pre_stored: FxHashSet::default(),
+            vec_param_preloaded: FxHashSet::default(),
+            uses_sret: false,
+            function_sections: false,
+            data_sections: false,
+            needs_divdi3_helpers: false,
+            emit_cfi: true,
+            fn_boundary_markers: false,
+            fn_boundary_marked: FxHashSet::default(),
+            fn_entry_locs: FxHashMap::default(),
+            callee_pops_direct: FxHashMap::default(),
+            callee_pops_indirect: FxHashMap::default(),
+
+            fp_const_pool: FxHashMap::default(),
+            vec_const_pool: FxHashMap::default(),
+            next_block_label: None,
+            next_synthetic_block_id: 0,
+            pending_asm_goto_trampolines: Vec::new(),
+            asm_cc_branch_values: FxHashMap::default(),
+            asm_cc_branch_output_ptrs: FxHashSet::default(),
+            observable_block_start: None,
+        }
+    }
+
+    pub fn next_label_id(&mut self) -> u32 {
+        self.out.next_label_id()
+    }
+
+    /// Reserve synthetic `.LBBn` labels after every real module block label.
+    /// Called once before module emission, when all renumbered IR labels are
+    /// known.
+    pub fn reserve_synthetic_block_ids_after(&mut self, max_real_id: Option<u32>) {
+        self.next_synthetic_block_id = max_real_id.map_or(0, |id| {
+            id.checked_add(1)
+                .expect("IR block label space exhausted by asm-goto trampoline")
+        });
+        self.pending_asm_goto_trampolines.clear();
+    }
+
+    /// Allocate a module-unique block-style label for an out-of-line asm-goto
+    /// output trampoline.
+    pub fn fresh_synthetic_block_id(&mut self) -> BlockId {
+        let id = self.next_synthetic_block_id;
+        self.next_synthetic_block_id = id
+            .checked_add(1)
+            .expect("asm-goto trampoline label space exhausted");
+        BlockId(id)
+    }
+
+    /// Start the address-identity region AFTER emitting this block's label.
+    /// The shared driver owns this boundary; individual instruction emitters do
+    /// not maintain a parallel counter that can drift from the actual output.
+    pub fn begin_block_address_identity(&mut self, observable: bool) {
+        self.observable_block_start = observable.then_some(self.out.buf.len());
+    }
+
+    /// A fallthrough fold needs positive evidence of bytes in THIS block, not
+    /// a guess about the last label in the module. Padding may emit zero bytes;
+    /// unknown directives, inline assembly and a rewound buffer fail closed.
+    /// The common, non-address-taken case is O(1) and examines no assembly.
+    pub fn fallthrough_would_alias_observable_label(&self) -> bool {
+        let Some(start) = self.observable_block_start else {
+            return false;
+        };
+        self.out
+            .buf
+            .get(start..)
+            .is_none_or(|body| !crate::backend::label_identity::has_separating_instruction(body))
+    }
+
+    /// Mark that a `.section` directive for a NON-TEXT section has just been
+    /// emitted (e.g. `__patchable_function_entries`, `__mcount_loc`).
+    /// `emit_switch_to_section` compares `current_text_section` against the
+    /// requested section to skip no-op switches; without invalidating here,
+    /// `current_text_section` would still read as the last text section
+    /// (`.text` or a custom `-ffunction-sections` name) and the switch back
+    /// would be skipped, leaving the function body in the writable, non-
+    /// executable data section — calling the function would then segfault
+    /// (reproduced on main: `-fpatchable-function-entry=2,0` placed whole
+    /// function bodies into `__patchable_function_entries,"awo"`).
+    pub fn invalidate_text_section(&mut self) {
+        self.current_text_section.clear();
+    }
+
+    /// Return from an inline data section to the current function's exact
+    /// text-section variant without changing the remembered identity.
+    pub fn restore_current_text_section(&mut self) {
+        let flags = if self.current_text_retain {
+            "axR"
+        } else {
+            "ax"
+        };
+        self.out.emit_fmt(format_args!(
+            ".section {},\"{}\",@progbits",
+            self.current_text_section, flags
+        ));
+    }
+
+    /// Generate a fresh label with the given prefix.  Delegates to the single
+    /// allocator in [`AsmOutput`] so every emitter path shares one namespace.
+    pub fn fresh_label(&mut self, prefix: &str) -> String {
+        self.out.fresh_label(prefix)
+    }
+
+    /// Central x87-pending flush gate. Any emitted line that could mutate
+    /// the x87 stack (all x87 mnemonics start with `f`) or that begins a
+    /// merge point (label lines end with `:`) invalidates the cached
+    /// top-of-stack copy first by popping it. The slot copy written by the
+    /// non-popping `fstl` remains correct for memory readers, so this only
+    /// ever costs one `fstp %st(0)`. Inert on every backend that never sets
+    /// `x87_pending` (x86-64/ARM/RISC-V) and while `x87_suppress` is set
+    /// (the binop's own controlled sequences).
+    fn x87_pre_emit(&mut self, s: &str) {
+        if self.x87_pending.is_some() && !self.x87_suppress {
+            let is_x87_line = s.len() >= 5 && s.starts_with("    f");
+            if is_x87_line || s.ends_with(':') {
+                self.x87_pending = None;
+                self.out.emit("    fstp %st(0)");
+            }
+        }
+    }
+
+    /// Place the pending closing-brace row (see `pending_epilogue_loc`).
+    pub fn flush_epilogue_loc(&mut self) {
+        if let Some(loc) = self.pending_epilogue_loc.take() {
+            self.emit(&loc);
+        }
+    }
+
+    pub fn emit(&mut self, s: &str) {
+        self.x87_pre_emit(s);
+        self.out.emit(s);
+    }
+
+    /// Get or create a .rodata label for a floating-point constant.
+    /// Returns the label name (e.g., ".LCFP_3"). Constants are deduped
+    /// so the same bit pattern always returns the same label.
+    pub fn get_fp_const_label(&mut self, bits: u64) -> String {
+        if let Some(label) = self.fp_const_pool.get(&bits) {
+            return label.clone();
+        }
+        let label = format!(".LCFP_{}", self.out.next_label_id());
+        self.fp_const_pool.insert(bits, label.clone());
+        label
+    }
+
+    /// Label for a full-width VECTOR constant (16 or 32 bytes, little-
+    /// endian). Keyed by the exact byte pattern so equal masks share one
+    /// .rodata slot. Used by emitters that fold a constant vector as a VEX
+    /// memory operand (`vxorps .LCVEC_3(%rip), %src, %dst`) — the one-
+    /// instruction spelling of the FP-Neg sign-mask composite, exactly the
+    /// form GCC emits for `-x` lanes.
+    pub fn get_vec_const_label(&mut self, bytes: &[u8]) -> String {
+        if let Some(label) = self.vec_const_pool.get(bytes) {
+            return label.clone();
+        }
+        let label = format!(".LCVEC_{}", self.out.next_label_id());
+        self.vec_const_pool.insert(bytes.to_vec(), label.clone());
+        label
+    }
+
+    /// Emit all accumulated FP constants as a .rodata section.
+    /// Called once at the end of module codegen.
+    ///
+    /// Every constant gets a 16-byte-aligned, 16-byte slot (the 8-byte value
+    /// followed by an 8-byte zero pad). The scalar readers (movsd/movss) only
+    /// read the first 8/4 bytes, but the Fabs emitter loads these constants
+    /// with `andpd`/`andps`, whose m128 memory operand must be 16-byte
+    /// aligned — an 8-byte-aligned slot raises #GP whenever the constant
+    /// lands on an 8-mod-16 offset (reproduced: two FP functions in one TU,
+    /// F64 fabs + F32 fabs, SIGSEGV at the andpd). The zero pad also makes
+    /// the upper lane of the andpd mask zero, which is the correct identity
+    /// for scalar-typed lanes.
+    pub fn emit_fp_const_pool(&mut self) {
+        if self.fp_const_pool.is_empty() && self.vec_const_pool.is_empty() {
+            return;
+        }
+        self.out.emit(".section .rodata");
+        // Sort by label name for deterministic output
+        let mut entries: Vec<_> = self.fp_const_pool.iter().collect();
+        entries.sort_by_key(|(_, label)| (*label).clone());
+        for (bits, label) in entries {
+            // .p2align, NOT .align: on AArch64/RISC-V gas `.align N` means
+            // 2^N bytes, so `.align 16` silently requested 64KiB alignment
+            // per constant. That bloated .rodata by ~64KiB per entry and
+            // pushed the pool out of the AArch64 ldr-literal ±1MB range
+            // (R_AARCH64_LD_PREL_LO19 truncation at static link). .p2align 4
+            // is 16 bytes on every gas target.
+            self.out.emit(".p2align 4");
+            self.out.emit_fmt(format_args!("{}:", label));
+            self.out
+                .emit_fmt(format_args!("    .quad {}", *bits as i64));
+            self.out.emit("    .quad 0");
+        }
+        // Full-width vector constants: 16 or 32 little-endian bytes each,
+        // aligned to their own size -- the splat loads use the aligned
+        // `vmovdqa`/`movdqa` forms (a 32-byte entry at 16-byte alignment
+        // faulted `vmovdqa .LCVEC(%rip), %ymm` in the -O2 runtime matrix).
+        let mut ventries: Vec<_> = self.vec_const_pool.iter().collect();
+        ventries.sort_by_key(|(_, label)| (*label).clone());
+        for (bytes, label) in ventries {
+            self.out.emit(if bytes.len() > 16 {
+                ".p2align 5"
+            } else {
+                ".p2align 4"
+            });
+            self.out.emit_fmt(format_args!("{}:", label));
+            for chunk in bytes.chunks(8) {
+                let mut q = [0u8; 8];
+                q[..chunk.len()].copy_from_slice(chunk);
+                self.out
+                    .emit_fmt(format_args!("    .quad {}", u64::from_le_bytes(q) as i64));
+            }
+        }
+    }
+
+    /// Emit formatted assembly directly (no temporary String allocation).
+    #[inline]
+    pub fn emit_fmt(&mut self, args: std::fmt::Arguments<'_>) {
+        // Only pay for string formatting when a pending x87 copy is live
+        // (the flush gate needs the fully-formatted line to classify it).
+        if self.x87_pending.is_some() && !self.x87_suppress {
+            let s = std::fmt::format(args);
+            self.x87_pre_emit(&s);
+            self.out.emit(&s);
+        } else {
+            self.out.emit_fmt(args);
+        }
+    }
+
+    /// Emit a visibility directive (.hidden, .protected, .internal) if the symbol
+    /// has non-default visibility. No-op if `visibility` is None or "default".
+    pub fn emit_visibility(&mut self, name: &str, visibility: &Option<String>) {
+        if let Some(vis) = visibility {
+            match vis.as_str() {
+                "hidden" => self.emit_fmt(format_args!(".hidden {}", name)),
+                "protected" => self.emit_fmt(format_args!(".protected {}", name)),
+                "internal" => self.emit_fmt(format_args!(".internal {}", name)),
+                _ => {} // "default" or unknown: no directive needed
+            }
+        }
+    }
+
+    /// Emit linkage directives (.globl or .weak) for a non-static symbol.
+    /// No-op if `is_static` is true.
+    pub fn emit_linkage(&mut self, name: &str, is_static: bool, is_weak: bool) {
+        if !is_static {
+            if is_weak {
+                self.emit_fmt(format_args!(".weak {}", name));
+            } else {
+                self.emit_fmt(format_args!(".globl {}", name));
+            }
+        }
+    }
+
+    pub fn reset_for_function(&mut self) {
+        self.stack_offset = 0;
+        // ABI-marker protocol hygiene: `chain_call` is armed by a
+        // SetStaticChain emission and discharged by the next
+        // Call/CallIndirect emission that publishes `# LCCC_CHAIN_CALL`
+        // (same authority contract as `call_is_variadic` and
+        // `# LCCC_VA_CALL`). A SetStaticChain whose call was removed by
+        // late IR cleanup would leave the flag armed at function end, and
+        // the FIRST call of the NEXT function would carry a false marker.
+        // A false chain/VA marker only adds a conservative register read
+        // (never unsound), but it makes the markers lie -- and the text
+        // liveness oracles' contract is "marker ⟺ ABI-invisible read".
+        // Reset both per function; value ids are already function-local.
+        self.chain_call = false;
+        self.call_is_variadic = false;
+        self.call_passes_wide_vector = false;
+        self.call_gp_arg_count = 6;
+        self.call_fp_arg_count = None;
+        self.value_locations.clear();
+        self.incoming_byval_slots.clear();
+        self.alloca_values.clear();
+        self.volatile_alloca_values.clear();
+        self.alloca_types.clear();
+        self.alloca_alignments.clear();
+        self.i128_values.clear();
+        self.wide_values.clear();
+        self.never_materialized_values.clear();
+        self.promoted_global_addr_homes.clear();
+        self.omitted_tls_roots.clear();
+        self.switch_unsigned_bounds.clear();
+        self.has_dyn_alloca = false;
+        self.omit_frame_pointer = false;
+        self.pending_classic_mcount_label = None;
+        self.frame_size = 0;
+        self.reg_cache.invalidate_all();
+        self.f128_direct_slots.clear();
+        self.f128_load_sources.clear();
+        self.small_slot_values.clear();
+        self.vector_values.clear();
+        self.protected_slot_values.clear();
+        self.explicit_locations.clear();
+        self.ra_accumulator_values.clear();
+        self.asm_output_values.clear();
+        self.param_pre_stored.clear();
+        self.vec_param_preloaded.clear();
+        self.vec_last_store_slot = None;
+        self.vec_last_store_val = None;
+        self.vec_last_store_reg = false;
+        self.vec_last_store_reg_name = None;
+        self.sse_last_store_slot = None;
+        self.sse_last_store_val = None;
+        self.sse_last_store_reg = false;
+        self.sse_last_store_reg_name = None;
+        // Per-function vector classification sets MUST be cleared here. Value
+        // IDs are function-local; leaving these populated leaks classifications
+        // from previously compiled functions into the next one (a scalar value
+        // in function B colliding with a vector intrinsic result ID from
+        // function A is then copied via the vector path, emitting LEA instead
+        // of LOAD — adler32-style miscompile: vs2 initialized with the address
+        // of its slot).
+        self.vector_values.clear();
+        self.vector128_values.clear();
+        self.protected_slot_values.clear();
+        self.vector_defer_values.clear();
+        self.vector_memfold_values.clear();
+        self.pending_vec_memfold = None;
+        self.pending_vec_store = None;
+        self.x87_pending = None;
+        self.x87_defer_values.clear();
+        self.x87_suppress = false;
+        self.direct_fp_result = None;
+        self.pending_sibcall = None;
+        self.sibcall_hint = None;
+        self.sibcall_marker_lines.clear();
+        self.vec_live_regs.clear();
+        self.dirty_upper_ymm = false;
+        self.uses_sret = false;
+        self.next_block_label = None;
+        // Drop any trampolines a previous function failed to emit instead of
+        // asserting on them: a caller that returns before the drain (the
+        // `is_naked` path does) would otherwise panic every assertion-enabled
+        // build, and, worse, a release build would emit the stale trampolines
+        // into the *next* function. The drain itself asserts that it consumed
+        // the queue, so a genuine leak still fails loudly where it happens.
+        self.pending_asm_goto_trampolines.clear();
+        self.asm_cc_branch_values.clear();
+        self.asm_cc_branch_output_ptrs.clear();
+        self.observable_block_start = None;
+        // GEP-fold bookkeeping is function-local too: `folded_gep_values`
+        // holds the value IDs of skipped address producers, and value IDs
+        // restart at 0 in every function.  Without this clear, IDs leaked
+        // from function A made `rematerialize_const_addr` fire spuriously in
+        // function B on a colliding ID (emitting a stray lea over B's live
+        // accumulator / rematerialising a GEP that was never skipped there) —
+        // zlib-ng gen_bitlen corruption once the register-base fold
+        // relaxation flooded the set, making collisions deterministic.
+        // `gep_base_offset` is the same class (per-function GEP base/index
+        // cache keyed by value ID).
+        self.folded_gep_values.clear();
+        self.gep_base_offset.clear();
+    }
+
+    /// Invalidate the vector-register peephole state. Called at every emission
+    /// that may clobber %ymm0/%xmm0 or break straight-line guarantees: calls,
+    /// inline asm, atomics, memcpy, and block boundaries.
+    /// Invalidate scratch-register forwarding without discarding vector values
+    /// held in allocator-managed registers. Scalar FP emission can overwrite
+    /// xmm0/xmm1 while xmm3+ vector homes remain valid, so a deferred value
+    /// pending in the scratch registers must be flushed but the allocator
+    /// homes must stay live.
+    pub fn invalidate_vec_scratch_peephole(&mut self) {
+        self.vec_last_store_slot = None;
+        self.vec_last_store_val = None;
+        self.vec_last_store_reg = false;
+        self.vec_last_store_reg_name = None;
+        self.sse_last_store_slot = None;
+        self.sse_last_store_val = None;
+        self.sse_last_store_reg = false;
+        self.sse_last_store_reg_name = None;
+        self.direct_fp_result = None;
+    }
+
+    /// Invalidate all vector-register peephole state. Called when control flow
+    /// or an ABI/asm clobber also makes allocator-managed vector homes unsafe.
+    pub fn invalidate_vec_peephole(&mut self) {
+        self.invalidate_vec_scratch_peephole();
+        self.vec_live_regs.clear();
+        // NOTE: dirty_upper_ymm is deliberately NOT cleared here. The vec
+        // peephole cache is compiler bookkeeping, but upper-half dirtiness is
+        // physical machine state that persists until an explicit vzeroupper
+        // (or the epilogue's); invalidating the cache mid-function must not
+        // lose the pending epilogue emission.
+    }
+
+    /// Record that vector value `v` is currently held in the physical
+    /// vector register named `reg` ("xmm5"/"ymm3"/"zmm0"). One physical
+    /// register bank holds exactly one vector value: every OTHER value's
+    /// claim on the same bank is evicted — the write that produced `v`
+    /// destroyed whatever the bank held before (a VEX.128 write also
+    /// zeroes the bank's upper half, and a 256/512-bit write overwrites
+    /// the low view, so the eviction is alias-conservative across the
+    /// xmm/ymm/zmm spellings of the same bank in both directions: at
+    /// worst it costs a redundant reload, never a wrong read).
+    ///
+    /// The eviction is the soundness fix for the stale-claim hazard: a
+    /// scratch bank claimed by two values — the add's accumulator claim
+    /// on xmm0 outlived the shift that redefined xmm0, and the xor's
+    /// operand resolver then read the shift's result as the accumulator
+    /// (`vpxor (v>>1), (v>>1)` — the simd_vecreg loopcarry miscompile).
+    /// Claims are only ever recorded after a real write of `v` into
+    /// `reg`, so eviction at the claim is exactly the point where the
+    /// previous content provably died.
+    pub fn vec_claim_live_reg(&mut self, v: u32, reg: &'static str) {
+        let bank = vector_reg_bank(reg);
+        self.vec_live_regs
+            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == v);
+        self.vec_live_regs.insert(v, reg);
+    }
+
+    /// Every value's `vec_live_regs` claim on `reg`'s bank EXCEPT `keep`
+    /// dies here: the bank is being overwritten with data that is (or
+    /// will be) `keep`'s — a real load into the scratch view, or a
+    /// move-aside `movdqa held -> reg`. Without this eviction a claim
+    /// survived the very clobber that invalidated it, and a later
+    /// operand resolver read the WRONG value out of the register (the
+    /// simd_vecreg loopcarry shape: the accumulator's claim on xmm0
+    /// outlived both the streamed reload and the shift that redefined
+    /// xmm0; the xor then consumed `(v>>1) ^ (v>>1)`).
+    pub fn vec_evict_bank_except(&mut self, reg: &str, keep: u32) {
+        let bank = vector_reg_bank(reg);
+        self.vec_live_regs
+            .retain(|&other, &mut r| vector_reg_bank(r) != bank || other == keep);
+    }
+
+    /// Get the over-alignment requirement for an alloca (> 16 bytes), or None.
+    pub fn alloca_over_align(&self, v: u32) -> Option<usize> {
+        self.alloca_alignments.get(&v).copied()
+    }
+
+    pub fn is_alloca(&self, v: u32) -> bool {
+        self.alloca_values.contains(&v)
+    }
+
+    /// Check if a value has a direct stack slot (the slot holds the value itself,
+    /// not a pointer to the value). This is true for allocas and promoted InlineAsm
+    /// output values.
+    pub fn is_direct_slot(&self, v: u32) -> bool {
+        self.alloca_values.contains(&v) || self.asm_output_values.contains(&v)
+    }
+
+    pub fn get_slot(&self, v: u32) -> Option<StackSlot> {
+        self.value_locations.get(&v).copied()
+    }
+
+    /// The slot that holds this VALUE's own bits (its data home), or `None`
+    /// when the value's slot means something else.
+    ///
+    /// An alloca's slot is the STORAGE the alloca denotes, not a home for the
+    /// value: the value of an alloca is the slot's ADDRESS. Reading the slot
+    /// therefore yields the pointee's bytes. Any consumer that wants the value
+    /// itself (a cast, an arithmetic operand, a return) must materialize
+    /// `leaq slot` and must use this accessor instead of [`Self::get_slot`]
+    /// so a slot lookup cannot silently rewrite `(int)(uintptr_t)&local` into
+    /// a read of `local` — the exact miscompile the register-direct narrowing
+    /// cast emitted (`movl slot, %reg` instead of `leaq slot` + truncation).
+    ///
+    /// `get_slot` stays the right accessor for address consumers (Load/Store
+    /// bases, `AllocaAddr` resolution), where the slot IS what is wanted.
+    pub fn data_home_slot(&self, v: u32) -> Option<StackSlot> {
+        if self.alloca_values.contains(&v) {
+            None
+        } else {
+            self.get_slot(v)
+        }
+    }
+
+    pub fn is_i128_value(&self, v: u32) -> bool {
+        self.i128_values.contains(&v)
+    }
+
+    /// Check if a value uses a 4-byte (small) stack slot.
+    /// Used by store/load paths to emit 4-byte instructions instead of 8-byte.
+    ///
+    /// Soundness contract (enforced by the slot allocator):
+    ///   1. Small slots are only allocated on targets whose store/load paths
+    ///      are width-consistent (x86-64 and i686; see
+    ///      set_target_small_slots), and only for values proven no wider than
+    ///      four bytes. i686's proof propagates through untyped Copy webs.
+    ///   2. Slot sharing is partitioned by exact size class — Tier 3 free
+    ///      lists, Tier 2 graph coloring and copy-alias resolution never mix
+    ///      4-byte and 8-byte occupants of the same physical slot. A 4-byte
+    ///      store therefore can never leave stale bytes that a later 64-bit
+    ///      access of the SAME slot could observe.
+    ///   3. Every access path honours the width: stores use movl, loads use
+    ///      the type-aware movzbl/movzwl/movl/movslq family, and ALU/compare
+    ///      memory-operand folding is suppressed whenever it would touch a
+    ///      small slot with an 8-byte form.
+    /// With those invariants, the old hazard (a 32-bit value sharing a slot
+    /// with a pointer, whose upper half a 64-bit reader then observed) is
+    /// structurally impossible rather than merely avoided.
+    pub fn is_small_slot(&self, v: u32) -> bool {
+        self.small_slot_values.contains(&v)
+    }
+
+    /// Check if a value is a "wide" type on 32-bit targets (F64, I64, U64).
+    /// These need multi-word copy handling instead of the 32-bit accumulator path.
+    pub fn is_wide_value(&self, v: u32) -> bool {
+        self.wide_values.contains(&v)
+    }
+
+    /// Track that `dest_id` was loaded from `source_id` at the given byte offset.
+    /// Automatically determines `is_indirect` based on whether the source is an alloca.
+    /// Allocas have data directly in the slot; non-allocas hold pointers that must be dereferenced.
+    #[inline]
+    pub fn track_f128_load(&mut self, dest_id: u32, source_id: u32, offset: i64) {
+        let is_indirect = !self.is_alloca(source_id);
+        self.f128_load_sources
+            .insert(dest_id, (source_id, offset, is_indirect));
+    }
+
+    /// Track that `value_id` has full F128 data stored directly in its own slot.
+    /// (Used after operations like negation or cast that produce full-precision F128 results.)
+    #[inline]
+    pub fn track_f128_self(&mut self, value_id: u32) {
+        self.f128_load_sources
+            .insert(value_id, (value_id, 0, false));
+    }
+
+    /// Look up the F128 load source for a value: `(source_id, offset, is_indirect)`.
+    #[inline]
+    pub fn get_f128_source(&self, value_id: u32) -> Option<(u32, i64, bool)> {
+        self.f128_load_sources.get(&value_id).copied()
+    }
+
+    /// Propagate F128 source tracking through a Copy: `dest` receives the
+    /// exact same source binding as `src` (the copy moves all 16 bytes, so
+    /// every consumer of `dest` can read them from the same place `src`'s
+    /// consumers would have). Without this, a Copy through an untracked
+    /// temporary silently downgrades later uses to the lossy f64-extend
+    /// fallback.
+    #[inline]
+    pub fn track_f128_copy(&mut self, dest_id: u32, src_id: u32) {
+        if let Some(entry) = self.f128_load_sources.get(&src_id).copied() {
+            self.f128_load_sources.insert(dest_id, entry);
+        }
+    }
+
+    /// The access model of the TLS symbol `name`. The table covers every TLS
+    /// symbol of the module, so a miss is a codegen bug; release builds then
+    /// fall back to Global-Dynamic, the one model that is correct for any TLS
+    /// symbol in any kind of output.
+    pub fn tls_model(&self, name: &str) -> crate::common::tls::TlsModel {
+        match self.tls_models.get(name) {
+            Some(model) => *model,
+            None => {
+                debug_assert!(false, "TLS symbol `{name}` has no model");
+                crate::common::tls::TlsModel::GlobalDynamic
+            }
+        }
+    }
+
+    /// Set the compilation-wide TLS inputs from the codegen options (shared by
+    /// every backend's `apply_options`).
+    pub fn apply_tls_options(&mut self, opts: &crate::backend::CodegenOptions) {
+        self.shared_lib = opts.shared_lib;
+        self.stack_clash_protection = opts.stack_clash_protection;
+        self.stack_protector_guard = opts.stack_protector_guard.clone();
+        self.tls_policy = crate::common::tls::TlsPolicy {
+            shlib: opts.pic,
+            floor: opts.tls_model_floor,
+        };
+    }
+
+    /// Returns true if the given symbol needs GOT indirection in PIC mode.
+    /// A symbol needs GOT if PIC is enabled AND it's not a local (static) symbol.
+    /// Local labels (starting with '.') are always PIC-safe via RIP-relative.
+    pub fn needs_got(&self, name: &str) -> bool {
+        if !self.pic_mode {
+            return false;
+        }
+        if name.starts_with('.') {
+            return false;
+        }
+        !self.local_symbols.contains(name)
+    }
+
+    /// Returns true if taking the address of a symbol requires GOT indirection
+    /// on x86-64.
+    ///
+    /// Full PIC keeps default-visibility data interposable and therefore uses
+    /// GOTPCREL. PIE is different: definitions in the main executable are not
+    /// preemptible, and ordinary extern data can use direct RIP-relative access
+    /// plus a copy relocation. Weak externs still need a GOT slot because their
+    /// address may resolve to zero. This is the GCC/Clang/ICX executable model;
+    /// conflating PIE with PIC added an address load and a long-lived temporary
+    /// to every gzip global access.
+    pub fn needs_got_for_addr(&self, name: &str) -> bool {
+        if self.code_model_kernel || name.starts_with('.') {
+            return false;
+        }
+        if self.local_symbols.contains(name) {
+            return false;
+        }
+        if self.pie_mode {
+            // RA-01 kill switch restores the old fully-GOT default so workload
+            // A/B runs isolate direct-global rematerialisation exactly.
+            if std::env::var_os("CCC_NO_GLOBAL_ADDR_REMAT").is_some() {
+                return true;
+            }
+            return self.weak_extern_symbols.contains(name)
+                || self.extern_function_symbols.contains(name);
+        }
+        self.pic_mode
+    }
+
+    /// Returns true if a function call should dispatch indirectly through the
+    /// GOT under `-fno-plt` (`call *sym@GOTPCREL(%rip)` on x86-64,
+    /// `call *sym@GOT[(%ebx)]` on i686).
+    pub fn needs_got_call(&self, name: &str) -> bool {
+        if self.code_model_kernel || name.starts_with('.') {
+            return false;
+        }
+        let base = name.split('@').next().unwrap_or(name);
+        // `-fno-plt` covers the whole translation unit; `noplt` names one
+        // callee. Both land on the same GOT-indirect call sequence.
+        if !self.no_plt && !self.noplt_symbols.contains(base) {
+            return false;
+        }
+        if self.local_symbols.contains(base) {
+            return false;
+        }
+        if self.pic_mode {
+            return true;
+        }
+        !self.defined_symbols.contains(base) || self.weak_extern_symbols.contains(base)
+    }
+
+    /// Returns true if a function call needs PLT indirection in PIC mode.
+    pub fn needs_plt(&self, name: &str) -> bool {
+        if self.no_plt || self.noplt_symbols.contains(name) {
+            return false;
+        }
+        self.needs_got(name)
+    }
+
+    /// Returns true if a symbol needs GOT indirection on AArch64.
+    ///
+    /// In PIC mode (-fPIC/-fpic/-shared), external symbols that may bind
+    /// externally must use GOT-indirect ADRP+LDR :got: sequences instead of
+    /// direct ADRP+ADD. The system linker rejects R_AARCH64_ADR_PREL_PG_HI21
+    /// against symbols that may bind externally in shared objects.
+    ///
+    /// Weak extern symbols always need GOT indirection regardless of PIC mode,
+    /// because they may resolve to zero at runtime.
+    pub fn needs_got_aarch64(&self, name: &str) -> bool {
+        if name.starts_with('.') {
+            return false;
+        }
+        // Weak extern symbols always need GOT indirection on AArch64
+        if self.weak_extern_symbols.contains(name) {
+            return true;
+        }
+        // In PIC mode, external symbols need GOT indirection (same as x86)
+        if self.pic_mode {
+            return !self.local_symbols.contains(name);
+        }
+        false
+    }
+}
+
+/// How a value's effective address is accessed. This captures the 3-way decision
+/// (alloca with over-alignment / alloca direct / non-alloca indirect) that repeats
+/// across emit_store, emit_load, emit_gep, and emit_memcpy.
+#[derive(Debug, Clone, Copy)]
+pub enum SlotAddr {
+    /// Alloca with alignment > 16: runtime-aligned address must be computed.
+    OverAligned(StackSlot, u32),
+    /// Normal alloca: slot IS the data, access directly.
+    Direct(StackSlot),
+    /// Non-alloca: slot holds a pointer that must be loaded first.
+    Indirect(StackSlot),
+    /// Pointer value already resides in an allocated physical register.
+    Reg(crate::backend::regalloc::PhysReg),
+}
+
+impl CodegenState {
+    /// Declare that this compilation tracks the %rax-family accumulator
+    /// (x86-64 or i686): every emitted line is AT&T x86 the sink's
+    /// shadow-epoch analyzer can classify, and every park/consume is held
+    /// to the epoch contract. Called by the x86-64 and i686 backend
+    /// constructors. Foreign-ISA backends (AArch64, RISC-V) must NOT call
+    /// this: their assembly is not AT&T x86 and the classifier's
+    /// vocabulary cannot describe it (see `AsmOutput::rax_epoch_active`).
+    /// `pub(crate)` enforces exactly that: the flag is load-bearing for
+    /// the ASSERTION's soundness, so arming it must stay reviewable inside
+    /// the crate that owns the two constructors — a must-not-call API
+    /// visible beyond the crate is a documented bug waiting to compile.
+    #[inline]
+    pub(crate) fn enable_rax_epoch_discipline(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.out.rax_epoch_active = true;
+        }
+    }
+
+    /// Record that the accumulator now holds `value_id`, syncing the debug
+    /// %rax shadow epoch (see [`RegCache::acc_park_epoch`]). Every park on
+    /// an epoch-enabled target (x86-64, i686) MUST go through this — a raw
+    /// `set_acc` leaves the epoch stale and the next `acc_has_verified`
+    /// would (correctly, but spuriously) report a discipline violation.
+    /// Foreign-ISA backends (AArch64, RISC-V) keep raw `set_acc`: the epoch
+    /// machinery is inert for them (`out.rax_epoch_active == false`), so a
+    /// stale epoch there is unobservable.
+    ///
+    /// History note: this comment once claimed foreign targets "never share
+    /// a `CodegenState` with an x86-64 function". That was false — the
+    /// generic `generate_module` driver (generate_load/store,
+    /// generate_copy, remat_indexed_acc_safe) runs for every target and
+    /// speaks this verified API — and a RISC-V `call`/`mul`/`div` line
+    /// moves the x86 classifier's implicit-write table regardless of its
+    /// operands. The target-scoped opt-in flag is the fix: the generic pass
+    /// layer keeps the verified API, and the flag (not the call sites)
+    /// scopes the epoch semantics to the x86 family.
+    #[inline]
+    pub fn park_acc(&mut self, value_id: u32, is_alloca: bool) {
+        self.reg_cache.set_acc(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            self.reg_cache.acc_park_epoch = self.out.debug_rax_epoch();
+        }
+    }
+
+    /// Re-sync the debug %rax park epoch after a sequence that wrote %rax
+    /// transiently but restored the parked value exactly (the narrow-copy
+    /// ferry in `emit_call_reg_args`: spill `%rax` to the transient frame,
+    /// ferry through it, reload it verbatim). The reload is a %rax write to
+    /// the epoch analyzer, so without this call the park epoch and the
+    /// shadow epoch diverge and the next `acc_has_verified` would report a
+    /// dead-%rax read although the value is live and identical. The caller
+    /// GUARANTEES that %rax holds the parked value again when it calls
+    /// this; an emitter that does not restore the value must use
+    /// [`RegCache::invalidate_acc`] instead. Release builds compile the
+    /// body away (the field it syncs is debug-only).
+    #[inline]
+    pub fn refresh_acc_park_epoch(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.reg_cache.acc_park_epoch = self.out.debug_rax_epoch();
+        }
+    }
+
+    /// Record that the secondary register now holds `value_id`, syncing
+    /// the debug %rcx shadow epoch (see [`RegCache::sec_park_epoch`]).
+    /// The %rcx mirror of [`park_acc`](Self::park_acc): every park on an
+    /// epoch-enabled target (x86-64, i686) MUST go through this — a raw
+    /// `set_sec` leaves the epoch stale and the next `sec_has_verified`
+    /// would (correctly, but spuriously) report a discipline violation.
+    /// i686 and RISC-V keep raw `set_sec` for now: their secondary-cache
+    /// traffic is producer-only (i686: no `sec_has` consumer exists) or
+    /// unwired to the epoch (RISC-V: foreign ISA, the scan is inert), so
+    /// migrating them would add epoch bookkeeping no assertion can observe.
+    #[inline]
+    pub fn park_sec(&mut self, value_id: u32, is_alloca: bool) {
+        self.reg_cache.set_sec(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            self.reg_cache.sec_park_epoch = self.out.debug_rcx_epoch();
+        }
+    }
+
+    /// The authoritative accumulator query for every site about to SOURCE a
+    /// value FROM %rax. Returns `reg_cache.acc_has(...)`, and in debug builds
+    /// asserts the shadow epoch is unchanged since the park — i.e. that no
+    /// instruction wrote any part of %rax without an `invalidate_acc` since
+    /// the cache claimed residency. This is the mechanical enforcement behind
+    /// the slot-independent acc fast paths: without a slot there is no
+    /// slow-but-correct fallback, only a dead-register read (silent
+    /// miscompile) or, after an over-invalidation, the loud no-location
+    /// panic. The epoch check catches the under-invalidation direction.
+    ///
+    /// Sites that merely test residency to decide whether to skip a RELOAD
+    /// (reading %rax to move it elsewhere is still a consume — they must use
+    /// this too). Only genuinely non-consuming probes may call
+    /// `reg_cache.acc_has` directly.
+    #[inline]
+    pub fn acc_has_verified(&self, value_id: u32, is_alloca: bool) -> bool {
+        let has = self.reg_cache.acc_has(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            // The assert is meaningful only on epoch-enabled targets; on a
+            // foreign ISA the epoch cannot move (the scan is gated off), so
+            // a stale park epoch would compare against a frozen 0.
+            if has && self.out.rax_epoch_active {
+                let park = self.reg_cache.acc_park_epoch;
+                let now = self.out.debug_rax_epoch();
+                debug_assert!(
+                    park == now,
+                    "x86 codegen: acc cache claims value {} is resident in %rax, but the \
+                     %rax shadow epoch moved since the park ({} -> {}): some emitter wrote \
+                     %rax without invalidate_acc, and sourcing the value from %rax now \
+                     reads a dead register. Last classified %rax write: {:?}. Last \
+                     unclassified emitted line: {:?} (unclassified vocabulary so far: \
+                     {:?} — extend the analyzer tables in backend/common.rs if that \
+                     line is benign — otherwise fix the missing invalidate_acc).",
+                    value_id,
+                    park,
+                    now,
+                    self.out.debug_last_rax_write(),
+                    self.out.debug_last_unclassified(),
+                    self.out.debug_unclassified_mnemonics()
+                );
+            }
+        }
+        has
+    }
+
+    /// The authoritative secondary-cache query for every site about to
+    /// SOURCE a value FROM %rcx. Returns `reg_cache.sec_has(...)`, and in
+    /// debug builds asserts the shadow epoch is unchanged since the park —
+    /// i.e. that no instruction wrote any part of %rcx without an
+    /// `invalidate_sec` since the cache claimed residency. The %rcx mirror
+    /// of [`acc_has_verified`](Self::acc_has_verified), and the mechanical
+    /// enforcement behind the `movq %rcx,%rax` SEC fast path in
+    /// `operand_to_rax`: without a slot there is no slow-but-correct
+    /// fallback, only a dead-register read (the CC-O0CALL-1 SIGSEGV
+    /// family) or, after an over-invalidation, the loud no-location panic.
+    /// The epoch check catches the under-invalidation direction.
+    ///
+    /// Sites that merely test residency to decide whether to skip a RELOAD
+    /// (reading %rcx to move it elsewhere is still a consume — they must
+    /// use this too). Only genuinely non-consuming probes may call
+    /// `reg_cache.sec_has` directly (today: none on x86-64; the i686 and
+    /// RISC-V call sites stay raw — see `park_sec` — because no epoch
+    /// assertion can observe them).
+    #[inline]
+    pub fn sec_has_verified(&self, value_id: u32, is_alloca: bool) -> bool {
+        let has = self.reg_cache.sec_has(value_id, is_alloca);
+        #[cfg(debug_assertions)]
+        {
+            // The assert is meaningful only on epoch-enabled targets; on a
+            // foreign ISA the epoch cannot move (the scan is gated off), so
+            // a stale park epoch would compare against a frozen 0.
+            if has && self.out.rax_epoch_active {
+                let park = self.reg_cache.sec_park_epoch;
+                let now = self.out.debug_rcx_epoch();
+                debug_assert!(
+                    park == now,
+                    "x86 codegen: secondary cache claims value {} is resident in %rcx, but the \
+                     %rcx shadow epoch moved since the park ({} -> {}): some emitter wrote \
+                     %rcx without invalidate_sec, and sourcing the value from %rcx now \
+                     reads a dead register (CC-O0CALL-1 class). Last classified %rcx \
+                     write: {:?}. Last unclassified emitted line: {:?} (unclassified \
+                     vocabulary so far: {:?} — extend the analyzer tables in \
+                     backend/common.rs if that line is benign — otherwise fix the \
+                     missing invalidate_sec).",
+                    value_id,
+                    park,
+                    now,
+                    self.out.debug_last_rcx_write(),
+                    self.out.debug_last_unclassified(),
+                    self.out.debug_unclassified_mnemonics()
+                );
+            }
+        }
+        has
+    }
+
+    pub fn is_accumulator_location(&self, val_id: u32) -> bool {
+        matches!(
+            self.explicit_locations.get(&val_id),
+            Some(ExplicitLocation::Accumulator)
+        )
+    }
+
+    /// Classify how to access a value's effective address.
+    /// Returns `None` if the value has no assigned stack slot (and isn't register-assigned).
+    pub fn resolve_slot_addr(&self, val_id: u32) -> Option<SlotAddr> {
+        // A constant-offset address of an ordinary alloca is itself a frame
+        // operand. Using it directly avoids reloading a spilled pointer copy
+        // (`mov OFF(%rsp),%rcx; mov (%rcx),...`). The producer still executes
+        // for non-memory uses; this only changes how memory operands address.
+        if let Some(&(base, offset)) = self.frame_offset_aliases.get(&val_id) {
+            if let Some(slot) = self.get_slot(base) {
+                if self.is_alloca(base) && self.alloca_over_align(base).is_none() {
+                    if let Some(addr) = slot.0.checked_add(offset) {
+                        if i32::try_from(addr).is_ok() {
+                            return Some(SlotAddr::Direct(StackSlot(addr)));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(slot) = self.get_slot(val_id) {
+            if self.is_alloca(val_id) {
+                if self.alloca_over_align(val_id).is_some() {
+                    Some(SlotAddr::OverAligned(slot, val_id))
+                } else {
+                    Some(SlotAddr::Direct(slot))
+                }
+            } else if self.i128_values.contains(&val_id)
+                || self.f128_direct_slots.contains(&val_id)
+                || self.vector_values.contains(&val_id)
+                || self.vector128_values.contains(&val_id)
+            {
+                // 16/32-byte payload values (i128/U128/F128 bit patterns, x87
+                // bit-op results, and the auto-vectorizer's Vec* values) live
+                // DIRECTLY in their slot — the slot is the data, not a pointer
+                // to it. Treat as Direct so memcpy, value_ptr_mem_operand, and
+                // friends take the slot address instead of loading the first 8
+                // payload bytes as a pointer (SEGV). Vec* values are stored
+                // with vmovupd/movups straight into the slot by the Vec*
+                // emitters; without this they resolved to Indirect and the
+                // defer-aware binary emitters fell back to a leaq+indirect
+                // load round-trip (v3 reduction-loop codegen).
+                Some(SlotAddr::Direct(slot))
+            } else {
+                Some(SlotAddr::Indirect(slot))
+            }
+        } else if let Some(ExplicitLocation::Reg(reg)) = self.explicit_locations.get(&val_id) {
+            Some(SlotAddr::Reg(*reg))
+        } else {
+            None
+        }
+    }
+}
+
+/// The bank number of a physical vector register name ("xmm5" → 5,
+/// "ymm3" → 3, "zmm0" → 0). The xmm/ymm/zmm spellings of one bank name
+/// the SAME physical storage viewed at different widths, so alias
+/// decisions in `vec_claim_live_reg` compare bank numbers, not strings.
+fn vector_reg_bank(reg: &str) -> u32 {
+    reg.trim_start_matches(|c: char| !c.is_ascii_digit())
+        .parse()
+        .unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod slot_addr_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+
+    /// `data_home_slot` must refuse an alloca's slot: for an alloca the slot
+    /// is the storage the alloca denotes, so a consumer that wants the VALUE
+    /// (the address) and reads the slot gets the pointee's bytes instead.
+    #[test]
+    fn data_home_slot_refuses_alloca_storage() {
+        let mut state = CodegenState::new();
+        state.value_locations.insert(4, StackSlot(-32));
+        state.value_locations.insert(9, StackSlot(-48));
+
+        // An ordinary value's slot holds the value itself.
+        assert_eq!(state.data_home_slot(4).map(|s| s.0), Some(-32));
+        assert_eq!(state.get_slot(4).map(|s| s.0), Some(-32));
+
+        // An alloca's slot holds what the alloca POINTS AT; its value is the
+        // slot's address, which no slot lookup can produce.
+        state.alloca_values.insert(9);
+        assert_eq!(state.get_slot(9).map(|s| s.0), Some(-48));
+        assert_eq!(
+            state.data_home_slot(9).map(|s| s.0),
+            None,
+            "an alloca's slot is its storage, never a home for its value"
+        );
+        // Address consumers still resolve it: SlotAddr::Direct is the slot
+        // whose ADDRESS is the value.
+        assert!(matches!(
+            state.resolve_slot_addr(9),
+            Some(SlotAddr::Direct(StackSlot(-48)))
+        ));
+
+        // A value with no slot at all stays `None` on both accessors.
+        assert_eq!(state.data_home_slot(11).map(|s| s.0), None);
+        assert_eq!(state.get_slot(11).map(|s| s.0), None);
+    }
+
+    #[test]
+    fn register_home_is_explicit_and_exact() {
+        let mut state = CodegenState::new();
+        state
+            .explicit_locations
+            .insert(17, ExplicitLocation::Reg(PhysReg(14)));
+        assert!(matches!(
+            state.resolve_slot_addr(17),
+            Some(SlotAddr::Reg(PhysReg(14)))
+        ));
+        assert!(state.get_slot(17).is_none());
+        state
+            .explicit_locations
+            .insert(18, ExplicitLocation::Accumulator);
+        assert!(state.is_accumulator_location(18));
+        assert!(state.resolve_slot_addr(18).is_none());
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod acc_epoch_validator_tests {
+    use super::*;
+
+    /// The mechanical-enforcement contract of the acc cache: an emitter
+    /// that writes %rax through the output sink without `invalidate_acc`
+    /// desyncs the shadow epoch, and the next verified consume must refuse
+    /// (debug panic) instead of sourcing a dead register. The release
+    /// predicate itself is unchanged — the assert is the enforcement.
+    #[test]
+    fn unstaged_rax_clobber_is_caught_between_park_and_consume() {
+        let mut state = CodegenState::new();
+        // This test speaks x86 vocabulary, so it opts into the discipline
+        // exactly as the x86-64/i686 constructors do.
+        state.enable_rax_epoch_discipline();
+        // Park v7 (e.g. the tail of store_rax_to): the park syncs the epoch.
+        state.park_acc(7, false);
+        assert!(
+            state.acc_has_verified(7, false),
+            "a fresh park verifies and consumes"
+        );
+        // Benign traffic that does not write %rax: still verifiable.
+        state.out.emit("    movq %rbx, %rcx");
+        state.out.emit("    movl %eax, -8(%rbp)");
+        assert!(state.acc_has_verified(7, false), "non-writing lines hold");
+        // An UNSTAGED clobber (the bug class: a future emitter forgets its
+        // invalidate_acc). The sink classifies the write and bumps the epoch.
+        state.out.emit("    movq $1, %rax");
+        assert_ne!(
+            state.reg_cache.acc_park_epoch,
+            state.out.debug_rax_epoch(),
+            "the sink must bump the epoch for the %rax write"
+        );
+        // The verified consume refuses loudly; the raw predicate is what
+        // release would consult (the assert is the whole difference).
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.acc_has_verified(7, false);
+        }));
+        assert!(
+            refused.is_err(),
+            "stale acc residency must panic under debug_assertions"
+        );
+        assert!(
+            state.reg_cache.acc_has(7, false),
+            "the cache entry itself is unchanged (invalidation, not the query, fixes it)"
+        );
+        // A proper invalidate_acc clears the entry; the consume is simply
+        // false — the over-invalidation direction, safe by construction.
+        state.reg_cache.invalidate_acc();
+        assert!(!state.acc_has_verified(7, false));
+    }
+
+    /// Re-parking after an intervening clobber heals the cache: the epoch
+    /// syncs to the CURRENT sink state, so the next consume verifies again.
+    #[test]
+    fn repark_after_clobber_resyncs_the_epoch() {
+        let mut state = CodegenState::new();
+        state.enable_rax_epoch_discipline();
+        state.park_acc(3, false);
+        state.out.emit("    addq %rcx, %rax");
+        assert_ne!(
+            state.reg_cache.acc_park_epoch,
+            state.out.debug_rax_epoch(),
+            "addq %rax is an explicit-destination write and must bump"
+        );
+        // The value is recomputed and re-parked (e.g. by store_rax_to's tail):
+        state.park_acc(3, false);
+        assert!(
+            state.acc_has_verified(3, false),
+            "a re-park re-establishes residency with a fresh epoch"
+        );
+    }
+
+    /// The epoch machinery is target-scoped: a fresh `CodegenState` (what
+    /// every foreign-ISA backend constructor produces) has it DISABLED, and
+    /// on a disabled target the sink classifier is inert — lines that would
+    /// be %rax writes on x86 (`call`, `movl ... %eax`) must NOT move the
+    /// epoch, and a verified consume must NOT assert even when the park
+    /// epoch is stale. This pins the F1 fix: the generic pass layer runs
+    /// for every target, so a foreign-ISA compilation (RISC-V `call foo`,
+    /// i686 %eax traffic on an unenabled state) can neither false-assert
+    /// nor be silently validated by machinery whose vocabulary does not
+    /// describe its assembly.
+    #[test]
+    fn epoch_machinery_is_inert_without_target_opt_in() {
+        let mut state = CodegenState::new();
+        assert!(
+            !state.out.rax_epoch_active,
+            "the discipline is opt-in per target; default state must be off"
+        );
+        // Park WITHOUT opting in (a foreign backend's park_acc): the epoch
+        // syncs (to 0 — the scan is inert), but no assertion can fire.
+        state.park_acc(7, false);
+        // Lines that would be %rax writes on x86-64: `call` is in the
+        // implicit-write table; `movl ... %eax` matches the dest-last rule.
+        // With the machinery disabled these must be ignored entirely.
+        state.out.emit("    call foo");
+        state.out.emit("    movl $1, %eax");
+        assert_eq!(
+            state.out.debug_rax_epoch(),
+            0,
+            "a non-opted-in target must never move the epoch"
+        );
+        // The consume returns the raw residency predicate and — critically —
+        // must not panic, although the park epoch was never re-synced after
+        // these lines.
+        assert!(
+            state.acc_has_verified(7, false),
+            "residency predicate is unchanged for foreign targets"
+        );
+    }
+
+    /// Opting in (as the x86-64/i686 constructors do) is what arms the
+    /// classifier: the same two lines that were inert above now move the
+    /// epoch and make a stale park assert. Paired with
+    /// `epoch_machinery_is_inert_without_target_opt_in`, this pins BOTH
+    /// directions of the target gate.
+    #[test]
+    fn target_opt_in_arms_the_classifier() {
+        let mut state = CodegenState::new();
+        state.enable_rax_epoch_discipline();
+        assert!(state.out.rax_epoch_active);
+        state.park_acc(7, false);
+        state.out.emit("    call foo");
+        assert_ne!(
+            state.out.debug_rax_epoch(),
+            0,
+            "an opted-in target classifies `call` as an implicit %rax write"
+        );
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.acc_has_verified(7, false);
+        }));
+        assert!(
+            refused.is_err(),
+            "on an opted-in target the stale park must be refused"
+        );
+    }
+}
+
+/// The %rcx mirror of `acc_epoch_validator_tests`: the mechanical
+/// enforcement contract of the secondary cache. The bug class is the
+/// CC-O0CALL-1 family (an emitter writes %rcx without `invalidate_sec`,
+/// the next SEC consume sources a dead register — a SIGSEGV via a garbage
+/// address in the call-staging shape, silent corruption elsewhere).
+#[cfg(all(test, debug_assertions))]
+mod sec_epoch_validator_tests {
+    use super::*;
+
+    /// An emitter that writes %rcx through the output sink without
+    /// `invalidate_sec` desyncs the shadow epoch, and the next verified
+    /// consume must refuse (debug panic) instead of sourcing a dead
+    /// register. The release predicate itself is unchanged — the assert is
+    /// the enforcement.
+    #[test]
+    fn unstaged_rcx_clobber_is_caught_between_park_and_consume() {
+        let mut state = CodegenState::new();
+        // This test speaks x86 vocabulary, so it opts into the discipline
+        // exactly as the x86-64/i686 constructors do (the flag gates both
+        // shadow epochs).
+        state.enable_rax_epoch_discipline();
+        // Park v7 (e.g. the tail of emit_to_rcx): the park syncs the epoch.
+        state.park_sec(7, false);
+        assert!(
+            state.sec_has_verified(7, false),
+            "a fresh park verifies and consumes"
+        );
+        // Benign traffic that does not write %rcx: still verifiable. (A
+        // %rax write is benign HERE — the epochs are independent.)
+        state.out.emit("    movq %rbx, %rax");
+        state.out.emit("    movl %ecx, -8(%rbp)");
+        state.out.emit("    divq %rcx");
+        assert!(state.sec_has_verified(7, false), "non-writing lines hold");
+        // An UNSTAGED clobber (the bug class: a future emitter forgets its
+        // invalidate_sec). The sink classifies the write and bumps the epoch.
+        state.out.emit("    movq $1, %rcx");
+        assert_ne!(
+            state.reg_cache.sec_park_epoch,
+            state.out.debug_rcx_epoch(),
+            "the sink must bump the epoch for the %rcx write"
+        );
+        // The verified consume refuses loudly; the raw predicate is what
+        // release would consult (the assert is the whole difference).
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.sec_has_verified(7, false);
+        }));
+        assert!(
+            refused.is_err(),
+            "stale sec residency must panic under debug_assertions"
+        );
+        assert!(
+            state.reg_cache.sec_has(7, false),
+            "the cache entry itself is unchanged (invalidation, not the query, fixes it)"
+        );
+        // A proper invalidate_sec clears the entry; the consume is simply
+        // false — the over-invalidation direction, safe by construction.
+        state.reg_cache.invalidate_sec();
+        assert!(!state.sec_has_verified(7, false));
+    }
+
+    /// Re-parking after an intervening clobber heals the cache: the epoch
+    /// syncs to the CURRENT sink state, so the next consume verifies again.
+    #[test]
+    fn sec_repark_after_clobber_resyncs_the_epoch() {
+        let mut state = CodegenState::new();
+        state.enable_rax_epoch_discipline();
+        state.park_sec(3, false);
+        state.out.emit("    addq %rax, %rcx");
+        assert_ne!(
+            state.reg_cache.sec_park_epoch,
+            state.out.debug_rcx_epoch(),
+            "addq %rcx is an explicit-destination write and must bump"
+        );
+        // The value is recomputed and re-parked:
+        state.park_sec(3, false);
+        assert!(
+            state.sec_has_verified(3, false),
+            "a re-park re-establishes residency with a fresh epoch"
+        );
+    }
+
+    /// The shared opt-in flag gates the SEC assertion too: without it the
+    /// scan is inert, the epoch cannot move, and a stale park stays
+    /// unverifiable-but-silent (the foreign-ISA posture).
+    #[test]
+    fn sec_assert_is_inert_without_target_opt_in() {
+        let mut state = CodegenState::new();
+        assert!(!state.out.rax_epoch_active);
+        state.park_sec(9, false);
+        state.out.emit("    movq $1, %rcx");
+        assert_eq!(state.out.debug_rcx_epoch(), 0, "inert scan never bumps");
+        assert!(
+            state.sec_has_verified(9, false),
+            "without the opt-in the query degrades to the raw predicate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod call_pop_tests {
+    use super::*;
+
+    /// A symbol whose call sites disagree on what the callee pops has no
+    /// single amount: it must read as unknown, never as the last site's.
+    #[test]
+    fn disagreeing_direct_sites_become_unknown() {
+        let mut state = CodegenState::new();
+        state.current_func_name = "caller".to_string();
+        state.record_call_pop(Some("make"), Some(4));
+        state.record_call_pop(Some("make"), Some(4));
+        state.record_call_pop(Some("plain"), Some(0));
+        assert_eq!(state.callee_pops_direct["make"], Some(4));
+        assert_eq!(state.callee_pops_direct["plain"], Some(0));
+        state.record_call_pop(Some("make"), Some(0));
+        assert_eq!(state.callee_pops_direct["make"], None);
+        state.record_call_pop(Some("make"), Some(4));
+        assert_eq!(state.callee_pops_direct["make"], None);
+        state.record_call_pop(None, Some(8));
+        state.record_call_pop(None, None);
+        assert_eq!(state.callee_pops_indirect["caller"], vec![Some(8), None]);
+        // Probes cannot poison a direct callee's agreement or append phantom
+        // indirect sites. No global flag mutation: other unit tests may emit.
+        state.record_call_pop_for_emission(Some("plain"), Some(4), true);
+        state.record_call_pop_for_emission(None, Some(4), true);
+        assert_eq!(state.callee_pops_direct["plain"], Some(0));
+        assert_eq!(state.callee_pops_indirect["caller"], vec![Some(8), None]);
+        state.record_call_pop_for_emission(None, Some(4), false);
+        assert_eq!(
+            state.callee_pops_indirect["caller"],
+            vec![Some(8), None, Some(4)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod switch_bounds_state_tests {
+    use super::*;
+    #[test]
+    fn function_reset_clears_facts_but_preserves_module_permission() {
+        let mut state = CodegenState::new();
+        assert!(!state.switch_bounds_enabled);
+        state.switch_bounds_enabled = true;
+        state.switch_unsigned_bounds.insert(7, (32, 15));
+        state.reset_for_function();
+        assert!(state.switch_bounds_enabled);
+        assert!(state.switch_unsigned_bounds.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod block_address_identity_tests {
+    use super::CodegenState;
+
+    #[test]
+    fn proof_is_scoped_to_the_current_block_and_reset_per_function() {
+        let mut state = CodegenState::new();
+        state.emit("nop"); // Must not count towards the new block.
+        state.emit(".Lobservable: # comment");
+        state.begin_block_address_identity(true);
+        assert!(state.fallthrough_would_alias_observable_label());
+        state.emit(".p2align 4");
+        state.emit(".space 0");
+        assert!(state.fallthrough_would_alias_observable_label());
+        state.emit("nop");
+        assert!(!state.fallthrough_would_alias_observable_label());
+        state.emit(".Lnext:");
+        state.begin_block_address_identity(true);
+        assert!(state.fallthrough_would_alias_observable_label());
+        state.begin_block_address_identity(false);
+        assert!(!state.fallthrough_would_alias_observable_label());
+        state.begin_block_address_identity(true);
+        state.reset_for_function();
+        assert!(!state.fallthrough_would_alias_observable_label());
+    }
+
+    #[test]
+    fn output_rewind_fails_closed() {
+        let mut state = CodegenState::new();
+        state.emit(".Lobservable:");
+        state.begin_block_address_identity(true);
+        state.out.buf.clear();
+        assert!(state.fallthrough_would_alias_observable_label());
+    }
+}

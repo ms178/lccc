@@ -1,0 +1,16 @@
+f32/gcc: PASS 606 exact-bit alias/guard cases
+f32/clang: PASS 606 exact-bit alias/guard cases
+f32/sse2: PASS 606 exact-bit alias/guard cases
+f32/sse2-rolled: PASS 606 exact-bit alias/guard cases
+f32/sse41: PASS 606 exact-bit alias/guard cases
+f32/sse41-rolled: PASS 606 exact-bit alias/guard cases
+f32/avx2: PASS 606 exact-bit alias/guard cases
+f32/avx2-rolled: PASS 606 exact-bit alias/guard cases
+f64/gcc: PASS 606 exact-bit alias/guard cases
+f64/clang: PASS 606 exact-bit alias/guard cases
+f64/sse2: PASS 606 exact-bit alias/guard cases
+f64/sse2-rolled: PASS 606 exact-bit alias/guard cases
+f64/sse41: PASS 606 exact-bit alias/guard cases
+f64/sse41-rolled: PASS 606 exact-bit alias/guard cases
+f64/avx2: PASS 606 exact-bit alias/guard cases
+f64/avx2-rolled: PASS 606 exact-bit alias/guard cases

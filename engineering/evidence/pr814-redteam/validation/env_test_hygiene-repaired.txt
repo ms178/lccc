@@ -1,0 +1,5 @@
+ok   environment mutation confined to src/test_support.rs
+ok   vec_interleave and vec_load_sink read no environment variable
+ok   pass-pipeline environment reads: 151 (budget 151)
+ok   no deferred-work markers in src/, tests/ or scripts/ (verbatim imports excepted)
+check_env_test_hygiene: PASS (guard-only env mutation, migrated passes clean, reads not growing, no markers)

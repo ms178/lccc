@@ -1,0 +1,1292 @@
+{
+  "measurement": "bounded native output differential, no timing; includes Adler combine",
+  "rows": [
+    {
+      "kernel": "gzip_crc32",
+      "level": "-O0",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O0-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "5bd8c6c648d16b54bc87698330d6aac0069d0dcd1af4829799a66744fdb9cd3f"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O0-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "a4a1b48124bbb204a0d28419f4d67ab23114f863ea1d158ec74eea4f4dec637f"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "gzip_crc32",
+      "level": "-O1",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O1-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "f604e2a2019edec27a7a930550539b68aeb29869087be387dbb87c99e03fb66e"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O1-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "a9ba2edbf37a2e5d761538eee8fd12c28ae362b53e1292fb282a30a83a482164"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "gzip_crc32",
+      "level": "-O2",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O2-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "2043acdc8df0b952b8700dffe066ad4f744e33fd704362280704157d99496925"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O2-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "1f71579b8e4dd81df21f2e3595eddcbd6d90b1e0ecfb94f1d32f3f6580dd80a0"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "gzip_crc32",
+      "level": "-O3",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O3-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "704dd9aec36f3488dd557e44fdb564194c9b53f2481078ae6d254220480961c2"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/gzip_crc32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/gzip_crc32-O3-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "4140336ac73256f9c3ce7f1ae098c17b88cdac3d72595d3e8e8d57a6f2fedfcc",
+          "binary_sha256": "1f71579b8e4dd81df21f2e3595eddcbd6d90b1e0ecfb94f1d32f3f6580dd80a0"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32",
+      "level": "-O0",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O0-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "7c53a764a5d4ae0ecddcc2349b8c0efb6afcc2c5ba703efc67c927966a6a54e7"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O0-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "4938556285090ed62912905c0d2c506362614b3a3979c2e774aeca3f2dc9b7a8"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32",
+      "level": "-O1",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O1-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "7d0cb9b7bd5aafda793c0dcddf2842625a7de3466fef1eb99e355aed653cb998"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O1-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "c11bd5cc8e5fcc644e3ce1867313e45d95ce5229230c97800350f230a32a176a"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32",
+      "level": "-O2",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O2-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "3f8ee365de6dbc151587e0d6a6feaad7143d6fcb5c88eec5742bd356e0439f54"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O2-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "aedc8c315bc276c97250c7794dca35f3263e3bb9d777cb7c1308fcfb38b4ef77"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32",
+      "level": "-O3",
+      "size_flags": "-DDATA_SIZE=16384 -DPASSES=4",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O3-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "1596c83590b4a67fe523c67986fb5c4beef9f085df8db04e9736214e0b13f66e"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DDATA_SIZE=16384",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32-O3-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "e2d85427db40575f8612c64ea07de196695cc5696c1cd0350adc07b9d0ba888c",
+          "binary_sha256": "aedc8c315bc276c97250c7794dca35f3263e3bb9d777cb7c1308fcfb38b4ef77"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32_combine",
+      "level": "-O0",
+      "size_flags": "-DPASSES=10000",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O0-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "97bcef3d3759300ba35fa1d692b4672405f58d4fc1cfaf0adcabe0a23f470b55"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O0-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "3fa497da00e10f29e6297ddd3e62465599e1e83678d20b512d15ce07af6b0eac"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32_combine",
+      "level": "-O1",
+      "size_flags": "-DPASSES=10000",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O1-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "4ba2f27f102c3ce0f5b727e93bd1f6c2e239e855e63b7b763796bf1bf368e0aa"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O1-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "b74c75e278a2b77a6e0f1289e299c0ae9840c6190d3cc6acd37f7ba9468e883b"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32_combine",
+      "level": "-O2",
+      "size_flags": "-DPASSES=10000",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O2-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "6b33a58ef716cb5f869f3418966ef9e96b712c26b85835c43920ffc30e1cecf9"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O2-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "9acfbed58f63b50f96ca3aa58357437113ae7e48faf49e56c355b0cb265f284d"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "zlib_ng_adler32_combine",
+      "level": "-O3",
+      "size_flags": "-DPASSES=10000",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O3-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "ca5236f31a3a422bee07b187ebc48144a35811f298a6c0f396c6e8c0adf1a447"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=10000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/zlib_ng_adler32_combine.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/zlib_ng_adler32_combine-O3-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "cb483dd6a82f24d49d3c375b787b0e36d537c17479f4769ac323315c7856162c",
+          "binary_sha256": "9acfbed58f63b50f96ca3aa58357437113ae7e48faf49e56c355b0cb265f284d"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "expat_siphash24",
+      "level": "-O0",
+      "size_flags": "-DPASSES=1000",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O0-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "96a1c4f09adf7187678f7b5f672125fb1c98132316b857a27968b1283a52f9b9"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O0-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "1339f2026dfc8dfc2f1f95b5bddf94aaaada3b08e86a4f2da76b53b1534ddde4"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "expat_siphash24",
+      "level": "-O1",
+      "size_flags": "-DPASSES=1000",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O1-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "2859b951e8d69f865bae3a817183ac01e5f5d21b6e813fe75e123100b3742b41"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O1-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "35d2dd46b90b96dd003c96187fa71732b92f27c7516eaaab806999014accba75"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "expat_siphash24",
+      "level": "-O2",
+      "size_flags": "-DPASSES=1000",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O2-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "8fe75d02f4e86c3e57ba62ed574773b9d4a6140ec060b3286d36de45976aae41"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O2-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "40dad7c0845ffec7dbd645b783b10e199a7f0a11add7ab911a3de84e84918daf"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "expat_siphash24",
+      "level": "-O3",
+      "size_flags": "-DPASSES=1000",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O3-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "96e95ebcde60ef4833813b244aecbb3af942c1ba90a9168bc1c570286ddeff0b"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=1000",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/expat_siphash24.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/expat_siphash24-O3-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "7cc845311001c6c19376592f0ded62f60647c9a47b814520e1df888c956b8f1d",
+          "binary_sha256": "40dad7c0845ffec7dbd645b783b10e199a7f0a11add7ab911a3de84e84918daf"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "sqlite_varint",
+      "level": "-O0",
+      "size_flags": "-DVALUE_COUNT=2048 -DPASSES=4",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O0-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "3226f519356feb5ed4dfa7c03a1259010564c0e6253fe95dac928b2a0f1a0c65"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O0-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "80246bf6672956d60f07c803eb9cb5baa6c899a447f89dc9af81e78b2072f384"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "sqlite_varint",
+      "level": "-O1",
+      "size_flags": "-DVALUE_COUNT=2048 -DPASSES=4",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O1-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "023a5b1ec4541ee53edf97f82adf1ce9dead89a8f2ab303221c7217039c84232"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O1-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "a975ea9d54f199b7efc0431d17f62aee5cf7ec0940be6bba72dc1c597c1efa9c"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "sqlite_varint",
+      "level": "-O2",
+      "size_flags": "-DVALUE_COUNT=2048 -DPASSES=4",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O2-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "1e5af9f838bf5109490eec6cc3bed3c5913a8dd3a6014ec87365390d46e94be8"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O2-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "5409fcf959dd1f1750ceb19661a182c1a4e31a4bfbb1b800f112529d2853d365"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "sqlite_varint",
+      "level": "-O3",
+      "size_flags": "-DVALUE_COUNT=2048 -DPASSES=4",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O3-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "154a40a725390c17da8dadcaca4a6761b17d7350583b776625e5136a84690b2e"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DVALUE_COUNT=2048",
+            "-DPASSES=4",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/sqlite_varint.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/sqlite_varint-O3-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "01ca363da25837ba048b025644fceb4b2592e83284b425fbae5b39cc672e17f9",
+          "binary_sha256": "5409fcf959dd1f1750ceb19661a182c1a4e31a4bfbb1b800f112529d2853d365"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "linux_find_bit",
+      "level": "-O0",
+      "size_flags": "-DPASSES=32",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O0-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "35ac2731275b81eac8999655aedc290ce82112f004b7030d24499ea16a2a2bc1"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O0-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "73e10cb4eff6f9ba019f738f9d5555cfa5a25e2aa6e2c44eb21bcdd1f93328e4"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "linux_find_bit",
+      "level": "-O1",
+      "size_flags": "-DPASSES=32",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O1-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "907489838977c1becab0e3c3d7a33e82a4b1748c86f52a878caf89c09a1cf143"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O1-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "7a01775e837d266bd4da0ad62236ce04491162fe76b0bfbe1aa005fba06690ee"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "linux_find_bit",
+      "level": "-O2",
+      "size_flags": "-DPASSES=32",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O2-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "a59c99a58a75d832e23907a09314ed3c007e087c1c43ba37c646c41aad43cc25"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O2-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "e9852e5443ec97a09e34d7f52f169a4c688d59804cfb00a1b7c0cb3fe91f488c"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "linux_find_bit",
+      "level": "-O3",
+      "size_flags": "-DPASSES=32",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O3-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "7bad0c7d420b7adf3d4a551afba4ccc5e009ada578bffb97be2ae518e375a454"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=32",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/linux_find_bit-O3-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "binary_sha256": "e9852e5443ec97a09e34d7f52f169a4c688d59804cfb00a1b7c0cb3fe91f488c"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "glibc_memcmp",
+      "level": "-O0",
+      "size_flags": "-DPASSES=16",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O0-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "1c84257c2d83b2b690813eba9136947b438daf319c89f62d4c108ba31943f148"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O0",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O0-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "d523b71d473adbfc19479fd8025360b51b1a3de0d79bd0a94fcb4467a55931a9"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "glibc_memcmp",
+      "level": "-O1",
+      "size_flags": "-DPASSES=16",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O1-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "255f2b025c0dae47050e06882978de7c376dcc0ac40a79b09a60a28aa4e5660f"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O1",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O1-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "4fa7ac08e4939fd3136a631c3ce5d2ee3255e7b607236ceec1e2302f90a8e31f"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "glibc_memcmp",
+      "level": "-O2",
+      "size_flags": "-DPASSES=16",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O2-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "cac53c50fd204b418db678340e0dd7b421d76944e0b32a58c71bf76d406e6aa0"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O2",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O2-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "bfdc256be00a95211e1a57548bd495bbb04133199b6b41445747cee4512f8a97"
+        }
+      },
+      "match": true
+    },
+    {
+      "kernel": "glibc_memcmp",
+      "level": "-O3",
+      "size_flags": "-DPASSES=16",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "arms": {
+        "gcc": {
+          "compile": [
+            "gcc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O3-gcc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "950bf3ce94173b283ddf02a74562b37893cf4f41b0aae865bd498abcf4f678a4"
+        },
+        "lccc": {
+          "compile": [
+            "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+            "-O3",
+            "-march=x86-64-v3",
+            "-fwrapv",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-DPASSES=16",
+            "/opt/lccc-audit-cache/lccc/tests/benchmark/programs/glibc_memcmp.c",
+            "-lm",
+            "-o",
+            "/home/user/.cache/kernel-fix-matrix/glibc_memcmp-O3-lccc"
+          ],
+          "compile_exit": 0,
+          "run_exit": 0,
+          "stdout_sha256": "aeef0d661cb58b3f2236e068654e8d8a9a5dfd403a44284200dadbcecbac9c80",
+          "binary_sha256": "bfdc256be00a95211e1a57548bd495bbb04133199b6b41445747cee4512f8a97"
+        }
+      },
+      "match": true
+    }
+  ],
+  "pass": 28,
+  "fail": 0,
+  "skip": 0
+}

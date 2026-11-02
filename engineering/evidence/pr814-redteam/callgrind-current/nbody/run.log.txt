@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| nbody | 532944 | 694930 | 1.30395 | 1444/1436 | 1911/1916 | 2994/3003 | 3454/3559 | 234/241 |
+geomean simulated Ir mine/ref = 1.3039456303101264 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/nbody/manifest.json

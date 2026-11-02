@@ -1,0 +1,40 @@
+;;; i686-evex-bf16-dot-and-pack-full-vector
+.text
+vdpbf16ps %xmm1, %xmm2, %xmm3
+vdpbf16ps %ymm7, %ymm6, %ymm5
+vdpbf16ps %zmm7, %zmm6, %zmm5{%k7}{z}
+vdpbf16ps (%eax){1to4}, %xmm5, %xmm6
+vdpbf16ps 508(%eax){1to4}, %xmm5, %xmm6{%k7}{z}
+vdpbf16ps 4064(%eax), %ymm5, %ymm6{%k7}
+vdpbf16ps 8128(%eax), %zmm5, %zmm6
+vcvtne2ps2bf16 %xmm1, %xmm2, %xmm3
+vcvtne2ps2bf16 %ymm7, %ymm6, %ymm5
+vcvtne2ps2bf16 %zmm7, %zmm6, %zmm5{%k7}{z}
+vcvtne2ps2bf16 (%eax){1to4}, %xmm5, %xmm6
+vcvtne2ps2bf16 508(%eax){1to4}, %xmm5, %xmm6{%k7}{z}
+vcvtne2ps2bf16 4064(%eax), %ymm5, %ymm6{%k7}
+vcvtne2ps2bf16 8128(%eax), %zmm5, %zmm6
+
+;;; i686-evex-bf16-reject-width-mismatch reject
+.text
+vdpbf16ps %ymm1, %xmm2, %ymm3
+
+;;; i686-evex-bf16-reject-wrong-dot-broadcast-count reject
+.text
+vdpbf16ps (%eax){1to8}, %zmm2, %zmm3
+
+;;; i686-evex-bf16-reject-wrong-pack-broadcast-count reject
+.text
+vcvtne2ps2bf16 (%eax){1to4}, %ymm2, %ymm3
+
+;;; i686-evex-bf16-reject-register-source-mask reject
+.text
+vdpbf16ps %xmm1{%k1}, %xmm2, %xmm3
+
+;;; i686-evex-bf16-reject-forced-vex reject
+.text
+{vex} vdpbf16ps %xmm1, %xmm2, %xmm3
+
+;;; i686-evex-bf16-reject-bad-operand-count reject
+.text
+vcvtne2ps2bf16 %xmm1, %xmm2

@@ -1,0 +1,8 @@
+.......................
+----------------------------------------------------------------------
+Ran 23 tests in 0.371s
+
+OK
+
+rows checked against as 2.47: 1638
+findings: 0   unmodeLLed rows: 0   not in the as 2.47 snapshot: 0

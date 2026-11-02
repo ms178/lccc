@@ -1,0 +1,11 @@
+# Paths exempt from scripts/check_no_conflict_markers.py, one glob per line.
+#
+# Empty by design: no tracked file may contain a merge conflict marker. Add an
+# entry ONLY for a fixture that must carry a real conflict to exercise a merge
+# tool, and say in the same file why. An entry that is no longer needed should
+# be deleted rather than left to rot.
+# Example: a doc that TEACHES merge conflicts would legitimately contain the
+# three-line shape and must be listed here, e.g.
+#   engineering/*MERGE*.md
+# Deliberately NOT skipped automatically: a marker inside a shell heredoc is a
+# real bug, and failing closed is worth more than sparing the rare lesson.

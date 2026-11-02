@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# ============================================================================
+# build_kernel_boot.sh — build the Linux kernel's x86 boot code (arch/x86/boot)
+# entirely with LCCC + lccc-ld, and report the 32 KiB "Setup too big!" gate.
+#
+# Scope: the real-mode setup objects (23 .o) linked into setup.elf by lccc-ld
+# against arch/x86/boot/setup.ld, whose ASSERT is `_end <= 0x8000` (32 KiB).
+# This is the exact gate that must pass before bzImage can be produced.
+#
+# Each function gets its own input section and lccc-ld performs relocation-
+# reachable section GC. Linux's script predates --gc-sections, so the generated
+# copy adds KEEP around boot-protocol payloads and registration tables that are
+# intentionally reached by layout rather than a machine relocation. No address,
+# alignment, data directive or ASSERT is changed.
+#
+# A stub zoffset.h is used: header.o's SIZE is independent of the ZO_* values
+# (they are immediates); the real values come from `nm compressed/vmlinux`.
+#
+# Usage:
+#   KERNEL_DIR=/path/to/linux LCCC=/path/to/lccc build_kernel_boot.sh
+# ============================================================================
+set -euo pipefail
+
+# Which kernel tree?  scripts/kernel_version.sh is the single source of truth
+# (explicit KERNEL_DIR/KVER > the prepared tree on disk > the package PKGBUILD
+# > a pinned fallback); the literal that used to live here went stale the
+# moment archpkgbuilds bumped 6.18.55 -> 6.18.58.
+# shellcheck source=kernel_version.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
+K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
+OUT=${OUT:-/tmp/bootbuild}
+# Resolve the script directory before `cd "$K"`: $0 is relative to the caller's
+# cwd, so sourcing boot_flags.sh after the cd would look inside the kernel tree.
+# The compiler defaults follow the same rule and point at THIS checkout: a repo
+# path baked in at write time only exists on the machine it was written on, and
+# every other harness script (boot_size_oracle.sh, boot_stage_bisect.sh) already
+# resolves relative to $0.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
+LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
+# mkcpustr is a host generator, never a kernel translation unit.
+HOSTCC=${HOSTCC:-cc}
+
+# Fail fast with an actionable message: without these, the first failure is a
+# bare "No such file or directory" from the assemble loop, dozens of lines in.
+[[ -d "$K" ]] || { echo "build_kernel_boot: kernel tree missing: $K" >&2; exit 1; }
+[[ -x "$LCCC" ]] || {
+  echo "build_kernel_boot: lccc missing: $LCCC" >&2
+  echo "  build it with scripts/build_lccc_fast.sh, or point LCCC= at one" >&2
+  exit 1
+}
+[[ -x "$LCCC_LD" ]] || { echo "build_kernel_boot: lccc-ld missing: $LCCC_LD" >&2; exit 1; }
+
+cd "$K"
+
+# Real-mode translation-unit flags come from the shared flag module so that
+# boot_size_oracle.sh measures exactly the same command lines (an A/B size
+# comparison must never be confounded by a flag difference).
+# shellcheck source=boot_flags.sh
+. "$SCRIPT_DIR/boot_flags.sh"
+# shellcheck source=boot_offsets.sh
+. "$SCRIPT_DIR/boot_offsets.sh"
+RMF="$LCCC_BOOT_CFLAGS"
+INC="$LCCC_BOOT_CPPFLAGS"
+# Extra flags for kconfigless staging (see boot_kconfigless_stage.sh): ways to
+# spell a Kconfig-generated environment (generated headers, forced -D macros)
+# that the sandbox cannot produce (no flex/bison).  Empty by default, so the
+# canonical gate invocation is unaffected; A/B stays valid as long as both
+# sides share the identical staged tree and EXTRA value.
+EXTRA="${LCCC_BOOT_EXTRA:-}"
+
+mkdir -p "$OUT"
+# Never modify Kbuild's real generated offsets: the setup-only stubs belong to
+# a disposable private include directory, even if this probe is interrupted.
+header_stage=$(mktemp -d "$OUT/.boot-header.XXXXXX")
+trap 'rm -rf -- "$header_stage"' EXIT
+lccc_boot_stage_header "$header_stage"
+
+# ---- generated headers -----------------------------------------------------
+# cpustr.h (needs the mkcpustr host tool)
+if [[ ! -f arch/x86/boot/cpustr.h ]]; then
+  "$HOSTCC" -O2 -Iarch/x86/include -Iarch/x86/include/generated -Iinclude \
+      arch/x86/boot/mkcpustr.c -o "$OUT/mkcpustr"
+  "$OUT/mkcpustr" > arch/x86/boot/cpustr.h
+fi
+
+# ---- assemble the .S files -------------------------------------------------
+ASM_FILES=("${LCCC_BOOT_ASM_FILES[@]}")
+for f in "${ASM_FILES[@]}"; do
+  echo "AS   $f.S"
+  source="arch/x86/boot/$f.S"
+  [[ $f != header ]] || source="$header_stage/header.S"
+  "$LCCC" $INC $RMF $EXTRA -D__ASSEMBLY__ -c "$source" -o "$OUT/$f.o"
+done
+
+# ---- compile the .c files --------------------------------------------------
+C_FILES=("${LCCC_BOOT_C_FILES[@]}")
+for f in "${C_FILES[@]}"; do
+  echo "CC   $f.c"
+  "$LCCC" $INC $RMF $EXTRA -c "arch/x86/boot/$f.c" -o "$OUT/$f.o"
+done
+
+# ---- link setup.elf with lccc-ld -------------------------------------------
+SETUP_OBJS=("${LCCC_BOOT_OBJS[@]}")
+OBJS=()
+for o in "${SETUP_OBJS[@]}"; do OBJS+=("$OUT/$o.o"); done
+
+# --gc-sections can only infer reachability represented by relocations.  These
+# sections are boot-protocol payloads or linker-collected registries: their
+# placement/extent is observable even when no instruction relocates to the
+# section itself. GNU KEEP is therefore required by the semantics of section
+# GC. Generate a build-local script so the pristine kernel tree remains intact.
+SETUP_LD="$OUT/setup-gc.ld"
+python3 - "arch/x86/boot/setup.ld" "$SETUP_LD" <<'PY'
+from pathlib import Path
+import sys
+
+source, output = map(Path, sys.argv[1:])
+text = source.read_text()
+sections = (
+    ".bstext", ".header", ".entrytext", ".inittext", ".initdata",
+    ".text32", ".pecompat", ".videocards",
+)
+for section in sections:
+    plain = f"*({section})"
+    kept = f"KEEP(*({section}))"
+    if kept in text:
+        continue
+    count = text.count(plain)
+    if count != 1:
+        raise SystemExit(
+            f"cannot add KEEP for {section}: expected one {plain}, found {count}"
+        )
+    text = text.replace(plain, kept)
+output.write_text(text)
+PY
+
+report_layout() { # report_layout <elf>
+  local elf=$1 end_hex end_dec delta
+  echo
+  echo "=== $(basename "$elf") section sizes (bytes) ==="
+  size -A "$elf"
+  echo
+  nm -n "$elf" | grep -E ' (_end|setup_size|setup_sects|__bss_start|__bss_end)$' || true
+  end_hex=$(nm -n "$elf" | awk '$3 == "_end" { print $1; exit }')
+  if [[ -n $end_hex ]]; then
+    end_dec=$((16#$end_hex))
+    delta=$((end_dec - 0x8000))
+    if (( delta <= 0 )); then
+      printf '32 KiB gate: PASS (_end=%d, headroom=%d bytes)\n' "$end_dec" "$((-delta))"
+    else
+      printf '32 KiB gate: FAIL (_end=%d, overflow=%d bytes)\n' "$end_dec" "$delta"
+    fi
+  fi
+}
+
+validate_payloads() { # validate_payloads <elf>
+  local elf=$1 section bytes
+  for section in .videocards; do
+    bytes=$(size -A "$elf" | awk -v section="$section" '$1 == section { print $2; exit }')
+    [[ ${bytes:-0} -gt 0 ]] || {
+      echo "error: --gc-sections dropped required $section registry" >&2
+      return 1
+    }
+  done
+  if grep -q '^CONFIG_EFI_MIXED=y' .config; then
+    bytes=$(size -A "$elf" | awk '$1 == ".pecompat" { print $2; exit }')
+    [[ ${bytes:-0} -gt 0 ]] || {
+      echo "error: --gc-sections dropped required EFI mixed-mode .pecompat payload" >&2
+      return 1
+    }
+  fi
+}
+
+validate_flat_oracles() { # validate_flat_oracles <lccc-elf>
+  local elf=$1 objcopy_bin oracle tag
+  [[ ${LCCC_BOOT_ORACLES:-1} != 0 ]] || return 0
+  objcopy_bin=${OBJCOPY:-objcopy}
+  command -v "$objcopy_bin" >/dev/null 2>&1 || {
+    echo "warning: objcopy unavailable; flat-image oracle comparison skipped" >&2
+    return 0
+  }
+  "$objcopy_bin" -O binary "$elf" "$OUT/setup.bin"
+  for oracle in ld.bfd ld.lld; do
+    command -v "$oracle" >/dev/null 2>&1 || continue
+    tag=${oracle#ld.}
+    "$oracle" --gc-sections -m elf_i386 -z noexecstack -T "$SETUP_LD" \
+      "${OBJS[@]}" -o "$OUT/setup.$tag.elf"
+    "$objcopy_bin" -O binary "$OUT/setup.$tag.elf" "$OUT/setup.$tag.bin"
+    cmp "$OUT/setup.bin" "$OUT/setup.$tag.bin" || {
+      echo "error: lccc-ld setup.bin differs from $oracle oracle" >&2
+      return 1
+    }
+    echo "ORACLE $oracle: PASS (flat setup image byte-identical)"
+  done
+  sha256sum "$OUT/setup.bin"
+}
+
+echo "LD   setup.elf (lccc-ld)"
+if "$LCCC_LD" --gc-sections -m elf_i386 -z noexecstack -T "$SETUP_LD" \
+    "${OBJS[@]}" -o "$OUT/setup.elf"; then
+  report_layout "$OUT/setup.elf"
+  validate_payloads "$OUT/setup.elf"
+  validate_flat_oracles "$OUT/setup.elf"
+  # ISA audit of the built setup objects: the 16-bit path is compiled with
+  # REALMODE_CFLAGS (`-march=i386 -mno-mmx -mno-sse`), so a BMI/ABM/VEX/SSE4.2
+  # mnemonic in here means that flag set stopped being honored — and this code
+  # runs before the kernel exists, on the CPU the boot sector just woke up on.
+  "$SCRIPT_DIR/kernel_boot_isa.sh" scan "$OUT"
+  exit 0
+else
+  link_status=$?
+fi
+
+# A size ASSERT aborts before an ELF exists, which used to leave the developer
+# with no `_end` value and encouraged misleading sums of input sections.  Link
+# a diagnostic artifact after removing ONLY the two size guards; every ABI,
+# header-offset and init-section ASSERT remains active.  This artifact is never
+# a boot candidate.  It exists solely to expose the exact linker-script layout
+# and alignment cliffs (notably `.pecompat` at 4 KiB alignment).
+diag_script="$OUT/setup-size-diagnostic.ld"
+sed -e '/ASSERT(setup_sects <= 64,/d' \
+    -e '/ASSERT(_end <= 0x8000,/d' \
+    "$SETUP_LD" > "$diag_script"
+echo "LD   setup-size-diagnostic.elf (size ASSERTs removed for measurement only)"
+if "$LCCC_LD" --gc-sections -m elf_i386 -z noexecstack -T "$diag_script" \
+    "${OBJS[@]}" -o "$OUT/setup-size-diagnostic.elf"; then
+  report_layout "$OUT/setup-size-diagnostic.elf"
+else
+  echo "error: diagnostic link also failed; this is not solely a size-gate failure" >&2
+fi
+exit "$link_status"

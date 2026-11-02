@@ -1,0 +1,1219 @@
+//! ArmCodegen: ALU operations (integer arithmetic, bitwise, unary).
+
+use super::emit::{
+    ArmCodegen, arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys,
+};
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrBinOp, Operand, Value};
+
+impl ArmCodegen {
+    /// True when `op` is a value whose **only** current home is the
+    /// accumulator.
+    ///
+    /// Such a value has no callee-saved register assignment and no stack slot:
+    /// the skip-slot optimisation keeps an immediately-consumed value in x0 and
+    /// never spills it. Any emission that writes x0 therefore destroys it
+    /// irrecoverably — `operand_to_x0` would have nowhere left to reload from.
+    fn operand_lives_only_in_acc(&self, op: &Operand) -> bool {
+        let Operand::Value(v) = op else {
+            return false;
+        };
+        // `acc_has` is keyed by (value, is_alloca); consult both spellings so
+        // an alloca/non-alloca disagreement in the cache cannot hide a value
+        // that really is sitting in x0.
+        self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true)
+    }
+
+    /// Stage several operands into their scratch registers, **accumulator-
+    /// resident operands first**.
+    ///
+    /// Every staging route for a register-less operand goes through x0
+    /// (`operand_to_x0` followed by `mov <scratch>, x0`). If two operands need
+    /// staging and one of them already lives only in x0, staging the other one
+    /// first destroys it: the value has no register assignment and no stack
+    /// slot, so the reload has to give up. That is exactly how
+    /// `sha256_transform`'s checksum lost its `state[3]` term —
+    /// `eor x0, x1, x2, lsl #16` was emitted with `x2` materialised as zero
+    /// (BUG-2026-09-09, AArch64 silent miscompile).
+    ///
+    /// x0 can hold at most one value, so at most one operand is
+    /// accumulator-resident; ordering it first is both necessary and
+    /// sufficient. The sort is stable, so in the common case (nothing is
+    /// accumulator-resident, or the resident operand is already first) the
+    /// emitted code is byte-identical to the previous behaviour.
+    fn stage_operands_acc_first(
+        &mut self,
+        pairs: &[(&Operand, &'static str)],
+        materialize: &mut dyn FnMut(&mut Self, &Operand, &'static str) -> String,
+    ) -> Vec<String> {
+        let mut order: Vec<usize> = (0..pairs.len()).collect();
+        order.sort_by_key(|&i| !self.operand_lives_only_in_acc(pairs[i].0));
+        let mut regs: Vec<Option<String>> = vec![None; pairs.len()];
+        for i in order {
+            let (op, scratch) = pairs[i];
+            regs[i] = Some(materialize(self, op, scratch));
+        }
+        regs.into_iter()
+            .map(|r| r.expect("stage_operands_acc_first stages every operand exactly once"))
+            .collect()
+    }
+
+    pub(super) fn emit_shifted_logical_impl(
+        &mut self,
+        shift_op: IrBinOp,
+        shift_lhs: &Operand,
+        shift_amount: &Operand,
+        logical_op: IrBinOp,
+        other: &Operand,
+        dest: &Value,
+        ty: IrType,
+    ) {
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        let amount = Self::const_as_imm12(shift_amount)
+            .expect("shifted logical fusion requires a constant shift");
+        let width = if use_32bit { 32 } else { 64 };
+        debug_assert!(amount < width);
+
+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
+            // FP-homed integer values must stage through the scratch GPR:
+            // callee_saved_name panics on FP register indices (the session-29
+            // ICE class). operand_to_x0 handles the fmov correctly.
+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
+                if use_32bit {
+                    callee_saved_name_32(reg).to_string()
+                } else {
+                    callee_saved_name(reg).to_string()
+                }
+            } else {
+                this.operand_to_x0(op);
+                let acc = if use_32bit { "w0" } else { "x0" };
+                this.state
+                    .emit_fmt(format_args!("    mov {}, {}", scratch, acc));
+                scratch.to_string()
+            }
+        };
+        // BUG-2026-09-09: stage whichever operand currently lives only in x0
+        // FIRST. Materialising `other` first clobbers x0, and when `shift_lhs`
+        // is the skip-slot result of the immediately preceding instruction it
+        // has no register and no slot to reload from.
+        let scratch_other = if use_32bit { "w1" } else { "x1" };
+        let scratch_shifted = if use_32bit { "w2" } else { "x2" };
+        let staged = self.stage_operands_acc_first(
+            &[(other, scratch_other), (shift_lhs, scratch_shifted)],
+            &mut materialize,
+        );
+        let other_reg = staged[0].clone();
+        let shifted_reg = staged[1].clone();
+        let output = if let Some(reg) = self.dest_reg(dest) {
+            if use_32bit {
+                callee_saved_name_32(reg)
+            } else {
+                callee_saved_name(reg)
+            }
+        } else if use_32bit {
+            "w0"
+        } else {
+            "x0"
+        };
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, {}, {} #{}",
+            arm_alu_mnemonic(logical_op),
+            output,
+            other_reg,
+            shifted_reg,
+            arm_alu_mnemonic(shift_op),
+            amount
+        ));
+        self.state.reg_cache.invalidate_acc();
+        if self.dest_reg(dest).is_none() {
+            self.store_x0_to(dest);
+        }
+    }
+
+    pub(super) fn emit_int_fused_mul_add_impl(
+        &mut self,
+        lhs: &Operand,
+        rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+    ) {
+        let use_32bit = matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        );
+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
+            if let Some(reg) = this.operand_reg(op) {
+                if use_32bit {
+                    callee_saved_name_32(reg).to_string()
+                } else {
+                    callee_saved_name(reg).to_string()
+                }
+            } else {
+                // Not register-assigned: load stack-homed values directly into
+                // the scratch register, avoiding the ldr-into-x0 + mov detour.
+                if let Operand::Value(v) = op {
+                    if !this.state.is_alloca(v.0) {
+                        if let Some(slot) = this.state.get_slot(v.0) {
+                            this.emit_load_from_sp(scratch, slot.0, "ldr");
+                            return scratch.to_string();
+                        }
+                    }
+                }
+                this.operand_to_x0(op);
+                let acc_name = if use_32bit { "w0" } else { "x0" };
+                this.state
+                    .emit_fmt(format_args!("    mov {}, {}", scratch, acc_name));
+                scratch.to_string()
+            }
+        };
+        // Same invariant as `emit_shifted_logical_impl`: an operand that lives
+        // only in the accumulator must be captured before another operand's
+        // staging writes x0 (BUG-2026-09-09 bug class).
+        let staged = self.stage_operands_acc_first(
+            &[
+                (lhs, if use_32bit { "w1" } else { "x1" }),
+                (rhs, if use_32bit { "w2" } else { "x2" }),
+                (acc, if use_32bit { "w3" } else { "x3" }),
+            ],
+            &mut materialize,
+        );
+        let lhs_reg = staged[0].clone();
+        let rhs_reg = staged[1].clone();
+        let acc_reg = staged[2].clone();
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+            let output = if use_32bit {
+                callee_saved_name_32(dest_phys)
+            } else {
+                callee_saved_name(dest_phys)
+            };
+            self.state.emit_fmt(format_args!(
+                "    madd {}, {}, {}, {}",
+                output, lhs_reg, rhs_reg, acc_reg
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let output = if use_32bit { "w0" } else { "x0" };
+        self.state.emit_fmt(format_args!(
+            "    madd {}, {}, {}, {}",
+            output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_x0_to(dest);
+    }
+
+    /// Integer fused multiply-subtract: dest = acc - lhs*rhs (msub).
+    /// Same staging discipline as emit_int_fused_mul_add_impl; msub reads
+    /// all three sources before writing, so output aliasing is safe.
+    pub(super) fn emit_int_fused_mul_sub_impl(
+        &mut self,
+        lhs: &Operand,
+        rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+    ) {
+        let use_32bit = matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        );
+        let mut materialize = |this: &mut Self, op: &Operand, scratch: &'static str| -> String {
+            // FP-homed integer values stage through the scratch GPR
+            // (callee_saved_name panics on FP indices; session-29 class).
+            if let Some(reg) = this.operand_reg(op).filter(|r| !is_arm_fp_phys(*r)) {
+                if use_32bit {
+                    callee_saved_name_32(reg).to_string()
+                } else {
+                    callee_saved_name(reg).to_string()
+                }
+            } else {
+                if let Operand::Value(v) = op {
+                    if !this.state.is_alloca(v.0) {
+                        if let Some(slot) = this.state.get_slot(v.0) {
+                            this.emit_load_from_sp(scratch, slot.0, "ldr");
+                            return scratch.to_string();
+                        }
+                    }
+                }
+                this.operand_to_x0(op);
+                let acc_name = if use_32bit { "w0" } else { "x0" };
+                this.state
+                    .emit_fmt(format_args!("    mov {}, {}", scratch, acc_name));
+                scratch.to_string()
+            }
+        };
+        let staged = self.stage_operands_acc_first(
+            &[
+                (lhs, if use_32bit { "w1" } else { "x1" }),
+                (rhs, if use_32bit { "w2" } else { "x2" }),
+                (acc, if use_32bit { "w3" } else { "x3" }),
+            ],
+            &mut materialize,
+        );
+        let lhs_reg = staged[0].clone();
+        let rhs_reg = staged[1].clone();
+        let acc_reg = staged[2].clone();
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+            let output = if use_32bit {
+                callee_saved_name_32(dest_phys)
+            } else {
+                callee_saved_name(dest_phys)
+            };
+            self.state.emit_fmt(format_args!(
+                "    msub {}, {}, {}, {}",
+                output, lhs_reg, rhs_reg, acc_reg
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
+        let output = if use_32bit { "w0" } else { "x0" };
+        self.state.emit_fmt(format_args!(
+            "    msub {}, {}, {}, {}",
+            output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_x0_to(dest);
+    }
+
+    pub(super) fn emit_float_neg_impl(&mut self, ty: IrType) {
+        if ty == IrType::F32 {
+            self.state.emit("    fmov s0, w0");
+            self.state.emit("    fneg s0, s0");
+            self.state.emit("    fmov w0, s0");
+            self.state.emit("    mov w0, w0"); // zero-extend
+        } else {
+            self.state.emit("    fmov d0, x0");
+            self.state.emit("    fneg d0, d0");
+            self.state.emit("    fmov x0, d0");
+        }
+    }
+
+    pub(super) fn emit_int_neg_impl(&mut self, ty: IrType) {
+        // 32-bit forms operate on w0 and zero-extend into x0, matching the
+        // I32 home convention used by clz/rev elsewhere in this backend. A
+        // 64-bit `neg x0,x0` on a zero-extended U32 would leave 0xFFFFFFFF
+        // in the upper half (x86-64 audit, claim 1 — same bug class).
+        match ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
+                self.state.emit("    neg w0, w0");
+            }
+            _ => self.state.emit("    neg x0, x0"),
+        }
+    }
+
+    pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
+        match ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
+                self.state.emit("    mvn w0, w0");
+            }
+            _ => self.state.emit("    mvn x0, x0"),
+        }
+    }
+
+    pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
+        if ty == IrType::I32 || ty == IrType::U32 {
+            self.state.emit("    clz w0, w0");
+        } else {
+            self.state.emit("    clz x0, x0");
+        }
+    }
+
+    pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
+        if ty == IrType::I32 || ty == IrType::U32 {
+            self.state.emit("    rbit w0, w0");
+            self.state.emit("    clz w0, w0");
+        } else {
+            self.state.emit("    rbit x0, x0");
+            self.state.emit("    clz x0, x0");
+        }
+    }
+
+    pub(super) fn emit_int_bswap_impl(&mut self, ty: IrType) {
+        if ty == IrType::I16 || ty == IrType::U16 {
+            self.state.emit("    rev w0, w0");
+            self.state.emit("    lsr w0, w0, #16");
+        } else if ty == IrType::I32 || ty == IrType::U32 {
+            self.state.emit("    rev w0, w0");
+        } else {
+            self.state.emit("    rev x0, x0");
+        }
+    }
+
+    pub(super) fn emit_int_bitreverse_impl(&mut self, ty: IrType) {
+        if ty == IrType::I32 || ty == IrType::U32 {
+            self.state.emit("    rbit w0, w0");
+        } else {
+            self.state.emit("    rbit x0, x0");
+        }
+    }
+
+    pub(super) fn emit_int_popcount_impl(&mut self, ty: IrType) {
+        if self.general_regs_only {
+            // Count within 2-, 4-, then 8-bit lanes. Each byte holds 0..8;
+            // multiplying by repeated 0x01 sums the bytes into the top byte
+            // without a carry (total <= 64). No data-dependent branch, helper
+            // call, memory access, or forbidden FP/SIMD register is needed.
+            // x0 is the unary accumulator; x1 is reserved emitter scratch,
+            // never an allocated SSA home (ARM_CALLER_SAVED excludes it).
+            let narrow = matches!(ty, IrType::I32 | IrType::U32);
+            let (r, pairs, nibbles, bytes, ones, shift) = if narrow {
+                (
+                    "w",
+                    "0x55555555",
+                    "0x33333333",
+                    "0x0f0f0f0f",
+                    "0x01010101",
+                    24,
+                )
+            } else {
+                (
+                    "x",
+                    "0x5555555555555555",
+                    "0x3333333333333333",
+                    "0x0f0f0f0f0f0f0f0f",
+                    "0x0101010101010101",
+                    56,
+                )
+            };
+            self.state.emit_fmt(format_args!("    lsr {r}1, {r}0, #1"));
+            self.state
+                .emit_fmt(format_args!("    and {r}1, {r}1, #{pairs}"));
+            self.state
+                .emit_fmt(format_args!("    sub {r}0, {r}0, {r}1"));
+            self.state.emit_fmt(format_args!("    lsr {r}1, {r}0, #2"));
+            self.state
+                .emit_fmt(format_args!("    and {r}0, {r}0, #{nibbles}"));
+            self.state
+                .emit_fmt(format_args!("    and {r}1, {r}1, #{nibbles}"));
+            self.state
+                .emit_fmt(format_args!("    add {r}0, {r}0, {r}1"));
+            self.state
+                .emit_fmt(format_args!("    add {r}0, {r}0, {r}0, lsr #4"));
+            self.state
+                .emit_fmt(format_args!("    and {r}0, {r}0, #{bytes}"));
+            self.state.emit_fmt(format_args!("    mov {r}1, #{ones}"));
+            self.state
+                .emit_fmt(format_args!("    mul {r}0, {r}0, {r}1"));
+            self.state
+                .emit_fmt(format_args!("    lsr {r}0, {r}0, #{shift}"));
+            return;
+        }
+        if ty == IrType::I32 || ty == IrType::U32 {
+            self.state.emit("    fmov s0, w0");
+        } else {
+            self.state.emit("    fmov d0, x0");
+        }
+        self.state.emit("    cnt v0.8b, v0.8b");
+        self.state.emit("    uaddlv h0, v0.8b");
+        self.state.emit("    fmov w0, s0");
+    }
+
+    pub(super) fn emit_int_binop_impl(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+
+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+        // AArch64 target). The TAIL of a pair emits nothing — its result was
+        // stored by the HEAD's sdiv+msub dual-store further up in this block
+        // (exactly GCC's shape: one divide, the remainder folded as
+        // lhs - q*rhs). Dead tails skip the msub entirely — unlike x86's
+        // free dual-output, the msub costs a cycle on AArch64.
+        if matches!(
+            op,
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+        ) {
+            if self.divrem_tail_dests.contains(&dest.0) {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM-ARM] tail-skip dest={}", dest.0);
+                }
+                return;
+            }
+            if let Some(&partner_dest) = self.divrem_head_partners.get(&dest.0) {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!(
+                        "[DIVREM-ARM] head-emit dest={} op={:?} partner={}",
+                        dest.0, op, partner_dest
+                    );
+                }
+                self.emit_divrem_pair_head_arm(dest, op, lhs, rhs, use_32bit, partner_dest);
+                return;
+            }
+        }
+
+        // Strength reduction: UDiv/URem by power-of-2 constant
+        if let Some(shift) = Self::const_as_power_of_2(rhs) {
+            if op == IrBinOp::UDiv {
+                self.operand_to_x0(lhs);
+                if use_32bit {
+                    self.state
+                        .emit_fmt(format_args!("    lsr w0, w0, #{}", shift));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    lsr x0, x0, #{}", shift));
+                }
+                self.store_x0_to(dest);
+                return;
+            }
+            if op == IrBinOp::URem {
+                self.operand_to_x0(lhs);
+                let mask = (1u64 << shift) - 1;
+                if use_32bit {
+                    self.state
+                        .emit_fmt(format_args!("    and w0, w0, #{}", mask));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    and x0, x0, #{}", mask));
+                }
+                self.store_x0_to(dest);
+                return;
+            }
+        }
+
+        // Register-direct path. An FP-homed destination (d8-d14 / d16-d31,
+        // possible since call-spanning F64 values allocate to the FP pool)
+        // cannot take the GP three-operand form — callee_saved_name would
+        // panic ("invalid ARM register index", aarch64_fuzz seed 17: an
+        // integer BinOp whose result feeds an F64 conversion got an FP
+        // home). Fall through to the accumulator path, which stages via
+        // x0 and lets store_x0_to fmov into the FP register.
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
+            let dest_name = callee_saved_name(dest_phys);
+            let dest_name_32 = callee_saved_name_32(dest_phys);
+
+            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle)
+                && matches!(
+                    ty,
+                    IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
+                )
+            {
+                // The register-direct form is written for the 32/64-bit
+                // views.  Narrow operations take the accumulator path, which
+                // reduces the index modulo the operation width and
+                // canonicalizes the signed/unsigned result.
+                if self.emit_bit_modify_into(op, dest_phys, lhs, rhs, use_32bit) {
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+
+            let is_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
+            let is_simple_alu = matches!(
+                op,
+                IrBinOp::Add
+                    | IrBinOp::Sub
+                    | IrBinOp::And
+                    | IrBinOp::Or
+                    | IrBinOp::Xor
+                    | IrBinOp::Mul
+            ) || is_shift;
+            if is_simple_alu {
+                let mnemonic = arm_alu_mnemonic(op);
+                let lhs_phys = self.operand_reg(lhs).filter(|r| !is_arm_fp_phys(*r));
+                // Emit `op dest, lhs, rhs` with lhs either its assigned register
+                // (three-operand form, no setup mov) or dest preloaded with lhs.
+                macro_rules! emit3 {
+                    ($rhs:expr_2021) => {
+                        if let Some(lp) = lhs_phys {
+                            if use_32bit {
+                                let l = callee_saved_name_32(lp);
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}, {}, {}",
+                                    mnemonic,
+                                    dest_name_32,
+                                    l,
+                                    $rhs(lp, true)
+                                ));
+                            } else {
+                                let l = callee_saved_name(lp);
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}, {}, {}",
+                                    mnemonic,
+                                    dest_name,
+                                    l,
+                                    $rhs(lp, false)
+                                ));
+                            }
+                        } else {
+                            self.operand_to_callee_reg(lhs, dest_phys);
+                            if use_32bit {
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}, {}, {}",
+                                    mnemonic,
+                                    dest_name_32,
+                                    dest_name_32,
+                                    $rhs(dest_phys, true)
+                                ));
+                            } else {
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}, {}, {}",
+                                    mnemonic,
+                                    dest_name,
+                                    dest_name,
+                                    $rhs(dest_phys, false)
+                                ));
+                            }
+                        }
+                    };
+                }
+
+                if matches!(op, IrBinOp::Add | IrBinOp::Sub) {
+                    if let Some(imm) = Self::const_as_imm12(rhs) {
+                        emit3!(|_, _| format!("#{}", imm));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+
+                if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
+                    let width = if use_32bit { 32 } else { 64 };
+                    if let Some(imm) = Self::const_as_logical_imm(rhs, width) {
+                        emit3!(|_, _| format!("#{:#x}", imm));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                }
+
+                // AArch64 encodes a constant shift directly in the instruction.
+                // Keeping the value in its assigned register avoids several moves
+                // through x0/x1/x2 for the common C bit-manipulation idiom.
+                if is_shift {
+                    if let Some(imm) = Self::const_as_imm12(rhs) {
+                        let width = if use_32bit { 32 } else { 64 };
+                        if imm < width {
+                            emit3!(|_, _| format!("#{}", imm));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+
+                let rhs_phys = self.operand_reg(rhs).filter(|r| !is_arm_fp_phys(*r));
+                // Regalloc can assign two values whose lifetime endpoints meet
+                // to the same register. If they are then used by the SAME
+                // instruction, the later definition has overwritten the older
+                // value in that register (AArch64 torture 20120919-1: `s +=
+                // pi[i]` became `add w5,w5,w5`).  Repair this rare boundary
+                // case locally by reloading one operand from its stack home
+                // into x0/w0 and using the three-operand form. This preserves
+                // the aggressive allocator's half-open handoff policy while
+                // keeping same-instruction uses correct.
+                if let (Operand::Value(lv), Operand::Value(rv), Some(lp), Some(rp)) =
+                    (lhs, rhs, lhs_phys, rhs_phys)
+                {
+                    if lv.0 != rv.0 && lp.0 == rp.0 {
+                        let scratch = if use_32bit { "w0" } else { "x0" };
+                        if let Some(slot) = self.state.get_slot(lv.0) {
+                            self.emit_load_from_sp(scratch, slot.0, "ldr");
+                            let r = if use_32bit {
+                                callee_saved_name_32(rp)
+                            } else {
+                                callee_saved_name(rp)
+                            };
+                            let out = if use_32bit { dest_name_32 } else { dest_name };
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, {}, {}",
+                                mnemonic, out, scratch, r
+                            ));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                        if let Some(slot) = self.state.get_slot(rv.0) {
+                            self.emit_load_from_sp(scratch, slot.0, "ldr");
+                            let l = if use_32bit {
+                                callee_saved_name_32(lp)
+                            } else {
+                                callee_saved_name(lp)
+                            };
+                            let out = if use_32bit { dest_name_32 } else { dest_name };
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, {}, {}",
+                                mnemonic, out, l, scratch
+                            ));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+                if let Some(rp) = rhs_phys {
+                    let rhs_name = if use_32bit {
+                        callee_saved_name_32(rp)
+                    } else {
+                        callee_saved_name(rp)
+                    };
+                    if rp.0 == dest_phys.0 {
+                        // rhs lives in dest's home. The three-operand form
+                        // `op dest, lhs, rhs` reads rhs AFTER dest is written,
+                        // so dest==rhs turns the op into `lhs OP lhs` whenever
+                        // lhs is not itself live in that register. This is the
+                        // same machine constraint the allocator's half-open
+                        // handoff does not model locally; the previous repair
+                        // covered only a slotted VALUE lhs — a CONSTANT lhs
+                        // (repro: `(int32_t)c - 2` with the result homed over
+                        // the addend, arm_csinc_select main preheader:
+                        // `mov x23,#-1; sub x23,x23,x23` computed 0) and a
+                        // slotless lhs fell through to the broken form. Stage
+                        // lhs through x0 — that path handles constants, stack
+                        // homes and the accumulator uniformly — then read rhs
+                        // from its (dest-named) home in the same instruction.
+                        let scratch = if use_32bit { "w0" } else { "x0" };
+                        self.operand_to_x0(lhs);
+                        let out = if use_32bit { dest_name_32 } else { dest_name };
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, {}, {}",
+                            mnemonic, out, scratch, rhs_name
+                        ));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
+                    }
+                    emit3!(|_, is32| if is32 {
+                        callee_saved_name_32(rp).to_string()
+                    } else {
+                        callee_saved_name(rp).to_string()
+                    });
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+                // rhs not register-assigned: load it into x0 as scratch.
+                // If lhs is also not register-assigned, its load into dest goes
+                // through x0 too — so lhs must be loaded FIRST, otherwise it
+                // clobbers the rhs already sitting in x0.
+                if lhs_phys.is_none() {
+                    self.operand_to_callee_reg(lhs, dest_phys);
+                    self.operand_to_x0(rhs);
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, {}, w0",
+                            mnemonic, dest_name_32, dest_name_32
+                        ));
+                    } else {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, {}, x0",
+                            mnemonic, dest_name, dest_name
+                        ));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+                self.operand_to_x0(rhs);
+                emit3!(|_, is32| if is32 {
+                    "w0".to_string()
+                } else {
+                    "x0".to_string()
+                });
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
+        // Immediate accumulator path for spilled/short-lived results.  The
+        // previous fallback materialized every constant in x0, copied both
+        // operands through x1/x2, then performed a register-register op.  GEP
+        // scaling and loop increments commonly land here, so use AArch64's
+        // immediate forms even when the result has no physical assignment.
+        if matches!(op, IrBinOp::Add | IrBinOp::Sub) {
+            if let Some(imm) = Self::const_as_imm12(rhs) {
+                self.operand_to_x0(lhs);
+                let mnemonic = arm_alu_mnemonic(op);
+                if use_32bit {
+                    self.state
+                        .emit_fmt(format_args!("    {} w0, w0, #{}", mnemonic, imm));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {} x0, x0, #{}", mnemonic, imm));
+                }
+                self.store_x0_to(dest);
+                return;
+            }
+        }
+        if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
+            let width = if use_32bit { 32 } else { 64 };
+            if let Some(imm) = Self::const_as_logical_imm(rhs, width) {
+                self.operand_to_x0(lhs);
+                let mnemonic = arm_alu_mnemonic(op);
+                if use_32bit {
+                    self.state
+                        .emit_fmt(format_args!("    {} w0, w0, #{:#x}", mnemonic, imm));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    {} x0, x0, #{:#x}", mnemonic, imm));
+                }
+                self.store_x0_to(dest);
+                return;
+            }
+        }
+        if matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
+            if let Some(imm) = Self::const_as_imm12(rhs) {
+                let width = if use_32bit { 32 } else { 64 };
+                if imm < width {
+                    self.operand_to_x0(lhs);
+                    let mnemonic = arm_alu_mnemonic(op);
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    {} w0, w0, #{}", mnemonic, imm));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} x0, x0, #{}", mnemonic, imm));
+                    }
+                    self.store_x0_to(dest);
+                    return;
+                }
+            }
+        }
+
+        // Fallback: accumulator path
+        self.operand_to_x0(lhs);
+        self.state.emit("    mov x1, x0");
+        self.operand_to_x0(rhs);
+        self.state.emit("    mov x2, x0");
+
+        if use_32bit {
+            match op {
+                IrBinOp::Add => {
+                    self.state.emit("    add w0, w1, w2");
+                }
+                IrBinOp::Sub => {
+                    self.state.emit("    sub w0, w1, w2");
+                }
+                IrBinOp::Mul => {
+                    self.state.emit("    mul w0, w1, w2");
+                }
+                IrBinOp::SDiv => {
+                    self.state.emit("    sdiv w0, w1, w2");
+                }
+                IrBinOp::UDiv => self.state.emit("    udiv w0, w1, w2"),
+                IrBinOp::SRem => {
+                    self.state.emit("    sdiv w3, w1, w2");
+                    self.state.emit("    msub w0, w3, w2, w1");
+                }
+                IrBinOp::URem => {
+                    self.state.emit("    udiv w3, w1, w2");
+                    self.state.emit("    msub w0, w3, w2, w1");
+                }
+                IrBinOp::And => self.state.emit("    and w0, w1, w2"),
+                IrBinOp::Or => self.state.emit("    orr w0, w1, w2"),
+                IrBinOp::Xor => self.state.emit("    eor w0, w1, w2"),
+                IrBinOp::Shl => {
+                    self.state.emit("    lsl w0, w1, w2");
+                }
+                IrBinOp::AShr => {
+                    self.state.emit("    asr w0, w1, w2");
+                }
+                IrBinOp::LShr => self.state.emit("    lsr w0, w1, w2"),
+                IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+                    // AArch64 has a native rotate: EXTR with Rn == Rm is a
+                    // rotate by an immediate, ROR (register) rotates by a
+                    // register.  Both mask the count modulo the register
+                    // width, which is precisely the reduction the IR's rotate
+                    // semantics define, so no fixup is needed.  A left rotate
+                    // by n is a right rotate by (32 - n); `neg` + ROR gets
+                    // that for a variable count because ROR reduces its count
+                    // mod 32.  w3 is this path's existing scratch (see SRem's
+                    // `msub w0, w3, w2, w1`).
+                    let left = op == IrBinOp::RotateLeft;
+                    match Self::const_as_imm12(rhs) {
+                        Some(imm) => {
+                            let amount = (imm as i64).rem_euclid(32);
+                            let extr = if left { (32 - amount) % 32 } else { amount };
+                            if extr == 0 {
+                                self.state.emit("    mov w0, w1");
+                            } else {
+                                self.state
+                                    .emit_fmt(format_args!("    extr w0, w1, w1, #{extr}"));
+                            }
+                        }
+                        None => {
+                            if left {
+                                self.state.emit("    neg w3, w2");
+                                self.state.emit("    ror w0, w1, w3");
+                            } else {
+                                self.state.emit("    ror w0, w1, w2");
+                            }
+                        }
+                    }
+                }
+                IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
+                IrBinOp::UMulHigh | IrBinOp::SMulHigh => {
+                    crate::ir::ops::mul_high_unsupported_here()
+                }
+                IrBinOp::BitTest => self.emit_bit_test(rhs, ty),
+                IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+                    self.emit_bit_modify(op, rhs, ty)
+                }
+            }
+        } else {
+            match op {
+                IrBinOp::Add => self.state.emit("    add x0, x1, x2"),
+                IrBinOp::Sub => self.state.emit("    sub x0, x1, x2"),
+                IrBinOp::Mul => self.state.emit("    mul x0, x1, x2"),
+                IrBinOp::SDiv => self.state.emit("    sdiv x0, x1, x2"),
+                IrBinOp::UDiv => self.state.emit("    udiv x0, x1, x2"),
+                IrBinOp::SRem => {
+                    self.state.emit("    sdiv x3, x1, x2");
+                    self.state.emit("    msub x0, x3, x2, x1");
+                }
+                IrBinOp::URem => {
+                    self.state.emit("    udiv x3, x1, x2");
+                    self.state.emit("    msub x0, x3, x2, x1");
+                }
+                IrBinOp::And => self.state.emit("    and x0, x1, x2"),
+                IrBinOp::Or => self.state.emit("    orr x0, x1, x2"),
+                IrBinOp::Xor => self.state.emit("    eor x0, x1, x2"),
+                IrBinOp::Shl => self.state.emit("    lsl x0, x1, x2"),
+                IrBinOp::AShr => self.state.emit("    asr x0, x1, x2"),
+                IrBinOp::LShr => self.state.emit("    lsr x0, x1, x2"),
+                IrBinOp::RotateLeft | IrBinOp::RotateRight => {
+                    // 64-bit counterpart of the w-register case above; EXTR's
+                    // immediate is 6 bits and ROR reduces mod 64.
+                    let left = op == IrBinOp::RotateLeft;
+                    match Self::const_as_imm12(rhs) {
+                        Some(imm) => {
+                            let amount = (imm as i64).rem_euclid(64);
+                            let extr = if left { (64 - amount) % 64 } else { amount };
+                            if extr == 0 {
+                                self.state.emit("    mov x0, x1");
+                            } else {
+                                self.state
+                                    .emit_fmt(format_args!("    extr x0, x1, x1, #{extr}"));
+                            }
+                        }
+                        None => {
+                            if left {
+                                self.state.emit("    neg x3, x2");
+                                self.state.emit("    ror x0, x1, x3");
+                            } else {
+                                self.state.emit("    ror x0, x1, x2");
+                            }
+                        }
+                    }
+                }
+                IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
+                IrBinOp::UMulHigh => self.state.emit("    umulh x0, x1, x2"),
+                IrBinOp::SMulHigh => self.state.emit("    smulh x0, x1, x2"),
+                IrBinOp::BitTest => self.emit_bit_test(rhs, ty),
+                IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle => {
+                    self.emit_bit_modify(op, rhs, ty)
+                }
+            }
+        }
+
+        self.store_x0_to(dest);
+    }
+
+    /// `BitSet`/`BitClear` into a destination that already has a register
+    /// home: stage the base there, build the one-hot mask in x3 and `orr`
+    /// (set) or `bic` (clear) it in place.  Three instructions, the same
+    /// count the shift/OR spelling it replaces needs, without the accumulator
+    /// path's two staging moves.
+    ///
+    /// Refused -- letting the caller fall through to the accumulator path --
+    /// when the index lives in the destination register (the base staging
+    /// would destroy it) or in x3 itself (the mask build writes x3).
+    fn emit_bit_modify_into(
+        &mut self,
+        op: IrBinOp,
+        dest_phys: crate::backend::regalloc::PhysReg,
+        base: &Operand,
+        index: &Operand,
+        use_32bit: bool,
+    ) -> bool {
+        let own_idx = self.operand_reg(index).filter(|r| !is_arm_fp_phys(*r));
+        if own_idx == Some(dest_phys) || own_idx.map(|r| r.0) == Some(3) {
+            return false;
+        }
+        let (r, width) = if use_32bit { ('w', 32) } else { ('x', 64) };
+        let dest = if use_32bit {
+            callee_saved_name_32(dest_phys)
+        } else {
+            callee_saved_name(dest_phys)
+        };
+        // The base is read in place when it already has a home: the
+        // three-operand form above does the same, and staging a copy into the
+        // destination would be a dead `mov` for every value with a register
+        // home (`x | 1 << n` with x in a callee-saved register).
+        let base_reg = self.operand_reg(base).filter(|r| !is_arm_fp_phys(*r));
+        let read = match base_reg {
+            Some(reg) => {
+                if use_32bit {
+                    callee_saved_name_32(reg).to_string()
+                } else {
+                    callee_saved_name(reg).to_string()
+                }
+            }
+            None => {
+                self.operand_to_callee_reg(base, dest_phys);
+                dest.to_string()
+            }
+        };
+        self.state.emit("    mov w3, #1");
+        match Self::const_as_imm12(index) {
+            Some(imm) => {
+                let amount = (imm as i64).rem_euclid(width);
+                self.state
+                    .emit_fmt(format_args!("    lsl {r}3, {r}3, #{amount}"));
+            }
+            None => match own_idx {
+                Some(reg) => {
+                    let src = if use_32bit {
+                        callee_saved_name_32(reg)
+                    } else {
+                        callee_saved_name(reg)
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    lsl {r}3, {r}3, {src}"));
+                }
+                None => {
+                    self.operand_to_x0(index);
+                    self.state
+                        .emit_fmt(format_args!("    lsl {r}3, {r}3, {r}0"));
+                }
+            },
+        }
+        let mnemonic = Self::bit_modify_mnemonic(op);
+        self.state
+            .emit_fmt(format_args!("    {mnemonic} {dest}, {read}, {r}3"));
+        true
+    }
+
+    /// The AArch64 operation against a one-hot mask. The callers admit only
+    /// the three bit-modify operations; keeping the table here makes the
+    /// register-direct and accumulator paths share exactly the same semantics.
+    fn bit_modify_mnemonic(op: IrBinOp) -> &'static str {
+        debug_assert!(matches!(
+            op,
+            IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle
+        ));
+        match op {
+            IrBinOp::BitSet => "orr",
+            IrBinOp::BitClear => "bic",
+            _ => "eor",
+        }
+    }
+
+    /// `BitSet`/`BitClear`/`BitToggle(x1, x2)` into x0/w0: materialize one,
+    /// shift it by the index, then OR, BIC or EOR it with the base. LSLV masks
+    /// at the register width, not the IR width: subword operations explicitly
+    /// reduce the index first. Signed/unsigned subword results are restored
+    /// to the backend's canonical integer form before leaving the accumulator.
+    /// x3 is scratch; x1 holds the base and x2 the index throughout.
+    fn emit_bit_modify(&mut self, op: IrBinOp, rhs: &Operand, ty: IrType) {
+        let width = (ty.size() * 8) as i64;
+        debug_assert!(matches!(width, 8 | 16 | 32 | 64));
+        let r = if width < 64 { 'w' } else { 'x' };
+        let constant_index = Self::const_as_imm12(rhs);
+        if width < 32 && constant_index.is_none() {
+            self.state
+                .emit_fmt(format_args!("    and w2, w2, #{}", width - 1));
+        }
+        self.state.emit("    mov w3, #1");
+        match constant_index {
+            Some(imm) => {
+                let amount = (imm as i64).rem_euclid(width);
+                self.state
+                    .emit_fmt(format_args!("    lsl {r}3, {r}3, #{amount}"));
+            }
+            None => self
+                .state
+                .emit_fmt(format_args!("    lsl {r}3, {r}3, {r}2")),
+        }
+        let mnemonic = Self::bit_modify_mnemonic(op);
+        self.state
+            .emit_fmt(format_args!("    {mnemonic} {r}0, {r}1, {r}3"));
+        match ty {
+            IrType::I8 => self.state.emit("    sxtb x0, w0"),
+            IrType::I16 => self.state.emit("    sxth x0, w0"),
+            IrType::U8 => self.state.emit("    uxtb w0, w0"),
+            IrType::U16 => self.state.emit("    uxth w0, w0"),
+            _ => {}
+        }
+    }
+
+    /// `BitTest(x1, rhs)` into x0/w0: bit `rhs mod W` of the base (the IR
+    /// semantics, `IrBinOp::BitTest`). AArch64 has no BT. An immediate index
+    /// is one `ubfx` for every value -- reduced modulo W first, because an
+    /// index of W or more (an undefined C shift that may sit in dead code)
+    /// must still assemble, and the reduction is exactly what the register
+    /// form does (LSRV takes its amount modulo the register size).
+    fn emit_bit_test(&mut self, rhs: &Operand, ty: IrType) {
+        let width = (ty.size() * 8) as i64;
+        debug_assert!(matches!(width, 8 | 16 | 32 | 64));
+        let r = if width < 64 { 'w' } else { 'x' };
+        if let Some(imm) = Self::const_as_imm12(rhs) {
+            let bit = (imm as i64).rem_euclid(width);
+            self.state
+                .emit_fmt(format_args!("    ubfx {r}0, {r}1, #{bit}, #1"));
+        } else {
+            if width < 32 {
+                self.state
+                    .emit_fmt(format_args!("    and w2, w2, #{}", width - 1));
+            }
+            self.state
+                .emit_fmt(format_args!("    lsr {r}0, {r}1, {r}2"));
+            self.state.emit_fmt(format_args!("    and {r}0, {r}0, #1"));
+        }
+    }
+
+    /// Store x3 (the fused pair's second result) to a value's location.
+    /// Mirror of `store_x0_to` with the source register changed; no
+    /// accumulator claim (the value sits in x3, not the x0 accumulator).
+    pub(super) fn store_x3_to(&mut self, dest: &Value, use_32bit: bool) {
+        let src = if use_32bit { "w3" } else { "x3" };
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_arm_fp_phys(reg) {
+                self.state
+                    .emit_fmt(format_args!("    fmov d{}, {}", reg.0 - 24, src));
+            } else {
+                let reg_name = callee_saved_name(reg);
+                self.state
+                    .emit_fmt(format_args!("    mov {}, {}", reg_name, src));
+            }
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_sp(src, slot.0, "str");
+        }
+    }
+
+    /// Emit one divide serving a same-block div/rem pair (GCC's sdiv+msub
+    /// shape) and store BOTH results. The head's own result always lands in
+    /// x0; the partner's result is materialised in x3 via msub (quotient
+    /// heads) or taken directly from x3 (remainder heads).
+    fn emit_divrem_pair_head_arm(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        use_32bit: bool,
+        partner_dest: u32,
+    ) {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
+        // x1/x2 (operands) and x3 (remainder scratch) are used as FIXED
+        // registers here. That is sound without any RA exclusion because
+        // the ARM allocator only ever assigns x4, x5, x6, x7, x8, x13, x14
+        // (ARM_CALLER_SAVED) and x19-x28 (ARM_CALLEE_SAVED) — x1/x2/x3 are
+        // in no pool (audited 2026-08-29; x86's counterpart needs the %rdx
+        // exclusion because x86's allocatable pool includes rdx).
+        self.operand_to_x0(lhs);
+        self.state.emit("    mov x1, x0");
+        self.operand_to_x0(rhs);
+        self.state.emit("    mov x2, x0");
+        let div_mnem = if signed { "sdiv" } else { "udiv" };
+        let w = if use_32bit { "w" } else { "x" };
+        let tail = Value(partner_dest);
+        let tail_dead = self
+            .state
+            .value_use_counts
+            .get(partner_dest as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0;
+        if self_is_div {
+            // Quotient head: x0 = q directly; remainder = lhs - q*rhs in x3.
+            self.state
+                .emit_fmt(format_args!("    {} {}0, {}1, {}2", div_mnem, w, w, w));
+            if !tail_dead {
+                self.state
+                    .emit_fmt(format_args!("    msub {}3, {}0, {}2, {}1", w, w, w, w));
+                self.store_x3_to(&tail, use_32bit);
+            }
+            self.store_x0_to(dest);
+        } else {
+            // Remainder head: x3 = q feeds the msub that produces x0 = r.
+            self.state
+                .emit_fmt(format_args!("    {} {}3, {}1, {}2", div_mnem, w, w, w));
+            self.state
+                .emit_fmt(format_args!("    msub {}0, {}3, {}2, {}1", w, w, w, w));
+            if !tail_dead {
+                self.store_x3_to(&tail, use_32bit);
+            }
+            self.store_x0_to(dest);
+        }
+    }
+
+    pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
+        self.operand_to_x0_x1(src);
+        self.store_x0_x1_to(dest);
+    }
+}
+
+#[cfg(test)]
+mod bit_modify_width_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+
+    fn emit(op: IrBinOp, ty: IrType) -> String {
+        let mut cg = ArmCodegen::new();
+        cg.reg_assignments.insert(1, PhysReg(1));
+        cg.reg_assignments.insert(2, PhysReg(2));
+        // Value(3) has no register home, forcing the accumulator path.
+        cg.emit_int_binop_impl(
+            &Value(3),
+            op,
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(2)),
+            ty,
+        );
+        cg.state.out.buf
+    }
+
+    #[test]
+    fn narrow_bit_modify_uses_the_operation_width() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let width = (ty.size() * 8) as u32;
+            for op in [IrBinOp::BitSet, IrBinOp::BitClear, IrBinOp::BitToggle] {
+                let asm = emit(op, ty);
+                assert!(
+                    asm.contains(&format!("and w2, w2, #{}", width - 1)),
+                    "{op:?} {ty:?} must reduce the index modulo {width}:\n{asm}"
+                );
+                assert!(
+                    asm.contains("lsl w3, w3, w2"),
+                    "{op:?} {ty:?} must build the mask in the 32-bit view:\n{asm}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_bit_test_uses_the_operation_width() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            let width = (ty.size() * 8) as u32;
+            let asm = emit(IrBinOp::BitTest, ty);
+            assert!(
+                asm.contains(&format!("and w2, w2, #{}", width - 1)),
+                "BitTest {ty:?} must reduce the index modulo {width}:\n{asm}"
+            );
+            assert!(
+                asm.contains("lsr w0, w1, w2") && asm.contains("and w0, w0, #1"),
+                "BitTest {ty:?} must extract a 0/1 result in the 32-bit view:\n{asm}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_narrow_results_are_sign_extended() {
+        for (ty, ext) in [(IrType::I8, "sxtb"), (IrType::I16, "sxth")] {
+            for op in [IrBinOp::BitSet, IrBinOp::BitClear, IrBinOp::BitToggle] {
+                let asm = emit(op, ty);
+                assert!(
+                    asm.contains(ext),
+                    "{op:?} {ty:?} must canonicalize the signed result:\n{asm}"
+                );
+            }
+        }
+    }
+}

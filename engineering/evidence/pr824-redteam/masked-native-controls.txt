@@ -1,0 +1,30 @@
+gcc-16 (Debian 16.2.0-3) 16.2.0
+Copyright (C) 2026 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+vucomisd: original=1 removed=0
+vucomiss: original=1 removed=0
+vcomisd: original=1 removed=0
+vcomiss: original=1 removed=0
+vptest: original=1 removed=0
+vtestpd: original=1 removed=0
+vtestps: original=1 removed=0
+vpcmpistri: original=1 removed=0
+vpcmpistrm: original=1 removed=0
+vpcmpestri: original=1 removed=0
+vpcmpestrm: original=1 removed=0
+VEX flag-read architectural witnesses: PASS (11 original/deleted pairs)
+sha256rnds2 implicit XMM0: original=1 removed=0
+fxsave implicit XMM7: original=1 removed=0
+xsave upper YMM7: original=1 removed=0
+fxrstor non-scalar frame read: original=1 removed=0
+string-mask copy relation: original=1 removed=0
+string-mask prior upper definition: original=1 removed=0
+saved bracket state: original=1 removed=0
+implicit wide blend mask: original=1 removed=0
+string-index spill home: original=1 removed=0
+Implicit vector/state architectural witnesses: PASS (SHA conditional on ISA availability)
+implicit GP product: original=2 illegal=0
+GP fixed-operand controls: PASS (native implicit product + assembler shift rejection)
+masked copies: merge original=ffffffffffffffff illegal=0; zero original=0 illegal=ffffffffffffffff

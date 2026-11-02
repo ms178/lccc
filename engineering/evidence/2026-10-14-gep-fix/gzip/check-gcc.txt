@@ -1,0 +1,71 @@
+  GEN      public-submodule-commit
+make  check-recursive
+make[1]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc'
+Making check in lib
+make[2]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/lib'
+make  check-am
+make[3]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/lib'
+make[3]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/lib'
+make[2]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/lib'
+Making check in doc
+make[2]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/doc'
+make[2]: Nothing to be done for 'check'.
+make[2]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/doc'
+Making check in .
+make[2]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc'
+make  check-local
+make[3]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc'
+  GEN      gzip.doc.gz
+  GEN      check-local
+make[3]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc'
+make[2]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc'
+Making check in tests
+make[2]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/tests'
+make  check-TESTS
+make[3]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/tests'
+make[4]: Entering directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/tests'
+PASS: list-big
+PASS: gzip-env
+PASS: reference
+PASS: helin-segv
+PASS: help-version
+PASS: hufts
+PASS: keep
+PASS: list
+PASS: memcpy-abuse
+PASS: mixed
+PASS: null-suffix-clobber
+PASS: pipe-output
+PASS: reproducible
+PASS: stdin
+PASS: synchronous
+PASS: timestamp
+PASS: two-files
+PASS: trailing-nul
+PASS: unpack-invalid
+PASS: unpack-valid
+PASS: upper-suffix
+PASS: write-error
+PASS: z-suffix
+PASS: zdiff
+PASS: zgrep-f
+PASS: zgrep-abuse
+PASS: zgrep-binary
+PASS: zgrep-context
+PASS: zgrep-signal
+PASS: znew-k
+============================================================================
+Testsuite summary for gzip 1.14
+============================================================================
+# TOTAL: 30
+# PASS:  30
+# SKIP:  0
+# XFAIL: 0
+# FAIL:  0
+# XPASS: 0
+# ERROR: 0
+============================================================================
+make[4]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/tests'
+make[3]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/tests'
+make[2]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc/tests'
+make[1]: Leaving directory '/opt/lccc-audit-cache/lccc-gzip-1.14.0zyyvte5/obj-gcc'

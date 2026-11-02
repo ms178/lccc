@@ -1,0 +1,9 @@
+target            : tests/benchmark/programs/lz4_compress.c   (25 interleaved samples, ['-O3', '-march=x86-64-v3'], -DMATCH_RICH A:LCCC_NO_BYTECMP_VEC=1)
+arm A             : target/fastbuild/lccc  [LCCC_NO_BYTECMP_VEC=1]
+arm B             : target/fastbuild/lccc
+checksum          : 007c8f9a0a8617e8 (identical)
+base  min/median  :   20.670 /   23.249 ms
+opt   min/median  :   14.651 /   16.094 ms
+delta on min      : -29.12 %
+delta on median   : -30.78 %
+paired win/loss   : 24 / 1  (96% faster)

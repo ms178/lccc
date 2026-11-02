@@ -1,0 +1,47 @@
+{
+  "compiler_sha256": {
+    "before": "539badafdabb0a9376b88264b7456329f0ba2a403d4b49da2ad1d38ebe3444ba",
+    "after": "207b4ebb4a6a1433ca3ed4b020245e6dae52e782ca8be52b34fc2e5174a41768"
+  },
+  "source_sha256": {
+    "plain.c": "9ea18cd0a8ce5ae26060370643e72b468605f38852dd798798a7c55c1eb95a07",
+    "mixed.c": "3077bed0a10c3f620737f3afc0ff782466e0b805826c3e96512b39acf1f3fad0"
+  },
+  "measurement": "sum of function symbol sizes in relocatable objects; no linker relaxation",
+  "O0": {
+    "function_count": 80,
+    "functions_with_different_assembly_lines": 0,
+    "assembly_instruction_lines": {
+      "plain": 14800,
+      "mixed": 14800
+    },
+    "object_symbol_bytes": {
+      "plain": 47874,
+      "mixed": 47874
+    },
+    "functions_with_different_object_sizes": 0,
+    "assembly_sha256": {
+      "before_plain": "54aae15314813f7c52667879eccd6829954d5ee6a8270b077fe74c76e4c67c51",
+      "after_plain": "54aae15314813f7c52667879eccd6829954d5ee6a8270b077fe74c76e4c67c51",
+      "after_mixed": "c039748a89520d7f2b9c1e1f7b22584dfd451757614a0b57d362f6acfbbb63aa"
+    }
+  },
+  "O2": {
+    "function_count": 80,
+    "functions_with_different_assembly_lines": 0,
+    "assembly_instruction_lines": {
+      "plain": 7276,
+      "mixed": 7276
+    },
+    "object_symbol_bytes": {
+      "plain": 18618,
+      "mixed": 18618
+    },
+    "functions_with_different_object_sizes": 0,
+    "assembly_sha256": {
+      "before_plain": "3209a5faf5e79a13bfc144385e894e9c330ee2dc6284d7cb517dc9ccfb49f2c9",
+      "after_plain": "3209a5faf5e79a13bfc144385e894e9c330ee2dc6284d7cb517dc9ccfb49f2c9",
+      "after_mixed": "d1816167304b686d9a2dbbe2e3a7693eb09cb8deacaeff798b2d6cb2fe5a0411"
+    }
+  }
+}

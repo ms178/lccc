@@ -1,0 +1,362 @@
+[
+  {
+    "name": "d_add",
+    "expression": "((x&255u)+(y&255u))&15u",
+    "expected": "(x+y)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_sub",
+    "expression": "((x&255u)-(y&255u))&15u",
+    "expected": "(x-y)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_mul",
+    "expression": "((x&255u)*(y&255u))&15u",
+    "expected": "(x*y)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_mul_tz",
+    "expression": "((x&15u)*1536u)&1536u",
+    "expected": "(x*1536u)&1536u",
+    "nonzero": false
+  },
+  {
+    "name": "d_shl",
+    "expression": "((x&255u)<<7)&1536u",
+    "expected": "(x<<7)&1536u",
+    "nonzero": false
+  },
+  {
+    "name": "d_lshr",
+    "expression": "((x&0xff00u)>>8)&15u",
+    "expected": "(x>>8)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_ashr",
+    "expression": "((int)(x&0xffffff80u)>>7)&15u",
+    "expected": "((int)x>>7)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_rotate",
+    "expression": "(((x&65535u)<<8)|((x&65535u)>>24))&0xf00u",
+    "expected": "((x<<8)|(x>>24))&0xf00u",
+    "nonzero": false
+  },
+  {
+    "name": "d_not",
+    "expression": "(~(x&255u))&15u",
+    "expected": "(~x)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_neg",
+    "expression": "(-(x&255u))&15u",
+    "expected": "(-x)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_xor",
+    "expression": "((x&255u)^(y&255u))&15u",
+    "expected": "(x^y)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_or",
+    "expression": "((x&255u)|(y&255u))&15u",
+    "expected": "(x|y)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_and",
+    "expression": "((x&255u)&(y&255u))&15u",
+    "expected": "(x&y)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_bswap",
+    "expression": "__builtin_bswap32(x&0xff000000u)&15u",
+    "expected": "__builtin_bswap32(x)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_rem_shl",
+    "expression": "((x%48u)<<9)&1536u",
+    "expected": "(x<<9)&1536u",
+    "nonzero": false
+  },
+  {
+    "name": "d_rem_lshr",
+    "expression": "((x%768u)>>4)&15u",
+    "expected": "(x>>4)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_rem_add",
+    "expression": "((x%48u)+(y%80u))&15u",
+    "expected": "(x+y)&15u",
+    "nonzero": false
+  },
+  {
+    "name": "d_rem_mul",
+    "expression": "((x%48u)*1536u)&1536u",
+    "expected": "(x*1536u)&1536u",
+    "nonzero": false
+  },
+  {
+    "name": "tz_odd",
+    "expression": "__builtin_ctz(x*3u)",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_variable_odd",
+    "expression": "__builtin_ctz(x*(y|1u))",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_neg",
+    "expression": "__builtin_ctz(-x)",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_isolate",
+    "expression": "__builtin_ctz(x&-x)",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_or_neg",
+    "expression": "__builtin_ctz(x|-x)",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_xor_shift",
+    "expression": "__builtin_ctz(x^(x<<7))",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_or_shift",
+    "expression": "__builtin_ctz(x|(x<<7))",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_add_shift",
+    "expression": "__builtin_ctz(x+(x<<7))",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_sub_shift",
+    "expression": "__builtin_ctz(x-(x<<7))",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "lz_or_shift",
+    "expression": "__builtin_clz(x|(x>>7))",
+    "expected": "__builtin_clz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "lz_xor_shift",
+    "expression": "__builtin_clz(x^(x>>7))",
+    "expected": "__builtin_clz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "lz_andnot_shift",
+    "expression": "__builtin_clz(x&~(x>>7))",
+    "expected": "__builtin_clz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "tz_andnot_shift",
+    "expression": "__builtin_ctz(x&~(x<<7))",
+    "expected": "__builtin_ctz(x)",
+    "nonzero": true
+  },
+  {
+    "name": "pc_swap",
+    "expression": "__builtin_popcount(__builtin_bswap32(x))",
+    "expected": "__builtin_popcount(x)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_rotate",
+    "expression": "__builtin_popcount((x<<7)|(x>>25))",
+    "expected": "__builtin_popcount(x)",
+    "nonzero": false
+  },
+  {
+    "name": "parity_add",
+    "expression": "(__builtin_popcount(x)+__builtin_popcount(y))&1u",
+    "expected": "__builtin_popcount(x^y)&1u",
+    "nonzero": false
+  },
+  {
+    "name": "parity_sub",
+    "expression": "(__builtin_popcount(x)-__builtin_popcount(y))&1u",
+    "expected": "__builtin_popcount(x^y)&1u",
+    "nonzero": false
+  },
+  {
+    "name": "parity_xor",
+    "expression": "(__builtin_popcount(x)^__builtin_popcount(y))&1u",
+    "expected": "__builtin_popcount(x^y)&1u",
+    "nonzero": false
+  },
+  {
+    "name": "parity_not",
+    "expression": "__builtin_popcount(~x)&1u",
+    "expected": "__builtin_popcount(x)&1u",
+    "nonzero": false
+  },
+  {
+    "name": "parity_even_xor",
+    "expression": "__builtin_popcount(x^0x5au)&1u",
+    "expected": "__builtin_popcount(x)&1u",
+    "nonzero": false
+  },
+  {
+    "name": "pc_partition",
+    "expression": "__builtin_popcount(x&0x55555555u)+__builtin_popcount(x&0xaaaaaaaau)",
+    "expected": "__builtin_popcount(x)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_symmetric_difference",
+    "expression": "__builtin_popcount(x|y)-__builtin_popcount(x&y)",
+    "expected": "__builtin_popcount(x^y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_complement",
+    "expression": "__builtin_popcount(x)+__builtin_popcount(~x)",
+    "expected": "32u",
+    "nonzero": false
+  },
+  {
+    "name": "pc_variable_partition",
+    "expression": "__builtin_popcount(x&y)+__builtin_popcount(x&~y)",
+    "expected": "__builtin_popcount(x)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_and_xor",
+    "expression": "__builtin_popcount(x&y)+__builtin_popcount(x^y)",
+    "expected": "__builtin_popcount(x|y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_union_minus_xor",
+    "expression": "__builtin_popcount(x|y)-__builtin_popcount(x^y)",
+    "expected": "__builtin_popcount(x&y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_union_minus_left",
+    "expression": "__builtin_popcount(x|y)-__builtin_popcount(x&~y)",
+    "expected": "__builtin_popcount(y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_union_minus_right",
+    "expression": "__builtin_popcount(x|y)-__builtin_popcount(~x&y)",
+    "expected": "__builtin_popcount(x)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_xor_minus_left",
+    "expression": "__builtin_popcount(x^y)-__builtin_popcount(x&~y)",
+    "expected": "__builtin_popcount(~x&y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_xor_minus_right",
+    "expression": "__builtin_popcount(x^y)-__builtin_popcount(~x&y)",
+    "expected": "__builtin_popcount(x&~y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_triangle_xor",
+    "expression": "__builtin_popcount(x)+__builtin_popcount(y)-2*__builtin_popcount(x&y)",
+    "expected": "__builtin_popcount(x^y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_triangle_and",
+    "expression": "__builtin_popcount(x)+__builtin_popcount(y)-__builtin_popcount(x^y)",
+    "expected": "2u*__builtin_popcount(x&y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_triangle_or",
+    "expression": "__builtin_popcount(x)+__builtin_popcount(y)+__builtin_popcount(x^y)",
+    "expected": "2u*__builtin_popcount(x|y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_doubled_or",
+    "expression": "2*__builtin_popcount(x|y)-__builtin_popcount(x)-__builtin_popcount(y)",
+    "expected": "__builtin_popcount(x^y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_demorgan_and",
+    "expression": "__builtin_popcount(x&y)+__builtin_popcount(~x|~y)",
+    "expected": "32u",
+    "nonzero": false
+  },
+  {
+    "name": "pc_demorgan_or",
+    "expression": "__builtin_popcount(x|y)+__builtin_popcount(~x&~y)",
+    "expected": "32u",
+    "nonzero": false
+  },
+  {
+    "name": "pc_complement_difference",
+    "expression": "__builtin_popcount(~(x&y))-__builtin_popcount(~(x|y))",
+    "expected": "__builtin_popcount(x^y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_xnor_minus_and",
+    "expression": "__builtin_popcount(~(x^y))-__builtin_popcount(x&y)",
+    "expected": "__builtin_popcount(~(x|y))",
+    "nonzero": false
+  },
+  {
+    "name": "pc_nor_plus_xor",
+    "expression": "__builtin_popcount(~(x|y))+__builtin_popcount(x^y)",
+    "expected": "__builtin_popcount(~(x&y))",
+    "nonzero": false
+  },
+  {
+    "name": "pc_partition_four",
+    "expression": "__builtin_popcount(x&y)+__builtin_popcount(x&~y)+__builtin_popcount(~x&y)+__builtin_popcount(~x&~y)",
+    "expected": "32u",
+    "nonzero": false
+  },
+  {
+    "name": "pc_partition_three",
+    "expression": "__builtin_popcount(x&y)+__builtin_popcount(x&~y)+__builtin_popcount(~x&y)",
+    "expected": "__builtin_popcount(x|y)",
+    "nonzero": false
+  },
+  {
+    "name": "pc_absorption",
+    "expression": "__builtin_popcount((x|y)&x)+__builtin_popcount(~x&y)",
+    "expected": "__builtin_popcount(x|y)",
+    "nonzero": false
+  }
+]

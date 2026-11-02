@@ -1,0 +1,2 @@
+PASS: user-asm input homes; 5 QEMU runs; 1 poisoned-x17 control
+PASS: AArch64 popcount O0/O1/O2/O3/Os, default/restricted; FP/user-asm guard; 10 QEMU runs (--run requires availability)

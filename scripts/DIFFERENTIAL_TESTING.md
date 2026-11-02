@@ -1,0 +1,117 @@
+# Differential Testing Harnesses (fuzz_diff.py)
+
+`scripts/fuzz_diff.py` is the unified differential-testing entry point for
+LCCC. It generates random C programs, compiles each with LCCC **and every
+selected reference compiler** (GCC, Clang) across the requested optimization
+levels, runs every binary, and flags any behavior mismatch (stdout, stderr, or
+exit code). **Any disagreement is a compiler bug** — the reproducer is saved
+under `--repro-dir` (default `artifacts/repros/`).
+
+The harness descends from the standalone testers adopted from John Regehr's
+`claudes-c-compiler` **yarpgen** branch (CC0,
+https://github.com/regehr/claudes-c-compiler). Regehr (University of Utah) is
+the author of YARPGen and a co-author of Csmith — the industry-standard tools
+for finding compiler miscompiles. Those tools found the regression corpus in
+`tests/regression/regress_*.c` (see the porting notes in
+`tests/regression/README_REGEHR_YARPGEN.md`).
+
+## Engines
+
+| Engine | Generator | Dependencies |
+|---|---|---|
+| `synthetic` | Built-in randomized C generator (fixed-shape programs with random constants) | none |
+| `csmith` | [Csmith](https://github.com/csmith-project/csmith) | `csmith` binary + runtime headers |
+| `yarpgen` | [YARPGen](https://github.com/intel/yarpgen) (provision pinned: `scripts/ensure_yarpgen.sh`) | `yarpgen` binary |
+| `stress_suite` | Repository stress generators (`gen_fp_stress`, `gen_gep_chain_stress`, `gen_slot_stress`) + a bounded `unroll_stress.py` sweep | none |
+| `mutpair` | Missed-alarm near-miss pairs (`scripts/mutpair.py`): UB-free function + one-edit mutant, execution-filtered to *known* inequivalent / known equivalent; both result columns printed and judged | none |
+
+Every advertised engine must be a real implementation: `--check-engines`
+verifies the dispatch wiring and is wired into CI. (This guard exists because
+the csmith/yarpgen engines once regressed to silent no-op stubs that reported
+`TOTAL: 0` with exit status 0 — a validation vacuum.)
+
+## Common usage
+
+```bash
+# Dependency-free smoke: 100 synthetic programs vs gcc+clang at -O0..-O3.
+./scripts/fuzz_diff.py --engine synthetic --count 100 -j4
+
+# Real Csmith: complex aggregates / bit-fields / pointer semantics.
+./scripts/fuzz_diff.py --engine csmith \
+  --csmith /usr/bin/csmith --include /usr/include/csmith --count 500 -j2
+
+# YARPGen: whole-program random C99 with driver.c + func.c.
+./scripts/fuzz_diff.py --engine yarpgen --yarpgen ~/yarpgen/build/yarpgen --count 200 -j2
+
+# Repository stress generators + bounded unroller sweep.
+./scripts/fuzz_diff.py --engine stress_suite --seed 1234
+
+# Missed-alarm pairs (Regehr/Livinskii transplant): catches optimisers that
+# collapse two observably different computations.  Standalone mode judges
+# against the built-in Python model (no reference compiler needed).
+./scripts/fuzz_diff.py --engine mutpair --count 300 --seed 1000 -j2
+./scripts/mutpair.py --self-test   # invariants + fake-optimiser negative control
+
+# CI wiring guard.
+./scripts/fuzz_diff.py --check-engines
+```
+
+`--count 0` (and the legacy `--tests 0`) means *run forever*.
+
+## Reference compilers
+
+`--refs gcc,clang` (default). **All** selected references must build and run
+the program and agree with each other before LCCC is judged; a divergence
+against any one reference is a failure. References missing from `PATH` are
+filtered out; having none is an error.
+
+## Legacy invocations (csmith_diff.py / yarpgen_diff.py)
+
+`scripts/csmith_diff.py` and `scripts/yarpgen_diff.py` remain as thin wrappers
+that translate the historical flag spellings and forward to the matching
+engine:
+
+| Legacy flag | Unified spelling |
+|---|---|
+| `--ccc PATH` | `--lccc PATH` |
+| `--clang PATH` / `--gcc PATH` | appended to `--refs` |
+| `--jobs N` | `-j N` |
+| `--tests N` | `--count N` |
+| `--seed-start N` | `--seed N` |
+| `--out-dir D` | `--repro-dir D` |
+| `--compile-timeout` / `--run-timeout` / `--include` / `--csmith` / `--yarpgen` / `--refs` | unchanged |
+| `--keep-passing` / `--keep-skipped` / `--keep-all` / `--progress-every` / `--work-root` / `--continue-on-divergence` | accepted, reported, ignored |
+
+Like the pre-unification testers, the wrappers run forever unless bounded
+(`--count N` / legacy `--tests N`).
+
+## Targeted scalar-float fuzzer
+
+`scripts/fuzz_float_scalar_vs_gcc.py` is a focused generator for the x86-64
+scalar float register paths random corpora rarely stress: many float values
+live across non-inlined calls, float<->u32 bit casts, phis fed by compares,
+and back-edge copies (spill/reload, GPR homes, FP copy webs). Output is an
+integer hash, compared bit-exactly with GCC 16.2. Every program is screened
+with UBSan including `float-cast-overflow` first, so UB never counts.
+
+```bash
+# SSE1-only x86-64 (-mno-sse2): no SSE2 move may leak, results must match.
+./scripts/fuzz_float_scalar_vs_gcc.py --mode sse1 --cases 240
+# Baseline ISA at -O1/-O2/-O3/-O2 -mavx2.
+./scripts/fuzz_float_scalar_vs_gcc.py --mode default --cases 240 --keep /tmp/div
+```
+
+It found the SSE1 scalar routes that still emitted SSE2 moves and the FP
+copy-web leader miscompile (`tests/regression/fp_copy_web_call_leader.c`).
+It is a session tool, not a CI gate: the bugs it finds are pinned by reduced
+fixtures and permission probes, which run in milliseconds.
+
+## Why this matters
+
+LCCC's correctness bar is the hard constraint of the project: a fast compiler
+that miscompiles is worthless. These harnesses give a **reproducible,
+automated** path to keep finding (and then locking in as regression tests) the
+real bugs that random-program corpora are best at exposing. Every bug they
+find should be reduced, ported into `tests/regression/`, and fixed — see the
+follow-up docs in `docs/`/`engineering/` for the session-by-session log of
+cases found and fixed.

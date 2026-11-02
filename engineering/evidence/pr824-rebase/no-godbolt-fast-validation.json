@@ -1,0 +1,89 @@
+{
+  "scope": "fast only; not an immutable final-tree acceptance stamp",
+  "summary": {
+    "passed": 201,
+    "failed": 42,
+    "skipped": 13
+  },
+  "exit_code": 1,
+  "failed_gates": [
+    "memory-value-contracts",
+    "ivsr-integer-domains",
+    "static-local-init",
+    "designator-init",
+    "file-scope-init",
+    "typedef-volatile-codegen",
+    "seg-init-brace-elision",
+    "volatile-member-codegen",
+    "const-volatile-objects",
+    "ivsr-vecaddr-struct-walk",
+    "ivwiden-exposed-latch",
+    "fp-extract-homes",
+    "empty-aggregate-abi",
+    "reassoc-latency",
+    "loop-store-motion",
+    "seg-const-offset-fold",
+    "seg-gs-runtime",
+    "seg-copy-size-sweep",
+    "seg-declarator-space",
+    "seg-typedef-codegen",
+    "seg-conv-diagnostics",
+    "seg-conversion-parity",
+    "regression-corpus-link",
+    "record-tag-identity",
+    "select-from-compare",
+    "redundant-test-elimination",
+    "i686-integer-isa-parity",
+    "map-i64-two-lane",
+    "asm-goto-phi-edge",
+    "i686-label-ref-safety",
+    "asm-diff-oracle-gas-2.47",
+    "a64-gas-provision",
+    "arm-a64-xml-provision",
+    "encdiff-semantic-validation",
+    "asmdiff-semantic-validation",
+    "x86-asm-diff",
+    "i686-asm-diff",
+    "encdiff-corpus",
+    "kernel-relocs-tool",
+    "linker-suite",
+    "aarch64-arm-doccheck",
+    "msrv-check"
+  ],
+  "controller_mutated_during_run": true,
+  "extra_shell_diagnostic": "scripts/ci_local.sh: line 1877: closing: command not found (controller edited during execution)",
+  "full_slow_local_ci_run": false,
+  "log_sha256": "c6701cdb3d9c2a708bd1db7379d9cb5771e5af30d95dff755e15aba3957e2dd3",
+  "rustfmt": "PASS",
+  "strict_clippy": {
+    "result": "PASS",
+    "toolchain": "1.99.0",
+    "policy_names_probed": 76,
+    "unknown_compatibility_names": 0
+  },
+  "prototype_rust_tests": {
+    "library_passed": 4716,
+    "failed": 0,
+    "ignored": 8
+  },
+  "restored_rust_tests": {
+    "library_passed": 4714,
+    "failed": 0,
+    "ignored": 8,
+    "all_targets": "PASS; additional bin test passed",
+    "log_sha256": "04445ca29769eb2c6529b92030acb891863f90e1c3d5fd2072086d2b3c2db809"
+  },
+  "final_src_tree": "fcfae50abda650f7161d9ee6c3aeefcfcab02c56",
+  "earlier_folded_src_tree": "fcfae50abda650f7161d9ee6c3aeefcfcab02c56",
+  "missing_prerequisites_not_waived": [
+    "GCC16/multilib/libgcc",
+    "Rust1.97",
+    "pinned external gas/Arm/kernel tools"
+  ],
+  "final_python_corpus": {
+    "collected": 465,
+    "result": "OK",
+    "skipped": 4,
+    "log_sha256": "745f40c9ff3161ce028b3cc64895e093aaf2c610aef64424e031281a5971c360"
+  }
+}

@@ -1,0 +1,26 @@
+;;; x86-64-vsm4-documentation-backed-vex-forms
+.text
+;;; Intel SDM v093 documents VEX.128/256 only; avoid undocumented GAS
+;;; EVEX/ZMM extensions unless a current vendor ISA manual specifies them.
+vsm4key4 %xmm4, %xmm5, %xmm6
+vsm4key4 %ymm4, %ymm5, %ymm6
+vsm4key4 %xmm7, %xmm5, %xmm6
+vsm4key4 (%rax), %xmm5, %xmm6
+vsm4key4 2032(%rax), %xmm5, %xmm6
+vsm4key4 (%rax), %ymm5, %ymm6
+vsm4key4 4064(%rax), %ymm5, %ymm6
+vsm4rnds4 %xmm4, %xmm5, %xmm6
+vsm4rnds4 %ymm4, %ymm5, %ymm6
+vsm4rnds4 %xmm7, %xmm5, %xmm6
+vsm4rnds4 (%rax), %xmm5, %xmm6
+vsm4rnds4 2032(%rax), %xmm5, %xmm6
+vsm4rnds4 (%rax), %ymm5, %ymm6
+vsm4rnds4 4064(%rax), %ymm5, %ymm6
+
+;;; x86-64-vsm4-reject-width-mismatch reject
+.text
+vsm4key4 %xmm1, %ymm2, %ymm3
+
+;;; x86-64-vsm4-reject-operand-count reject
+.text
+vsm4rnds4 %xmm1, %xmm2

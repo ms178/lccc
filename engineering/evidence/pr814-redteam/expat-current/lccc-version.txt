@@ -1,0 +1,5 @@
+lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0
+GCC is maintained by the Free Software Foundation, Inc.
+This program is a fork of CCC (written by Claude Opus 4.6);
+It is not intended for production use.
+Backend: standalone

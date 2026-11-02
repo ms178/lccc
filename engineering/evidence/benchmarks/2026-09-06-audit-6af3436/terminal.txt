@@ -1,0 +1,282 @@
+▶ arith_loop: 32-variable arithmetic loop / register pressure
+▶ fib: recursive Fibonacci / recurrence recognition
+▶ matmul: dense matrix multiply / FP and cache
+▶ qsort: quicksort via libc / branches
+▶ sieve: sieve of Eratosthenes / stores
+▶ tce_sum: tail-recursive accumulator / TCE
+▶ nbody: N-body simulation / FP structs
+▶ binary_trees: binary trees / allocation and recursion
+▶ spectral_norm: spectral norm / dense floating point
+▶ mandelbrot: Mandelbrot / FP branch-heavy inner loop
+▶ hash_table: hash table / pointer chasing
+▶ strlen_bench: string operations / byte loops
+▶ switch_dispatch: switch lowering / dispatch
+▶ struct_copy: struct copy / ABI and memory
+▶ loop_patterns: scalar loop transforms
+▶ fannkuch: Fannkuch-Redux / permutations
+▶ ackermann: Ackermann / deep recursion
+▶ constant_recursion: constant recursive specialization
+▶ bitops: bit manipulation / integer selection
+▶ double_reduction: two independent accumulators per loop (multi-reduction)
+▶ ascii_case_fold: ASCII parser case-fold byte loop / branch selection
+▶ binary_search: sorted-table binary search / branch-heavy lookup
+▶ ring_fifo: masked ring FIFO enqueue/dequeue / dependent loads
+▶ aarch64_select_patterns: conditional increment, narrow compare, and select pressure
+▶ histogram: 256-bin histogram / indexed increment and reduction
+▶ gzip_crc32: GNU gzip CRC-32 scalar table loop
+▶ libm_round_family: glibc libm scalar rounding entry points (vroundsd inline)
+▶ tls_seg_access: glibc TLS access shapes (THREAD_SELF/SETMEM, %fs segment)
+▶ zlib_ng_adler32: zlib-ng Adler-32 NMAX accumulator
+▶ expat_xml_scan: Expat UTF-8 XML name-token scan
+▶ sqlite_varint: SQLite 1–9 byte varint decoder
+▶ linux_find_bit: Linux sparse find_next_andnot_bit
+▶ glibc_memcmp: glibc aligned-word memcmp path
+▶ chacha20_block: ChaCha20 20-round ARX block cipher / register pressure
+▶ sha256_transform: SHA-256 64-step block transform / rotate and schedule
+▶ linux_rbtree: Linux kernel intrusive Red-Black tree insertion and search
+▶ zstd_count: Zstandard fast unaligned match counting (ZSTD_count / ctz)
+▶ lz4_compress: LZ4 fast block compression / 4-byte hash matching
+▶ glibc_strstr: glibc two-way string search / needle shift table
+============================================================================================================
+LCCC generated-code benchmark report
+Measurement class: VM screening; PMU: perf is not installed
+Pinning: {'requested': 'none', 'allowed_cpus': [0, 1], 'applied': False, 'reason': 'affinity disabled by user'}; rounds: 9; warm-ups: 1
+Primary statistic is paired median wall time.  All samples are retained; min is diagnostic only.
+============================================================================================================
+Benchmark                 LCCC median     GCC median               LCCC/GCC paired    Correct
+------------------------------------------------------------------------------------------------------------
+arith_loop                  114.62 ms       98.54 ms 1.163 (1.16× slower) [1.141, 1.206]       pass
+  LCCC/CLANG paired: 1.161 (1.16× slower) [1.050, 1.182]; CLANG median=99.85 ms
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 11.8% (>5%)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+fib                           1.41 ms      171.35 ms 0.008 (119.93× faster) [0.007, 0.008]       pass
+  LCCC/CLANG paired: 0.005 (205.48× faster) [0.004, 0.005]; CLANG median=292.01 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 25.7% (>5%)
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+matmul                        5.39 ms        8.98 ms 0.661 (1.51× faster) [0.487, 0.684]       pass
+  LCCC/CLANG paired: 0.685 (1.46× faster) [0.596, 0.701]; CLANG median=7.96 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 18.2% (>5%)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: wall-clock coefficient of variation is 28.7% (>5%)
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: wall-clock coefficient of variation is 19.7% (>5%)
+qsort                       124.70 ms      124.15 ms 1.005 (1.00× slower) [0.995, 1.018]       pass
+  LCCC/CLANG paired: 1.009 (1.01× slower) [1.003, 1.013]; CLANG median=123.40 ms
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+sieve                        39.59 ms       37.96 ms 1.046 (1.05× slower) [1.034, 1.057]       pass
+  LCCC/CLANG paired: 1.133 (1.13× slower) [1.112, 1.158]; CLANG median=35.04 ms
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: 2 MAD outlier(s) retained (never silently discarded)
+tce_sum                       1.18 ms        1.21 ms 0.981 (1.02× faster) [0.939, 1.061]       pass
+  LCCC/CLANG paired: 1.002 (1.00× slower) [0.910, 1.060]; CLANG median=1.21 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 6.6% (>5%)
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: wall-clock coefficient of variation is 5.3% (>5%)
+nbody                       413.86 ms      309.78 ms 1.349 (1.35× slower) [1.321, 1.356]       pass
+  LCCC/CLANG paired: 1.249 (1.25× slower) [1.194, 1.262]; CLANG median=332.06 ms
+  ! lccc: 4 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 11.5% (>5%)
+  ! clang: 3 MAD outlier(s) retained (never silently discarded)
+binary_trees                 1.5857 s       1.4501 s 1.092 (1.09× slower) [1.076, 1.139]       pass
+  LCCC/CLANG paired: 1.119 (1.12× slower) [1.020, 1.228]; CLANG median=1.3441 s
+  ! lccc: wall-clock coefficient of variation is 5.5% (>5%)
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: wall-clock coefficient of variation is 5.4% (>5%)
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 8.9% (>5%)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+spectral_norm               253.29 ms      200.57 ms 1.262 (1.26× slower) [1.256, 1.310]       pass
+  LCCC/CLANG paired: 1.271 (1.27× slower) [1.254, 1.319]; CLANG median=198.97 ms
+  ! lccc: 2 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: 2 MAD outlier(s) retained (never silently discarded)
+mandelbrot                   1.5442 s       1.4892 s 1.036 (1.04× slower) [1.033, 1.040]       pass
+  LCCC/CLANG paired: 1.026 (1.03× slower) [1.024, 1.029]; CLANG median=1.5052 s
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+hash_table                  11.2746 s      10.3646 s 1.088 (1.09× slower) [1.063, 1.318]       pass
+  LCCC/CLANG paired: 1.093 (1.09× slower) [1.056, 1.154]; CLANG median=10.3144 s
+  ! lccc: wall-clock coefficient of variation is 5.8% (>5%)
+  ! gcc: wall-clock coefficient of variation is 14.6% (>5%)
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 8.6% (>5%)
+strlen_bench                294.85 ms      285.62 ms 1.037 (1.04× slower) [0.952, 1.080]       pass
+  LCCC/CLANG paired: 1.084 (1.08× slower) [1.019, 1.123]; CLANG median=265.35 ms
+  ! lccc: wall-clock coefficient of variation is 10.7% (>5%)
+  ! gcc: wall-clock coefficient of variation is 9.4% (>5%)
+  ! clang: wall-clock coefficient of variation is 9.7% (>5%)
+switch_dispatch             529.34 ms      503.93 ms 1.048 (1.05× slower) [1.046, 1.055]       pass
+  LCCC/CLANG paired: 1.030 (1.03× slower) [1.024, 1.038]; CLANG median=514.64 ms
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+struct_copy                  28.11 ms       26.46 ms 1.052 (1.05× slower) [1.037, 1.072]       pass
+  LCCC/CLANG paired: 1.361 (1.36× slower) [1.333, 1.384]; CLANG median=20.53 ms
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: wall-clock coefficient of variation is 15.5% (>5%)
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 6.1% (>5%)
+  ! clang: 2 MAD outlier(s) retained (never silently discarded)
+loop_patterns                78.16 ms       75.58 ms 1.035 (1.04× slower) [1.023, 1.039]       pass
+  LCCC/CLANG paired: 1.149 (1.15× slower) [1.137, 1.182]; CLANG median=67.90 ms
+fannkuch                     3.1612 s       2.5449 s 1.242 (1.24× slower) [1.228, 1.247]       pass
+  LCCC/CLANG paired: 1.181 (1.18× slower) [1.166, 1.186]; CLANG median=2.6823 s
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+ackermann                     1.45 ms      148.72 ms 0.010 (102.04× faster) [0.009, 0.010]       pass
+  LCCC/CLANG paired: 0.002 (437.40× faster) [0.002, 0.002]; CLANG median=636.24 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 7.5% (>5%)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+constant_recursion            1.50 ms      149.59 ms 0.010 (102.37× faster) [0.009, 0.010]       pass
+  LCCC/CLANG paired: 0.002 (424.52× faster) [0.002, 0.002]; CLANG median=636.71 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 7.2% (>5%)
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: 2 MAD outlier(s) retained (never silently discarded)
+bitops                      296.59 ms      394.37 ms 0.757 (1.32× faster) [0.732, 0.761]       pass
+  LCCC/CLANG paired: 0.861 (1.16× faster) [0.842, 0.871]; CLANG median=347.03 ms
+  ! lccc: wall-clock coefficient of variation is 7.9% (>5%)
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+double_reduction            107.93 ms      117.19 ms 0.849 (1.18× faster) [0.831, 0.917]       pass
+  LCCC/CLANG paired: 0.957 (1.05× faster) [0.815, 1.016]; CLANG median=118.24 ms
+  ! lccc: wall-clock coefficient of variation is 59.5% (>5%)
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: wall-clock coefficient of variation is 22.1% (>5%)
+  ! gcc: 3 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 20.1% (>5%)
+ascii_case_fold               1.36 ms        1.34 ms 1.034 (1.03× slower) [0.992, 1.082]       pass
+  LCCC/CLANG paired: 1.093 (1.09× slower) [1.030, 1.155]; CLANG median=1.28 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 6.5% (>5%)
+  ! lccc: 2 MAD outlier(s) retained (never silently discarded)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+binary_search                 1.30 ms        1.30 ms 0.992 (1.01× faster) [0.963, 1.050]       pass
+  LCCC/CLANG paired: 0.983 (1.02× faster) [0.955, 1.017]; CLANG median=1.31 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 5.1% (>5%)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: wall-clock coefficient of variation is 24.4% (>5%)
+  ! clang: 2 MAD outlier(s) retained (never silently discarded)
+ring_fifo                     1.20 ms        1.17 ms 1.024 (1.02× slower) [0.964, 1.142]       pass
+  LCCC/CLANG paired: 1.004 (1.00× slower) [0.967, 1.129]; CLANG median=1.18 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 5.8% (>5%)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: wall-clock coefficient of variation is 5.6% (>5%)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+aarch64_select_patterns      151.08 ms      128.69 ms 1.177 (1.18× slower) [1.163, 1.203]       pass
+  LCCC/CLANG paired: 1.492 (1.49× slower) [1.378, 1.513]; CLANG median=102.30 ms
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 11.0% (>5%)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+histogram                     1.50 ms        1.56 ms 1.014 (1.01× slower) [0.966, 1.068]       pass
+  LCCC/CLANG paired: 1.116 (1.12× slower) [1.066, 1.171]; CLANG median=1.39 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+gzip_crc32                  150.36 ms      167.12 ms 0.900 (1.11× faster) [0.898, 0.909]       pass
+  LCCC/CLANG paired: 0.903 (1.11× faster) [0.901, 0.920]; CLANG median=166.61 ms
+  ! lccc: 2 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+libm_round_family           238.67 ms       1.0977 s 0.218 (4.59× faster) [0.208, 0.219]       pass
+  LCCC/CLANG paired: 0.259 (3.86× faster) [0.254, 0.273]; CLANG median=919.94 ms
+  ! lccc: 3 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: wall-clock coefficient of variation is 15.1% (>5%)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+tls_seg_access               11.77 ms       13.09 ms 1.037 (1.04× slower) [0.886, 1.107]       pass
+  LCCC/CLANG paired: 1.081 (1.08× slower) [0.913, 1.104]; CLANG median=11.75 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 29.8% (>5%)
+  ! lccc: 4 MAD outlier(s) retained (never silently discarded)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: wall-clock coefficient of variation is 26.3% (>5%)
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: wall-clock coefficient of variation is 32.1% (>5%)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+zlib_ng_adler32              40.30 ms       38.43 ms 1.053 (1.05× slower) [1.032, 1.055]       pass
+  LCCC/CLANG paired: 1.112 (1.11× slower) [1.109, 1.136]; CLANG median=36.24 ms
+  ! lccc: 2 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+expat_xml_scan               67.01 ms       38.93 ms 1.724 (1.72× slower) [1.708, 1.737]       pass
+  LCCC/CLANG paired: 1.280 (1.28× slower) [1.254, 1.286]; CLANG median=52.38 ms
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: 2 MAD outlier(s) retained (never silently discarded)
+sqlite_varint                30.51 ms       24.75 ms 1.231 (1.23× slower) [1.227, 1.236]       pass
+  LCCC/CLANG paired: 1.177 (1.18× slower) [1.170, 1.186]; CLANG median=25.91 ms
+  ! lccc: 2 MAD outlier(s) retained (never silently discarded)
+linux_find_bit               17.81 ms       13.54 ms 1.307 (1.31× slower) [1.289, 1.322]       pass
+  LCCC/CLANG paired: 1.064 (1.06× slower) [1.040, 1.074]; CLANG median=16.71 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+glibc_memcmp                  9.42 ms        8.13 ms 1.161 (1.16× slower) [1.155, 1.173]       pass
+  LCCC/CLANG paired: 1.150 (1.15× slower) [1.124, 1.175]; CLANG median=8.26 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+chacha20_block               2.7355 s      278.14 ms 9.860 (9.86× slower) [9.805, 9.937]       pass
+  LCCC/CLANG paired: 11.273 (11.27× slower) [11.143, 11.804]; CLANG median=242.48 ms
+  ! lccc: 2 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+sha256_transform            790.51 ms      285.60 ms 2.764 (2.76× slower) [2.755, 2.778]       pass
+  LCCC/CLANG paired: 2.598 (2.60× slower) [2.587, 2.607]; CLANG median=304.28 ms
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: 2 MAD outlier(s) retained (never silently discarded)
+  ! clang: 1 MAD outlier(s) retained (never silently discarded)
+linux_rbtree                 16.96 ms       15.19 ms 1.118 (1.12× slower) [1.104, 1.134]       pass
+  LCCC/CLANG paired: 1.107 (1.11× slower) [1.101, 1.132]; CLANG median=15.30 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+zstd_count                   15.15 ms       10.61 ms 1.401 (1.40× slower) [1.388, 1.428]       pass
+  LCCC/CLANG paired: 1.313 (1.31× slower) [1.252, 1.371]; CLANG median=11.30 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: wall-clock coefficient of variation is 13.3% (>5%)
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: wall-clock coefficient of variation is 15.1% (>5%)
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! clang: wall-clock coefficient of variation is 9.1% (>5%)
+  ! clang: 3 MAD outlier(s) retained (never silently discarded)
+lz4_compress                 10.61 ms        2.80 ms 3.784 (3.78× slower) [3.720, 3.894]       pass
+  LCCC/CLANG paired: 3.343 (3.34× slower) [3.213, 3.479]; CLANG median=3.18 ms
+  ! lccc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! lccc: 1 MAD outlier(s) retained (never silently discarded)
+  ! gcc: median runtime below 20 ms; process-launch and scheduler noise may dominate
+  ! gcc: 1 MAD outlier(s) retained (never silently discarded)
+  ! clang: median runtime below 20 ms; process-launch and scheduler noise may dominate
+glibc_strstr                 4.7544 s       4.4162 s 1.076 (1.08× slower) [1.073, 1.079]       pass
+  LCCC/CLANG paired: 1.045 (1.04× slower) [1.043, 1.047]; CLANG median=4.5481 s
+------------------------------------------------------------------------------------------------------------
+LCCC/GCC aggregate over correct benchmark pairs only:
+  n=39; geometric mean=0.8025; arithmetic mean=1.3232
+  best=fib (0.008 (119.93× faster)); worst=chacha20_block (9.860 (9.86× slower))
+LCCC / fastest available reference aggregate over correct benchmark pairs only:
+  n=39; geometric mean=0.8342; arithmetic mean=1.3947
+  best=fib vs gcc (0.008 (119.93× faster)); worst=chacha20_block vs clang (11.273 (11.27× slower))
+Raw per-round samples, commands, metadata, and optional disassembly are retained in JSON/artifacts.

@@ -1,0 +1,117 @@
+;;; evex-avx512f-dq-bw — the S09/S10 EVEX families: reciprocal/sqrt-14,
+;;; expand/compress, vptestm* k-destinations, vpmov* down-conversions,
+;;; vshuf{f,i}32x4/64x2, vdbpsadbw, vcvtps2ph/vcvtph2ps, variable
+;;; vpermq/vpermpd, vmovddup/shdup/sldup EVEX, vbroadcasti32x2,
+;;; vpblendmb/w, vpsllvw/rlvw/ravw, masked vmovss/vmovsd. All byte-verified
+;;; against GNU as 2.47.
+;;; rcp14_sqrt14
+.text
+vrcp14ps %xmm1, %xmm2
+vrcp14ps %zmm1, %zmm2
+vrcp14ps (%rax), %xmm2
+vrcp14ps (%rax){1to4}, %xmm2
+vrcp14ps %xmm1, %xmm2{%k3}{z}
+vrcp14pd %ymm1, %ymm2
+vrsqrt14ps %xmm1, %xmm2
+vrsqrt14pd %zmm1, %zmm2{%k3}
+;;; expand_compress
+vexpandps %xmm1, %xmm2
+vexpandps (%rax), %xmm2
+vexpandps %xmm1, %xmm2{%k3}{z}
+vexpandpd (%rax), %xmm2{%k3}
+vcompressps %xmm2, (%rax)
+vcompressps %xmm1, %xmm2
+vcompresspd %ymm2, (%rax)
+;;; ptestm_kdest
+vptestmd %xmm1, %xmm2, %k3
+vptestmd (%rax), %xmm2, %k3
+vptestmd (%rax){1to4}, %xmm2, %k3
+vptestmd %xmm1, %xmm2, %k3{%k5}
+vptestmq %xmm1, %xmm2, %k3
+vptestnmd %xmm1, %xmm2, %k3
+vptestnmq %xmm1, %xmm2, %k3
+vptestmb %xmm1, %xmm2, %k3
+vptestmw %xmm1, %xmm2, %k3
+vptestnmb %xmm1, %xmm2, %k3
+vptestnmw %xmm1, %xmm2, %k3
+;;; pmov_downconvert
+vpmovdb %xmm1, %xmm2
+vpmovdb %xmm1, (%rax)
+vpmovsdb %xmm1, %xmm2
+vpmovusdb %xmm1, %xmm2{%k3}{z}
+vpmovqb %xmm1, %xmm2
+vpmovsqb %xmm1, %xmm2
+vpmovusqb %xmm1, %xmm2
+vpmovqw %xmm1, %xmm2
+vpmovsqw %xmm1, %xmm2
+vpmovusqw %xmm1, %xmm2
+vpmovdw %ymm1, %xmm2
+vpmovsdw %xmm1, %xmm2
+vpmovusdw %xmm1, %xmm2
+vpmovqd %zmm1, %ymm2
+vpmovqd %ymm1, %xmm2
+vpmovsqd %zmm1, %ymm2
+vpmovusqd %zmm1, %ymm2
+vpmovwb %zmm1, %ymm2
+vpmovwb %ymm1, 256(%rax)
+vpmovswb %ymm1, %xmm2
+vpmovuswb %zmm1, (%rax)
+vpmovuswb %ymm1, %xmm2
+;;; shuffle32x4
+vshuff32x4 $3, %ymm1, %ymm2, %ymm3
+vshuff32x4 $3, %zmm1, %zmm2, %zmm3
+vshuff64x2 $1, %ymm1, %ymm2, %ymm3
+vshufi32x4 $4, %ymm1, %ymm2, %ymm3
+vshufi32x4 $7, %zmm1, %zmm2, %zmm3{%k5}{z}
+vshufi64x2 $255, %zmm1, %zmm2, %zmm3
+;;; vdbpsadbw
+vdbpsadbw $3, %xmm1, %xmm2, %xmm3
+vdbpsadbw $3, (%rax), %ymm2, %ymm3
+;;; f16c
+vcvtps2ph $4, %xmm1, %xmm2
+vcvtps2ph $4, %ymm1, %xmm2
+vcvtps2ph $4, %xmm1, (%rax)
+vcvtps2ph $4, %zmm1, %ymm2
+vcvtps2ph $4, %zmm1, 256(%rax)
+vcvtph2ps %xmm1, %xmm2
+vcvtph2ps %ymm1, %zmm2
+vcvtph2ps %xmm1, %xmm2{%k3}{z}
+;;; vperm_variable
+vpermq %ymm4, %ymm5, %ymm6
+vpermpd %ymm4, %ymm5, %ymm6
+vpermpd %zmm4, %zmm5, %zmm6
+vpermq %zmm4, %zmm5, %zmm6{%k7}{z}
+vpermq $1, %ymm4, %ymm5
+;;; dup_evex
+vmovddup %xmm1, %xmm2
+vmovddup (%rax), %xmm2
+vmovddup %ymm1, %ymm2
+vmovddup %zmm1, %zmm2{%k3}{z}
+vmovshdup %xmm1, %xmm2
+vmovsldup (%rax), %ymm2
+;;; broadcast32x2_blend_shifts
+vbroadcasti32x2 %xmm1, %ymm2
+vbroadcasti32x2 (%rax), %zmm2
+vbroadcasti32x2 %xmm1, %xmm2
+vpblendmb %xmm1, %xmm2, %xmm3
+vpblendmb (%rax), %xmm2, %xmm3
+vpblendmw %zmm1, %zmm2, %zmm3
+vpsllvw %xmm1, %xmm2, %xmm3
+vpsrlvw (%rax), %ymm2, %ymm3
+vpsravw %zmm1, %zmm2, %zmm3
+;;; scalar_mov_masked
+vmovss %xmm4, %xmm5, %xmm6{%k7}
+vmovss %xmm4, %xmm5, %xmm6{%k7}{z}
+vmovss %xmm6, (%rax){%k7}
+vmovss (%rax), %xmm6{%k7}
+vmovsd %xmm4, %xmm5, %xmm6{%k7}
+vmovsd %xmm6, (%rax){%k7}
+;;; case_and_segments
+push %FS
+push %fs
+push %gs
+pop %FS
+pop %gs
+;;; case_segment_reject reject
+push %es
+pop %ds

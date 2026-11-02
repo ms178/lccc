@@ -1,0 +1,9 @@
+FAIL  dead_static_aliased_global (GCC mismatch)
+      gcc : 123 456|0
+      lccc: 0 0|1
+
+================================================================
+regression suite: PASS=0 FAIL=1 SKIP=0 (AB-diff failures: 0)
+failed: dead_static_aliased_global:oracle
+================================================================
+boot gate: SKIP (KERNEL_DIR not set or tree not prepared)

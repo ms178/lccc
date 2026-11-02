@@ -1,0 +1,671 @@
+{
+ "flags": "-O2 -march=x86-64-v3",
+ "gaps": {
+  "nbody:main": 190,
+  "struct_copy:main": 60,
+  "sha256_transform:main": 54,
+  "sha256_transform:sha256_transform": 27,
+  "linux_find_bit:main": 22,
+  "mandelbrot:main": 8,
+  "spectral_norm:main": -22,
+  "lz4_compress:main": -42
+ },
+ "detail": [
+  {
+   "file": "tests/benchmark/programs/lz4_compress.c",
+   "compilers": {
+    "lccc": {
+     "src_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "dst_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "hash_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "main": {
+      "insns": 250,
+      "loads": 69,
+      "stores": 28,
+      "spills": 46,
+      "branch": 34,
+      "vector": 0
+     }
+    },
+    "gcc16.2": {
+     "main": {
+      "insns": 292,
+      "loads": 46,
+      "stores": 25,
+      "spills": 15,
+      "branch": 43,
+      "vector": 51
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 421,
+      "loads": 120,
+      "stores": 17,
+      "spills": 15,
+      "branch": 60,
+      "vector": 20
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 361,
+      "loads": 52,
+      "stores": 34,
+      "spills": 37,
+      "branch": 59,
+      "vector": 3
+     },
+     "src_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "hash_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "dst_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 361,
+      "loads": 55,
+      "stores": 20,
+      "spills": 23,
+      "branch": 55,
+      "vector": 2
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/mandelbrot.c",
+   "compilers": {
+    "lccc": {
+     "main": {
+      "insns": 55,
+      "loads": 6,
+      "stores": 0,
+      "spills": 0,
+      "branch": 9,
+      "vector": 1
+     }
+    },
+    "gcc16.2": {
+     "main": {
+      "insns": 47,
+      "loads": 4,
+      "stores": 0,
+      "spills": 0,
+      "branch": 7,
+      "vector": 6
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 59,
+      "loads": 7,
+      "stores": 0,
+      "spills": 0,
+      "branch": 10,
+      "vector": 4
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 64,
+      "loads": 6,
+      "stores": 1,
+      "spills": 3,
+      "branch": 7,
+      "vector": 3
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 64,
+      "loads": 9,
+      "stores": 1,
+      "spills": 3,
+      "branch": 10,
+      "vector": 9
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/linux_find_bit.c",
+   "compilers": {
+    "lccc": {
+     "linux_bitmap_a": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "linux_bitmap_b": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "linux_find_next_andnot_bit": {
+      "insns": 45,
+      "loads": 5,
+      "stores": 0,
+      "spills": 0,
+      "branch": 7,
+      "vector": 0
+     },
+     "main": {
+      "insns": 106,
+      "loads": 19,
+      "stores": 0,
+      "spills": 0,
+      "branch": 14,
+      "vector": 0
+     }
+    },
+    "gcc16.2": {
+     "linux_find_next_andnot_bit.part.0": {
+      "insns": 72,
+      "loads": 9,
+      "stores": 0,
+      "spills": 0,
+      "branch": 6,
+      "vector": 0
+     },
+     "main": {
+      "insns": 84,
+      "loads": 18,
+      "stores": 7,
+      "spills": 15,
+      "branch": 16,
+      "vector": 4
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 118,
+      "loads": 23,
+      "stores": 0,
+      "spills": 0,
+      "branch": 13,
+      "vector": 15
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 205,
+      "loads": 28,
+      "stores": 8,
+      "spills": 11,
+      "branch": 25,
+      "vector": 19
+     },
+     "linux_bitmap_a": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "linux_bitmap_b": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 121,
+      "loads": 28,
+      "stores": 1,
+      "spills": 3,
+      "branch": 12,
+      "vector": 27
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/sha256_transform.c",
+   "compilers": {
+    "lccc": {
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "sha256_transform": {
+      "insns": 153,
+      "loads": 30,
+      "stores": 3,
+      "spills": 5,
+      "branch": 9,
+      "vector": 45
+     },
+     "main": {
+      "insns": 148,
+      "loads": 35,
+      "stores": 37,
+      "spills": 60,
+      "branch": 16,
+      "vector": 19
+     }
+    },
+    "gcc16.2": {
+     "sha256_transform": {
+      "insns": 137,
+      "loads": 27,
+      "stores": 19,
+      "spills": 21,
+      "branch": 4,
+      "vector": 31
+     },
+     "main": {
+      "insns": 94,
+      "loads": 11,
+      "stores": 15,
+      "spills": 23,
+      "branch": 11,
+      "vector": 6
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 106,
+      "loads": 14,
+      "stores": 14,
+      "spills": 22,
+      "branch": 9,
+      "vector": 36
+     },
+     "sha256_transform": {
+      "insns": 126,
+      "loads": 27,
+      "stores": 11,
+      "spills": 20,
+      "branch": 3,
+      "vector": 12
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 438,
+      "loads": 66,
+      "stores": 42,
+      "spills": 86,
+      "branch": 13,
+      "vector": 42
+     },
+     "data.130.0.0.2": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "state.130.0.0.2": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 113,
+      "loads": 18,
+      "stores": 18,
+      "spills": 28,
+      "branch": 10,
+      "vector": 38
+     },
+     "sha256_transform": {
+      "insns": 749,
+      "loads": 74,
+      "stores": 28,
+      "spills": 77,
+      "branch": 2,
+      "vector": 686
+     },
+     "K": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/spectral_norm.c",
+   "compilers": {
+    "lccc": {
+     "mul_AtAv": {
+      "insns": 236,
+      "loads": 46,
+      "stores": 2,
+      "spills": 6,
+      "branch": 17,
+      "vector": 17
+     },
+     "main": {
+      "insns": 50,
+      "loads": 9,
+      "stores": 0,
+      "spills": 7,
+      "branch": 10,
+      "vector": 0
+     }
+    },
+    "gcc16.2": {
+     "mul_Atv.constprop.0": {
+      "insns": 51,
+      "loads": 6,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 30
+     },
+     "mul_Av.constprop.0": {
+      "insns": 51,
+      "loads": 6,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 30
+     },
+     "main": {
+      "insns": 72,
+      "loads": 13,
+      "stores": 2,
+      "spills": 9,
+      "branch": 12,
+      "vector": 17
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 365,
+      "loads": 94,
+      "stores": 21,
+      "spills": 98,
+      "branch": 16,
+      "vector": 29
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 274,
+      "loads": 30,
+      "stores": 1,
+      "spills": 23,
+      "branch": 14,
+      "vector": 82
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 253,
+      "loads": 50,
+      "stores": 1,
+      "spills": 35,
+      "branch": 13,
+      "vector": 163
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/nbody.c",
+   "compilers": {
+    "lccc": {
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "main": {
+      "insns": 308,
+      "loads": 127,
+      "stores": 31,
+      "spills": 31,
+      "branch": 17,
+      "vector": 29
+     }
+    },
+    "gcc16.2": {
+     "energy": {
+      "insns": 97,
+      "loads": 26,
+      "stores": 0,
+      "spills": 0,
+      "branch": 8,
+      "vector": 22
+     },
+     "main": {
+      "insns": 118,
+      "loads": 34,
+      "stores": 12,
+      "spills": 0,
+      "branch": 10,
+      "vector": 56
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 266,
+      "loads": 100,
+      "stores": 20,
+      "spills": 8,
+      "branch": 28,
+      "vector": 50
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 1192,
+      "loads": 300,
+      "stores": 114,
+      "spills": 240,
+      "branch": 5,
+      "vector": 0
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 372,
+      "loads": 111,
+      "stores": 78,
+      "spills": 133,
+      "branch": 6,
+      "vector": 311
+     },
+     "energy": {
+      "insns": 159,
+      "loads": 36,
+      "stores": 3,
+      "spills": 6,
+      "branch": 10,
+      "vector": 90
+     },
+     "bodies": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    }
+   },
+   "errors": {}
+  },
+  {
+   "file": "tests/benchmark/programs/struct_copy.c",
+   "compilers": {
+    "lccc": {
+     "main": {
+      "insns": 136,
+      "loads": 36,
+      "stores": 31,
+      "spills": 60,
+      "branch": 4,
+      "vector": 1
+     }
+    },
+    "gcc16.2": {
+     "main": {
+      "insns": 100,
+      "loads": 20,
+      "stores": 8,
+      "spills": 11,
+      "branch": 9,
+      "vector": 55
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 76,
+      "loads": 5,
+      "stores": 0,
+      "spills": 0,
+      "branch": 3,
+      "vector": 47
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 213,
+      "loads": 50,
+      "stores": 48,
+      "spills": 83,
+      "branch": 4,
+      "vector": 2
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 82,
+      "loads": 8,
+      "stores": 1,
+      "spills": 3,
+      "branch": 3,
+      "vector": 16
+     }
+    }
+   },
+   "errors": {}
+  }
+ ]
+}

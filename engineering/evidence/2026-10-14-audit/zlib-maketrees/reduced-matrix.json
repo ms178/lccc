@@ -1,0 +1,144 @@
+[
+  {
+    "arm": "gcc-O2",
+    "command": [
+      "gcc",
+      "-O2",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {},
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": true
+  },
+  {
+    "arm": "clang-O2",
+    "command": [
+      "clang",
+      "-O2",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {},
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": true
+  },
+  {
+    "arm": "gcc-asan-ubsan",
+    "command": [
+      "gcc",
+      "-O1",
+      "-fsanitize=address,undefined",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {
+      "ASAN_OPTIONS": "detect_leaks=0",
+      "UBSAN_OPTIONS": "halt_on_error=1"
+    },
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": true
+  },
+  {
+    "arm": "lccc-O0",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O0",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {},
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": true
+  },
+  {
+    "arm": "lccc-O1",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O1",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {},
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": true
+  },
+  {
+    "arm": "lccc-O2",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O2",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {},
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": false
+  },
+  {
+    "arm": "lccc-O3",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O3",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {},
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": false
+  },
+  {
+    "arm": "lccc-no-widen",
+    "command": [
+      "target/fastbuild/lccc",
+      "-O2",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/maketrees-small.c",
+      "/opt/lccc-audit-cache/lccc/engineering/evidence/2026-10-14-audit/zlib-maketrees/gencodes-small.c",
+      "-o",
+      "/home/user/.cache/zlib-isolate/reduced"
+    ],
+    "env": {
+      "CCC_NO_IV_WIDEN": "1"
+    },
+    "compile_rc": 0,
+    "stderr": "",
+    "run_rc": 0,
+    "run_stderr": "",
+    "matches": true
+  }
+]

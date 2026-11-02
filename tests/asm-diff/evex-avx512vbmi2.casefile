@@ -1,0 +1,23 @@
+;;; vbmi2-compress-expand-byte-word
+vpcompressb %zmm31, -128(%rax)
+vpcompressb %ymm31, %ymm30{%k5}{z}
+vpcompressw %ymm29, -256(%rcx){%k3}
+vpcompressw %xmm17, %xmm18{%k3}
+vpexpandb -128(%rax), %zmm29{%k2}{z}
+vpexpandb %zmm30, %zmm31{%k5}
+vpexpandw 256(%rax), %ymm28{%k5}
+vpexpandw %xmm17, %xmm18{%k3}{z}
+;;; vbmi2-variable-funnel-shifts
+vpshldvw %zmm29, %zmm28, %zmm27{%k3}{z}
+vpshldvw 128(%rax), %zmm5, %zmm6{%k3}
+vpshldvd 508(%rax){1to16}, %zmm5, %zmm6{%k3}
+vpshldvq 1016(%rax){1to8}, %zmm5, %zmm6{%k3}
+vpshrdvw 128(%rax), %zmm5, %zmm6{%k3}
+vpshrdvd 508(%rax){1to4}, %xmm17, %xmm18{%k5}
+vpshrdvq 1016(%rax){1to2}, %xmm17, %xmm18{%k5}{z}
+vpshrdvd 508(%rax){1to16}, %zmm5, %zmm6{%k3}{z}
+;;; vbmi2-invalid-directions-and-shapes reject
+vpcompressb (%rax), %zmm1
+vpexpandb %zmm1, (%rax)
+vpshldvw 64(%rax){1to32}, %zmm5, %zmm6
+vpshldvd %ymm5, %xmm6, %xmm7

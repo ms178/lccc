@@ -1,0 +1,750 @@
+{
+  "fixture_generator_sha256": "0ce776340d33ca044aea33fe5c7006f3187cb66d7537339caf85ff4f08806994",
+  "oracle_version": "LLD 21.1.0 (compatible with GNU linkers)",
+  "passed": 38,
+  "failed": 0,
+  "skipped": 0,
+  "records": [
+    {
+      "case": "valid-64-0--7",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0--7.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0--7-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "5c995cc5705100c503f481f78e899646dbfce49ff48d494ecbc52cb90378d3a2"
+    },
+    {
+      "case": "valid-64-0--7",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0--7.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0--7-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "5c995cc5705100c503f481f78e899646dbfce49ff48d494ecbc52cb90378d3a2"
+    },
+    {
+      "case": "valid-64-8--7",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8--7.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8--7-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "c8f8d118dbbf5739a5c60448f37a6fa6de06abf3a2a9ca404918937881885f58"
+    },
+    {
+      "case": "valid-64-8--7",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8--7.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8--7-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "c8f8d118dbbf5739a5c60448f37a6fa6de06abf3a2a9ca404918937881885f58"
+    },
+    {
+      "case": "valid-64-0-0",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-0.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-0-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "f704c1acad7c2639bb33dfb369535b59ed8f103e92fced23ecc5f8b6a1013337"
+    },
+    {
+      "case": "valid-64-0-0",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-0.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-0-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "f704c1acad7c2639bb33dfb369535b59ed8f103e92fced23ecc5f8b6a1013337"
+    },
+    {
+      "case": "valid-64-8-0",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-0.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-0-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "1b08f48d931b43a95b2131c37d67c4e2d953f1c262d9bc538244749d4315d979"
+    },
+    {
+      "case": "valid-64-8-0",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-0.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-0-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "1b08f48d931b43a95b2131c37d67c4e2d953f1c262d9bc538244749d4315d979"
+    },
+    {
+      "case": "valid-64-0-11",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-11.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-11-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "6bab1d173ed4e4e30ebdc183c655a03fcc34bce513d9120e71bcc7690b6b0b4d"
+    },
+    {
+      "case": "valid-64-0-11",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-11.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-0-11-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "6bab1d173ed4e4e30ebdc183c655a03fcc34bce513d9120e71bcc7690b6b0b4d"
+    },
+    {
+      "case": "valid-64-8-11",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-11.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-11-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "1c0ec24fb10883256f6047ea182e159c73a626445ae4146809bc053bd1dcb151"
+    },
+    {
+      "case": "valid-64-8-11",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-11.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-64-8-11-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "1c0ec24fb10883256f6047ea182e159c73a626445ae4146809bc053bd1dcb151"
+    },
+    {
+      "case": "valid-marker-0",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-0.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-0-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "af39723434270f50c7674d93890ef7f94cdc6a5f0b971283119cfdfe48ecf268"
+    },
+    {
+      "case": "valid-marker-0",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-0.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-0-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "af39723434270f50c7674d93890ef7f94cdc6a5f0b971283119cfdfe48ecf268"
+    },
+    {
+      "case": "valid-marker-51",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-51.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-51-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "872db1741bd87ff027a8fc661c722e1aaa1d3f7db4da8c0914ea4d7dd7880a52"
+    },
+    {
+      "case": "valid-marker-51",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-51.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-marker-51-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "872db1741bd87ff027a8fc661c722e1aaa1d3f7db4da8c0914ea4d7dd7880a52"
+    },
+    {
+      "case": "valid-uleb-padded-1",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-1.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-1-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "86c258e020cb862518b750686dba69936c9c84c94dee9fcd61b932bfae445005"
+    },
+    {
+      "case": "valid-uleb-padded-1",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-1.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-1-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "86c258e020cb862518b750686dba69936c9c84c94dee9fcd61b932bfae445005"
+    },
+    {
+      "case": "valid-uleb-padded-2",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-2.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-2-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "8a95e77a422ab0e75a4fa3588fa5f2037b627c17b3cfceaa7ff05c1c6750b835"
+    },
+    {
+      "case": "valid-uleb-padded-2",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-2.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-2-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "8a95e77a422ab0e75a4fa3588fa5f2037b627c17b3cfceaa7ff05c1c6750b835"
+    },
+    {
+      "case": "valid-uleb-padded-3",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-3.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-3-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "0dc3d0fc452dd38cd8ef639bd369e84b018d8af0b06113ec2454294af2c946bf"
+    },
+    {
+      "case": "valid-uleb-padded-3",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-3.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-3-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "0dc3d0fc452dd38cd8ef639bd369e84b018d8af0b06113ec2454294af2c946bf"
+    },
+    {
+      "case": "valid-uleb-padded-4",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-4.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-4-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "4f53002fac11bd989f914c5e4ef2ad2dac610733c407f2b9f22a4a7aef3e90ef"
+    },
+    {
+      "case": "valid-uleb-padded-4",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-4.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-4-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "4f53002fac11bd989f914c5e4ef2ad2dac610733c407f2b9f22a4a7aef3e90ef"
+    },
+    {
+      "case": "valid-uleb-padded-5",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-5.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-5-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "76f9a91c0783ba7862c9e652645824fe6ab2b733c5a9814452d2777bc0cf005a"
+    },
+    {
+      "case": "valid-uleb-padded-5",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-5.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-5-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "76f9a91c0783ba7862c9e652645824fe6ab2b733c5a9814452d2777bc0cf005a"
+    },
+    {
+      "case": "valid-uleb-padded-6",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-6.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-6-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "f1a4adb614e737b2c4133edd7e333c054df807d79c1d65bd5b7420eb21b3b07e"
+    },
+    {
+      "case": "valid-uleb-padded-6",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-6.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-6-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "f1a4adb614e737b2c4133edd7e333c054df807d79c1d65bd5b7420eb21b3b07e"
+    },
+    {
+      "case": "valid-uleb-padded-7",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-7.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-7-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "be2334c087b9599fa7fba872b54c2e0dfe64d39e4add112c9789dc39923bb025"
+    },
+    {
+      "case": "valid-uleb-padded-7",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-7.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-7-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "be2334c087b9599fa7fba872b54c2e0dfe64d39e4add112c9789dc39923bb025"
+    },
+    {
+      "case": "valid-uleb-padded-8",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-8.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-8-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "28375b7fd7b54fc9c1013ec292272c58f674d1a4797c68e5fde2064f1679aaba"
+    },
+    {
+      "case": "valid-uleb-padded-8",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-8.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-8-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "28375b7fd7b54fc9c1013ec292272c58f674d1a4797c68e5fde2064f1679aaba"
+    },
+    {
+      "case": "valid-uleb-padded-9",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-9.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-9-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "249b8bfba758f50643adad2172e80121329895361f83d9a0499a33b049d9304d"
+    },
+    {
+      "case": "valid-uleb-padded-9",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-9.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-9-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "249b8bfba758f50643adad2172e80121329895361f83d9a0499a33b049d9304d"
+    },
+    {
+      "case": "valid-uleb-padded-10",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-10.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-10-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "81736f30a89863e865aa4fe0c8edcc119fd192bef95e5ef05a3500f36aa066b6"
+    },
+    {
+      "case": "valid-uleb-padded-10",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-10.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-uleb-padded-10-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "81736f30a89863e865aa4fe0c8edcc119fd192bef95e5ef05a3500f36aa066b6"
+    },
+    {
+      "case": "valid-none-empty",
+      "shared": false,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-none-empty.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-none-empty-False-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "e95b8f1665b57c3c88f6be3ef9820e3448224b4a5113402e00654c863bb64c14"
+    },
+    {
+      "case": "valid-none-empty",
+      "shared": true,
+      "tool": "oracle",
+      "passed": true,
+      "command": [
+        "/home/user/.cache/lccc-tools/bin/ld.lld",
+        "-m",
+        "elf64lriscv",
+        "--no-relax",
+        "-shared",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-none-empty.o",
+        "-o",
+        "/tmp/lccc-rv-reloc-ogfk4udt/valid-none-empty-True-oracle.elf"
+      ],
+      "returncode": 0,
+      "diagnostic": "",
+      "expected_accept": true,
+      "fixture_sha256": "e95b8f1665b57c3c88f6be3ef9820e3448224b4a5113402e00654c863bb64c14"
+    }
+  ]
+}

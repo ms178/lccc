@@ -1,0 +1,8 @@
+Control: replace only DT_DEBUG (21,0) with DT_RELENT (19,8) in the saved failing ELF32 executable.
+
+'PLT' relocation section at offset 0x8048310 contains 32 bytes:
+ Offset     Info    Type                Sym. Value  Symbol's Name
+0804c00c  00000107 R_386_JUMP_SLOT        00000000   __libc_start_main@GLIBC_2.34
+0804c010  00000407 R_386_JUMP_SLOT        08049040   notypefn
+0804c014  00000207 R_386_JUMP_SLOT        00000000   notypefn2
+0804c018  00000307 R_386_JUMP_SLOT        00000000   printf@GLIBC_2.0

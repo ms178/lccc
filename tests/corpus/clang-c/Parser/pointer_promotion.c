@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// Origin: edgcpp/compiler tests/tests/imported/clang/c (Apache-2.0 WITH
+// LLVM-exception).  Adapted into LCCC by scripts/edg_corpus_mine.py.
+//type: fp
+//options:  --c
+// RUN: %clang_cc1 -fsyntax-only -verify %s
+
+void test(void) {
+  void *vp;
+  int *ip;
+  char *cp;
+  struct foo *fp;
+  struct bar *bp;
+  short sint = 7;
+
+  if (ip < cp) {} // expected-warning {{comparison of distinct pointer types ('int *' and 'char *')}}
+  if (cp < fp) {} // expected-warning {{comparison of distinct pointer types ('char *' and 'struct foo *')}}
+  if (fp < bp) {} // expected-warning {{comparison of distinct pointer types ('struct foo *' and 'struct bar *')}}
+  if (ip < 7) {} // expected-warning {{comparison between pointer and integer ('int *' and 'int')}}
+  if (sint < ip) {} // expected-warning {{comparison between pointer and integer ('short' and 'int *')}}
+  if (ip == cp) {} // expected-warning {{comparison of distinct pointer types ('int *' and 'char *')}}
+}

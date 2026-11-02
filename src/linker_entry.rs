@@ -1,0 +1,473 @@
+//! Public entry points for the standalone `lccc-ld` linker driver.
+
+use crate::backend::linker_common::Elf64Object;
+pub use crate::backend::linker_common::{
+    BuildIdStyle, check_rwx_segments, convert_elf_file_to_flat_binary,
+};
+pub use crate::backend::x86::linker::emit_script::ScriptLinkExtras;
+
+/// GNU property note flags, shared by every link path (built-in, shared
+/// object and linker-script links).
+pub use crate::backend::linker_common::cet::{PropertyLinkFlags, merge_property_into_objects};
+
+/// Version banner shared by the compiler driver's built-in linker query and
+/// the standalone `lccc-ld` binary.
+///
+/// Keep the first two whitespace-delimited fields exactly `GNU ld` and the
+/// final field numeric. Linux's `scripts/ld-version.sh` (and other build-system
+/// probes modelled on it) reject any linker whose banner is not in GNU ld or
+/// LLD form, even when the linker's command-line interface is compatible.
+/// The compatibility version remains 2.42 rather than tracking LCCC releases:
+/// it describes the GNU-ld interface level advertised by this implementation.
+pub const GNU_LD_VERSION_OUTPUT: &str = "GNU ld (LCCC built-in) 2.42";
+
+/// Publish `--sysroot=DIR` to the linker's path resolution.
+///
+/// `lccc-ld` calls this once from `main` instead of exporting `LCCC_SYSROOT`
+/// into its own environment: the resolved sysroot is process configuration, not
+/// ambient state, and mutating `environ` is a data race (edition 2024 made
+/// `std::env::set_var` `unsafe` for exactly that reason).  Library and runtime
+/// discovery consult `backend::common::sysroot`, which prefers this override and
+/// still honours `LCCC_SYSROOT` for the compiler driver and for callers that set
+/// it in the child's environment.
+pub fn set_sysroot_override(root: &str) {
+    crate::backend::common::set_sysroot_override(root);
+}
+
+/// Load a mix of relocatable objects (.o) and archives (.a) for x86-64 with
+/// whole-command-line group semantics. `inputs` is (path, whole_archive).
+/// `undefined` are `-u`/`--undefined` symbols that must pull archive members.
+pub fn load_inputs_x86(
+    inputs: &[(String, bool)],
+    objects: &mut Vec<Elf64Object>,
+    undefined: &[String],
+    lib_paths: &[String],
+) -> Result<(), String> {
+    crate::backend::x86::linker::load_inputs_for_ld(inputs, objects, undefined, lib_paths)
+}
+
+/// Input list of a `-r` or `-T` link with every `-lNAME` expanded in place;
+/// see [`crate::backend::linker_common::expand_file_mode_libs`].
+pub fn expand_file_mode_libs(
+    ordered_args: &[String],
+    files: &[(String, bool)],
+    extra_dirs: &[String],
+    mode: &str,
+) -> Result<Vec<(String, bool)>, String> {
+    crate::backend::linker_common::expand_file_mode_libs(ordered_args, files, extra_dirs, mode)
+}
+
+/// The `SEARCH_DIR` directories a linker script declares, in order.
+pub fn script_search_dirs(script_src: &str) -> Result<Vec<String>, String> {
+    Ok(crate::backend::linker_common::linker_script::parse_linker_script(script_src)?.search_dirs)
+}
+
+/// Load ELF32/i386 objects and archives for a script-driven link.
+/// `undefined` are `-u`/`--undefined` symbols that must pull archive members.
+pub fn load_inputs_i386_script(
+    inputs: &[(String, bool)],
+    undefined: &[String],
+) -> Result<Vec<Elf64Object>, String> {
+    crate::backend::i686::linker::load_inputs_for_script(inputs, undefined)
+}
+
+/// Append a synthetic object carrying an empty `.note.gnu.build-id`
+/// section (36 bytes for SHA-1). The script engine places it via the usual
+/// `*(.note.*)` input patterns and patches the digest after layout.
+pub fn append_build_id_object(objects: &mut Vec<Elf64Object>) {
+    append_build_id_object_styled(objects, &BuildIdStyle::Sha1);
+}
+
+/// Append a synthetic `.note.gnu.build-id` object sized for `style`.
+pub fn append_build_id_object_styled(objects: &mut Vec<Elf64Object>, style: &BuildIdStyle) {
+    if style.is_enabled() {
+        objects.push(crate::backend::linker_common::build_id::synthetic_note_object_styled(style));
+    }
+}
+
+/// `-S`/`--strip-debug` (and `-s`) for the paths that place input sections
+/// themselves -- a linker script, `-r`: each debug section stops being an
+/// input section, exactly like the parser's own metadata (`SHT_NULL`), and
+/// loses its relocations. Section indices stay stable, so every other
+/// reference is untouched.
+pub fn strip_debug_sections(objects: &mut [Elf64Object]) {
+    use crate::backend::elf::{SHF_ALLOC, SHT_NULL};
+    use crate::backend::linker_common::is_debug_section_name;
+    for obj in objects {
+        for (si, sec) in obj.sections.iter_mut().enumerate() {
+            if sec.flags & SHF_ALLOC == 0 && is_debug_section_name(&sec.name) {
+                sec.sh_type = SHT_NULL;
+                sec.size = 0;
+                if let Some(relocs) = obj.relocations.get_mut(si) {
+                    relocs.clear();
+                }
+            }
+        }
+    }
+}
+
+/// Relocatable link (`ld -r`): merge objects into a single ET_REL (x86-64).
+pub fn link_relocatable_x86(objects: &[Elf64Object], output: &str) -> Result<(), String> {
+    crate::backend::x86::linker::emit_rel::link_relocatable(objects, output)
+}
+
+/// Link pre-loaded objects with a full GNU linker script (x86-64).
+pub fn link_with_script_x86(
+    objects: &mut [Elf64Object],
+    script_src: &str,
+    output: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_script::link_with_script(
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+    )
+}
+
+/// Link pre-loaded objects with a full GNU linker script and extended options (x86-64).
+pub fn link_with_script_x86_extras(
+    objects: &mut [Elf64Object],
+    script_src: &str,
+    output: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+    extras: &ScriptLinkExtras,
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_script::link_with_script_with_extras(
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+        extras,
+    )
+}
+
+/// Link pre-loaded ELF32/i386 objects with a full GNU linker script.
+pub fn link_with_script_i386(
+    objects: &mut [Elf64Object],
+    script_src: &str,
+    output: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_script::link_with_script_i386(
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+    )
+}
+
+/// Link pre-loaded ELF32/i386 objects with a full GNU linker script and extended options.
+pub fn link_with_script_i386_extras(
+    objects: &mut [Elf64Object],
+    script_src: &str,
+    output: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+    extras: &ScriptLinkExtras,
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_script::link_with_script_i386_with_extras(
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+        extras,
+    )
+}
+
+/// Standard userspace executable link for the standalone `lccc-ld` driver.
+///
+/// Exactly the compiler driver's pipeline (`link_builtin`): symbol
+/// resolution with archive group semantics, PLT/GOT, RELRO, eh_frame_hdr,
+/// gc-sections, --wrap/-u/--defsym. CRT objects are expected as positional
+/// inputs (the gcc-style ld invocation lists crt1/crti/crtn explicitly), so
+/// no CRT injection happens here; the crt slots stay empty and `user_args`
+/// carries -L/-l/-z/... in GNU spelling for `parse_linker_args`.
+/// GNU ld's built-in library search path (its default script's
+/// `SEARCH_DIR`s, searched after every `-L`), for the standalone linker.
+/// The union of the multiarch (Debian/Ubuntu) and lib64/lib (Fedora, Arch)
+/// layouts, in GNU's order; a directory a system lacks costs one failed
+/// lookup.  `-nostdlib` and `-T` (whose script replaces the default one)
+/// drop it, as in GNU ld.
+pub const DEFAULT_SEARCH_DIRS_X86_64: &[&str] = &[
+    "/usr/local/lib/x86_64-linux-gnu",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/local/lib64",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
+/// [`DEFAULT_SEARCH_DIRS_X86_64`] for `-m elf_i386`.  `/usr/lib` and `/lib`
+/// hold 64-bit libraries on a multilib host; the i386 search skips files of
+/// the wrong class ("skipping incompatible"), as GNU ld does.
+pub const DEFAULT_SEARCH_DIRS_I386: &[&str] = &[
+    "/usr/local/lib/i386-linux-gnu",
+    "/lib/i386-linux-gnu",
+    "/usr/lib/i386-linux-gnu",
+    "/usr/local/lib32",
+    "/lib32",
+    "/usr/lib32",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
+/// The `--as-needed` state in effect for an input file named just before
+/// `args[at]`, for each ascending position `at`
+/// (`linker_common::as_needed_states`).
+pub fn as_needed_states(args: &[String], at: &[usize]) -> Vec<bool> {
+    crate::backend::linker_common::as_needed_states(args, at)
+}
+
+pub fn link_builtin_x86(
+    object_files: &[&str],
+    object_as_needed: &[bool],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::x86::linker::link_builtin(
+        object_files,
+        object_as_needed,
+        output,
+        user_args,
+        search_dirs, // after the -L paths in user_args
+        &[],         // no implicit libs: the caller lists -lc etc. explicitly
+        &[],         // CRT before: positional
+        &[],         // CRT after: positional
+    )
+}
+
+/// Shared-library link for the standalone `lccc-ld -shared` driver.
+pub fn link_shared_x86(
+    object_files: &[&str],
+    object_as_needed: &[bool],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::x86::linker::link_shared(
+        object_files,
+        object_as_needed,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+/// Standard ELF32/i386 userspace executable link for `lccc-ld -m elf_i386`.
+///
+/// The i686 backend's `link_builtin` — the pipeline the `lccc-i686`
+/// compiler driver uses.  Every operand (CRT objects, objects, archives,
+/// `-l` libraries, positional flags) is in `user_args` in command-line
+/// order, so no CRT, library path or implicit library injection happens
+/// here and link order is preserved exactly.
+pub fn link_builtin_i386(
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::i686::linker::link_builtin(
+        &[], // every operand is positional in user_args
+        output,
+        user_args,
+        search_dirs, // after the -L paths in user_args
+        &[],         // no implicit libs: the caller lists -lc etc. explicitly
+        &[],         // CRT before: positional
+        &[],         // CRT after: positional
+    )
+}
+
+/// ELF32/i386 shared-library link for `lccc-ld -m elf_i386 -shared`.
+pub fn link_shared_i386(
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::i686::linker::link_shared(&[], output, user_args, search_dirs, &[], &[], &[])
+}
+
+pub const DEFAULT_SEARCH_DIRS_AARCH64: &[&str] = &[
+    "/usr/local/lib/aarch64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/aarch64-linux-gnu/lib",
+    "/usr/local/lib64",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
+pub const DEFAULT_SEARCH_DIRS_RISCV64: &[&str] = &[
+    "/usr/local/lib/riscv64-linux-gnu",
+    "/lib/riscv64-linux-gnu",
+    "/usr/lib/riscv64-linux-gnu",
+    "/usr/riscv64-linux-gnu/lib",
+    "/usr/local/lib64",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
+pub fn link_builtin_aarch64(
+    object_files: &[&str],
+    object_as_needed: &[bool],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+    is_static: bool,
+) -> Result<(), String> {
+    crate::backend::arm::linker::link_builtin(
+        object_files,
+        object_as_needed,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+        is_static,
+    )
+}
+
+pub fn link_shared_aarch64(
+    object_files: &[&str],
+    object_as_needed: &[bool],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::arm::linker::link_shared(
+        object_files,
+        object_as_needed,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+pub fn link_builtin_riscv64(
+    object_files: &[&str],
+    object_as_needed: &[bool],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::riscv::linker::link_builtin(
+        object_files,
+        object_as_needed,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+pub fn link_shared_riscv64(
+    object_files: &[&str],
+    object_as_needed: &[bool],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::riscv::linker::link_shared(
+        object_files,
+        object_as_needed,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::GNU_LD_VERSION_OUTPUT;
+
+    #[test]
+    fn standalone_banner_has_linux_ld_version_shape() {
+        let fields: Vec<_> = GNU_LD_VERSION_OUTPUT.split_whitespace().collect();
+        assert_eq!(&fields[..2], &["GNU", "ld"]);
+        assert!(
+            fields
+                .last()
+                .unwrap()
+                .split('.')
+                .all(|part| { !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) })
+        );
+    }
+}

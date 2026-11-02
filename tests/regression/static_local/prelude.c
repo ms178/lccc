@@ -1,0 +1,10 @@
+struct s { int x; int y; };
+int g(void);
+static int sf;
+extern int ef;
+struct s gs;
+int garr[4];
+const int carr[2] = {1, 2};
+const int cg = 5;
+static int *sptr;
+static int *const cp = &sf;

@@ -1,0 +1,28 @@
+
+Dynamic section at offset 0x3f48 contains 22 entries:
+  Tag        Type                         Name/Value
+ 0x00000001 (NEEDED)                     Shared library: [libnfn.so]
+ 0x00000001 (NEEDED)                     Shared library: [libc.so.6]
+ 0x0000000c (INIT)                       0x8049000
+ 0x0000000d (FINI)                       0x80491ac
+ 0x00000019 (INIT_ARRAY)                 0x804bf40
+ 0x0000001b (INIT_ARRAYSZ)               4 (bytes)
+ 0x0000001a (FINI_ARRAY)                 0x804bf44
+ 0x0000001c (FINI_ARRAYSZ)               4 (bytes)
+ 0x6ffffef5 (GNU_HASH)                   0x80481ec
+ 0x00000005 (STRTAB)                     0x804826c
+ 0x00000006 (SYMTAB)                     0x804820c
+ 0x0000000a (STRSZ)                      101 (bytes)
+ 0x0000000b (SYMENT)                     16 (bytes)
+ 0x00000015 (DEBUG)                      0x0
+ 0x00000003 (PLTGOT)                     0x804c000
+ 0x00000002 (PLTRELSZ)                   32 (bytes)
+ 0x00000014 (PLTREL)                     REL
+ 0x00000017 (JMPREL)                     0x8048310
+ 0x6ffffff0 (VERSYM)                     0x80482d1
+ 0x6ffffffe (VERNEED)                    0x80482e0
+ 0x6fffffff (VERNEEDNUM)                 1
+ 0x00000000 (NULL)                       0x0
+
+'PLT' relocation section at offset 0x8048310 contains 32 bytes:
+<missing or corrupt dynamic tag: DT_RELENT>

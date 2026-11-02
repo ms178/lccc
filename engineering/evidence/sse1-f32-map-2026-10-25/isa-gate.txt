@@ -1,0 +1,1 @@
+vectorizer/FMA x86 ISA emission gates: PASS

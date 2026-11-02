@@ -1,0 +1,285 @@
+{
+  "flags": [
+    "-O3",
+    "-march=x86-64-v3",
+    "-S"
+  ],
+  "measurement": "static instruction count including RET, no timing inference",
+  "versions": {
+    "gcc": "gcc-16 (GCC) 16.2.0",
+    "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)"
+  },
+  "source_sha256": "69dfc8122968c1b55f88cfdca05471861838dbf33f8fbfe468935f27ee445cf0",
+  "counts": {
+    "odd_mul": {
+      "pre_batch": 8,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 7
+    },
+    "or_neg": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 12,
+      "clang": 8
+    },
+    "isolate_low": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 10,
+      "clang": 7
+    },
+    "or_shl": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 12,
+      "clang": 8
+    },
+    "or_lshr": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 12,
+      "clang": 8
+    },
+    "xor_shl": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 12,
+      "clang": 8
+    },
+    "xor_lshr": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 12,
+      "clang": 8
+    },
+    "add_shl": {
+      "pre_batch": 9,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 9
+    },
+    "sub_shl": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 12,
+      "clang": 10
+    },
+    "rsub_shl": {
+      "pre_batch": 9,
+      "lccc": 4,
+      "gcc": 12,
+      "clang": 9
+    },
+    "swap_zero": {
+      "pre_batch": 8,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 8
+    },
+    "rotate_zero": {
+      "pre_batch": 7,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 7
+    },
+    "pop_zero": {
+      "pre_batch": 7,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 7
+    },
+    "add_xor": {
+      "pre_batch": 9,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 8
+    },
+    "rsub_xor": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 9
+    },
+    "sub_xor": {
+      "pre_batch": 10,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 8
+    },
+    "mul_eq": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "pop_full": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 5,
+      "clang": 4
+    },
+    "clz_zero": {
+      "pre_batch": 5,
+      "lccc": 3,
+      "gcc": 3,
+      "clang": 3
+    },
+    "ctz_zero": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 3,
+      "clang": 3
+    },
+    "lshr_zero": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "lshr_full": {
+      "pre_batch": 5,
+      "lccc": 5,
+      "gcc": 5,
+      "clang": 4
+    },
+    "ashr_zero": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "ashr_full": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 5,
+      "clang": 4
+    },
+    "shl_zero": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "or_mask": {
+      "pre_batch": 5,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "not_mask": {
+      "pre_batch": 6,
+      "lccc": 5,
+      "gcc": 5,
+      "clang": 5
+    },
+    "div_zero": {
+      "pre_batch": 13,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "pop_le": {
+      "pre_batch": 5,
+      "lccc": 2,
+      "gcc": 6,
+      "clang": 5
+    },
+    "cancel_add": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "cancel_sub": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "cancel_rsub": {
+      "pre_batch": 7,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "cancel_xor": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "cancel_neg": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "cancel_not": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "cancel_swap": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "cancel_rotate": {
+      "pre_batch": 6,
+      "lccc": 4,
+      "gcc": 4,
+      "clang": 4
+    },
+    "swap_and": {
+      "pre_batch": 7,
+      "lccc": 3,
+      "gcc": 3,
+      "clang": 3
+    },
+    "swap_or": {
+      "pre_batch": 7,
+      "lccc": 3,
+      "gcc": 3,
+      "clang": 3
+    },
+    "swap_xor": {
+      "pre_batch": 7,
+      "lccc": 3,
+      "gcc": 3,
+      "clang": 3
+    },
+    "swap_not": {
+      "pre_batch": 7,
+      "lccc": 3,
+      "gcc": 3,
+      "clang": 3
+    },
+    "swap_shl": {
+      "pre_batch": 5,
+      "lccc": 3,
+      "gcc": 5,
+      "clang": 3
+    },
+    "swap_lshr": {
+      "pre_batch": 5,
+      "lccc": 3,
+      "gcc": 5,
+      "clang": 3
+    },
+    "swap_select": {
+      "pre_batch": 9,
+      "lccc": 5,
+      "gcc": 4,
+      "clang": 4
+    },
+    "urem_low": {
+      "pre_batch": 10,
+      "lccc": 3,
+      "gcc": 3,
+      "clang": 3
+    }
+  }
+}

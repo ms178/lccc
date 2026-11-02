@@ -1,0 +1,197 @@
+name: Named candidate compiler comparison
+permissions:
+  contents: read
+concurrency:
+  group: compiler-comparison-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  compiler-comparison:
+    name: Named candidate semantic and performance audit
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.audit_compare) ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'compiler-comparison'))
+    runs-on: ubuntu-24.04
+    container: debian:unstable-slim
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-16
+      RUSTFLAGS: -D warnings -C link-arg=-Wl,--no-keep-memory
+    steps:
+    - name: Provision actual Debian measurement tools
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends ca-certificates curl git python3 gcc-16 g++-16 gcc libc6-dev clang lld valgrind binutils
+        test "$(gcc-16 -dumpfullversion)" = 16.2.0
+        gcc-16 --version
+        clang --version
+        valgrind --version
+        dpkg-query -W gcc-16 g++-16 libc6-dev binutils valgrind
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Build pinned reference trees without switching branches
+      id: comparison-build
+      env:
+        COMPETING_REF: ${{ inputs.competing_ref || '4216f897460be1eef08cc0f24e8b6016cd738283' }}
+        PRIOR_REF: ${{ inputs.prior_ref || '3671c7c9a088226b2962ff9712c178da79e7b9d4' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        mkdir -p target/compiler-comparison
+        git rev-parse HEAD > target/compiler-comparison/final.commit
+        for label in main pr835 prior; do
+          case "$label" in
+            main) reference=main ;;
+            pr835) reference=$COMPETING_REF ;;
+            prior) reference=$PRIOR_REF ;;
+          esac
+          case "$reference" in
+            ''|-*|*..*|*[!A-Za-z0-9_./-]*) echo "Invalid reference: $reference" >&2; exit 2 ;;
+          esac
+          git fetch --no-tags --depth=1 origin "$reference"
+          sha=$(git rev-parse FETCH_HEAD)
+          source="$RUNNER_TEMP/compiler-$label"
+          mkdir -p "$source"
+          git archive "$sha" | tar -x -C "$source"
+          printf '%s\n' "$sha" > "target/compiler-comparison/$label.commit"
+          CARGO_TARGET_DIR="$source/target" python3 scripts/ci_test_report.py -- \
+            cargo build --manifest-path "$source/Cargo.toml" --profile fastbuild --locked -j 2 --bin lccc
+          cp "$source/target/fastbuild/lccc" "target/compiler-comparison/$label"
+        done
+        python3 scripts/ci_test_report.py -- cargo build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv
+        rustc -Vv
+        cargo --version
+        rustfmt --version
+        cargo clippy --version
+        sha256sum target/fastbuild/lccc target/compiler-comparison/main target/compiler-comparison/pr835 target/compiler-comparison/prior
+    - name: Compare the same native semantic witnesses across every arm
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/compare_compiler_witnesses.py --gcc gcc-16 \
+          --compiler final=target/fastbuild/lccc --require final \
+          --compiler gcc16-optimized=gcc-16 \
+          --compiler main=target/compiler-comparison/main \
+          --compiler pr835=target/compiler-comparison/pr835 \
+          --compiler prior=target/compiler-comparison/prior \
+          --out target/compiler-comparison/witnesses
+    # Each evidence section has its own ten-notice Actions budget and is
+    # published immediately after measurement, including explicit failures.
+    - name: Publish semantic witnesses and source identities
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section semantic
+    - name: Correctness-gated paired native comparison of all registered shapes
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 tests/benchmark/run_benchmarks.py --lccc target/fastbuild/lccc \
+          --gcc gcc-16 --clang clang --compilers lccc,gcc,clang \
+          --candidate pr835="$GITHUB_WORKSPACE/target/compiler-comparison/pr835" \
+          --candidate prior="$GITHUB_WORKSPACE/target/compiler-comparison/prior" \
+          --opt=-O2 --cflag=-std=gnu17 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
+          --reps 9 --warmup 1 --strict --no-pmu-probe \
+          --json target/compiler-comparison/native.json \
+          --markdown target/compiler-comparison/native.md \
+          --artifact-dir target/compiler-comparison/native-artifacts
+        python3 scripts/benchmark_comparison_report.py target/compiler-comparison/native.json \
+          --out target/compiler-comparison/native-summary.json
+    - name: Publish all paired native comparisons
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section native
+    - name: Screen all shapes at O3 without making a second timing claim
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 tests/benchmark/run_benchmarks.py --lccc target/fastbuild/lccc \
+          --gcc gcc-16 --clang clang --compilers lccc,gcc,clang \
+          --candidate pr835="$GITHUB_WORKSPACE/target/compiler-comparison/pr835" \
+          --candidate prior="$GITHUB_WORKSPACE/target/compiler-comparison/prior" \
+          --opt=-O3 --cflag=-std=gnu17 --cflag=-march=x86-64-v3 --cflag=-fwrapv \
+          --skip-perf --strict --no-pmu-probe \
+          --json target/compiler-comparison/correctness-o3.json
+    - name: Publish all O3 correctness comparisons
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section correctness-o3
+    - name: Registry-aware local codegen oracles for each exact compiler
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        status=0
+        for label in final main pr835 prior; do
+          compiler="$GITHUB_WORKSPACE/target/compiler-comparison/$label"
+          if [[ $label == final ]]; then compiler="$GITHUB_WORKSPACE/target/fastbuild/lccc"; fi
+          if ! python3 scripts/benchmark_codegen.py --gcc gcc-16 --local "$compiler" --oracles '' \
+            --out "target/compiler-comparison/codegen-$label"; then
+            status=1
+          fi
+        done
+        exit "$status"
+    - name: Publish final whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-final
+    - name: Publish main whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-main
+    - name: Publish competing whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-pr835
+    - name: Publish input whole-TU codegen counts
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section codegen-prior
+    - name: Bounded Callgrind comparison of every registered shape
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/callgrind_corpus.py --mine "$GITHUB_WORKSPACE/target/fastbuild/lccc" \
+          --ref "$GITHUB_WORKSPACE/target/compiler-comparison/pr835" --gcc-include-command gcc-16 \
+          --out target/compiler-comparison/callgrind
+    - name: Publish bounded direct Callgrind comparison
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section callgrind
+    - name: Independent GCC control for the bounded instrumentation sizes
+      if: ${{ !cancelled() && steps.comparison-build.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/callgrind_corpus.py --mine "$GITHUB_WORKSPACE/target/fastbuild/lccc" \
+          --ref gcc-16 --gcc-include-command gcc-16 \
+          --out target/compiler-comparison/callgrind-gcc-control
+    - name: Publish independent bounded GCC control
+      if: always()
+      run: python3 scripts/publish_compiler_comparison.py --root target/compiler-comparison --section callgrind-gcc-control
+    - name: Retain raw commands, outputs, binaries and counter evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: named-compiler-comparison
+        path: target/compiler-comparison/
+        if-no-files-found: error
+'on':
+  pull_request:
+    types: [labeled]
+    branches:
+    - main
+  workflow_dispatch:
+    inputs:
+      audit_compare:
+        description: Run the opt-in named-candidate research lane
+        type: boolean
+        default: false
+      competing_ref:
+        description: Same-repository competing reference to archive, never check out
+        type: string
+        default: 4216f897460be1eef08cc0f24e8b6016cd738283
+      prior_ref:
+        description: Same-repository prior candidate commit to archive
+        type: string
+        default: 3671c7c9a088226b2962ff9712c178da79e7b9d4

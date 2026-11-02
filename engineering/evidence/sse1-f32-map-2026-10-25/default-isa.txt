@@ -1,0 +1,5 @@
+ok: default build defines no post-x86-64 feature macro
+ok: default code has no post-x86-64 instruction, VEX encoding, or FMA
+ok: -march=x86-64-v3 and -mpopcnt grant their post-baseline classes
+ok: GCC default feature macros agree (none of the post-x86-64 set)
+PASS: default ISA policy (x86-64 default emits no post-baseline instruction; opt-in classes granted)

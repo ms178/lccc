@@ -1,0 +1,651 @@
+{
+  "complete": true,
+  "metric": "whole-compiler simulated Ir, NOT wall-clock speedup",
+  "baseline_commit": "18cff8402337549f1d9cbe3a21e8e6c331708167",
+  "candidate_commit": "92109165be2b45343b47028eb6a643636318c110",
+  "valgrind": {
+    "command": [
+      "valgrind"
+    ],
+    "executable": "/home/user/.local/valgrind/bin/valgrind",
+    "sha256": "a698e3b1c336f33570da8400ac167a85209caa77946c380607762940f6138fa5",
+    "version": "valgrind-3.16.0.GIT"
+  },
+  "arms": {
+    "candidate": {
+      "original_sha256": "1b702f8fb62c84cca927e5b9000e4261a84ebf92b1584eeb03dae76c1b308578",
+      "stripped_sha256": "1504311b61a6a859788807efce1ce20e282671329b5116a4df131f07f4ec4ac8",
+      "text_sha256": "138a82e207e481b607ff59d8ee39a21e27cfc1c0be68341acf9683b8abd633ca",
+      "binary": "/home/user/lccc/results/pr824-next/aa/compiler"
+    },
+    "baseline": {
+      "original_sha256": "0054c7ed6fddba2b4baf6655fa0f351e48ea57dbe709e7da48327c3fcd09aac3",
+      "stripped_sha256": "549fc54694b423c39a78bee62acc3fe1577835304a49fbee1effa6af9579ac4f",
+      "text_sha256": "936821b937db984a8e8b7027e265f2199d10a65aafb0ae381be75d43ccfbb592",
+      "binary": "/home/user/lccc/results/pr824-next/bb/compiler"
+    }
+  },
+  "cases": {
+    "minmax": {
+      "source_sha256": "7b4ad1b6237a347a2a0f62618ee75f52a2b8a9a485efdcedad59259f449bfe77",
+      "rounds": [
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "arms": {
+            "candidate": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 23.580321613000706,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "2a5709739e3febd3fd3e27d561b3f5a52cd3cb876a94cf975f26a780e024ae07",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--376873-- it at http://valgrind.org/support/bug_reports.html.\n--376873-- WARNING: unhandled amd64-linux syscall: 435\n--376873-- You may be able to write your own handler.\n--376873-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--376873-- Nevertheless we consider this a bug.  Please report\n--376873-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/aa/minmax-0.cg",
+                "/home/user/lccc/results/pr824-next/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/aa/minmax.s"
+              ],
+              "events": {
+                "Ir": 955563223,
+                "Dr": 212334703,
+                "Dw": 107692381,
+                "I1mr": 2342571,
+                "D1mr": 1628021,
+                "D1mw": 524965,
+                "ILmr": 45168,
+                "DLmr": 17927,
+                "DLmw": 28398,
+                "Bc": 158605663,
+                "Bcm": 7182119,
+                "Bi": 24832921,
+                "Bim": 1296193
+              },
+              "profile_sha256": "5614f50225ff432aee1b81b03825f0158f7fcf6c73b0b1a9886e42c05892e924",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b"
+            },
+            "baseline": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 23.851918884000042,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "37cd9af32b817e77ad6a6e48ffa2c78ed8cc2904f3e09d4dcf6fb6e708cdfa7e",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--377841-- it at http://valgrind.org/support/bug_reports.html.\n--377841-- WARNING: unhandled amd64-linux syscall: 435\n--377841-- You may be able to write your own handler.\n--377841-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--377841-- Nevertheless we consider this a bug.  Please report\n--377841-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/bb/minmax-0.cg",
+                "/home/user/lccc/results/pr824-next/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/bb/minmax.s"
+              ],
+              "events": {
+                "Ir": 953047430,
+                "Dr": 211710728,
+                "Dw": 107492182,
+                "I1mr": 2249252,
+                "D1mr": 1611348,
+                "D1mw": 519276,
+                "ILmr": 45043,
+                "DLmr": 17928,
+                "DLmw": 28387,
+                "Bc": 158088359,
+                "Bcm": 7220648,
+                "Bi": 24761825,
+                "Bim": 1405565
+              },
+              "profile_sha256": "1826ebec6583937d241312ae35685306521d398e9e9f6014ca1297ecb78e754b",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b"
+            }
+          },
+          "ir_candidate_over_baseline": 1.002639735359236
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "arms": {
+            "baseline": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 29.799997964000795,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "25194ffff7cedb2b2d492ce331862c0b29a261f650ac51dc3a3d22475f8018ec",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--377848-- it at http://valgrind.org/support/bug_reports.html.\n--377848-- WARNING: unhandled amd64-linux syscall: 435\n--377848-- You may be able to write your own handler.\n--377848-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--377848-- Nevertheless we consider this a bug.  Please report\n--377848-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/bb/minmax-1.cg",
+                "/home/user/lccc/results/pr824-next/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/bb/minmax.s"
+              ],
+              "events": {
+                "Ir": 953047277,
+                "Dr": 211710757,
+                "Dw": 107492226,
+                "I1mr": 2249252,
+                "D1mr": 1611354,
+                "D1mw": 519282,
+                "ILmr": 45043,
+                "DLmr": 17928,
+                "DLmw": 28393,
+                "Bc": 158088317,
+                "Bcm": 7220673,
+                "Bi": 24761835,
+                "Bim": 1405565
+              },
+              "profile_sha256": "c1b801ea8ed907feac816687e90c2cb986e131d73a97d4cc1846b0035777bea1",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b"
+            },
+            "candidate": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 35.15738955699999,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "7df4bc8b8372732c8c733c62a8ea74c4b0a832d8d92482534f0e3624ca0e29e4",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--378215-- it at http://valgrind.org/support/bug_reports.html.\n--378215-- WARNING: unhandled amd64-linux syscall: 435\n--378215-- You may be able to write your own handler.\n--378215-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--378215-- Nevertheless we consider this a bug.  Please report\n--378215-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/aa/minmax-1.cg",
+                "/home/user/lccc/results/pr824-next/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/regression/minmax_shapes/minmax_shapes.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/aa/minmax.s"
+              ],
+              "events": {
+                "Ir": 955563477,
+                "Dr": 212334762,
+                "Dw": 107692392,
+                "I1mr": 2342570,
+                "D1mr": 1628023,
+                "D1mw": 524960,
+                "ILmr": 45168,
+                "DLmr": 17927,
+                "DLmw": 28395,
+                "Bc": 158605672,
+                "Bcm": 7182094,
+                "Bi": 24832928,
+                "Bim": 1296193
+              },
+              "profile_sha256": "0c9d81e63deb0ca489d09fdaa9f380602c74fa9f59f37ea4ea3725123e2cf3d3",
+              "assembly_sha256": "295f7ca506dc66f244f49b4492ed4287dc4879a223d94b8ef6439e0f31a15c1b"
+            }
+          },
+          "ir_candidate_over_baseline": 1.0026401628342305
+        }
+      ]
+    },
+    "libm": {
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "rounds": [
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "arms": {
+            "baseline": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 15.697317909998674,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "eb38879738c2e9ebbb3e9d5e97ef0d72960cb4ad26123cddbb90d48934b4b5e4",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--379227-- it at http://valgrind.org/support/bug_reports.html.\n--379227-- WARNING: unhandled amd64-linux syscall: 435\n--379227-- You may be able to write your own handler.\n--379227-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--379227-- Nevertheless we consider this a bug.  Please report\n--379227-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/bb/libm-0.cg",
+                "/home/user/lccc/results/pr824-next/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/bb/libm.s"
+              ],
+              "events": {
+                "Ir": 299159708,
+                "Dr": 65474938,
+                "Dw": 34704926,
+                "I1mr": 834447,
+                "D1mr": 464047,
+                "D1mw": 222450,
+                "ILmr": 49369,
+                "DLmr": 19092,
+                "DLmw": 37846,
+                "Bc": 48906124,
+                "Bcm": 2398569,
+                "Bi": 7481910,
+                "Bim": 422859
+              },
+              "profile_sha256": "f08fdb699d8e45ebd0d9549bbc71e3d2c54997bd45faf90d4f64804d508f9a1b",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70"
+            },
+            "candidate": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 15.213199097999677,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "90e1070843567d8bef69b6fc4a3ca45258a332c709939e24eb55996ccab0a3de",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--379469-- it at http://valgrind.org/support/bug_reports.html.\n--379469-- WARNING: unhandled amd64-linux syscall: 435\n--379469-- You may be able to write your own handler.\n--379469-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--379469-- Nevertheless we consider this a bug.  Please report\n--379469-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/aa/libm-0.cg",
+                "/home/user/lccc/results/pr824-next/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/aa/libm.s"
+              ],
+              "events": {
+                "Ir": 298514525,
+                "Dr": 65299720,
+                "Dw": 34722128,
+                "I1mr": 853230,
+                "D1mr": 458479,
+                "D1mw": 223639,
+                "ILmr": 49514,
+                "DLmr": 19092,
+                "DLmw": 37857,
+                "Bc": 48749323,
+                "Bcm": 2392997,
+                "Bi": 7449505,
+                "Bim": 380419
+              },
+              "profile_sha256": "0740498ff9a33ae85cca6a8f493a8736bf93931454abef1337a30fd462835529",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70"
+            }
+          },
+          "ir_candidate_over_baseline": 0.9978433492788407
+        },
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "arms": {
+            "candidate": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 11.476392840999324,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "d00727286d25b8fab07adf302d8e2f302fa5cd6a784e88650d1ddd65d3a1625f",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--379785-- it at http://valgrind.org/support/bug_reports.html.\n--379785-- WARNING: unhandled amd64-linux syscall: 435\n--379785-- You may be able to write your own handler.\n--379785-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--379785-- Nevertheless we consider this a bug.  Please report\n--379785-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/aa/libm-1.cg",
+                "/home/user/lccc/results/pr824-next/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/aa/libm.s"
+              ],
+              "events": {
+                "Ir": 298514970,
+                "Dr": 65299819,
+                "Dw": 34722174,
+                "I1mr": 853217,
+                "D1mr": 458472,
+                "D1mw": 223635,
+                "ILmr": 49509,
+                "DLmr": 19092,
+                "DLmw": 37869,
+                "Bc": 48749366,
+                "Bcm": 2392998,
+                "Bi": 7449517,
+                "Bim": 380419
+              },
+              "profile_sha256": "a7e6eaab6f3adf60a6b78fa8154fde4d267427e9afd63aee0d9d59277c8326a5",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70"
+            },
+            "baseline": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 10.477860007000345,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "50bb2d8e97223db79544d0baaba6a1b71afd34cec752427860ad18bc346ffc55",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--379841-- it at http://valgrind.org/support/bug_reports.html.\n--379841-- WARNING: unhandled amd64-linux syscall: 435\n--379841-- You may be able to write your own handler.\n--379841-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--379841-- Nevertheless we consider this a bug.  Please report\n--379841-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/bb/libm-1.cg",
+                "/home/user/lccc/results/pr824-next/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/tests/benchmark/programs/libm_round_family.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/bb/libm.s"
+              ],
+              "events": {
+                "Ir": 299159163,
+                "Dr": 65474857,
+                "Dw": 34704904,
+                "I1mr": 834447,
+                "D1mr": 464031,
+                "D1mw": 222441,
+                "ILmr": 49369,
+                "DLmr": 19092,
+                "DLmw": 37857,
+                "Bc": 48906062,
+                "Bcm": 2398474,
+                "Bi": 7481906,
+                "Bim": 422859
+              },
+              "profile_sha256": "403efbc6f696fd79e4b58e305c1e71fffc776e02aa15860ab80f050319254b28",
+              "assembly_sha256": "7b8d09df2490c0a5aa3feaa9d6c045bf91ded30452d8c284b1e1d58bc8143b70"
+            }
+          },
+          "ir_candidate_over_baseline": 0.9978466546251167
+        }
+      ]
+    },
+    "chain-64": {
+      "source_sha256": "72a75d45c02660a26e1fc4f7257d9a69542cc180aae81aed9512c41805b8ded3",
+      "rounds": [
+        {
+          "order": [
+            "candidate",
+            "baseline"
+          ],
+          "arms": {
+            "candidate": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 17.01025854600084,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "caeea05473190908840c6aa7a18ce44843200676fd888da52c9a164238523878",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--380292-- it at http://valgrind.org/support/bug_reports.html.\n--380292-- WARNING: unhandled amd64-linux syscall: 435\n--380292-- You may be able to write your own handler.\n--380292-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--380292-- Nevertheless we consider this a bug.  Please report\n--380292-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/aa/chain-64-0.cg",
+                "/home/user/lccc/results/pr824-next/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/results/pr824-followup/latest-main-measurements/chain-64.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/aa/chain-64.s"
+              ],
+              "events": {
+                "Ir": 662592669,
+                "Dr": 146480151,
+                "Dw": 71499835,
+                "I1mr": 577848,
+                "D1mr": 3184525,
+                "D1mw": 778061,
+                "ILmr": 41946,
+                "DLmr": 17804,
+                "DLmw": 42103,
+                "Bc": 111543046,
+                "Bcm": 3961163,
+                "Bi": 16420074,
+                "Bim": 783703
+              },
+              "profile_sha256": "4d330e48ac810b31b5fffa3819ad1a20913a8e9a3db75123b3988af1946d7fff",
+              "assembly_sha256": "1ac461bc1279c6815c8e61198ff0ba60689302907ae9d7e59de64d7f7647e183"
+            },
+            "baseline": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 16.854862189000414,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "627104f23285d780e1aff746c0d0ae7e23f470f154a09e69a636bd48ecc54f12",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--380901-- it at http://valgrind.org/support/bug_reports.html.\n--380901-- WARNING: unhandled amd64-linux syscall: 435\n--380901-- You may be able to write your own handler.\n--380901-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--380901-- Nevertheless we consider this a bug.  Please report\n--380901-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/bb/chain-64-0.cg",
+                "/home/user/lccc/results/pr824-next/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/results/pr824-followup/latest-main-measurements/chain-64.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/bb/chain-64.s"
+              ],
+              "events": {
+                "Ir": 662673789,
+                "Dr": 146485276,
+                "Dw": 71499808,
+                "I1mr": 479946,
+                "D1mr": 3175390,
+                "D1mw": 778327,
+                "ILmr": 41795,
+                "DLmr": 17806,
+                "DLmw": 42098,
+                "Bc": 111559446,
+                "Bcm": 3967515,
+                "Bi": 16420070,
+                "Bim": 883746
+              },
+              "profile_sha256": "e12dc0556e9cde9a4d326b6e8ceda6ba78986c2bfb59565b248a10622ca12355",
+              "assembly_sha256": "1ac461bc1279c6815c8e61198ff0ba60689302907ae9d7e59de64d7f7647e183"
+            }
+          },
+          "ir_candidate_over_baseline": 0.9998775868287738
+        },
+        {
+          "order": [
+            "baseline",
+            "candidate"
+          ],
+          "arms": {
+            "baseline": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 16.86892975000046,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "c88e161e5689362de1cdbf8deb6d6a2f89ee9e36ddd9dc4f3f62089fe36991cc",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--381299-- it at http://valgrind.org/support/bug_reports.html.\n--381299-- WARNING: unhandled amd64-linux syscall: 435\n--381299-- You may be able to write your own handler.\n--381299-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--381299-- Nevertheless we consider this a bug.  Please report\n--381299-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/bb/chain-64-1.cg",
+                "/home/user/lccc/results/pr824-next/bb/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/results/pr824-followup/latest-main-measurements/chain-64.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/bb/chain-64.s"
+              ],
+              "events": {
+                "Ir": 662670018,
+                "Dr": 146484965,
+                "Dw": 71499816,
+                "I1mr": 479946,
+                "D1mr": 3175383,
+                "D1mw": 778328,
+                "ILmr": 41795,
+                "DLmr": 17806,
+                "DLmw": 42100,
+                "Bc": 111558918,
+                "Bcm": 3967168,
+                "Bi": 16420071,
+                "Bim": 883746
+              },
+              "profile_sha256": "629cc21cc33843719f313aac843f209c8c0280b7d6803bba020de5223d4b87e5",
+              "assembly_sha256": "1ac461bc1279c6815c8e61198ff0ba60689302907ae9d7e59de64d7f7647e183"
+            },
+            "candidate": {
+              "process": {
+                "returncode": 0,
+                "failure": null,
+                "elapsed": 16.52802641800008,
+                "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "stderr_sha256": "295d5dde087cb0a58096ab7e6d6953d8a97ed608ed8194a8e8d2ce104b0655d9",
+                "stderr_excerpt": "less we consider this a bug.  Please report\n--381830-- it at http://valgrind.org/support/bug_reports.html.\n--381830-- WARNING: unhandled amd64-linux syscall: 435\n--381830-- You may be able to write your own handler.\n--381830-- Read the file README_MISSING_SYSCALL_OR_IOCTL.\n--381830-- Nevertheless we consider this a bug.  Please report\n--381830-- it at http://valgrind.org/support/bug_reports.html.\n"
+              },
+              "command": [
+                "valgrind",
+                "--tool=callgrind",
+                "--cache-sim=yes",
+                "--branch-sim=yes",
+                "--quiet",
+                "--I1=32768,8,64",
+                "--D1=32768,8,64",
+                "--LL=33554432,16,64",
+                "--callgrind-out-file=/home/user/lccc/results/pr824-next/aa/chain-64-1.cg",
+                "/home/user/lccc/results/pr824-next/aa/compiler",
+                "-O3",
+                "-march=x86-64-v3",
+                "-fwrapv",
+                "-S",
+                "/home/user/lccc/results/pr824-followup/latest-main-measurements/chain-64.c",
+                "-o",
+                "/home/user/lccc/results/pr824-next/aa/chain-64.s"
+              ],
+              "events": {
+                "Ir": 662591274,
+                "Dr": 146480008,
+                "Dw": 71499822,
+                "I1mr": 577845,
+                "D1mr": 3184516,
+                "D1mw": 778031,
+                "ILmr": 41945,
+                "DLmr": 17804,
+                "DLmw": 42103,
+                "Bc": 111542870,
+                "Bcm": 3961041,
+                "Bi": 16420070,
+                "Bim": 783703
+              },
+              "profile_sha256": "8b78d29cbaef933dfb9dc12250fbb90344a044aa692f19460e9f2e3324dd4a25",
+              "assembly_sha256": "1ac461bc1279c6815c8e61198ff0ba60689302907ae9d7e59de64d7f7647e183"
+            }
+          },
+          "ir_candidate_over_baseline": 0.9998811716271129
+        }
+      ]
+    }
+  }
+}

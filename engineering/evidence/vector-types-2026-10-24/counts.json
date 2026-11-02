@@ -1,0 +1,17 @@
+{
+  "common_functions": 377,
+  "totals": {
+    "before": 2583,
+    "after": 2582,
+    "gcc16": 2441,
+    "clang23": 2133
+  },
+  "changed": {
+    "fma_chain": {
+      "before": 4,
+      "after": 3,
+      "gcc16": 3,
+      "clang23": 3
+    }
+  }
+}

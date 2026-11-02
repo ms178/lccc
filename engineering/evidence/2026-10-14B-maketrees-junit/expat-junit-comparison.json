@@ -1,0 +1,15 @@
+{
+  "candidate_path": "/home/user/.cache/a14/expat/ctest-lccc.xml",
+  "candidate_tests": 1,
+  "candidate_unique": 1,
+  "comparable": true,
+  "configuration_problems": [],
+  "duplicate_identities": {
+    "candidate": 0,
+    "reference": 0
+  },
+  "problems": [],
+  "reference_path": "/home/user/.cache/a14/expat/ctest-gcc.xml",
+  "reference_tests": 1,
+  "reference_unique": 1
+}

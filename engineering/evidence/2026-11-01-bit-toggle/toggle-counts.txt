@@ -1,0 +1,12 @@
+              toggle-before.stoggle-after.stoggle-gcc.stoggle-clang.s
+btog32        6         3         3         3         
+btog64        6         3         3         3         
+btog_masked   6         4         3         3         
+btog_imm      3         3         3         3         
+btog_mem      5         4         5         3         
+btog_twice    2         2         2         2         
+btog_swapped  5         3         3         3         
+btog_offset   7         4         4         4         
+keep_xor_two  6         6         5         5         
+keep_xor_not  8         8         4         4         
+keep_xor_hi   6         6         5         5         

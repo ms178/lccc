@@ -1,0 +1,2544 @@
+//! Shared linker argument parsing.
+//!
+//! Extracts linker flags from the `user_args` passed through `-Wl,` and
+//! direct `-L`/`-l` flags. Used by x86, ARM, and RISC-V linkers.
+
+use std::path::Path;
+
+/// Parsed linker arguments from user_args.
+///
+/// Contains all the flags that are common across backends. Not all backends
+/// use every field; unused fields are simply ignored.
+#[derive(Debug, Default)]
+pub struct LinkerArgs {
+    /// Extra library search paths from `-L` flags.
+    pub extra_lib_paths: Vec<String>,
+    /// Library names from `-l` flags (without the `lib` prefix or `.a`/`.so` suffix).
+    pub libs_to_load: Vec<String>,
+    /// Bare file paths (`.o`, `.a` files) passed as arguments.
+    pub extra_object_files: Vec<String>,
+    /// Whether `--export-dynamic` / `-rdynamic` was passed.
+    pub export_dynamic: bool,
+    /// RPATH entries from `-Wl,-rpath=` or `-Wl,-rpath,`.
+    pub rpath_entries: Vec<String>,
+    /// Emit DT_RUNPATH instead of DT_RPATH.  Defaults to true (bfd/lld/mold
+    /// parity); `--disable-new-dtags` clears it, `--enable-new-dtags` sets it.
+    pub use_runpath: bool,
+    /// Sort SHN_COMMON symbols by descending size before BSS allocation
+    /// (from `--sort-common[=yes]`; `--sort-common=no` / `--no-sort-common`
+    /// restore the default hash order).  Off by default, as in bfd.
+    pub sort_common: bool,
+    /// Symbol definitions from `--defsym=SYM=VAL`.
+    /// TODO: only supports symbol-to-symbol aliasing, not arbitrary expressions.
+    pub defsym_defs: Vec<(String, String)>,
+    /// Enable garbage collection of unused sections (from `--gc-sections`).
+    pub gc_sections: bool,
+    /// Identical Code Folding mode from `--icf=safe|all|none`.
+    ///
+    /// `None` disables ICF. `Some("safe")` refuses to fold functions whose
+    /// address is observable; `Some("all")` folds regardless, which is only
+    /// valid when the program never compares function pointers.
+    pub icf: Option<String>,
+    /// Whether `-static` was passed.
+    pub is_static: bool,
+    /// Entry point symbol from `-e SYM` / `--entry=SYM` (default `_start`).
+    pub entry_symbol: Option<String>,
+    /// Symbols to wrap from `--wrap=SYM`: references to SYM are redirected to
+    /// `__wrap_SYM`, and references to `__real_SYM` are redirected to SYM.
+    pub wrap_symbols: Vec<String>,
+    /// Symbols forced undefined via `-u SYM` / `--undefined=SYM` (forces
+    /// archive members that define them to be pulled in).
+    pub undefined_symbols: Vec<String>,
+    /// `-z now`: eager binding (DT_FLAGS: BIND_NOW, DT_FLAGS_1: NOW).
+    pub z_now: bool,
+    /// `-z relro` (default true, `-z norelro` clears): emit PT_GNU_RELRO.
+    pub z_relro: bool,
+    /// `--no-relax` (last of `--relax`/`--no-relax` wins): RISC-V links keep
+    /// every instruction sequence at its assembled size, deleting only the
+    /// surplus `R_RISCV_ALIGN` padding, which no link may keep.
+    pub no_relax: bool,
+    /// `-z pack-relative-relocs` / `-z nopack-relative-relocs`: pack aligned
+    /// `R_*_RELATIVE` relocations into `.relr.dyn` (`SHT_RELR` / `DT_RELR`).
+    pub z_pack_relative_relocs: bool,
+    /// `-z text` / `-z notext` / `-z textoff`: what to do when a dynamic
+    /// relocation would have to patch a read-only segment (see
+    /// [`TextrelPolicy`]).  Last spelling wins, as in GNU ld.
+    pub z_text: TextrelPolicy,
+    /// `-Map=FILE` / `-Map FILE`: write a GNU-ld-compatible link map.
+    pub map_path: Option<String>,
+    /// `--exclude-libs=LIST`: archives whose symbols must NOT be re-exported
+    /// from a shared library. Comma/colon-separated basenames, or `ALL`.
+    pub exclude_libs: Vec<String>,
+    /// `--version-script=FILE`: restricts the exported symbol set.
+    pub version_script: Option<String>,
+    /// Requested ELF interpreter from `--dynamic-linker=PATH`.
+    ///
+    /// The default remains the target ABI interpreter.  Keeping this in the
+    /// parsed argument object is important for sysroot/staging builds (and for
+    /// testing a freshly built libc without replacing the host loader):
+    /// silently hard-wiring `/lib64/ld-linux-x86-64.so.2` makes an otherwise
+    /// valid binary execute against the wrong libc.
+    pub dynamic_linker: Option<String>,
+    /// `-soname=NAME`: DT_SONAME recorded in a shared library.
+    pub soname: Option<String>,
+    /// `--build-id[=STYLE]`: emit `.note.gnu.build-id`.
+    ///
+    /// Not a nicety.  Debian's gcc passes `--build-id` on *every* link, and
+    /// debuginfod, RPM/DEB debuginfo extraction, systemd-coredump matching and
+    /// `eu-unstrip` all key on it.  Silently honouring the flag while emitting
+    /// no note produces binaries that look linked but cannot be symbolised
+    /// after the fact.  `--build-id=none` (and `=0`) clears it, matching GNU ld.
+    pub build_id: bool,
+    /// `-Bsymbolic` / `-Bsymbolic-functions` / `-Bno-symbolic`, last one
+    /// wins (GNU ld `lexsup.c`); see [`Symbolic`].
+    pub symbolic: Symbolic,
+    /// `--no-undefined` / `-z defs`: reject unresolved symbols in a shared
+    /// library instead of deferring them to the loader.
+    pub no_undefined: bool,
+    /// Inputs in **command-line order**, each tagged with the positional state
+    /// in effect where it appeared.
+    ///
+    /// `extra_object_files` / `libs_to_load` above are order-insensitive views
+    /// kept for existing callers. They cannot express `--whole-archive`, which
+    /// is *positional*: it applies only to archives that follow it, until
+    /// `--no-whole-archive`. Link order also decides archive member selection,
+    /// so any caller doing real archive resolution must use this list.
+    pub inputs: Vec<InputItem>,
+    /// `-pie` / `--pic-executable`: emit a position-independent executable
+    /// (`ET_DYN` based at 0, `DF_1_PIE`, `R_X86_64_RELATIVE` for internal
+    /// absolute addresses).  Debian's gcc passes `-pie` on every link, so a
+    /// linker that ignores it silently ships every binary without ASLR.
+    pub is_pie: bool,
+    /// `-s` / `--strip-all`: omit `.symtab` and `.strtab` from the output.
+    pub strip_all: bool,
+    /// `-S` / `--strip-debug`: omit the debug sections, keep the symbol
+    /// table (GNU ld). `--strip-all` implies it.
+    pub strip_debug: bool,
+    /// `--hash-style=gnu|sysv|both`.  `Gnu` is the default everywhere that
+    /// matters on x86-64; `both` is still requested by builds targeting
+    /// pre-2.23 glibc, which has no `DT_GNU_HASH` support.
+    pub hash_style: HashStyle,
+    /// `-z ibt`: indirect-branch tracking.  Sets the `GNU_PROPERTY_X86_
+    /// FEATURE_1_AND` IBT bit (1) in the merged property note, creating the
+    /// note when no input had one (GNU ld behaviour).
+    pub z_ibt: bool,
+    /// `-z shstk`: shadow-stack control (FEATURE_1_AND bit 2).
+    pub z_shstk: bool,
+    /// `-z lam-u48`: 48-bit linear-address masking (FEATURE_1_AND bits 4|8).
+    pub z_lam_u48: bool,
+    /// `-z lam-u57`: 57-bit linear-address masking (FEATURE_1_AND bit 8).
+    pub z_lam_u57: bool,
+    /// `-z x86-64-{baseline,v2,v3,v4}` ISA level (binutils
+    /// `ld/emulparams/x86-64-level.sh`): 0 = unset (the default — nothing is
+    /// injected), 1 = baseline, 2/3/4 = v2/v3/v4.  ORed into
+    /// `GNU_PROPERTY_X86_ISA_1_NEEDED` by the property-note merge (see
+    /// `linker_common::cet`), creating the property when no input had one.
+    pub z_isa_level: u32,
+    /// An unparseable `-z x86-64-*` keyword (e.g. `-z x86-64-v9`), kept so
+    /// the link path can fail with GNU's `invalid x86-64 ISA level` fatal
+    /// instead of silently ignoring the typo.
+    pub z_isa_level_invalid: Option<String>,
+    /// Keyword forms accepted but not implemented and therefore warned about
+    /// (`-z ibt=func` & co, and a distinct `common-page-size=` granularity).
+    /// Collected here so the link path can apply `--fatal-warnings` too.
+    pub z_ignored_keywords: Vec<String>,
+    /// `--emit-relocs` / `-q`: keep the applied relocations in `.rela.*`
+    /// sections (the kernel's arch/x86/tools/relocs pass consumes them).
+    pub emit_relocs: bool,
+    /// `-z execstack` (Some(true)) / `-z noexecstack` (Some(false)); None
+    /// leaves the decision to the inputs' `.note.GNU-stack` markers.
+    pub z_execstack: Option<bool>,
+    /// `--warn-execstack` (Some(true)) / `--no-warn-execstack` (Some(false));
+    /// None is GNU ld's default and `--warn-execstack-objects` (warn about
+    /// executable markers only, see `stack_note::execstack_report`).
+    pub warn_execstack: Option<bool>,
+    /// `--error-execstack` / `--no-error-execstack` (last wins): an
+    /// executable-stack report fails the link with GNU ld's error text.
+    pub error_execstack: bool,
+    /// `-z` keywords that only set `DF_1_*` / `DF_*` dynamic flags:
+    /// origin, nodelete, nodlopen, initfirst, interpose, nodefaultlib.
+    pub z_dyn_flag_keywords: Vec<String>,
+    /// Other `-z KEYWORD[=VALUE]` spellings retained for backend-specific
+    /// handling (for example `separate-code`, `text`, and unknown keywords).
+    /// Any accepted-but-unimplemented diagnostic request belongs in
+    /// `z_ignored_keywords` so it cannot disappear silently.
+    pub z_other_keywords: Vec<String>,
+    /// Positional file operands that do not exist.  GNU ld reports
+    /// `cannot find FILE: No such file or directory`; callers that resolve
+    /// the ordered input list themselves turn these into that error.
+    pub missing_inputs: Vec<String>,
+    /// The `--build-id=STYLE` style when one was given (`sha1`, `md5`,
+    /// `uuid`, `0xHEX`, `tree`, `none`), for backends implementing only some.
+    pub build_id_style: Option<String>,
+    /// `--threads=N`: recorded for interface compatibility; lccc links
+    /// single-threaded, so the value is accepted and not acted on.
+    #[allow(dead_code)]
+    pub threads: Option<u32>,
+    /// `--no-undefined-version`: recorded for interface compatibility (GNU
+    /// ld "Disallow undefined version").  lccc accepts the flag but does
+    /// not enforce it: version references are never checked against the
+    /// version definitions, so the link succeeds where GNU ld would fail
+    /// an unsatisfiable version reference.  Same accepted-but-recorded
+    /// status as `threads`; enforcement needs version-script checking the
+    /// linker does not have yet.
+    #[allow(dead_code)]
+    pub no_undefined_version: bool,
+    /// `--dynamic-list=FILE`: symbol glob lists exported by PDE/PIE or kept
+    /// preemptible under `-Bsymbolic` in shared libraries.
+    pub dynamic_lists: Vec<String>,
+    /// `--image-base=ADDR`: explicit load base override.
+    pub image_base: Option<u64>,
+    pub image_base_invalid: Option<String>,
+    /// `-z max-page-size=N`: zero selects the backend default; nonzero values
+    /// are power-of-two segment alignments (LCCC requires >= 4096).
+    pub max_page_size: Option<u64>,
+    pub max_page_size_invalid: Option<String>,
+    /// Invalid `-z common-page-size=N` value, if any. The value is validated
+    /// against GNU ld, but its distinct layout effect is not implemented.
+    pub common_page_size_invalid: Option<String>,
+    /// Invalid `--pack-dyn-relocs=` value, if any.
+    pub pack_dyn_relocs_invalid: Option<String>,
+    /// `-t` / `--trace`: print each input file / archive member as loaded.
+    pub trace_files: bool,
+    /// `--warn-common`: GNU ld's COMMON-symbol diagnostics (see
+    /// `warn_common`), honoring `--fatal-warnings`.
+    pub warn_common: bool,
+    /// `--warn-rwx-segments` / `--no-warn-rwx-segments`: diagnose a PT_LOAD
+    /// that is both writable and executable. GNU ld enables this by default;
+    /// the last toggle wins. The check never changes layout or output bytes.
+    pub warn_rwx_segments: bool,
+    /// `--fatal-warnings` / `--no-fatal-warnings`.
+    pub fatal_warnings: bool,
+    /// `--print-memory-usage`: print MEMORY / segment usage summary.
+    pub print_memory_usage: bool,
+    /// `--oformat=FORMAT` (`binary`, `elf64-x86-64`, ...).
+    pub oformat: Option<String>,
+}
+
+impl LinkerArgs {
+    /// Validate common option values (`--build-id`, `--image-base`, `-z max-page-size`
+    /// / `common-page-size`, and `--pack-dyn-relocs`).
+    pub fn validate_common_options(&self) -> Result<(), String> {
+        let _ = self.resolved_build_id_style()?;
+        if let Some(bad) = &self.image_base_invalid {
+            return Err(format!("invalid --image-base address '{bad}'"));
+        }
+        if let Some(bad) = &self.max_page_size_invalid {
+            return Err(max_page_size_error(bad));
+        }
+        self.validate_common_page_size()?;
+        if let Some(bad) = &self.pack_dyn_relocs_invalid {
+            return Err(format!(
+                "unknown --pack-dyn-relocs format '{bad}' (expected relr or none)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate the `-z common-page-size` argument without applying it. Linker
+    /// script mode does not use the ordinary backend option validator, but GNU
+    /// ld still rejects malformed/non-power-of-two values there.
+    pub fn validate_common_page_size(&self) -> Result<(), String> {
+        if let Some(bad) = &self.common_page_size_invalid {
+            return Err(format!("invalid common page size `{bad}'"));
+        }
+        Ok(())
+    }
+
+    /// `-z KEYWORD[=VALUE]` spellings kept in `z_other_keywords` that are
+    /// neither implemented nor equivalent to the linker's default.  These
+    /// spellings must remain visible to each target's warning policy.
+    pub fn z_other_keyword_warnings(&self) -> Vec<String> {
+        self.z_other_keyword_warnings_except(&[])
+    }
+
+    /// As above, for a link path that implements additional keywords beyond
+    /// the shared default-equivalent options.
+    pub fn z_other_keyword_warnings_except(&self, implemented: &[&str]) -> Vec<String> {
+        self.z_other_keywords
+            .iter()
+            .filter(|kw| {
+                !matches!(kw.as_str(), "separate-code" | "combreloc")
+                    && !kw.starts_with("max-page-size=")
+                    && !implemented.iter().any(|name| *name == kw.as_str())
+            })
+            .map(|kw| format!("-z {kw} ignored"))
+            .collect()
+    }
+
+    /// Warn about accepted diagnostic/keyword options whose behavior the
+    /// built-in backend does not implement, honoring the final
+    /// `--fatal-warnings` state. `backend_page_size` is a fixed target layout;
+    /// a differing explicit max-page-size cannot be honored by these backends.
+    pub fn warn_unimplemented_keyword_options(&self, backend_page_size: u64) -> Result<(), String> {
+        let mut warnings: Vec<String> = self
+            .z_ignored_keywords
+            .iter()
+            .map(|kw| format!("-z {kw} ignored"))
+            .collect();
+        warnings.extend(self.z_other_keyword_warnings());
+        // AArch64 and RISC-V call this shared policy but do not emit the
+        // requested DT_FLAGS/DT_FLAGS_1 bits. Keep these options visible
+        // instead of accepting nodelete/origin/initfirst and their peers
+        // with empty stderr.
+        warnings.extend(
+            self.z_dyn_flag_keywords
+                .iter()
+                .map(|kw| format!("-z {kw} ignored")),
+        );
+        if self.image_base.is_some() {
+            warnings.push(
+                "--image-base ignored: explicit image bases are not implemented for this backend"
+                    .to_string(),
+            );
+        }
+        if self.z_pack_relative_relocs {
+            warnings.push(
+                "--pack-dyn-relocs=relr / -z pack-relative-relocs ignored: RELR packing is not implemented for this backend"
+                    .to_string(),
+            );
+        }
+        if let Some(requested) = self.max_page_size
+            && requested != 0
+            && requested != backend_page_size
+        {
+            warnings.push(format!(
+                "-z max-page-size={requested:#x} ignored: this backend uses fixed {backend_page_size:#x} page alignment"
+            ));
+        }
+        if self.fatal_warnings && !warnings.is_empty() {
+            return Err(format!("warning treated as error: {}", warnings[0]));
+        }
+        for warning in &warnings {
+            eprintln!("lccc-ld: warning: {warning}");
+        }
+        Ok(())
+    }
+
+    pub fn resolved_build_id_style(&self) -> Result<super::build_id::BuildIdStyle, String> {
+        super::build_id::BuildIdStyle::parse(self.build_id, self.build_id_style.as_deref())
+    }
+
+    pub fn resolved_page_size(&self, default_page_size: u64) -> Result<u64, String> {
+        if let Some(bad) = &self.max_page_size_invalid {
+            return Err(max_page_size_error(bad));
+        }
+        let requested = self.max_page_size.unwrap_or(default_page_size);
+        Ok(if requested == 0 {
+            default_page_size
+        } else {
+            requested
+        })
+    }
+
+    /// The GNU property-note merge flags (`linker_common::cet`) for this
+    /// link: CET bits plus the `-z x86-64-*` ISA level.  Fails on an
+    /// unparseable ISA level with GNU's message body (`invalid x86-64 ISA
+    /// level: ...`, measured on ld 2.44); the driver renders it with its
+    /// standard `lccc-ld: error: ` prefix like every other link failure.
+    pub fn property_link_flags(&self) -> Result<super::cet::PropertyLinkFlags, String> {
+        if let Some(bad) = &self.z_isa_level_invalid {
+            return Err(format!("invalid x86-64 ISA level: {bad}"));
+        }
+        Ok(super::cet::PropertyLinkFlags {
+            ibt: self.z_ibt,
+            shstk: self.z_shstk,
+            lam_u48: self.z_lam_u48,
+            lam_u57: self.z_lam_u57,
+            isa_level: self.z_isa_level,
+        })
+    }
+}
+
+/// One input file or `-l` library, with the positional flag state that applied
+/// at the point it appeared on the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputItem {
+    /// Either a bare path (`foo.o`, `libbar.a`) or a library stem from `-lfoo`.
+    pub name: String,
+    /// True when this came from `-l`/`--library` and still needs `-L` search.
+    pub is_lib: bool,
+    /// True when `--whole-archive` was in effect: every member of this archive
+    /// is linked in, not just those resolving an undefined symbol.
+    pub whole_archive: bool,
+    /// True when `--as-needed` was in effect at this position.
+    ///
+    /// Like `--whole-archive`, this is a *positional* toggle: it applies to the
+    /// inputs that follow it, until `--no-as-needed`. A shared library tagged
+    /// as-needed only gets a `DT_NEEDED` entry when it actually resolves
+    /// something; one tagged no-as-needed is recorded unconditionally, which is
+    /// how a program pulls in a library purely for its ELF constructors.
+    pub as_needed: bool,
+    /// True when `-Bstatic` (or its aliases `-dn`, `-non_shared`, `-static`)
+    /// was in effect at this position: a `-l` search considers only
+    /// `libNAME.a`, never `libNAME.so`.  `-Bdynamic` (`-dy`,
+    /// `-call_shared`) turns it back off.  Positional, like
+    /// `--whole-archive`; it has no effect on plain file operands.
+    pub static_search: bool,
+}
+
+/// The `--as-needed` state of the input written as `path_or_name`: a path,
+/// or the `-l` stem that a resolved `/dir/libNAME.so[.N]` came from; the last
+/// mention wins.  An input the user never named (a driver default) is
+/// as-needed: such libraries are consulted only for what is still undefined,
+/// and GNU's no-as-needed default would give each one a DT_NEEDED nobody
+/// asked for.
+pub fn input_as_needed(inputs: &[InputItem], path_or_name: &str) -> bool {
+    let state_of = |name: &str| {
+        inputs
+            .iter()
+            .rev()
+            .find(|it| it.name == name)
+            .map(|it| it.as_needed)
+    };
+    let base = std::path::Path::new(path_or_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path_or_name);
+    let stem = base.strip_prefix("lib").unwrap_or(base);
+    let stem = stem.split(".so").next().unwrap_or(stem);
+    state_of(path_or_name)
+        .or_else(|| state_of(stem))
+        .unwrap_or(true)
+}
+
+/// The `--as-needed` state that the GNU ld command line `args` puts in
+/// effect for an input file named just before `args[at]` (`at ==
+/// args.len()`: after the last argument), for each of the ascending
+/// positions `at`.  It is the state [`parse_linker_args`] records for a
+/// bare input file ([`InputItem::as_needed`]), for a caller that keeps its
+/// input files apart from the options: the standalone `lccc-ld` loads them
+/// in command-line order itself, and a library it names after
+/// `--no-as-needed` must get its `DT_NEEDED` used or not.
+pub fn as_needed_states(args: &[String], at: &[usize]) -> Vec<bool> {
+    let mut pos = PositionalState::default();
+    let mut stack: Vec<PositionalState> = Vec::new();
+    let mut applied = 0;
+    at.iter()
+        .map(|&end| {
+            for tok in &args[applied..end.clamp(applied, args.len())] {
+                pos.apply(tok, &mut stack);
+            }
+            applied = applied.max(end.min(args.len()));
+            pos.as_needed
+        })
+        .collect()
+}
+
+/// The `--as-needed` state of the `i`-th of a link's `object_files`: the
+/// state the caller recorded for it (`states`, from [`as_needed_states`]),
+/// or, when the caller recorded none -- the compiler driver, whose
+/// `object_files` are its own objects --, what [`input_as_needed`] says.
+pub fn object_as_needed(states: &[bool], i: usize, inputs: &[InputItem], path: &str) -> bool {
+    states
+        .get(i)
+        .copied()
+        .unwrap_or_else(|| input_as_needed(inputs, path))
+}
+
+/// Positional input state that `--push-state` saves and `--pop-state`
+/// restores (GNU ld: `--as-needed`, `--whole-archive`, `-Bstatic`/`-Bdynamic`
+/// and friends).  gcc's specs rely on it: `--push-state --as-needed -lgcc_s
+/// --pop-state` must leave the caller's `--as-needed` setting untouched.
+#[derive(Debug, Clone, Copy, Default)]
+struct PositionalState {
+    whole_archive: bool,
+    as_needed: bool,
+    static_search: bool,
+}
+
+impl PositionalState {
+    /// Apply one positional flag; returns false when `tok` is not one.
+    fn apply(&mut self, tok: &str, stack: &mut Vec<PositionalState>) -> bool {
+        match tok {
+            "--whole-archive" => self.whole_archive = true,
+            "--no-whole-archive" => self.whole_archive = false,
+            "--as-needed" => self.as_needed = true,
+            "--no-as-needed" => self.as_needed = false,
+            "-Bstatic" | "-dn" | "-non_shared" | "-static" => self.static_search = true,
+            "-Bdynamic" | "-dy" | "-call_shared" => self.static_search = false,
+            "--push-state" => stack.push(*self),
+            // GNU ld errors on an unbalanced --pop-state; this parser has no
+            // error channel, so an unmatched pop keeps the current state
+            // instead of inventing one.
+            "--pop-state" => {
+                if let Some(saved) = stack.pop() {
+                    *self = saved;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn item(&self, name: &str, is_lib: bool) -> InputItem {
+        InputItem {
+            name: name.to_string(),
+            is_lib,
+            whole_archive: self.whole_archive,
+            as_needed: self.as_needed,
+            static_search: self.static_search,
+        }
+    }
+}
+
+/// Which dynamic symbol hash tables to emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashStyle {
+    /// `.gnu.hash` + `DT_GNU_HASH` only.  The default.
+    #[default]
+    Gnu,
+    /// `.hash` + `DT_HASH` only.
+    Sysv,
+    /// Both tables, for loaders too old for `DT_GNU_HASH`.
+    Both,
+}
+
+impl HashStyle {
+    pub fn wants_gnu(self) -> bool {
+        matches!(self, HashStyle::Gnu | HashStyle::Both)
+    }
+    pub fn wants_sysv(self) -> bool {
+        matches!(self, HashStyle::Sysv | HashStyle::Both)
+    }
+}
+
+/// Parse the value of `--hash-style=`.
+///
+/// GNU ld accepts `gnu`, `sysv`, `both`, and a comma-separated combination
+/// (`gnu,sysv`).  Returns `None` for an unrecognised value so the caller can
+/// keep the default rather than silently guessing.
+pub fn parse_hash_style(v: &str) -> Option<HashStyle> {
+    let mut gnu = false;
+    let mut sysv = false;
+    for tok in v.to_ascii_lowercase().split(',') {
+        match tok.trim() {
+            "gnu" => gnu = true,
+            "sysv" => sysv = true,
+            "both" => {
+                gnu = true;
+                sysv = true;
+            }
+            _ => return None,
+        }
+    }
+    Some(match (gnu, sysv) {
+        (false, true) => HashStyle::Sysv,
+        (true, true) => HashStyle::Both,
+        _ => HashStyle::Gnu,
+    })
+}
+
+/// Apply a single linker flag that is a plain token-to-field mapping.
+///
+/// Returns `true` if the token was consumed.  Both the top-level argument loop
+/// and the `-Wl,` sub-argument loop call this, so a flag spelled either way is
+/// handled by one definition instead of two that can drift.  Flags needing a
+/// value or carrying positional state are handled inline by the callers.
+/// Options whose spelling is a single token: relocation retention and
+/// thread hints.  Returns true when consumed.
+///
+/// Deliberately NOT here: `--isa-level=` / `-march=`.  GNU ld has no such
+/// options (it errors on them); the real ISA-level interface is
+/// `-z x86-64-{baseline,v2,v3,v4}`, parsed with the other `-z` keywords
+/// below.  Accepting lookalike spellings would bless a non-GNU interface.
+fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
+    match tok {
+        "--emit-relocs" | "-q" => {
+            result.emit_relocs = true;
+        }
+        "--warn-execstack" => result.warn_execstack = Some(true),
+        "--no-warn-execstack" => result.warn_execstack = Some(false),
+        "--warn-execstack-objects" => result.warn_execstack = None,
+        "--error-execstack" => result.error_execstack = true,
+        "--no-error-execstack" => result.error_execstack = false,
+        "--no-emit-relocs" => {
+            result.emit_relocs = false;
+        }
+        "--relax" => {
+            result.no_relax = false;
+        }
+        "--no-relax" => {
+            result.no_relax = true;
+        }
+        "--no-undefined-version" => {
+            result.no_undefined_version = true;
+        }
+        "--sort-common" => {
+            result.sort_common = true;
+        }
+        "--no-sort-common" => {
+            result.sort_common = false;
+        }
+        "--warn-common" => {
+            result.warn_common = true;
+        }
+        "--warn-rwx-segments" => result.warn_rwx_segments = true,
+        "--no-warn-rwx-segments" => result.warn_rwx_segments = false,
+        "--no-threads" => {
+            result.threads = None;
+        }
+        "--threads" => {
+            // The value arrives as the next argument on the plain path;
+            // the group path joins it first (`--threads,N`).  Recording is
+            // best-effort: lccc links single-threaded.
+            return true;
+        }
+        _ => {
+            if let Some(v) = tok.strip_prefix("--threads=") {
+                // Lenient like GNU: a bad value is ignored, not fatal.
+                result.threads = v.parse().ok();
+                return true;
+            }
+            if let Some(v) = tok.strip_prefix("--sort-common=") {
+                // Lenient like GNU: an unknown value keeps the current
+                // setting instead of erroring the whole link.
+                match v {
+                    "yes" => result.sort_common = true,
+                    "no" => result.sort_common = false,
+                    _ => {}
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
+    match tok {
+        "-pie" | "--pie" | "--pic-executable" => result.is_pie = true,
+        "-no-pie" | "--no-pie" | "--no-pic-executable" => result.is_pie = false,
+        // Exact match only, so `-soname`/`-shared` are not shadowed.
+        "-s" | "--strip-all" => result.strip_all = true,
+        "-S" | "--strip-debug" => result.strip_debug = true,
+        "-t" | "--trace" => result.trace_files = true,
+        "--fatal-warnings" => result.fatal_warnings = true,
+        "--no-fatal-warnings" => result.fatal_warnings = false,
+        "--print-memory-usage" => result.print_memory_usage = true,
+        _ => return false,
+    }
+    true
+}
+
+fn parse_u64_addr(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Parse the integer spelling used by GNU ld's `-z common-page-size` and
+/// `-z max-page-size` (`strtoul(..., 0)` syntax). BFD accepts decimal,
+/// hexadecimal, octal, a leading sign, and leading C whitespace. An empty
+/// option value is a special zero/default spelling; whitespace-only and
+/// trailing-whitespace spellings are rejected.
+fn parse_gnu_page_size_value(raw: &str) -> Option<u64> {
+    if raw.is_empty() {
+        return Some(0);
+    }
+    let mut s =
+        raw.trim_start_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r'));
+    if s.is_empty() {
+        return None;
+    }
+    let negative = s.starts_with('-');
+    if negative || s.starts_with('+') {
+        s = &s[1..];
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let value = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else if let Some(octal) = s.strip_prefix('0') {
+        if octal.is_empty() {
+            Some(0)
+        } else {
+            u64::from_str_radix(octal, 8).ok()
+        }
+    } else {
+        s.parse::<u64>().ok()
+    }?;
+    // BFD uses an unsigned conversion: apply a negative sign modulo 2^64.
+    // Some unusual negative spellings therefore wrap to valid powers of two.
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
+}
+
+/// Parse and validate `-z common-page-size` syntax. Its value is not applied
+/// by this linker, but GNU ld rejects malformed and non-power-of-two values.
+fn parse_common_page_size(raw: &str) -> Option<u64> {
+    parse_gnu_page_size_value(raw)
+}
+
+fn max_page_size_error(value: &str) -> String {
+    match parse_gnu_page_size_value(value) {
+        Some(n) if n != 0 && n.is_power_of_two() && n < 0x1000 => {
+            // BFD accepts sub-page powers of two. This layout implementation
+            // deliberately rejects them rather than silently clamping to the
+            // host page size, so describe the limitation as unsupported, not
+            // malformed GNU syntax.
+            format!("unsupported maximum page size `{value}': LCCC requires at least 0x1000")
+        }
+        _ => format!("invalid maximum page size `{value}'"),
+    }
+}
+
+fn apply_kv_option(result: &mut LinkerArgs, tok: &str, next: Option<&str>) -> Option<bool> {
+    if let Some(v) = tok.strip_prefix("--dynamic-list=") {
+        if !v.is_empty() {
+            result.dynamic_lists.push(v.to_string());
+        }
+        return Some(false);
+    }
+    if tok == "--dynamic-list" {
+        if let Some(v) = next.filter(|s| !s.is_empty()) {
+            result.dynamic_lists.push(v.to_string());
+            return Some(true);
+        }
+        return Some(false);
+    }
+    if let Some(v) = tok.strip_prefix("--image-base=") {
+        match parse_u64_addr(v) {
+            Some(addr) => {
+                result.image_base = Some(addr);
+                result.image_base_invalid = None;
+            }
+            None => result.image_base_invalid = Some(v.to_string()),
+        }
+        return Some(false);
+    }
+    if tok == "--image-base" {
+        if let Some(v) = next {
+            match parse_u64_addr(v) {
+                Some(addr) => {
+                    result.image_base = Some(addr);
+                    result.image_base_invalid = None;
+                }
+                None => result.image_base_invalid = Some(v.to_string()),
+            }
+            return Some(true);
+        }
+        return Some(false);
+    }
+    if let Some(v) = tok.strip_prefix("--pack-dyn-relocs=") {
+        match v {
+            "relr" => {
+                result.z_pack_relative_relocs = true;
+                result.pack_dyn_relocs_invalid = None;
+            }
+            "none" => {
+                result.z_pack_relative_relocs = false;
+                result.pack_dyn_relocs_invalid = None;
+            }
+            other => result.pack_dyn_relocs_invalid = Some(other.to_string()),
+        }
+        return Some(false);
+    }
+    if tok == "--pack-dyn-relocs" {
+        if let Some(v) = next {
+            match v {
+                "relr" => {
+                    result.z_pack_relative_relocs = true;
+                    result.pack_dyn_relocs_invalid = None;
+                }
+                "none" => {
+                    result.z_pack_relative_relocs = false;
+                    result.pack_dyn_relocs_invalid = None;
+                }
+                other => result.pack_dyn_relocs_invalid = Some(other.to_string()),
+            }
+            return Some(true);
+        }
+        return Some(false);
+    }
+    // `-b FORMAT` / `--format FORMAT` name the format of the INPUT files
+    // that follow (bfd: "Specify target for following input files"); they
+    // are not `--oformat`.  The link entry points turn `binary` inputs into
+    // wrapper objects and consume the switches before parsing
+    // (`binary_input`); here the switch and its word are only kept out of
+    // the input list.
+    if let Some(word) = super::binary_input::format_switch(tok) {
+        return Some(word.is_none() && next.is_some());
+    }
+    if let Some(v) = tok.strip_prefix("--oformat=") {
+        result.oformat = Some(v.to_string());
+        return Some(false);
+    }
+    if tok == "--oformat" {
+        if let Some(v) = next {
+            result.oformat = Some(v.to_string());
+            return Some(true);
+        }
+        return Some(false);
+    }
+    None
+}
+
+/// Parse user linker arguments into a structured `LinkerArgs`.
+///
+/// Handles `-L`, `-l`, `-Wl,` (with nested flags like `--defsym`, `--export-dynamic`,
+/// `-rpath`, `--gc-sections`), `-rdynamic`, `-static`, and bare file paths.
+/// Apply one `-z KEYWORD` to the parsed arguments.
+///
+/// Both the split form (`-Wl,-z,relro`) and the joined form
+/// (`-Wl,-zrelro`) funnel through this one function so the two GNU
+/// spellings cannot drift apart.  There must be exactly ONE such
+/// function: `-z defs` (the spelling CMake/Qt use for --no-undefined)
+/// was once handled in a second `-z` arm that the first arm's match had
+/// already made unreachable, silently disabling it for shared
+/// libraries until the so_z_defs_rejects_undefined differential test
+/// caught it.
+fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
+    match kw {
+        "now" => result.z_now = true,
+        "lazy" => result.z_now = false,
+        "relro" => result.z_relro = true,
+        "norelro" => result.z_relro = false,
+        "pack-relative-relocs" => result.z_pack_relative_relocs = true,
+        "nopack-relative-relocs" => result.z_pack_relative_relocs = false,
+        "defs" => result.no_undefined = true,
+        "undefs" => result.no_undefined = false,
+        // CET property note bits (see linker_common::cet).
+        "ibt" => result.z_ibt = true,
+        "shstk" => result.z_shstk = true,
+        "lam-u48" => result.z_lam_u48 = true,
+        "lam-u57" => result.z_lam_u57 = true,
+        // x86-64 ISA level (binutils `ld/emulparams/x86-64-level.sh`):
+        // `-z x86-64-{baseline,v2,v3,v4}` marks the level as needed in
+        // the property note.  GNU's rule, measured on ld 2.44:
+        //   * baseline / v2 / v3 / v4 set the level;
+        //   * `x86-64-v` + a bad suffix (v, v1, v2x, v9, ...) is the
+        //     `invalid x86-64 ISA level` fatal — the parser has no error
+        //     channel, so the keyword is kept for the link path to
+        //     reject via `property_link_flags`;
+        //   * any OTHER `x86-64-*` keyword (x86-64-foo, x86-64-,
+        //     x86-64-baselineX, wrong-case X86-64-v3) is warned about
+        //     and ignored (`-z <kw> ignored`), like every other
+        //     unrecognised `-z` keyword — NOT fatal.
+        "x86-64-baseline" => result.z_isa_level = 1,
+        k if k.starts_with("x86-64-v") => match k["x86-64-v".len()..].parse::<u32>() {
+            Ok(n) if (2..=4).contains(&n) => result.z_isa_level = n,
+            _ => result.z_isa_level_invalid = Some(k.to_string()),
+        },
+        k if k.starts_with("x86-64-") => {
+            result.z_ignored_keywords.push(k.to_string());
+        }
+        k if k.starts_with("ibt=")
+            || k.starts_with("shstk=")
+            || k.starts_with("lam-u48=")
+            || k.starts_with("lam-u57=") =>
+        {
+            // `-z ibt=func` & co: accepted, ignored, warned.
+            result.z_ignored_keywords.push(k.to_string());
+        }
+        "text" => result.z_text = TextrelPolicy::Error,
+        "notext" | "textoff" => result.z_text = TextrelPolicy::Allow,
+        "execstack" => result.z_execstack = Some(true),
+        "noexecstack" => result.z_execstack = Some(false),
+        "origin" | "nodelete" | "nodlopen" | "initfirst" | "interpose" | "nodefaultlib" => {
+            result.z_dyn_flag_keywords.push(kw.to_string());
+        }
+        "max-page-size" => {
+            // BFD accepts the bare keyword but warns that no value was given.
+            result.z_ignored_keywords.push(kw.to_string());
+        }
+        k if k.starts_with("max-page-size=") => {
+            let v = &k["max-page-size=".len()..];
+            match parse_gnu_page_size_value(v) {
+                Some(n) if n == 0 || (n >= 0x1000 && n.is_power_of_two()) => {
+                    result.max_page_size = Some(n);
+                }
+                _ => {
+                    // An invalid occurrence remains fatal even if a later
+                    // spelling is valid; GNU ld diagnoses each argument as it
+                    // parses it rather than letting later flags erase errors.
+                    result
+                        .max_page_size_invalid
+                        .get_or_insert_with(|| v.to_string());
+                }
+            }
+            result.z_other_keywords.push(kw.to_string());
+        }
+        "common-page-size" => {
+            // BFD accepts the bare spelling but warns that it is ignored.
+            result.z_ignored_keywords.push(kw.to_string());
+        }
+        k if k.starts_with("common-page-size=") => {
+            let v = &k["common-page-size=".len()..];
+            match parse_common_page_size(v) {
+                Some(n) if n == 0 || n.is_power_of_two() => {}
+                _ => {
+                    result
+                        .common_page_size_invalid
+                        .get_or_insert_with(|| v.to_string());
+                }
+            }
+            // Layout currently has one page-granularity control. A distinct
+            // common-page-size is not implemented, so keep the request visible
+            // to the linker's warning/fatal-warning policy rather than storing
+            // it in the silently ignored generic keyword bucket.
+            result.z_ignored_keywords.push(kw.to_string());
+        }
+        _ => result.z_other_keywords.push(kw.to_string()),
+    }
+}
+
+/// What the linker does when an output would need a dynamic relocation
+/// that patches a read-only segment (a "text relocation").
+///
+/// The x86 linkers first avoid the situation where that is free: a
+/// non-executable read-only section that needs load-time relocation is
+/// placed at the head of the `PT_GNU_RELRO` window instead of in the
+/// read-only segment (the dynamic loader writes it, then `mprotect`s it
+/// read-only -- the same end state, and it works on loaders without text
+/// relocation support such as musl).  Only code, which cannot move out of
+/// the executable segment, is left; for that the policy mirrors GNU ld
+/// (`bfd/elflink.c`, `bfd_elf_final_link` and `_bfd_elf_maybe_set_textrel`):
+///
+/// * default -- warn about the first offending site, then that
+///   `DT_TEXTREL` is being created, and emit `DT_TEXTREL` + `DF_TEXTREL`;
+/// * `-z text` -- the same site warning, then the fatal
+///   `read-only segment has dynamic relocations`;
+/// * `-z notext` / `-z textoff` -- emit the tags silently.
+///
+/// Without `DT_TEXTREL` glibc maps the code read-only and faults applying
+/// the relocation, so emitting it silently -- what this linker used to do
+/// -- was never an option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextrelPolicy {
+    /// GNU default: warn, then emit `DT_TEXTREL`.
+    #[default]
+    Warn,
+    /// `-z notext` / `-z textoff`: emit `DT_TEXTREL` silently.
+    Allow,
+    /// `-z text`: refuse the link.
+    Error,
+}
+
+impl TextrelPolicy {
+    /// The site part of GNU's warning: `FILE: warning: relocation against
+    /// `SYM' in read-only section `SEC'`, or without the symbol when the
+    /// relocation is against a local.
+    pub fn site(file: &str, sym: Option<&str>, section: &str) -> String {
+        match sym {
+            Some(sym) if !sym.is_empty() => {
+                format!(
+                    "{file}: warning: relocation against `{sym}' in read-only section `{section}'"
+                )
+            }
+            _ => format!("{file}: warning: relocation in read-only section `{section}'"),
+        }
+    }
+
+    /// Decide an output that needs text relocations.  `site` is the first
+    /// offending relocation ([`TextrelPolicy::site`]); `output` names the
+    /// output kind the way GNU does (`shared object`, `PIE`, `PDE`).
+    /// `Ok(())` means: emit `DT_TEXTREL` and `DF_TEXTREL`.
+    pub fn apply(self, site: &str, output: &str) -> Result<(), String> {
+        match self {
+            Self::Allow => Ok(()),
+            Self::Warn => {
+                eprintln!("lccc-ld: {site}");
+                eprintln!("lccc-ld: warning: creating DT_TEXTREL in a {output}");
+                Ok(())
+            }
+            Self::Error => {
+                eprintln!("lccc-ld: {site}");
+                Err("read-only segment has dynamic relocations".to_string())
+            }
+        }
+    }
+}
+
+/// How `-Bsymbolic*` binds a shared object's references to its own
+/// default-visibility definitions.  Only meaningful for `-shared`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Symbolic {
+    /// ELF default: such definitions are preemptible.
+    #[default]
+    None,
+    /// `-Bsymbolic-functions`: functions bind locally; data stays
+    /// preemptible, so an executable's copy relocation of a library
+    /// variable is still the one copy both see.  (Treating this like
+    /// `-Bsymbolic` -- as lccc-ld once did -- gives the library its own
+    /// copy of every such variable: two objects where C has one.)
+    Functions,
+    /// `-Bsymbolic`: every definition binds locally; DF_SYMBOLIC is set.
+    All,
+}
+
+impl Symbolic {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "-Bsymbolic" => Some(Self::All),
+            "-Bsymbolic-functions" => Some(Self::Functions),
+            "-Bno-symbolic" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Whether a definition of ELF symbol type `st_type` binds inside the
+    /// library.  "Functions" are STT_FUNC and STT_GNU_IFUNC: lld binds
+    /// only STT_FUNC, GNU ld everything but data; an STT_NOTYPE symbol may
+    /// be either, and staying preemptible is always correct.
+    pub fn binds_locally(self, st_type: u8) -> bool {
+        const STT_FUNC: u8 = 2;
+        const STT_GNU_IFUNC: u8 = 10;
+        match self {
+            Self::None => false,
+            Self::Functions => st_type == STT_FUNC || st_type == STT_GNU_IFUNC,
+            Self::All => true,
+        }
+    }
+}
+
+/// DT_FLAGS / DT_FLAGS_1 bits (gABI; DF_1_* from GNU/Solaris).
+pub mod dyn_flags {
+    pub const DF_ORIGIN: u64 = 0x1;
+    pub const DF_SYMBOLIC: u64 = 0x2;
+    pub const DF_TEXTREL: u64 = crate::backend::elf::DF_TEXTREL as u64;
+    pub const DF_BIND_NOW: u64 = crate::backend::elf::DF_BIND_NOW as u64;
+    pub const DF_1_NOW: u64 = crate::backend::elf::DF_1_NOW as u64;
+    pub const DF_1_GLOBAL: u64 = 0x2;
+    pub const DF_1_NODELETE: u64 = 0x8;
+    pub const DF_1_INITFIRST: u64 = 0x20;
+    pub const DF_1_NOOPEN: u64 = 0x40;
+    pub const DF_1_ORIGIN: u64 = 0x80;
+    pub const DF_1_INTERPOSE: u64 = 0x400;
+    pub const DF_1_NODEFLIB: u64 = 0x800;
+    pub const DF_1_PIE: u64 = crate::backend::elf::DF_1_PIE as u64;
+}
+
+impl LinkerArgs {
+    /// `(DT_FLAGS, DT_FLAGS_1)` requested by the options -- `-z now` and the
+    /// `-z origin/nodelete/nodlopen/initfirst/interpose/nodefaultlib/global`
+    /// keywords -- common to executables and shared objects.  Emitters add
+    /// what depends on the output kind (DF_1_PIE, DF_SYMBOLIC).  Before,
+    /// the x86-64 emitters dropped all of these but `-z now` in
+    /// executables: `-z nodelete` libraries could be unloaded by
+    /// `dlclose` and `-Wl,-z,now` libraries bound lazily.
+    pub fn requested_dyn_flags(&self) -> (u64, u64) {
+        use dyn_flags::*;
+        let (mut flags, mut flags_1) = (0u64, 0u64);
+        if self.z_now {
+            flags |= DF_BIND_NOW;
+            flags_1 |= DF_1_NOW;
+        }
+        for kw in &self.z_dyn_flag_keywords {
+            match kw.as_str() {
+                "origin" => {
+                    flags |= DF_ORIGIN;
+                    flags_1 |= DF_1_ORIGIN;
+                }
+                "nodelete" => flags_1 |= DF_1_NODELETE,
+                "nodlopen" => flags_1 |= DF_1_NOOPEN,
+                "initfirst" => flags_1 |= DF_1_INITFIRST,
+                "interpose" => flags_1 |= DF_1_INTERPOSE,
+                "nodefaultlib" => flags_1 |= DF_1_NODEFLIB,
+                _ => {}
+            }
+        }
+        if self.z_other_keywords.iter().any(|k| k == "global") {
+            flags_1 |= DF_1_GLOBAL;
+        }
+        (flags, flags_1)
+    }
+}
+
+/// The dynamic-section entry GNU ld writes for `-rpath`: ONE `DT_RUNPATH`
+/// (`DT_RPATH` under `--disable-new-dtags`) holding every entry, joined
+/// with ':' in command-line order. `None` without `-rpath`.
+pub fn rpath_dyn_entry(args: &LinkerArgs) -> Option<(i64, String)> {
+    use crate::backend::elf::{DT_RPATH, DT_RUNPATH};
+    (!args.rpath_entries.is_empty()).then(|| {
+        let tag = if args.use_runpath {
+            DT_RUNPATH
+        } else {
+            DT_RPATH
+        };
+        (tag, args.rpath_entries.join(":"))
+    })
+}
+
+/// GNU ld options whose value may arrive as the next word (`--opt VALUE`);
+/// see the re-join in [`parse_linker_args`].
+pub(crate) const VALUE_TAKING: &[&str] = &[
+    "--wrap",
+    "--defsym",
+    "--icf",
+    "-Map",
+    "--version-script",
+    "--dynamic-list",
+    "--exclude-libs",
+    "--image-base",
+    "--pack-dyn-relocs",
+    "--oformat",
+    // The input-format switch (`binary_input`): `-Wl,-b -Wl,binary` must
+    // be re-joined, or the format word falls through to the input list.
+    "-b",
+    "--format",
+    "-format",
+    "-rpath",
+    "-rpath-link",
+    "--rpath-link",
+    "--hash-style",
+    "-hash-style",
+    "--dynamic-linker",
+    "-dynamic-linker",
+    "-I",
+    "-soname",
+    "--entry",
+    "-e",
+    "--undefined",
+    "-u",
+    "-z",
+];
+
+/// GNU ld accepts `--opt VALUE` alongside `--opt=VALUE`.  A driver that
+/// forwards them as `-Wl,--opt -Wl,VALUE` splits the pair across two
+/// arguments, and a `-Wl,` group parser sees one group at a time, so the
+/// value would be dropped or taken as a file.  Re-join such pairs up front
+/// (`-Wl,--wrap -Wl,bv` becomes `-Wl,--wrap,bv`) for every option whose
+/// value is the next word: `VALUE_TAKING` and `binary_input::VALUE_WORDS`.
+/// Shared by `parse_linker_args` and the AArch64 static loader.
+pub(crate) fn join_split_wl_values(user_args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(user_args.len());
+    let mut k = 0;
+    while k < user_args.len() {
+        let mut cur = user_args[k].clone();
+        k += 1;
+        // Absorb following -Wl, groups while this one ends in an option
+        // that is still waiting for its value.
+        while k < user_args.len() {
+            let wl = match cur.strip_prefix("-Wl,") {
+                Some(w) => w,
+                None => break,
+            };
+            let last = match wl.split(',').next_back() {
+                Some(l) => l,
+                None => break,
+            };
+            if !VALUE_TAKING.contains(&last) && !super::binary_input::VALUE_WORDS.contains(&last) {
+                break;
+            }
+            let nxt = match user_args[k].strip_prefix("-Wl,") {
+                Some(w) => w,
+                None => break, // value is a separate argv entry; leave it
+            };
+            cur = format!("{},{}", cur, nxt);
+            k += 1;
+        }
+        out.push(cur);
+    }
+    out
+}
+
+/// A library-search option inside a `-Wl,` group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchOption<'a> {
+    /// `-L DIR`, `-LDIR`, `--library-path[=]DIR`.
+    Dir(&'a str),
+    /// `-l NAME`, `-lNAME`, `--library[=]NAME`.
+    Lib(&'a str),
+}
+
+/// Classify `tok` (with the group's next word `next`) as GNU ld's `-L` /
+/// `-l` in any of their spellings, and say whether `next` was its value.
+/// A bare `-L` or `-l` takes the next word, as in GNU ld; matching only the
+/// joined prefix made `-Wl,-L,DIR` add an empty search directory and link
+/// `DIR` as a file.  `None` for anything else, including a bare option with
+/// no value left (the caller's value-word arm consumes it).
+pub(crate) fn search_option<'a>(
+    tok: &'a str,
+    next: Option<&'a str>,
+) -> Option<(SearchOption<'a>, bool)> {
+    let value = |joined: Option<&'a str>, bare: bool| -> Option<(&'a str, bool)> {
+        match joined {
+            Some(v) if !v.is_empty() => Some((v, false)),
+            _ if bare => next.filter(|v| !v.is_empty()).map(|v| (v, true)),
+            _ => None,
+        }
+    };
+    if tok == "-L" || tok == "--library-path" {
+        return value(None, true).map(|(v, used)| (SearchOption::Dir(v), used));
+    }
+    if tok == "-l" || tok == "--library" {
+        return value(None, true).map(|(v, used)| (SearchOption::Lib(v), used));
+    }
+    if let Some(v) = tok.strip_prefix("--library-path=") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Dir(v), used));
+    }
+    if let Some(v) = tok.strip_prefix("--library=") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Lib(v), used));
+    }
+    if tok.starts_with("--") {
+        return None;
+    }
+    if let Some(v) = tok.strip_prefix("-L") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Dir(v), used));
+    }
+    if let Some(v) = tok.strip_prefix("-l") {
+        return value(Some(v), false).map(|(v, used)| (SearchOption::Lib(v), used));
+    }
+    None
+}
+
+pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
+    let mut result = LinkerArgs::default();
+    // DT_RUNPATH is the default, not DT_RPATH: bfd (as configured by every
+    // major distro), lld and mold all emit RUNPATH for a plain `-rpath`.
+    // Upstream bfd's historic RPATH default only survives in niche
+    // configurations; matching the de-facto standard keeps
+    // `-Wl,-rpath,$ORIGIN` links behaving identically under every linker.
+    // `--disable-new-dtags` still opts back into DT_RPATH below.
+    result.use_runpath = true;
+    result.warn_rwx_segments = true; // GNU ld's default RWX LOAD diagnostic
+    result.z_relro = true; // RELRO is on by default, like GNU ld/mold
+
+    let joined = join_split_wl_values(user_args);
+    let args: Vec<&str> = joined.iter().map(|s| s.as_str()).collect();
+    // Retained for a `-Wl,-rpath` whose path arrives as a *separate argv
+    // entry* (not another `-Wl,` group), which the join above deliberately
+    // does not merge.
+    let mut pending_rpath = false;
+    // Positional state: --whole-archive applies to archives that FOLLOW it,
+    // until --no-whole-archive turns it back off; likewise --as-needed and
+    // -Bstatic.  GNU ld defaults to --no-as-needed / -Bdynamic; gcc's driver
+    // passes --as-needed explicitly when it wants it.
+    let mut pos = PositionalState::default();
+    let mut pos_stack: Vec<PositionalState> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        if arg == "-rdynamic" {
+            result.export_dynamic = true;
+        } else if let Some(v) = arg.strip_prefix("--version-script=") {
+            result.version_script = Some(v.to_string());
+        } else if arg == "--version-script" && i + 1 < args.len() {
+            i += 1;
+            result.version_script = Some(args[i].to_string());
+        } else if let Some(v) = arg.strip_prefix("--exclude-libs=") {
+            result.exclude_libs.extend(split_lib_list(v));
+        } else if arg == "--exclude-libs" && i + 1 < args.len() {
+            i += 1;
+            result.exclude_libs.extend(split_lib_list(args[i]));
+        } else if arg == "--print-map" || arg == "-M" {
+            result.map_path = Some("-".to_string());
+        } else if let Some(v) = arg.strip_prefix("-Map=") {
+            // Top-level spelling: lccc-ld and other direct callers pass
+            // `-Map=FILE` as its own argument, not inside a `-Wl,` group.
+            result.map_path = Some(v.to_string());
+        } else if arg == "-Map" && i + 1 < args.len() {
+            i += 1;
+            result.map_path = Some(args[i].to_string());
+        } else if let Some(v) = arg.strip_prefix("--dynamic-linker=") {
+            if !v.is_empty() {
+                result.dynamic_linker = Some(v.to_string());
+            }
+        } else if arg == "--dynamic-linker" || arg == "-dynamic-linker" || arg == "-I" {
+            if i + 1 < args.len() {
+                i += 1;
+                if !args[i].is_empty() {
+                    result.dynamic_linker = Some(args[i].to_string());
+                }
+            }
+        } else if arg == "-static" {
+            result.is_static = true;
+            pos.apply(arg, &mut pos_stack);
+        } else if pos.apply(arg, &mut pos_stack) {
+            // positional toggle consumed
+        } else if let Some(sym) = arg.strip_prefix("--entry=") {
+            result.entry_symbol = Some(sym.to_string());
+        } else if (arg == "--entry" || arg == "-e") && i + 1 < args.len() {
+            i += 1;
+            result.entry_symbol = Some(args[i].to_string());
+        } else if let Some(sym) = arg.strip_prefix("--undefined=") {
+            result.undefined_symbols.push(sym.to_string());
+        } else if (arg == "--undefined" || arg == "-u") && i + 1 < args.len() {
+            i += 1;
+            result.undefined_symbols.push(args[i].to_string());
+        } else if let Some(path) = arg.strip_prefix("-L") {
+            let p = if path.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                path
+            };
+            result.extra_lib_paths.push(p.to_string());
+        } else if let Some(lib) = arg.strip_prefix("-l") {
+            let l = if lib.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                lib
+            };
+            result.libs_to_load.push(l.to_string());
+            result.inputs.push(pos.item(l, true));
+        } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
+            let parts: Vec<&str> = wl_arg.split(',').collect();
+            // Handle -Wl,-rpath -Wl,/path two-arg form
+            if pending_rpath && !parts.is_empty() {
+                result.rpath_entries.push(parts[0].to_string());
+                pending_rpath = false;
+                i += 1;
+                continue;
+            }
+            let mut j = 0;
+            while j < parts.len() {
+                let part = parts[j];
+                if part == "--export-dynamic" || part == "-export-dynamic" || part == "-E" {
+                    result.export_dynamic = true;
+                } else if let Some(v) = part.strip_prefix("--dynamic-linker=") {
+                    if !v.is_empty() {
+                        result.dynamic_linker = Some(v.to_string());
+                    }
+                } else if let Some(v) = part.strip_prefix("-dynamic-linker=") {
+                    if !v.is_empty() {
+                        result.dynamic_linker = Some(v.to_string());
+                    }
+                } else if (part == "--dynamic-linker" || part == "-dynamic-linker" || part == "-I")
+                    && j + 1 < parts.len()
+                {
+                    j += 1;
+                    if !parts[j].is_empty() {
+                        result.dynamic_linker = Some(parts[j].to_string());
+                    }
+                } else if part.starts_with("-rpath-link") || part.starts_with("--rpath-link") {
+                    // `-rpath-link DIR` only tells the linker where to find
+                    // the DT_NEEDED dependencies of input shared objects.
+                    // lccc's linkers never load indirect dependencies (no
+                    // --copy-dt-needed-entries, no shared-object undefined
+                    // check), so the option cannot change the output; its
+                    // value must still be consumed, not taken as an input.
+                    if !part.contains('=') && j + 1 < parts.len() {
+                        j += 1;
+                    }
+                } else if let Some(rp) = part.strip_prefix("-rpath=") {
+                    result.rpath_entries.push(rp.to_string());
+                } else if part == "-rpath" && j + 1 < parts.len() {
+                    j += 1;
+                    result.rpath_entries.push(parts[j].to_string());
+                } else if part == "-rpath" {
+                    // -rpath without following value in this -Wl, group;
+                    // the path comes in the next -Wl, argument
+                    pending_rpath = true;
+                } else if part == "--enable-new-dtags" {
+                    result.use_runpath = true;
+                } else if part == "--disable-new-dtags" {
+                    result.use_runpath = false;
+                } else if let Some((opt, used_next)) =
+                    search_option(part, parts.get(j + 1).copied())
+                {
+                    if used_next {
+                        j += 1;
+                    }
+                    match opt {
+                        SearchOption::Dir(dir) => result.extra_lib_paths.push(dir.to_string()),
+                        SearchOption::Lib(lib) => {
+                            result.libs_to_load.push(lib.to_string());
+                            result.inputs.push(pos.item(lib, true));
+                        }
+                    }
+                } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
+                    if let Some(eq_pos) = defsym_arg.find('=') {
+                        result.defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
+                    }
+                } else if part == "--defsym" && j + 1 < parts.len() {
+                    j += 1;
+                    let defsym_arg = parts[j];
+                    if let Some(eq_pos) = defsym_arg.find('=') {
+                        result.defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
+                    }
+                } else if let Some(v) = part.strip_prefix("--version-script=") {
+                    result.version_script = Some(v.to_string());
+                } else if part == "--version-script" && j + 1 < parts.len() {
+                    j += 1;
+                    result.version_script = Some(parts[j].to_string());
+                } else if let Some(v) = part.strip_prefix("--exclude-libs=") {
+                    result.exclude_libs.extend(split_lib_list(v));
+                } else if part == "--exclude-libs" && j + 1 < parts.len() {
+                    j += 1;
+                    result.exclude_libs.extend(split_lib_list(parts[j]));
+                } else if part == "--print-map" || part == "-M" {
+                    // GNU ld writes the map to stdout; "-" is the sentinel.
+                    result.map_path = Some("-".to_string());
+                } else if let Some(v) = part.strip_prefix("-Map=") {
+                    result.map_path = Some(v.to_string());
+                } else if part == "-Map" && j + 1 < parts.len() {
+                    j += 1;
+                    result.map_path = Some(parts[j].to_string());
+                } else if let Some(v) = part.strip_prefix("--icf=") {
+                    // Unknown values disable ICF rather than erroring, which
+                    // matches how gold/lld treat --icf=none.
+                    result.icf = crate::backend::x86::linker::parse_icf_mode(v).map(str::to_string);
+                } else if part == "--icf" && j + 1 < parts.len() {
+                    // `--icf MODE`, the separated spelling the re-join above
+                    // produces for `-Wl,--icf -Wl,all`.
+                    j += 1;
+                    result.icf =
+                        crate::backend::x86::linker::parse_icf_mode(parts[j]).map(str::to_string);
+                } else if part == "--no-icf" {
+                    result.icf = None;
+                } else if part == "--gc-sections" {
+                    result.gc_sections = true;
+                } else if part == "--no-gc-sections" {
+                    result.gc_sections = false;
+                } else if part == "-static" {
+                    result.is_static = true;
+                    pos.apply(part, &mut pos_stack);
+                } else if pos.apply(part, &mut pos_stack) {
+                    // positional toggle consumed
+                } else if part == "-z" && j + 1 < parts.len() {
+                    j += 1;
+                    apply_z_keyword(&mut result, parts[j]);
+                } else if let Some(kw) = part.strip_prefix("-z") {
+                    // Joined form inside the group (`-Wl,-zrelro`): GNU ld
+                    // accepts `-z<keyword>` identically to `-z <keyword>`
+                    // (measured on 2.44, including through `-Wl,`, which
+                    // the compiler driver splits into the joined ld
+                    // argument), so it funnels through the same keyword
+                    // function.  A bare `-z` never reaches here — the arm
+                    // above consumes it — but an empty remainder is
+                    // skipped rather than asserted on.
+                    if !kw.is_empty() {
+                        apply_z_keyword(&mut result, kw);
+                    }
+                } else if let Some(sym) = part.strip_prefix("--entry=") {
+                    result.entry_symbol = Some(sym.to_string());
+                } else if (part == "-e" || part == "--entry") && j + 1 < parts.len() {
+                    j += 1;
+                    result.entry_symbol = Some(parts[j].to_string());
+                } else if let Some(sym) = part.strip_prefix("--wrap=") {
+                    result.wrap_symbols.push(sym.to_string());
+                } else if part == "--wrap" && j + 1 < parts.len() {
+                    j += 1;
+                    result.wrap_symbols.push(parts[j].to_string());
+                } else if let Some(sym) = part.strip_prefix("--undefined=") {
+                    result.undefined_symbols.push(sym.to_string());
+                } else if (part == "-u" || part == "--undefined") && j + 1 < parts.len() {
+                    j += 1;
+                    result.undefined_symbols.push(parts[j].to_string());
+                } else if let Some(sym) = part.strip_prefix("-u") {
+                    if !sym.is_empty() && !sym.starts_with('-') {
+                        result.undefined_symbols.push(sym.to_string());
+                    }
+                } else if let Some(sym) = part.strip_prefix("-e") {
+                    // -e<sym> joined form (only if it looks like a symbol, not
+                    // another flag such as -export-dynamic which is handled above)
+                    if !sym.is_empty()
+                        && !sym.starts_with('-')
+                        && !part.starts_with("-enable")
+                        && !part.starts_with("-export")
+                    {
+                        result.entry_symbol = Some(sym.to_string());
+                    }
+                } else if let Some(sn) = part.strip_prefix("-soname=") {
+                    result.soname = Some(sn.to_string());
+                } else if part == "-soname" && j + 1 < parts.len() {
+                    j += 1;
+                    result.soname = Some(parts[j].to_string());
+                } else if let Some(s) = Symbolic::from_flag(part) {
+                    result.symbolic = s;
+                } else if part == "--no-undefined" {
+                    result.no_undefined = true;
+                // GNU ld also takes the single-dash spelling, which the
+                // RISC-V gcc driver passes (`-hash-style=gnu`).
+                } else if let Some(v) = part
+                    .strip_prefix("--hash-style=")
+                    .or_else(|| part.strip_prefix("-hash-style="))
+                {
+                    if let Some(h) = parse_hash_style(v) {
+                        result.hash_style = h;
+                    }
+                } else if (part == "--hash-style" || part == "-hash-style") && j + 1 < parts.len() {
+                    j += 1;
+                    if let Some(h) = parse_hash_style(parts[j]) {
+                        result.hash_style = h;
+                    }
+                } else if let Some(used_next) =
+                    apply_kv_option(&mut result, part, parts.get(j + 1).copied())
+                {
+                    if used_next {
+                        j += 1;
+                    }
+                } else if misc_option(&mut result, part) {
+                    // consumed
+                } else if apply_plain_flag(&mut result, part) {
+                    // consumed
+                } else if let Some(style) = part.strip_prefix("--build-id=") {
+                    result.build_id = !matches!(style, "none" | "0");
+                    result.build_id_style = Some(style.to_string());
+                } else if part == "--build-id" {
+                    result.build_id = true;
+                } else if part == "--no-build-id" {
+                    result.build_id = false;
+                } else if super::binary_input::VALUE_WORDS.contains(&part) {
+                    // An option this parser does not act on, whose value is
+                    // the next word (`-Wl,-T,script.ld`): the value is not
+                    // an input file.
+                    j += 1;
+                } else if !part.starts_with('-') && !part.is_empty() {
+                    // A file operand inside `-Wl,` (`-Wl,extra.o`, or the
+                    // wrapper object of `-Wl,-b,binary,blob.bin`) is an input
+                    // exactly like one outside it: GNU ld links it.  It used
+                    // to be dropped, leaving its symbols undefined.
+                    if Path::new(part).exists() {
+                        result.extra_object_files.push(part.to_string());
+                        result.inputs.push(pos.item(part, false));
+                    } else {
+                        result.missing_inputs.push(part.to_string());
+                    }
+                }
+                j += 1;
+            }
+        } else if let Some(sn) = arg.strip_prefix("-soname=") {
+            result.soname = Some(sn.to_string());
+        } else if arg == "-soname" && i + 1 < args.len() {
+            i += 1;
+            result.soname = Some(args[i].to_string());
+        } else if let Some(s) = Symbolic::from_flag(arg) {
+            result.symbolic = s;
+        } else if arg == "--no-undefined" {
+            result.no_undefined = true;
+        } else if let Some(v) = arg.strip_prefix("--hash-style=") {
+            if let Some(h) = parse_hash_style(v) {
+                result.hash_style = h;
+            }
+        } else if arg == "--hash-style" && i + 1 < args.len() {
+            i += 1;
+            if let Some(h) = parse_hash_style(args[i]) {
+                result.hash_style = h;
+            }
+        } else if arg == "--threads" && i + 1 < args.len() {
+            i += 1;
+            // Lenient like GNU: a bad value is ignored, not fatal.  lccc
+            // links single-threaded; the value is recorded, not acted on.
+            result.threads = args[i].parse().ok();
+        } else if let Some(used_next) = apply_kv_option(&mut result, arg, args.get(i + 1).copied())
+        {
+            if used_next {
+                i += 1;
+            }
+        } else if misc_option(&mut result, arg) {
+            // consumed
+        } else if apply_plain_flag(&mut result, arg) {
+            // consumed
+        } else if let Some(style) = arg.strip_prefix("--build-id=") {
+            result.build_id = !matches!(style, "none" | "0");
+            result.build_id_style = Some(style.to_string());
+        } else if arg == "--build-id" {
+            result.build_id = true;
+        } else if arg == "--no-build-id" {
+            result.build_id = false;
+        } else if !arg.starts_with('-') && Path::new(arg).exists() {
+            result.extra_object_files.push(arg.to_string());
+            result.inputs.push(pos.item(arg, false));
+        } else if !arg.starts_with('-') && !arg.is_empty() {
+            result.missing_inputs.push(arg.to_string());
+        }
+        i += 1;
+    }
+    result
+}
+
+#[cfg(test)]
+mod map_arg_tests {
+    use super::*;
+
+    /// GNU ld takes `--hash-style` single- or double-dashed, with the value
+    /// attached or separate; the RISC-V gcc driver passes `-hash-style=gnu`.
+    #[test]
+    fn hash_style_takes_both_spellings() {
+        for flags in [
+            &["-Wl,--hash-style=sysv"][..],
+            &["-Wl,-hash-style=sysv"],
+            &["-Wl,--hash-style,sysv"],
+            &["-Wl,-hash-style,sysv"],
+        ] {
+            let parsed = parse_linker_args(&args(flags));
+            assert!(matches!(parsed.hash_style, HashStyle::Sysv), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn rpath_is_one_colon_joined_runpath_unless_old_dtags() {
+        use crate::backend::elf::{DT_RPATH, DT_RUNPATH};
+        assert_eq!(
+            rpath_dyn_entry(&parse_linker_args(&args(&["-Wl,--as-needed"]))),
+            None
+        );
+        let a = parse_linker_args(&args(&["-Wl,-rpath,/opt/a", "-Wl,-rpath=$ORIGIN/../lib"]));
+        assert_eq!(
+            rpath_dyn_entry(&a),
+            Some((DT_RUNPATH, "/opt/a:$ORIGIN/../lib".to_string()))
+        );
+        let a = parse_linker_args(&args(&["-Wl,-rpath,/x", "-Wl,--disable-new-dtags"]));
+        assert_eq!(rpath_dyn_entry(&a), Some((DT_RPATH, "/x".to_string())));
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `-Map` reaches the linker in four spellings depending on whether the
+    /// caller is a Makefile driving `ld` directly, gcc forwarding via `-Wl,`,
+    /// or a build system using the separated form. All four must work.
+    #[test]
+    fn map_path_is_recognised_in_every_spelling() {
+        assert_eq!(
+            parse_linker_args(&args(&["-Map=out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Map", "out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,-Map=out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,-Map,out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
+    }
+
+    #[test]
+    fn dynamic_linker_is_preserved_in_driver_and_ld_spellings() {
+        for argv in [
+            vec!["--dynamic-linker=/tmp/ld.so"],
+            vec!["--dynamic-linker", "/tmp/ld.so"],
+            vec!["-Wl,--dynamic-linker=/tmp/ld.so"],
+            vec!["-Wl,--dynamic-linker,/tmp/ld.so"],
+        ] {
+            assert_eq!(
+                parse_linker_args(&args(&argv)).dynamic_linker.as_deref(),
+                Some("/tmp/ld.so"),
+                "argv={argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn map_path_absent_by_default() {
+        assert!(
+            parse_linker_args(&args(&["-static", "a.o"]))
+                .map_path
+                .is_none()
+        );
+    }
+
+    /// A path containing '=' (legal) must survive intact.
+    #[test]
+    fn map_path_with_equals_in_filename() {
+        assert_eq!(
+            parse_linker_args(&args(&["-Map=/tmp/a=b.map"]))
+                .map_path
+                .as_deref(),
+            Some("/tmp/a=b.map")
+        );
+    }
+}
+
+/// Split an `--exclude-libs` value into archive names.
+///
+/// GNU ld accepts both comma and colon as separators (`--exclude-libs
+/// libfoo.a:libbar.a` and `...=libfoo.a,libbar.a` are both in the wild), and
+/// the special value `ALL`. Entries are stored verbatim; matching happens in
+/// `exclude_libs_matches`.
+fn split_lib_list(v: &str) -> Vec<String> {
+    v.split([',', ':'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does `source_name` (e.g. `/usr/lib/libfoo.a(bar.o)`) belong to an archive
+/// named by `--exclude-libs`?
+///
+/// GNU ld matches on the archive's *basename*, not its path, and `ALL` matches
+/// every static archive. Objects that did not come from an archive (no
+/// parenthesised member) are never excluded — `--exclude-libs` is about
+/// archives only.
+pub fn exclude_libs_matches(exclude: &[String], source_name: &str) -> bool {
+    if exclude.is_empty() {
+        return false;
+    }
+    // Archive members are recorded as "path/to/libfoo.a(member.o)".
+    let Some(paren) = source_name.find('(') else {
+        return false;
+    };
+    if !source_name.ends_with(')') {
+        return false;
+    }
+    let archive = &source_name[..paren];
+    let base = archive.rsplit('/').next().unwrap_or(archive);
+    exclude
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case("ALL") || e == base || e == archive)
+}
+
+#[cfg(test)]
+mod ordered_input_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Create real files, because `parse_linker_args` only accepts bare paths
+    /// that exist on disk (it must not mistake a stray token for an input).
+    fn with_files<T>(names: &[&str], f: impl FnOnce(&std::path::Path) -> T) -> T {
+        // Unique per call, not just per process: `cargo test` runs these
+        // concurrently in one binary, so a directory keyed only on the PID is
+        // shared between tests and the first one to finish deletes the others'
+        // files out from under them. That produced a genuinely flaky failure
+        // (whole_archive_positional_via_wl passed in isolation, failed in a
+        // full run) which is far worse than an outright bug: it trains you to
+        // rerun instead of investigate.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let td = std::env::temp_dir().join(format!("lccc_args_{}_{}", std::process::id(), uniq));
+        std::fs::create_dir_all(&td).unwrap();
+        for n in names {
+            std::fs::write(td.join(n), b"").unwrap();
+        }
+        let r = f(&td);
+        let _ = std::fs::remove_dir_all(&td);
+        r
+    }
+
+    /// `--whole-archive` is *positional*: it applies to archives that follow
+    /// it and stops at `--no-whole-archive`. Recording it as a single global
+    /// bool (what `LinkerArgs` could express before `inputs` existed) links
+    /// every member of every archive, which silently bloats output and can
+    /// introduce duplicate-symbol errors.
+    #[test]
+    fn whole_archive_is_positional_not_global() {
+        with_files(&["a.a", "b.a", "c.a"], |d| {
+            let p = |n: &str| d.join(n).to_string_lossy().to_string();
+            let r = parse_linker_args(&args(&[
+                &p("a.a"),
+                "--whole-archive",
+                &p("b.a"),
+                "--no-whole-archive",
+                &p("c.a"),
+            ]));
+            let got: Vec<(String, bool)> = r
+                .inputs
+                .iter()
+                .map(|i| {
+                    (
+                        std::path::Path::new(&i.name)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                        i.whole_archive,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("a.a".to_string(), false),
+                    ("b.a".to_string(), true),
+                    ("c.a".to_string(), false),
+                ]
+            );
+        });
+    }
+
+    /// The same must hold through the `-Wl,` spelling, which is how gcc
+    /// actually passes these flags.
+    #[test]
+    fn whole_archive_positional_via_wl() {
+        with_files(&["x.a", "y.a"], |d| {
+            let p = |n: &str| d.join(n).to_string_lossy().to_string();
+            let r = parse_linker_args(&args(&[
+                "-Wl,--whole-archive",
+                &p("x.a"),
+                "-Wl,--no-whole-archive",
+                &p("y.a"),
+            ]));
+            let got: Vec<bool> = r.inputs.iter().map(|i| i.whole_archive).collect();
+            assert_eq!(got, vec![true, false]);
+        });
+    }
+
+    /// Link order decides archive member selection, so `inputs` must preserve
+    /// the exact command-line sequence, interleaving `-l` libs and bare files.
+    #[test]
+    fn inputs_preserve_command_line_order() {
+        with_files(&["first.o", "second.o"], |d| {
+            let p = |n: &str| d.join(n).to_string_lossy().to_string();
+            let r = parse_linker_args(&args(&[&p("first.o"), "-lm", &p("second.o"), "-lpthread"]));
+            let got: Vec<(String, bool)> = r
+                .inputs
+                .iter()
+                .map(|i| {
+                    (
+                        std::path::Path::new(&i.name)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                        i.is_lib,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![
+                    ("first.o".to_string(), false),
+                    ("m".to_string(), true),
+                    ("second.o".to_string(), false),
+                    ("pthread".to_string(), true),
+                ]
+            );
+        });
+    }
+
+    /// `inputs` is an additional view, not a replacement: the pre-existing
+    /// order-insensitive fields must keep working so current callers are
+    /// unaffected by the refactor.
+    #[test]
+    fn legacy_views_still_populated() {
+        with_files(&["o1.o"], |d| {
+            let p = |n: &str| d.join(n).to_string_lossy().to_string();
+            let r = parse_linker_args(&args(&[&p("o1.o"), "-lfoo", "-Wl,-lbar"]));
+            assert_eq!(r.libs_to_load, vec!["foo".to_string(), "bar".to_string()]);
+            assert_eq!(r.extra_object_files.len(), 1);
+            assert_eq!(r.inputs.len(), 3, "one entry per input, in order");
+        });
+    }
+}
+
+#[cfg(test)]
+mod z_isa_level_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every `-z x86-64-*` level (binutils
+    /// `ld/emulparams/x86-64-level.sh`), spelled the way the driver
+    /// forwards it (`-Wl,-z,<kw>`): 0 = unset is the default, baseline =
+    /// 1, v2/v3/v4 = 2/3/4.  Last one wins, like the other `-z` toggles.
+    #[test]
+    fn isa_levels_parse_to_level_numbers() {
+        let d = parse_linker_args(&args(&[]));
+        assert_eq!(d.z_isa_level, 0, "unset by default");
+        assert_eq!(d.z_isa_level_invalid, None);
+        for (kw, want) in [
+            ("x86-64-baseline", 1),
+            ("x86-64-v2", 2),
+            ("x86-64-v3", 3),
+            ("x86-64-v4", 4),
+        ] {
+            let r = parse_linker_args(&args(&[&format!("-Wl,-z,{kw}")]));
+            assert_eq!(r.z_isa_level, want, "-z {kw}");
+            assert_eq!(r.z_isa_level_invalid, None, "-z {kw} must not flag invalid");
+        }
+        let r = parse_linker_args(&args(&["-Wl,-z,x86-64-v2", "-Wl,-z,x86-64-v4"]));
+        assert_eq!(r.z_isa_level, 4, "last level wins");
+    }
+
+    /// A bad `x86-64-v` suffix is kept for the link path to reject —
+    /// GNU fatals with `invalid x86-64 ISA level`, and silently ignoring
+    /// the typo would link an image for the wrong microarchitecture.
+    /// `v1` is invalid (baseline covers it); so are a bare `x86-64-v`,
+    /// out-of-range versions, and non-numeric suffixes.
+    #[test]
+    fn isa_level_v_typos_are_kept_for_rejection() {
+        for kw in [
+            "x86-64-v1",
+            "x86-64-v5",
+            "x86-64-v9",
+            "x86-64-v",
+            "x86-64-v2x",
+            "x86-64-v3x",
+        ] {
+            let r = parse_linker_args(&args(&[&format!("-Wl,-z,{kw}")]));
+            assert_eq!(r.z_isa_level, 0, "-z {kw} must not set a level");
+            assert_eq!(
+                r.z_isa_level_invalid.as_deref(),
+                Some(kw),
+                "-z {kw} must be kept for rejection"
+            );
+        }
+    }
+
+    /// Any OTHER `x86-64-*` keyword is warned about and ignored — GNU's
+    /// `-z <kw> ignored` (measured on ld 2.44), not the invalid-level
+    /// fatal.  That includes a non-`v` keyword, a bare prefix, and a
+    /// near-miss of baseline.  (Wrong-case `X86-64-v3` also warns under
+    /// GNU, but it misses the lowercase prefix and lands in the generic
+    /// silent-unknown bucket — the pre-existing unknown-`-z` gap, not
+    /// this rule; see the follow-up notes.)
+    #[test]
+    fn isa_level_non_v_keywords_warn_and_ignore() {
+        for kw in ["x86-64-avx512", "x86-64-", "x86-64-baselineX"] {
+            let r = parse_linker_args(&args(&[&format!("-Wl,-z,{kw}")]));
+            assert_eq!(r.z_isa_level, 0, "-z {kw} must not set a level");
+            assert_eq!(
+                r.z_isa_level_invalid, None,
+                "-z {kw} must not be a fatal error"
+            );
+            assert!(
+                r.z_ignored_keywords.iter().any(|k| k == kw),
+                "-z {kw} must land on the warn-and-ignore list"
+            );
+        }
+    }
+
+    /// `-Bsymbolic*` / `-Bno-symbolic`: the last spelling wins in either
+    /// order and in both the `-Wl,` group and bare (lccc-ld) forms --
+    /// GNU ld's `lexsup.c` just overwrites one mode variable.
+    #[test]
+    fn symbolic_last_spelling_wins() {
+        let cases: &[(&[&str], Symbolic)] = &[
+            (&[], Symbolic::None),
+            (&["-Wl,-Bsymbolic"], Symbolic::All),
+            (&["-Wl,-Bsymbolic-functions"], Symbolic::Functions),
+            (
+                &["-Wl,-Bsymbolic,-Bsymbolic-functions"],
+                Symbolic::Functions,
+            ),
+            (
+                &["-Wl,-Bsymbolic-functions", "-Wl,-Bsymbolic"],
+                Symbolic::All,
+            ),
+            (&["-Wl,-Bsymbolic", "-Wl,-Bno-symbolic"], Symbolic::None),
+            (&["-Bsymbolic-functions"], Symbolic::Functions),
+            (
+                &["-Bsymbolic-functions", "-Bno-symbolic", "-Bsymbolic"],
+                Symbolic::All,
+            ),
+        ];
+        for (a, want) in cases {
+            assert_eq!(parse_linker_args(&args(a)).symbolic, *want, "{a:?}");
+        }
+        // Functions mode binds exactly STT_FUNC and STT_GNU_IFUNC.
+        for t in 0u8..16 {
+            assert_eq!(
+                Symbolic::Functions.binds_locally(t),
+                t == 2 || t == 10,
+                "{t}"
+            );
+            assert!(Symbolic::All.binds_locally(t) && !Symbolic::None.binds_locally(t));
+        }
+    }
+
+    #[test]
+    fn requested_dyn_flags_cover_every_keyword() {
+        use super::dyn_flags::*;
+        let f = |a: &[&str]| parse_linker_args(&args(a)).requested_dyn_flags();
+        assert_eq!(f(&[]), (0, 0));
+        assert_eq!(f(&["-Wl,-z,now"]), (DF_BIND_NOW, DF_1_NOW));
+        assert_eq!(f(&["-Wl,-z,now,-z,lazy"]), (0, 0));
+        assert_eq!(f(&["-Wl,-z,origin"]), (DF_ORIGIN, DF_1_ORIGIN));
+        assert_eq!(
+            f(&[
+                "-Wl,-z,nodelete,-z,nodlopen,-z,initfirst",
+                "-Wl,-z,interpose,-z,nodefaultlib,-z,global",
+            ]),
+            (
+                0,
+                DF_1_NODELETE
+                    | DF_1_NOOPEN
+                    | DF_1_INITFIRST
+                    | DF_1_INTERPOSE
+                    | DF_1_NODEFLIB
+                    | DF_1_GLOBAL
+            )
+        );
+    }
+
+    /// `-z text` / `-z notext` / `-z textoff`: the last spelling wins, the
+    /// keywords never reach the unknown-keyword list (i686 would warn
+    /// `-z text ignored`), and the default is GNU's warn-and-emit.
+    #[test]
+    fn z_text_family_last_wins() {
+        let p = |a: &[&str]| parse_linker_args(&args(a));
+        assert_eq!(p(&[]).z_text, TextrelPolicy::Warn);
+        assert_eq!(p(&["-Wl,-z,text"]).z_text, TextrelPolicy::Error);
+        assert_eq!(p(&["-Wl,-ztext"]).z_text, TextrelPolicy::Error);
+        assert_eq!(p(&["-Wl,-z,notext"]).z_text, TextrelPolicy::Allow);
+        assert_eq!(p(&["-Wl,-z,textoff"]).z_text, TextrelPolicy::Allow);
+        assert_eq!(p(&["-Wl,-z,text,-z,notext"]).z_text, TextrelPolicy::Allow);
+        assert_eq!(
+            p(&["-Wl,-z,notext", "-Wl,-z,text"]).z_text,
+            TextrelPolicy::Error
+        );
+        let r = p(&["-Wl,-z,text,-z,notext,-z,textoff"]);
+        assert!(r.z_other_keywords.is_empty(), "{:?}", r.z_other_keywords);
+        // The site wording is GNU's, with and without a symbol.
+        assert_eq!(
+            TextrelPolicy::site("a.o", Some("f"), ".text"),
+            "a.o: warning: relocation against `f' in read-only section `.text'"
+        );
+        assert_eq!(
+            TextrelPolicy::site("a.o", None, ".text"),
+            "a.o: warning: relocation in read-only section `.text'"
+        );
+        assert!(TextrelPolicy::Error.apply("s", "PIE").is_err());
+        assert!(TextrelPolicy::Allow.apply("s", "PIE").is_ok());
+    }
+
+    /// The joined `-z<keyword>` spelling inside a `-Wl,` group behaves
+    /// exactly like the split `-Wl,-z,<keyword>` spelling (GNU accepts
+    /// both identically, measured on 2.44).
+    #[test]
+    fn joined_z_keywords_match_split_form() {
+        let r = parse_linker_args(&args(&["-Wl,-zrelro"]));
+        assert!(r.z_relro);
+        let r = parse_linker_args(&args(&["-Wl,-znorelro"]));
+        assert!(!r.z_relro);
+        assert!(!parse_linker_args(&args(&[])).no_relax);
+        assert!(parse_linker_args(&args(&["-Wl,--no-relax"])).no_relax);
+        assert!(!parse_linker_args(&args(&["-Wl,--no-relax", "-Wl,--relax"])).no_relax);
+        let r = parse_linker_args(&args(&["-Wl,-zibt", "-Wl,-zshstk"]));
+        assert!(r.z_ibt && r.z_shstk);
+        let r = parse_linker_args(&args(&["-Wl,-zx86-64-v3"]));
+        assert_eq!(r.z_isa_level, 3);
+        assert_eq!(r.z_isa_level_invalid, None);
+        let r = parse_linker_args(&args(&["-Wl,-zx86-64-v9"]));
+        assert_eq!(r.z_isa_level_invalid.as_deref(), Some("x86-64-v9"));
+        let r = parse_linker_args(&args(&["-Wl,-zx86-64-foo"]));
+        assert_eq!(r.z_isa_level_invalid, None);
+        assert!(r.z_ignored_keywords.iter().any(|k| k == "x86-64-foo"));
+    }
+
+    /// Common-page-size values are validated like GNU ld even though this
+    /// backend warns that the separate layout granularity is not implemented.
+    #[test]
+    fn common_page_size_values_are_validated_independently() {
+        for value in [
+            "",
+            "0",
+            "-0",
+            "1",
+            "2",
+            "0x800",
+            "010",
+            "+16",
+            "-18446744073709551614",
+            "-18446744073709551615",
+            " 16",
+            "\t010000",
+        ] {
+            let arg = format!("-Wl,-z,common-page-size={value}");
+            let r = parse_linker_args(&args(&[&arg]));
+            assert_eq!(r.common_page_size_invalid, None, "value {value:?}");
+            assert_eq!(r.max_page_size_invalid, None, "value {value:?}");
+            assert!(
+                r.z_ignored_keywords
+                    .iter()
+                    .any(|kw| kw == &format!("common-page-size={value}")),
+                "value {value:?} must remain visible to the warning policy"
+            );
+        }
+
+        for value in [
+            "bad",
+            "3",
+            "0x1800",
+            "08",
+            "+",
+            "-1",
+            "-18446744073709551616",
+            "4096 ",
+            " ",
+        ] {
+            let arg = format!("-Wl,-z,common-page-size={value}");
+            let r = parse_linker_args(&args(&[&arg]));
+            assert_eq!(
+                r.common_page_size_invalid.as_deref(),
+                Some(value),
+                "value {value:?} must be rejected"
+            );
+            assert_eq!(r.max_page_size_invalid, None, "value {value:?}");
+            assert_eq!(
+                r.validate_common_page_size().unwrap_err(),
+                format!("invalid common page size `{value}'")
+            );
+        }
+
+        let bare = parse_linker_args(&args(&["-Wl,-z,common-page-size"]));
+        assert_eq!(bare.common_page_size_invalid, None);
+        assert!(
+            bare.z_ignored_keywords
+                .iter()
+                .any(|kw| kw == "common-page-size")
+        );
+
+        let common_bad = parse_linker_args(&args(&[
+            "-Wl,-z,common-page-size=3",
+            "-Wl,-z,max-page-size=0x1000",
+        ]));
+        assert_eq!(common_bad.common_page_size_invalid.as_deref(), Some("3"));
+        assert_eq!(common_bad.max_page_size_invalid, None);
+        let max_bad = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=3",
+            "-Wl,-z,common-page-size=0x1000",
+        ]));
+        assert_eq!(max_bad.max_page_size_invalid.as_deref(), Some("3"));
+        assert_eq!(max_bad.common_page_size_invalid, None);
+    }
+
+    #[test]
+    fn max_page_size_uses_gnu_integer_syntax_and_zero_selects_default() {
+        let bare = parse_linker_args(&args(&["-Wl,-z,max-page-size"]));
+        assert_eq!(bare.max_page_size, None);
+        assert_eq!(bare.max_page_size_invalid, None);
+        assert!(
+            bare.z_ignored_keywords
+                .iter()
+                .any(|kw| kw == "max-page-size")
+        );
+
+        for (value, expected) in [
+            ("", 0),
+            ("0", 0),
+            ("00", 0),
+            ("0x1000", 0x1000),
+            ("0X1000", 0x1000),
+            ("010000", 0x1000),
+            ("+4096", 0x1000),
+            (" 4096", 0x1000),
+            ("-18446744073709547520", 0x1000),
+        ] {
+            let arg = format!("-Wl,-z,max-page-size={value}");
+            let parsed = parse_linker_args(&args(&[&arg]));
+            assert_eq!(parsed.max_page_size, Some(expected), "value {value:?}");
+            assert_eq!(parsed.max_page_size_invalid, None, "value {value:?}");
+            parsed.validate_common_options().unwrap();
+            assert_eq!(
+                parsed.resolved_page_size(0x200000).unwrap(),
+                if expected == 0 { 0x200000 } else { expected },
+                "value {value:?}"
+            );
+        }
+
+        // BFD accepts sub-page powers of two, but this layout implementation
+        // intentionally rejects them rather than silently clamping alignment.
+        for value in ["1", "2", "2048", "-18446744073709551615"] {
+            let arg = format!("-Wl,-z,max-page-size={value}");
+            let parsed = parse_linker_args(&args(&[&arg]));
+            assert_eq!(parsed.max_page_size_invalid.as_deref(), Some(value));
+            assert!(
+                parsed
+                    .validate_common_options()
+                    .unwrap_err()
+                    .contains("unsupported maximum page size")
+            );
+        }
+
+        for value in ["bad", "3", "0x1800", "08", "+", "4096 ", " "] {
+            let arg = format!("-Wl,-z,max-page-size={value}");
+            let parsed = parse_linker_args(&args(&[&arg]));
+            assert_eq!(parsed.max_page_size_invalid.as_deref(), Some(value));
+            assert!(
+                parsed
+                    .validate_common_options()
+                    .unwrap_err()
+                    .contains("invalid maximum page size")
+            );
+        }
+
+        // Any invalid spelling is fatal, even if another occurrence is valid.
+        let invalid_then_valid = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=3",
+            "-Wl,-z,max-page-size=0x1000",
+        ]));
+        assert_eq!(invalid_then_valid.max_page_size, Some(0x1000));
+        assert_eq!(
+            invalid_then_valid.max_page_size_invalid.as_deref(),
+            Some("3")
+        );
+        let valid_then_invalid = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=0x1000",
+            "-Wl,-z,max-page-size=3",
+        ]));
+        assert_eq!(
+            valid_then_invalid.max_page_size_invalid.as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn fixed_backend_page_size_and_unknown_z_keywords_warn() {
+        let parsed = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=0x200000",
+            "-Wl,-z,separate-code",
+            "-Wl,-z,global",
+            "-Wl,-z,not-a-real-keyword",
+        ]));
+        assert_eq!(
+            parsed.z_other_keyword_warnings(),
+            vec!["-z global ignored", "-z not-a-real-keyword ignored"]
+        );
+        assert_eq!(
+            parsed.z_other_keyword_warnings_except(&["global"]),
+            vec!["-z not-a-real-keyword ignored"]
+        );
+        assert!(parsed.warn_unimplemented_keyword_options(0x1000).is_ok());
+
+        let same = parse_linker_args(&args(&["-Wl,-z,max-page-size=0x1000"]));
+        assert!(same.warn_unimplemented_keyword_options(0x1000).is_ok());
+        let zero = parse_linker_args(&args(&["-Wl,-z,max-page-size=0"]));
+        assert!(zero.warn_unimplemented_keyword_options(0x1000).is_ok());
+
+        let fatal = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=0x200000",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
+            "warning treated as error: -z max-page-size=0x200000 ignored: this backend uses fixed 0x1000 page alignment"
+        );
+
+        let fatal_image_base = parse_linker_args(&args(&[
+            "-Wl,--image-base=0x80000",
+            "-Wl,-z,pack-relative-relocs",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal_image_base
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
+            "warning treated as error: --image-base ignored: explicit image bases are not implemented for this backend"
+        );
+
+        let fatal_relr = parse_linker_args(&args(&[
+            "-Wl,-z,pack-relative-relocs",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal_relr
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
+            "warning treated as error: --pack-dyn-relocs=relr / -z pack-relative-relocs ignored: RELR packing is not implemented for this backend"
+        );
+    }
+
+    /// `-b FORMAT` / `--format FORMAT` select the format of the INPUT files
+    /// that follow (bfd `ld --help`: "Specify target for following input
+    /// files"); bfd links `gcc main.c -Wl,-b,binary` by reading the trailing
+    /// libraries as raw data, never by writing a flat image.  The parser
+    /// keeps the switch and its word out of the input list and leaves
+    /// `--oformat` alone; and, as under GNU ld's `getopt_long_only`,
+    /// `-build-id` is not `-b uild-id`.
+    /// A file named inside `-Wl,` is linked like one outside it (GNU ld
+    /// links `gcc m.c -Wl,h.o`; lccc dropped it), while the value of every
+    /// value-taking option -- acted on or not -- never becomes an input.
+    #[test]
+    fn wl_file_operands_are_inputs_and_option_values_are_not() {
+        let dir = std::env::temp_dir().join(format!("lccc-wl-operand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let obj = dir.join("h.o");
+        std::fs::write(&obj, b"").expect("file");
+        let obj = obj.to_string_lossy().into_owned();
+        let parsed = parse_linker_args(&args(&[&format!("-Wl,{obj}")]));
+        assert_eq!(parsed.extra_object_files, std::slice::from_ref(&obj));
+        assert!(parsed.inputs.iter().any(|i| i.name == obj));
+        let missing = parse_linker_args(&args(&["-Wl,/nonexistent/lccc/x.o"]));
+        assert_eq!(missing.missing_inputs, ["/nonexistent/lccc/x.o"]);
+        let mut wrong = Vec::new();
+        for opt in VALUE_TAKING
+            .iter()
+            .chain(super::super::binary_input::VALUE_WORDS)
+        {
+            // `-z` takes a keyword; the rest take a value this word stands
+            // in for (a defsym needs its `=`).
+            let value = match *opt {
+                "-z" => "now",
+                "--defsym" => "sym=0",
+                "-b" | "--format" | "-format" => "default",
+                _ => "valueword",
+            };
+            // Both the in-group and the split (`-Wl,OPT -Wl,VALUE`) forms.
+            for form in [
+                vec![format!("-Wl,{opt},{value}")],
+                vec![format!("-Wl,{opt}"), format!("-Wl,{value}")],
+            ] {
+                let form: Vec<&str> = form.iter().map(String::as_str).collect();
+                let parsed = parse_linker_args(&args(&form));
+                // `-l NAME` is the one option whose value is an input: a
+                // library, never a file operand.
+                let ok = if matches!(*opt, "-l" | "--library") {
+                    parsed.libs_to_load == [value]
+                        && parsed.inputs.len() == 1
+                        && parsed.inputs[0].is_lib
+                } else {
+                    parsed.inputs.is_empty()
+                };
+                if !ok || !parsed.missing_inputs.is_empty() {
+                    wrong.push(format!("{form:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "option values taken as inputs: {wrong:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GNU ld's `-L` / `-l` in every spelling, joined or separated, in one
+    /// group or split across two.
+    #[test]
+    fn wl_search_options_take_their_value_in_every_spelling() {
+        for spelling in [
+            &["-Wl,-L,/opt/x"][..],
+            &["-Wl,-L/opt/x"],
+            &["-Wl,--library-path,/opt/x"],
+            &["-Wl,--library-path=/opt/x"],
+            &["-Wl,-L", "-Wl,/opt/x"],
+        ] {
+            let parsed = parse_linker_args(&args(spelling));
+            assert_eq!(parsed.extra_lib_paths, ["/opt/x"], "{spelling:?}");
+            assert!(
+                parsed.inputs.is_empty() && parsed.missing_inputs.is_empty(),
+                "{spelling:?}"
+            );
+        }
+        for spelling in [
+            &["-Wl,-l,m"][..],
+            &["-Wl,-lm"],
+            &["-Wl,--library,m"],
+            &["-Wl,--library=m"],
+            &["-Wl,-l", "-Wl,m"],
+        ] {
+            let parsed = parse_linker_args(&args(spelling));
+            assert_eq!(parsed.libs_to_load, ["m"], "{spelling:?}");
+            assert!(parsed.missing_inputs.is_empty(), "{spelling:?}");
+        }
+        assert_eq!(search_option("-L", None), None);
+        assert_eq!(search_option("--library-path=", Some("x")), None);
+        assert_eq!(search_option("--library-pathx", Some("x")), None);
+        assert_eq!(
+            search_option("-lc", Some("x")),
+            Some((SearchOption::Lib("c"), false))
+        );
+        assert_eq!(
+            join_split_wl_values(&args(&["-Wl,-T", "-Wl,s.ld", "-Wl,-L", "x.o"])),
+            args(&["-Wl,-T,s.ld", "-Wl,-L", "x.o"])
+        );
+    }
+
+    #[test]
+    fn dash_b_is_the_input_format_not_oformat() {
+        for spelling in [
+            &["-Wl,-b,binary"][..],
+            &["-Wl,-bbinary"],
+            &["-Wl,-b", "-Wl,binary"],
+            &["-Wl,--format=binary"],
+            &["-Wl,--format", "-Wl,binary"],
+        ] {
+            let parsed = parse_linker_args(&args(spelling));
+            assert!(parsed.oformat.is_none(), "{spelling:?}");
+            assert!(
+                parsed.inputs.iter().all(|i| i.name != "binary"),
+                "{spelling:?}: the format word became an input"
+            );
+        }
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,--oformat=binary"]))
+                .oformat
+                .as_deref(),
+            Some("binary")
+        );
+        assert!(
+            parse_linker_args(&args(&["-Wl,-build-id"]))
+                .oformat
+                .is_none()
+        );
+    }
+
+    /// GNU ld 2.47's executable-stack switches (`ld/lexsup.c`): last wins,
+    /// and `--warn-execstack-objects` is the default (markers only).
+    #[test]
+    fn execstack_report_switches() {
+        let p = |a: &[&str]| parse_linker_args(&args(a));
+        let none = p(&[]);
+        assert_eq!((none.warn_execstack, none.error_execstack), (None, false));
+        assert_eq!(p(&["-Wl,--warn-execstack"]).warn_execstack, Some(true));
+        assert_eq!(p(&["-Wl,--no-warn-execstack"]).warn_execstack, Some(false));
+        assert_eq!(
+            p(&["-Wl,--warn-execstack", "-Wl,--warn-execstack-objects"]).warn_execstack,
+            None
+        );
+        assert!(p(&["-Wl,--error-execstack"]).error_execstack);
+        assert!(!p(&["-Wl,--error-execstack", "-Wl,--no-error-execstack"]).error_execstack);
+    }
+
+    #[test]
+    fn warn_rwx_segments_defaults_on_and_last_toggle_wins() {
+        assert!(parse_linker_args(&args(&[])).warn_rwx_segments);
+        assert!(parse_linker_args(&args(&["--warn-rwx-segments"])).warn_rwx_segments);
+        assert!(!parse_linker_args(&args(&["--no-warn-rwx-segments"])).warn_rwx_segments);
+        assert!(
+            parse_linker_args(&args(&["--no-warn-rwx-segments", "--warn-rwx-segments",]))
+                .warn_rwx_segments
+        );
+        assert!(
+            !parse_linker_args(&args(&["--warn-rwx-segments", "--no-warn-rwx-segments",]))
+                .warn_rwx_segments
+        );
+        let via_wl = parse_linker_args(&args(&["-Wl,--no-warn-rwx-segments,--fatal-warnings"]));
+        assert!(!via_wl.warn_rwx_segments);
+        assert!(via_wl.fatal_warnings);
+    }
+
+    #[test]
+    fn warn_common_is_retained_for_driver_links() {
+        let plain = parse_linker_args(&args(&["--warn-common"]));
+        assert!(plain.warn_common);
+
+        let via_wl = parse_linker_args(&args(&["-Wl,--warn-common"]));
+        assert!(via_wl.warn_common);
+
+        let fatal = parse_linker_args(&args(&["-Wl,--fatal-warnings,--warn-common"]));
+        assert!(fatal.warn_common);
+        assert!(fatal.fatal_warnings);
+    }
+
+    #[test]
+    fn ignored_keyword_warnings_obey_fatal_state() {
+        let warning = parse_linker_args(&args(&["-Wl,-z,common-page-size=0x1000"]));
+        assert!(warning.warn_unimplemented_keyword_options(0x1000).is_ok());
+
+        let fatal = parse_linker_args(&args(&[
+            "-Wl,-z,common-page-size=0x1000",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
+            "warning treated as error: -z common-page-size=0x1000 ignored"
+        );
+    }
+
+    #[test]
+    fn unimplemented_cross_keyword_warnings_obey_fatal_state() {
+        for kw in [
+            "origin",
+            "nodelete",
+            "nodlopen",
+            "initfirst",
+            "interpose",
+            "nodefaultlib",
+            "global",
+            "not-a-real-keyword",
+        ] {
+            let option = format!("-Wl,-z,{kw}");
+            let fatal = parse_linker_args(&args(&[option.as_str(), "-Wl,--fatal-warnings"]));
+            assert_eq!(
+                fatal
+                    .warn_unimplemented_keyword_options(0x1000)
+                    .unwrap_err(),
+                format!("warning treated as error: -z {kw} ignored")
+            );
+        }
+        for kw in ["separate-code", "combreloc"] {
+            let option = format!("-Wl,-z,{kw}");
+            let default = parse_linker_args(&args(&[option.as_str(), "-Wl,--fatal-warnings"]));
+            assert!(default.warn_unimplemented_keyword_options(0x1000).is_ok());
+        }
+    }
+
+    /// `--no-undefined-version` is a real GNU flag ("Disallow undefined
+    /// version") so both the plain and the `-Wl,` spelling must parse —
+    /// it is recorded, not enforced (see the field docs).
+    #[test]
+    fn no_undefined_version_parses_but_is_record_only() {
+        let r = parse_linker_args(&args(&["--no-undefined-version"]));
+        assert!(r.no_undefined_version);
+        let r = parse_linker_args(&args(&["-Wl,--no-undefined-version"]));
+        assert!(r.no_undefined_version);
+        let r = parse_linker_args(&args(&[]));
+        assert!(!r.no_undefined_version);
+    }
+
+    /// `property_link_flags` maps the parsed `-z` state onto the CET
+    /// merge flags, and renders an invalid level with GNU's wording.
+    #[test]
+    fn property_link_flags_maps_levels_and_rejects_invalid() {
+        let r = parse_linker_args(&args(&["-Wl,-z,ibt", "-Wl,-z,shstk", "-Wl,-z,x86-64-v3"]));
+        let f = r.property_link_flags().expect("valid flags must convert");
+        assert!(f.ibt && f.shstk);
+        assert!(!f.lam_u48 && !f.lam_u57);
+        assert_eq!(f.isa_level, 3);
+
+        let bad = parse_linker_args(&args(&["-Wl,-z,x86-64-v9"]));
+        assert_eq!(
+            bad.property_link_flags().unwrap_err(),
+            "invalid x86-64 ISA level: x86-64-v9"
+        );
+        // Deferred rejection is any-invalid-wins: GNU would have fatalled
+        // at parse time on the bad keyword no matter what surrounds it.
+        let mixed = parse_linker_args(&args(&["-Wl,-z,x86-64-v3", "-Wl,-z,x86-64-v9"]));
+        assert!(mixed.property_link_flags().is_err());
+        let mixed2 = parse_linker_args(&args(&["-Wl,-z,x86-64-v9", "-Wl,-z,x86-64-v3"]));
+        assert!(mixed2.property_link_flags().is_err());
+    }
+
+    /// `lccc-ld` keeps its input files apart from the options: each takes
+    /// the `--as-needed` state of its position, `--push-state` scoping
+    /// included, which is the state `parse_linker_args` records for an
+    /// input named inline at that position.
+    #[test]
+    fn as_needed_states_follow_the_position() {
+        let opts = args(&[
+            "--as-needed",
+            "--push-state",
+            "--no-as-needed",
+            "--pop-state",
+            "--no-as-needed",
+        ]);
+        assert_eq!(
+            as_needed_states(&opts, &[0, 1, 3, 4, 5]),
+            [false, true, false, true, false]
+        );
+        assert_eq!(as_needed_states(&opts, &[4, 4, 9]), [true, true, false]);
+        for at in 0..=opts.len() {
+            let mut inline = opts.clone();
+            inline.insert(at, "-lx".to_string());
+            let parsed = parse_linker_args(&inline);
+            assert_eq!(
+                [parsed.inputs[0].as_needed],
+                *as_needed_states(&opts, &[at]),
+                "input before argument {at}"
+            );
+        }
+        // A recorded state wins; without one, the driver's rule applies.
+        assert!(!object_as_needed(&[false], 0, &[], "./a.so"));
+        assert!(object_as_needed(&[], 0, &[], "./a.so"));
+    }
+}

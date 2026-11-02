@@ -1,0 +1,4 @@
+baseline zero-symbol shared ADR: exit=0
+
+P=0x10008, delta=-65544, link-time target=0x0, target at B=0x70000000: 0x70000000 (incorrectly B, not 0)
+aarch64-linux-gnu-ld: exit=0

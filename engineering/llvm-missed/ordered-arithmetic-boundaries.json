@@ -1,0 +1,11 @@
+{
+ "lccc": "target/fastbuild/lccc",
+ "gcc": "work/toolchains/gcc-16/bin/gcc-16",
+ "seeds": "0:20",
+ "levels": "O2,O3",
+ "march": "x86-64,x86-64-v3",
+ "cases": 4533,
+ "mismatches": [],
+ "generator_defects": [],
+ "builds": 160
+}

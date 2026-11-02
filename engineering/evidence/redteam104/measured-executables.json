@@ -1,0 +1,150 @@
+{
+  "archive": "S104-MEASURED-EXECUTABLES.tar.xz",
+  "bytes": 356224,
+  "sha256": "4e0efa977e926bd6e0dc823252e53257652261e0456a444d1bd842528d1847d7",
+  "members": [
+    {
+      "path": "mask/candidate-O0",
+      "bytes": 7832,
+      "sha256": "8354c84cd0ca700afdb8e44e3a83817d1cf46bd91561395611a16adf24a42ea4"
+    },
+    {
+      "path": "mask/candidate-O1",
+      "bytes": 6872,
+      "sha256": "f71548964c3578b66e359115f3aec3b5a6284a7d837ec9d848103ed7a2ed9f62"
+    },
+    {
+      "path": "mask/candidate-O2",
+      "bytes": 6528,
+      "sha256": "ce50720d7421e6e7f6f340ab4eb19b61bc986ef6c9880dc9f270347087c906fb"
+    },
+    {
+      "path": "mask/candidate-O3",
+      "bytes": 6528,
+      "sha256": "ce50720d7421e6e7f6f340ab4eb19b61bc986ef6c9880dc9f270347087c906fb"
+    },
+    {
+      "path": "mask/candidate-Os",
+      "bytes": 6440,
+      "sha256": "f7ee9a5a1f7441665e27e9f14b43ce17284ff19d6d3fdf3e2dce165fa89c23e6"
+    },
+    {
+      "path": "mask/prior-O0",
+      "bytes": 7832,
+      "sha256": "8354c84cd0ca700afdb8e44e3a83817d1cf46bd91561395611a16adf24a42ea4"
+    },
+    {
+      "path": "mask/prior-O1",
+      "bytes": 6872,
+      "sha256": "f71548964c3578b66e359115f3aec3b5a6284a7d837ec9d848103ed7a2ed9f62"
+    },
+    {
+      "path": "mask/prior-O2",
+      "bytes": 6560,
+      "sha256": "59d6723bf31287498856e87885e7f6638659cff43776029a798d925f617e91e7"
+    },
+    {
+      "path": "mask/prior-O3",
+      "bytes": 6560,
+      "sha256": "59d6723bf31287498856e87885e7f6638659cff43776029a798d925f617e91e7"
+    },
+    {
+      "path": "mask/prior-Os",
+      "bytes": 6488,
+      "sha256": "d73a7850095de7afb553915cafe13add3db83eb7ae616d0b7f6370370884cce9"
+    },
+    {
+      "path": "mask/gcc-O0",
+      "bytes": 16056,
+      "sha256": "8d99ed72712f03c08b9c09ab97eed8f9d2d7eed3e0a75cb4c6033e937312ecb4"
+    },
+    {
+      "path": "mask/gcc-O1",
+      "bytes": 16032,
+      "sha256": "99f10ce0877ba23d308405dc96c629719d1ee2c3712b8498dbf8477b6d62ca46"
+    },
+    {
+      "path": "mask/gcc-O2",
+      "bytes": 16032,
+      "sha256": "2f73f8a91bca5584fe87e99421fd80e645b7d5c640f00f843e8b4c7f3b0c686a"
+    },
+    {
+      "path": "mask/gcc-O3",
+      "bytes": 16032,
+      "sha256": "2f73f8a91bca5584fe87e99421fd80e645b7d5c640f00f843e8b4c7f3b0c686a"
+    },
+    {
+      "path": "mask/gcc-Os",
+      "bytes": 16032,
+      "sha256": "62ca01e5b867edd4cd0fe03e34635ded4a7b9cf9f665a588ec0cdd4641ddf078"
+    },
+    {
+      "path": "mask/clang-O0",
+      "bytes": 16144,
+      "sha256": "f7b6c1d22ae87a4395080a7ea618de74fb38736af5a6cd1cf2b28a9035699b64"
+    },
+    {
+      "path": "mask/clang-O1",
+      "bytes": 16064,
+      "sha256": "882cd08cb19f3e3b486c442cb4a88f447d42920681c59d0dbd51f9eb085bedf5"
+    },
+    {
+      "path": "mask/clang-O2",
+      "bytes": 16064,
+      "sha256": "fb6533bc461b4dd1dd6f5d3d939717b294452fcd5ae7bd636565300b39dc9d93"
+    },
+    {
+      "path": "mask/clang-O3",
+      "bytes": 16064,
+      "sha256": "fb6533bc461b4dd1dd6f5d3d939717b294452fcd5ae7bd636565300b39dc9d93"
+    },
+    {
+      "path": "mask/clang-Os",
+      "bytes": 16064,
+      "sha256": "2c4235930d909626f7f52227e800051e02e1e7fef30fe754069ded45778d1b23"
+    },
+    {
+      "path": "mask/icx-O0",
+      "bytes": 16088,
+      "sha256": "b781b7aa03ce34972c05b092903360e51585822833360ae2356770b2d450a83b"
+    },
+    {
+      "path": "mask/icx-O1",
+      "bytes": 16016,
+      "sha256": "38ce3b2d7499ddd05fb5cb903b5e863578cb2ffb4754754cf6c1f7d4cb80d8cc"
+    },
+    {
+      "path": "mask/icx-O2",
+      "bytes": 16016,
+      "sha256": "38ce3b2d7499ddd05fb5cb903b5e863578cb2ffb4754754cf6c1f7d4cb80d8cc"
+    },
+    {
+      "path": "mask/icx-O3",
+      "bytes": 16016,
+      "sha256": "94e7d577ca702a4c519246d5df939f0cd604b913cbc855f53d5e3513511d21e2"
+    },
+    {
+      "path": "mask/icx-Os",
+      "bytes": 16016,
+      "sha256": "4b1671bf0036a6a39c0f228b14b66685e7df25011cbc5ee31348fc86799b0963"
+    },
+    {
+      "path": "mask/no-bmi2",
+      "bytes": 6560,
+      "sha256": "d2e34bbfbcdd37b93fcfec16969eb9edaaaa8f70ded71c03f62df290906b54ed"
+    },
+    {
+      "path": "zstd/driver-candidate",
+      "bytes": 755608,
+      "sha256": "c662e1950591e34db234d16e972064f0074c5b4f59d24b69a4b59c12df207a2f"
+    },
+    {
+      "path": "zstd/cli-candidate",
+      "bytes": 1044432,
+      "sha256": "5906852ea8c53035205f5119463c9f25390995b1420fb2d3e746f854441521b3"
+    }
+  ],
+  "baseline_and_gcc": "artifacts/S103-ZSTD-GNU17-EXECUTABLES.tar.xz",
+  "native45": "byte-identical to retained S101 ELFs; see identity45.json.gz",
+  "inputs": "artifacts/S101-ZSTD-INPUTS.tar.xz"
+}

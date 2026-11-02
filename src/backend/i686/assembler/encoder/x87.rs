@@ -1,0 +1,453 @@
+//! x87 FPU instruction encoders for i686.
+//!
+//! Handles x87 floating-point load/store, arithmetic, comparison,
+//! and control instructions.
+
+use super::*;
+
+impl super::InstructionEncoder {
+    // ---- x87 FPU encoding (identical to x86-64, no REX needed) ----
+
+    pub(super) fn encode_x87_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
+        self.encode_x87_mem_raw(ops, opcode, ext)
+    }
+
+    /// Body of encode_x87_mem without segment-prefix handling.
+    /// encode_x87_wait_mem uses this so the override precedes 0x9B.
+    fn encode_x87_mem_raw(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("x87 mem op requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Memory(mem) => {
+                self.bytes.extend_from_slice(opcode);
+                self.encode_modrm_mem(ext, mem)
+            }
+            _ => Err("x87 mem op requires memory operand".to_string()),
+        }
+    }
+
+    pub(super) fn encode_x87_wait_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
+        // GAS emits the FWAIT (0x9B) byte BEFORE the segment override:
+        // `9b 26 d9 70 08` for `fstenv %es:8(%eax)` (binutils 2.44).
+        self.bytes.push(0x9B);
+        self.encode_x87_mem_raw(ops, opcode, ext)
+    }
+
+    pub(super) fn encode_fld_st(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("fld requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let n = parse_st_num(&reg.name)?;
+                self.bytes.extend_from_slice(&[0xD9, 0xC0 + n]);
+                Ok(())
+            }
+            _ => Err("fld requires st register".to_string()),
+        }
+    }
+
+    pub(super) fn encode_fstp_st(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err("fstp requires 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let n = parse_st_num(&reg.name)?;
+                self.bytes.extend_from_slice(&[0xDD, 0xD8 + n]);
+                Ok(())
+            }
+            _ => Err("fstp requires st register".to_string()),
+        }
+    }
+
+    pub(super) fn encode_fxch(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.is_empty() {
+            // fxch with no operand defaults to st(1)
+            self.bytes.extend_from_slice(&[0xD9, 0xC9]);
+            return Ok(());
+        }
+        if ops.len() == 1 || ops.len() == 2 {
+            // With 1 operand: fxch %st(i)
+            // With 2 operands: fxch %st(i), %st (AT&T syntax)
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xD9, 0xC8 + n]);
+                    Ok(())
+                }
+                _ => Err("fxch requires st register".to_string()),
+            }
+        } else {
+            Err("fxch requires 0, 1 or 2 operands".to_string())
+        }
+    }
+
+    /// Encode fnstsw (store FPU status word).
+    pub(super) fn encode_fnstsw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        self.encode_fnstsw_raw(ops)
+    }
+
+    /// Body of encode_fnstsw without segment-prefix handling (see
+    /// encode_fstsw, which must place the override before 0x9B).
+    fn encode_fnstsw_raw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.is_empty() {
+            // fnstsw with no operand defaults to %ax
+            self.bytes.extend_from_slice(&[0xDF, 0xE0]);
+            return Ok(());
+        }
+        if ops.len() != 1 {
+            return Err("fnstsw requires 0 or 1 operand".to_string());
+        }
+        match &ops[0] {
+            Operand::Register(reg) if reg.name == "ax" => {
+                self.bytes.extend_from_slice(&[0xDF, 0xE0]);
+                Ok(())
+            }
+            Operand::Memory(mem) => {
+                self.bytes.push(0xDD);
+                self.encode_modrm_mem(7, mem)
+            }
+            _ => Err("fnstsw requires %ax or memory operand".to_string()),
+        }
+    }
+
+    pub(super) fn encode_fstsw(&mut self, ops: &[Operand]) -> Result<(), String> {
+        // GAS order: FWAIT first, then the segment override (`9b 26 dd 78 08`).
+        self.bytes.push(0x9B);
+        self.encode_fnstsw_raw(ops)
+    }
+
+    pub(super) fn encode_x87_st_i(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        base: u8,
+        name: &str,
+    ) -> Result<(), String> {
+        if ops.len() != 1 {
+            return Err(format!("{} requires 1 st register operand", name));
+        }
+        match &ops[0] {
+            Operand::Register(reg) => {
+                let n = parse_st_num(&reg.name)?;
+                self.bytes.extend_from_slice(opcode);
+                self.bytes.push(base + n);
+                Ok(())
+            }
+            _ => Err(format!("{} requires st register", name)),
+        }
+    }
+
+    /// Encode the x87 forms whose ModR/M byte is `base + i` over an implicit
+    /// `st(0)`: `fcomi`, `fcomip`, `fucomi`, `fucomip`, `fcmovcc` and `ffreep`.
+    ///
+    /// Both spellings the assembler accepts are handled — `fcomip %st(3)` and
+    /// `fcomip %st(3),%st` — plus the bare `fcomi`, which GAS defines as
+    /// `%st(1)`.  The AT&T operand order for these rows is `%st(i),%st` (the
+    /// table's `{ FloatReg, FloatAcc }`), so it is the *second* operand that
+    /// has to be the implicit `st(0)`: `fcomip %st,%st(3)` names a different
+    /// comparison and is rejected rather than silently encoded as `%st(3)`.
+    pub(super) fn encode_x87_st0_sti(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        base: u8,
+        default_reg: Option<u8>,
+        name: &str,
+    ) -> Result<(), String> {
+        let n = match ops {
+            [] => default_reg.ok_or_else(|| format!("`{name}' requires an st register operand"))?,
+            [Operand::Register(reg)] => parse_st_num(&reg.name)?,
+            [Operand::Register(first), Operand::Register(second)] => {
+                if parse_st_num(&second.name)? != 0 {
+                    return Err(format!("`{name}' requires %st as its second operand"));
+                }
+                parse_st_num(&first.name)?
+            }
+            _ => return Err(format!("`{name}' requires an st register operand")),
+        };
+        self.bytes.extend_from_slice(&[opcode, base + n]);
+        Ok(())
+    }
+
+    pub(super) fn encode_fcom(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() == 1 || ops.len() == 2 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xD8, 0xD0 + n]);
+                    Ok(())
+                }
+                _ => Err("fcom requires st register".to_string()),
+            }
+        } else if ops.is_empty() {
+            self.bytes.extend_from_slice(&[0xD8, 0xD1]);
+            Ok(())
+        } else {
+            Err("fcom requires 0, 1 or 2 operands".to_string())
+        }
+    }
+
+    pub(super) fn encode_fcomp(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() == 1 || ops.len() == 2 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xD8, 0xD8 + n]);
+                    Ok(())
+                }
+                _ => Err("fcomp requires st register".to_string()),
+            }
+        } else if ops.is_empty() {
+            self.bytes.extend_from_slice(&[0xD8, 0xD9]);
+            Ok(())
+        } else {
+            Err("fcomp requires 0, 1 or 2 operands".to_string())
+        }
+    }
+
+    /// Encode fucomi (unordered compare and set EFLAGS).
+    /// Encode fucomp (unordered compare and pop, sets FPU status word).
+    pub(super) fn encode_fucomp(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() == 1 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xDD, 0xE8 + n]);
+                    Ok(())
+                }
+                _ => Err("fucomp requires st register".to_string()),
+            }
+        } else if ops.len() == 2 {
+            // AT&T syntax: fucomp %st(1), %st  — first operand is the source
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xDD, 0xE8 + n]);
+                    Ok(())
+                }
+                _ => Err("fucomp requires st register".to_string()),
+            }
+        } else if ops.is_empty() {
+            // Default: fucomp %st(1)
+            self.bytes.extend_from_slice(&[0xDD, 0xE9]);
+            Ok(())
+        } else {
+            Err("fucomp requires 0, 1 or 2 operands".to_string())
+        }
+    }
+
+    /// Encode fucom (unordered compare, sets FPU status word, no pop).
+    pub(super) fn encode_fucom(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() == 1 {
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xDD, 0xE0 + n]);
+                    Ok(())
+                }
+                _ => Err("fucom requires st register".to_string()),
+            }
+        } else if ops.len() == 2 {
+            // AT&T syntax: fucom %st(1), %st — first operand is the source
+            match &ops[0] {
+                Operand::Register(reg) => {
+                    let n = parse_st_num(&reg.name)?;
+                    self.bytes.extend_from_slice(&[0xDD, 0xE0 + n]);
+                    Ok(())
+                }
+                _ => Err("fucom requires st register".to_string()),
+            }
+        } else if ops.is_empty() {
+            // Default: fucom %st(1)
+            self.bytes.extend_from_slice(&[0xDD, 0xE1]);
+            Ok(())
+        } else {
+            Err("fucom requires 0, 1 or 2 operands".to_string())
+        }
+    }
+
+    /// Map a `sym@MOD` modifier to its relocation type (`i686_modifier_reloc`);
+    /// an unknown modifier is the GNU as error, never a silent `R_386_32`.
+    pub(super) fn tls_reloc_type(&self, modifier: &str) -> Result<u32, String> {
+        super::core::i686_modifier_reloc(modifier)
+            .ok_or_else(|| format!("unknown i686 relocation modifier: @{}", modifier))
+    }
+
+    /// Encode x87 register-register arithmetic (fadd/fmul/fsub/fdiv with st(i) operands).
+    pub(super) fn encode_x87_arith_reg(
+        &mut self,
+        ops: &[Operand],
+        opcode_st0: u8,
+        opcode_sti: u8,
+        base_modrm: u8,
+    ) -> Result<(), String> {
+        match ops.len() {
+            0 => {
+                // Bare `fadd` is `faddp %st, %st(1)` (GAS 2.47: DE C1):
+                // the no-operand form pops. The D8 default encoded the
+                // non-popping `fadd %st(1), %st` instead. DE pop bases
+                // coincide with the D8/DC bases, so only the opcode changes.
+                self.bytes.extend_from_slice(&[0xDE, base_modrm + 1]);
+                Ok(())
+            }
+            1 => {
+                // fadd %st(i) -> st(0) = st(0) op st(i)
+                match &ops[0] {
+                    Operand::Register(reg) => {
+                        let n = parse_st_num(&reg.name)?;
+                        self.bytes.extend_from_slice(&[opcode_st0, base_modrm + n]);
+                        Ok(())
+                    }
+                    _ => Err("x87 arith requires st register operand".to_string()),
+                }
+            }
+            2 => {
+                // Two operands: fadd %st(i), %st or fadd %st, %st(i)
+                match (&ops[0], &ops[1]) {
+                    (Operand::Register(src), Operand::Register(dst)) => {
+                        let src_n = parse_st_num(&src.name)?;
+                        let dst_n = parse_st_num(&dst.name)?;
+                        if dst_n == 0 {
+                            // fadd %st(i), %st -> D8 (base + i)
+                            self.bytes
+                                .extend_from_slice(&[opcode_st0, base_modrm + src_n]);
+                        } else if src_n == 0 {
+                            // fadd %st, %st(i) -> DC (base + i). The DC base
+                            // is the instruction's OWN base (verified vs GNU
+                            // as 2.47): fsub %st,%st(i) = DC E0+i, fsubr =
+                            // DC E8+i, fdiv = DC F0+i, fdivr = DC F8+i.
+                            // NO swap -- the old remap table encoded fsub as
+                            // fsubr (DC EC for `fsub %st,%st(4)`).
+                            self.bytes
+                                .extend_from_slice(&[opcode_sti, base_modrm + dst_n]);
+                        } else {
+                            return Err("x87 arith: one operand must be st(0)".to_string());
+                        }
+                        Ok(())
+                    }
+                    _ => Err("x87 arith requires st register operands".to_string()),
+                }
+            }
+            _ => Err("x87 arith requires 0-2 operands".to_string()),
+        }
+    }
+
+    /// Encode the x87 popping arithmetic forms (`faddp` ... `fdivrp`):
+    /// `DE base+N`. Bare is st(1); one register encodes its own index;
+    /// two registers encode the nonzero one. A reversed pair is only
+    /// legal for `faddp`/`fmulp` (commutative); the rest are GAS's
+    /// `operand type mismatch` (the reversal would change the result).
+    pub(super) fn encode_x87_pop_reg(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        base_modrm: u8,
+    ) -> Result<(), String> {
+        let n = match ops.len() {
+            0 => 1,
+            1 => match &ops[0] {
+                Operand::Register(reg) => parse_st_num(&reg.name)?,
+                _ => return Err("x87 pop arith requires st register operand".to_string()),
+            },
+            2 => match (&ops[0], &ops[1]) {
+                (Operand::Register(a), Operand::Register(b)) => {
+                    let (x, y) = (parse_st_num(&a.name)?, parse_st_num(&b.name)?);
+                    if x == 0 {
+                        y
+                    } else if y == 0 {
+                        if !matches!(mnemonic, "faddp" | "fmulp") {
+                            return Err(format!("operand type mismatch for `{mnemonic}'"));
+                        }
+                        x
+                    } else {
+                        return Err("x87 pop arith: one operand must be st(0)".to_string());
+                    }
+                }
+                _ => return Err("x87 pop arith requires st register operands".to_string()),
+            },
+            _ => return Err("x87 pop arith requires 0-2 operands".to_string()),
+        };
+        self.bytes.extend_from_slice(&[0xDE, base_modrm + n]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod x87_pop_tests {
+    use super::*;
+
+    fn instruction(mnemonic: &str, operands: Vec<Operand>) -> Instruction {
+        Instruction {
+            prefixes: Vec::new(),
+            mnemonic: mnemonic.to_owned(),
+            operands,
+            nf: false,
+            force_evex: false,
+            vex_hint: None,
+            force_rex2: false,
+            dfv: 0,
+        }
+    }
+
+    fn reg(name: &str) -> Operand {
+        Operand::Register(Register {
+            name: name.to_owned(),
+            mask: None,
+            zeroing: false,
+            broadcast: None,
+        })
+    }
+
+    fn hex_of(mnemonic: &str, operands: Vec<Operand>) -> String {
+        let mut enc = InstructionEncoder::new();
+        enc.encode(&instruction(mnemonic, operands)).unwrap();
+        enc.bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn pop_forms_encode_their_register() {
+        assert_eq!(hex_of("faddp", vec![]), "de c1");
+        assert_eq!(hex_of("faddp", vec![reg("st(3)")]), "de c3");
+        assert_eq!(hex_of("fsubp", vec![reg("st(7)")]), "de e7");
+        assert_eq!(hex_of("faddp", vec![reg("st"), reg("st(2)")]), "de c2");
+        assert_eq!(hex_of("fdivrp", vec![reg("st"), reg("st(5)")]), "de fd");
+    }
+
+    #[test]
+    fn bare_arith_is_the_popping_form() {
+        assert_eq!(hex_of("fadd", vec![]), "de c1");
+        assert_eq!(hex_of("fsub", vec![]), "de e1");
+        assert_eq!(hex_of("fmul", vec![]), "de c9");
+    }
+
+    #[test]
+    fn dc_two_operand_forms_keep_their_own_base() {
+        // The old swap table encoded `fsub %st,%st(4)` as DC EC (fsubr).
+        assert_eq!(hex_of("fsub", vec![reg("st"), reg("st(4)")]), "dc e4");
+        assert_eq!(hex_of("fsubr", vec![reg("st"), reg("st(4)")]), "dc ec");
+        assert_eq!(hex_of("fdiv", vec![reg("st"), reg("st(4)")]), "dc f4");
+        assert_eq!(hex_of("fdivr", vec![reg("st"), reg("st(4)")]), "dc fc");
+    }
+}

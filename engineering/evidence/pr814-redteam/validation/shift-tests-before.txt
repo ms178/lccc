@@ -1,0 +1,29 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 4m 17s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-267d0aafaf8b1eea)
+
+running 6 tests
+test backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::debug_locations_do_not_consume_the_instruction_window ... FAILED
+test backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::a_plain_shift_and_add_still_folds ... ok
+test backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::refuses_to_cross_a_cqto_implicit_read ... ok
+test backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::refuses_to_cross_an_idivq_implicit_write ... ok
+test backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::refuses_to_cross_bytes_that_can_read_flags_or_registers ... ok
+test backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::still_folds_across_a_harmless_line ... ok
+
+failures:
+
+---- backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::debug_locations_do_not_consume_the_instruction_window stdout ----
+
+thread 'backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::debug_locations_do_not_consume_the_instruction_window' (14073) panicked at src/backend/x86/codegen/peephole/passes/local_patterns.rs:12108:9:
+assertion `left == right` failed
+  left: ".text\nf:\n.cfi_startproc\nshlq $3, %rcx\nmovq %rsi, %rdi\nleaq bins(%rip), %r9\naddq %rcx, %r9\nmovq %r9, %rax\nret\n.cfi_endproc"
+ right: ".text\nf:\n.cfi_startproc\nmovq %rsi, %rdi\nleaq bins(%rip), %r9\nleaq (%r9, %rcx, 8), %r9\nmovq %r9, %rax\nret\n.cfi_endproc"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    backend::x86::codegen::peephole::passes::local_patterns::shift_into_sib_tests::debug_locations_do_not_consume_the_instruction_window
+
+test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 4674 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

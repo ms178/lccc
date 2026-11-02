@@ -1,0 +1,12 @@
+gcc -O0 strict reciprocal pack: 140 cases OK
+base -O0 strict reciprocal pack: 140 cases OK
+cand -O0 strict reciprocal pack: 140 cases OK
+gcc -O2 strict reciprocal pack: 140 cases OK
+base -O2 strict reciprocal pack: 140 cases OK
+cand -O2 strict reciprocal pack: 140 cases OK
+gcc -O3 strict reciprocal pack: 140 cases OK
+base -O3 strict reciprocal pack: 140 cases OK
+cand -O3 strict reciprocal pack: 140 cases OK
+no-xmm strict reciprocal pack: 140 cases OK
+no-avx strict reciprocal pack: 140 cases OK
+mixed-sign packed code emitted and all 11 executions returned 140 cases OK

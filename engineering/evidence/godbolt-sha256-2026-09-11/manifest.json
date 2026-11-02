@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "source": "tests/benchmark/programs/sha256_transform.c",
+  "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+  "function": "sha256_transform",
+  "remote_flags": "-O2",
+  "local_flags": "-O2",
+  "oracles": [
+    {
+      "key": "lccc",
+      "id": "target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O2",
+      "instructions": 206,
+      "artifact_retained": true
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2",
+      "instructions": 154,
+      "artifact_retained": true
+    },
+    {
+      "key": "clang23.1",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2",
+      "instructions": 126,
+      "artifact_retained": true
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O2",
+      "instructions": 1069,
+      "artifact_retained": false,
+      "note": "1085-line fully-unrolled output; not retained. The only cited fact is the instruction count, recorded above."
+    },
+    {
+      "key": "icc",
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": "",
+      "flags": "-O2",
+      "error": "function 'sha256_transform' was not emitted (likely inlined or removed)",
+      "artifact_retained": true
+    }
+  ]
+}

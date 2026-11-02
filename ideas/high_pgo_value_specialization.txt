@@ -1,0 +1,63 @@
+PGO Value Specialization (constant-argument specialization)
+============================================================
+Priority: MEDIUM-HIGH
+
+Idea
+----
+The PGO value profiler today records only **indirect-call targets**. Extend it
+to record the *values* of hot call-site arguments, then specialize the hot path
+for the dominating constant(s):
+
+```c
+// before
+int r = compute(mode, buf, n);      // mode is almost always 2 in the profile
+
+// after specialization
+if (mode == 2) { ... body of compute with mode folded to 2 ... }
+else           { r = compute(mode, buf, n); }
+```
+
+This is the scalar analogue of the indirect-call promotion already in the
+codebase: a guarded fast path where the dominating argument value is a compile
+time constant, letting constant folding + DCE + strength reduction collapse the
+specialized body.
+
+Why it is valuable
+------------------
+- Many real workloads call a general function with one overwhelmingly common
+  constant argument (a config flag, an enum mode, a size class). GCC/LLVM
+  capture this via `-fprofile-values` + `-fipa-sra`/specialization.
+- It compounds with the existing `ipcp.rs` (interprocedural constant
+  propagation) but does not require whole-program proof — it is a *guarded*
+  specialization, safe under aliasing and undefined-behavior rules.
+
+What to build
+-------------
+1. Extend the per-site value-profile record (currently `ValueSite` for targets)
+   with **argument value histograms** for hot sites (top-N constant operands).
+2. Emit the histogram in the instrumented build the same way the target slots
+   are emitted today.
+3. At use time, when a site's dominating constant argument occurs ≥ `stable`
+   fraction, clone the callee body with the argument replaced by the constant,
+   emit `cmp arg, const; jne cold; call specialized; cold: call original`.
+4. Only for acyclic (or shallow) callees and only when the constant appears in
+   cheap-to-fold positions (switches, bounds, arithmetic) to bound code growth.
+
+Risks
+-----
+- Code-size growth (same guard as devirtualization); guard with a budget.
+- Must not fire on arguments that are pointers with observable identity, or on
+  `volatile`, or where folding would be semantically wrong. Gate on the same
+  signature-checking as promotion.
+
+Measurable success
+------------------
+- A kernel whose hot function is called with a dominant constant `mode` should
+  show the specialized body eliminating the branch/switch and arithmetic.
+- No >1% regression on the broad suite; bounded `.text` growth.
+
+Key files
+- src/pgo/instrument.rs (value-profiling extension)
+- src/pgo/promote.rs (reuse the guarded-clone transform)
+- reference: LLVM `-pgo-icall-promotion`, GCC `-fipa-*` + value profiling,
+  ICC `-prof-use`.

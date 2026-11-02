@@ -1,0 +1,516 @@
+//! I686Codegen: global address operations (global, label, TLS) and the
+//! folded absolute-address load/store forms.
+//!
+//! All address-formation paths follow the register-direct convention of
+//! the folded load: a register-assigned destination is written directly,
+//! avoiding the `movl %eax, %reg` copy the accumulator staging would add.
+//! When the destination has no register, the value is staged through
+//! `%eax` and `store_eax_to` (which already elides the copy for a
+//! destination homed in `%eax` itself).
+//!
+//! # Fold gates (defense in depth)
+//!
+//! The absolute load/store folds are gated upstream: `is_foldable_mem_ty`
+//! excludes `F128` and 128-bit integers, `rip_rel_blocked` excludes GOT,
+//! TLS and absolute symbols, and `supports_global_addr_fold` is false in
+//! PIC mode. The `assert!`s below are a second line of defense for a
+//! miscompile-critical boundary — the failure mode of a leaked fold is a
+//! silently wrong address, so the checks stay in release builds too.
+//! Each runs once per folded instruction; the cost is noise next to
+//! string emission.
+
+use super::emit::I686Codegen;
+use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
+use crate::emit;
+use crate::ir::reexports::TlsModel;
+use crate::ir::reexports::{IrConst, Operand, Value};
+
+/// Memory-operand text for the high word of a 64-bit (pair) access at
+/// `sym`, whose text may already carry a constant offset (`sym+38`).
+///
+/// The pair paths used to spell `sym` and then append a literal `+4`
+/// unconditionally, which produced `boot_params+38+4` — legal GAS syntax (the
+/// expression is folded), but it hides the real offset from every tool that
+/// reads the assembly and, until the assembler learned to fold chained terms,
+/// it also produced a bogus undefined symbol named `boot_params+38`.  Folding
+/// here keeps the emitted text as simple as what GCC/Clang write.
+/// Magnitude of a constant tail as written in an AT&T memory operand
+/// (`12`, `0x1f`, `0b101`).  `None` means the tail is not a constant, so the
+/// caller must not touch it.
+fn pair_offset_magnitude(tail: &str) -> Option<i64> {
+    if let Some(digits) = tail.strip_prefix("0x").or_else(|| tail.strip_prefix("0X")) {
+        return i64::from_str_radix(digits, 16).ok();
+    }
+    if let Some(digits) = tail.strip_prefix("0b").or_else(|| tail.strip_prefix("0B")) {
+        return i64::from_str_radix(digits, 2).ok();
+    }
+    tail.parse::<i64>().ok()
+}
+
+fn pair_hi_operand(sym: &str) -> String {
+    // Split a trailing `+N` / `-N` (decimal or 0x/0b), i.e. exactly the shape
+    // this file's callers build.  Anything else (TLS prefixes, expressions
+    // with a second symbol) keeps the plain `+4` spelling, which the assembler
+    // folds anyway.
+    let bytes = sym.as_bytes();
+    let mut split = None;
+    for i in (1..bytes.len()).rev() {
+        if bytes[i] == b'+' || bytes[i] == b'-' {
+            split = Some(i);
+            break;
+        }
+    }
+    if let Some(i) = split {
+        let tail = sym[i + 1..].trim();
+        if let Some(magnitude) = pair_offset_magnitude(tail) {
+            let signed = if bytes[i] == b'-' {
+                -magnitude
+            } else {
+                magnitude
+            };
+            if let Some(sum) = signed.checked_add(4) {
+                let head = &sym[..i];
+                return if sum == 0 {
+                    head.to_string()
+                } else if sum > 0 {
+                    format!("{}+{}", head, sum)
+                } else {
+                    format!("{}{}", head, sum)
+                };
+            }
+        }
+    }
+    format!("{}+4", sym)
+}
+
+/// Return the register spelling needed for a scalar store of `ty`.
+///
+/// In 32-bit mode only eax, ebx, ecx and edx have encodable low-byte
+/// registers; in particular sil/dil/bpl/spl require a REX prefix and must
+/// not be used here. Every 16-bit partial is encodable; `%sp` is listed
+/// for totality even though the stack pointer is never a value home.
+///
+/// This is an encoding helper, not a register-allocation policy:
+/// recognizing esp/sp does not make the stack pointer available for
+/// allocation.
+fn i686_store_register(ty: IrType, name32: &str) -> Option<&str> {
+    match ty {
+        IrType::I8 | IrType::U8 => match name32 {
+            "eax" => Some("al"),
+            "ebx" => Some("bl"),
+            "ecx" => Some("cl"),
+            "edx" => Some("dl"),
+            _ => None,
+        },
+        IrType::I16 | IrType::U16 => match name32 {
+            "eax" => Some("ax"),
+            "ebx" => Some("bx"),
+            "ecx" => Some("cx"),
+            "edx" => Some("dx"),
+            "esi" => Some("si"),
+            "edi" => Some("di"),
+            "ebp" => Some("bp"),
+            "esp" => Some("sp"),
+            _ => None,
+        },
+        _ => Some(name32),
+    }
+}
+
+impl I686Codegen {
+    pub(super) fn emit_global_addr_impl(&mut self, dest: &Value, name: &str) {
+        let (reg, needs_store) = match self.dest_reg(dest) {
+            Some(phys) => (super::emit::phys_reg_name(phys), false),
+            None => ("eax", true),
+        };
+
+        if self.state.pic_mode {
+            if self.state.needs_got(name) {
+                emit!(self.state, "    movl {}@GOT(%ebx), %{}", name, reg);
+            } else {
+                emit!(self.state, "    leal {}@GOTOFF(%ebx), %{}", name, reg);
+            }
+        } else {
+            emit!(self.state, "    movl ${}, %{}", name, reg);
+        }
+
+        // Register-direct cache discipline: a destination written into
+        // %eax/%edx now holds its own value there, so the matching cache
+        // entry is refreshed; a write to any other register leaves the
+        // tracked pair untouched, so cached entries stay valid.
+        if needs_store {
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        } else {
+            match reg {
+                "eax" => self.state.park_acc(dest.0, false),
+                "edx" => self.state.reg_cache.set_sec(dest.0, false),
+                _ => {}
+            }
+        }
+    }
+
+    /// Folded GlobalAddr+Load using absolute addressing.
+    ///
+    /// The caller must restrict this fold to supported scalar types and
+    /// non-PIC mode. `sym` may include a constant offset, e.g. "sym+4".
+    ///
+    /// Extended floating-point values require a representation-aware path;
+    /// the generic scalar load must not silently truncate them.
+    pub(super) fn emit_global_load_abs_impl(&mut self, dest: &Value, sym: &str, ty: IrType) {
+        assert!(
+            !self.state.pic_mode,
+            "i686 absolute global load fold is not valid in PIC mode"
+        );
+        assert!(
+            ty != IrType::F128,
+            "i686 absolute global load fold does not support F128"
+        );
+
+        if super::emit::is_pair_scalar(ty) {
+            emit!(self.state, "    movl {}, %eax", sym);
+            emit!(self.state, "    movl {}, %edx", pair_hi_operand(sym));
+
+            // The loads have replaced both halves of the accumulator pair.
+            // Do not expose stale pair metadata to the store helper.
+            self.state.reg_cache.invalidate_acc();
+            self.state.reg_cache.invalidate_sec();
+            self.emit_store_acc_pair_impl(dest);
+            return;
+        }
+
+        let load_instr = self.mov_load_for_type(ty);
+
+        // Register-direct: load straight into the destination register.
+        // `mov_load_for_type` provides the sign/zero extension for narrow
+        // integer loads into the 32-bit register.
+        if let Some(d_reg) = self.dest_reg(dest) {
+            let d_name = super::emit::phys_reg_name(d_reg);
+            emit!(self.state, "    {} {}, %{}", load_instr, sym, d_name);
+            match d_name {
+                "eax" => self.state.park_acc(dest.0, false),
+                "edx" => self.state.reg_cache.set_sec(dest.0, false),
+                _ => {}
+            }
+            return;
+        }
+
+        emit!(self.state, "    {} {}, %eax", load_instr, sym);
+        self.state.reg_cache.invalidate_acc();
+        self.store_eax_to(dest);
+    }
+
+    /// Folded GlobalAddr+Store using absolute addressing.
+    ///
+    /// As with the load fold, the caller must establish that the type and
+    /// memory-access semantics are supported. Splitting a 64-bit operation
+    /// into two movl instructions does not provide atomicity.
+    pub(super) fn emit_global_store_abs_impl(&mut self, val: &Operand, sym: &str, ty: IrType) {
+        assert!(
+            !self.state.pic_mode,
+            "i686 absolute global store fold is not valid in PIC mode"
+        );
+        assert!(
+            ty != IrType::F128,
+            "i686 absolute global store fold does not support F128"
+        );
+
+        if super::emit::is_pair_scalar(ty) {
+            self.emit_load_acc_pair_impl(val);
+            emit!(self.state, "    movl %eax, {}", sym);
+            emit!(self.state, "    movl %edx, {}", pair_hi_operand(sym));
+            self.state.reg_cache.invalidate_acc();
+            self.state.reg_cache.invalidate_sec();
+            return;
+        }
+        self.emit_scalar_store_to_mem(val, sym, ty);
+    }
+
+    /// Store a non-pair scalar to the memory operand text `sym` (an absolute
+    /// symbol, or a `%gs:` TLS operand): an immediate, the value's own
+    /// register, or `%eax` staging when the value has no encodable register.
+    fn emit_scalar_store_to_mem(&mut self, val: &Operand, sym: &str, ty: IrType) {
+        // Integer constants can be stored without a scratch register.
+        // Truncate to the actual store width and print a signed immediate;
+        // this preserves the low bits without relying on assembler
+        // acceptance of out-of-range positive decimal immediates.
+        //
+        // Floating-point constants must retain their bit representation,
+        // not undergo a numerical conversion through to_i64().
+        if let Operand::Const(c) = val {
+            if !matches!(c, IrConst::F32(_) | IrConst::F64(_)) {
+                if let Some(v) = c.to_i64() {
+                    let (mnem, imm) = match ty {
+                        IrType::I8 | IrType::U8 => ("movb", (v as i8) as i64),
+                        IrType::I16 | IrType::U16 => ("movw", (v as i16) as i64),
+                        _ => ("movl", (v as i32) as i64),
+                    };
+                    emit!(self.state, "    {} ${}, {}", mnem, imm, sym);
+                    return;
+                }
+            }
+        }
+
+        let store_instr = self.mov_store_for_type(ty);
+
+        if let Operand::Value(v) = val {
+            if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                let name32 = super::emit::phys_reg_name(phys);
+                if let Some(reg) = i686_store_register(ty, name32) {
+                    emit!(self.state, "    {} %{}, {}", store_instr, reg, sym);
+                    return;
+                }
+            }
+        }
+
+        // In particular, byte values allocated to esi/edi/ebp must be
+        // staged through a register with an encodable low-byte form.
+        self.operand_to_eax(val);
+        let src = self.eax_for_type(ty);
+        emit!(self.state, "    {} {}, {}", store_instr, src, sym);
+    }
+
+    pub(super) fn emit_label_addr_impl(&mut self, dest: &Value, label: &str) {
+        let (reg, needs_store) = match self.dest_reg(dest) {
+            Some(phys) => (super::emit::phys_reg_name(phys), false),
+            None => ("eax", true),
+        };
+
+        if self.state.pic_mode {
+            emit!(self.state, "    leal {}@GOTOFF(%ebx), %{}", label, reg);
+        } else {
+            emit!(self.state, "    movl ${}, %{}", label, reg);
+        }
+
+        if needs_store {
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        } else {
+            match reg {
+                "eax" => self.state.park_acc(dest.0, false),
+                "edx" => self.state.reg_cache.set_sec(dest.0, false),
+                _ => {}
+            }
+        }
+    }
+
+    /// Emit the ELF i386 TLS address of `name` for its selected model
+    /// (`common::tls`, the same table every backend uses):
+    ///
+    /// * local-exec: `%gs:0 + x@ntpoff`, a link-time constant (also in PIE);
+    /// * initial-exec: the GOT slot holding the TP offset, `x@gotntpoff(%ebx)`
+    ///   when the code is position-independent, absolute `x@indntpoff`
+    ///   (`R_386_TLS_IE`) otherwise, exactly like GCC;
+    /// * global-/local-dynamic: the GNU2 descriptor sequence
+    ///   `leal x@tlsdesc(%ebx),%eax; call *x@tlscall(%eax)`, which returns
+    ///   the TP offset in %eax and preserves every other register, so the
+    ///   allocator's %ecx/%edx homes survive it. The linker relaxes it to IE
+    ///   or LE when the symbol ends up static. Dynamic models are only chosen
+    ///   for shared-object code, where `pic_mode` holds and `function_needs_got`
+    ///   keeps the GOT base in %ebx.
+    ///
+    /// `%ebx` cannot be the destination in a GOT-live function (the allocator
+    /// reserves it), so writing the destination register directly is safe.
+    /// Direct `%gs:` store to an omitted Local-Exec TLS root:
+    /// `movX $imm|%r, %gs:x@NTPOFF` (GCC 16.2 `-m32`). Always succeeds for an
+    /// omitted LE root of a `tls_direct_store_type_ok` type: the shared
+    /// omission analysis admits exactly those stores.
+    pub(super) fn try_emit_tls_direct_store_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if offset != 0 || !self.tls_direct_store_type_ok(ty) {
+            return false;
+        }
+        let Some(name) = self.state.omitted_tls_roots.get(&base.0).cloned() else {
+            return false;
+        };
+        if self.state.tls_model(&name) != TlsModel::LocalExec {
+            return false;
+        }
+        self.emit_scalar_store_to_mem(val, &format!("%gs:{}@NTPOFF", name), ty);
+        true
+    }
+
+    /// Direct `%gs:` load of an omitted TLS root (GCC 16.2 `-m32` forms):
+    ///   LE:          `movl %gs:x@NTPOFF, %r`
+    ///   IE non-PIC:  `movl x@INDNTPOFF, %r;      movl %gs:(%r), %r`
+    ///   IE PIC:      `movl x@GOTNTPOFF(%ebx), %r; movl %gs:(%r), %r`
+    /// with `%r` the destination's register (or `%eax` + spill). Only roots
+    /// the generic emitter omitted qualify: for a materialized root the
+    /// plain `movl (%root), %r` is already one instruction, and the IE form
+    /// would re-load the GOT slot. Dynamic models keep the descriptor root.
+    pub(super) fn try_emit_tls_direct_load_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if offset != 0 || !self.tls_direct_load_type_ok(ty) {
+            return false;
+        }
+        let Some(name) = self.state.omitted_tls_roots.get(&base.0).cloned() else {
+            return false;
+        };
+        let model = self.state.tls_model(&name);
+        if !matches!(model, TlsModel::LocalExec | TlsModel::InitialExec) {
+            return false;
+        }
+        let load = self.mov_load_for_type(ty);
+        let (reg, needs_store) = match self.dest_reg(dest) {
+            Some(phys) => (super::emit::phys_reg_name(phys), false),
+            None => ("eax", true),
+        };
+        if model == TlsModel::LocalExec {
+            emit!(self.state, "    {} %gs:{}@NTPOFF, %{}", load, name, reg);
+        } else {
+            if self.state.pic_mode {
+                emit!(self.state, "    movl {}@GOTNTPOFF(%ebx), %{}", name, reg);
+            } else {
+                emit!(self.state, "    movl {}@INDNTPOFF, %{}", name, reg);
+            }
+            emit!(self.state, "    {} %gs:(%{}), %{}", load, reg, reg);
+        }
+        if needs_store {
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        } else {
+            match reg {
+                "eax" => self.state.park_acc(dest.0, false),
+                "edx" => self.state.reg_cache.set_sec(dest.0, false),
+                _ => {}
+            }
+        }
+        true
+    }
+
+    pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
+        let (reg, needs_store) = match self.dest_reg(dest) {
+            Some(phys) => (super::emit::phys_reg_name(phys), false),
+            None => ("eax", true),
+        };
+
+        match self.state.tls_model(name) {
+            TlsModel::LocalExec => {
+                emit!(self.state, "    movl %gs:0, %{}", reg);
+                emit!(self.state, "    addl ${}@NTPOFF, %{}", name, reg);
+            }
+            TlsModel::InitialExec => {
+                if self.state.pic_mode {
+                    emit!(self.state, "    movl {}@GOTNTPOFF(%ebx), %{}", name, reg);
+                } else {
+                    emit!(self.state, "    movl {}@INDNTPOFF, %{}", name, reg);
+                }
+                emit!(self.state, "    addl %gs:0, %{}", reg);
+            }
+            TlsModel::GlobalDynamic | TlsModel::LocalDynamic => {
+                // GNU2 TLS descriptors have the same crucial property on
+                // i386 as x86-64: the special resolver ABI preserves every
+                // allocator home other than the EAX result. This is shorter
+                // than classic GD/LDM and remains linker-relaxable.
+                emit!(self.state, "    leal {}@TLSDESC(%ebx), %eax", name);
+                emit!(self.state, "    lccc_tls_call32 {}", name);
+                emit!(self.state, "    addl %gs:0, %eax");
+                if reg != "eax" {
+                    emit!(self.state, "    movl %eax, %{}", reg);
+                }
+                self.state.reg_cache.invalidate_all();
+            }
+        }
+
+        if needs_store {
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        } else {
+            match reg {
+                "eax" => self.state.park_acc(dest.0, false),
+                "edx" => self.state.reg_cache.set_sec(dest.0, false),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_store_registers_are_encodable_in_i386_mode() {
+        let cases = [
+            ("eax", Some("al")),
+            ("ebx", Some("bl")),
+            ("ecx", Some("cl")),
+            ("edx", Some("dl")),
+            ("esi", None),
+            ("edi", None),
+            ("ebp", None),
+            ("esp", None),
+        ];
+
+        for ty in [IrType::I8, IrType::U8] {
+            for (reg, expected) in cases {
+                assert_eq!(i686_store_register(ty, reg), expected, "{reg}");
+            }
+        }
+    }
+
+    #[test]
+    fn word_store_registers_use_16_bit_names() {
+        let cases = [
+            ("eax", "ax"),
+            ("ebx", "bx"),
+            ("ecx", "cx"),
+            ("edx", "dx"),
+            ("esi", "si"),
+            ("edi", "di"),
+            ("ebp", "bp"),
+            ("esp", "sp"),
+        ];
+
+        for ty in [IrType::I16, IrType::U16] {
+            for (reg, expected) in cases {
+                assert_eq!(i686_store_register(ty, reg), Some(expected), "{reg}");
+            }
+        }
+    }
+
+    #[test]
+    fn dword_stores_preserve_register_names() {
+        for ty in [IrType::I32, IrType::U32, IrType::F32] {
+            for reg in ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"] {
+                assert_eq!(i686_store_register(ty, reg), Some(reg));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_partial_registers_are_rejected() {
+        for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
+            assert_eq!(i686_store_register(ty, "not_a_register"), None);
+        }
+    }
+
+    #[test]
+    fn pair_hi_operand_folds_the_offset_instead_of_stacking_addends() {
+        // The shape arch/x86/boot/video-vesa.c triggers: a 64-bit field copy
+        // out of `vminfo` at byte 31 and into `boot_params` at byte 38.
+        assert_eq!(pair_hi_operand("boot_params+38"), "boot_params+42");
+        assert_eq!(pair_hi_operand("vminfo+31"), "vminfo+35");
+        // Negative and hexadecimal offsets stay legal assembly.
+        assert_eq!(pair_hi_operand("sym-8"), "sym-4");
+        assert_eq!(pair_hi_operand("sym+0x10"), "sym+20");
+        // No offset / a bare symbol: the plain `+4` spelling is correct.
+        assert_eq!(pair_hi_operand("sym"), "sym+4");
+        // A tail that is not a constant is left to the assembler's expression
+        // folding (which now handles chained terms like GNU as).
+        assert_eq!(pair_hi_operand("sym+other"), "sym+other+4");
+        // The fold also cancels: `sym-4` + 4 is just `sym`.
+        assert_eq!(pair_hi_operand("sym-4"), "sym");
+    }
+}

@@ -1,0 +1,97 @@
+{
+  "label": "E6: supply ON vs OFF on sha (steal OFF, shipping precision)",
+  "arm_a": {
+    "binary": "/tmp/paired_ab_zf37x0gi/arm_a",
+    "sha256": "1157e9354610af9e1d2844af1fb096c5a63bdb97a376d5c11640d7d9a299a099",
+    "env": "CCC_NO_X64_SPAN_STEAL=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "arm_b": {
+    "binary": "/tmp/paired_ab_zf37x0gi/arm_b",
+    "sha256": "b35e503c91813d3a80f78cc9be5f49f4b39bf8fb67c4529e740216bb3c433d38",
+    "env": "CCC_NO_X64_SPAN_STEAL=1,CCC_NO_WEB_INLOOP_USE=1",
+    "warmup": {
+      "rc": 0,
+      "stdout_sha256": "56c0fc3ada9b67701b989f84ab866a515663f50b952fb38e7324d6ca00cf6f79"
+    }
+  },
+  "identical_binaries": false,
+  "rounds": 15,
+  "warmup": 2,
+  "arm_a_timings": {
+    "arm": "SUPon",
+    "n": 15,
+    "min_ms": 405.51,
+    "median_ms": 407.806,
+    "mean_ms": 409.507,
+    "stdev_ms": 5.649,
+    "samples_ms": [
+      411.809,
+      429.828,
+      407.105,
+      411.046,
+      407.436,
+      406.469,
+      408.196,
+      408.46,
+      408.265,
+      407.318,
+      408.763,
+      405.51,
+      407.806,
+      406.802,
+      407.79
+    ]
+  },
+  "arm_b_timings": {
+    "arm": "SUPoff",
+    "n": 15,
+    "min_ms": 430.83,
+    "median_ms": 433.721,
+    "mean_ms": 442.155,
+    "stdev_ms": 17.69,
+    "samples_ms": [
+      437.261,
+      461.806,
+      433.721,
+      430.83,
+      432.034,
+      432.597,
+      432.113,
+      433.209,
+      484.498,
+      434.403,
+      431.694,
+      439.109,
+      431.424,
+      435.706,
+      481.923
+    ]
+  },
+  "paired_diffs_ms": [
+    -25.452,
+    -31.979,
+    -26.615,
+    -19.784,
+    -24.599,
+    -26.128,
+    -23.916,
+    -24.749,
+    -76.233,
+    -27.085,
+    -22.931,
+    -33.599,
+    -23.618,
+    -28.905,
+    -74.133
+  ],
+  "median_ratio_b_over_a": 1.06355,
+  "min_ratio_b_over_a": 1.06244,
+  "sign_test_p": 0.0003,
+  "median_and_min_agree": true,
+  "significant": true,
+  "verdict": "SUPon FASTER by 6.35% (median)"
+}

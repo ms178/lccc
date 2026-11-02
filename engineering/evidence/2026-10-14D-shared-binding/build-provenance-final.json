@@ -1,0 +1,29 @@
+{
+  "base": "3ff36e8592b0d0e26645bf37d6685395b1a6eca5",
+  "candidate_source_commit": "6b5b16c2ba8d87e0edc13dbec231fb5213067a67",
+  "build_policy": "independent worktrees and target dirs; fastbuild O1 j2; CARGO_PROFILE_FASTBUILD_DEBUG=0 CARGO_INCREMENTAL=0; 4 GiB active swap",
+  "binaries": {
+    "base": {
+      "path": "/home/user/.cache/reference-source/target/fastbuild/lccc",
+      "sha256": "c7589bb428d970ac336b12da28f08800cc99219529eb2e316aa2a88ac858f6e2"
+    },
+    "candidate": {
+      "path": "/home/user/.cache/lccc/target/fastbuild/lccc",
+      "sha256": "0e92765b3c81dcd06cabc1c2dffa853127fb0bcea0777085b928103032750939"
+    }
+  },
+  "source_sha256": {
+    "base": {
+      "src/backend/riscv/linker/reloc.rs": "a09799c21288147a6feff74b83847015f6519abd613360a42ea63b1f40fc2015",
+      "src/backend/riscv/linker/symbols.rs": "bfc5f4fe2bea28a5ae8d539fc7be229934f92aca8c0dd14e401eff5d9cbab3cd",
+      "src/backend/riscv/linker/emit_shared.rs": "847fd862da1594fb728257f76e79d4ac7c438b88b906c7aa100325e6bbbb7206",
+      "src/backend/riscv/linker/relocations.rs": "475cd990117e3b01b293c85c979f92db9ad5601e86f0f3067efa5f61b9763d78"
+    },
+    "candidate": {
+      "src/backend/riscv/linker/reloc.rs": "f86bb91c6c6077d60ff66566e508e7fcf6f3b2337350c4b578b8e1db393e9b6f",
+      "src/backend/riscv/linker/symbols.rs": "6f1a91c0b5116da84d346b68e2ae256c55bb5055764420af6f475e24f727bf49",
+      "src/backend/riscv/linker/emit_shared.rs": "f29e9bfeafa9babb528092db9aa7897e1879ef7ae68c03a7cbb79d4cff338921",
+      "src/backend/riscv/linker/relocations.rs": "884bf7f74e8d69849a3d1152777c87af03411aa99c6717b079801018c1ddfa3e"
+    }
+  }
+}

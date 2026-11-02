@@ -1,0 +1,30 @@
+{
+  "repository_head": "da01098fe423dd023270cf256d9e527fea000ada",
+  "note": "Compiled binaries (not merely HEAD); identify them by SHA-256 below. Diagnostic wording is informational.",
+  "inputs": "engineering/evidence/2026-09-26-pr630-review/pr630-review-probe-inputs.json",
+  "inputs_sha256": "e168cc1a66ca91265bcbc6f9c34862017d2b985a11f0caf26efee1ae049ef700",
+  "oracle": {
+    "x86_64": {
+      "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+      "sha256": "337fffe4e577749002dbd0cf268bf49b75fe3032f641a79cb4993cc21589dfc0"
+    },
+    "i686": {
+      "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+      "sha256": "f3139962e4030bc58708aaf8e0d7612f46be66546fc05badd7c5934dbe332493"
+    }
+  },
+  "compiler_sha256": {
+    "x86_64": "4ab6f26e1d416567597311cc72a72577fb9ed2b5cff55ec81e11ed84c9e00a98",
+    "i686": "4ef6e60dbc33157a59d565a335146599e83dd07615224afd494afeadb1e13368"
+  },
+  "per_series": {
+    "review-boundary": {
+      "total": 23,
+      "accepted_by_gas": 12,
+      "accepted_by_lccc": 12,
+      "matches": 23,
+      "mismatch_reasons": {}
+    }
+  },
+  "mismatches": []
+}

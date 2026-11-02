@@ -1,0 +1,2258 @@
+use super::*;
+use crate::backend::arm::assembler::parser::Operand;
+
+/// Register-offset extend/shift: the S bit means "shift by the access-size
+/// scale", not "any positive shift". `ldr x0, [x1, x2, lsl #1]` used to
+/// assemble as scaled-by-8. llvm-mc 23.1.2 rejects that form.
+/// The whole family is regular -- three addressing bases (offset `ldr/str`,
+/// unscaled `ldur/stur`, unprivileged `ldtr/sttr`) crossed with seven spellings
+/// (bare, `b`, `h`, `sb`, `sh`, `sw`) -- and GNU as 2.47's verdicts (measured,
+/// one instruction per cell) put each spelling in exactly one of four classes:
+///
+/// | class        | registers            | mnemonics |
+/// |--------------|----------------------|-----------|
+/// | `Any`        | `w x b h s d q`      | `ldr str ldur stur` |
+/// | `Gpr32`      | `w`                  | `ldrb strb ldrh strh ldurb sturb ldurh sturh ldtrb sttrb ldtrh sttrh` |
+/// | `Gpr32Or64`  | `w x`                | `ldrsb ldrsh ldursb ldursh ldtrsb ldtrsh` |
+/// | `Gpr64`      | `x`                  | `ldrsw ldursw ldtrsw` |
+///
+/// The unprivileged base is the one that does NOT take `Any`: `ldtr s0,[x0]`
+/// has no encoding (the load/store-unprivileged group has no FP/SIMD form), and
+/// it used to assemble here as `ldtr s0` because the encoder derived the width
+/// from the register and never asked what the mnemonic allowed.  `ldtrb x0`
+/// was the same defect one size down: the byte form's Rt is 32-bit-only, which
+/// the byte/halfword mnemonics of the *offset* base already enforced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LdstDest {
+    Any,
+    Gpr32,
+    Gpr32Or64,
+    Gpr64,
+}
+
+impl LdstDest {
+    /// Check one transferred register against the mnemonic's class.
+    ///
+    /// Takes the *parsed* register, not its spelling skeleton: `lr` is an
+    /// `x30` and belongs to `Gpr32Or64`, but a first-letter test reads it as
+    /// neither `w` nor `x` and refused `ldrsb lr,[x1]`, which GNU as accepts.
+    /// The class questions this answers are exactly the two the reader can
+    /// answer -- which register file, and how wide -- so they are asked of the
+    /// reader's answer.
+    pub(crate) fn check(self, rt: &LdstRt, mn: &str) -> Result<(), String> {
+        let reg_name = rt.name.as_str();
+        let lower = reg_name.to_ascii_lowercase();
+        let fp = rt.is_fp;
+        // SP is spelled with the same letters as the GPR class it does not
+        // belong to: `wsp` starts with `w` and `sp` is neither, so a
+        // first-letter test alone accepted `strh wsp,[x0]` and `stur wsp,[x0]`
+        // -- the encoding's Rt field reads 31 as the *zero* register, so those
+        // assembled as stores of WZR.  GAS rejects both ("expected an integer
+        // or zero register at operand 1").
+        if !fp && (lower == "sp" || lower == "wsp") {
+            return Err(format!(
+                "{mn}: `{reg_name}` is the stack pointer, but this slot reads encoding \
+                 31 as the zero register; write `{}` if the zero register is what \
+                 you meant",
+                if lower == "sp" { "xzr" } else { "wzr" }
+            ));
+        }
+        let ok = match self {
+            LdstDest::Any => true,
+            LdstDest::Gpr32 => !fp && !rt.is_64,
+            LdstDest::Gpr32Or64 => !fp,
+            LdstDest::Gpr64 => !fp && rt.is_64,
+        };
+        if ok {
+            return Ok(());
+        }
+        let want = match self {
+            LdstDest::Any => "a general-purpose or FP/SIMD register",
+            LdstDest::Gpr32 => "a 32-bit general-purpose register (w0-w30 or wzr)",
+            LdstDest::Gpr32Or64 => "a general-purpose register (w0-w30 or x0-x30)",
+            LdstDest::Gpr64 => "a 64-bit general-purpose register (x0-x30)",
+        };
+        Err(format!(
+            "{mn}: the data register must be {want}; `{reg_name}` is not \
+             (the same mnemonic with a {} register is a different instruction)",
+            if fp { "FP/SIMD" } else { "wider" }
+        ))
+    }
+}
+
+/// Encode the `option`/`S` fields of a register-offset memory operand.
+///
+/// Measured on GNU as 2.47 (`ldr x0,[x0,x1]` = 0xf8616800):
+///
+/// | index | extend | #0 | #scale | other |
+/// |-------|--------|----|--------|-------|
+/// | Xn    | (bare) |  ok|     -- |  --   |
+/// | Xn    | `lsl`  |  ok|     ok | reject|
+/// | Xn    | `sxtx` |  ok|     ok | reject|
+/// | Wn    | (bare) | reject (write `uxtw`/`sxtw`) |
+/// | Wn    | `uxtw` |  ok|     ok | reject|
+/// | Wn    | `sxtw` |  ok|     ok | reject|
+///
+/// `uxtx` is not spelled by GAS at all, and `uxtw`/`sxtw` on an X index (or
+/// `lsl` on a W index) are rejected; accepting any of them was the fail-open
+/// that let `ldr x0,[x0, w1]` assemble as an unsigned-extending load of a
+/// register the programmer did not ask to extend.
+fn mem_reg_offset_option(
+    extend: Option<&str>,
+    shift: Option<u8>,
+    index_is_64: bool,
+    scale: u8,
+    mn: &str,
+) -> Result<(u32, u32), String> {
+    let amt = shift.unwrap_or(0);
+    if amt != 0 && amt != scale {
+        return Err(format!(
+            "{mn}: shift #{amt} is not valid for this access size (expected #0 or #{scale})"
+        ));
+    }
+    let s_bit = u32::from(amt == scale && scale > 0);
+    match (extend, index_is_64) {
+        (None | Some("lsl"), true) => Ok((0b011, s_bit)),
+        (Some("sxtx"), true) => Ok((0b111, s_bit)),
+        (None, false) => Err(format!(
+            "{mn}: a 32-bit index needs an explicit extend; write `uxtw` for the zero- \
+             extending form or `sxtw` for the sign-extending one"
+        )),
+        (Some("uxtw"), false) => Ok((0b010, s_bit)),
+        (Some("sxtw"), false) => Ok((0b110, s_bit)),
+        (Some("lsl"), false) => Err(format!(
+            "{mn}: a 32-bit index cannot take `lsl`; write `uxtw` or `sxtw`"
+        )),
+        (Some("uxtw" | "sxtw"), true) => Err(format!(
+            "{mn}: `{}` is not an extend of a 64-bit index; `lsl` and `sxtx` are",
+            extend.unwrap_or("")
+        )),
+        (Some("uxtx"), _) => Err(format!(
+            "{mn}: `uxtx` is not an addressing extend (write nothing for the \
+             64-bit form, or `lsl`)"
+        )),
+        (Some(other), _) => Err(format!(
+            "{mn}: extend `{other}` is not valid for this index width"
+        )),
+    }
+}
+
+// ── Loads/Stores ─────────────────────────────────────────────────────────
+
+// ── Checked offset fields ──────────────────────────────────────────────────
+//
+// The AArch64 load/store immediate fields are NARROW and SIGNED, and the
+// original code masked every offset into them with `& 0x1FF` / `& 0x7F`.
+// Masking cannot fail, so an offset that does not fit was silently wrapped:
+//
+// ldr x0, [x1, #32768] -> scaled imm12 needs 4096 (too big), so it fell
+// through to the unscaled form, where
+// 32768 & 0x1FF == 0, assembling `ldur x0, [x1]`
+// -- a load from the base register instead of
+// base+32768, with no diagnostic.
+// stp x0, x1, [x2, #8192] -> (8192 >> 3) & 0x7F == 0, storing to [x2].
+//
+// Both are the same defect class as the RISC-V branch truncation fixed
+// elsewhere in this tree: an immediate that does not fit is mangled into a
+// plausible-looking instruction instead of being refused.
+//
+// These helpers are the single place that decision is made. Every caller must
+// go through one of them; the `& MASK` idiom is not to be reintroduced.
+
+/// Encode `offset` as the signed 9-bit immediate of an unscaled, pre-index or
+/// post-index load/store. Legal range is -256..=255.
+/// Atomic / exclusive / pair-less `[Xn]` operand: SP is a legal base, a
+/// non-zero offset is not (the architecture has no encoding for it; the
+/// previous `..` match dropped the offset and assembled `[x0, #8]` as `[x0]`).
+fn atomic_xn(mem: Option<&Operand>, mn: &str) -> Result<u32, String> {
+    match mem {
+        Some(Operand::Mem { base, offset: 0 }) => mem_xn_or_sp(base, mn),
+        Some(Operand::Mem { offset, .. }) => Err(format!(
+            "{mn}: offset #{offset} is not encodable (only `[Xn]` / `[SP]` with offset 0)"
+        )),
+        Some(Operand::MemPostIndex { .. }) | Some(Operand::MemPreIndex { .. }) => Err(format!(
+            "{mn}: writeback addressing is not available on this form"
+        )),
+        _ => Err(format!("{mn}: expected memory operand [Xn]")),
+    }
+}
+
+/// Rt of a GPR load/store: encoding 31 is XZR, never SP. `str sp, [x0]`
+/// previously stored XZR.
+fn gpr_rt_not_sp(name: &str, mn: &str) -> Result<GpReg, String> {
+    let r = GpReg::by_name(name)
+        .ok_or_else(|| format!("{mn}: `{name}` is not a general-purpose register"))?;
+    if r.is_sp {
+        return Err(format!(
+            "{mn}: the stack pointer cannot be the transferred register; \
+             write `{}` if the zero register is what you meant",
+            if r.is_64 { "xzr" } else { "wzr" }
+        ));
+    }
+    Ok(r)
+}
+
+pub(crate) fn checked_imm9(offset: i64, what: &str) -> Result<u32, String> {
+    if !(-256..=255).contains(&offset) {
+        return Err(format!(
+            "{what}: offset {offset} is outside the signed 9-bit immediate of this addressing mode (allowed -256..=255); it would silently wrap. Use a register offset, or materialise the address into a register."
+        ));
+    }
+    Ok((offset as u32) & 0x1FF)
+}
+
+/// Encode `offset` as the scaled signed 7-bit immediate of a load/store pair.
+/// `shift` is log2 of the access width, so the legal *byte* range is
+/// -64*2^shift ..= 63*2^shift, in steps of 2^shift.
+pub(crate) fn checked_imm7(offset: i64, shift: u32, what: &str) -> Result<u32, String> {
+    let align = 1i64 << shift;
+    if offset % align != 0 {
+        return Err(format!(
+            "{what}: offset {offset} is not a multiple of {align}; this pair accesses {align}-byte elements and the immediate is scaled"
+        ));
+    }
+    let scaled = offset >> shift;
+    if !(-64..=63).contains(&scaled) {
+        return Err(format!(
+            "{what}: offset {offset} scales to {scaled}, which is outside the signed 7-bit immediate of a load/store pair (allowed -64..=63, i.e. {}..={} bytes); it would silently wrap",
+            -64 * align,
+            63 * align
+        ));
+    }
+    Ok((scaled as u32) & 0x7F)
+}
+
+/// Auto-detect LDR/STR size from the first register operand.
+pub(crate) fn encode_ldr_str_auto(
+    operands: &[Operand],
+    is_load: bool,
+) -> Result<EncodeResult, String> {
+    // Determine size from register: Wn -> 32-bit (size=10), Xn -> 64-bit (size=11)
+    // FP: Sn -> 32-bit, Dn -> 64-bit, Qn -> 128-bit
+    let reg_name = match operands.first() {
+        Some(Operand::Reg(r)) => r.to_lowercase(),
+        _ => return Err("ldr/str needs register operand".to_string()),
+    };
+
+    // `b` and `h` were simply absent from this table, so they fell through to
+    // the 64-bit default and every byte/halfword FP access was encoded as a
+    // doubleword one: `str b9, [x10]` assembled to the same word as
+    // `str d9, [x10]`. The default is now an error rather than a guess --
+    // silently picking a width is how the original defect stayed invisible.
+    // SP is never a transferred register of LDR/STR (encoding 31 is XZR).
+    // Catch it here so `str sp, [x0]` is rejected instead of storing XZR.
+    if let Some(gp) = GpReg::by_name(&reg_name) {
+        if gp.is_sp {
+            return Err(format!(
+                "{}: the stack pointer cannot be the transferred register; write `{}` \
+                 if the zero register is what you meant",
+                if is_load { "ldr" } else { "str" },
+                if gp.is_64 { "xzr" } else { "wzr" }
+            ));
+        }
+    }
+
+    let (size, is_128bit) = if reg_name == "sp" || reg_name == "xzr" || reg_name == "lr" {
+        (0b11, false) // 64-bit GPR
+    } else if reg_name == "wsp" || reg_name == "wzr" {
+        (0b10, false) // 32-bit GPR
+    } else {
+        match reg_name.chars().next() {
+            Some('w') => (0b10, false), // 32-bit GPR
+            Some('x') => (0b11, false), // 64-bit GPR
+            Some('b') => (0b00, false), // 8-bit FP
+            Some('h') => (0b01, false), // 16-bit FP
+            Some('s') => (0b10, false), // 32-bit FP
+            Some('d') => (0b11, false), // 64-bit FP
+            // 128-bit: size=00 with the opc adjustment applied in encode_ldr_str.
+            Some('q') => (0b00, true),
+            // `v<n>` names the same register file but is not a *scalar* LDR/STR
+            // operand in GNU as: `str v0,[x0,#16]` is rejected ("unexpected
+            // register type at operand 1") while `str q0,[x0,#16]` is legal.
+            // Accepting the spelling would assemble an instruction the
+            // programmer did not write, which is the bug class this whole
+            // family is being audited for.
+            Some('v') => {
+                return Err(format!(
+                    "ldr/str: `{reg_name}` is a vector register; this instruction takes \
+                     the 128-bit scalar spelling `q{}`",
+                    &reg_name[1..]
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "ldr/str: unrecognised register `{reg_name}` (expected w, x, b, h, s, d or q)"
+                ));
+            }
+        }
+    };
+
+    encode_ldr_str(operands, is_load, size, false, is_128bit)
+}
+
+pub(crate) fn encode_ldr_str(
+    operands: &[Operand],
+    is_load: bool,
+    size: u32,
+    is_signed: bool,
+    is_128bit: bool,
+) -> Result<EncodeResult, String> {
+    encode_ldr_str_checked(operands, is_load, size, is_signed, is_128bit, LdstDest::Any)
+}
+
+/// [`encode_ldr_str`] with the mnemonic's destination class.
+///
+/// The offset-base family is where the width comes from the *register* for the
+/// bare spellings, so the mnemonic's own words -- `b`, `h`, `sb`, `sh` -- are
+/// the only thing that fixes the access size.  A `ldrb` whose Rt is `x9` used
+/// to assemble as a byte load into X9, which is a different instruction from
+/// anything the programmer wrote: GNU as rejects it, and so must we.
+pub(crate) fn encode_ldr_str_checked(
+    operands: &[Operand],
+    is_load: bool,
+    size: u32,
+    is_signed: bool,
+    is_128bit: bool,
+    dest: LdstDest,
+) -> Result<EncodeResult, String> {
+    // LDR/STR take exactly two operands.  `ldr x0,[x0],x1` (a *register*
+    // post-index) is not an instruction in the architecture; the extra operand
+    // used to be dropped, so the row assembled as a plain `ldr x0,[x0]` -- the
+    // index silently lost.
+    if operands.len() != 2 {
+        return Err(format!(
+            "ldr/str takes exactly 2 operands, got {}; a register offset has no \
+             writeback form (only `[Xn, #imm]!` and `[Xn], #imm` exist)",
+            operands.len()
+        ));
+    }
+
+    // The class gate runs on the spelling, before anything is collapsed to a
+    // number: `ldrb wzr,[x0]` stays legal, `ldrb xzr,[x0]` is a different
+    // access size and is refused.
+    let rt_reg = ldst_rt(operands, 0, "ldr/str")?;
+    if dest != LdstDest::Any {
+        dest.check(&rt_reg, "ldr/str")?;
+    }
+    let rt = rt_reg.num;
+    let fp = rt_reg.is_fp;
+
+    // Use the size parameter as-is (auto-detection happens in encode_ldr_str_auto)
+    let actual_size = size;
+
+    let v = if fp { 1u32 } else { 0u32 };
+
+    match operands.get(1) {
+        // [base, #offset]
+        Some(Operand::Mem { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+
+            // Unsigned offset encoding
+            // Size determines the shift for offset alignment
+            // For 128-bit Q registers: shift=4, opc=11 (load) or 10 (store)
+            let shift = if is_128bit { 4 } else { actual_size };
+            let opc = if is_128bit {
+                if is_load { 0b11 } else { 0b10 }
+            } else if is_load {
+                if is_signed { 0b10 } else { 0b01 }
+            } else {
+                0b00
+            };
+
+            // Check if offset is aligned and fits in 12-bit unsigned field
+            let abs_offset = *offset as u64;
+            let align = 1u64 << shift;
+            if *offset >= 0 && abs_offset.is_multiple_of(align) {
+                let imm12 = (abs_offset / align) as u32;
+                if imm12 < 4096 {
+                    // Unsigned offset form: size 111 V 01 opc imm12 Rn Rt
+                    let word = (actual_size << 30)
+                        | (0b111 << 27)
+                        | (v << 26)
+                        | (0b01 << 24)
+                        | (opc << 22)
+                        | (imm12 << 10)
+                        | (rn << 5)
+                        | rt;
+                    return Ok(EncodeResult::Word(word));
+                }
+            }
+
+            // Unscaled offset (LDUR/STUR form).
+            //
+            // The unscaled form *does* exist for 128-bit accesses: `size == 00`
+            // with `opc == 10` is STUR/LDUR of a Q register. `str q0,[x1,#8]`
+            // is therefore legal (GAS emits 3c808020) even though 8 is not a
+            // multiple of the Q access width -- it simply cannot use the
+            // scaled form. Do not "helpfully" reject it.
+            let imm9 = checked_imm9(*offset, "ldr/str")?;
+            let opc = if is_128bit {
+                if is_load { 0b11 } else { 0b10 }
+            } else if is_load {
+                if is_signed { 0b10 } else { 0b01 }
+            } else {
+                0b00
+            };
+            let word = (((actual_size << 30) | (0b111 << 27) | (v << 26))
+                | (opc << 22)
+                | ((imm9 as u32 & 0x1FF) << 12))
+                | (rn << 5)
+                | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        // [base, #offset]! (pre-index)
+        Some(Operand::MemPreIndex { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let imm9 = checked_imm9(*offset, if is_load { "ldr/str" } else { "ldr/str" })?;
+            let opc = if is_128bit {
+                if is_load { 0b11 } else { 0b10 }
+            } else if is_load {
+                0b01
+            } else {
+                0b00
+            };
+            let word = ((actual_size << 30) | (0b111 << 27) | (v << 26))
+                | (opc << 22)
+                | ((imm9 as u32 & 0x1FF) << 12)
+                | (0b11 << 10)
+                | (rn << 5)
+                | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        // [base], #offset (post-index)
+        Some(Operand::MemPostIndex { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let imm9 = checked_imm9(*offset, if is_load { "ldr/str" } else { "ldr/str" })?;
+            let opc = if is_128bit {
+                if is_load { 0b11 } else { 0b10 }
+            } else if is_load {
+                0b01
+            } else {
+                0b00
+            };
+            let word = ((actual_size << 30) | (0b111 << 27) | (v << 26))
+                | (opc << 22)
+                | ((imm9 as u32 & 0x1FF) << 12)
+                | (0b01 << 10)
+                | (rn << 5)
+                | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        // [base, Xm] register offset
+        Some(Operand::MemRegOffset {
+            base,
+            index,
+            extend,
+            shift,
+        }) => {
+            // Check if index is a :lo12: modifier
+            if index.starts_with(':') {
+                // Parse modifier from the index string
+                let rn = mem_xn_or_sp(base, "ldr/str")?;
+                let mod_str = index.trim_start_matches(':');
+                let (kind, sym) = if let Some(colon_pos) = mod_str.find(':') {
+                    (&mod_str[..colon_pos], &mod_str[colon_pos + 1..])
+                } else {
+                    return Err(format!("malformed modifier in memory operand: {}", index));
+                };
+
+                let (symbol, addend) = if let Some(plus_pos) = sym.find('+') {
+                    let s = &sym[..plus_pos];
+                    let off: i64 = sym[plus_pos + 1..].parse().unwrap_or(0);
+                    (s.to_string(), off)
+                } else {
+                    (sym.to_string(), 0i64)
+                };
+
+                let opc = if is_128bit {
+                    if is_load { 0b11 } else { 0b10 }
+                } else if is_load {
+                    0b01
+                } else {
+                    0b00
+                };
+
+                let reloc_type = match kind {
+                    "lo12" => {
+                        if is_128bit {
+                            RelocType::Ldst128AbsLo12
+                        } else {
+                            match actual_size {
+                                0b00 => RelocType::Ldst8AbsLo12,
+                                0b01 => RelocType::Ldst16AbsLo12,
+                                0b10 => RelocType::Ldst32AbsLo12,
+                                0b11 => RelocType::Ldst64AbsLo12,
+                                _ => RelocType::Ldst64AbsLo12,
+                            }
+                        }
+                    }
+                    // The GOT-slot forms name an 8-byte LP64 entry and their
+                    // relocations scale the slot offset by 8. GAS 2.47 also
+                    // accepts them on `ldr wN`/`str`, where the field scales
+                    // by 4 or the GOT is written: a silently wrong access
+                    // (ILP32's 4-byte slots use other relocations, and LCCC
+                    // has no ILP32). Refused here, like every other
+                    // meaningless operand form.
+                    "got_lo12" | "gottprel_lo12" | "tlsdesc_lo12" => {
+                        if !is_load || is_signed || v != 0 || is_128bit || actual_size != 0b11 {
+                            return Err(format!(":{kind}: needs a 64-bit integer ldr (xN)"));
+                        }
+                        match kind {
+                            "got_lo12" => RelocType::Ld64GotLo12,
+                            "gottprel_lo12" => RelocType::TlsIeLd64GotTprelLo12,
+                            _ => RelocType::TlsDescLd64Lo12,
+                        }
+                    }
+                    _ => return Err(format!("unsupported modifier in load/store: {}", kind)),
+                };
+
+                let word =
+                    ((actual_size << 30) | (0b111 << 27) | (v << 26) | (0b01 << 24) | (opc << 22))
+                        | (rn << 5)
+                        | rt;
+                return Ok(EncodeResult::WordWithReloc {
+                    word,
+                    reloc: Relocation {
+                        reloc_type,
+                        symbol,
+                        addend,
+                    },
+                });
+            }
+
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let rm_reg = mem_rm(index, "ldr/str")?;
+            let rm = rm_reg.num;
+            let opc = if is_128bit {
+                if is_load { 0b11 } else { 0b10 }
+            } else if is_load {
+                0b01
+            } else {
+                0b00
+            };
+            let scale = if is_128bit { 4 } else { actual_size as u8 };
+            let (option, s_bit) =
+                mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, scale, "ldr/str")?;
+            let word = (actual_size << 30)
+                | (0b111 << 27)
+                | (v << 26)
+                | (opc << 22)
+                | (1 << 21)
+                | (rm << 16)
+                | (option << 13)
+                | (s_bit << 12)
+                | (0b10 << 10)
+                | (rn << 5)
+                | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        // LDR (literal): ldr Rt, label — PC-relative load
+        Some(Operand::Symbol(sym)) if is_load => {
+            // opc V 011 00 imm19 Rt
+            // For GP registers: opc=00 → 32-bit (W), opc=01 → 64-bit (X), opc=11 → PRFM
+            // For FP/SIMD:      opc=00 → 32-bit (S), opc=01 → 64-bit (D), opc=10 → 128-bit (Q)
+            // Note: actual_size uses 10=32-bit, 11=64-bit but LDR literal uses 00=32-bit, 01=64-bit
+            let opc = if is_128bit {
+                0b10u32
+            } else if fp {
+                // FP: S=00, D=01 (same mapping as GP)
+                if actual_size == 0b11 { 0b01 } else { 0b00 }
+            } else {
+                // GP: W=00, X=01
+                if actual_size == 0b11 { 0b01 } else { 0b00 }
+            };
+            let word = (opc << 30) | (v << 26) | (0b011 << 27) | rt;
+            return Ok(EncodeResult::WordWithReloc {
+                word,
+                reloc: Relocation {
+                    reloc_type: RelocType::Ldr19,
+                    symbol: sym.clone(),
+                    addend: 0,
+                },
+            });
+        }
+
+        _ => {}
+    }
+
+    Err(format!("unsupported ldr/str operands: {:?}", operands))
+}
+
+/// Encode LDUR/STUR (unscaled immediate offset load/store)
+/// Format: size 111 V 00 opc 0 imm9 00 Rn Rt
+/// The unscaled (LDUR/STUR/LDTR/STTR) form of a spelled-width access.
+///
+/// The size and opc fields are fixed by the *mnemonic* here (`ldurb` is a byte
+/// access whatever register it names), which is what makes these spellings
+/// legal at all: they are the only encodings of the family whose width does not
+/// come from Rt.
+fn ldur_imm9_form(
+    operands: &[Operand],
+    size: u32,
+    op2_bits: u32,
+    v: u32,
+    opc: u32,
+    rt: u32,
+    mn: &str,
+) -> Result<EncodeResult, String> {
+    let (rn, imm9) = match &operands[1] {
+        Operand::Mem { base, offset } => (mem_xn_or_sp(base, mn)?, checked_imm9(*offset, mn)?),
+        _ => {
+            return Err(format!(
+                "{mn}: expected an offset memory operand, got {:?}",
+                operands[1]
+            ));
+        }
+    };
+    let word = (size << 30)
+        | (0b111 << 27)
+        | (v << 26)
+        | (opc << 22)
+        | (imm9 << 12)
+        | (op2_bits << 10)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// [`encode_ldur_stur`] with the mnemonic's destination class: the unscaled
+/// base carries the same spelled widths as the offset base (`ldurb`, `ldurh`,
+/// `ldursb`, `ldursh`, `ldursw`), and the unprivileged base (`ldtr`/`sttr`) has
+/// no FP/SIMD form at all -- `ldtr d0,[x0]` used to assemble as a GPR access.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_ldur_stur(
+    operands: &[Operand],
+    is_load: bool,
+    op2_bits: u32,
+) -> Result<EncodeResult, String> {
+    encode_ldur_stur_checked(
+        operands,
+        is_load,
+        op2_bits,
+        LdstDest::Any,
+        None,
+        false,
+        "ldur/stur",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_ldur_stur_checked(
+    operands: &[Operand],
+    is_load: bool,
+    op2_bits: u32,
+    dest: LdstDest,
+    forced_size: Option<u32>,
+    signed: bool,
+    mn: &str,
+) -> Result<EncodeResult, String> {
+    if operands.len() < 2 {
+        return Err(format!("{mn} requires 2 operands"));
+    }
+    let rt_reg = ldst_rt(operands, 0, mn)?;
+    if dest != LdstDest::Any {
+        dest.check(&rt_reg, mn)?;
+    }
+    let rt = rt_reg.num;
+    let reg_name = rt_reg.name.to_lowercase();
+    // Rt = 31 reads as the zero register in every encoding of this family,
+    // SP spelling or not: `ldur sp,[x0,#8]` used to assemble as an XZR load.
+    if !rt_reg.is_fp && (reg_name == "sp" || reg_name == "wsp") {
+        return Err(format!(
+            "{mn}: the stack pointer cannot be the transferred register; write `{}` \
+             if the zero register is what you meant",
+            if reg_name == "sp" { "xzr" } else { "wzr" }
+        ));
+    }
+    let fp = rt_reg.is_fp;
+    let v = if fp { 1u32 } else { 0u32 };
+    // The access size comes from the *parsed* register.  `starts_with('x')`
+    // asked the spelling, and `lr` does not start with `x`: `ldur lr,[x1,#8]`
+    // assembled as `ldur w30,[x1,#8]` (0xb840803e) while GNU as emits the
+    // 64-bit 0xf840803e -- a same-opcode, half-width load, which is the kind
+    // of wrong that shows up as a truncated pointer much later.  The width
+    // letter is the reader's answer, so it is the one used here.
+    if let Some(size) = forced_size {
+        let opc = if signed {
+            if rt_reg.is_64 { 0b10u32 } else { 0b11 }
+        } else if is_load {
+            0b01
+        } else {
+            0b00
+        };
+        return ldur_imm9_form(operands, size, op2_bits, v, opc, rt, mn);
+    }
+
+    let (size, opc) = if fp {
+        match rt_reg.letter {
+            b'q' => (0b00u32, if is_load { 0b11u32 } else { 0b10 }),
+            b'd' => (0b11, if is_load { 0b01 } else { 0b00 }),
+            b's' => (0b10, if is_load { 0b01 } else { 0b00 }),
+            b'h' => (0b01, if is_load { 0b01 } else { 0b00 }),
+            // `ldur b0,[x0,#8]` is LDUR of a B register: size 00, opc 01
+            // (load) / 00 (store), exactly like the `q` form but one byte
+            // wide.  It is a real encoding -- GNU as emits 0x3c804020 -- and
+            // the reader has already refused every spelling that is not a
+            // floating-point letter.
+            b'b' => (0b00, if is_load { 0b01 } else { 0b00 }),
+            _ => {
+                return Err(format!(
+                    "{mn}: `{reg_name}` has no unscaled form; this family takes the \
+                     scalar spellings b/h/s/d/q (and w/x for general registers)"
+                ));
+            }
+        }
+    } else {
+        let sz = if rt_reg.is_64 { 0b11u32 } else { 0b10 };
+        (sz, if is_load { 0b01u32 } else { 0b00 })
+    };
+
+    let (rn, imm9_enc) = match &operands[1] {
+        Operand::Mem { base, offset } => (mem_xn_or_sp(base, mn)?, checked_imm9(*offset, mn)?),
+        _ => {
+            return Err(format!(
+                "{mn}: expected memory operand, got {:?}",
+                operands[1]
+            ));
+        }
+    };
+    let word = (size << 30)
+        | (0b111 << 27)
+        | (v << 26)
+        | (opc << 22)
+        | (imm9_enc << 12)
+        | (op2_bits << 10)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// Encode LDTR/STTR with explicit size (for ldtrh, ldtrb, etc.)
+
+pub(crate) fn encode_ldrsw(operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() < 2 {
+        return Err("ldrsw requires 2 operands".to_string());
+    }
+
+    // LDRSW writes a 64-bit Xt; a W destination is not encodable (GAS rejects
+    // `ldrsw w0, [x0]`). Encoding 31 is XZR, not SP.
+    let rt_reg = gpr_rt_not_sp(
+        match operands.first() {
+            Some(Operand::Reg(n)) => n.as_str(),
+            _ => return Err("ldrsw: expected Xt destination".to_string()),
+        },
+        "ldrsw",
+    )?;
+    if !rt_reg.is_64 {
+        return Err(
+            "ldrsw: destination must be a 64-bit Xt (W-registers are not encodable)".to_string(),
+        );
+    }
+    let rt = rt_reg.num;
+
+    match operands.get(1) {
+        Some(Operand::Mem { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldrsw")?;
+            // LDRSW: size=10 111 V=0 01 opc=10 -> unsigned offset
+            // Actually: 10 111 0 01 10 imm12 Rn Rt
+            let abs_offset = *offset as u64;
+            if *offset >= 0 && abs_offset.is_multiple_of(4) {
+                let imm12 = (abs_offset / 4) as u32;
+                if imm12 < 4096 {
+                    let word = ((0b10 << 30) | (0b111 << 27))
+                        | (0b01 << 24)
+                        | (0b10 << 22)
+                        | (imm12 << 10)
+                        | (rn << 5)
+                        | rt;
+                    return Ok(EncodeResult::Word(word));
+                }
+            }
+            // Unscaled: LDURSW
+            let imm9 = checked_imm9(*offset, "ldrsw")?;
+            let word =
+                (((0b10 << 30) | (0b111 << 27)) | (0b10 << 22) | ((imm9 as u32 & 0x1FF) << 12))
+                    | (rn << 5)
+                    | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        Some(Operand::MemPostIndex { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let imm9 = checked_imm9(*offset, "ldrsw")?;
+            let word = ((0b10 << 30) | (0b111 << 27))
+                | (0b10 << 22)
+                | ((imm9 as u32 & 0x1FF) << 12)
+                | (0b01 << 10)
+                | (rn << 5)
+                | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        Some(Operand::MemPreIndex { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let imm9 = checked_imm9(*offset, "ldrsw")?;
+            let word = ((0b10 << 30) | (0b111 << 27))
+                | (0b10 << 22)
+                | ((imm9 as u32 & 0x1FF) << 12)
+                | (0b11 << 10)
+                | (rn << 5)
+                | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        Some(Operand::MemRegOffset {
+            base,
+            index,
+            extend,
+            shift,
+        }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let rm_reg = mem_rm(index, "ldrsw")?;
+            let rm = rm_reg.num;
+            let (option, s_bit) =
+                mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, 2, "ldrsw")?;
+            // LDRSW reg: 10 111 0 00 10 1 Rm option S 10 Rn Rt
+            let word = (0b10 << 30)
+                | (0b111 << 27)
+                | (0b10 << 22)
+                | (1 << 21)
+                | (rm << 16)
+                | (option << 13)
+                | (s_bit << 12)
+                | (0b10 << 10)
+                | (rn << 5)
+                | rt;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        _ => {}
+    }
+
+    Err(format!("unsupported ldrsw operands: {:?}", operands))
+}
+
+pub(crate) fn encode_ldrs(operands: &[Operand], size: u32) -> Result<EncodeResult, String> {
+    encode_ldrs_checked(operands, size, LdstDest::Any, "ldrs")
+}
+
+/// [`encode_ldrs`] with the mnemonic's destination class: `ldrsb`/`ldrsh` take
+/// a w or x register (an FP destination is a different instruction entirely),
+/// and `ldrsw` takes only x.
+pub(crate) fn encode_ldrs_checked(
+    operands: &[Operand],
+    size: u32,
+    dest: LdstDest,
+    mn: &str,
+) -> Result<EncodeResult, String> {
+    // LDRSB/LDRSH: sign-extending byte/halfword loads.  The destination class
+    // is per mnemonic (`ldrsb`/`ldrsh` take w or x, `ldrsw` only x), and the
+    // opc field selects the *sign-extended width*, not the register width --
+    // which is why an FP destination here used to encode a plain FP load of
+    // the same byte address, i.e. a different instruction.
+    if operands.len() != 2 {
+        return Err(format!(
+            "{mn} takes exactly 2 operands (Rt, [Xn{{, #imm}}]), got {}",
+            operands.len()
+        ));
+    }
+    let rt_reg = ldst_rt(operands, 0, mn)?;
+    if dest != LdstDest::Any {
+        dest.check(&rt_reg, mn)?;
+    }
+
+    let rt = rt_reg.num;
+    // A signed load into a floating-point register is not a form: `ldrsw s0`
+    // does not exist, so the class the mnemonic's own check allows is the
+    // answer here too, and `is_64` is the GP width when there is one.
+    if rt_reg.is_fp {
+        return Err(format!(
+            "{mn}: `{}` is a floating-point register; this instruction loads into \
+             a general-purpose register",
+            rt_reg.name
+        ));
+    }
+    let is_64 = rt_reg.is_64;
+    let opc = if is_64 { 0b10 } else { 0b11 }; // 64-bit target: opc=10, 32-bit: opc=11
+
+    if let Some(Operand::Mem { base, offset }) = operands.get(1) {
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
+        let shift = size;
+        let abs_offset = *offset as u64;
+        let align = 1u64 << shift;
+        if *offset >= 0 && abs_offset.is_multiple_of(align) {
+            let imm12 = (abs_offset / align) as u32;
+            if imm12 < 4096 {
+                let word = ((size << 30) | (0b111 << 27))
+                    | (0b01 << 24)
+                    | (opc << 22)
+                    | (imm12 << 10)
+                    | (rn << 5)
+                    | rt;
+                return Ok(EncodeResult::Word(word));
+            }
+        }
+        // Unscaled
+        let imm9 = checked_imm9(*offset, "ldrs")?;
+        let word = (((size << 30) | (0b111 << 27)) | (opc << 22) | ((imm9 as u32 & 0x1FF) << 12))
+            | (rn << 5)
+            | rt;
+        return Ok(EncodeResult::Word(word));
+    }
+
+    // Post-index: ldrsb/ldrsh Rt, [Xn], #imm
+    if let Some(Operand::MemPostIndex { base, offset }) = operands.get(1) {
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
+        let imm9 = checked_imm9(*offset, "ldrs")?;
+        let word = (size << 30)
+            | (0b111 << 27)
+            | (opc << 22)
+            | ((imm9 as u32 & 0x1FF) << 12)
+            | (0b01 << 10)
+            | (rn << 5)
+            | rt;
+        return Ok(EncodeResult::Word(word));
+    }
+
+    // Pre-index: ldrsb/ldrsh Rt, [Xn, #imm]!
+    if let Some(Operand::MemPreIndex { base, offset }) = operands.get(1) {
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
+        let imm9 = checked_imm9(*offset, "ldrs")?;
+        let word = (size << 30)
+            | (0b111 << 27)
+            | (opc << 22)
+            | ((imm9 as u32 & 0x1FF) << 12)
+            | (0b11 << 10)
+            | (rn << 5)
+            | rt;
+        return Ok(EncodeResult::Word(word));
+    }
+
+    // Register offset: ldrsb/ldrsh Rt, [Xn, Xm{, extend {#amount}}]
+    if let Some(Operand::MemRegOffset {
+        base,
+        index,
+        extend,
+        shift,
+    }) = operands.get(1)
+    {
+        let rn = mem_xn_or_sp(base, "ldr/str")?;
+        let rm_reg = mem_rm(index, "ldrs")?;
+        let rm = rm_reg.num;
+        let (option, s_bit) =
+            mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, size as u8, "ldrs")?;
+        let word = (size << 30)
+            | (0b111 << 27)
+            | (opc << 22)
+            | (1 << 21)
+            | (rm << 16)
+            | (option << 13)
+            | (s_bit << 12)
+            | (0b10 << 10)
+            | (rn << 5)
+            | rt;
+        return Ok(EncodeResult::Word(word));
+    }
+
+    Err(format!("unsupported ldrsb/ldrsh operands: {:?}", operands))
+}
+
+pub(crate) fn encode_ldp_stp(operands: &[Operand], is_load: bool) -> Result<EncodeResult, String> {
+    if operands.len() != 3 {
+        return Err(format!(
+            "ldp/stp requires 3 operands, got {}",
+            operands.len()
+        ));
+    }
+
+    let name1 = reg_name_at(operands, 0)?;
+    let name2 = reg_name_at(operands, 1)?;
+
+    // Same classifier as `ldnp/stnp`, deliberately shared: the two encodings
+    // differ only in the no-allocate bit, so they cannot disagree about what a
+    // register class means. `ldp`/`stp` used to carry its own copy, which
+    // mapped `b`/`h` registers onto the S pair (there is no such pair form) and
+    // never checked that the two registers of a pair shared a class -- so
+    // `stp b0, b1, [x0]` silently assembled as `stp s0, s1, [x0]`.
+    let what = if is_load { "ldp" } else { "stp" };
+    let (opc, v, shift) = pair_reg_fields(&name1, what)?;
+    let (opc2, v2, _) = pair_reg_fields(&name2, what)?;
+    if (opc, v) != (opc2, v2) {
+        return Err(format!(
+            "{what}: `{name1}` and `{name2}` are different register classes; a pair needs two registers of the same kind and width"
+        ));
+    }
+
+    let rt1 = parse_reg_num(&name1).ok_or_else(|| format!("invalid register: {name1}"))?;
+    let rt2 = parse_reg_num(&name2).ok_or_else(|| format!("invalid register: {name2}"))?;
+    let l = if is_load { 1u32 } else { 0u32 };
+
+    match operands.get(2) {
+        // STP rt1, rt2, [base, #offset]! (pre-index)
+        Some(Operand::MemPreIndex { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
+            let word = (opc << 30)
+                | (0b101 << 27)
+                | (v << 26)
+                | (0b011 << 23)
+                | (l << 22)
+                | ((imm7 as u32 & 0x7F) << 15)
+                | (rt2 << 10)
+                | (rn << 5)
+                | rt1;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        // LDP/STP rt1, rt2, [base], #offset (post-index)
+        Some(Operand::MemPostIndex { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
+            let word = (opc << 30)
+                | (0b101 << 27)
+                | (v << 26)
+                | (0b001 << 23)
+                | (l << 22)
+                | ((imm7 as u32 & 0x7F) << 15)
+                | (rt2 << 10)
+                | (rn << 5)
+                | rt1;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        // LDP/STP rt1, rt2, [base, #offset] (signed offset)
+        Some(Operand::Mem { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldp" } else { "stp" })?;
+            let word = (opc << 30)
+                | (0b101 << 27)
+                | (v << 26)
+                | (0b010 << 23)
+                | (l << 22)
+                | ((imm7 as u32 & 0x7F) << 15)
+                | (rt2 << 10)
+                | (rn << 5)
+                | rt1;
+            return Ok(EncodeResult::Word(word));
+        }
+
+        _ => {}
+    }
+
+    Err(format!("unsupported ldp/stp operands: {:?}", operands))
+}
+
+/// Encode LDNP/STNP (load/store pair non-temporal)
+/// Encoding: opc 101 V 000 L imm7 Rt2 Rn Rt
+/// TODO: Only handles integer registers (V=0). FP/SIMD register support needed for V=1.
+/// Classify a register for the load/store-PAIR encodings.
+///
+/// Returns `(opc, V, scale)`, where `opc` is the 2-bit class field at 31:30,
+/// `V` at bit 26 selects the SIMD/FP encoding space, and `scale` is log2 of the
+/// access width -- the shift applied to the byte offset before it is stored in
+/// the imm7 field.
+///
+/// ```text
+/// GPR W -> (00, 0, 2) FP S -> (00, 1, 2)
+/// GPR X -> (10, 0, 3) FP D -> (01, 1, 3)
+/// FP Q -> (10, 1, 4)
+/// ```
+///
+/// `ldnp`/`stnp` previously hardcoded `V = 0` and chose `opc` from "is this a
+/// 64-bit register", which is a GPR-only question. Every FP non-temporal pair
+/// was therefore encoded as the corresponding GPR pair: `ldnp s24, s13,
+/// [x20, #80]` produced exactly the word GAS produces for `ldnp w24, w13,
+/// [x20, #80]` -- a pair of 32-bit integer loads in place of two single-precision
+/// float loads. `ldp`/`stp` already classified correctly, which is why the
+/// defect survived: the common pair instructions were right and the rare
+/// non-temporal ones were silently wrong.
+fn pair_reg_fields(name: &str, what: &str) -> Result<(u32, u32, u32), String> {
+    let n = name.to_lowercase();
+    // Encoding 31 in a pair transferred register is XZR/WZR, never SP.
+    // `ldp sp, x1, [x0]` previously assembled as `ldp xzr, x1, [x0]`.
+    if n == "sp" || n == "wsp" {
+        return Err(format!(
+            "{what}: the stack pointer cannot be a transferred register of a pair; write `{}` if the zero register is what you meant",
+            if n == "sp" { "xzr" } else { "wzr" }
+        ));
+    }
+    let fields = match n.as_str() {
+        "xzr" | "lr" => (0b10u32, 0u32, 3u32),
+        "wzr" => (0b00, 0, 2),
+        _ => match n.chars().next() {
+            Some('x') => (0b10, 0, 3),
+            Some('w') => (0b00, 0, 2),
+            Some('s') => (0b00, 1, 2),
+            Some('d') => (0b01, 1, 3),
+            // Only `q` is the 128-bit scalar spelling of a pair; GNU as
+            // rejects `ldp v0, v1, [x0]` (it reads `v0` as a *vector*, and the
+            // pair forms take scalars).  Accepting it encoded `ldp q0, q1`.
+            Some('v') => {
+                return Err(format!(
+                    "{what}: `{name}` is a vector register; a pair takes the 128-bit \
+                     scalar spelling (q0 to q31)"
+                ));
+            }
+            Some('q') => (0b10, 1, 4),
+            _ => {
+                return Err(format!(
+                    "{what}: unsupported register `{name}` (a load/store pair expects w, x, s, d or q)"
+                ));
+            }
+        },
+    };
+    Ok(fields)
+}
+
+/// Fetch the register *name* at `idx`; the pair encoders need the class, which
+/// the numeric `get_reg` does not carry.
+fn reg_name_at(operands: &[Operand], idx: usize) -> Result<String, String> {
+    match operands.get(idx) {
+        Some(Operand::Reg(r)) => Ok(r.clone()),
+        other => Err(format!("expected register at operand {idx}, got {other:?}")),
+    }
+}
+
+pub(crate) fn encode_ldnp_stnp(
+    operands: &[Operand],
+    is_load: bool,
+) -> Result<EncodeResult, String> {
+    if operands.len() != 3 {
+        return Err(format!(
+            "ldnp/stnp requires 3 operands, got {}",
+            operands.len()
+        ));
+    }
+
+    let name1 = reg_name_at(operands, 0)?;
+    let name2 = reg_name_at(operands, 1)?;
+
+    // One opc/V field covers the whole pair, so both registers must be the
+    // same class and width. A mismatched pair has no encoding at all; it must
+    // be diagnosed rather than silently downgraded to the GPR form.
+    let what = if is_load { "ldnp" } else { "stnp" };
+    let (opc, v, shift) = pair_reg_fields(&name1, what)?;
+    let (opc2, v2, _) = pair_reg_fields(&name2, what)?;
+    if (opc, v) != (opc2, v2) {
+        return Err(format!(
+            "{what}: `{name1}` and `{name2}` are different register classes; a pair needs two registers of the same kind and width"
+        ));
+    }
+
+    let rt1 = parse_reg_num(&name1).ok_or_else(|| format!("invalid register: {name1}"))?;
+    let rt2 = parse_reg_num(&name2).ok_or_else(|| format!("invalid register: {name2}"))?;
+    let l: u32 = if is_load { 1 } else { 0 };
+
+    match operands.get(2) {
+        Some(Operand::Mem { base, offset }) => {
+            let rn = mem_xn_or_sp(base, "ldr/str")?;
+            let align = 1i64 << shift;
+            // The imm7 field is scaled, so an unaligned offset would be
+            // truncated and the pair would access the wrong address.
+            if *offset % align != 0 {
+                return Err(format!(
+                    "ldnp/stnp: offset {offset} is not a multiple of {align} (required by the {name1} access width)"
+                ));
+            }
+            let imm7 = checked_imm7(*offset, shift, if is_load { "ldnp" } else { "stnp" })?;
+            // LDNP/STNP: opc(31:30) 101(29:27) V(26) 000(25:23) L(22)
+            // imm7(21:15) Rt2(14:10) Rn(9:5) Rt(4:0)
+            let word = (opc << 30)
+                | (0b101 << 27)
+                | (v << 26)
+                | (l << 22)
+                | ((imm7 as u32 & 0x7F) << 15)
+                | (rt2 << 10)
+                | (rn << 5)
+                | rt1;
+            Ok(EncodeResult::Word(word))
+        }
+        _ => Err(format!("unsupported ldnp/stnp operands: {operands:?}")),
+    }
+}
+
+// ── Exclusive loads/stores ───────────────────────────────────────────────
+
+/// Encode LDXR/STXR and byte/halfword variants.
+/// `forced_size`: None = auto-detect from register width, Some(0b00) = byte, Some(0b01) = halfword
+/// The status register of STXR/STLXR: a 32-bit general-purpose register.
+///
+/// The instruction stores the exclusive-access outcome as a 32-bit word, so
+/// encoding 31 reads as WZR and the field is W-only: `stxr x0,x1,[x2]` was
+/// accepted and assembled with X0's number in a field that means "W0", i.e. an
+/// instruction GNU as rejects ("expected an integer or zero register at operand
+/// 1").  The same check catches `stxr sp,...` for free.
+fn status_w(name: &str, mn: &str) -> Result<u32, String> {
+    let r = GpReg::by_name(name).ok_or_else(|| {
+        format!("{mn}: `{name}` is not a general-purpose register (expected w0-w30 or wzr)")
+    })?;
+    if r.is_sp {
+        return Err(format!(
+            "{mn}: the stack pointer is not a status register; write `wzr` if the \
+             zero register is what you meant"
+        ));
+    }
+    if r.is_64 {
+        return Err(format!(
+            "{mn}: `{name}` is 64-bit; the exclusive-status register is 32-bit (write `{}`)",
+            name.replacen('x', "w", 1)
+        ));
+    }
+    Ok(r.num)
+}
+
+/// Whether an atomic mnemonic's size suffix fixes the 32-bit register spelling.
+///
+/// `casb w0,w1,[x2]` is the byte form and takes W registers; `casb x0,x1,[x2]`
+/// has no encoding, and GNU as refuses `ldxrb xzr,[x1]` for the same reason
+/// while accepting `ldxr xzr,[x1]`.  Every member of the exclusive/LSE family
+/// spells its byte and half forms with a trailing `b`/`h` *after* the ordering
+/// letters (`casab`, `ldaddalh`, `stlxrb`), and no other member of the family
+/// ends in either letter, so the suffix is the whole rule.
+fn size_suffix_forces_w(mnemonic: &str) -> bool {
+    matches!(mnemonic.as_bytes().last(), Some(b'b') | Some(b'h'))
+}
+
+/// Rt of the exclusive loads/stores and the LSE read-modify-writes: a GPR, and
+/// never the stack pointer (`ldxr sp,[x1]` encoded as an XZR load), and of the
+/// width the mnemonic's size suffix demands when it has one.
+fn exclusive_rt(operands: &[Operand], idx: usize, mn: &str) -> Result<(u32, bool), String> {
+    let (rt, is_64) = get_reg(operands, idx)?;
+    let name = reg_name_at(operands, idx).unwrap_or_default();
+    if let Some(gp) = GpReg::by_name(&name) {
+        if gp.is_sp {
+            return Err(format!(
+                "{mn}: the stack pointer cannot be the transferred register; write `{}` \
+                 if the zero register is what you meant",
+                if gp.is_64 { "xzr" } else { "wzr" }
+            ));
+        }
+        if is_64 && size_suffix_forces_w(mn) {
+            return Err(format!(
+                "{mn}: `{name}` is 64-bit, but the byte/half form of {mn} operates on a \
+                 32-bit register (write `{}`)",
+                name.replacen('x', "w", 1)
+            ));
+        }
+    }
+    Ok((rt, is_64))
+}
+
+/// Encode LDXR/STXR and their byte and halfword variants.
+///
+/// `mn` is the *spelling* the programmer wrote (`ldxrb`, `stxrh`, ...) and not
+/// a family name, because the mnemonic is what carries the width rule: a
+/// trailing `b`/`h` fixes the transferred register at 32 bits, so
+/// `ldxrb x0,[x1]` has no encoding while `ldxrb w0,[x1]` does.  The size field
+/// alone cannot tell the two apart, and passing a family name here — which is
+/// what this function used to be called with — silently dropped the rule for
+/// every `ldaxr*`/`stlxr*`/`ldar*` spelling.
+pub(crate) fn encode_ldxr_stxr(
+    operands: &[Operand],
+    mn: &str,
+    is_load: bool,
+    forced_size: Option<u32>,
+) -> Result<EncodeResult, String> {
+    if is_load {
+        if operands.len() != 2 {
+            return Err(format!(
+                "{mn} takes exactly 2 operands (Rt, [Xn]), got {}",
+                operands.len()
+            ));
+        }
+        let (rt, is_64) = exclusive_rt(operands, 0, mn)?;
+        let rn = atomic_xn(operands.get(1), mn)?;
+        let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
+        let word = ((size << 30) | (0b001000010 << 21) | (0b11111 << 16))
+            | (0b11111 << 10)
+            | (rn << 5)
+            | rt;
+        Ok(EncodeResult::Word(word))
+    } else {
+        if operands.len() != 3 {
+            return Err(format!(
+                "{mn} takes exactly 3 operands (Ws, Rt, [Xn]), got {}",
+                operands.len()
+            ));
+        }
+        let ws = status_w(&reg_name_at(operands, 0)?, mn)?;
+        let (rt, is_64) = exclusive_rt(operands, 1, mn)?;
+        let rn = atomic_xn(operands.get(2), mn)?;
+        let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
+        let word =
+            ((size << 30) | (0b001000000 << 21) | (ws << 16)) | (0b11111 << 10) | (rn << 5) | rt;
+        Ok(EncodeResult::Word(word))
+    }
+}
+
+/// Encode LDAXR/STLXR and byte/halfword variants.
+/// Rs/Rt of CAS and SWP must select the same access width.
+///
+/// Unlike LDXR/STXR (whose size is the mnemonic's or Rt's), CAS/SWP have a
+/// single size field for both registers, so a mixed pair has no encoding:
+/// `cas x0,w1,[x2]` used to assemble as `cas w0,w1,[x2]` (X0's number in a
+/// 32-bit field), a different instruction than the one written.
+fn same_width_pair(rs_name: &str, rt_name: &str, mn: &str) -> Result<(), String> {
+    let rs = GpReg::by_name(rs_name);
+    let rt = GpReg::by_name(rt_name);
+    if let (Some(a), Some(b)) = (rs, rt) {
+        if a.is_sp || b.is_sp {
+            return Err(format!(
+                "{mn}: the stack pointer cannot be a transferred register"
+            ));
+        }
+        if a.is_64 != b.is_64 {
+            return Err(format!(
+                "{mn}: `{rs_name}` and `{rt_name}` must be the same width; the \
+                 instruction has one size field for both"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Encode LDAXR/STLXR and their byte and halfword variants (see
+/// [`encode_ldxr_stxr`] for why the spelling, and not a family name, is the
+/// argument).
+pub(crate) fn encode_ldaxr_stlxr(
+    operands: &[Operand],
+    mn: &str,
+    is_load: bool,
+    forced_size: Option<u32>,
+) -> Result<EncodeResult, String> {
+    if is_load {
+        if operands.len() != 2 {
+            return Err(format!(
+                "{mn} takes exactly 2 operands (Rt, [Xn]), got {}",
+                operands.len()
+            ));
+        }
+        let (rt, is_64) = exclusive_rt(operands, 0, mn)?;
+        let rn = atomic_xn(operands.get(1), mn)?;
+        let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
+        let word = (size << 30)
+            | (0b001000010 << 21)
+            | (0b11111 << 16)
+            | (1 << 15)
+            | (0b11111 << 10)
+            | (rn << 5)
+            | rt;
+        Ok(EncodeResult::Word(word))
+    } else {
+        if operands.len() != 3 {
+            return Err(format!(
+                "{mn} takes exactly 3 operands (Ws, Rt, [Xn]), got {}",
+                operands.len()
+            ));
+        }
+        let ws = status_w(&reg_name_at(operands, 0)?, mn)?;
+        let (rt, is_64) = exclusive_rt(operands, 1, mn)?;
+        let rn = atomic_xn(operands.get(2), mn)?;
+        let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
+        let word = (size << 30)
+            | (0b001000000 << 21)
+            | (ws << 16)
+            | (1 << 15)
+            | (0b11111 << 10)
+            | (rn << 5)
+            | rt;
+        Ok(EncodeResult::Word(word))
+    }
+}
+
+/// Encode LDXP/STXP/LDAXP/STLXP (exclusive pair) instructions.
+///
+/// LDXP Xt1, Xt2, [Xn] : sz 001000 0 1 1 11111 0 Rt2 Rn Rt
+/// LDAXP Xt1, Xt2, [Xn] : sz 001000 0 1 1 11111 1 Rt2 Rn Rt
+/// STXP Ws, Xt1, Xt2, [Xn] : sz 001000 0 0 1 Rs 0 Rt2 Rn Rt
+/// STLXP Ws, Xt1, Xt2, [Xn] : sz 001000 0 0 1 Rs 1 Rt2 Rn Rt
+pub(crate) fn encode_ldxp_stxp(
+    operands: &[Operand],
+    mn: &str,
+    is_load: bool,
+    acquire_release: bool,
+) -> Result<EncodeResult, String> {
+    let o0 = if acquire_release { 1u32 } else { 0 };
+    if is_load {
+        // LDXP/LDAXP Rt, Rt2, [Rn]
+        if operands.len() != 3 {
+            return Err(format!(
+                "{mn} takes exactly 3 operands (Rt, Rt2, [Xn]), got {}",
+                operands.len()
+            ));
+        }
+        let (rt, is_64) = exclusive_rt(operands, 0, mn)?;
+        let (rt2, rt2_is_64) = exclusive_rt(operands, 1, mn)?;
+        // One `sz` field covers both transferred registers, so the two halves
+        // must select the same width: `ldaxp w0,x1,[x2]` used to assemble as
+        // the 64-bit pair (X0's number in the first half), a different
+        // instruction than the one written.
+        if is_64 != rt2_is_64 {
+            return Err(format!(
+                "{mn}: `{}` and `{}` must be the same width; the pair form has one \
+                 size field for both halves",
+                reg_name_at(operands, 0).unwrap_or_default(),
+                reg_name_at(operands, 1).unwrap_or_default()
+            ));
+        }
+        let rn = atomic_xn(operands.get(2), mn)?;
+        let sz = if is_64 { 1u32 } else { 0 };
+        // 1 sz 001000 0 1 1 11111 o0 Rt2 Rn Rt (bit23=0)
+        let word = (1u32 << 31)
+            | (sz << 30)
+            | (0b001000 << 24)
+            | (1 << 22)
+            | (1 << 21)
+            | (0b11111 << 16)
+            | (o0 << 15)
+            | (rt2 << 10)
+            | (rn << 5)
+            | rt;
+        Ok(EncodeResult::Word(word))
+    } else {
+        // STXP/STLXP Ws, Rt, Rt2, [Rn]
+        if operands.len() != 4 {
+            return Err(format!(
+                "{mn} takes exactly 4 operands (Ws, Rt, Rt2, [Xn]), got {}",
+                operands.len()
+            ));
+        }
+        let ws = status_w(&reg_name_at(operands, 0)?, mn)?;
+        let (rt, is_64) = exclusive_rt(operands, 1, mn)?;
+        let (rt2, rt2_is_64) = exclusive_rt(operands, 2, mn)?;
+        if is_64 != rt2_is_64 {
+            return Err(format!(
+                "{mn}: `{}` and `{}` must be the same width; the pair form has one \
+                 size field for both halves",
+                reg_name_at(operands, 1).unwrap_or_default(),
+                reg_name_at(operands, 2).unwrap_or_default()
+            ));
+        }
+        let rn = atomic_xn(operands.get(3), mn)?;
+        let sz = if is_64 { 1u32 } else { 0 };
+        // 1 sz 001000 0 0 1 Rs o0 Rt2 Rn Rt (bit23=0, bit22=0)
+        let word = (1u32 << 31)
+            | (sz << 30)
+            | (0b001000 << 24)
+            | (1 << 21)
+            | (ws << 16)
+            | (o0 << 15)
+            | (rt2 << 10)
+            | (rn << 5)
+            | rt;
+        Ok(EncodeResult::Word(word))
+    }
+}
+
+/// Encode LDAR/STLR and byte/halfword variants.
+pub(crate) fn encode_ldar_stlr(
+    operands: &[Operand],
+    mn: &str,
+    is_load: bool,
+    forced_size: Option<u32>,
+) -> Result<EncodeResult, String> {
+    if operands.len() != 2 {
+        return Err(format!(
+            "{mn} takes exactly 2 operands (Rt, [Xn]), got {}",
+            operands.len()
+        ));
+    }
+    let (rt, is_64) = exclusive_rt(operands, 0, mn)?;
+    let rn = atomic_xn(operands.get(1), mn)?;
+    let size = forced_size.unwrap_or(if is_64 { 0b11 } else { 0b10 });
+    let l = if is_load { 1u32 } else { 0 };
+    // LDAR/STLR: size 001000 1 L 0 11111 1 11111 Rn Rt
+    let word = ((size << 30) | (0b001000 << 24) | (1 << 23) | (l << 22))
+        | (0b11111 << 16)
+        | (1 << 15)
+        | (0b11111 << 10)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+// ── Address computation ──────────────────────────────────────────────────
+
+/// Both PC-relative address instructions have exactly two operands and an X
+/// destination. Register class alone is insufficient: Wn shares the number.
+fn adr_destination(operands: &[Operand], mnemonic: &str) -> Result<u32, String> {
+    if operands.len() != 2 {
+        return Err(format!("{mnemonic} takes exactly 2 operands"));
+    }
+    let rd = reg_operand(operands, 0, GpRole::RegOrZr, mnemonic)?;
+    if !rd.is_64 {
+        return Err(format!("{mnemonic} requires a 64-bit destination register"));
+    }
+    Ok(rd.num)
+}
+
+pub(crate) fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> {
+    // ADRP's Rd is a 64-bit general-purpose register: `adrp d0, sym` used to
+    // encode `adrp x0, sym` because the permissive reader accepts the FP width
+    // letters, i.e. a page-address computation written into a double register
+    // became one into x0.  SP is not encodable either (field 31 is XZR here).
+    let rd = adr_destination(operands, "adrp")?;
+
+    let (sym, addend) = match operands.get(1) {
+        Some(Operand::Symbol(s)) => (s.clone(), 0i64),
+        Some(Operand::Modifier { kind, symbol })
+            if matches!(kind.as_str(), "got" | "gottprel" | "tlsdesc") =>
+        {
+            // adrp xN, :got:sym / :gottprel:sym (TLS IE) / :tlsdesc:sym
+            let reloc_type = match kind.as_str() {
+                "got" => RelocType::AdrGotPage21,
+                "gottprel" => RelocType::TlsIeAdrGotTprelPage21,
+                _ => RelocType::TlsDescAdrPage21,
+            };
+            let word = (1u32 << 31) | (0b10000 << 24) | rd;
+            return Ok(EncodeResult::WordWithReloc {
+                word,
+                reloc: Relocation {
+                    reloc_type,
+                    symbol: symbol.clone(),
+                    addend: 0,
+                },
+            });
+        }
+        Some(Operand::SymbolOffset(s, off)) => (s.clone(), *off),
+        Some(Operand::Label(s)) => (s.clone(), 0i64),
+        // Parser misclassifies symbol names that collide with register names (s1, v0, d1, etc.),
+        // condition codes (cc, lt, le), or barrier names (st, ld).
+        // ADRP never takes these as actual operand types, so treat them as symbols.
+        Some(Operand::Reg(name)) => (name.clone(), 0i64),
+        Some(Operand::Cond(name)) => (name.clone(), 0i64),
+        Some(Operand::Barrier(name)) => (name.clone(), 0i64),
+        _ => {
+            return Err(format!(
+                "adrp needs symbol operand, got {:?}",
+                operands.get(1)
+            ));
+        }
+    };
+
+    // ADRP: 1 immlo[1:0] 10000 immhi[18:0] Rd
+    let word = (1u32 << 31) | (0b10000 << 24) | rd;
+    Ok(EncodeResult::WordWithReloc {
+        word,
+        reloc: Relocation {
+            reloc_type: RelocType::AdrpPage21,
+            symbol: sym,
+            addend,
+        },
+    })
+}
+
+pub(crate) fn encode_adr(operands: &[Operand]) -> Result<EncodeResult, String> {
+    let rd = adr_destination(operands, "adr")?;
+
+    // Check for immediate offset form: adr Rd, #imm
+    if let Some(Operand::Imm(imm)) = operands.get(1) {
+        let bits = crate::backend::arm::address::adr_imm_bits(*imm)?;
+        let word = bits | (0b10000 << 24) | rd;
+        return Ok(EncodeResult::Word(word));
+    }
+
+    let (sym, addend) = get_symbol(operands, 1)?;
+    // ADR: 0 immlo[1:0] 10000 immhi[18:0] Rd
+    let word = (0b10000 << 24) | rd;
+    Ok(EncodeResult::WordWithReloc {
+        word,
+        reloc: Relocation {
+            reloc_type: RelocType::AdrPrelLo21,
+            symbol: sym,
+            addend,
+        },
+    })
+}
+
+// ── Prefetch ─────────────────────────────────────────────────────────────
+
+/// Encode the PRFM (prefetch memory) instruction.
+/// Format: PRFM <prfop>, [<Xn|SP>{, #<pimm>}]
+/// Encoding: 1111 1001 10 imm12 Rn Rt
+/// where Rt is the 5-bit prefetch operation type.
+pub(crate) fn encode_prfm(operands: &[Operand], unscaled: bool) -> Result<EncodeResult, String> {
+    let mn = if unscaled { "prfum" } else { "prfm" };
+    if operands.len() != 2 {
+        return Err(format!(
+            "{mn} takes exactly 2 operands (prfop, [Xn{{, #imm}}]), got {}",
+            operands.len()
+        ));
+    }
+
+    // First operand: prefetch operation type (parsed as Symbol)
+    let prfop = match &operands[0] {
+        Operand::Symbol(s) => encode_prfop(s)?,
+        Operand::Imm(v) => {
+            if *v < 0 || *v > 31 {
+                return Err(format!("prfm: immediate prefetch type out of range: {}", v));
+            }
+            *v as u32
+        }
+        _ => {
+            return Err(format!(
+                "prfm: expected prefetch operation name, got {:?}",
+                operands[0]
+            ));
+        }
+    };
+
+    // Second operand: memory address [Xn{, #imm}]
+    match &operands[1] {
+        Operand::Mem { base, offset } => {
+            if unscaled {
+                // PRFUM: 1111 1000 10 imm9 Rn Rt -- no scaling, signed range.
+                let rn = mem_xn_or_sp(base, mn)?;
+                let imm9 = checked_imm9(*offset, mn)?;
+                return Ok(EncodeResult::Word(
+                    0xF8800000 | (imm9 << 12) | (rn << 5) | prfop,
+                ));
+            }
+            let rn = mem_xn_or_sp(base, "prfm")?;
+            let imm = *offset;
+            if imm < 0 || imm % 8 != 0 {
+                return Err(format!(
+                    "prfm: offset must be non-negative and 8-byte aligned, got {imm}; \
+                     the unscaled form `prfum` takes any -256..255 offset"
+                ));
+            }
+            let imm12 = (imm / 8) as u32;
+            if imm12 > 0xFFF {
+                return Err(format!("prfm: offset too large: {}", imm));
+            }
+            // PRFM (imm): 1111 1001 10 imm12(12) Rn(5) Rt(5)
+            let word = 0xF9800000 | (imm12 << 10) | (rn << 5) | prfop;
+            Ok(EncodeResult::Word(word))
+        }
+        Operand::Symbol(_sym) => {
+            // PRFM (literal) with symbol reference is not yet supported
+            Err("prfm with symbol/label operand not yet supported".to_string())
+        }
+        Operand::MemRegOffset {
+            base,
+            index,
+            extend,
+            shift,
+        } => {
+            // PRFM (register): 11 111 0 00 10 1 Rm option S 10 Rn Rt
+            let rn = mem_xn_or_sp(base, "prfm")?;
+            let rm_reg = mem_rm(index, "prfm")?;
+            let rm = rm_reg.num;
+            let (option, s_bit) =
+                mem_reg_offset_option(extend.as_deref(), *shift, rm_reg.is_64, 3, "prfm")?;
+            // PRFM (register): size=11 V=0 opc=10, register offset.
+            // opc lives at bits 23:22, so it is `<< 22` not `<< 23`. The
+            // off-by-one produced 0xf9206800 for `prfm pldl1keep,[x0,x0]`;
+            // GAS emits 0xf8a06800.
+            let word = (0b11 << 30)
+                | (0b111 << 27)
+                | (0b10 << 22)
+                | (1 << 21)
+                | (rm << 16)
+                | (option << 13)
+                | (s_bit << 12)
+                | (0b10 << 10)
+                | (rn << 5)
+                | prfop;
+            Ok(EncodeResult::Word(word))
+        }
+        _ => Err(format!(
+            "prfm: expected memory operand, got {:?}",
+            operands[1]
+        )),
+    }
+}
+
+/// Map prefetch operation name to its 5-bit encoding.
+pub(crate) fn encode_prfop(name: &str) -> Result<u32, String> {
+    match name.to_lowercase().as_str() {
+        "pldl1keep" => Ok(0b00000),
+        "pldl1strm" => Ok(0b00001),
+        "pldl2keep" => Ok(0b00010),
+        "pldl2strm" => Ok(0b00011),
+        "pldl3keep" => Ok(0b00100),
+        "pldl3strm" => Ok(0b00101),
+        "plil1keep" => Ok(0b01000),
+        "plil1strm" => Ok(0b01001),
+        "plil2keep" => Ok(0b01010),
+        "plil2strm" => Ok(0b01011),
+        "plil3keep" => Ok(0b01100),
+        "plil3strm" => Ok(0b01101),
+        "pstl1keep" => Ok(0b10000),
+        "pstl1strm" => Ok(0b10001),
+        "pstl2keep" => Ok(0b10010),
+        "pstl2strm" => Ok(0b10011),
+        "pstl3keep" => Ok(0b10100),
+        "pstl3strm" => Ok(0b10101),
+        _ => Err(format!("prfm: unknown prefetch operation: {}", name)),
+    }
+}
+
+// ── LSE Atomics ──────────────────────────────────────────────────────────
+
+/// Parse the order/size suffix shared by the CAS and CASP families
+/// (everything after the `cas` / `casp` stem).
+///
+/// Valid suffixes:
+/// "" relaxed "b" byte (CAS family only)
+/// "a" acquire "h" half (CAS family only)
+/// "l" release
+/// "al" acquire+release
+/// Byte/half letters always trail the order letters (`casalb`, `caslb`, ...).
+///
+/// The parse is exact rather than a `contains` probe: a lenient contains
+/// check silently encodes a mistyped mnemonic such as `casq` as relaxed
+/// CAS, i.e. the assembler would accept and mis-assemble garbage.
+/// Returns `(acquire, release, size_letter)`.
+fn parse_atomic_order_suffix(
+    stem: &str,
+    suffix: &str,
+) -> Result<(bool, bool, Option<char>), String> {
+    let (order, size) = if let Some(rest) = suffix.strip_suffix('b') {
+        (rest, Some('b'))
+    } else if let Some(rest) = suffix.strip_suffix('h') {
+        (rest, Some('h'))
+    } else {
+        (suffix, None)
+    };
+    let (a, l) = match order {
+        "" => (false, false),
+        "a" => (true, false),
+        "l" => (false, true),
+        "al" => (true, true),
+        _ => return Err(format!("{}: invalid order/size suffix '{}'", stem, suffix)),
+    };
+    Ok((a, l, size))
+}
+
+/// Encode CAS/CASA/CASAL/CASL and byte/halfword variants (Compare and Swap).
+/// CAS SZ |001000|1|A|1|Rs|R|11111|Rn|Rt (LLVM AArch64InstrFormats.td;
+/// round-trip verified against Capstone for all twelve order/size forms)
+pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+    // EXACT arity: the previous `< 3` (and the same shape in swp/ldop/stop)
+    // silently ignored trailing operands, so `cas x0,x1,[x2],x3` -- assembly
+    // no architecture defines -- assembled as `cas x0,x1,[x2]` with the extra
+    // operand dropped.  A dropped operand is never harmless: it is the one
+    // that would have selected a different width, ordering or destination in
+    // the form the programmer meant.
+    if operands.len() != 3 {
+        return Err(format!(
+            "{} takes exactly 3 operands (Rs, Rt, [Rn]), got {}",
+            mnemonic,
+            operands.len()
+        ));
+    }
+    let (rs, is_64) = exclusive_rt(operands, 0, mnemonic)?;
+    let (rt, _) = exclusive_rt(operands, 1, mnemonic)?;
+    let rn = atomic_xn(operands.get(2), mnemonic)?;
+    same_width_pair(
+        &reg_name_at(operands, 0)?,
+        &reg_name_at(operands, 1)?,
+        mnemonic,
+    )?;
+    let mn = mnemonic.to_lowercase();
+    let suffix = mn.strip_prefix("cas").unwrap_or("");
+    let (a, l, size_letter) = parse_atomic_order_suffix("cas", suffix)?;
+    // Determine size: 'b' suffix = byte (00), 'h' suffix = half (01), else register-based
+    let size = match size_letter {
+        Some('b') => 0b00u32,
+        Some('h') => 0b01u32,
+        _ if is_64 => 0b11u32,
+        _ => 0b10u32,
+    };
+    // size 001000 1 A 1 Rs R 11111 Rn Rt
+    let word = (size << 30)
+        | (0b001000 << 24)
+        | (1 << 23)
+        | ((a as u32) << 22)
+        | (1 << 21)
+        | (rs << 16)
+        | ((l as u32) << 15)
+        | (0b11111 << 10)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// Encode CASP/CASPA/CASPAL/CASPL (Compare and Swap **Pair**, LSE).
+///
+/// CASP 0|SZ|001000|0|A|1|Rs|R|11111|Rn|Rt
+///
+/// Layout per LLVM AArch64InstrFormats.td (Capstone round-trip verified):
+/// - bit 31 is always 0 and SZ (bit 30) selects X pairs (1) vs W pairs (0);
+/// this is why CASP does NOT live at the same size-field position as CAS.
+/// - bit 23 (NP) is 0 here and 1 for CAS — the architectural CAS/CASP split.
+/// - A (bit 22) / R (bit 15) are the acquire/release order bits.
+///
+/// Operand order: `casp<order> Xs, Xs+1, Xt, Xt+1, [Xn]` — the first pair
+/// holds the expected (compare) value and receives the loaded old value
+/// (both members are in-out), the second pair holds the new value.
+/// Only Xs and Xt occupy encoding fields; Xs+1 / Xt+1 are architecturally
+/// implied, so the text operands are validated to match exactly (GAS
+/// parity: even-numbered start register, consecutive pairs, uniform width).
+/// Read the second register of a CASP pair: the successor of `first`, which may
+/// also be written as the zero register when the pair starts at 30.
+fn casp_pair_second(
+    operands: &[Operand],
+    idx: usize,
+    first: GpReg,
+    mn: &str,
+) -> Result<GpReg, String> {
+    let reg = reg_operand(operands, idx, GpRole::RegOrZr, mn)?;
+    let name = operand_spelling(operands, idx);
+    // The zero register is number 31, so it is the successor of 30 and of
+    // nothing else.
+    let num = if reg.is_zr {
+        if first.num != 30 {
+            return Err(format!(
+                "{mn}: `{name}` is register 31, so it can only be the second half of a pair \
+                 that starts at 30; this one starts at `{}{}`",
+                if first.is_64 { "x" } else { "w" },
+                first.num
+            ));
+        }
+        31
+    } else if reg.num == first.num + 1 {
+        reg.num
+    } else {
+        return Err(format!(
+            "{mn}: the second half of the pair after `{}{}` must be `{}{}` (the \
+             instruction encodes only the first half), not `{name}`",
+            if first.is_64 { "x" } else { "w" },
+            first.num,
+            if first.is_64 { "x" } else { "w" },
+            first.num + 1
+        ));
+    };
+    if reg.is_64 != first.is_64 {
+        return Err(format!(
+            "{mn}: `{name}` and the first half of its pair are different widths; a pair is \
+             one width, and the instruction has one size field for all four registers"
+        ));
+    }
+    Ok(GpReg {
+        num,
+        is_64: first.is_64,
+        is_sp: false,
+        is_zr: false,
+    })
+}
+
+pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 5 {
+        return Err(format!(
+            "{} requires exactly 5 operands (Xs, Xs+1, Xt, Xt+1, [Xn])",
+            mnemonic
+        ));
+    }
+    // The four register operands are two *pairs*, and the encoding carries only
+    // the first half of each: the second is architecturally the next register.
+    // GNU as spells that out in its own diagnostics ("reg pair must start from
+    // even reg at operand 1", "reg pair must be contiguous at operand 2"), and
+    // it accepts the successor either written out (`casp x0,x1,...`) or — when
+    // the pair starts at 30 — as the zero register, whose number *is* 31
+    // (`casp x30,xzr,...`).  Reading all four slots as plain numbered registers
+    // refused that last spelling, which is a real one the kernel's
+    // `cmpxchg_double` paths can produce.
+    let rs_reg = reg_operand(operands, 0, GpRole::Reg, mnemonic)?;
+    let rt_reg = reg_operand(operands, 2, GpRole::Reg, mnemonic)?;
+    let rs1_reg = casp_pair_second(operands, 1, rs_reg, mnemonic)?;
+    let rt1_reg = casp_pair_second(operands, 3, rt_reg, mnemonic)?;
+    let (rs, rs_64) = (rs_reg.num, rs_reg.is_64);
+    let (rt, rt_64) = (rt_reg.num, rt_reg.is_64);
+
+    // Uniform width across the whole instruction (both pairs): the size field
+    // is one bit for all four registers.
+    if rs_64 != rs1_reg.is_64 || rt_64 != rt1_reg.is_64 || rs_64 != rt_64 {
+        return Err(format!(
+            "{}: CASP pair registers must all be X or all be W",
+            mnemonic
+        ));
+    }
+    // Even start register: the pair occupies `start` and `start + 1`, and only
+    // `start >> 1` is encoded, so an odd start would silently move the pair.
+    if rs % 2 != 0 || rt % 2 != 0 {
+        return Err(format!(
+            "{}: CASP pair start registers must be even (got {}, {})",
+            mnemonic, rs, rt
+        ));
+    }
+
+    // Base register: plain GPR64sp — no offset/writeback forms exist for
+    // CASP, and XZR-as-base is not encodable (31 here means SP).
+    let rn = atomic_xn(operands.get(4), mnemonic)?;
+
+    let mn = mnemonic.to_lowercase();
+    let suffix = mn.strip_prefix("casp").unwrap_or("");
+    let (a, l, size_letter) = parse_atomic_order_suffix("casp", suffix)?;
+    if size_letter.is_some() {
+        return Err(format!("{}: CASP has no byte/halfword variants", mnemonic));
+    }
+
+    let size_bit = if rs_64 { 1u32 } else { 0 };
+    // 0|SZ 001000 0 A 1 Rs R 11111 Rn Rt
+    let word = (size_bit << 30)
+        | (0b001000 << 24)
+        | ((a as u32) << 22)
+        | (1 << 21)
+        | (rs << 16)
+        | ((l as u32) << 15)
+        | (0b11111 << 10)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// Encode SWP/SWPA/SWPAL/SWPL and byte/halfword variants (Swap).
+/// SWP Xs, Xt, [Xn]: size 111000 AR 1 Rs 1 000 00 Rn Rt
+/// Variants: swp, swpa, swpal, swpl, swpb, swpab, swpalb, swplb, swph, swpah, swpalh, swplh
+pub(crate) fn encode_swp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 3 {
+        return Err(format!(
+            "{} takes exactly 3 operands (Rs, Rt, [Rn]), got {}",
+            mnemonic,
+            operands.len()
+        ));
+    }
+    let (rs, is_64) = exclusive_rt(operands, 0, mnemonic)?;
+    let (rt, _) = exclusive_rt(operands, 1, mnemonic)?;
+    let rn = atomic_xn(operands.get(2), mnemonic)?;
+    same_width_pair(
+        &reg_name_at(operands, 0)?,
+        &reg_name_at(operands, 1)?,
+        mnemonic,
+    )?;
+    let mn = mnemonic.to_lowercase();
+    let suffix = mn.strip_prefix("swp").unwrap_or("");
+    // Determine size: 'b' suffix = byte (00), 'h' suffix = half (01), else register-based
+    let size = if suffix.contains('b') {
+        0b00u32
+    } else if suffix.contains('h') {
+        0b01u32
+    } else if is_64 {
+        0b11u32
+    } else {
+        0b10u32
+    };
+    let a = if suffix.contains('a') { 1u32 } else { 0u32 };
+    let r = if suffix.contains('l') { 1u32 } else { 0u32 };
+    // size 111000 A R 1 Rs 1 000 00 Rn Rt
+    let word = (size << 30)
+        | (0b111000 << 24)
+        | (a << 23)
+        | (r << 22)
+        | (1 << 21)
+        | (rs << 16)
+        | (1 << 15)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// Encode LDADD/LDCLR/LDEOR/LDSET and their acquire/release/byte/halfword variants (LSE atomics).
+/// LDADD Rs, Rt, [Xn]: size 111000 A R 1 Rs 0 opc 00 Rn Rt
+/// opc: LDADD=000, LDCLR=001, LDEOR=010, LDSET=011
+pub(crate) fn encode_ldop(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 3 {
+        return Err(format!(
+            "{} takes exactly 3 operands (Rs, Rt, [Rn]), got {}",
+            mnemonic,
+            operands.len()
+        ));
+    }
+    // One size field covers both registers, so a mixed pair has no encoding:
+    // `ldadd wzr,x1,[x2]` (32-bit operand with a 64-bit one) used to assemble
+    // as the 64-bit form, silently promoting the operand register.
+    same_width_pair(
+        &reg_name_at(operands, 0)?,
+        &reg_name_at(operands, 1)?,
+        mnemonic,
+    )?;
+    let (rs, is_64) = exclusive_rt(operands, 0, mnemonic)?;
+    let (rt, _) = exclusive_rt(operands, 1, mnemonic)?;
+    let rn = atomic_xn(operands.get(2), mnemonic)?;
+    let mn = mnemonic.to_lowercase();
+    // Determine base op and suffix
+    let (base, suffix) = if let Some(s) = mn.strip_prefix("ldadd") {
+        (0b000u32, s)
+    } else if let Some(s) = mn.strip_prefix("ldclr") {
+        (0b001u32, s)
+    } else if let Some(s) = mn.strip_prefix("ldeor") {
+        (0b010u32, s)
+    } else if let Some(s) = mn.strip_prefix("ldset") {
+        (0b011u32, s)
+    } else if let Some(s) = mn.strip_prefix("ldsmax") {
+        // opc 100..111: the min/max forms (FEAT_LSE).  ld<op>{a}{l}{b,h}.
+        (0b100u32, s)
+    } else if let Some(s) = mn.strip_prefix("ldsmin") {
+        (0b101u32, s)
+    } else if let Some(s) = mn.strip_prefix("ldumax") {
+        (0b110u32, s)
+    } else if let Some(s) = mn.strip_prefix("ldumin") {
+        (0b111u32, s)
+    } else {
+        return Err(format!("unknown ld atomic op: {}", mnemonic));
+    };
+    // Determine size: 'b' suffix = byte (00), 'h' suffix = half (01), else register-based
+    let size = if suffix.contains('b') {
+        0b00u32
+    } else if suffix.contains('h') {
+        0b01u32
+    } else if is_64 {
+        0b11u32
+    } else {
+        0b10u32
+    };
+    let a = if suffix.contains('a') { 1u32 } else { 0u32 };
+    let r = if suffix.contains('l') { 1u32 } else { 0u32 };
+    // size 111000 A R 1 Rs 0 opc 00 Rn Rt
+    let word = (size << 30)
+        | (0b111000 << 24)
+        | (a << 23)
+        | (r << 22)
+        | (1 << 21)
+        | (rs << 16)
+        | (base << 12)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// Encode STADD/STCLR/STEOR/STSET and their release/byte/halfword variants.
+/// These are aliases for LDADD/LDCLR/LDEOR/LDSET with Rt=XZR (register 31).
+/// STADD Ws, [Xn] encodes as LDADD Ws, WZR, [Xn]
+/// Variants: stadd/stclr/steor/stset, plus 'l' (release), 'b' (byte), 'h' (half).
+pub(crate) fn encode_stop(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 2 {
+        return Err(format!(
+            "{} takes exactly 2 operands (Rs, [Rn]), got {}",
+            mnemonic,
+            operands.len()
+        ));
+    }
+    let (rs, is_64) = exclusive_rt(operands, 0, mnemonic)?;
+    let rn = atomic_xn(operands.get(1), mnemonic)?;
+    let mn = mnemonic.to_lowercase();
+    // Determine base op from the prefix
+    let (opc, suffix) = if let Some(s) = mn.strip_prefix("stadd") {
+        (0b000u32, s)
+    } else if let Some(s) = mn.strip_prefix("stclr") {
+        (0b001u32, s)
+    } else if let Some(s) = mn.strip_prefix("steor") {
+        (0b010u32, s)
+    } else if let Some(s) = mn.strip_prefix("stset") {
+        (0b011u32, s)
+    } else {
+        return Err(format!("unknown st atomic op: {}", mnemonic));
+    };
+    // Determine size: 'b' suffix = byte (00), 'h' suffix = half (01), else register-based
+    let size = if suffix.contains('b') {
+        0b00u32
+    } else if suffix.contains('h') {
+        0b01u32
+    } else if is_64 {
+        0b11u32
+    } else {
+        0b10u32
+    };
+    // A=0 (no acquire for store aliases), R from 'l' suffix (release)
+    let r = if suffix.contains('l') { 1u32 } else { 0u32 };
+    let rt = 31u32; // XZR/WZR - discard result
+    // size 111000 A R 1 Rs 0 opc 00 Rn Rt
+    let word = (size << 30)
+        | (0b111000 << 24)
+        | (r << 22)
+        | (1 << 21)
+        | (rs << 16)
+        | (opc << 12)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+// ── Tests: LSE atomics (CAS family + CASP pair) ──────────────────────────
+//
+// Every expected word below was cross-verified by round-tripping the
+// encoder output through Capstone (aarch64 little-endian), which decodes
+// it back to the exact source mnemonic and operands. The CASP layout
+// (0|SZ in bits 31-30, NP=0 in bit 23) follows LLVM's
+// AArch64InstrFormats.td; note that a naive "same size field as CAS,
+// flip bit 23" reading decodes as LDXP/STXP instead.
+#[cfg(test)]
+mod lse_atomic_tests {
+    use super::*;
+    use crate::backend::arm::assembler::parser::Operand;
+
+    fn enc(mnemonic: &str, operands: &[Operand]) -> u32 {
+        match encode_any(mnemonic, operands).expect(mnemonic) {
+            EncodeResult::Word(w) => w,
+            other => panic!("{}: expected single word, got {:?}", mnemonic, other),
+        }
+    }
+
+    // Route through the same mnemonic sets as the dispatch table so the
+    // test also pins the mnemonic -> encoder wiring, not just internals.
+    fn encode_any(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+        match mnemonic {
+            "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb" | "cash"
+            | "casah" | "casalh" | "caslh" => encode_cas(mnemonic, operands),
+            "casp" | "caspa" | "caspal" | "caspl" => encode_casp(mnemonic, operands),
+            other => Err(format!("test harness: unknown mnemonic {}", other)),
+        }
+    }
+
+    fn reg(r: &str) -> Operand {
+        Operand::Reg(r.to_string())
+    }
+    fn mem(base: &str) -> Operand {
+        Operand::Mem {
+            base: base.to_string(),
+            offset: 0,
+        }
+    }
+    fn casp_ops(xs: &str, xs1: &str, xt: &str, xt1: &str, base: &str) -> Vec<Operand> {
+        vec![reg(xs), reg(xs1), reg(xt), reg(xt1), mem(base)]
+    }
+
+    // ── CAS family (pre-existing encoder, now pinned against drift) ──
+
+    #[test]
+    fn cas_family_exact_words() {
+        let m = mem("x2");
+        let x_ops = [reg("x0"), reg("x1"), m.clone()];
+        assert_eq!(enc("cas", &x_ops), 0xC8A0_7C41);
+        assert_eq!(enc("casa", &x_ops), 0xC8E0_7C41);
+        assert_eq!(enc("casl", &x_ops), 0xC8A0_FC41);
+        assert_eq!(enc("casal", &x_ops), 0xC8E0_FC41);
+        // Size comes from the W register when there is no b/h suffix.
+        let w_ops = [reg("w0"), reg("w1"), m.clone()];
+        assert_eq!(enc("cas", &w_ops), 0x88A0_7C41);
+        assert_eq!(enc("casb", &w_ops), 0x08A0_7C41);
+        assert_eq!(enc("casab", &w_ops), 0x08E0_7C41);
+        assert_eq!(enc("caslb", &w_ops), 0x08A0_FC41);
+        assert_eq!(enc("casalb", &w_ops), 0x08E0_FC41);
+        assert_eq!(enc("cash", &w_ops), 0x48A0_7C41);
+        assert_eq!(enc("casah", &w_ops), 0x48E0_7C41);
+        assert_eq!(enc("casalh", &w_ops), 0x48E0_FC41);
+    }
+
+    #[test]
+    fn cas_rejects_mistyped_suffixes() {
+        let ops = [reg("x0"), reg("x1"), mem("x2")];
+        // A lenient contains-based parser would silently encode these as
+        // relaxed CAS instead of rejecting them.
+        for bad in ["casq", "casx", "caszr", "caslbq"] {
+            assert!(encode_any(bad, &ops).is_err(), "{} must be rejected", bad);
+        }
+    }
+
+    // ── CASP pair family ─────────────────────────────────────────────
+
+    #[test]
+    fn casp_family_exact_words() {
+        assert_eq!(
+            enc("casp", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4820_7D62
+        );
+        assert_eq!(
+            enc("caspa", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4860_7D62
+        );
+        assert_eq!(
+            enc("caspl", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4820_FD62
+        );
+        assert_eq!(
+            enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4860_FD62
+        );
+        // W pairs: SZ=0 (bit 30 clear).
+        assert_eq!(
+            enc("caspal", &casp_ops("w0", "w1", "w2", "w3", "x11")),
+            0x0860_FD62
+        );
+        // SP base is GPR64sp-legal.
+        assert_eq!(
+            enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "sp")),
+            0x4860_FFE2
+        );
+        // High register pair: Rs=2, Rt=4.
+        assert_eq!(
+            enc("caspal", &casp_ops("x2", "x3", "x4", "x5", "sp")),
+            0x4862_FFE4
+        );
+    }
+
+    #[test]
+    fn casp_rejects_invalid_pairs() {
+        // Odd pair-start registers: architecturally unallocated encoding.
+        assert!(encode_any("caspal", &casp_ops("x1", "x2", "x2", "x3", "x11")).is_err());
+        // Non-consecutive second registers: the encoding field only stores
+        // Xs/Xt, so accepting these would silently swap which registers
+        // participate in the atomic operation.
+        assert!(encode_any("caspal", &casp_ops("x0", "x2", "x4", "x5", "x11")).is_err());
+        // Mixed widths across or within pairs.
+        assert!(encode_any("caspal", &casp_ops("x0", "x1", "w2", "w3", "x11")).is_err());
+        assert!(encode_any("caspal", &casp_ops("w0", "x1", "x2", "x3", "x11")).is_err());
+        // SP/xzr as pair member (lr = x30 is fine, sp = 31 is not).
+        assert!(encode_any("caspal", &casp_ops("x30", "sp", "x2", "x3", "x11")).is_err());
+        assert!(encode_any("caspal", &casp_ops("xzr", "x1", "x2", "x3", "x11")).is_err());
+        // xzr as base register.
+        assert!(encode_any("caspal", &casp_ops("x0", "x1", "x2", "x3", "xzr")).is_err());
+        // Offset/writeback memory forms do not exist for CASP.
+        let off = vec![
+            reg("x0"),
+            reg("x1"),
+            reg("x2"),
+            reg("x3"),
+            Operand::Mem {
+                base: "x11".to_string(),
+                offset: 8,
+            },
+        ];
+        assert!(encode_any("caspal", &off).is_err());
+        // Wrong operand count.
+        let short = vec![reg("x0"), reg("x1"), reg("x2"), mem("x11")];
+        assert!(encode_any("caspal", &short).is_err());
+        // No byte/halfword pair forms; no mistyped order letters.
+        assert!(encode_any("caspalb", &casp_ops("x0", "x1", "x2", "x3", "x11")).is_err());
+        assert!(encode_any("caspaq", &casp_ops("x0", "x1", "x2", "x3", "x11")).is_err());
+        assert!(encode_any("caspx", &casp_ops("x0", "x1", "x2", "x3", "x11")).is_err());
+    }
+
+    /// The second half of each pair is architecturally the register after the
+    /// first, and register 31 is spelled `xzr`/`wzr` — so a pair that starts at
+    /// 30 may write its second half as the zero register, which is exactly the
+    /// spelling the kernel's `cmpxchg_double` paths produce.  Every word here
+    /// is GNU as 2.47's output for the same spelling.
+    #[test]
+    fn casp_pair_halves_may_be_spelled_as_the_zero_register() {
+        assert_eq!(
+            enc("casp", &casp_ops("x30", "xzr", "x0", "x1", "x4")),
+            0x483E_7C80
+        );
+        assert_eq!(
+            enc("casp", &casp_ops("x2", "x3", "x30", "xzr", "x4")),
+            0x4822_7C9E
+        );
+        assert_eq!(
+            enc("casp", &casp_ops("x30", "xzr", "x30", "xzr", "x4")),
+            0x483E_7C9E
+        );
+        assert_eq!(
+            enc("casp", &casp_ops("w0", "w1", "w30", "wzr", "x4")),
+            0x0820_7C9E
+        );
+        // The zero register is 31, so it is the successor of 30 and of nothing
+        // else: these two pairs are not contiguous and have no encoding.
+        assert!(encode_any("casp", &casp_ops("x0", "xzr", "x2", "x3", "x4")).is_err());
+        assert!(encode_any("casp", &casp_ops("x0", "x1", "x2", "xzr", "x4")).is_err());
+        // A width mismatch between the halves is refused as well.
+        assert!(encode_any("casp", &casp_ops("w0", "x1", "x2", "x3", "x4")).is_err());
+        assert!(encode_any("casp", &casp_ops("x30", "wzr", "x0", "x1", "x4")).is_err());
+    }
+}

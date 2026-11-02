@@ -1,0 +1,14 @@
+# Commands hosted CI executes that scripts/ci_local.sh deliberately does not.
+# check_ci_gate_parity.py fails on a hosted script, cargo subcommand or
+# `--config` build mode that ci_local does not mirror unless it is listed
+# here, and on an entry ci_local mirrors after all, so the list can only
+# shrink.  Only a measurement with no local meaning belongs here; a
+# contract (anything that can fail) must be mirrored.
+.github/scripts/ci-bench.py  # timed benchmark run on the runner's hardware; its pass/fail is output-only, which ci_local's benchmark-output-oracle checks
+scripts/ci_annotate_log.py  # attaches a failed gate's output to the check run as annotations; a terminal shows that output directly
+tests/regression/measure_i686_vector_copy.sh  # hosted-hardware timing measurement; ci_local deliberately runs correctness checks without host timing loops
+
+scripts/benchmark_native_batched.py  # hosted CPU timing; ELF rename/calibration/output invariants are covered by corpus discovery (test_batched_* and test_benchmark_elf_identity), source outputs by benchmark-output-oracle
+scripts/publish_cpu_runtime_evidence.py  # publishes hosted machine measurements to checks annotations; rejection/identity contracts are mirrored by corpus discovery (test_cpu_runtime_publication)
+scripts/audit_intel_sdm.py  # acquires the 5,364-page primary Intel manual and publishes source pages as hosted check annotations; external source access and hosted Checks API publication have no local CI mirror
+.github/scripts/ci_bench_ratios.py  # publishes a shard's paired ratios as a checks annotation; the ratio semantics are mirrored by corpus discovery (test_bench_ratios_annotations), and there is no shard report to publish without the hosted timed corpus

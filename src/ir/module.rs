@@ -1,0 +1,762 @@
+use super::constants::IrConst;
+use super::instruction::{BasicBlock, BlockId, Instruction, Terminator, Value};
+use crate::common::fx_hash::FxHashMap;
+use crate::common::source::Span;
+/// IR module, function, and global variable definitions.
+///
+/// `IrModule` is the top-level compilation unit containing functions, globals,
+/// string literals, and linker directives. `IrFunction` represents a single
+/// function with its parameter list, basic blocks, and ABI metadata.
+/// `IrGlobal` defines a global variable with its initializer and linkage.
+use crate::common::types::IrType;
+
+/// A compilation unit in the IR.
+#[derive(Debug)]
+pub struct IrModule {
+    pub functions: Vec<IrFunction>,
+    /// Explicit per-function alignment requested by declarations. Kept at
+    /// module level so redeclarations/prototypes can contribute without
+    /// inflating every IrFunction and every optimization clone.
+    pub function_alignments: crate::common::fx_hash::FxHashMap<String, usize>,
+    /// Emitted function symbols whose code sections carry SHF_GNU_RETAIN.
+    /// Module-level storage lets any declaration contribute without inflating
+    /// every IrFunction and every optimization clone.
+    pub retained_functions: crate::common::fx_hash::FxHashSet<String>,
+    /// Linker names of functions referenced by this translation unit but not
+    /// defined in it. Backends need this distinction when taking addresses:
+    /// PIE may use copy relocations for ordinary extern data, but no analogous
+    /// mechanism makes an interposable extern function address PC-relative.
+    pub extern_function_symbols: crate::common::fx_hash::FxHashSet<String>,
+    /// Functions declared `__attribute__((noplt))` and NOT defined in this
+    /// translation unit: calls to them must be dispatched through the GOT
+    /// instead of a PLT stub (`-fno-plt` for one symbol). GCC restricts the
+    /// attribute to that case too — a same-TU definition still gets a plain
+    /// `R_X86_64_PLT32` call (measured 2026-10-30).
+    pub noplt_symbols: crate::common::fx_hash::FxHashSet<String>,
+    pub globals: Vec<IrGlobal>,
+    /// Declared byte size of every `extern` data object this unit declares
+    /// (file or block scope), the largest over its declarations (a later
+    /// complete declaration completes the composite type, C11 6.2.7p3).
+    /// Function types, thread-locals and incomplete types are absent.
+    /// Consumed by `licm::speculation_safe_globals`; weakness and aliasing
+    /// are judged there from `symbol_attrs` and `aliases`.
+    pub extern_data_sizes: crate::common::fx_hash::FxHashMap<String, usize>,
+    pub string_literals: Vec<(String, String)>, // (label, value)
+    /// Wide string literals (L"..."): (label, chars as u32 values including null terminator)
+    pub wide_string_literals: Vec<(String, Vec<u32>)>,
+    /// char16_t string literals (u"..."): (label, chars as u16 values including null terminator)
+    pub char16_string_literals: Vec<(String, Vec<u16>)>,
+    pub constructors: Vec<String>, // functions with __attribute__((constructor))
+    pub destructors: Vec<String>,  // functions with __attribute__((destructor))
+    /// Symbol aliases: (alias_name, target_name, is_weak)
+    /// From __attribute__((alias("target"))) and __attribute__((weak))
+    pub aliases: Vec<(String, String, bool)>,
+    /// GNU indirect functions from `__attribute__((ifunc("resolver")))` /
+    /// `[[gnu::ifunc("resolver")]]`: (symbol_name, resolver_name, is_local, visibility).
+    pub ifuncs: Vec<(String, String, bool, Option<String>)>,
+    /// Top-level asm("...") directives - emitted verbatim in assembly output
+    pub toplevel_asm: Vec<String>,
+    /// Symbol attribute directives for extern declarations:
+    /// (name, is_weak, visibility) - emitted as .weak/.hidden/.protected directives
+    pub symbol_attrs: Vec<(String, bool, Option<String>)>,
+    /// __asm__("label") linker-symbol redirects on declarations
+    /// (C name -> asm label). Filled during lowering; consumed by the
+    /// backend when emitting symbol names.
+    pub asm_labels: crate::common::fx_hash::FxHashMap<String, String>,
+    /// Symbol version directives: (function_name, symver_string)
+    /// From __attribute__((symver("name@@VERSION"))) - emitted as .symver directives
+    pub symver_directives: Vec<(String, String)>,
+    /// `__attribute__((tls_model("...")))` per TLS symbol (IR name): the
+    /// attribute of the symbol's LAST declaration, absent when that one is
+    /// plain (GCC 16.2; see `record_tls_model_attr`). Consumed only through
+    /// `common::tls::model_table`.
+    pub tls_model_attrs: crate::common::fx_hash::FxHashMap<String, crate::common::tls::TlsModel>,
+    /// Symbols marked `__attribute__((externally_visible))` on any declaration
+    /// or definition; kept externally visible under `-fwhole-program`.
+    pub externally_visible_symbols: crate::common::fx_hash::FxHashSet<String>,
+    /// Per-function `__attribute__((zero_call_used_regs("...")))` mode overrides.
+    pub zero_call_used_regs_attrs: crate::common::fx_hash::FxHashMap<
+        String,
+        crate::backend::zero_call_used_regs::ZeroCallUsedRegs,
+    >,
+}
+
+/// The ELF TLS access model (one enum for the whole compiler; the policy that
+/// picks a symbol's model lives with it in `common::tls`).
+pub use crate::common::tls::TlsModel;
+
+/// A global variable.
+#[derive(Debug, Clone)]
+pub struct IrGlobal {
+    pub name: String,
+    pub ty: IrType,
+    /// Size of the global in bytes (for arrays, this is elem_size * count).
+    pub size: usize,
+    /// Alignment in bytes.
+    pub align: usize,
+    /// Initializer for the global variable.
+    pub init: GlobalInit,
+    /// Whether this is a static (file-scope) variable.
+    pub is_static: bool,
+    /// Whether this is an extern declaration (no storage emitted).
+    pub is_extern: bool,
+    /// Whether this has __attribute__((common)) - use COMMON linkage.
+    pub is_common: bool,
+    /// __attribute__((section("..."))) - place in specific ELF section.
+    pub section: Option<String>,
+    /// __attribute__((weak)) - emit as a weak symbol (STB_WEAK).
+    pub is_weak: bool,
+    /// __attribute__((visibility("hidden"|"default"|...))) or #pragma GCC visibility.
+    pub visibility: Option<String>,
+    /// Whether the user specified an explicit alignment via __attribute__((aligned(N))) or _Alignas.
+    /// When true, we respect the user's alignment exactly and don't auto-promote to 16.
+    pub has_explicit_align: bool,
+    /// Whether this global has const qualification (should be placed in .rodata).
+    pub is_const: bool,
+    /// __attribute__((used)) - prevent dead code elimination of this symbol.
+    pub is_used: bool,
+    /// __attribute__((retain)) - keep the object's section alive through
+    /// `--gc-sections` (SHF_GNU_RETAIN). GCC also gives the object its own
+    /// section (`<default>.<name>`), which is what makes retention visible.
+    pub is_retain: bool,
+    /// __attribute__((nocommon)) - a tentative definition that must stay a
+    /// real `.bss` object even under `-fcommon`, which is applied to the whole
+    /// module after lowering.
+    pub is_nocommon: bool,
+    /// Whether this global has _Thread_local or __thread storage class.
+    /// Thread-local globals are placed in .tdata/.tbss and accessed via TLS mechanisms.
+    pub is_thread_local: bool,
+}
+
+/// Initializer for a global variable.
+#[derive(Debug, Clone)]
+pub enum GlobalInit {
+    /// No initializer (zero-initialized in .bss).
+    Zero,
+    /// Single scalar constant.
+    Scalar(IrConst),
+    /// Array of scalar constants.
+    Array(Vec<IrConst>),
+    /// String literal (stored as bytes with null terminator).
+    String(String),
+    /// Wide string literal (stored as array of u32 wchar_t values, no null terminator in vec).
+    /// The backend emits each value as .long and adds a null terminator.
+    WideString(Vec<u32>),
+    /// char16_t string literal (stored as array of u16 values, no null terminator in vec).
+    /// The backend emits each value as .short and adds a null terminator.
+    Char16String(Vec<u16>),
+    /// Address of another global (for pointer globals like `const char *s = "hello"`).
+    GlobalAddr(String),
+    /// Address of a global plus a byte offset (for `&arr[3]`, `&s.field`, etc.).
+    GlobalAddrOffset(String, i64),
+    /// Compound initializer: a sequence of initializer elements (for arrays/structs
+    /// containing address expressions, e.g., `int *ptrs[] = {&a, &b, 0}`).
+    Compound(Vec<GlobalInit>),
+    /// Difference of two labels (&&lab1 - &&lab2) for computed goto dispatch tables.
+    /// Fields: (label1, label2, byte_size) where byte_size is the width of the
+    /// resulting integer (4 for int, 8 for long).
+    GlobalLabelDiff(String, String, usize),
+}
+
+impl GlobalInit {
+    /// Visit every symbol name referenced by this initializer.
+    /// Calls `f` with each global/label name found in GlobalAddr, GlobalAddrOffset,
+    /// and GlobalLabelDiff variants, recursing into Compound children.
+    pub fn for_each_ref<F: FnMut(&str)>(&self, f: &mut F) {
+        match self {
+            GlobalInit::GlobalAddr(name) | GlobalInit::GlobalAddrOffset(name, _) => {
+                f(name);
+            }
+            GlobalInit::GlobalLabelDiff(label1, label2, _) => {
+                f(label1);
+                f(label2);
+            }
+            GlobalInit::Compound(fields) => {
+                for field in fields {
+                    field.for_each_ref(f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns the byte size of this initializer element in a compound context.
+    /// Used when flattening nested Compound elements into a parent Compound.
+    pub fn byte_size(&self) -> usize {
+        match self {
+            GlobalInit::Scalar(_) => 1,
+            // Use target pointer size: 4 bytes on i686, 8 bytes on 64-bit targets
+            GlobalInit::GlobalAddr(_) | GlobalInit::GlobalAddrOffset(_, _) => {
+                crate::common::types::target_ptr_size()
+            }
+            GlobalInit::Compound(inner) => inner.len(),
+            GlobalInit::Array(vals) => vals.len(),
+            GlobalInit::Zero => 0,
+            GlobalInit::String(s) => s.chars().count(),
+            GlobalInit::WideString(ws) => ws.len() * 4,
+            GlobalInit::Char16String(cs) => cs.len() * 2,
+            GlobalInit::GlobalLabelDiff(_, _, size) => *size,
+        }
+    }
+
+    /// Returns the total number of bytes that will be emitted for this initializer.
+    /// Unlike `byte_size()`, this correctly accounts for GlobalAddr entries
+    /// (pointer-sized: 4 bytes on i686, 8 bytes on 64-bit) inside Compound initializers.
+    pub fn emitted_byte_size(&self) -> usize {
+        match self {
+            GlobalInit::Scalar(_) => 1,
+            // Use target pointer size: 4 bytes on i686, 8 bytes on 64-bit targets
+            GlobalInit::GlobalAddr(_) | GlobalInit::GlobalAddrOffset(_, _) => {
+                crate::common::types::target_ptr_size()
+            }
+            GlobalInit::Compound(inner) => inner.iter().map(|e| e.emitted_byte_size()).sum(),
+            GlobalInit::Array(vals) => vals.len(),
+            GlobalInit::Zero => 0,
+            GlobalInit::String(s) => s.chars().count() + 1,
+            GlobalInit::WideString(ws) => (ws.len() + 1) * 4,
+            GlobalInit::Char16String(cs) => (cs.len() + 1) * 2,
+            GlobalInit::GlobalLabelDiff(_, _, size) => *size,
+        }
+    }
+}
+
+/// Normalize a `target("...")` attribute string into the option list
+/// stored in [`IrFunction::target_features`]: split on commas, trim,
+/// lower-case, drop empties, and keep the order: GCC applies the options
+/// in order (`avx512bmm,no-avx512bmm` keeps AVX512BW, `no-sse2,aes` has
+/// SSE2), as does [`crate::backend::x86::isa::function_feature_bits`].
+/// Consumers compare the resulting feature sets, never the strings.
+///
+/// An `arch=` replaces the ISA with the named CPU's and forgets everything
+/// before it, so the ISA options before the last one (grants, denials,
+/// `general-regs-only`) are dropped here; options after it apply on top of
+/// the CPU. `key=value` options such as `tune=` are not ISA options and
+/// survive. GCC 16.2 compiles `target("avx2,arch=x86-64")` to SSE2 and
+/// `target("no-avx2,arch=haswell")` to AVX2 (measured).
+pub fn normalize_target_features(raw: &str) -> Vec<String> {
+    let mut features: Vec<String> = raw
+        .split(',')
+        .map(|f| f.trim().to_ascii_lowercase())
+        .filter(|f| !f.is_empty())
+        .collect();
+    if let Some(arch) = features.iter().rposition(|f| f.starts_with("arch=")) {
+        let mut index = 0;
+        features.retain(|f| {
+            let keep = index >= arch || f.contains('=');
+            index += 1;
+            keep
+        });
+    }
+    features
+}
+
+/// What a function body needs from the x86 ISA beyond the feature set its
+/// own `target(...)` options give it (bits are `X86Feature`s).
+///
+/// Most IR is ISA-neutral: the backend lowers it under the feature set of
+/// the function it ends up in, so a callee without `target(...)` may inline
+/// into a caller with fewer features (`_mm_popcnt_u32`'s
+/// `__builtin_popcount` becomes `popcnt` or a bit trick). What is not
+/// neutral is an intrinsic the lowering emitted because a permission check
+/// passed: such a body may only move into callers holding `relied`.
+/// lccc's 512-bit intrinsics are `always_inline` header functions without
+/// GCC's per-function `target`, so a requirement the translation unit
+/// lacks is `deferred`: legal once inlined into a caller that grants it,
+/// an error naming [`Self::first_use`] if the body survives inlining.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct X86IsaNeeds {
+    /// Features whose permission the lowering relied on.
+    pub relied: u64,
+    /// Features an `always_inline` body without `target(...)` needs but
+    /// its translation unit does not have.
+    pub deferred: u64,
+    /// The first intrinsic that needs a deferred feature.
+    pub first_use: Option<String>,
+}
+
+impl X86IsaNeeds {
+    /// Take over the needs of a body inlined into a function whose feature
+    /// set is `caller_features`: what that function grants is settled.
+    pub fn absorb(&mut self, inlined: &X86IsaNeeds, caller_features: u64) {
+        self.relied |= inlined.relied;
+        let deferred = inlined.deferred & !caller_features;
+        if deferred != 0 && self.first_use.is_none() {
+            self.first_use.clone_from(&inlined.first_use);
+        }
+        self.deferred |= deferred;
+    }
+}
+
+/// What a block's terminator looked like when lowering recorded its
+/// statement.  A row is emitted only while the terminator keeps this shape:
+/// a pass that merges blocks or retargets a jump changes it, and the stale
+/// span is dropped instead of naming the line of another statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminatorShape {
+    Return,
+    Branch(BlockId),
+    CondBranch(BlockId, BlockId),
+    Other,
+}
+
+impl TerminatorShape {
+    pub fn of(term: &Terminator) -> Self {
+        match term {
+            Terminator::Return(_) => Self::Return,
+            Terminator::Branch(target) => Self::Branch(*target),
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => Self::CondBranch(*true_label, *false_label),
+            _ => Self::Other,
+        }
+    }
+
+    /// The same shape after a relabelling; `None` if a target is gone.
+    fn remapped(self, map: &impl Fn(BlockId) -> Option<BlockId>) -> Option<Self> {
+        Some(match self {
+            Self::Branch(t) => Self::Branch(map(t)?),
+            Self::CondBranch(t, f) => Self::CondBranch(map(t)?, map(f)?),
+            other => other,
+        })
+    }
+}
+
+/// `-g`: the statement each block's terminator was lowered from, keyed by
+/// block label.  A statement can lower to nothing but its terminator --
+/// `return y;` once mem2reg drops the load of `y`, `goto`, `break` -- and
+/// with only instruction spans it got no line row: no breakpoint could land
+/// on it.
+#[derive(Debug, Clone, Default)]
+pub struct TerminatorSpans(FxHashMap<BlockId, (Span, TerminatorShape)>);
+
+impl TerminatorSpans {
+    pub fn record(&mut self, label: BlockId, span: Span, term: &Terminator) {
+        if span != Span::dummy() {
+            self.0.insert(label, (span, TerminatorShape::of(term)));
+        }
+    }
+
+    /// The statement of `label`'s terminator, while it still has the
+    /// recorded shape.
+    pub fn span_of(&self, label: BlockId, term: &Terminator) -> Option<Span> {
+        self.0
+            .get(&label)
+            .filter(|(_, shape)| *shape == TerminatorShape::of(term))
+            .map(|(span, _)| *span)
+    }
+
+    /// Follow a renumbering that adds `offset` to every label.
+    pub fn shift(&mut self, offset: u32) {
+        self.remap(|label| Some(BlockId(label.0 + offset)));
+    }
+
+    /// Follow a relabelling: `map` gives each live block's new label.  An
+    /// entry whose block or target is gone (`None`) is dropped: its old
+    /// label may name another block now.
+    pub fn remap(&mut self, map: impl Fn(BlockId) -> Option<BlockId>) {
+        self.0 = std::mem::take(&mut self.0)
+            .into_iter()
+            .filter_map(|(label, (span, shape))| Some((map(label)?, (span, shape.remapped(&map)?))))
+            .collect();
+    }
+
+    /// `label`'s terminator now goes to `new_target` where it went to
+    /// `old_target` (an edge split): still the same statement's jump.
+    pub fn retarget(&mut self, label: BlockId, old_target: BlockId, new_target: BlockId) {
+        if let Some((_, shape)) = self.0.get_mut(&label) {
+            let swap = |t: BlockId| if t == old_target { new_target } else { t };
+            *shape = match *shape {
+                TerminatorShape::Branch(t) => TerminatorShape::Branch(swap(t)),
+                // `retarget_block_edge_once` moves one edge: the true one first.
+                TerminatorShape::CondBranch(t, f) if t == old_target => {
+                    TerminatorShape::CondBranch(new_target, f)
+                }
+                TerminatorShape::CondBranch(t, f) => TerminatorShape::CondBranch(t, swap(f)),
+                other => other,
+            };
+        }
+    }
+}
+
+/// An IR function.
+#[derive(Debug, Clone)]
+pub struct IrFunction {
+    /// Immutable language contract for this function; clones retain it and
+    /// outlined functions inherit it. run_passes initializes it even at O0.
+    pub pass_policy: crate::common::pass_policy::PassPolicy,
+    pub name: String,
+    pub return_type: IrType,
+    pub params: Vec<IrParam>,
+    pub blocks: Vec<BasicBlock>,
+    pub is_variadic: bool,
+    pub is_declaration: bool, // true if no body (extern)
+    pub is_static: bool,      // true if declared with `static` linkage
+    pub is_inline: bool, // true if declared with `inline` (used to skip patchable function entries)
+    /// True when __attribute__((always_inline)) is present.
+    /// These functions must always be inlined at call sites.
+    pub is_always_inline: bool,
+    /// True when __attribute__((noinline)) is present.
+    /// These functions must never be inlined.
+    pub is_noinline: bool,
+    /// Cached upper bound on Value IDs: all Value IDs in this function are < next_value_id.
+    /// Set by lowering/mem2reg/phi_eliminate to avoid expensive full-IR scans.
+    /// A value of 0 means "not yet computed" (will fall back to scanning).
+    pub next_value_id: u32,
+    /// FP arithmetic value → statement-root id (OP-36). Written by the
+    /// frontend lowering (fresh root per statement); consumed by the
+    /// backend's OnExpr contraction gate. Pass-created values stay absent
+    /// and fail closed; the inline pass drops callee tags rather than
+    /// renumbering (their statement granularity is meaningless in the
+    /// caller and a numeric collision could fabricate a false match).
+    pub fp_expr_tags: crate::common::fp_contract::FpExprTags,
+    /// Cached upper bound on Block Labels: all Block Labels in this function are < next_label.
+    /// Set by vectorization and other transformation passes to avoid duplicate labels.
+    /// A value of 0 means "not yet computed" (will fall back to scanning).
+    pub next_label: u32,
+    /// Opening brace of the definition's body: under `-g` it is the
+    /// function's first line-table row, placed before the prologue as GCC
+    /// does, so debuggers can attribute the entry and skip the prologue to
+    /// the next row.  It runs through the closing brace, whose line is the
+    /// epilogue's row.  `Span::dummy()` for synthesized functions.
+    pub body_span: crate::common::source::Span,
+    /// `-g` rows for terminators (see [`TerminatorSpans`]).
+    pub terminator_spans: TerminatorSpans,
+    /// __attribute__((section("..."))) - place in specific ELF section.
+    pub section: Option<String>,
+    /// Normalized `__attribute__((target("...")))` features: lower-case,
+    /// trimmed, in the attribute's order (see [`normalize_target_features`]).
+    /// Empty for functions without the attribute. The inliner refuses to
+    /// clone a callee whose set is not a subset of its caller's (GCC's
+    /// `can_inline_p` ISA rule); the x86-64 emitter enables the scalar
+    /// integer extensions it names while emitting this function.
+    pub target_features: Vec<String>,
+    /// What the body needs from the x86 ISA beyond its `target(...)`, for
+    /// the inliner's ISA contract (`passes::inline`).
+    pub x86_isa_needs: X86IsaNeeds,
+    /// __attribute__((visibility("hidden"|"default"|...)))
+    pub visibility: Option<String>,
+    /// __attribute__((weak)) - emit as a weak symbol (STB_WEAK).
+    pub is_weak: bool,
+    /// __attribute__((used)) - prevent dead code elimination of this symbol.
+    pub is_used: bool,
+    /// __attribute__((fastcall)) - i386 fastcall calling convention.
+    /// First two integer/pointer args passed in ecx/edx instead of stack.
+    pub is_fastcall: bool,
+    /// i686: `__attribute__((regparm(N)))` on the function definition —
+    /// per-function override of the global -mregparm flag.
+    pub regparm: Option<u8>,
+    /// __attribute__((naked)) - emit no prologue/epilogue; function body is pure asm.
+    pub is_naked: bool,
+    /// __attribute__((no_instrument_function)) - skip mcount/__fentry__ entry
+    /// instrumentation. The Linux kernel marks early-boot, NMI, and
+    /// .noinstr.text functions this way: the tracer infrastructure isn't
+    /// mapped there yet (or must not run), so emitting the call would fault.
+    pub no_instrument: bool,
+    /// Set by the inlining pass when call sites were inlined into this function.
+    /// Used by post-inlining passes (mem2reg re-run, symbol resolution) to know
+    /// that non-entry blocks may contain allocas from inlined callees.
+    pub has_inlined_calls: bool,
+    /// Values corresponding to the allocas created for function parameters.
+    /// Tracked explicitly because lowering creates these allocas, but they may
+    /// become unused after optimization. The backend uses this to detect dead
+    /// param allocas and skip stack slot allocation, reducing frame size.
+    pub param_alloca_values: Vec<Value>,
+    /// True when the function returns a large struct via hidden pointer (sret).
+    /// On i386 SysV ABI, such functions must use `ret $4` to pop the hidden
+    /// pointer argument from the caller's stack.
+    pub uses_sret: bool,
+    /// Block IDs referenced by static local variable initializers via &&label.
+    /// These blocks must be kept reachable and not merged away by CFG simplify,
+    /// since their labels appear in global data (.quad .LBB3) and must resolve.
+    pub global_init_label_blocks: Vec<super::instruction::BlockId>,
+    /// Return carrier classes. SysV AMD64 uses one entry per eightbyte for
+    /// aggregate returns (rax/rdx or xmm0/xmm1). On i686, three INTEGER entries
+    /// mark the Clang integer ExtVector EAX:EDX:ECX return bundle. Empty when
+    /// neither convention applies.
+    pub ret_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True if the return value is _Float128 (ONE 16-byte XMM return).
+    pub ret_is_f128_sse: bool,
+    /// True for `extern inline __attribute__((gnu_inline))` functions (or `extern inline`
+    /// in GNU89 mode). These function bodies are lowered for inlining, but must NOT be
+    /// emitted as standalone definitions. After the inlining pass, they are converted to
+    /// declarations so any remaining calls resolve to the external libc/library symbol.
+    /// This prevents infinite recursion when the inline body calls the same symbol
+    /// (e.g., glibc's `btowc` inline calling `__btowc_alias` with asm name "btowc").
+    pub is_gnu_inline_def: bool,
+    /// F64 phi destinations created by loop-local memory recurrence promotion.
+    /// Backends may give these values dedicated FP registers without enabling
+    /// broad register allocation for every phi-elimination Copy chain.
+    pub loop_promoted_f64_values: Vec<Value>,
+    /// Stack-smashing protection metadata (`-fstack-protector*` + function attrs).
+    pub ssp: SspInfo,
+}
+
+/// Per-function stack-protector attributes and local-variable classification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SspInfo {
+    /// `__attribute__((stack_protect))` present on declaration or definition.
+    pub stack_protect: bool,
+    /// `__attribute__((no_stack_protector))` or `optimize("no-stack-protector")`.
+    pub no_stack_protector: bool,
+    /// Function declares at least one local array (or aggregate containing an array).
+    pub has_array: bool,
+    /// Largest byte size of any local `char`/`signed char`/`unsigned char` array
+    /// (including char arrays nested inside local structs/unions).
+    pub max_char_array_bytes: u32,
+    /// Dedicated canary `Alloca` inserted by `backend::stack_protector`, placed
+    /// at the highest-address local slot by `calculate_stack_space_common`.
+    pub stack_guard_alloca: Option<Value>,
+}
+
+impl SspInfo {
+    /// Merge local-frame triggers from an inlined callee into its caller.
+    pub fn merge_inlined(&mut self, callee: SspInfo) {
+        self.stack_protect |= callee.stack_protect;
+        self.has_array |= callee.has_array;
+        if callee.max_char_array_bytes > self.max_char_array_bytes {
+            self.max_char_array_bytes = callee.max_char_array_bytes;
+        }
+    }
+}
+
+/// A function parameter.
+#[derive(Debug, Clone)]
+pub struct IrParam {
+    pub ty: IrType,
+    /// Pointer parameter carries the C `restrict` no-alias contract for this
+    /// function invocation. Preserved into IR so legality checks do not have
+    /// to guess that two arbitrary pointer parameters are disjoint.
+    pub noalias: bool,
+    /// If this param is a struct/union passed by value, its byte size. None for non-struct params.
+    pub struct_size: Option<usize>,
+    /// Struct alignment in bytes. Used on RISC-V to even-align register pairs for
+    /// 2×XLEN-aligned structs. None for non-struct params.
+    pub struct_align: Option<usize>,
+    /// Local parameter-object alignment when a typedef or declaration requests
+    /// stronger alignment than the ABI carrier. Applies to scalars AND
+    /// aggregates: this must not change incoming stack-argument placement.
+    /// `Alloca.align` takes the maximum of this and `struct_align`.
+    pub param_align: Option<usize>,
+    /// Per-eightbyte SysV ABI classification for struct params (x86-64 only).
+    /// Empty for non-struct params or when classification is not applicable.
+    /// A singleton `[NoClass]` on a scalar parameter is the internal i686
+    /// ExtVector-lane marker: the lane is stack-passed even under regparm and
+    /// does not consume the next ordinary GP register.
+    pub struct_eightbyte_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True for _Float128 params: ONE 16-byte XMM register.
+    pub is_f128_sse: bool,
+    /// RISC-V LP64D float field classification for struct params.
+    /// When Some, indicates this struct should use FP registers per the psABI
+    /// hardware floating-point calling convention. None for non-struct params
+    /// or structs that don't qualify for FP register passing.
+    pub riscv_float_class: Option<crate::common::types::RiscvFloatClass>,
+}
+
+impl IrModule {
+    pub fn new() -> Self {
+        Self {
+            functions: Vec::new(),
+            function_alignments: crate::common::fx_hash::FxHashMap::default(),
+            retained_functions: crate::common::fx_hash::FxHashSet::default(),
+            extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+            noplt_symbols: crate::common::fx_hash::FxHashSet::default(),
+            globals: Vec::new(),
+            extern_data_sizes: crate::common::fx_hash::FxHashMap::default(),
+            string_literals: Vec::new(),
+            wide_string_literals: Vec::new(),
+            char16_string_literals: Vec::new(),
+            constructors: Vec::new(),
+            destructors: Vec::new(),
+            aliases: Vec::new(),
+            ifuncs: Vec::new(),
+            toplevel_asm: Vec::new(),
+            symbol_attrs: Vec::new(),
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            symver_directives: Vec::new(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            externally_visible_symbols: crate::common::fx_hash::FxHashSet::default(),
+            zero_call_used_regs_attrs: crate::common::fx_hash::FxHashMap::default(),
+        }
+    }
+
+    /// Run a transformation on each defined (non-declaration) function, returning
+    /// the total count of changes made. Used by optimization passes.
+    pub fn for_each_function<F>(&mut self, mut f: F) -> usize
+    where
+        F: FnMut(&mut IrFunction) -> usize,
+    {
+        let mut total = 0;
+        for func in &mut self.functions {
+            if !func.is_declaration {
+                total += f(func);
+            }
+        }
+        total
+    }
+}
+
+impl Default for IrModule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IrFunction {
+    #[cfg(test)]
+    pub fn new(name: String, return_type: IrType, params: Vec<IrParam>, is_variadic: bool) -> Self {
+        Self {
+            pass_policy: Default::default(),
+            name,
+            return_type,
+            params,
+            blocks: Vec::new(),
+            is_variadic,
+            is_declaration: false,
+            is_static: false,
+            is_inline: false,
+            is_always_inline: false,
+            x86_isa_needs: Default::default(),
+            is_noinline: false,
+            target_features: Vec::new(),
+            next_value_id: 0,
+            fp_expr_tags: Default::default(),
+            next_label: 0,
+            section: None,
+            visibility: None,
+            is_weak: false,
+            is_used: false,
+            has_inlined_calls: false,
+            param_alloca_values: Vec::new(),
+            uses_sret: false,
+            is_fastcall: false,
+            regparm: None,
+            is_naked: false,
+            no_instrument: false,
+            global_init_label_blocks: Vec::new(),
+            ret_eightbyte_classes: Vec::new(),
+            ret_is_f128_sse: false,
+            is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
+            ssp: SspInfo::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
+        }
+    }
+
+    /// Return the highest Value ID defined (as a destination) in this function, or 0 if empty.
+    /// Uses the cached `next_value_id` if available, otherwise falls back to scanning.
+    /// Useful for sizing flat lookup tables indexed by Value ID.
+    #[inline]
+    pub fn max_value_id(&self) -> u32 {
+        if self.next_value_id > 0 {
+            // next_value_id is the first *unused* ID, so max used is one less
+            return self.next_value_id - 1;
+        }
+        // Fallback: sound scan (expensive). InlineAsm outputs are definitions
+        // that `dest()` does not cover; a dest-only fallback would under-report
+        // and any pass seeding fresh IDs from it would collide with asm outputs
+        // (pr84524: an InlineAsm output at id 55 above every dest() id was
+        // silently reused by loop_invert's cloned latch test).
+        Self::scan_max_mentioned_value_id(self)
+    }
+
+    /// First unused Value ID, computed soundly.
+    ///
+    /// Passes that clone instructions or synthesize new values MUST seed
+    /// their fresh-ID allocator from this method and write the result back to
+    /// `next_value_id` (see `bit_idioms`, `iv_widen`). It is deliberately
+    /// defensive: the cached `next_value_id` is cross-checked against a full
+    /// scan of every definition form (`dest()`, InlineAsm outputs — which are
+    /// side-channel definitions invisible to `dest()` —) and every use, so a
+    /// pass that forgot to maintain the cache cannot resurrect already-taken
+    /// IDs and corrupt SSA numbering downstream.
+    pub fn sound_next_value_id(&self) -> u32 {
+        Self::scan_max_mentioned_value_id(self).saturating_add(1)
+    }
+
+    /// Highest Value ID mentioned anywhere in the function: destinations of
+    /// every definition form, InlineAsm output values (defs not covered by
+    /// `dest()`), and every operand use including terminator operands.
+    fn scan_max_mentioned_value_id(func: &IrFunction) -> u32 {
+        let mut max_id: u32 = 0;
+        // The cached bound stays authoritative when present.
+        if func.next_value_id > 0 {
+            max_id = func.next_value_id - 1;
+        }
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(v) = inst.dest() {
+                    if v.0 > max_id {
+                        max_id = v.0;
+                    }
+                }
+                if let Instruction::InlineAsm { outputs, .. } = inst {
+                    for (_, v, _) in outputs {
+                        if v.0 > max_id {
+                            max_id = v.0;
+                        }
+                    }
+                }
+                // Uses cover parameters, terminator-feeding chains, and any
+                // id that only appears as an operand (e.g. a def forgotten by
+                // a misbehaving pass must not be re-issued either).
+                for u in inst.used_values() {
+                    if u > max_id {
+                        max_id = u;
+                    }
+                }
+            }
+            for u in block.terminator.used_values() {
+                if u > max_id {
+                    max_id = u;
+                }
+            }
+        }
+        max_id
+    }
+}
+
+#[cfg(test)]
+mod value_id_tests {
+    use super::*;
+    use crate::common::types::AddressSpace;
+    use crate::ir::instruction::BlockId;
+
+    /// InlineAsm outputs are definitions invisible to `dest()`. Both the
+    /// cached-bound cross-check and the fallback scan must account for them,
+    /// including DEAD asm outputs (no uses anywhere).
+    #[test]
+    fn sound_next_value_id_covers_dead_inline_asm_outputs() {
+        let mut f = IrFunction::new("t".into(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::InlineAsm {
+                template: String::new(),
+                outputs: vec![("+r".to_string(), Value(55), None)],
+                inputs: Vec::new(),
+                clobbers: Vec::new(),
+                operand_types: vec![IrType::U16],
+                goto_labels: Vec::new(),
+                input_symbols: vec![None],
+                seg_overrides: vec![AddressSpace::Default],
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        f.next_value_id = 0; // force the scan fallback path
+        assert_eq!(f.max_value_id(), 55, "fallback scan must see asm outputs");
+        assert_eq!(
+            f.sound_next_value_id(),
+            56,
+            "first unused id must be above the dead asm output"
+        );
+
+        // With the cache present, the cached bound is authoritative and the
+        // scan must never lower it below an observed def.
+        f.next_value_id = 60;
+        assert_eq!(f.max_value_id(), 59);
+        assert_eq!(f.sound_next_value_id(), 60);
+    }
+}

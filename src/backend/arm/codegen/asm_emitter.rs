@@ -1,0 +1,876 @@
+//! AArch64 InlineAsmEmitter implementation: constraint classification, scratch
+//! register allocation, operand loading/storing, and template substitution.
+
+use super::emit::{ArmCodegen, is_arm_fp_reg};
+use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::CodegenState;
+use crate::common::asm_constraints::aarch64_flag_condition;
+use crate::common::types::IrType;
+use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
+
+/// AArch64 GP scratch registers for inline asm:
+/// - 17 caller-saved registers first (`x9..x15`, `x0..x8`, `x16`; `x17` stays reserved
+///   for 128-bit vector pointer staging, and `x18` [platform register], `x29` [FP],
+///   `x30` [LR] are never touched),
+/// - followed by 10 callee-saved registers (`x19..x28`) for extreme-pressure overflow.
+pub(super) const ARM_GP_SCRATCH: &[&str] = &[
+    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+    "x8", "x16", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+];
+/// AArch64 FP/SIMD scratch registers for inline asm (d8-d15 are callee-saved,
+/// d16-d31 are caller-saved; we use v16+ as scratch to avoid save/restore).
+/// We use the 'v' prefix so that unmodified %0 in templates like `eor %0.16b, %1.16b, %2.16b`
+/// correctly produces `v16.16b` (GCC behavior). Modifiers (%d0, %s0, etc.) convert
+/// to the appropriate scalar view in format_reg_static.
+const ARM_FP_SCRATCH: &[&str] = &[
+    "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25",
+];
+
+/// Convert an IR constant to a 64-bit value appropriate for an inline asm operand.
+/// On AArch64, 32-bit values in X registers must have upper 32 bits zeroed (zero-extended).
+/// For 64-bit operand types, the constant is sign-extended to preserve its semantic value
+/// (e.g., int64_t a = -128 stored as IrConst::I32(-128) must become 0xFFFFFFFF_FFFFFF80).
+fn const_for_asm_operand(c: &IrConst, operand_type: &IrType) -> i64 {
+    let sext = c.to_i64().unwrap_or(0);
+    match operand_type.size() {
+        // 32-bit operand: zero-extend the 32-bit bit pattern.
+        // This ensures e.g. 0xF0000000u stays 0x00000000_F0000000 in the X register,
+        // not 0xFFFFFFFF_F0000000 (which would be sign-extended).
+        1 => sext & 0xFF,
+        2 => sext & 0xFFFF,
+        4 => sext & 0xFFFF_FFFF,
+        // 64-bit or larger operand: sign-extend to preserve int64_t semantics.
+        _ => sext,
+    }
+}
+
+// Provenance delimiters understood by both the native assembler (whose
+// parser drops `//…` and `#…` lines alike) and GAS (which special-cases
+// `#APP`/`#NO_APP` on every target). One spelling across extended, naked
+// and file-scope user text, shared with x86/i686 so downstream scanners
+// need a single grammar; operand setup and output writeback remain outside
+// the extended-asm region.
+pub(super) const USER_ASM_MARKERS: (&str, &str) = ("#APP", "#NO_APP");
+
+impl InlineAsmEmitter for ArmCodegen {
+    fn asm_state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
+
+    // Multi-alternative constraint parsing (e.g., "rm", "ri") matching x86 behavior.
+    // Priority: specific register > GP register > FP register > memory > immediate.
+    // Registers are preferred over memory for performance.
+    fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
+        let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+        // Explicit register constraint from register variable: {regname}
+        if c.starts_with('{') && c.ends_with('}') {
+            let reg_name = &c[1..c.len() - 1];
+            // On AArch64, GCC treats r0-r30 as aliases for x0-x30.
+            // The Linux kernel uses `register ... asm("r0")` extensively
+            // (e.g., arm-smccc.h). Normalize to the canonical x-register name.
+            let normalized = normalize_aarch64_register(reg_name);
+            return AsmOperandKind::Specific(normalized);
+        }
+        // `=@cc<cond>` flag outputs: a `ConditionCode` operand owns a GP scratch
+        // register that the template is not allowed to name, and
+        // `store_output_from_reg` materialises the condition into it with
+        // `CSET` before storing. The suffix is validated while parsing against
+        // `asm_constraints::AARCH64_FLAG_CONDITIONS` (the ARM `ConditionHolds`
+        // names GCC accepts here), so every `cond` that reaches this point has
+        // a `CSET` spelling.
+        if let Some(cond) = c.strip_prefix("@cc") {
+            return AsmOperandKind::ConditionCode(cond.to_string());
+        }
+        if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
+            if let Ok(n) = c.parse::<usize>() {
+                return AsmOperandKind::Tied(n);
+            }
+        }
+
+        // Parse multi-alternative constraints character by character.
+        let mut has_gp = false;
+        let mut has_fp = false;
+        let mut has_mem = false;
+        let mut has_imm = false;
+
+        for ch in c.chars() {
+            match ch {
+                'r' => has_gp = true,
+                'g' => {
+                    has_gp = true;
+                    has_mem = true;
+                    has_imm = true;
+                }
+                'w' => has_fp = true,
+                'm' | 'Q' | 'o' | 'V' | 'p' => has_mem = true,
+                'i' | 'n' | 'I' | 'K' | 'L' => has_imm = true,
+                _ => {}
+            }
+        }
+
+        if has_gp {
+            AsmOperandKind::GpReg
+        } else if has_fp {
+            AsmOperandKind::FpReg
+        } else if has_mem {
+            AsmOperandKind::Memory
+        } else if has_imm {
+            AsmOperandKind::Immediate
+        } else {
+            AsmOperandKind::GpReg
+        }
+    }
+
+    fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, _is_output: bool) {
+        if matches!(op.kind, AsmOperandKind::Memory) {
+            if let Operand::Value(v) = val {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    if self.state.is_alloca(v.0) {
+                        // Alloca: stack slot IS the memory location
+                        op.mem_offset = slot.0;
+                    } else {
+                        // Non-alloca: slot holds a pointer that needs indirection.
+                        // Mark with empty mem_addr; resolve_memory_operand will handle it.
+                        op.mem_addr = String::new();
+                        op.mem_offset = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    fn fallback_scratch_reg(&mut self, kind: &AsmOperandKind) -> String {
+        match kind {
+            AsmOperandKind::FpReg => "v16".to_string(),
+            _ => "x9".to_string(),
+        }
+    }
+
+    fn resolve_memory_operand(
+        &mut self,
+        op: &mut AsmOperand,
+        val: &Operand,
+        excluded: &[String],
+    ) -> Option<String> {
+        if !op.mem_addr.is_empty() || op.mem_offset != 0 {
+            return None;
+        }
+        let alloc_gp_tmp = |this: &mut Self| -> String {
+            let mut r = this.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+            if r.is_empty() {
+                r = this.fallback_scratch_reg(&AsmOperandKind::GpReg);
+            }
+            if r == "x0" {
+                this.state.reg_cache.invalidate_acc();
+            }
+            r
+        };
+        // Each memory operand gets its own unique register via assign_scratch_reg,
+        // so multiple "=m" outputs don't overwrite each other's addresses.
+        match val {
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    if self.state.is_alloca(v.0) {
+                        self.emit_alloca_addr(&tmp_reg, v.0, slot.0);
+                    } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                        if !super::emit::is_arm_fp_phys(phys) {
+                            let src = super::emit::callee_saved_name(phys);
+                            if src != tmp_reg {
+                                self.state
+                                    .emit_fmt(format_args!("    mov {}, {}", tmp_reg, src));
+                            }
+                        } else {
+                            self.emit_load_from_sp(&tmp_reg, slot.0, "ldr");
+                        }
+                    } else {
+                        self.emit_load_from_sp(&tmp_reg, slot.0, "ldr");
+                    }
+                    op.mem_addr = format!("[{}]", tmp_reg);
+                    return Some(tmp_reg);
+                } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    let src = super::emit::callee_saved_name(phys);
+                    if src != tmp_reg {
+                        self.state
+                            .emit_fmt(format_args!("    mov {}, {}", tmp_reg, src));
+                    }
+                    op.mem_addr = format!("[{}]", tmp_reg);
+                    return Some(tmp_reg);
+                } else if self.state.reg_cache.acc_has(v.0, false) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    if tmp_reg != "x0" {
+                        self.state.emit_fmt(format_args!("    mov {}, x0", tmp_reg));
+                    }
+                    op.mem_addr = format!("[{}]", tmp_reg);
+                    return Some(tmp_reg);
+                } else {
+                    assert!(
+                        !op.mem_addr.is_empty(),
+                        "aarch64 codegen: inline-asm memory operand value {} has neither \
+                         stack slot nor register assignment",
+                        v.0
+                    );
+                }
+            }
+            Operand::Const(c) => {
+                if let Some(addr) = c.to_i64() {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    self.emit_load_imm64(&tmp_reg, addr);
+                    op.mem_addr = format!("[{}]", tmp_reg);
+                    return Some(tmp_reg);
+                }
+            }
+        }
+        None
+    }
+
+    fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String {
+        if matches!(kind, AsmOperandKind::FpReg) {
+            // Caller-saved SIMD scratch v16..v31 only (never v32+!).
+            const ARM_FP_ALL: &[&str] = &[
+                "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
+                "v28", "v29", "v30", "v31",
+            ];
+            while self.asm_fp_scratch_idx < ARM_FP_ALL.len() {
+                let reg = ARM_FP_ALL[self.asm_fp_scratch_idx];
+                self.asm_fp_scratch_idx += 1;
+                if !excluded.iter().any(|e| e == reg) {
+                    return reg.to_string();
+                }
+            }
+            for &r in ARM_FP_SCRATCH {
+                if !excluded.iter().any(|e| e == r) {
+                    return r.to_string();
+                }
+            }
+            String::new()
+        } else {
+            // Walk ARM_GP_SCRATCH (17 caller-saved + 10 callee-saved x19..x28;
+            // never x18, x29, x30, or x31+), skipping live RA homes on the first pass.
+            while self.asm_scratch_idx < ARM_GP_SCRATCH.len() * 2 {
+                let idx = self.asm_scratch_idx;
+                self.asm_scratch_idx += 1;
+                let allow_ra_home = idx >= ARM_GP_SCRATCH.len();
+                let reg_name = ARM_GP_SCRATCH[idx % ARM_GP_SCRATCH.len()];
+                if excluded.iter().any(|e| {
+                    e == reg_name
+                        || reg_name
+                            .strip_prefix('x')
+                            .is_some_and(|n| e.strip_prefix('w') == Some(n))
+                }) {
+                    continue;
+                }
+                let in_ra = self.reg_assignments.values().any(|&p| {
+                    !super::emit::is_arm_fp_phys(p) && super::emit::callee_saved_name(p) == reg_name
+                });
+                if in_ra != allow_ra_home {
+                    continue;
+                }
+                if let Some(n) = reg_name
+                    .strip_prefix('x')
+                    .and_then(|s| s.parse::<u8>().ok())
+                {
+                    if (19..=28).contains(&n) {
+                        let phys = PhysReg(n);
+                        if !self.used_callee_saved.contains(&phys) {
+                            self.used_callee_saved.push(phys);
+                            self.used_callee_saved.sort_by_key(|r| r.0);
+                        }
+                    }
+                }
+                return reg_name.to_string();
+            }
+            String::new()
+        }
+    }
+
+    fn load_input_to_reg(
+        &mut self,
+        op: &AsmOperand,
+        val: &Operand,
+        _constraint: &str,
+        operands: &[AsmOperand],
+    ) {
+        let reg = &op.reg;
+        let is_fp = is_arm_fp_reg(reg);
+        let is_sp = reg == "sp";
+        // Lowering represents a 16-byte C vector/aggregate by its address,
+        // but records I128 as the asm transfer width. A spilled POINTER is
+        // not the vector's home. True I128 values and direct/vector homes
+        // retain their by-value load path below.
+        if is_fp && op.operand_type == IrType::I128 {
+            if let Operand::Value(v) = val {
+                if !self.state.is_direct_slot(v.0)
+                    && !self.state.i128_values.contains(&v.0)
+                    && !self.state.vector_values.contains(&v.0)
+                    && !self
+                        .reg_assignments
+                        .get(&v.0)
+                        .is_some_and(|&r| super::emit::is_arm_fp_phys(r))
+                {
+                    let dst = Self::fp_to_q_reg(reg);
+                    if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                        let src = super::emit::callee_saved_name(phys);
+                        self.state
+                            .emit_fmt(format_args!("    ldr {}, [{}]", dst, src));
+                        return;
+                    }
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        // x17 is outside the ordinary operand/RA pools, but
+                        // an explicit register variable can still claim it.
+                        let preserve = operands
+                            .iter()
+                            .any(|operand| matches!(operand.reg.as_str(), "x17" | "w17" | "r17"));
+                        if preserve {
+                            self.state.emit("    str x17, [sp, #-16]!");
+                        }
+                        let adjustment = if preserve { 16 } else { 0 };
+                        self.emit_load_from_sp("x17", slot.0 + adjustment, "ldr");
+                        self.state.emit_fmt(format_args!("    ldr {}, [x17]", dst));
+                        if preserve {
+                            self.state.emit("    ldr x17, [sp], #16");
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        match val {
+            Operand::Const(c) => {
+                if is_fp {
+                    // Load FP constant: extract IEEE 754 bit pattern, move to GP reg,
+                    // then fmov to FP reg. to_i64() returns None for floats, so we
+                    // must use to_bits() to get the bit-level representation.
+                    // fmov requires d/s register form, not v.
+                    let bits = match c {
+                        IrConst::F32(v) => v.to_bits() as i64,
+                        IrConst::F64(v) => v.to_bits() as i64,
+                        _ => c.to_i64().unwrap_or(0),
+                    };
+                    self.emit_load_imm64("x9", bits);
+                    if op.operand_type == IrType::F32 {
+                        let s_reg = Self::fp_to_s_reg(reg);
+                        self.state.emit_fmt(format_args!("    fmov {}, w9", s_reg));
+                    } else {
+                        let d_reg = Self::fp_to_d_reg(reg);
+                        self.state.emit_fmt(format_args!("    fmov {}, x9", d_reg));
+                    }
+                } else if is_sp {
+                    // ARM64: can't use ldr/mov imm to sp directly in most cases.
+                    // Load to scratch first, then mov to sp.
+                    let val = const_for_asm_operand(c, &op.operand_type);
+                    self.emit_load_imm64("x9", val);
+                    self.state.emit("    mov sp, x9");
+                } else {
+                    let val = const_for_asm_operand(c, &op.operand_type);
+                    self.emit_load_imm64(reg, val);
+                }
+            }
+            Operand::Value(v) => {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    if is_fp {
+                        // Load FP value from stack: use ldr with d/s register form.
+                        // For SIMD vector types (>= 16 bytes), use ldr with q register.
+                        let type_size = op.operand_type.size();
+                        if type_size == 16 {
+                            // 128-bit vector: load directly with ldr qN
+                            let q_reg = Self::fp_to_q_reg(reg);
+                            self.emit_load_from_sp(&q_reg, slot.0, "ldr");
+                        } else if op.operand_type == IrType::F32 || type_size == 4 {
+                            self.state
+                                .emit_fmt(format_args!("    ldr w9, [sp, #{}]", slot.0));
+                            let s_reg = Self::fp_to_s_reg(reg);
+                            self.state.emit_fmt(format_args!("    fmov {}, w9", s_reg));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    ldr x9, [sp, #{}]", slot.0));
+                            let d_reg = Self::fp_to_d_reg(reg);
+                            self.state.emit_fmt(format_args!("    fmov {}, x9", d_reg));
+                        }
+                    } else if is_sp {
+                        // ARM64: can't use ldr to load directly into sp.
+                        // Load to scratch first, then mov to sp.
+                        self.emit_load_from_sp("x9", slot.0, "ldr");
+                        self.state.emit("    mov sp, x9");
+                    } else if self.state.is_alloca(v.0) {
+                        // Alloca: the IR value represents the ADDRESS of the
+                        // allocated memory. Compute its address instead of
+                        // loading the contents.
+                        self.emit_alloca_addr(reg, v.0, slot.0);
+                    } else {
+                        // Non-alloca: load the value from the stack slot.
+                        self.emit_load_from_sp(reg, slot.0, "ldr");
+                    }
+                } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    // No stack slot, but register-allocated (authoritative
+                    // allocation — the register holds the value throughout
+                    // its range): materialise the asm input with a direct
+                    // mov, mirroring the RISC-V backend's register-home
+                    // path. This matters for asm that must not touch the
+                    // stack (page-table switches) and for tied operands
+                    // (`asm("" : "=r"(out) : "0"(in))`) where silently
+                    // skipping the load feeds the asm stale register
+                    // contents (the x86-64 OPTIMIZER_HIDE_VAR bug class).
+                    if is_fp {
+                        let size = op.operand_type.size();
+                        if size == 16 {
+                            // A 128-bit value has a SIMD home; moving only D
+                            // would silently lose its high half.
+                            let src = super::emit::arm_vector_name(phys);
+                            let dst = Self::fp_to_q_reg(reg).replacen('q', "v", 1);
+                            self.state
+                                .emit_fmt(format_args!("    mov {}.16b, {}.16b", dst, src));
+                        } else {
+                            let ty = if size == 4 { IrType::F32 } else { IrType::F64 };
+                            let dst = if size == 4 {
+                                Self::fp_to_s_reg(reg)
+                            } else {
+                                Self::fp_to_d_reg(reg)
+                            };
+                            let src = if super::emit::is_arm_fp_phys(phys) {
+                                super::emit::arm_fp_name(phys, ty)
+                            } else if size == 4 {
+                                super::emit::callee_saved_name_32(phys).to_owned()
+                            } else {
+                                super::emit::callee_saved_name(phys).to_owned()
+                            };
+                            self.state
+                                .emit_fmt(format_args!("    fmov {}, {}", dst, src));
+                        }
+                    } else if is_sp {
+                        // sp cannot be an ldr/mov destination from an
+                        // arbitrary home in all states; stage via x9.
+                        let src = super::emit::callee_saved_name(phys);
+                        self.state.emit_fmt(format_args!("    mov x9, {}", src));
+                        self.state.emit("    mov sp, x9");
+                    } else {
+                        let src = super::emit::callee_saved_name(phys);
+                        self.state
+                            .emit_fmt(format_args!("    mov {}, {}", reg, src));
+                    }
+                } else {
+                    // Neither slot nor register: fail loudly instead of
+                    // silently feeding the asm stale register contents.
+                    panic!(
+                        "arm codegen: inline-asm input value {} has no stack slot or \
+                         register assignment",
+                        v.0
+                    );
+                }
+            }
+        }
+    }
+
+    fn preload_readwrite_output(&mut self, op: &AsmOperand, ptr: &Value) {
+        let reg = &op.reg;
+        let is_fp = is_arm_fp_reg(reg);
+        if let Some(slot) = self.state.get_slot(ptr.0) {
+            if is_fp {
+                // Load current FP value for read-write constraint.
+                // fmov requires d/s register form, not v.
+                let type_size = op.operand_type.size();
+                if type_size == 16 {
+                    let q_reg = Self::fp_to_q_reg(reg);
+                    self.emit_load_from_sp(&q_reg, slot.0, "ldr");
+                } else if op.operand_type == IrType::F32 || type_size == 4 {
+                    self.state
+                        .emit_fmt(format_args!("    ldr w9, [sp, #{}]", slot.0));
+                    let s_reg = Self::fp_to_s_reg(reg);
+                    self.state.emit_fmt(format_args!("    fmov {}, w9", s_reg));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    ldr x9, [sp, #{}]", slot.0));
+                    let d_reg = Self::fp_to_d_reg(reg);
+                    self.state.emit_fmt(format_args!("    fmov {}, x9", d_reg));
+                }
+            } else if reg == "sp" {
+                // ARM64: can't use ldr to load directly into sp.
+                self.emit_load_from_sp("x9", slot.0, "ldr");
+                self.state.emit("    mov sp, x9");
+            } else {
+                self.emit_load_from_sp(reg, slot.0, "ldr");
+            }
+        }
+    }
+
+    fn substitute_template_line(
+        &self,
+        line: &str,
+        operands: &[AsmOperand],
+        gcc_to_internal: &[usize],
+        _operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+    ) -> String {
+        // For memory operands (Q/m constraints), use mem_addr (e.g., "[x9]") or
+        // format as [sp, #offset] for stack-based memory. For register operands,
+        // use the register name directly.
+        let op_regs: Vec<String> = operands
+            .iter()
+            .map(|o| {
+                if matches!(o.kind, AsmOperandKind::Memory) {
+                    if !o.mem_addr.is_empty() {
+                        // Non-alloca pointer: mem_addr already formatted as "[xN]"
+                        o.mem_addr.clone()
+                    } else if o.mem_offset != 0 {
+                        // Alloca: stack-relative address
+                        format!("[sp, #{}]", o.mem_offset)
+                    } else {
+                        // Fallback: wrap register in brackets
+                        if o.reg.is_empty() {
+                            "[sp]".to_string()
+                        } else {
+                            format!("[{}]", o.reg)
+                        }
+                    }
+                } else {
+                    o.reg.clone()
+                }
+            })
+            .collect();
+        let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
+        let op_imm_values: Vec<Option<i64>> = operands.iter().map(|o| o.imm_value).collect();
+        let op_imm_symbols: Vec<Option<String>> =
+            operands.iter().map(|o| o.imm_symbol.clone()).collect();
+        let mut result = Self::substitute_asm_operands_static(
+            line,
+            &op_regs,
+            &op_names,
+            gcc_to_internal,
+            &op_imm_values,
+            &op_imm_symbols,
+        );
+        // Substitute %l[name] goto label references
+        result = crate::backend::inline_asm::substitute_goto_labels(
+            &result,
+            goto_labels,
+            gcc_to_internal.len(),
+        );
+        result
+    }
+
+    fn store_output_from_reg(
+        &mut self,
+        op: &AsmOperand,
+        ptr: &Value,
+        _constraint: &str,
+        all_output_regs: &[&str],
+    ) {
+        if matches!(op.kind, AsmOperandKind::Memory) {
+            return;
+        }
+        // `=@cc<cond>` flag output: the template left the condition in NZCV and
+        // the operand's own value is that condition, not a register. GCC builds
+        // it with `CSET w<n>, <cond>` (the architectural alias for
+        // `CSINC Wd, WZR, WZR, invert(cond)`), which is why the constraint
+        // carries an ARM `ConditionHolds` name rather than an x86 suffix.
+        //
+        // Nothing can have written NZCV between the template and this call:
+        // phase 4 stores outputs in operand order and every other store is a
+        // `str`/`fmov`/`ldr`+`str` sequence, none of which touch the flag bank,
+        // so the first flag output still reads the flags the template produced.
+        // `CSET` leaves NZCV alone in turn, so a second flag output in the same
+        // statement reads the same condition.
+        //
+        // The register name is used in its `w` form: `CSET` has no 64-bit form,
+        // and writing `w<n>` zero-extends into `x<n>`, so the generic output
+        // store below (which stores the whole x-register) writes a clean 0/1.
+        if let AsmOperandKind::ConditionCode(ref cond) = op.kind {
+            let Some(arm_cond) = aarch64_flag_condition(cond) else {
+                // Unreachable: the parser rejects every suffix this table
+                // does not contain. Emitting nothing is still strictly better
+                // than storing a stale register as the result of the asm, so
+                // the branch stays as the fail-closed form.
+                return;
+            };
+            let w_reg = Self::to_w_reg(&op.reg);
+            self.state
+                .emit_fmt(format_args!("    cset {}, {}", w_reg, arm_cond));
+        }
+        let reg = &op.reg;
+        let is_fp = is_arm_fp_reg(reg);
+        if let Some(slot) = self.state.get_slot(ptr.0) {
+            if is_fp {
+                // Store FP/SIMD register output. fmov requires d/s form, not v.
+                let type_size = op.operand_type.size();
+                if type_size == 16 {
+                    // 128-bit vector: store directly with str qN
+                    let q_reg = Self::fp_to_q_reg(reg);
+                    self.emit_store_to_sp(&q_reg, slot.0, "str");
+                } else if op.operand_type == IrType::F32 || type_size == 4 {
+                    let s_reg = Self::fp_to_s_reg(reg);
+                    self.state.emit_fmt(format_args!("    fmov w9, {}", s_reg));
+                    self.state
+                        .emit_fmt(format_args!("    str w9, [sp, #{}]", slot.0));
+                } else {
+                    let d_reg = Self::fp_to_d_reg(reg);
+                    self.state.emit_fmt(format_args!("    fmov x9, {}", d_reg));
+                    self.state
+                        .emit_fmt(format_args!("    str x9, [sp, #{}]", slot.0));
+                }
+            } else if reg == "sp" {
+                // ARM64: sp (register 31) can't be used as str source operand directly.
+                // Move to a scratch register first, then store.
+                self.state.emit("    mov x9, sp");
+                self.emit_store_to_sp("x9", slot.0, "str");
+            } else if self.state.is_direct_slot(ptr.0) {
+                self.emit_store_to_sp(reg, slot.0, "str");
+            } else {
+                // Non-alloca: slot holds a pointer, store through it.
+                // Pick a scratch register that doesn't conflict with ANY output register,
+                // not just the current one. This prevents clobbering other outputs that
+                // haven't been stored yet.
+                let candidates = ["x9", "x10", "x11", "x12", "x13", "x14", "x15"];
+                let scratch = candidates
+                    .iter()
+                    .find(|&&c| !all_output_regs.contains(&c))
+                    .copied()
+                    .unwrap_or(if reg != "x9" { "x9" } else { "x10" });
+                self.emit_load_from_sp(scratch, slot.0, "ldr");
+                self.state
+                    .emit_fmt(format_args!("    str {}, [{}]", reg, scratch));
+            }
+        }
+    }
+
+    fn reset_scratch_state(&mut self) {
+        self.asm_scratch_idx = 0;
+        self.asm_fp_scratch_idx = 0;
+    }
+
+    /// Override the default (x86) immediate constraint validation with AArch64 semantics.
+    ///
+    /// On AArch64:
+    ///   'K' - logical immediate: a bitmask value encodable in the N:immr:imms field
+    ///         of AND/ORR/EOR/TST instructions. Excludes 0 and all-ones.
+    ///   'I' - unsigned 12-bit immediate (0..4095) for add/sub instructions
+    ///   'L' - logical immediate for 32-bit operations (32-bit bitmask pattern)
+    fn constant_fits_immediate(&self, constraint: &str, value: i64) -> bool {
+        let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+        // If constraint has 'i' or 'n', any constant value is accepted
+        if stripped.contains('i') || stripped.contains('n') {
+            return true;
+        }
+        // Check each constraint letter with AArch64-specific ranges
+        for ch in stripped.chars() {
+            let fits = match ch {
+                // AArch64 'K': 64-bit logical immediate (bitmask encodable in N:immr:imms)
+                // Used by AND/ORR/EOR/TST instructions. 0 and all-ones are NOT valid.
+                'K' => is_valid_aarch64_logical_immediate(value as u64),
+                // AArch64 'L': 32-bit logical immediate (validate in 32-bit context)
+                'L' => is_valid_aarch64_logical_immediate_32(value as u32),
+                // AArch64 'I': unsigned 12-bit add/sub immediate
+                'I' => (0..=4095).contains(&value),
+                _ => continue,
+            };
+            if fits {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Normalize AArch64 register name aliases.
+///
+/// GCC treats `r0`-`r30` as aliases for `x0`-`x30` on AArch64. The Linux kernel
+/// uses this convention extensively in inline assembly (e.g., `register unsigned long
+/// r0 asm("r0")` in arm-smccc.h). This function maps these aliases to canonical
+/// AArch64 register names so the assembler accepts them.
+pub(super) fn normalize_aarch64_register(name: &str) -> String {
+    if let Some(suffix) = name.strip_prefix('r') {
+        if let Ok(n) = suffix.parse::<u32>() {
+            if n <= 30 {
+                return format!("x{}", n);
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// Check whether a 32-bit value is a valid AArch64 32-bit logical immediate.
+/// Used for the 'L' constraint (32-bit logical operations like AND w0, w1, #imm).
+fn is_valid_aarch64_logical_immediate_32(value: u32) -> bool {
+    if value == 0 || value == u32::MAX {
+        return false;
+    }
+    // Check element sizes: 2, 4, 8, 16, 32 bits within a 32-bit value
+    let mut size: u32 = 32;
+    while size >= 2 {
+        let mask = if size == 32 {
+            u32::MAX
+        } else {
+            (1u32 << size) - 1
+        };
+        let element = value & mask;
+        // Check if value is a repeating pattern of this element size
+        let mut check = element;
+        let mut s = size;
+        while s < 32 {
+            check |= check << s;
+            s *= 2;
+        }
+        if check == value {
+            let val = element & mask;
+            if val != 0 && val != mask {
+                let rotated = ((val >> 1) | ((val & 1) << (size - 1))) & mask;
+                let transitions = val ^ rotated;
+                if transitions.count_ones() == 2 {
+                    return true;
+                }
+            }
+        }
+        size >>= 1;
+    }
+    false
+}
+
+/// Check whether a 64-bit value is a valid AArch64 logical immediate.
+///
+/// AArch64 logical immediates are bitmask patterns encodable in the 13-bit
+/// N:immr:imms field of AND/ORR/EOR/TST instructions. Valid patterns consist
+/// of a repeating element of size 2, 4, 8, 16, 32, or 64 bits, where each
+/// element contains a contiguous (possibly rotated) run of set bits.
+///
+/// The values 0 and all-ones (0xFFFFFFFF_FFFFFFFF) are NOT valid logical immediates.
+fn is_valid_aarch64_logical_immediate(value: u64) -> bool {
+    // 0 and all-ones are never valid logical immediates
+    if value == 0 || value == u64::MAX {
+        return false;
+    }
+
+    // Try each possible element size: 2, 4, 8, 16, 32, 64 bits.
+    // For each size, check if the value is a repeating pattern of that element,
+    // and if the element contains a contiguous (possibly rotated) run of 1-bits.
+    let mut size: u32 = 64;
+    while size >= 2 {
+        let mask = if size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << size) - 1
+        };
+        let element = value & mask;
+
+        // Check if value is a repeating pattern of this element size
+        if is_repeating_pattern(value, element, size) {
+            // Check if the element has a contiguous run of 1-bits (possibly rotated)
+            if has_contiguous_ones(element, size) {
+                return true;
+            }
+        }
+        size >>= 1;
+    }
+    false
+}
+
+/// Check if `value` is composed of `element` repeated to fill 64 bits.
+fn is_repeating_pattern(value: u64, element: u64, size: u32) -> bool {
+    let mut check = element;
+    let mut s = size;
+    while s < 64 {
+        check |= check << s;
+        s *= 2;
+    }
+    check == value
+}
+
+/// Check if the lowest `size` bits of `element` contain a contiguous run of
+/// set bits (possibly rotated). A contiguous-rotated pattern means there's
+/// at most one 0->1 transition and one 1->0 transition in the circular bit sequence.
+fn has_contiguous_ones(element: u64, size: u32) -> bool {
+    let mask = if size == 64 {
+        u64::MAX
+    } else {
+        (1u64 << size) - 1
+    };
+    let val = element & mask;
+    // All-zeros or all-ones within the element are not valid
+    if val == 0 || val == mask {
+        return false;
+    }
+    // A contiguous run of 1-bits (possibly rotated) has the property that
+    // val ^ (val rotated by 1) has exactly 2 set bits (the two transitions).
+    let rotated = ((val >> 1) | ((val & 1) << (size - 1))) & mask;
+    let transitions = val ^ rotated;
+    transitions.count_ones() == 2
+}
+
+#[cfg(test)]
+mod flag_output_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    /// Build the operand shape `classify_constraint` produces for `=@cc<cond>`
+    /// and the register `assign_scratch_reg` hands it.
+    fn cc_operand(cond: &str, reg: &str, ty: IrType) -> AsmOperand {
+        let mut op = AsmOperand::new(AsmOperandKind::ConditionCode(cond.to_string()), None);
+        op.reg = reg.to_string();
+        op.operand_type = ty;
+        op
+    }
+
+    /// The operand's value is the CONDITION, not whatever the template left in
+    /// the scratch register: `CSET` must be emitted, in its `w` form, before
+    /// the ordinary store.
+    #[test]
+    fn flag_output_materialises_the_condition_with_cset() {
+        let mut cg = ArmCodegen::new();
+        cg.state.value_locations.insert(7, StackSlot(-16));
+        cg.state.asm_output_values.insert(7);
+        let op = cc_operand("eq", "x9", IrType::I32);
+        cg.store_output_from_reg(&op, &Value(7), "=@cceq", &["x9"]);
+        let buf = cg.state.out.buf.clone();
+        let cset = buf
+            .find("cset w9, eq")
+            .unwrap_or_else(|| panic!("no `cset w9, eq` in: {buf}"));
+        let str_at = buf
+            .find("str x9, [sp")
+            .or_else(|| buf.find("str x9,"))
+            .unwrap_or_else(|| panic!("flag output was not stored: {buf}"));
+        assert!(cset < str_at, "CSET must precede the store: {buf}");
+    }
+
+    /// Every accepted suffix is spelled the way `CSET` expects: no translation
+    /// table, no `hs`→`cs` rewriting.
+    #[test]
+    fn every_accepted_condition_is_emitted_verbatim() {
+        for cond in crate::common::asm_constraints::AARCH64_FLAG_CONDITIONS {
+            let mut cg = ArmCodegen::new();
+            cg.state.value_locations.insert(1, StackSlot(-8));
+            let op = cc_operand(cond, "x10", IrType::I32);
+            cg.store_output_from_reg(&op, &Value(1), "=@cc", &["x10"]);
+            let buf = &cg.state.out.buf;
+            assert!(
+                buf.contains(&format!("cset w10, {cond}")),
+                "{cond} must be emitted verbatim: {buf}"
+            );
+        }
+    }
+
+    /// A suffix the table does not contain cannot have passed the parser; the
+    /// store must then emit nothing rather than store a stale register.
+    #[test]
+    fn unknown_condition_emits_nothing() {
+        let mut cg = ArmCodegen::new();
+        cg.state.value_locations.insert(3, StackSlot(-8));
+        let op = cc_operand("z", "x9", IrType::I32);
+        cg.store_output_from_reg(&op, &Value(3), "=@ccz", &["x9"]);
+        assert!(cg.state.out.buf.is_empty(), "got: {}", cg.state.out.buf);
+    }
+
+    /// `x`-form to `w`-form, and nothing else.
+    #[test]
+    fn to_w_reg_covers_the_register_forms_the_allocator_returns() {
+        for (from, want) in [
+            ("x0", "w0"),
+            ("x9", "w9"),
+            ("x30", "w30"),
+            ("w9", "w9"),
+            ("v16", "v16"),
+            ("sp", "sp"),
+        ] {
+            assert_eq!(ArmCodegen::to_w_reg(from), want, "{from}");
+        }
+    }
+}

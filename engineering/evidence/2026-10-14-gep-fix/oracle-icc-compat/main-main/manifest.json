@@ -1,0 +1,27 @@
+{
+  "source": "tests/regression/fixtures/late_const_gep/main.c",
+  "function": "main",
+  "arch": "x86",
+  "errors": [],
+  "records": [
+    {
+      "key": "icc",
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": "",
+      "flags": "-O2 -march=core-avx2",
+      "elapsed_s": 0.6382379180004136,
+      "instructions": 50,
+      "loads": 6,
+      "stores": 22,
+      "spills": 0,
+      "stack_refs": 0,
+      "xmm_reg_moves": 0,
+      "branches": 3,
+      "vectors": 32,
+      "calls": 2,
+      "ratio_vs_best": 1.0
+    }
+  ]
+}

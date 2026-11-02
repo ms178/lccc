@@ -1,0 +1,112 @@
+{
+ "flags": "-O2 -march=x86-64-v3 -DMATCH_RICH=1 -DPASSES=2048",
+ "gaps": {
+  "lz4_compress:main": 20
+ },
+ "detail": [
+  {
+   "file": "tests/benchmark/programs/lz4_compress.c",
+   "compilers": {
+    "lccc": {
+     "src_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "dst_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "hash_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "main": {
+      "insns": 326,
+      "loads": 88,
+      "stores": 40,
+      "spills": 75,
+      "branch": 48,
+      "vector": 0
+     }
+    },
+    "gcc": {
+     "main": {
+      "insns": 306,
+      "loads": 46,
+      "stores": 26,
+      "spills": 15,
+      "branch": 45,
+      "vector": 51
+     }
+    },
+    "clang": {
+     "main": {
+      "insns": 414,
+      "loads": 119,
+      "stores": 17,
+      "spills": 15,
+      "branch": 58,
+      "vector": 20
+     }
+    },
+    "icc": {
+     "main": {
+      "insns": 367,
+      "loads": 54,
+      "stores": 35,
+      "spills": 37,
+      "branch": 60,
+      "vector": 3
+     },
+     "src_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "hash_table": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     },
+     "dst_data": {
+      "insns": 0,
+      "loads": 0,
+      "stores": 0,
+      "spills": 0,
+      "branch": 0,
+      "vector": 0
+     }
+    },
+    "icx": {
+     "main": {
+      "insns": 336,
+      "loads": 52,
+      "stores": 18,
+      "spills": 23,
+      "branch": 53,
+      "vector": 2
+     }
+    }
+   },
+   "errors": {}
+  }
+ ]
+}

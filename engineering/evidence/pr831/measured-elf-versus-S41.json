@@ -1,0 +1,77 @@
+[
+  {
+    "case": "nbody",
+    "arm": "aa",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "nbody",
+    "arm": "bb",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "nbody",
+    "arm": "cc",
+    "same_elf_as_S41": false
+  },
+  {
+    "case": "fannkuch",
+    "arm": "aa",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "fannkuch",
+    "arm": "bb",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "fannkuch",
+    "arm": "cc",
+    "same_elf_as_S41": false
+  },
+  {
+    "case": "histogram",
+    "arm": "aa",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "histogram",
+    "arm": "bb",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "histogram",
+    "arm": "cc",
+    "same_elf_as_S41": false
+  },
+  {
+    "case": "libm_round_family",
+    "arm": "aa",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "libm_round_family",
+    "arm": "bb",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "libm_round_family",
+    "arm": "cc",
+    "same_elf_as_S41": false
+  },
+  {
+    "case": "lz4_match_extend",
+    "arm": "aa",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "lz4_match_extend",
+    "arm": "bb",
+    "same_elf_as_S41": true
+  },
+  {
+    "case": "lz4_match_extend",
+    "arm": "cc",
+    "same_elf_as_S41": false
+  }
+]

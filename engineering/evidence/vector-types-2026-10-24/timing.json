@@ -1,0 +1,110 @@
+{
+  "metric": "call-inclusive dependent f32x8 FMA chain; not general throughput",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "cpu": 0,
+  "iterations_per_sample": 100000000,
+  "before_sha256": "4b479dab779595e007982d9abcf45e1ed2a249bcdfed812294e03e79235d758e",
+  "after_sha256": "1f53f00a0c04f02bb7cefaf8f59998d67d365519f9b10ad42bfdbdb6659b59d1",
+  "driver_flags": [
+    "-O2",
+    "-mavx2",
+    "-mfma",
+    "-Wall",
+    "-Wextra",
+    "-Werror"
+  ],
+  "compiler": "gcc-16 (GCC) 16.2.0",
+  "samples_ns": [
+    {
+      "new": 211345118,
+      "original": 212826769
+    },
+    {
+      "original": 213615080,
+      "new": 215125523
+    },
+    {
+      "new": 212166825,
+      "original": 211407842
+    },
+    {
+      "original": 210614007,
+      "new": 211530071
+    },
+    {
+      "new": 213544880,
+      "original": 210634592
+    },
+    {
+      "original": 210676430,
+      "new": 210710265
+    },
+    {
+      "new": 210280456,
+      "original": 212527489
+    },
+    {
+      "original": 212113664,
+      "new": 212782942
+    },
+    {
+      "new": 210680746,
+      "original": 210585662
+    },
+    {
+      "original": 209931172,
+      "new": 209788903
+    },
+    {
+      "new": 210081208,
+      "original": 209529936
+    },
+    {
+      "original": 209370382,
+      "new": 210562407
+    },
+    {
+      "new": 212144130,
+      "original": 215137526
+    },
+    {
+      "original": 209973768,
+      "new": 213075971
+    },
+    {
+      "new": 210520556,
+      "original": 211915065
+    },
+    {
+      "original": 210222970,
+      "new": 211710585
+    },
+    {
+      "new": 213167138,
+      "original": 215249664
+    },
+    {
+      "original": 212901840,
+      "new": 214435554
+    },
+    {
+      "new": 211074139,
+      "original": 209443580
+    },
+    {
+      "original": 210239227,
+      "new": 210907287
+    },
+    {
+      "new": 211168409,
+      "original": 210919559
+    }
+  ],
+  "median_before_over_after": 0.9968546444855528,
+  "ratio_median_absolute_deviation": 0.003875861582140705,
+  "min_ratio": 0.9854408594951328,
+  "max_ratio": 1.014110199513887,
+  "caveat": "Virtualized single-host timing, no PMU evidence; no universal speed claim.",
+  "before_kernel_sha256": "826ab6da58cb0437ddac24568ab5c1878ca9c7ddc8ad4ba7e494f9aeca9e0ec4",
+  "after_kernel_sha256": "4cea348bf7d13175d97046c6d27175c456b4af0a05ca86fcf1b967f8b0bf1a8c"
+}

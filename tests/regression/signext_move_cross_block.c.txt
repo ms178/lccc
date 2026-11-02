@@ -1,0 +1,1 @@
+sign-extend/move fusion must not delete the only definition of %rax when a successor block still reads it (switch compare chain)

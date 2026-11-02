@@ -1,0 +1,16 @@
+FAIL default command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: 
+FAIL weak-definition command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: 
+FAIL import command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: /tmp/rv-shared-loader-odcvlm5b/runner: error while loading shared libraries: /tmp/rv-shared-loader-odcvlm5b/shared.so: unexpected reloc type 0x06
+
+FAIL weak-import command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: /tmp/rv-shared-loader-odcvlm5b/runner: error while loading shared libraries: /tmp/rv-shared-loader-odcvlm5b/shared.so: unexpected reloc type 0x06
+
+FAIL weak-missing command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: /tmp/rv-shared-loader-odcvlm5b/runner: error while loading shared libraries: /tmp/rv-shared-loader-odcvlm5b/shared.so: unexpected reloc type 0x06
+
+FAIL weak-hidden-missing command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: /tmp/rv-shared-loader-odcvlm5b/runner: error while loading shared libraries: /tmp/rv-shared-loader-odcvlm5b/shared.so: unexpected reloc type 0x06
+
+FAIL weak-protected-missing command failed (127): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: /tmp/rv-shared-loader-odcvlm5b/runner: error while loading shared libraries: /tmp/rv-shared-loader-odcvlm5b/shared.so: unexpected reloc type 0x06
+
+FAIL absolute-default command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: 
+FAIL absolute-weak command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: 
+FAIL absolute-protected command failed (91): ['qemu-riscv64', '-L', '/usr/riscv64-linux-gnu', '/tmp/rv-shared-loader-odcvlm5b/runner']: 
+RV64 shared loader: 3 PASS / 10 FAIL / 0 SKIP

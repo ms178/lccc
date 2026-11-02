@@ -1,0 +1,1470 @@
+use super::super::parser::*;
+
+/// Register encoding (3-bit register number in ModR/M and SIB).
+pub(crate) fn reg_num(name: &str) -> Option<u8> {
+    match name {
+        "al" | "ax" | "eax" | "rax" | "xmm0" | "st" | "st(0)" | "mm0" | "es" | "ymm0" | "zmm0"
+        | "k0" | "K0" => Some(0),
+        "cl" | "cx" | "ecx" | "rcx" | "xmm1" | "st(1)" | "mm1" | "cs" | "ymm1" | "zmm1" | "k1"
+        | "K1" => Some(1),
+        "dl" | "dx" | "edx" | "rdx" | "xmm2" | "st(2)" | "mm2" | "ss" | "ymm2" | "zmm2" | "k2"
+        | "K2" => Some(2),
+        "bl" | "bx" | "ebx" | "rbx" | "xmm3" | "st(3)" | "mm3" | "ds" | "ymm3" | "zmm3" | "k3"
+        | "K3" => Some(3),
+        "ah" | "spl" | "sp" | "esp" | "rsp" | "xmm4" | "st(4)" | "mm4" | "fs" | "ymm4" | "zmm4"
+        | "k4" | "K4" => Some(4),
+        "ch" | "bpl" | "bp" | "ebp" | "rbp" | "xmm5" | "st(5)" | "mm5" | "gs" | "ymm5" | "zmm5"
+        | "k5" | "K5" => Some(5),
+        "dh" | "sil" | "si" | "esi" | "rsi" | "xmm6" | "st(6)" | "mm6" | "ymm6" | "zmm6" | "k6"
+        | "K6" => Some(6),
+        "bh" | "dil" | "di" | "edi" | "rdi" | "xmm7" | "st(7)" | "mm7" | "ymm7" | "zmm7" | "k7"
+        | "K7" => Some(7),
+        "r8b" | "r8w" | "r8d" | "r8" | "xmm8" | "ymm8" | "zmm8" => Some(0),
+        "r9b" | "r9w" | "r9d" | "r9" | "xmm9" | "ymm9" | "zmm9" => Some(1),
+        "r10b" | "r10w" | "r10d" | "r10" | "xmm10" | "ymm10" | "zmm10" => Some(2),
+        "r11b" | "r11w" | "r11d" | "r11" | "xmm11" | "ymm11" | "zmm11" => Some(3),
+        "r12b" | "r12w" | "r12d" | "r12" | "xmm12" | "ymm12" | "zmm12" => Some(4),
+        "r13b" | "r13w" | "r13d" | "r13" | "xmm13" | "ymm13" | "zmm13" => Some(5),
+        "r14b" | "r14w" | "r14d" | "r14" | "xmm14" | "ymm14" | "zmm14" => Some(6),
+        "r15b" | "r15w" | "r15d" | "r15" | "xmm15" | "ymm15" | "zmm15" => Some(7),
+        _ => vec_reg_id(name)
+            .map(|n| n & 7)
+            .or_else(|| gp_id(name).map(|id| id & 7)),
+    }
+}
+
+/// Full 5-bit vector register number (xmm/ymm/zmm 0–31).
+pub(crate) fn vec_reg_id(name: &str) -> Option<u8> {
+    for prefix in ["zmm", "ymm", "xmm"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            if let Ok(n) = rest.parse::<u8>() {
+                if n < 32 {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Full 5-bit GP register id (0..31). APX EGPRs occupy 16..31.
+pub(crate) fn gp_id(name: &str) -> Option<u8> {
+    match name {
+        "al" | "ax" | "eax" | "rax" => Some(0),
+        "cl" | "cx" | "ecx" | "rcx" => Some(1),
+        "dl" | "dx" | "edx" | "rdx" => Some(2),
+        "bl" | "bx" | "ebx" | "rbx" => Some(3),
+        "ah" | "spl" | "sp" | "esp" | "rsp" => Some(4),
+        "ch" | "bpl" | "bp" | "ebp" | "rbp" => Some(5),
+        "dh" | "sil" | "si" | "esi" | "rsi" => Some(6),
+        "bh" | "dil" | "di" | "edi" | "rdi" => Some(7),
+        "r8b" | "r8w" | "r8d" | "r8" => Some(8),
+        "r9b" | "r9w" | "r9d" | "r9" => Some(9),
+        "r10b" | "r10w" | "r10d" | "r10" => Some(10),
+        "r11b" | "r11w" | "r11d" | "r11" => Some(11),
+        "r12b" | "r12w" | "r12d" | "r12" => Some(12),
+        "r13b" | "r13w" | "r13d" | "r13" => Some(13),
+        "r14b" | "r14w" | "r14d" | "r14" => Some(14),
+        "r15b" | "r15w" | "r15d" | "r15" => Some(15),
+        _ => parse_egpr(name),
+    }
+}
+
+fn parse_egpr(name: &str) -> Option<u8> {
+    let stem = name
+        .strip_suffix('b')
+        .or_else(|| name.strip_suffix('w'))
+        .or_else(|| name.strip_suffix('d'))
+        .unwrap_or(name);
+    let digits = stem.strip_prefix('r')?;
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let id: u8 = digits.parse().ok()?;
+    (16..=31).contains(&id).then_some(id)
+}
+
+/// True for APX extended GPRs (%r16..%r31 and their width suffixes).
+pub(crate) fn is_egpr(name: &str) -> bool {
+    gp_id(name).is_some_and(|id| id >= 16)
+}
+
+/// Accumulator: %al/%ax/%eax/%rax only. %r8 and %r16 share ModR/M 000
+/// with %rax; using `reg_num == 0 && !needs_rex_ext` would treat %r16 as
+/// the accumulator and emit the 04/05/A8/A9/90 short forms against the
+/// wrong register.
+pub(crate) fn is_accum(name: &str) -> bool {
+    gp_id(name) == Some(0)
+}
+
+/// (bit3, bit4) of a GP id; vector registers only contribute bit3 via
+/// `needs_rex_ext`.
+pub(crate) fn gp_ext_bits(name: &str) -> (bool, bool) {
+    match gp_id(name) {
+        Some(id) => ((id & 8) != 0, id >= 16),
+        None => (needs_rex_ext(name), false),
+    }
+}
+
+/// True if any operand names an EGPR (including memory base/index).
+pub(crate) fn operands_have_egpr(ops: &[Operand]) -> bool {
+    ops.iter().any(|op| match op {
+        Operand::Register(r) => is_egpr(&r.name),
+        Operand::Memory(m) => {
+            m.base.as_ref().is_some_and(|b| is_egpr(&b.name))
+                || m.index.as_ref().is_some_and(|i| is_egpr(&i.name))
+        }
+        Operand::Indirect(inner) => operands_have_egpr(std::slice::from_ref(inner)),
+        _ => false,
+    })
+}
+
+/// Is this an MMX register?
+pub(crate) fn is_mmx(name: &str) -> bool {
+    name.starts_with("mm")
+        && !name.starts_with("mmx")
+        && name.len() <= 3
+        && name.as_bytes().get(2).is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Is this a segment register?
+pub(crate) fn is_segment_reg(name: &str) -> bool {
+    matches!(name, "es" | "cs" | "ss" | "ds" | "fs" | "gs")
+}
+
+pub(crate) fn is_control_reg(name: &str) -> bool {
+    matches!(name, "cr0" | "cr2" | "cr3" | "cr4" | "cr8")
+}
+
+pub(crate) fn control_reg_num(name: &str) -> Option<u8> {
+    match name {
+        "cr0" => Some(0),
+        "cr2" => Some(2),
+        "cr3" => Some(3),
+        "cr4" => Some(4),
+        "cr8" => Some(8),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_debug_reg(name: &str) -> bool {
+    matches!(
+        name,
+        "db0"
+            | "db1"
+            | "db2"
+            | "db3"
+            | "db4"
+            | "db5"
+            | "db6"
+            | "db7"
+            | "dr0"
+            | "dr1"
+            | "dr2"
+            | "dr3"
+            | "dr4"
+            | "dr5"
+            | "dr6"
+            | "dr7"
+    )
+}
+
+pub(crate) fn debug_reg_num(name: &str) -> Option<u8> {
+    match name {
+        "db0" | "dr0" => Some(0),
+        "db1" | "dr1" => Some(1),
+        "db2" | "dr2" => Some(2),
+        "db3" | "dr3" => Some(3),
+        "db4" | "dr4" => Some(4),
+        "db5" | "dr5" => Some(5),
+        "db6" | "dr6" => Some(6),
+        "db7" | "dr7" => Some(7),
+        _ => None,
+    }
+}
+
+/// Is this a YMM register?
+pub(crate) fn is_ymm(name: &str) -> bool {
+    name.starts_with("ymm")
+}
+
+/// Does this register need the REX.B/R/X extension bit (id bit 3)?
+///
+/// APX %r16–%r23 have bit3 clear (they need REX2.R4/B4/X4, not REX.R/B/X),
+/// so they must NOT return true here. %r24–%r31 have both bit3 and bit4.
+pub(crate) fn needs_rex_ext(name: &str) -> bool {
+    if let Some(id) = gp_id(name) {
+        return (id & 8) != 0;
+    }
+    name.starts_with("xmm8")
+        || name.starts_with("xmm9")
+        || name.starts_with("xmm10")
+        || name.starts_with("xmm11")
+        || name.starts_with("xmm12")
+        || name.starts_with("xmm13")
+        || name.starts_with("xmm14")
+        || name.starts_with("xmm15")
+        || name.starts_with("ymm8")
+        || name.starts_with("ymm9")
+        || name.starts_with("ymm10")
+        || name.starts_with("ymm11")
+        || name.starts_with("ymm12")
+        || name.starts_with("ymm13")
+        || name.starts_with("ymm14")
+        || name.starts_with("ymm15")
+        || name.starts_with("zmm8")
+        || name.starts_with("zmm9")
+        || name.starts_with("zmm10")
+        || name.starts_with("zmm11")
+        || name.starts_with("zmm12")
+        || name.starts_with("zmm13")
+        || name.starts_with("zmm14")
+        || name.starts_with("zmm15")
+}
+
+/// Is this a ZMM (512-bit AVX-512) register?
+pub(crate) fn is_zmm(name: &str) -> bool {
+    name.starts_with("zmm")
+}
+
+/// Is this an AVX-512 mask (opmask) register?
+pub(crate) fn is_kreg(name: &str) -> bool {
+    name.len() == 2
+        && name.starts_with('k')
+        && name.as_bytes().get(1).is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Does a vector register need EVEX R'/V'/X extra bits (xmm/ymm/zmm 16–31)?
+pub(crate) fn needs_evex_rprime(name: &str) -> bool {
+    vec_reg_id(name).is_some_and(|n| n >= 16)
+}
+
+/// Operand requires EVEX (cannot be encoded with VEX/legacy).
+pub(crate) fn operand_needs_evex(op: &Operand) -> bool {
+    match op {
+        Operand::Register(r) => {
+            is_zmm(&r.name)
+                || is_kreg(&r.name)
+                || needs_evex_rprime(&r.name)
+                || r.mask.is_some()
+                || r.zeroing
+        }
+        Operand::Memory(m) => m.mask.is_some() || m.zeroing || m.broadcast.is_some(),
+        Operand::Label(s) => is_evex_sae_token(s),
+        _ => false,
+    }
+}
+
+/// `{sae}` / `{r*-sae}` written as a standalone AT&T operand.
+pub(crate) fn is_evex_sae_token(s: &str) -> bool {
+    let t = s.trim().trim_matches(|c| c == '{' || c == '}').trim();
+    matches!(t, "sae" | "rn-sae" | "rd-sae" | "ru-sae" | "rz-sae")
+}
+
+/// Rounding control encoded in EVEX.L'L when EVEX.b is set.
+///
+/// `Some(None)` is bare `{sae}` (SAE-only insns: vmax/vmin/vcmp/vcomi).
+/// `Some(Some(rc))` is `{rn,rd,ru,rz-sae}` (ER insns: vadd/vmul/vsqrt/vcvt).
+/// GAS 2.47 rejects `{sae}` on ER mnemonics and `{r*-sae}` on SAE-only ones;
+/// they must not be rewritten into each other even though both use LL=00
+/// when rc=0.
+pub(crate) fn evex_sae_rounding(s: &str) -> Option<Option<u8>> {
+    if !is_evex_sae_token(s) {
+        return None;
+    }
+    let t = s.trim().trim_matches(|c| c == '{' || c == '}').trim();
+    match t {
+        "sae" => Some(None),
+        "rn-sae" => Some(Some(0)),
+        "rd-sae" => Some(Some(1)),
+        "ru-sae" => Some(Some(2)),
+        "rz-sae" => Some(Some(3)),
+        _ => None,
+    }
+}
+
+/// Does this register need the VEX.B extension bit? Same as REX ext but for VEX-encoded instructions.
+pub(crate) fn needs_vex_ext(name: &str) -> bool {
+    needs_rex_ext(name)
+}
+
+/// Is this a 64-bit GP register?
+pub(crate) fn is_reg64(name: &str) -> bool {
+    matches!(
+        name,
+        "rax"
+            | "rcx"
+            | "rdx"
+            | "rbx"
+            | "rsp"
+            | "rbp"
+            | "rsi"
+            | "rdi"
+            | "r8"
+            | "r9"
+            | "r10"
+            | "r11"
+            | "r12"
+            | "r13"
+            | "r14"
+            | "r15"
+            | "r16"
+            | "r17"
+            | "r18"
+            | "r19"
+            | "r20"
+            | "r21"
+            | "r22"
+            | "r23"
+            | "r24"
+            | "r25"
+            | "r26"
+            | "r27"
+            | "r28"
+            | "r29"
+            | "r30"
+            | "r31"
+    )
+}
+
+/// Is this a 32-bit GP register?
+pub(crate) fn is_reg32(name: &str) -> bool {
+    matches!(
+        name,
+        "eax"
+            | "ecx"
+            | "edx"
+            | "ebx"
+            | "esp"
+            | "ebp"
+            | "esi"
+            | "edi"
+            | "r8d"
+            | "r9d"
+            | "r10d"
+            | "r11d"
+            | "r12d"
+            | "r13d"
+            | "r14d"
+            | "r15d"
+            | "r16d"
+            | "r17d"
+            | "r18d"
+            | "r19d"
+            | "r20d"
+            | "r21d"
+            | "r22d"
+            | "r23d"
+            | "r24d"
+            | "r25d"
+            | "r26d"
+            | "r27d"
+            | "r28d"
+            | "r29d"
+            | "r30d"
+            | "r31d"
+    )
+}
+
+/// Is this a 16-bit GP register?
+pub(crate) fn is_reg16(name: &str) -> bool {
+    matches!(
+        name,
+        "ax" | "cx"
+            | "dx"
+            | "bx"
+            | "sp"
+            | "bp"
+            | "si"
+            | "di"
+            | "r8w"
+            | "r9w"
+            | "r10w"
+            | "r11w"
+            | "r12w"
+            | "r13w"
+            | "r14w"
+            | "r15w"
+            | "r16w"
+            | "r17w"
+            | "r18w"
+            | "r19w"
+            | "r20w"
+            | "r21w"
+            | "r22w"
+            | "r23w"
+            | "r24w"
+            | "r25w"
+            | "r26w"
+            | "r27w"
+            | "r28w"
+            | "r29w"
+            | "r30w"
+            | "r31w"
+    )
+}
+
+/// Is this an 8-bit GP register?
+pub(crate) fn is_reg8(name: &str) -> bool {
+    matches!(
+        name,
+        "al" | "cl"
+            | "dl"
+            | "bl"
+            | "ah"
+            | "ch"
+            | "dh"
+            | "bh"
+            | "spl"
+            | "bpl"
+            | "sil"
+            | "dil"
+            | "r8b"
+            | "r9b"
+            | "r10b"
+            | "r11b"
+            | "r12b"
+            | "r13b"
+            | "r14b"
+            | "r15b"
+            | "r16b"
+            | "r17b"
+            | "r18b"
+            | "r19b"
+            | "r20b"
+            | "r21b"
+            | "r22b"
+            | "r23b"
+            | "r24b"
+            | "r25b"
+            | "r26b"
+            | "r27b"
+            | "r28b"
+            | "r29b"
+            | "r30b"
+            | "r31b"
+    )
+}
+
+/// Does this 8-bit register require REX prefix for access (spl, bpl, sil, dil)?
+pub(crate) fn is_rex_required_8bit(name: &str) -> bool {
+    matches!(name, "spl" | "bpl" | "sil" | "dil")
+}
+
+/// Is this an XMM register?
+pub(crate) fn is_xmm(name: &str) -> bool {
+    name.starts_with("xmm")
+}
+
+/// Is this a general-purpose register (r0-r31 in any width spelling)?
+/// Used to select the EVEX r/m +16 extension bit: GPRs extend through
+/// rex2.B (P0 bit 3, set), vectors through EVEX.X (P0 bit 6, inverted).
+pub(crate) fn is_gpr_name(name: &str) -> bool {
+    gp_id(name).is_some()
+}
+
+/// Is this an XMM or YMM register?
+pub(crate) fn is_xmm_or_ymm(name: &str) -> bool {
+    name.starts_with("xmm") || name.starts_with("ymm")
+}
+
+/// Get the operand-size suffix character for a register name.
+/// Returns 'q' for 64-bit, 'l' for 32-bit, 'w' for 16-bit, 'b' for 8-bit.
+pub(crate) fn register_size_suffix(name: &str) -> Option<char> {
+    if is_reg64(name) {
+        return Some('q');
+    }
+    if is_reg32(name) {
+        return Some('l');
+    }
+    if is_reg16(name) {
+        return Some('w');
+    }
+    if is_reg8(name) {
+        return Some('b');
+    }
+    None
+}
+
+/// GNU as rejects a sign/zero extension whose register operand disagrees
+/// with the width its mnemonic spells (`movswq m, %eax`: "incorrect register
+/// `%eax' used with `q' suffix"; `movsbl %ax, %eax`: ... `b' suffix).
+/// Encoding the suffix's width regardless let a codegen defect ship `-S`
+/// output no GNU toolchain assembles; both x86 encoders reject such text
+/// exactly as GAS does.  Non-GPR operands are left to the caller's checks.
+pub(crate) fn check_movext_register_sizes(
+    ops: &[Operand],
+    src_size: u8,
+    dst_size: u8,
+) -> Result<(), String> {
+    let suffix = |size: u8| match size {
+        1 => 'b',
+        2 => 'w',
+        4 => 'l',
+        _ => 'q',
+    };
+    for (op, size) in ops.iter().zip([src_size, dst_size]) {
+        if let Operand::Register(reg) = op {
+            let want = suffix(size);
+            if register_size_suffix(&reg.name).is_some_and(|got| got != want) {
+                return Err(format!(
+                    "incorrect register `%{}' used with `{want}' suffix",
+                    reg.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set of base mnemonics that accept AT&T size suffixes (b/w/l/q).
+/// Only these mnemonics will have suffixes inferred from operand types.
+pub(crate) const SUFFIXABLE_MNEMONICS: &[&str] = &[
+    "mov", "add", "sub", "and", "or", "xor", "cmp", "test", "push", "pop", "lea", "shl", "shr",
+    "sar", "rol", "ror", "inc", "dec", "neg", "not", "imul", "mul", "div", "idiv", "adc", "sbb",
+    "xchg", "cmpxchg", "xadd", "bswap", "bsf", "bsr",
+];
+
+/// Infer the AT&T size suffix for an unsuffixed mnemonic from its operands.
+///
+/// Hand-written assembly (e.g., musl's .s files) often omits the size suffix
+/// when it can be inferred from register operands. For example:
+///   push %rax  -> pushq %rax
+///   mov %edi,%ecx -> movl %edi,%ecx
+///   and $0x3f,%ecx -> andl $0x3f,%ecx
+///
+/// Only mnemonics in the SUFFIXABLE_MNEMONICS whitelist are candidates for
+/// suffix inference. All others are returned as-is.
+pub(crate) fn infer_suffix(mnemonic: &str, ops: &[Operand]) -> String {
+    // Check if this is a known suffixable mnemonic
+    if !SUFFIXABLE_MNEMONICS.contains(&mnemonic) {
+        return mnemonic.to_string();
+    }
+
+    // For shift/rotate instructions, the suffix comes from the LAST
+    // operand when that operand is a REGISTER — including %cl as the
+    // destination (`shl %cl` = d0 e1, `shr $4,%cl` = c0 e9 04,
+    // `sar %cl,%cl` = d2 f9 — all byte-probed against GAS 2.47). The
+    // classic 2-operand form has the destination last (`shl %cl,%edx` ->
+    // `shll`), the APX NDD 3-operand form has it last (`shl
+    // %cl,%ecx,%edx` -> `shll`), and the 1-operand shift-by-1 form has
+    // it first and only (`shl %edx` -> `shll`). A memory LAST operand
+    // leaves the mnemonic unsuffixed for the encoder's GAS 32-bit
+    // default (`shl (%rax)` = d1 20, `sal %cl,(%rax)` = d3 20 — the %cl
+    // COUNT never decides the size, only a register DESTINATION does).
+    let is_shift = matches!(mnemonic, "shl" | "shr" | "sar" | "rol" | "ror");
+    if is_shift {
+        if let Some(Operand::Register(r)) = ops.last() {
+            if let Some(suffix) = register_size_suffix(&r.name) {
+                return format!("{}{}", mnemonic, suffix);
+            }
+        }
+        return mnemonic.to_string();
+    }
+
+    // Find the first register operand to determine size
+    for op in ops {
+        if let Operand::Register(r) = op {
+            if let Some(suffix) = register_size_suffix(&r.name) {
+                return format!("{}{}", mnemonic, suffix);
+            }
+        }
+    }
+
+    // No register operand found - return as-is
+    mnemonic.to_string()
+}
+
+/// Get operand size from mnemonic suffix.
+pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
+    // Handle mnemonics that don't follow the simple suffix pattern
+    match mnemonic {
+        "cltq" | "cqto" | "cltd" | "cdq" | "cqo" | "cbtw" | "cbw" | "cwtl"
+        | "cwde" | "cdqe" | "cwtd" | "cwd" | "ret" | "nop" | "ud2"
+        // `rdrand`/`rdseed` end in `d`, and `movbe`/`lddqu` in `e`/`u`; none of
+        // those letters is an AT&T size suffix.  Without an entry here the
+        // width check below compares a bogus suffix against the real register.
+        | "rdrand" | "rdseed" | "rdpid" | "movbe" | "lddqu" | "vlddqu" | "bswap"
+        | "endbr64" | "pause" | "mfence" | "lfence" | "sfence" | "clflush"
+        | "syscall" | "sysenter" | "cpuid" | "rdtsc" | "rdtscp" | "rdpmc"
+        | "clc" | "stc" | "cli" | "sti" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "finit" | "fwait" | "wait" | "fnstcw" | "fstcw"
+        // SMAP / UINTR / SERIALIZE / PKRU / MONITOR-MWAIT / cache maintenance:
+        // zero-operand system instructions (kernel uaccess, idle, PKU paths).
+        | "stac" | "clac" | "clui" | "stui" | "serialize" | "enclu" | "encls" | "enclv"
+        | "rdpkru" | "wrpkru" | "monitor" | "mwait" | "wbnoinvd"
+        | "monitorx" | "mwaitx"
+        | "fld1" | "fldl2e" | "fldlg2" | "fldln2" | "fldz" | "fldpi" | "fldl2t"
+        | "fabs" | "fsqrt" | "frndint" | "f2xm1" | "fscale" | "fpatan" | "fprem" | "fprem1"
+        | "fyl2x" | "fyl2xp1" | "fptan" | "fsin" | "fcos" | "fsincos" | "fxtract" | "fnclex" | "fclex" | "fxch"
+        | "fadd" | "fmul" | "fsub" | "fdiv" | "fcom" | "fcomp" | "fcompp" | "fucompp"
+        | "fnstenv" | "fstenv" | "fldenv" | "fnsave" | "fsave" | "frstor" | "fnstsw" | "fstsw"
+        | "fnop" | "fincstp" | "fdecstp" | "ffree"
+        | "ldmxcsr" | "stmxcsr" | "wbinvd" | "invd" | "rdsspq" | "rdsspd"
+        | "lmsw" | "smsw"
+        | "pushf" | "pushfq" | "pushfl" | "popf" | "popfq" | "popfl" | "int3"
+        | "movsq" | "stosq" | "movsw" | "stosw" | "lodsb" | "lodsw" | "lodsd" | "lodsq"
+        | "scasb" | "scasw" | "scasd" | "scasq" | "cmpsb" | "cmpsw" | "cmpsd" | "cmpsq"
+        | "insb" | "insw" | "insd" | "insl" | "outsb" | "outsw" | "outsd" | "outsl"
+        | "inb" | "inw" | "inl" | "outb" | "outw" | "outl" => return None,
+        _ => {}
+    }
+
+    let last = mnemonic.as_bytes().last()?;
+    match last {
+        b'b' => Some(1),
+        b'w' => Some(2),
+        b'l' | b'd' => Some(4),
+        b'q' => Some(8),
+        _ => None,
+    }
+}
+
+/// Register-class identity used for operand-consistency checking.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RegClass {
+    Gp(u8), // width in bytes: 1, 2, 4, 8
+    Xmm,
+    Ymm,
+    Zmm,
+    Mask,
+    Mmx,
+    X87,
+    Seg,
+    Ctrl,
+    Dbg,
+    Other,
+}
+
+pub(crate) fn reg_class(name: &str) -> RegClass {
+    if is_reg64(name) {
+        RegClass::Gp(8)
+    } else if is_reg32(name) {
+        RegClass::Gp(4)
+    } else if is_reg16(name) {
+        RegClass::Gp(2)
+    } else if is_reg8(name) {
+        RegClass::Gp(1)
+    } else if is_xmm(name) {
+        RegClass::Xmm
+    } else if is_ymm(name) {
+        RegClass::Ymm
+    } else if is_zmm(name) {
+        RegClass::Zmm
+    } else if is_kreg(name) {
+        RegClass::Mask
+    } else if is_mmx(name) {
+        RegClass::Mmx
+    } else if name == "st" || name.starts_with("st(") {
+        RegClass::X87
+    } else if is_segment_reg(name) {
+        RegClass::Seg
+    } else if is_control_reg(name) {
+        RegClass::Ctrl
+    } else if is_debug_reg(name) {
+        RegClass::Dbg
+    } else {
+        RegClass::Other
+    }
+}
+
+/// Mnemonics whose register operands are INTENTIONALLY of different widths or
+/// classes, and therefore exempt from the uniform-width check.
+fn is_mixed_width_mnemonic(m: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "movs",
+        "movz",
+        "movbe",
+        "cvt",
+        "vcvt",
+        "pmov",
+        "vpmov",
+        "pinsr",
+        "pextr",
+        "vpinsr",
+        "vpextr",
+        "extractps",
+        "vextractps",
+        "insertps",
+        "vinsertps",
+        "vextract",
+        "vinsert",
+        "vbroadcast",
+        "vpbroadcast",
+        "broadcast",
+        "kmov",
+        "movmsk",
+        "vmovmsk",
+        "crc32",
+        // `bt`/`bts`/`btr`/`btc` are NOT mixed-width: the bit-index register
+        // and the bit-base register share one operand size (GAS: "register
+        // type mismatch for `bt'" on `btl %rcx, %r8d`, "incorrect register
+        // `%r8' used with `l' suffix" on `btl $31, %r8`).  The former
+        // exemption let the BitTest emitter's `btl $31, %r8` through and hid
+        // it from every GAS-oracle build.
+        "shld",
+        "shrd",
+        "vperm",
+        "vpsll",
+        "vpsrl",
+        "vpsra",
+        "psll",
+        "psrl",
+        "psra",
+        "vgather",
+        "vpgather",
+        "vscatter",
+        "vpscatter",
+        "in",
+        "out",
+        "vzero",
+        "enter",
+        "lar",
+        "lsl",
+        "lgdt",
+        "lidt",
+        "sgdt",
+        "sidt",
+        "lldt",
+        "sldt",
+        "ltr",
+        "str",
+        "lmsw",
+        "smsw",
+        "verr",
+        "verw",
+        "vmread",
+        "vmwrite",
+        "vcmp",
+        "cmpp",
+        "cmps",
+        "vdpp",
+        "dpp",
+        "vround",
+        "round",
+        "vblend",
+        "blend",
+        "vpblend",
+        "pblend",
+        "vpalignr",
+        "palignr",
+        "vshuf",
+        "shuf",
+        "pshuf",
+        "vpshuf",
+        "vptest",
+        "ptest",
+        "vtest",
+        "aeskeygenassist",
+        "pclmul",
+        "vpclmul",
+        "vpdp",
+        "vpmadd",
+        // XOP/LWP and the FMA4-era 5-op family: the specific encoders
+        // carry the byte-probed GAS 2.47 diagnostics (register type
+        // mismatch for the ymm-capable vpcmov/vfrcz*/vpermil2*; operand
+        // size mismatch for the xmm-only vpperm/vprot*/vpmac*/vph*/
+        // vpsha*/vpshl*), which the generic rules below would pre-empt
+        // with non-GAS wording.
+        "vpcmov",
+        "vpperm",
+        "vprot",
+        "vpmac",
+        "vph",
+        "vfrcz",
+        "vpsha",
+        "vpshl",
+        "vpermil2",
+        "pmadd",
+        "psadbw",
+        "vpsadbw",
+        "mpsadbw",
+        "vmpsadbw",
+        "vfixup",
+        "vrange",
+        "vreduce",
+        "vgetmant",
+        "vrndscale",
+        "vscalef",
+        "vfpclass",
+        "vpternlog",
+        "vpcmp",
+        "vpshld",
+        "vpshrd",
+        "vpconflict",
+        "vplzcnt",
+        "vpopcnt",
+        "vpcompress",
+        "vpexpand",
+        "vcompress",
+        "vexpand",
+        "sh",
+        "sal",
+        "sar",
+        "rol",
+        "ror",
+        "rcl",
+        "rcr",
+    ];
+    PREFIXES.iter().any(|p| m.starts_with(p))
+}
+
+/// `movd`/`movq`/`vmovd`/`vmovq` shape validation (GAS 2.47 texts).
+///
+/// The GP side is r32/r64 for `movd`, r64-only for `movq` (an r32/r16/r8
+/// there is `operand type mismatch'); the vector side is mm/xmm for SSE,
+/// xmm-only for VEX (an mm, ymm, zmm, k-mask or segment register there is
+/// likewise `operand type mismatch'); mm and xmm never mix; and `movd`
+/// has no vector-vector form (`movd %xmm0,%xmm1` is `operand type
+/// mismatch', only `movq` moves xmm<->xmm). Memory sides are unsized
+/// (m32/m64) and always accepted. Anything else (immediates, labels) is
+/// passed through to the encoder diagnostics.
+fn check_movdq_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    if ops.len() != 2 {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let type_err = || format!("operand type mismatch for `{mnemonic}'");
+    let quad = mnemonic.ends_with('q');
+    let vex = mnemonic.starts_with('v');
+    for op in ops {
+        if let Operand::Register(r) = op {
+            let ok = match reg_class(&r.name) {
+                RegClass::Gp(4) => !quad,
+                RegClass::Gp(8) => true,
+                RegClass::Mmx => !vex,
+                RegClass::Xmm => true,
+                _ => false,
+            };
+            if !ok {
+                return Err(type_err());
+            }
+        }
+    }
+    let has_mm = ops.iter().any(
+        |op| matches!(op, Operand::Register(r) if matches!(reg_class(&r.name), RegClass::Mmx)),
+    );
+    let has_xmm = ops.iter().any(
+        |op| matches!(op, Operand::Register(r) if matches!(reg_class(&r.name), RegClass::Xmm)),
+    );
+    if has_mm && has_xmm {
+        return Err(type_err());
+    }
+    if !quad && (has_mm || has_xmm) {
+        let both_vec = ops.iter().all(|op| {
+            matches!(op, Operand::Register(r)
+                if matches!(reg_class(&r.name), RegClass::Mmx | RegClass::Xmm))
+        });
+        // The one exception (GAS 2.47 byte-probed): `vmovd %xmm4,%xmm6'
+        // (VEX/EVEX, both XMM, same width) is accepted and encoded through
+        // the EVEX-promoted row (62 f1 7e 08 7e f4; `.s' flips to D6).
+        // The non-VEX `movd` pair and every `mm`-involved pair stay
+        // rejected (`movd %xmm4,%xmm6' and `movd %mm1,%mm2' are
+        // "operand type mismatch").
+        let vex_xmm_pair = vex && !has_mm && both_vec;
+        if both_vec && !vex_xmm_pair {
+            return Err(type_err());
+        }
+    }
+    Ok(())
+}
+
+/// `pextr`/`pinsr` shape validation, SSE and VEX (GAS 2.47 texts).
+///
+/// Extracts are (imm, xmm, dst), inserts (imm, src, vsrc[, dst]). The
+/// element side takes r32/r64/mem for `b`/`w` (an r8/r16/vec/k-mask
+/// there is `operand type mismatch'), r32/mem for `d` and r64/mem for
+/// `q` (a wrong-width GPR there is `operand size mismatch', a non-GPR
+/// is `operand type mismatch'). The xmm sides accept xmm only (ymm is
+/// `operand size mismatch', anything else `operand type mismatch').
+/// Memory sides are unsized and always accepted; unknown suffixes and
+/// non-register/mem sides pass through to the encoder diagnostics.
+fn check_pextr_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    let is_ins = mnemonic.contains("pinsr");
+    let dq_width: Option<u8> = match mnemonic.chars().last() {
+        Some('b') | Some('w') => None,
+        Some('d') => Some(4),
+        Some('q') => Some(8),
+        _ => return Ok(()),
+    };
+    let vex = mnemonic.starts_with('v');
+    let expect = if !is_ins {
+        3
+    } else if vex {
+        4
+    } else {
+        3
+    };
+    if ops.len() != expect {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    // The pextr/pinsr imm8 is UNSIGNED 0..255 in GAS 2.47 — `$256` and
+    // `$-2` are `operand type mismatch` (byte-probed for the VEX rows
+    // here and for the EVEX-promoted rows in encoder/promoted.rs;
+    // vmpsadbw's VEX rows are the signed exception, checked in its own
+    // encoder).
+    if let Some(Operand::Immediate(ImmediateValue::Integer(v))) = ops.first() {
+        if !(0..=255).contains(v) {
+            return Err(format!("operand type mismatch for `{mnemonic}'"));
+        }
+    }
+    let type_err = || format!("operand type mismatch for `{mnemonic}'");
+    let size_err = || format!("operand size mismatch for `{mnemonic}'");
+    // Element side (extract destination / insert source).
+    let check_elem = |op: &Operand| -> Result<(), String> {
+        match op {
+            Operand::Register(r) => match reg_class(&r.name) {
+                RegClass::Gp(w) => match dq_width {
+                    None => {
+                        if w == 4 || w == 8 {
+                            Ok(())
+                        } else {
+                            Err(type_err())
+                        }
+                    }
+                    Some(ew) => {
+                        if w == ew {
+                            Ok(())
+                        } else {
+                            Err(size_err())
+                        }
+                    }
+                },
+                _ => Err(type_err()),
+            },
+            Operand::Memory(_) => Ok(()),
+            _ => Ok(()),
+        }
+    };
+    // XMM side (extract source / insert vsrc+dest).
+    let check_xmm = |op: &Operand| -> Result<(), String> {
+        match op {
+            Operand::Register(r) => match reg_class(&r.name) {
+                RegClass::Xmm => Ok(()),
+                RegClass::Ymm | RegClass::Zmm => Err(size_err()),
+                _ => Err(type_err()),
+            },
+            _ => Err(type_err()),
+        }
+    };
+    if !is_ins {
+        check_xmm(&ops[1])?;
+        check_elem(&ops[2])?;
+    } else {
+        check_elem(&ops[1])?;
+        check_xmm(&ops[2])?;
+        if vex {
+            check_xmm(&ops[3])?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate the legacy SIMD immediate row before register numbers can alias
+/// MMX, XMM, GP or wider vectors. Only PSHUFW is MMX-only; PALIGNR has
+/// separate MMX/XMM rows. All other callers use an XMM-only legacy row.
+/// Return whether the emitter must select the MMX (no mandatory prefix) row.
+pub(crate) fn check_legacy_simd_imm8(ops: &[Operand], opcode: &[u8]) -> Result<bool, String> {
+    let [
+        Operand::Immediate(ImmediateValue::Integer(imm)),
+        src,
+        Operand::Register(dst),
+    ] = ops
+    else {
+        return Err(
+            "legacy SIMD immediate instruction requires imm8, source, destination".to_string(),
+        );
+    };
+    // GNU's signed spelling is row-specific: several control operands are
+    // explicitly unsigned (ROUND*, compares, PALIGNR, INSERTPS, AES and GFNI).
+    // Both spellings still encode exactly one byte; do not silently truncate.
+    let signed_alias = matches!(opcode,
+        [0x0F, 0x70 | 0xC6] | [0x66 | 0xF2 | 0xF3, 0x0F, 0x70]
+        | [0x66, 0x0F, 0xC6] | [0x0F, 0x3A, 0xCC]
+        | [0x66, 0x0F, 0x3A, 0x0C..=0x0E | 0x40..=0x44]);
+    let min_imm = if signed_alias { -128 } else { 0 };
+    if !(min_imm..=255).contains(imm) {
+        return Err("immediate does not fit this instruction's 8-bit field".to_string());
+    }
+    let mmx = |name: &str| {
+        name.strip_prefix("mm")
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| n < 8)
+    };
+    let xmm = |name: &str| is_xmm(name) && vec_reg_id(name).is_some_and(|n| n < 16);
+    let use_mmx = mmx(&dst.name);
+    let valid_destination = match opcode {
+        [0x0F, 0x70] => use_mmx, // PSHUFW, not PSHUFD/PSHUFLW/PSHUFHW.
+        [0x66, 0x0F, 0x3A, 0x0F] => use_mmx || xmm(&dst.name), // PALIGNR.
+        _ => xmm(&dst.name),
+    };
+    let valid_source = match src {
+        Operand::Register(r) => {
+            if use_mmx {
+                mmx(&r.name)
+            } else {
+                xmm(&r.name)
+            }
+        }
+        Operand::Memory(_) => true,
+        Operand::Label(s) => !s.starts_with('{'), // normalized absolute memory
+        _ => false,
+    };
+    if !valid_destination || !valid_source {
+        return Err(
+            "operand type or register width mismatch for legacy SIMD immediate instruction"
+                .to_string(),
+        );
+    }
+    Ok(use_mmx)
+}
+
+/// Validate that an instruction's operands are mutually consistent.
+///
+/// This catches the class of malformed input that would otherwise be encoded
+/// as a *different, valid* instruction. It is deliberately conservative: it
+/// only rejects combinations that are unambiguously illegal, so it can never
+/// turn working assembly into an error.
+pub(crate) fn validate_operands(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
+    // `movd`/`movq` cross register FILES (`movq %xmm0,%rax`), so they are
+    // exempt from the uniform-width rule ONLY when a vector register is
+    // actually involved. As a plain GP move, `movq %rax,%eax` is just as
+    // malformed as `mov %rax,%eax` and must be rejected.
+    // `movd`/`movq` cross register files (`movq %xmm0,%rax`), so they are
+    // exempt from the uniform-width rule ONLY when a vector register is
+    // actually involved. As a plain GP move, `movq %rax,%eax` is just as
+    // malformed as `mov %rax,%eax` and must be rejected. Vector-involved
+    // forms take the GAS-exact shape check (which also rejects ymm/zmm).
+    if matches!(mnemonic, "movd" | "movq" | "vmovd" | "vmovq")
+        && ops.iter().any(|op| {
+            matches!(op, Operand::Register(r)
+            if matches!(reg_class(&r.name),
+                        RegClass::Xmm | RegClass::Ymm | RegClass::Zmm | RegClass::Mmx))
+        })
+    {
+        return check_movdq_shape(mnemonic, ops);
+    }
+
+    // `pextr`/`pinsr` (SSE and VEX) take the GAS-exact shape check: the
+    // encoders derive everything from operand position and would
+    // otherwise mis-assemble wrong-width vectors and GPRs silently.
+    if mnemonic.starts_with("pextr")
+        || mnemonic.starts_with("pinsr")
+        || mnemonic.starts_with("vpextr")
+        || mnemonic.starts_with("vpinsr")
+    {
+        return check_pextr_shape(mnemonic, ops);
+    }
+
+    // 1. SIB scale must be 1/2/4/8; %rsp can never be an index.
+    for op in ops {
+        if let Operand::Memory(m) = op {
+            if let Some(scale) = m.scale {
+                if !matches!(scale, 1 | 2 | 4 | 8) {
+                    return Err(format!(
+                        "expecting scale factor of 1, 2, 4, or 8: got `{scale}'"
+                    ));
+                }
+            }
+            if let Some(idx) = &m.index {
+                let n = idx.name.trim_start_matches('%');
+                if n == "rsp" || n == "esp" || n == "sp" {
+                    return Err(format!("%{} cannot be used as an index register", n));
+                }
+            }
+        }
+    }
+
+    // 2a. Extension source must be narrower than the destination and match
+    //     the mnemonic's source suffix.
+    if ops.len() == 2
+        && (mnemonic.starts_with("movs") || mnemonic.starts_with("movz"))
+        && mnemonic.len() > 4
+    {
+        let src_w = match &mnemonic[4..5] {
+            "b" => Some(1u8),
+            "w" => Some(2),
+            "l" => Some(4),
+            _ => None,
+        };
+        if let (Some(w), Operand::Register(a)) = (src_w, &ops[0]) {
+            if let RegClass::Gp(aw) = reg_class(&a.name) {
+                if aw != w {
+                    return Err(format!(
+                        "`{}` source must be a {}-bit register, got %{}",
+                        mnemonic,
+                        w * 8,
+                        a.name
+                    ));
+                }
+            }
+        }
+        if let (Operand::Register(a), Operand::Register(b)) = (&ops[0], &ops[1]) {
+            if let (RegClass::Gp(aw), RegClass::Gp(bw)) = (reg_class(&a.name), reg_class(&b.name)) {
+                if aw >= bw {
+                    return Err(format!(
+                        "`{}` destination must be wider than source: %{} -> %{}",
+                        mnemonic, a.name, b.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // 2b. `cmovCC` has no 8-bit form.
+    if mnemonic.starts_with("cmov") {
+        for op in ops {
+            if let Operand::Register(r) = op {
+                if reg_class(&r.name) == RegClass::Gp(1) {
+                    return Err(format!("`{}` has no 8-bit form: %{}", mnemonic, r.name));
+                }
+            }
+        }
+    }
+
+    // 3. Uniform-width rule for plain two-register data/ALU forms.
+    if ops.len() == 2 && !is_mixed_width_mnemonic(mnemonic) {
+        if let (Operand::Register(a), Operand::Register(b)) = (&ops[0], &ops[1]) {
+            let (ca, cb) = (reg_class(&a.name), reg_class(&b.name));
+            let comparable = matches!(
+                (ca, cb),
+                (RegClass::Gp(_), RegClass::Gp(_))
+                    | (RegClass::Xmm, RegClass::Xmm)
+                    | (RegClass::Ymm, RegClass::Ymm)
+                    | (RegClass::Xmm, RegClass::Ymm)
+                    | (RegClass::Ymm, RegClass::Xmm)
+            );
+            if comparable && ca != cb {
+                return Err(format!(
+                    "operand size mismatch for `{}`: %{} and %{}",
+                    mnemonic, a.name, b.name
+                ));
+            }
+        }
+    }
+
+    // 4. A vector mnemonic's register operands must all be the same width.
+    if mnemonic.starts_with('v') && !is_mixed_width_mnemonic(mnemonic) {
+        let mut seen: Option<RegClass> = None;
+        for op in ops {
+            if let Operand::Register(r) = op {
+                let c = reg_class(&r.name);
+                if !matches!(c, RegClass::Xmm | RegClass::Ymm | RegClass::Zmm) {
+                    continue;
+                }
+                match seen {
+                    None => seen = Some(c),
+                    Some(prev) if prev != c => {
+                        return Err(format!("mixed vector register widths in `{}`", mnemonic));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // 5. A suffixed mnemonic must agree with its register operands' width.
+    //    `setCC`/`cmovCC`/`jCC` end in a CONDITION CODE, not a size suffix
+    //    (`setl` is set-if-less, not "set long"), so they must be excluded.
+    let is_cc_mnemonic = mnemonic.starts_with("set")
+        || mnemonic.starts_with("cmov")
+        || mnemonic.starts_with("cfcmov")
+        || (mnemonic.starts_with('j') && mnemonic != "jmp" && mnemonic != "jmpq");
+    if let Some(sz) = mnemonic_size_suffix(mnemonic) {
+        // LWP spellings end in letters that LOOK like size suffixes
+        // (`lwpval` → 'l') but are full mnemonic names: the destination
+        // register independently chooses r32/r64 (GAS 2.47 accepts
+        // `lwpval $imm, %ebx, %r15`). The 0x8F family has no suffixed
+        // spellings at all.
+        let is_lwp = mnemonic == "lwpins" || mnemonic == "lwpval";
+        if !is_cc_mnemonic
+            && !is_lwp
+            && !is_mixed_width_mnemonic(mnemonic)
+            && matches!(sz, 1 | 2 | 4 | 8)
+        {
+            for op in ops {
+                if let Operand::Register(r) = op {
+                    if let RegClass::Gp(w) = reg_class(&r.name) {
+                        if w != sz {
+                            return Err(format!(
+                                "`{}` operand size does not match register %{}",
+                                mnemonic, r.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 6. REX / legacy-high-byte conflict. %ah/%ch/%dh/%bh are encodable only
+    //    WITHOUT REX, while %spl/%bpl/%sil/%dil and %r8b-%r15b REQUIRE it.
+    //    An instruction naming both is unencodable: the REX byte one operand
+    //    demands silently reinterprets the other, touching the WRONG REGISTER.
+    {
+        let mut has_high8 = false;
+        let mut needs_rex = false;
+        for op in ops {
+            if let Operand::Register(r) = op {
+                let n = r.name.trim_start_matches('%');
+                if matches!(n, "ah" | "ch" | "dh" | "bh") {
+                    has_high8 = true;
+                } else if is_rex_required_8bit(n) || needs_rex_ext(n) {
+                    needs_rex = true;
+                }
+            } else if let Operand::Memory(m) = op {
+                if m.base.as_ref().is_some_and(|b| needs_rex_ext(&b.name))
+                    || m.index.as_ref().is_some_and(|i| needs_rex_ext(&i.name))
+                {
+                    needs_rex = true;
+                }
+            }
+        }
+        if has_high8 && needs_rex {
+            return Err(
+                "cannot encode %ah/%ch/%dh/%bh together with a REX-requiring register".to_string(),
+            );
+        }
+    }
+
+    // 7. In 64-bit mode push/pop take 64-bit (or 16-bit) operands only.
+    // `infer_suffix` may already have rewritten `push %eax` to `pushl`, so
+    // match every spelling rather than only the canonical 64-bit one.
+    if matches!(
+        mnemonic,
+        "push" | "pushq" | "pushl" | "pushw" | "pushb" | "pop" | "popq" | "popl" | "popw" | "popb"
+    ) {
+        if let Some(Operand::Register(r)) = ops.first() {
+            if let RegClass::Gp(w) = reg_class(&r.name) {
+                if w == 4 || w == 1 {
+                    return Err(format!(
+                        "cannot {} a {}-bit register in 64-bit mode: %{}",
+                        if mnemonic.starts_with("push") {
+                            "push"
+                        } else {
+                            "pop"
+                        },
+                        w * 8,
+                        r.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // 8. Zero-operand instructions must not be given operands.
+    if matches!(
+        mnemonic,
+        "vzeroupper"
+            | "vzeroall"
+            | "cpuid"
+            | "leave"
+            | "leaveq"
+            | "hlt"
+            | "pause"
+            | "syscall"
+            | "sysret"
+            | "ud2"
+            | "cwtl"
+            | "cltq"
+            | "cqto"
+            | "cltd"
+            | "cwtd"
+            | "endbr64"
+            | "endbr32"
+            | "cbtw"
+            | "cbw"
+            | "cwde"
+            | "cdqe"
+            | "cwd"
+            | "lfence"
+            | "sfence"
+            | "mfence"
+            | "rdtsc"
+            | "rdtscp"
+            | "cdq"
+            | "cqo"
+            | "stac"
+            | "clac"
+            | "clui"
+            | "stui"
+            | "serialize"
+            | "rdpkru"
+            | "wrpkru"
+            | "wbnoinvd"
+            | "clzero"
+            | "rdpru"
+            | "mcommit"
+    ) && !ops.is_empty()
+    {
+        return Err(format!("`{}` takes no operands", mnemonic));
+    }
+
+    Ok(())
+}
+
+/// Truncate an immediate to the operand's width and reinterpret it as signed.
+///
+/// x86 immediates are *modular*: for a 16-bit operand `$65535`, `$-1` and
+/// `$0xffff` denote the same value. An encoder that tests the raw source
+/// integer against the imm8 range therefore misses the compact form whenever
+/// the user wrote the unsigned spelling — GAS emits `66 83 c0 ff` for
+/// `addw $65535,%ax` while a naive encoder emits the 4/5-byte `81` form.
+pub(crate) fn canonical_imm(val: i64, size: u8) -> i64 {
+    match size {
+        1 => val as u8 as i8 as i64,
+        2 => val as u16 as i16 as i64,
+        4 => val as u32 as i32 as i64,
+        _ => val,
+    }
+}
+
+/// Whether `val`, taken modulo the operand width, fits the sign-extended
+/// 8-bit immediate form (opcode `0x83` / `0x6b`).
+pub(crate) fn fits_imm8(val: i64, size: u8) -> bool {
+    (-128..=127).contains(&canonical_imm(val, size))
+}
+
+/// Infer register size in bytes from register name.
+pub(crate) fn infer_reg_size(name: &str) -> u8 {
+    if is_reg64(name) {
+        8
+    } else if is_reg32(name) {
+        4
+    } else if is_reg16(name) {
+        2
+    } else if is_reg8(name) {
+        1
+    } else if is_xmm(name) {
+        16
+    } else if is_ymm(name) {
+        32
+    } else {
+        8
+    } // mmx and other registers default to 8
+}
+
+/// Infer operand size from a pair of operands for suffix-less instructions.
+pub(crate) fn infer_operand_size_from_pair(op1: &Operand, op2: &Operand) -> u8 {
+    // Try to infer from register operands
+    for op in [op1, op2] {
+        if let Operand::Register(r) = op {
+            if is_segment_reg(&r.name) {
+                continue;
+            }
+            if is_reg64(&r.name) {
+                return 8;
+            }
+            if is_reg32(&r.name) {
+                return 4;
+            }
+            if is_reg16(&r.name) {
+                return 2;
+            }
+            if is_reg8(&r.name) {
+                return 1;
+            }
+        }
+    }
+    // Default to 64-bit
+    8
+}
+
+/// Parse x87 register number: "st(0)" -> 0, "st" -> 0, "st(1)" -> 1, etc.
+pub(crate) fn parse_st_num(name: &str) -> Result<u8, String> {
+    if name == "st" || name == "st(0)" {
+        return Ok(0);
+    }
+    if name.starts_with("st(") && name.ends_with(')') {
+        let n: u8 = name[3..name.len() - 1]
+            .parse()
+            .map_err(|_| format!("bad st register: {}", name))?;
+        if n > 7 {
+            return Err(format!("st register out of range: {}", name));
+        }
+        return Ok(n);
+    }
+    Err(format!("not an st register: {}", name))
+}
+
+/// Map condition code suffix to encoding.
+pub(crate) fn cc_from_mnemonic(cc_str: &str) -> Result<u8, String> {
+    match cc_str {
+        "o" => Ok(0),
+        "no" => Ok(1),
+        "b" | "c" | "nae" => Ok(2),
+        "nb" | "nc" | "ae" => Ok(3),
+        "e" | "z" => Ok(4),
+        "ne" | "nz" => Ok(5),
+        "be" | "na" => Ok(6),
+        "nbe" | "a" => Ok(7),
+        "s" => Ok(8),
+        "ns" => Ok(9),
+        "p" | "pe" => Ok(10),
+        "np" | "po" => Ok(11),
+        "l" | "nge" => Ok(12),
+        "nl" | "ge" => Ok(13),
+        "le" | "ng" => Ok(14),
+        "nle" | "g" => Ok(15),
+        _ => Err(format!("unknown condition code: {}", cc_str)),
+    }
+}
+
+/// True for the FMA3 mnemonics that use the VEX 3-operand `0F38` encoding.
+pub(crate) fn is_fma3_vex(m: &str) -> bool {
+    fma3_opcode(m).is_some()
+}
+
+/// Decode an FMA3 mnemonic into its `0F38` opcode and VEX.W bit.
+///
+/// The FMA3 opcode space is a regular grid:
+///
+/// ```text
+///                 132     213     231
+///   vfmadd        0x98    0xA8    0xB8      packed; +1 -> scalar
+///   vfmsub        0x9A    0xAA    0xBA
+///   vfnmadd       0x9C    0xAC    0xBC
+///   vfnmsub       0x9E    0xAE    0xBE
+///   vfmaddsub     0x96    0xA6    0xB6      packed only
+///   vfmsubadd     0x97    0xA7    0xB7      packed only
+/// ```
+///
+/// W=1 selects the double-precision element type (`pd`/`sd`), W=0 selects
+/// single (`ps`/`ss`).  The mandatory prefix is 66 for every form.
+pub(crate) fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
+    let rest = m
+        .strip_prefix("vfm")
+        .map(|r| (r, false))
+        .or_else(|| m.strip_prefix("vfnm").map(|r| (r, true)))?;
+    let (rest, negated) = rest;
+
+    // Element type: the last two characters.
+    let (rest, ty) = rest.split_at_checked(rest.len().checked_sub(2)?)?;
+    let (w, scalar) = match ty {
+        "ps" => (0u8, false),
+        "pd" => (1, false),
+        "ss" => (0, true),
+        "sd" => (1, true),
+        _ => return None,
+    };
+
+    // Operand order: the three digits before the element type.
+    let (op, order) = rest.split_at_checked(rest.len().checked_sub(3)?)?;
+    let order_step: u8 = match order {
+        "132" => 0,
+        "213" => 1,
+        "231" => 2,
+        _ => return None,
+    };
+
+    let base: u8 = match (op, negated) {
+        ("add", false) => 0x98,
+        ("sub", false) => 0x9A,
+        ("add", true) => 0x9C,
+        ("sub", true) => 0x9E,
+        // addsub/subadd have no scalar form.
+        ("addsub", false) if !scalar => 0x96,
+        ("subadd", false) if !scalar => 0x97,
+        _ => return None,
+    };
+
+    Some((base + 0x10 * order_step + u8::from(scalar), w))
+}

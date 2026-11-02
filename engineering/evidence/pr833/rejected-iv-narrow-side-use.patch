@@ -1,0 +1,233 @@
+diff --git a/src/passes/iv_widen.rs b/src/passes/iv_widen.rs
+index 023e50a..124807d 100644
+--- a/src/passes/iv_widen.rs
++++ b/src/passes/iv_widen.rs
+@@ -130,6 +130,8 @@
+ //!   so it is retained as a same-size reinterpretation of the wide value and
+ //!   the chain below it is enqueued and classified normally (`CrossCast`) —
+ //!   that is where the I64 scaling and the GEP live.
++//! - An invariant-minus-seed side use remains narrow, fed by a local truncation
++//!   at that instruction. Its subtraction may wrap; it is not a widened member.
+ //! - Same-width casts (C's `int < unsigned` promotion) are retained as
+ //!   truncations rather than widened, keeping the mixed-signedness cmp exact.
+ //! - Rotated self-loops (header == latch) are widenable when a preheader
+@@ -560,6 +562,9 @@ struct WidenPlan {
+     /// (block_idx, member_value) — one truncation per escaping block. Only
+     /// members whose consumers expect the narrow value appear here.
+     escapes: Vec<(usize, Value)>,
++    /// In-loop invariant-minus-seed operations stay narrow, fed by a truncation
++    /// immediately before that instruction (never at a block's phi prefix).
++    narrow_reverse_subs: Vec<Value>,
+     has_addressing: bool,
+ }
+ 
+@@ -1275,6 +1280,7 @@ fn analyze_iv(
+ 
+     let mut cmps: Vec<CmpAction> = Vec::new();
+     let mut escapes: Vec<(usize, Value)> = Vec::new();
++    let mut narrow_reverse_subs = Vec::new();
+     let mut has_addressing = false;
+ 
+     // Worklist of (value, is_narrow_member, value_exact). Narrow members get
+@@ -1479,6 +1485,23 @@ fn analyze_iv(
+                                 queue.push((*dest, true, cur_exact));
+                                 continue;
+                             }
++                            // Keep invariant - IV in its original narrow domain. Its
++                            // result need not fit (notably under -fwrapv); only the
++                            // seed trajectory is widened. A local truncation keeps
++                            // every low bit and does not assume the subtraction
++                            // itself is extension-transparent. Requiring an invariant
++                            // lhs prevents it joining the derived closure later.
++                            if *op == IrBinOp::Sub
++                                && !cur_lhs
++                                && cur == phi_dest
++                                && cur_exact
++                                && *ty == phi_ty
++                                && operand_is_const_or_loop_invariant(other, lp, func, phi_dest)
++                                && matches!(other, Operand::Value(v) if defining_type(func, *v) == Some(phi_ty))
++                            {
++                                narrow_reverse_subs.push(*dest);
++                                continue;
++                            }
+                             // Two-member arithmetic: sound for signed members
+                             // (UB theorem); the other operand must be an
+                             // admitted member.
+@@ -2035,6 +2058,7 @@ fn analyze_iv(
+         members,
+         cmps,
+         escapes,
++        narrow_reverse_subs,
+         has_addressing,
+     })
+ }
+@@ -2683,6 +2707,32 @@ fn verify_plan(
+     if !plan_is_integral(func, plan) {
+         return false;
+     }
++    // Recheck the narrow side uses before any mutation. Their results must not
++    // also be members: retyping one while truncating its input would be wrong.
++    for &dest in &plan.narrow_reverse_subs {
++        let Some((
++            bi,
++            Instruction::BinOp {
++                op: IrBinOp::Sub,
++                lhs,
++                rhs,
++                ty,
++                ..
++            },
++        )) = find_def(func, dest)
++        else {
++            return false;
++        };
++        if !lp.body.contains(&bi)
++            || *ty != plan.phi_ty
++            || !matches!(rhs, Operand::Value(v) if *v == plan.phi_dest)
++            || !operand_is_const_or_loop_invariant(lhs, lp, func, plan.phi_dest)
++            || !matches!(lhs, Operand::Value(v) if defining_type(func, *v) == Some(plan.phi_ty))
++            || plan.members.iter().any(|m| m.value == dest)
++        {
++            return false;
++        }
++    }
+     // Latch shape: the step operand must still be what we recorded.
+     let Some(step) = plan_step_operand(func, plan.phi_dest, plan.latch_dest) else {
+         return false;
+@@ -2892,6 +2942,36 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
+         v
+     };
+ 
++    // Resolve all narrow-use sites before mutation, then insert in reverse
++    // instruction order. A truncation at the consumer dominates its use even
++    // when the seed is defined in this block; an escape-prefix cast would not
++    // be a generally valid repair for arbitrary in-loop members.
++    let Some(mut sites) = plan
++        .narrow_reverse_subs
++        .iter()
++        .map(|dest| find_def_idx(func, *dest))
++        .collect::<Option<Vec<_>>>()
++    else {
++        return false;
++    };
++    sites.sort_unstable();
++    for (bi, ii) in sites.into_iter().rev() {
++        let narrow = fresh();
++        insert_inst(
++            &mut func.blocks[bi],
++            ii,
++            Instruction::Cast {
++                dest: narrow,
++                src: Operand::Value(phi_dest),
++                from_ty: wide_ty,
++                to_ty: phi_ty,
++            },
++        );
++        if let Instruction::BinOp { rhs, .. } = &mut func.blocks[bi].instructions[ii + 1] {
++            *rhs = Operand::Value(narrow);
++        }
++    }
++
+     // 1. Preheader: wide init.
+     let wide_init: Operand = match plan.init {
+         Operand::Const(c) => Operand::Const(widen_const(c, phi_ty).unwrap_or(c)),
+@@ -3903,6 +3983,99 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn invariant_reverse_sub_stays_narrow_while_addressing_seed_widens() {
++        let _guard = WrappingGuard::new();
++        for (variant_lhs, wrong_type, expected) in
++            [(false, false, 1), (true, false, 0), (false, true, 0)]
++        {
++            let mut f = counting_loop(
++                "reverse_sub_narrow_side_use",
++                IrType::I32,
++                IrBinOp::Add,
++                vec![
++                    Instruction::Cast {
++                        dest: Value(9),
++                        src: Operand::Value(Value(1)),
++                        from_ty: IrType::I32,
++                        to_ty: IrType::I64,
++                    },
++                    gep_inst(10, 9, IrType::I8),
++                    Instruction::BinOp {
++                        dest: Value(11),
++                        op: IrBinOp::Sub,
++                        lhs: Operand::Value(Value(77)),
++                        rhs: Operand::Value(Value(1)),
++                        ty: IrType::I32,
++                    },
++                    Instruction::Cast {
++                        dest: Value(12),
++                        src: Operand::Value(Value(11)),
++                        from_ty: IrType::I32,
++                        to_ty: IrType::I64,
++                    },
++                    gep_inst(13, 12, IrType::I8),
++                ],
++                Some(Instruction::Cmp {
++                    dest: Value(99),
++                    op: IrCmpOp::Slt,
++                    lhs: Operand::Value(Value(1)),
++                    rhs: Operand::Const(IrConst::I32(64)),
++                    ty: IrType::I32,
++                }),
++            );
++            let lhs = Instruction::Load {
++                dest: Value(77),
++                ptr: Value(50),
++                ty: if wrong_type { IrType::U32 } else { IrType::I32 },
++                seg_override: AddressSpace::Default,
++                volatile: true,
++            };
++            if variant_lhs {
++                f.blocks[2].instructions.insert(0, lhs);
++            } else {
++                f.blocks[0].instructions.push(lhs);
++            }
++            check(&mut f, expected);
++            if expected == 1 {
++                let (
++                    _,
++                    Instruction::BinOp {
++                        ty,
++                        rhs: Operand::Value(narrow),
++                        ..
++                    },
++                ) = find_def(&f, Value(11)).unwrap()
++                else {
++                    panic!("missing narrow subtraction")
++                };
++                assert_eq!(*ty, IrType::I32);
++                assert!(matches!(
++                    find_def(&f, *narrow),
++                    Some((
++                        _,
++                        Instruction::Cast {
++                            src: Operand::Value(Value(1)),
++                            from_ty: IrType::I64,
++                            to_ty: IrType::I32,
++                            ..
++                        }
++                    ))
++                ));
++                assert!(matches!(
++                    find_def(&f, Value(1)),
++                    Some((
++                        _,
++                        Instruction::Phi {
++                            ty: IrType::I64,
++                            ..
++                        }
++                    ))
++                ));
++            }
++        }
++    }
++
+     #[test]
+     fn wrapping_signed_mask_range_supports_safe_arithmetic_only() {
+         let _guard = WrappingGuard::new();

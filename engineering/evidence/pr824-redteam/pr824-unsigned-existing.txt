@@ -1,0 +1,14 @@
+  contract 1: oracle parity across fold/rotation configurations
+  fold-on: parity
+  fold-killed: parity
+  rot: parity
+  rot-fold-killed: parity
+  O1: parity
+  Os: parity
+  O3-rot: parity
+  contract 2: default-on reporting, independent of rotation, kill switch
+  folds reported: default=27 rotation=6 killed=0
+  contract 3: folded nested loop, folded type-top bound, pinned refusals
+  wrap probe wrap_affine_fold: exact, and identical with the fold killed
+  wrap probe wrap_loop_fold: exact, and identical with the fold killed
+check_affine_loop_fold: PASS (oracle parity, default-on counted fold, nested+type-top folds, refusals pinned)

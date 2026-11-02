@@ -1,0 +1,46 @@
+;;; x86-64-evex-lane-fp-registers-and-compressed-disp8
+.text
+vinsertf32x4 $0xab, %xmm4, %ymm5, %ymm6{%k7}{z}
+vinsertf64x2 $0xab, %xmm4, %zmm5, %zmm6{%k7}
+vinsertf32x8 $0xab, %ymm4, %zmm5, %zmm6{%k7}{z}
+vinsertf64x4 $0xab, %ymm4, %zmm5, %zmm6{%k7}
+vextractf32x4 $123, %zmm5, %xmm6{%k7}
+vextractf64x2 $123, %ymm5, %xmm6{%k7}{z}
+vextractf32x8 $123, %zmm5, %ymm6{%k7}{z}
+vextractf64x4 $123, %zmm5, %ymm6{%k7}
+vinsertf32x4 $123, 2032(%rax), %ymm5, %ymm6{%k7}
+vinsertf64x2 $123, 2032(%rax), %ymm5, %ymm6{%k7}
+vinsertf32x8 $123, 4064(%rax), %zmm5, %zmm6{%k7}
+vinsertf64x4 $123, 4064(%rax), %zmm5, %zmm6{%k7}
+vextractf32x4 $123, %zmm5, 2032(%rax){%k7}
+vextractf64x2 $123, %ymm5, 2032(%rax){%k7}
+vextractf32x8 $123, %zmm5, 4064(%rax){%k7}
+vextractf64x4 $123, %zmm5, 4064(%rax){%k7}
+
+;;; x86-64-evex-lane-fp-reject-insert-base-destination-width reject
+.text
+vinsertf32x4 $1, %xmm1, %zmm2, %ymm3
+
+;;; x86-64-evex-lane-fp-reject-insert-lane-width reject
+.text
+vinsertf32x4 $1, %ymm1, %ymm2, %ymm3
+
+;;; x86-64-evex-lane-fp-reject-insert-x8-base-width reject
+.text
+vinsertf32x8 $1, %ymm1, %ymm2, %ymm3
+
+;;; x86-64-evex-lane-fp-reject-extract-destination-width reject
+.text
+vextractf32x4 $1, %zmm1, %ymm3
+
+;;; x86-64-evex-lane-fp-reject-extract-source-width reject
+.text
+vextractf32x8 $1, %ymm1, %ymm3
+
+;;; x86-64-evex-lane-fp-reject-unsigned-imm-boundaries reject
+.text
+vinsertf32x4 $-1, %xmm1, %ymm2, %ymm3
+
+;;; x86-64-evex-lane-fp-reject-imm-overflow reject
+.text
+vextractf32x4 $256, %zmm1, %xmm3

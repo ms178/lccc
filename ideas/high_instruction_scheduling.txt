@@ -1,0 +1,64 @@
+Instruction Scheduling for Raptor Lake (Port/Resource-Aware)
+=============================================================
+Priority: HIGH
+
+Problem
+-------
+LCCC emits straight-line machine code in IR order. There is no instruction
+scheduler, so latency-bound chains stall even when independent work exists to
+fill the gaps. This shows up as the ~1.1–1.3× gap on FP/latency-bound kernels
+and in the PGO benchmarks' slower-than-ideal loops.
+
+What GCC/ICC/LLVM do
+--------------------
+- Model each instruction's latency, throughput, and which execution ports it
+  uses (e.g. `mul`/`imul` latency ~3 on a p1 port, `div` ~20+, `fma` on p0/p1,
+  loads on p2/p3).
+- Schedule to (a) shorten the critical path and (b) balance port pressure, so
+  the pipeline never starves a single execution unit.
+
+Raptor Lake specifics (Intel Optimization Manual)
+-------------------------------------------------
+- 6 P-cores (i7-14700KF) with 4 ALU ports (p0,p1,p5,p6) + 2 store ports (p4,
+  p237) + 2 load ports (p2,p3).
+- Integer `add`/`lea`: ~1/cycle, 4 ports. `imul`: ~3 latency, 1 port.
+- FP `add`/`mul`: ~4 latency, 2 ports; `fma`: 4 latency; `div` ~11–13 latency.
+- Memory: load latency ~5; dependent loads chain at ~1/cycle on the load ports.
+- Branch: a 16-byte aligned macro-fused `cmp+jcc` predicts in the hot loop.
+
+What to build
+-------------
+Phase 1: **latency-scheduling within a basic block** (list scheduling).
+  - Build a small per-instruction model keyed by the IR op and type
+    (mov/lea/alu/imul/idiv/load/store/div/cmov).
+  - Compute a DAG from data dependencies (the IR operands already give use-defs).
+  - Emit in priority order: longest critical-path-to-end first, tie-break by
+    port pressure so independent work on different ports interleaves.
+  - Keep it correct-by-construction (never move a load before a store it may
+    alias unless provably safe — start conservative: only schedule within a
+    block, only reorder instructions with no memory-aliasing ambiguity).
+
+Phase 2: **port-pressure balancing** across the hot loop body.
+  - Estimate per-op port usage and alternate dependent FP chains onto p0/p1.
+
+Phase 3: **software pipelining / load hoisting** for counted loops, driven by
+  the PGO trip-count profile (a hot high-trip loop gets the aggressive schedule).
+
+Why it is worth it
+------------------
+- Latency-bound FP and memory kernels are the clearest remaining code-quality
+  gap; the schedule is measurable with the existing A/B harness.
+- A scheduler is largely independent of the rest of the backend, so it can be
+  landed behind an env guard (`LCCC_NO_SCHEDULE`) and bisected safely.
+
+Measurement plan
+----------------
+1. Pick latency-bound kernels (nbody, spectral_norm, matmul, FP chains).
+2. A/B scheduled vs unscheduled with the benchmark runner; confirm no >1%
+  regression on the broad suite.
+3. On the i7-14700KF, confirm with PMU: reduced backend-stall cycles, higher IPC.
+
+Key files
+- src/backend/scheduler.rs (new)
+- src/backend/generation.rs (call scheduler before emission)
+- Intel Optimization Manual: "Instruction Latency and Throughput", port tables.

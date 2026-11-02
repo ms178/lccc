@@ -1,0 +1,137 @@
+//! `__has_builtin` availability gating for the GNU x86 builtin namespace.
+//!
+//! Provenance: a full differential sweep of all 246 `__builtin_ia32_*`
+//! names registered in this tree against gcc 16.2.0, run at default and at
+//! each of `-msse3 -mssse3 -msse4.1 -msse4.2 -mavx -mbmi2 -mavx2 -mfma
+//! -mf16c -mavx512f` (2026-10-28). 136 names are baseline-known without
+//! any flag; the remaining 110 flip on exactly the feature macro listed
+//! here (16 SSSE3, 5 SSE4.1, 4 SSE4.2, 16 AVX, 6 BMI2, 63 AVX2).
+//! `tests/regression/check_has_builtin_features.py` re-runs the sweep
+//! against GCC and fails on any answer divergence, so this table cannot
+//! drift from the oracle.
+//!
+//! Feature *implication* rides on the predefined-macro table, not on
+//! per-name data: GCC answers `-mavx2`-builtins with 1 under `-mavx2`
+//! because that flag defines `__AVX2__` and everything it implies, and
+//! LCCC's macro implication chain was measured byte-identical to GCC's
+//! for every flag in the sweep.
+
+/// The predefined feature macro that must be defined for `__has_builtin`
+/// to answer 1 for `name`, for every GNU x86 builtin entry GCC 16.2
+/// conditions on a target flag. `None` means the name is not gated (it is
+/// either baseline-known or outside the swept namespace).
+pub fn x86_builtin_feature_macro(name: &str) -> Option<&'static str> {
+    match name {
+        "__builtin_ia32_addpd256" => Some("__AVX__"),
+        "__builtin_ia32_addps256" => Some("__AVX__"),
+        "__builtin_ia32_andps256" => Some("__AVX__"),
+        "__builtin_ia32_bzhi_di" => Some("__BMI2__"),
+        "__builtin_ia32_bzhi_si" => Some("__BMI2__"),
+        "__builtin_ia32_cmpps256" => Some("__AVX__"),
+        "__builtin_ia32_crc32di" => Some("__SSE4_2__"),
+        "__builtin_ia32_crc32hi" => Some("__SSE4_2__"),
+        "__builtin_ia32_crc32qi" => Some("__SSE4_2__"),
+        "__builtin_ia32_crc32si" => Some("__SSE4_2__"),
+        "__builtin_ia32_loaddqu256" => Some("__AVX__"),
+        "__builtin_ia32_loadupd256" => Some("__AVX__"),
+        "__builtin_ia32_loadups256" => Some("__AVX__"),
+        "__builtin_ia32_maxps256" => Some("__AVX__"),
+        "__builtin_ia32_minps256" => Some("__AVX__"),
+        "__builtin_ia32_mulpd256" => Some("__AVX__"),
+        "__builtin_ia32_mulps256" => Some("__AVX__"),
+        "__builtin_ia32_pabsb128" => Some("__SSSE3__"),
+        "__builtin_ia32_pabsb256" => Some("__AVX2__"),
+        "__builtin_ia32_pabsd128" => Some("__SSSE3__"),
+        "__builtin_ia32_pabsd256" => Some("__AVX2__"),
+        "__builtin_ia32_pabsw128" => Some("__SSSE3__"),
+        "__builtin_ia32_pabsw256" => Some("__AVX2__"),
+        "__builtin_ia32_packssdw256" => Some("__AVX2__"),
+        "__builtin_ia32_packuswb256" => Some("__AVX2__"),
+        "__builtin_ia32_paddb256" => Some("__AVX2__"),
+        "__builtin_ia32_paddd256" => Some("__AVX2__"),
+        "__builtin_ia32_paddq256" => Some("__AVX2__"),
+        "__builtin_ia32_paddw256" => Some("__AVX2__"),
+        "__builtin_ia32_palignr128" => Some("__SSSE3__"),
+        "__builtin_ia32_pblendvb128" => Some("__SSE4_1__"),
+        "__builtin_ia32_pblendw128" => Some("__SSE4_1__"),
+        "__builtin_ia32_pcmpeqb256" => Some("__AVX2__"),
+        "__builtin_ia32_pcmpeqd256" => Some("__AVX2__"),
+        "__builtin_ia32_pcmpeqq256" => Some("__AVX2__"),
+        "__builtin_ia32_pcmpgtb256" => Some("__AVX2__"),
+        "__builtin_ia32_pcmpgtd256" => Some("__AVX2__"),
+        "__builtin_ia32_pcmpgtq256" => Some("__AVX2__"),
+        "__builtin_ia32_pdep_di" => Some("__BMI2__"),
+        "__builtin_ia32_pdep_si" => Some("__BMI2__"),
+        "__builtin_ia32_permvarsi256" => Some("__AVX2__"),
+        "__builtin_ia32_pext_di" => Some("__BMI2__"),
+        "__builtin_ia32_pext_si" => Some("__BMI2__"),
+        "__builtin_ia32_phaddd128" => Some("__SSSE3__"),
+        "__builtin_ia32_phaddd256" => Some("__AVX2__"),
+        "__builtin_ia32_phaddsw128" => Some("__SSSE3__"),
+        "__builtin_ia32_phaddw128" => Some("__SSSE3__"),
+        "__builtin_ia32_phaddw256" => Some("__AVX2__"),
+        "__builtin_ia32_phsubd128" => Some("__SSSE3__"),
+        "__builtin_ia32_phsubsw128" => Some("__SSSE3__"),
+        "__builtin_ia32_phsubw128" => Some("__SSSE3__"),
+        "__builtin_ia32_pmaddubsw128" => Some("__SSSE3__"),
+        "__builtin_ia32_pmaddubsw256" => Some("__AVX2__"),
+        "__builtin_ia32_pmaddwd256" => Some("__AVX2__"),
+        "__builtin_ia32_pmaxsd256" => Some("__AVX2__"),
+        "__builtin_ia32_pmaxub256" => Some("__AVX2__"),
+        "__builtin_ia32_pminsd256" => Some("__AVX2__"),
+        "__builtin_ia32_pminub256" => Some("__AVX2__"),
+        "__builtin_ia32_pmovmskb256" => Some("__AVX2__"),
+        "__builtin_ia32_pmovsxbd256" => Some("__AVX2__"),
+        "__builtin_ia32_pmovsxbw256" => Some("__AVX2__"),
+        "__builtin_ia32_pmovsxwd256" => Some("__AVX2__"),
+        "__builtin_ia32_pmovzxbd256" => Some("__AVX2__"),
+        "__builtin_ia32_pmovzxbw128" => Some("__SSE4_1__"),
+        "__builtin_ia32_pmovzxbw256" => Some("__AVX2__"),
+        "__builtin_ia32_pmovzxwd128" => Some("__SSE4_1__"),
+        "__builtin_ia32_pmovzxwd256" => Some("__AVX2__"),
+        "__builtin_ia32_pmulhrsw128" => Some("__SSSE3__"),
+        "__builtin_ia32_pmulhw256" => Some("__AVX2__"),
+        "__builtin_ia32_pmulld128" => Some("__SSE4_1__"),
+        "__builtin_ia32_pmulld256" => Some("__AVX2__"),
+        "__builtin_ia32_pmullw256" => Some("__AVX2__"),
+        "__builtin_ia32_pmuludq256" => Some("__AVX2__"),
+        "__builtin_ia32_por256" => Some("__AVX2__"),
+        "__builtin_ia32_psadbw256" => Some("__AVX2__"),
+        "__builtin_ia32_pshufb128" => Some("__SSSE3__"),
+        "__builtin_ia32_pshufb256" => Some("__AVX2__"),
+        "__builtin_ia32_pshufd256" => Some("__AVX2__"),
+        "__builtin_ia32_psignb128" => Some("__SSSE3__"),
+        "__builtin_ia32_psignd128" => Some("__SSSE3__"),
+        "__builtin_ia32_psignw128" => Some("__SSSE3__"),
+        "__builtin_ia32_pslldi256" => Some("__AVX2__"),
+        "__builtin_ia32_pslldqi256" => Some("__AVX2__"),
+        "__builtin_ia32_psllqi256" => Some("__AVX2__"),
+        "__builtin_ia32_psllwi256" => Some("__AVX2__"),
+        "__builtin_ia32_psradi256" => Some("__AVX2__"),
+        "__builtin_ia32_psrawi256" => Some("__AVX2__"),
+        "__builtin_ia32_psrldi256" => Some("__AVX2__"),
+        "__builtin_ia32_psrldqi256" => Some("__AVX2__"),
+        "__builtin_ia32_psrlqi256" => Some("__AVX2__"),
+        "__builtin_ia32_psrlwi256" => Some("__AVX2__"),
+        "__builtin_ia32_psubb256" => Some("__AVX2__"),
+        "__builtin_ia32_psubd256" => Some("__AVX2__"),
+        "__builtin_ia32_psubq256" => Some("__AVX2__"),
+        "__builtin_ia32_psubusw256" => Some("__AVX2__"),
+        "__builtin_ia32_psubw256" => Some("__AVX2__"),
+        "__builtin_ia32_punpckhbw256" => Some("__AVX2__"),
+        "__builtin_ia32_punpckhdq256" => Some("__AVX2__"),
+        "__builtin_ia32_punpckhqdq256" => Some("__AVX2__"),
+        "__builtin_ia32_punpckhwd256" => Some("__AVX2__"),
+        "__builtin_ia32_punpcklbw256" => Some("__AVX2__"),
+        "__builtin_ia32_punpckldq256" => Some("__AVX2__"),
+        "__builtin_ia32_punpcklqdq256" => Some("__AVX2__"),
+        "__builtin_ia32_punpcklwd256" => Some("__AVX2__"),
+        "__builtin_ia32_pxor256" => Some("__AVX2__"),
+        "__builtin_ia32_storedqu256" => Some("__AVX__"),
+        "__builtin_ia32_subpd256" => Some("__AVX__"),
+        "__builtin_ia32_subps256" => Some("__AVX__"),
+        "__builtin_ia32_vextractf128_ps256" => Some("__AVX__"),
+        "__builtin_ia32_vzeroupper" => Some("__AVX__"),
+        _ => None,
+    }
+}

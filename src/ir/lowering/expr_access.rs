@@ -1,0 +1,2281 @@
+//! Expression access lowering: cast, compound literals, sizeof, generic selection,
+//! address-of, dereference, array subscript, member access, statement expressions,
+//! and va_arg.
+//!
+//! Extracted from expr.rs to keep expression lowering manageable.
+
+use super::lower::Lowerer;
+use super::string_init::StringInit;
+use super::structs::ExtVectorSelection;
+use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
+use crate::frontend::parser::ast::{
+    BlockItem, CompoundStmt, Designator, Expr, GenericAssociation, Initializer, InitializerItem,
+    SizeofArg, Stmt, TypeSpecifier,
+};
+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, Operand, Terminator, Value};
+
+impl Lowerer {
+    // -----------------------------------------------------------------------
+    // Cast expressions
+    // -----------------------------------------------------------------------
+
+    pub(super) fn lower_cast(&mut self, target_type: &TypeSpecifier, inner: &Expr) -> Operand {
+        let target_ctype = self.type_spec_to_ctype(target_type);
+        let inner_ctype = self.expr_ctype(inner);
+
+        // Handle complex type casts
+        if target_ctype.is_complex() && !inner_ctype.is_complex() {
+            let val = self.lower_expr(inner);
+            return self.real_to_complex(val, &inner_ctype, &target_ctype);
+        }
+        if target_ctype.is_complex() && inner_ctype.is_complex() {
+            if target_ctype == inner_ctype {
+                return self.lower_expr(inner);
+            }
+            let val = self.lower_expr(inner);
+            let ptr = self.operand_to_value(val);
+            return self.complex_to_complex(ptr, &inner_ctype, &target_ctype);
+        }
+        if !target_ctype.is_complex() && inner_ctype.is_complex() {
+            let val = self.lower_expr(inner);
+            let ptr = self.operand_to_value(val);
+
+            if target_ctype == CType::Bool {
+                return self.lower_complex_to_bool(ptr, &inner_ctype);
+            }
+
+            let real = self.load_complex_real(ptr, &inner_ctype);
+            let comp_ty = Self::complex_component_ir_type(&inner_ctype);
+            let to_ty = self.type_spec_to_ir(target_type);
+            if comp_ty != to_ty {
+                let dest = self.emit_cast_val(real, comp_ty, to_ty);
+                return Operand::Value(dest);
+            }
+            return real;
+        }
+
+        // GCC extension: cast to union type, e.g. (union convert)x
+        // Creates a temporary union, stores the value into the first matching member at offset 0.
+        if let CType::Union(ref key) = target_ctype {
+            let union_size = self
+                .types
+                .borrow_struct_layouts()
+                .get(&**key)
+                .map(|l| l.size)
+                .unwrap_or(0);
+            let inner_ctype = self.expr_ctype(inner);
+            let src = self.lower_expr(inner);
+
+            // Allocate stack space for the union and zero-initialize it
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: union_size,
+                ty: IrType::Ptr,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            self.zero_init_alloca(alloca, union_size);
+
+            // If the source is an aggregate (struct/union), lower_expr returns a pointer
+            // to the data. We need to memcpy the data, not store the pointer value.
+            match inner_ctype {
+                CType::Struct(_) | CType::Union(_) => {
+                    let src_size = self.ctype_size(&inner_ctype);
+                    let copy_size = src_size.min(union_size);
+                    if copy_size > 0 {
+                        let src_val = self.operand_to_value(src);
+                        self.emit(Instruction::Memcpy {
+                            dest: alloca,
+                            src: src_val,
+                            size: copy_size,
+                        });
+                    }
+                }
+                _ => {
+                    // Scalar source: store the value directly at offset 0
+                    let store_ty = self.get_expr_type(inner);
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val: src,
+                        ptr: alloca,
+                        ty: store_ty,
+                        seg_override: AddressSpace::Default,
+                    });
+                }
+            }
+
+            return Operand::Value(alloca);
+        }
+
+        // GCC extension: cast to struct type (rare, but handle similarly)
+        if let CType::Struct(_) = target_ctype {
+            // Struct casts are not standard C, but if the source is already a struct pointer, pass through
+            let src = self.lower_expr(inner);
+            return src;
+        }
+
+        // Vector-to-scalar cast: load the vector data as the target scalar type.
+        // Vectors are stored in stack allocas and lower_expr returns a pointer.
+        // A cast like `(long long)(V2SI){2,2}` must load the 8 bytes of vector
+        // data as an integer, not return the alloca pointer itself. A call
+        // returning a small vector in a register yields the bits, not an
+        // address; `vector_operand_ptr` spills that carrier first
+        // (`(long long)f()` dereferenced the bits).
+        if inner_ctype.is_vector() && !target_ctype.is_vector() {
+            let ptr = self.vector_operand_ptr(inner, &inner_ctype);
+            let to_ty = self.type_spec_to_ir(target_type);
+            let dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr,
+                ty: to_ty,
+                seg_override: AddressSpace::Default,
+            });
+            return Operand::Value(dest);
+        }
+
+        // Scalar-to-vector cast: store the scalar value into a vector-sized alloca.
+        // A cast like `(V2SI)(long long)val` stores the 8-byte integer into an
+        // alloca so the result is a pointer to vector data (matching vector repr).
+        if !inner_ctype.is_vector() && target_ctype.is_vector() {
+            let vec_size = self.ctype_size(&target_ctype);
+            let src = self.lower_expr(inner);
+            let from_ty = self.value_ir_type(inner);
+
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: vec_size,
+                ty: IrType::Ptr,
+                align: vec_size,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            // Zero-initialize in case source is smaller than vector
+            self.zero_init_alloca(alloca, vec_size);
+            // Store scalar at offset 0 (bitwise reinterpretation)
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: src,
+                ptr: alloca,
+                ty: from_ty,
+                seg_override: AddressSpace::Default,
+            });
+            return Operand::Value(alloca);
+        }
+
+        // Vector-to-vector cast: memcpy between allocas if sizes match. The
+        // source is always an address (`vector_operand_ptr` spills a packed
+        // small-vector call result), because every consumer of a cast treats
+        // its value as one: `(__m64)_mm_add_pi16(a, b)` passed on the packed
+        // bits, and `_mm_extract_pi16` of an rvalue dereferenced them.
+        if inner_ctype.is_vector() && target_ctype.is_vector() {
+            let src = Operand::Value(self.vector_operand_ptr(inner, &inner_ctype));
+            let src_size = self.ctype_size(&inner_ctype);
+            let dst_size = self.ctype_size(&target_ctype);
+            if src_size == dst_size {
+                // Same size: reinterpret cast, just pass through the pointer
+                return src;
+            }
+            // Different sizes: allocate new vector, memcpy what fits
+            let src_val = self.operand_to_value(src);
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: dst_size,
+                ty: IrType::Ptr,
+                align: dst_size,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            self.zero_init_alloca(alloca, dst_size);
+            let copy_size = src_size.min(dst_size);
+            self.emit(Instruction::Memcpy {
+                dest: alloca,
+                src: src_val,
+                size: copy_size,
+            });
+            return Operand::Value(alloca);
+        }
+
+        // Fold constant casts at lowering time so -O0 matches GCC
+        // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
+        // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
+        // This precedes the decimal and _Float128 runtime paths: their
+        // constant conversions fold exactly (shared value helpers) instead of
+        // calling libbid/libgcc at run time. Any floating side -- binary,
+        // _Float128 or decimal, whose rounding modes are all part of the
+        // floating-point environment -- keeps the conversion at run time
+        // when that environment is observable (FENV_ACCESS, -frounding-math).
+        let is_fp = |ct: &CType| {
+            ct.is_floating() || *ct == CType::Float128 || ct.is_decimal() || ct.is_half_float()
+        };
+        let observable_fp = self.pass_policy.fp_environment_observable
+            && (is_fp(&inner_ctype) || is_fp(&target_ctype));
+        if !observable_fp {
+            if let Some(c) = self.eval_const_cast(target_type, inner) {
+                return Operand::Const(c);
+            }
+        }
+
+        // C23 decimal floating point casts: route through the libbid
+        // (__bid_*) conversion helpers, exactly like GCC.
+        if (inner_ctype.is_decimal() || target_ctype.is_decimal()) && target_ctype != CType::Bool {
+            if target_ctype.is_decimal() && inner_ctype.is_decimal() && inner_ctype == target_ctype
+            {
+                // same-type decimal cast: identity (handled below by the
+                // generic same-type path) — fall through with nothing.
+            } else {
+                let src = self.lower_expr(inner);
+                return self.convert_decimal_scalar(
+                    src,
+                    IrType::from_ctype(&inner_ctype),
+                    &inner_ctype,
+                    &target_ctype,
+                );
+            }
+        }
+        // _Float128 (binary128) casts route through the libgcc soft-float
+        // conversion helpers (__extendsftf2, __trunctfdf2, __fixtfdi, ...),
+        // exactly like GCC. Both directions are covered.
+        if matches!(inner_ctype, CType::Float128) && target_ctype != CType::Float128 {
+            let src = self.lower_expr(inner);
+            return self.convert_from_f128(src, &target_ctype);
+        }
+        if target_ctype == CType::Float128 && inner_ctype != CType::Float128 {
+            let src = self.lower_expr(inner);
+            return self.convert_to_f128(src, &inner_ctype);
+        }
+        if (inner_ctype.is_half_float() || target_ctype.is_half_float())
+            && target_ctype != CType::Bool
+            && target_ctype != CType::Void
+        {
+            let src = self.lower_expr(inner);
+            let src_ty = self.value_ir_type(inner);
+            return self.convert_scalar_ctype(src, src_ty, &inner_ctype, &target_ctype);
+        }
+
+        let src = self.lower_expr(inner);
+        // Use the VALUE type (the defining instruction's actual result width,
+        // mirroring lower_arithmetic_binop), not the storage-level annotation.
+        // get_expr_type reports the widened carrier type (I64 for int-op-
+        // literal on LP64), which made `(long long)(4 * x)` — the inner mul
+        // materialized as a 32-bit imull with a 4-byte home — look like an
+        // I64->I64 identity: the zero-extension was dropped and the later
+        // 64-bit compare read the stale upper half of the 4-byte home
+        // (gcc.c-torture pr81588, amd64 at every opt level).
+        let mut from_ty = self.value_ir_type(inner);
+        let to_ty = self.type_spec_to_ir(target_type);
+        // A void cast evaluates its operand but performs no conversion.
+        // Keeping Cast(F64 -> Void) is not a backend operation and used to
+        // panic on i686 when observable FP correctly kept the expression.
+        if to_ty == IrType::Void {
+            return src;
+        }
+
+        if let Expr::Identifier(name, _) = inner {
+            if let Some(vi) = self.lookup_var_info(name) {
+                if vi.is_array || vi.is_struct {
+                    from_ty = IrType::Ptr;
+                }
+            }
+        }
+
+        // C standard: conversion to _Bool yields 0 or 1
+        if target_ctype == CType::Bool {
+            if inner_ctype.is_soft_float() {
+                // decimal / _Float128 / half-float zero test: +0 == -0 compares equal
+                return self.lower_soft_float_truthiness(src, &inner_ctype);
+            }
+            if from_ty.is_float() {
+                let zero = match from_ty {
+                    IrType::F32 => Operand::Const(IrConst::F32(0.0)),
+                    IrType::F64 => Operand::Const(IrConst::F64(0.0)),
+                    IrType::F128 => Operand::Const(IrConst::long_double(0.0)),
+                    _ => Operand::Const(IrConst::F64(0.0)),
+                };
+                let dest = self.emit_cmp_val(IrCmpOp::Ne, src, zero, from_ty);
+                return Operand::Value(dest);
+            }
+            return self.emit_bool_normalize_typed(src, from_ty);
+        }
+
+        // A pointer reinterpretation is only free when the target is an
+        // INTEGER of pointer width (bit-identical). A pointer cast to a
+        // float of the same size (Ptr -> F64, both 8 bytes on LP64) is a
+        // VALUE conversion, not a reinterpretation: dropping it returned the
+        // raw address as a double (`(double)p` printed 0.0 for a 0x55…
+        // address because the return path bitcast the pointer). `to_ty == Ptr`
+        // stays a no-op only for pointer/pointer-width-integer sources; a
+        // float -> Ptr cast is a C constraint violation that GCC rejects, and
+        // we leave that historical behaviour untouched here.
+        if cast_is_operand_identity(from_ty, to_ty) {
+            return src;
+        }
+
+        let dest = self.emit_cast_val(src, from_ty, to_ty);
+        Operand::Value(dest)
+    }
+
+    // -----------------------------------------------------------------------
+    // Compound literals
+    // -----------------------------------------------------------------------
+
+    /// Compute the byte size of a compound literal, handling incomplete array types.
+    /// For incomplete arrays (e.g., `(int[]){1,2,3}`), sizeof_type returns 0, so we
+    /// compute the size from element_size * initializer_count instead.
+    pub(super) fn compound_literal_size(
+        &self,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+    ) -> usize {
+        let ctype = self.type_spec_to_ctype(type_spec);
+        match (&ctype, init) {
+            (CType::Array(elem_ct, None), Initializer::Expr(_)) => {
+                let elem_size = self.ctype_size(elem_ct).max(1);
+                self.unsized_array_len(init, elem_ct)
+                    .map_or_else(|| self.sizeof_type(type_spec), |n| n * elem_size)
+            }
+            (CType::Array(elem_ct, None), Initializer::List(items)) => {
+                let elem_size = elem_ct
+                    .size_ctx(&*self.types.borrow_struct_layouts())
+                    .max(1);
+                // The bound the initializer gives (C11 6.7.9p22): strings,
+                // brace elision and designators as the array planner applies
+                // them; arrays of aggregates count their top-level items.
+                match self.unsized_array_len(init, elem_ct) {
+                    Some(n) => n.saturating_mul(elem_size),
+                    None => elem_size.saturating_mul(self.compute_init_list_array_size(items)),
+                }
+            }
+            _ => self.sizeof_type(type_spec),
+        }
+    }
+
+    pub(super) fn lower_compound_literal(
+        &mut self,
+        cl_expr: &Expr,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+        storage: &crate::frontend::parser::ast::CompoundLiteralStorage,
+    ) -> Operand {
+        let ty = self.type_spec_to_ir(type_spec);
+        let ctype = self.type_spec_to_ctype(type_spec);
+        let struct_layout = self.get_struct_layout_for_type(type_spec);
+        let is_scalar =
+            struct_layout.is_none() && !matches!(ctype, CType::Array(_, _)) && !ctype.is_vector();
+
+        let base_addr = if storage.is_static {
+            let label =
+                self.ensure_static_compound_literal_global(cl_expr, type_spec, init, storage);
+            let addr = self.fresh_value();
+            self.emit(Instruction::GlobalAddr {
+                dest: addr,
+                name: label,
+            });
+            addr
+        } else {
+            let size = self.compound_literal_size(type_spec, init);
+            self.alloc_and_init_compound_literal(type_spec, init, ty, size)
+        };
+
+        if is_scalar {
+            let loaded = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: base_addr,
+                ty,
+                seg_override: AddressSpace::Default,
+            });
+            Operand::Value(loaded)
+        } else {
+            Operand::Value(base_addr)
+        }
+    }
+
+    pub(super) fn init_array_compound_literal(
+        &mut self,
+        alloca: Value,
+        items: &[InitializerItem],
+        type_spec: &TypeSpecifier,
+        ty: IrType,
+        size: usize,
+    ) {
+        let elem_size = self.compound_literal_elem_size(type_spec);
+
+        // For vector types, determine the correct element IR type (e.g. F32 for float vectors)
+        let vector_elem_ir_ty = {
+            let ctype = self.type_spec_to_ctype(type_spec);
+            match ctype {
+                CType::Vector(elem_ct, _) | CType::ExtVector(elem_ct, _) => {
+                    Some(IrType::from_ctype(&elem_ct))
+                }
+                _ => None,
+            }
+        };
+
+        // For char/unsigned char array compound literals with a single string literal,
+        // copy the string bytes directly instead of storing a pointer.
+        if elem_size == 1 && items.len() == 1 && items[0].designators.is_empty() {
+            if let Initializer::Expr(Expr::StringLiteral(ref s, _)) = items[0].init {
+                self.emit_string_to_alloca(alloca, s, 0, size);
+                return;
+            }
+        }
+
+        // Get the element CType for dispatching struct/union/array element init
+        let elem_ctype = {
+            let ctype = self.type_spec_to_ctype(type_spec);
+            match ctype {
+                CType::Array(elem_ct, _) => Some((*elem_ct).clone()),
+                _ => None,
+            }
+        };
+
+        let has_designators = items.iter().any(|item| !item.designators.is_empty());
+        // Zero-init if there are designators, or if fewer initializers than total array size
+        // (C11 6.7.9p21: uninitialized elements are implicitly zero-initialized)
+        let needs_zero = has_designators || (items.len() * elem_size < size);
+        if needs_zero {
+            self.zero_init_alloca(alloca, size);
+        }
+
+        let mut current_idx = 0usize;
+        for item in items {
+            if let Some(Designator::Index(idx_expr)) = item.designators.first() {
+                if let Some(idx_val) = self.eval_const_expr_for_designator(idx_expr) {
+                    current_idx = idx_val;
+                }
+            }
+
+            let elem_offset = current_idx * elem_size;
+
+            match &item.init {
+                Initializer::Expr(expr) => {
+                    // For struct/union elements, the lowered expression produces an
+                    // alloca pointer (not the struct data itself). We must memcpy
+                    // from that alloca into the array element slot instead of storing
+                    // the pointer value.
+                    let is_struct_elem =
+                        matches!(&elem_ctype, Some(CType::Struct(_)) | Some(CType::Union(_)))
+                            && self.struct_value_size(expr).is_some();
+
+                    if is_struct_elem {
+                        let src_addr = self.get_struct_base_addr(expr);
+                        self.emit_memcpy_at_offset(alloca, elem_offset, src_addr, elem_size);
+                    } else {
+                        let val = self.lower_expr(expr);
+                        // For vector compound literals, cast each element to the vector element type
+                        let val = if let Some(vec_elem_ty) = vector_elem_ir_ty {
+                            let expr_ty = self.value_ir_type(expr);
+                            Operand::Value(self.emit_cast_val(val, expr_ty, vec_elem_ty))
+                        } else {
+                            val
+                        };
+                        if current_idx == 0 && items.len() == 1 && elem_size == size {
+                            self.emit(Instruction::Store {
+                                volatile: false,
+                                val,
+                                ptr: alloca,
+                                ty,
+                                seg_override: AddressSpace::Default,
+                            });
+                        } else {
+                            let offset_val = Operand::Const(IrConst::ptr_int(elem_offset as i64));
+                            let elem_ptr = self.fresh_value();
+                            self.emit(Instruction::GetElementPtr {
+                                dest: elem_ptr,
+                                base: alloca,
+                                offset: offset_val,
+                                ty,
+                            });
+                            let store_ty = vector_elem_ir_ty
+                                .unwrap_or_else(|| Self::ir_type_for_size(elem_size));
+                            self.emit(Instruction::Store {
+                                volatile: false,
+                                val,
+                                ptr: elem_ptr,
+                                ty: store_ty,
+                                seg_override: AddressSpace::Default,
+                            });
+                        }
+                    }
+                }
+                Initializer::List(sub_items) => {
+                    // Handle list initializers for array elements (e.g., struct or nested array)
+                    match &elem_ctype {
+                        Some(CType::Struct(key)) | Some(CType::Union(key)) => {
+                            let sub_layout =
+                                self.types.borrow_struct_layouts().get(&**key).cloned();
+                            if let Some(sub_layout) = sub_layout {
+                                // Zero-init the element region first for partial initialization
+                                self.zero_init_region(alloca, elem_offset, elem_size);
+                                self.emit_struct_init(sub_items, alloca, &sub_layout, elem_offset);
+                            }
+                        }
+                        Some(CType::Array(inner_elem_ty, Some(inner_size))) => {
+                            // Nested array: initialize element-by-element
+                            let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
+                            // Zero-init the element region for partial initialization
+                            if sub_items.len() < *inner_size {
+                                self.zero_init_region(alloca, elem_offset, elem_size);
+                            }
+                            for (si, sub_item) in sub_items.iter().enumerate() {
+                                if si >= *inner_size {
+                                    break;
+                                }
+                                if let Initializer::Expr(e) = &sub_item.init {
+                                    let inner_offset = elem_offset + si * inner_elem_size;
+                                    self.emit_init_expr_to_offset(
+                                        e,
+                                        alloca,
+                                        inner_offset,
+                                        inner_elem_ty,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            // Scalar array element with list init: use the first expression
+                            if let Some(first) = sub_items.first() {
+                                if let Initializer::Expr(expr) = &first.init {
+                                    let val = self.lower_expr(expr);
+                                    let offset_val =
+                                        Operand::Const(IrConst::ptr_int(elem_offset as i64));
+                                    let elem_ptr = self.fresh_value();
+                                    self.emit(Instruction::GetElementPtr {
+                                        dest: elem_ptr,
+                                        base: alloca,
+                                        offset: offset_val,
+                                        ty,
+                                    });
+                                    let store_ty = Self::ir_type_for_size(elem_size);
+                                    self.emit(Instruction::Store {
+                                        volatile: false,
+                                        val,
+                                        ptr: elem_ptr,
+                                        ty: store_ty,
+                                        seg_override: AddressSpace::Default,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            current_idx += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sizeof, Generic selection
+    // -----------------------------------------------------------------------
+
+    pub(super) fn lower_sizeof(&mut self, arg: &SizeofArg) -> Operand {
+        // An operand of variably modified type is evaluated (C11 6.5.3.4p2).
+        if let SizeofArg::Expr(expr) = arg {
+            if self.expr_is_variably_modified(expr) && expr.may_have_side_effects() {
+                self.lower_expr_discarded(expr);
+            }
+        }
+        if let Some(vla_val) = self.get_vla_sizeof(arg) {
+            return Operand::Value(vla_val);
+        }
+        // Check for sizeof(type) where type is or contains VLA dimensions
+        if let SizeofArg::Type(ts) = arg {
+            if let Some(vla_val) = self.compute_vla_sizeof_for_type(ts) {
+                return Operand::Value(vla_val);
+            }
+        }
+        let size = match arg {
+            SizeofArg::Type(ts) => self.sizeof_type(ts),
+            SizeofArg::Expr(expr) => self.sizeof_expr(expr),
+        };
+        Operand::Const(IrConst::ptr_int(size as i64))
+    }
+
+    pub(super) fn static_countof_type(&self, ts: &TypeSpecifier) -> Option<usize> {
+        if let TypeSpecifier::Array(_, Some(bound_expr)) = ts {
+            return self
+                .expr_as_array_size(bound_expr)
+                .and_then(|n| usize::try_from(n).ok());
+        }
+        if let TypeSpecifier::TypedefName(name) = ts {
+            if self
+                .func_state
+                .as_ref()
+                .is_some_and(|fs| fs.vla_typedef_sizes.contains_key(name))
+            {
+                if let CType::Array(_, Some(n)) = self.type_spec_to_ctype(ts) {
+                    return Some(n);
+                }
+                return None;
+            }
+        }
+        match self.type_spec_to_ctype(ts) {
+            CType::Array(_, Some(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    pub(super) fn static_countof_arg(&self, arg: &SizeofArg) -> Option<usize> {
+        match arg {
+            SizeofArg::Type(ts) => self.static_countof_type(ts),
+            SizeofArg::Expr(expr) => match expr {
+                Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _) => {
+                    Some(s.chars().count() + 1)
+                }
+                Expr::Char16StringLiteral(s, _) => Some(s.encode_utf16().count() + 1),
+                Expr::Identifier(name, _)
+                    if crate::frontend::parser::ast::is_function_name_builtin(name)
+                        && self
+                            .func_state
+                            .as_ref()
+                            .is_none_or(|fs| !fs.locals.contains_key(name)) =>
+                {
+                    let text = crate::frontend::parser::ast::function_name_builtin_text(
+                        name,
+                        self.func_state.as_ref().map(|fs| fs.source_name()),
+                    );
+                    Some(text.len() + 1)
+                }
+                Expr::CompoundLiteral(ts, init, _, _) => {
+                    if let TypeSpecifier::Array(elem_ts, None) = ts {
+                        let elem_sz = self.sizeof_type(elem_ts).max(1);
+                        Some(self.compound_literal_size(ts, init) / elem_sz)
+                    } else {
+                        self.static_countof_type(ts)
+                    }
+                }
+                Expr::Identifier(name, _) => {
+                    if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name))
+                    {
+                        if let Some(CType::Array(_, Some(n))) = info.c_type.as_ref() {
+                            return Some(*n);
+                        }
+                        if info.vla_size.is_some() {
+                            return None;
+                        }
+                        if info.is_array {
+                            if let Some(CType::Array(elem, None)) = info.c_type.as_ref() {
+                                let elem_sz = self.ctype_size(elem).max(1);
+                                return Some(info.alloc_size / elem_sz);
+                            }
+                        }
+                    }
+                    if let Some(ginfo) = self.globals.get(name) {
+                        if let Some(CType::Array(_, Some(n))) = ginfo.c_type.as_ref() {
+                            return Some(*n);
+                        }
+                        if ginfo.is_array {
+                            if let Some(CType::Array(elem, None)) = ginfo.c_type.as_ref() {
+                                let elem_sz = self.ctype_size(elem).max(1);
+                                for g in &self.module.globals {
+                                    if g.name == *name {
+                                        return Some(g.size / elem_sz);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match self.get_expr_ctype(expr)? {
+                        CType::Array(_, Some(n)) => Some(n),
+                        _ => None,
+                    }
+                }
+                _ => match self.get_expr_ctype(expr)? {
+                    CType::Array(_, Some(n)) => Some(n),
+                    _ => None,
+                },
+            },
+        }
+    }
+
+    pub(super) fn lower_countof(&mut self, arg: &SizeofArg) -> Operand {
+        if let Some(count) = self.static_countof_arg(arg) {
+            return Operand::Const(IrConst::ptr_int(count as i64));
+        }
+        // Outermost dimension is a VLA: total_bytes / elem_bytes.
+        let total = self.lower_sizeof(arg);
+        let elem = match arg {
+            SizeofArg::Type(TypeSpecifier::Array(elem_ts, _)) => {
+                self.lower_sizeof(&SizeofArg::Type((**elem_ts).clone()))
+            }
+            SizeofArg::Type(ts) => {
+                if let CType::Array(elem_ct, _) = self.type_spec_to_ctype(ts) {
+                    Operand::Const(IrConst::ptr_int(self.ctype_size(&elem_ct).max(1) as i64))
+                } else {
+                    Operand::Const(IrConst::ptr_int(1))
+                }
+            }
+            SizeofArg::Expr(expr) => {
+                if let Some(stride) = self.get_vla_stride_for_subscript(expr) {
+                    Operand::Value(stride)
+                } else if let Some(CType::Array(elem_ct, _)) = self.get_expr_ctype(expr) {
+                    Operand::Const(IrConst::ptr_int(self.ctype_size(&elem_ct).max(1) as i64))
+                } else {
+                    Operand::Const(IrConst::ptr_int(1))
+                }
+            }
+        };
+        if matches!(elem, Operand::Const(IrConst::I64(1) | IrConst::I32(1))) {
+            return total;
+        }
+        let size_ty = crate::common::types::target_int_ir_type();
+        let dest = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest,
+            op: crate::ir::reexports::IrBinOp::UDiv,
+            lhs: total,
+            rhs: elem,
+            ty: size_ty,
+        });
+        Operand::Value(dest)
+    }
+
+    fn get_vla_sizeof(&self, arg: &SizeofArg) -> Option<Value> {
+        match arg {
+            SizeofArg::Expr(expr) => self.vla_sizeof_of_expr(expr),
+            SizeofArg::Type(_) => None,
+        }
+    }
+
+    /// The runtime size of `expr` when its type is a VLA this function
+    /// tracks: a VLA object or typedef name, or what a subscript or
+    /// dereference of a VLA or pointer to one reaches. `sizeof` lowers to it,
+    /// and constant folding must not fold such a `sizeof`.
+    /// Whether `expr` has a variably modified type this function tracks.
+    pub(super) fn expr_is_variably_modified(&self, expr: &Expr) -> bool {
+        self.func_state.is_some()
+            && (self.vm_layout_of_expr(expr).is_some() || self.vla_sizeof_of_expr(expr).is_some())
+    }
+
+    pub(super) fn vla_sizeof_of_expr(&self, expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Identifier(name, _) => {
+                // Check local VLA variables first
+                if let Some(info) = self.func().locals.get(name) {
+                    if info.vla_size.is_some() {
+                        return info.vla_size;
+                    }
+                }
+                // Then check VLA typedef names (sizeof applied to a typedef identifier)
+                if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
+                    return Some(vla_size);
+                }
+            }
+            Expr::ArraySubscript(base, _, _) => {
+                if let Some(stride) = self.get_vla_stride_for_subscript(base) {
+                    return Some(stride);
+                }
+            }
+            Expr::Deref(inner, _) => {
+                if let Some(stride) = self.get_vla_stride_for_subscript(inner) {
+                    return Some(stride);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Compute the runtime sizeof for a type that may contain VLA dimensions.
+    /// Handles both typedef names that are VLA types and direct Array types
+    /// with non-constant size expressions. Also looks up struct/union tags
+    /// whose layout was recorded as a VLA at the type definition.
+    fn compute_vla_sizeof_for_type(&mut self, ts: &TypeSpecifier) -> Option<Value> {
+        // `typeof(expr)` of VM type: evaluated, and sized from its layout.
+        if let Some(base) = self.typeof_vm_base(ts) {
+            if base.size.is_some() {
+                return base.size;
+            }
+        }
+        // Check if it's a VLA typedef name with a pre-computed runtime size
+        if let TypeSpecifier::TypedefName(name) = ts {
+            if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
+                return Some(vla_size);
+            }
+        }
+        if let TypeSpecifier::Struct(Some(tag), ..) = ts {
+            let key = format!("struct.{}", tag);
+            if let Some(&vla_size) = self.func().vla_typedef_sizes.get(&key) {
+                return Some(vla_size);
+            }
+        }
+        if let TypeSpecifier::Union(Some(tag), ..) = ts {
+            let key = format!("union.{}", tag);
+            if let Some(&vla_size) = self.func().vla_typedef_sizes.get(&key) {
+                return Some(vla_size);
+            }
+        }
+        // Check if it's an Array type with non-constant dimensions
+        let resolved = self.resolve_type_spec(ts).clone();
+        if let TypeSpecifier::Array(ref elem, Some(ref size_expr)) = resolved {
+            if self.expr_as_array_size(size_expr).is_none() {
+                // Runtime dimension - compute size dynamically
+                let elem_clone = elem.clone();
+                let size_expr_clone = size_expr.clone();
+                let elem_size_opt = self.compute_vla_sizeof_for_type(&elem_clone);
+                let dim_val = self.lower_expr(&size_expr_clone);
+                let dim_value = self.operand_to_value(dim_val);
+                if let Some(elem_sz) = elem_size_opt {
+                    // Both element and dimension are runtime
+                    let ptr_int_ty = crate::common::types::target_int_ir_type();
+                    let mul = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(dim_value),
+                        Operand::Value(elem_sz),
+                        ptr_int_ty,
+                    );
+                    return Some(mul);
+                } else {
+                    // Element is constant, dimension is runtime
+                    let elem_size = self.sizeof_type(&elem_clone) as i64;
+                    if elem_size > 1 {
+                        let ptr_int_ty = crate::common::types::target_int_ir_type();
+                        let mul = self.emit_binop_val(
+                            IrBinOp::Mul,
+                            Operand::Value(dim_value),
+                            Operand::Const(IrConst::ptr_int(elem_size)),
+                            ptr_int_ty,
+                        );
+                        return Some(mul);
+                    } else {
+                        return Some(dim_value);
+                    }
+                }
+            }
+            // Constant outer dim but maybe VLA inner dims
+            let elem_size_opt = self.compute_vla_sizeof_for_type(elem);
+            if let Some(elem_sz) = elem_size_opt {
+                let const_dim = self.expr_as_array_size(size_expr).unwrap_or(1);
+                if const_dim > 1 {
+                    let ptr_int_ty = crate::common::types::target_int_ir_type();
+                    let mul = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(elem_sz),
+                        Operand::Const(IrConst::ptr_int(const_dim)),
+                        ptr_int_ty,
+                    );
+                    return Some(mul);
+                } else {
+                    return Some(elem_sz);
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn lower_generic_selection(
+        &mut self,
+        controlling: &Expr,
+        associations: &[GenericAssociation],
+    ) -> Operand {
+        let selected = self.resolve_generic_selection(controlling, associations);
+        self.lower_expr(selected)
+    }
+
+    /// Resolve a _Generic selection to the matching association expression,
+    /// for rvalue (`lower_generic_selection`) and lvalue (`lower_lvalue`)
+    /// contexts: the one selection rule of `resolve_generic_selection_expr`,
+    /// so a selection's value and its type always agree. Sema rejects a
+    /// selection that matches nothing, so the first association is only a
+    /// recovery value after that error.
+    pub(super) fn resolve_generic_selection<'a>(
+        &mut self,
+        controlling: &Expr,
+        associations: &'a [GenericAssociation],
+    ) -> &'a Expr {
+        self.resolve_generic_selection_expr(controlling, associations)
+            .unwrap_or(&associations[0].expr)
+    }
+
+    // -----------------------------------------------------------------------
+    // Address-of, dereference, subscript, member access
+    // -----------------------------------------------------------------------
+
+    pub(super) fn alloc_and_init_compound_literal(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+        ty: IrType,
+        size: usize,
+    ) -> Value {
+        let alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: alloca,
+            size,
+            ty,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        // Arrays of scalars of any rank (strings for character arrays
+        // included): resolved by the array planner.
+        let full_ty = self.complete_array_ctype(&self.type_spec_to_ctype(type_spec), size);
+        if let Some(geo) = self.scalar_array_geometry(&full_ty) {
+            let plan = self.plan_array_initializer(init, &geo);
+            self.store_array_plan(&plan, &geo, alloca, 0, false);
+            return alloca;
+        }
+        // Struct/union and array-of-aggregate lists: resolved once into the
+        // canonical form (`init_canon`).
+        let canonical = match init {
+            Initializer::List(items) => self
+                .canonical_init_items(items, &full_ty, None)
+                .map(Initializer::List),
+            Initializer::Expr(_) => None,
+        };
+        let init = canonical.as_ref().unwrap_or(init);
+        let struct_layout = self.get_struct_layout_for_type(type_spec);
+        match init {
+            Initializer::Expr(expr) => {
+                // For char array compound literals with string literal initializer,
+                // copy string bytes instead of storing pointer
+                let is_char_array = matches!(ty, IrType::I8 | IrType::U8) && {
+                    let ctype = self.type_spec_to_ctype(type_spec);
+                    matches!(ctype, CType::Array(_, _))
+                };
+                if is_char_array {
+                    if let Expr::StringLiteral(s, _) = expr {
+                        self.emit_string_to_alloca(alloca, s, 0, size);
+                    } else {
+                        let val = self.lower_expr(expr);
+                        self.emit(Instruction::Store {
+                            volatile: false,
+                            val,
+                            ptr: alloca,
+                            ty,
+                            seg_override: AddressSpace::Default,
+                        });
+                    }
+                } else {
+                    let val = self.lower_expr(expr);
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val,
+                        ptr: alloca,
+                        ty,
+                        seg_override: AddressSpace::Default,
+                    });
+                }
+            }
+            Initializer::List(items) => {
+                // Check if the type is an array or vector
+                let ctype = self.type_spec_to_ctype(type_spec);
+                let is_array = matches!(ctype, CType::Array(_, _));
+                // For vector compound literals, use the vector init list path
+                if ctype.is_vector() {
+                    self.lower_vector_init_list(items, alloca, &ctype);
+                } else if !is_array {
+                    if let Some(ref layout) = struct_layout {
+                        self.zero_init_alloca(alloca, layout.size);
+                        self.emit_struct_init(items, alloca, layout, 0);
+                    } else if !ctype.is_complex() {
+                        // A scalar literal converts its (possibly brace-
+                        // nested) initializer as by initialization (C11
+                        // 6.5.2.5p4, 6.7.9p11): `(double){ i - 3 }` is the
+                        // value i - 3, not the int's bits read as a double.
+                        // An empty list (C23 `(int){}`) is zero.
+                        match Self::unwrap_nested_init_expr(items) {
+                            Some(e) => {
+                                let val = self.lower_init_leaf(e, &ctype);
+                                self.emit(Instruction::Store {
+                                    volatile: false,
+                                    val,
+                                    ptr: alloca,
+                                    ty: IrType::from_ctype(&ctype),
+                                    seg_override: AddressSpace::Default,
+                                });
+                            }
+                            None => self.zero_init_alloca(alloca, size),
+                        }
+                    } else {
+                        self.init_array_compound_literal(alloca, items, type_spec, ty, size);
+                    }
+                } else {
+                    self.init_array_compound_literal(alloca, items, type_spec, ty, size);
+                }
+            }
+        }
+        alloca
+    }
+
+    pub(super) fn lower_address_of(&mut self, inner: &Expr) -> Operand {
+        // Try to constant-fold offsetof patterns: &((type*)0)->member
+        // This is critical for BUILD_BUG_ON / __compiletime_assert in the Linux kernel,
+        // which uses __builtin_offsetof (expanded to this pattern) in if-conditions
+        // that must be dead-code-eliminated.
+        if let Some(constant) = self.eval_offsetof_pattern(inner) {
+            return Operand::Const(constant);
+        }
+
+        if let Expr::CompoundLiteral(type_spec, init, _, storage) = inner {
+            if storage.is_static {
+                let label =
+                    self.ensure_static_compound_literal_global(inner, type_spec, init, storage);
+                let addr = self.fresh_value();
+                self.emit(Instruction::GlobalAddr {
+                    dest: addr,
+                    name: label,
+                });
+                return Operand::Value(addr);
+            }
+            let ty = self.type_spec_to_ir(type_spec);
+            let size = self.compound_literal_size(type_spec, init);
+            let alloca = self.alloc_and_init_compound_literal(type_spec, init, ty, size);
+            return Operand::Value(alloca);
+        }
+
+        self.in_address_of_top_lvalue = true;
+        let maybe_lv = self.lower_lvalue_for_mutation(inner);
+        self.in_address_of_top_lvalue = false;
+        if let Some(lv) = maybe_lv {
+            // GEP +0 is a no-op. Emitting it used to make a local look
+            // address-taken through a derived pointer even after a helper
+            // that took `&x` was inlined (`*p = v` stores through the GEP
+            // dest, not the alloca). Returning the alloca/address directly
+            // lets mem2reg promote the scalar. Field/subscript lvalues
+            // already have a real GEP in `lvalue_addr`.
+            return Operand::Value(self.lvalue_addr(&lv));
+        }
+
+        if let Expr::Identifier(name, _) = inner {
+            let dest = self.fresh_value();
+            // Apply __asm__("label") redirect (e.g. stat -> stat64)
+            let resolved = self.resolve_ref_name(name.as_str());
+            self.emit(Instruction::GlobalAddr {
+                dest,
+                name: resolved,
+            });
+            return Operand::Value(dest);
+        }
+
+        // The remaining LEGAL operand class: string literals (`&"abc"` is
+        // the address of the array — C11 6.5.3.2 allows & on an lvalue and
+        // an array-literal designator is one). Everything else — `&-x`,
+        // `&(a + b)`, `&42` — is NOT an lvalue: C requires one, GCC rejects
+        // with "lvalue required as unary '&' operand", and silently
+        // lowering the operand as a VALUE here hands the program a pointer
+        // to whatever temporary the backend staged (undefined behaviour at
+        // the first dereference — observed as a segfault in the SLP test
+        // battery).
+        match inner {
+            Expr::StringLiteral(..)
+            | Expr::WideStringLiteral(..)
+            | Expr::Char16StringLiteral(..) => return self.lower_expr(inner),
+            _ => {}
+        }
+        self.diagnostics
+            .borrow_mut()
+            .error("lvalue required as unary '&' operand", inner.span());
+        Operand::Const(IrConst::I64(0))
+    }
+
+    /// Check if dereferencing the given expression is a no-op because the
+    /// expression is a function pointer (or function designator). In C:
+    /// - *f where f is a function pointer → function designator → decays back
+    /// - *add where add is a function name → function designator → decays back
+    /// - *(s->fnptr) where fnptr is a function pointer member → same no-op
+    /// - **f, ***f etc. are also no-ops (recursive application)
+    pub(super) fn is_function_pointer_deref(&self, inner: &Expr) -> bool {
+        // First, check if the inner expression is actually a pointer-to-function-pointer.
+        // Due to our CType representation, int (**fpp)(int,int) is stored as
+        // Pointer(Function(FunctionType { return_type: Pointer(Int), ... })) — the same
+        // shape as a direct function pointer. We use the is_ptr_to_func_ptr flag
+        // (set during declaration analysis based on pointer count in derived declarators)
+        // to correctly distinguish these cases.
+        if let Expr::Identifier(name, _) = inner {
+            if let Some(vi) = self.lookup_var_info(name) {
+                if vi.is_ptr_to_func_ptr {
+                    // This is a pointer-to-function-pointer (e.g., int (**fpp)(int,int)).
+                    // Dereferencing it requires a real load to get the inner function pointer.
+                    return false;
+                }
+            }
+        }
+
+        // Check CType-based detection (works for typedef'd function pointers
+        // where param_ctype correctly sets CType::Pointer(CType::Function(...)),
+        // and also for struct member function pointers via get_expr_ctype)
+        if let Some(ref inner_ct) = self.get_expr_ctype(inner) {
+            if inner_ct.is_function_pointer() || matches!(inner_ct, CType::Function(_)) {
+                return true;
+            }
+        }
+        // Check for known function names (e.g., *add where add is a function)
+        match inner {
+            Expr::Identifier(name, _) => {
+                // Only treat as a function name dereference if there is no local variable
+                // with the same name. Local variables shadow function names, so if a local
+                // variable called "link" exists, *link should dereference the variable,
+                // not be treated as a no-op function pointer dereference.
+                if self.known_functions.contains(name.as_str())
+                    && self.lookup_var_info(name).is_none()
+                {
+                    return true;
+                }
+                // Check if this variable is a function pointer (deref is no-op).
+                // Pointer-to-function-pointer cases are already handled by the
+                // is_ptr_to_func_ptr early-return above, so any Pointer(Function(...))
+                // at this point is a genuine direct function pointer.
+                if let Some(vi) = self.lookup_var_info(name) {
+                    if let Some(ref ct) = vi.c_type {
+                        if ct.is_function_pointer() || matches!(ct, CType::Function(_)) {
+                            return true;
+                        }
+                    } else {
+                        // Fallback: consult the binding's declared function-pointer
+                        // signature only when c_type is unavailable.  When c_type IS
+                        // available, the check above is authoritative — a declared
+                        // signature is also recorded for pointer-to-function-pointers,
+                        // which are NOT no-op derefs.
+                        if self.local_fptr_sig(name).is_some() {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            // For nested derefs: *(*f) where *f is also a no-op → check recursively
+            Expr::Deref(deeper_inner, _) => self.is_function_pointer_deref(deeper_inner),
+            // For function calls that return a function pointer: *(p(args))
+            // If the callee is a function pointer variable whose return type is
+            // itself a function pointer, then dereferencing the result is a no-op.
+            Expr::FunctionCall(func, _, _) => {
+                // Strip deref layers from the callee (since *p, **p are equivalent for fptrs)
+                let mut callee: &Expr = func.as_ref();
+                while let Expr::Deref(inner, _) = callee {
+                    callee = inner;
+                }
+                if let Expr::Identifier(name, _) = callee {
+                    // Check if the callee returns a function pointer by examining its CType
+                    if let Some(vi) = self.lookup_var_info(name) {
+                        if let Some(ref ct) = vi.c_type {
+                            // Extract the return type of the function pointer
+                            if let Some(ret_ct) = ct.func_ptr_return_type(true) {
+                                // If the return type is a function pointer, deref is no-op
+                                if ret_ct.is_function_pointer()
+                                    || matches!(&ret_ct, CType::Function(_))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    // Also check known function signatures
+                    if let Some(sig) = self.func_meta.sigs.get(name.as_str()) {
+                        if let Some(ref ret_ct) = sig.return_ctype {
+                            if ret_ct.is_function_pointer() {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn lower_deref(&mut self, inner: &Expr) -> Operand {
+        // Check if pointee is an aggregate type that doesn't need a Load.
+        // Note: Function types are NOT included here — function pointer dereferences
+        // are handled by is_function_pointer_deref which correctly distinguishes
+        // direct function pointers (no-op deref) from pointer-to-function-pointers
+        // (which need a real load despite having similar CType shapes).
+        let pointee_is_no_load = |ct: &CType| -> bool {
+            if let CType::Pointer(pointee, _) = ct {
+                matches!(
+                    pointee.as_ref(),
+                    CType::Array(_, _)
+                        | CType::Struct(_)
+                        | CType::Union(_)
+                        | CType::Vector(_, _)
+                        | CType::ExtVector(_, _)
+                ) || pointee.is_complex()
+            } else {
+                false
+            }
+        };
+        // In C, dereferencing a function pointer yields a function designator which
+        // immediately decays back to a function pointer. So *f, **f, ***f etc. are
+        // all equivalent when f is a function pointer. No Load should be emitted.
+        // This also applies to direct function names: (*add)(x, y) is valid C
+        // because the function name decays to a pointer, and dereferencing that
+        // gives back the function designator.
+        if self.is_function_pointer_deref(inner) {
+            return self.lower_expr(inner);
+        }
+        // Check if dereferencing yields an aggregate type.
+        // In these cases, the result is an address (no Load needed).
+        if self
+            .get_expr_ctype(inner)
+            .is_some_and(|ct| pointee_is_no_load(&ct))
+        {
+            return self.lower_expr(inner);
+        }
+        {
+            let inner_ct = self.expr_ctype(inner);
+            if pointee_is_no_load(&inner_ct) {
+                return self.lower_expr(inner);
+            }
+            // Handle *array where array is a multi-dimensional array:
+            // e.g., *x where x is int[2][3] has inner CType = Array(Array(Int,3), 2).
+            // Dereferencing peels off the outer dimension, yielding Array(Int,3) which
+            // is an aggregate — so no Load is needed, just return the base address.
+            if let CType::Array(ref elem, _) = inner_ct {
+                if elem.is_complex()
+                    || matches!(
+                        elem.as_ref(),
+                        CType::Struct(_)
+                            | CType::Union(_)
+                            | CType::Array(_, _)
+                            | CType::Vector(_, _)
+                            | CType::ExtVector(_, _)
+                    )
+                {
+                    return self.lower_expr(inner);
+                }
+            }
+        }
+
+        let addr_space = self.get_addr_space_of_ptr_expr(inner);
+        let ptr = self.lower_expr(inner);
+        let dest = self.fresh_value();
+        let deref_ty = self
+            .get_pointee_type_of_expr(inner)
+            .unwrap_or(crate::common::types::target_int_ir_type());
+        let ptr_val = self.operand_to_value(ptr);
+        self.emit_ubsan_null_check(ptr_val, addr_space);
+        let is_vol = self.pointee_expr_is_volatile(inner);
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: ptr_val,
+            ty: deref_ty,
+            seg_override: addr_space,
+        });
+        if matches!(self.expr_ctype(inner), CType::Pointer(ref p, _) if **p == CType::Bool) {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), deref_ty);
+        }
+        Operand::Value(dest)
+    }
+
+    pub(super) fn lower_array_subscript(
+        &mut self,
+        expr: &Expr,
+        base: &Expr,
+        index: &Expr,
+    ) -> Operand {
+        if self.subscript_result_is_array(expr) {
+            let addr = self.compute_array_element_addr(base, index);
+            return Operand::Value(addr);
+        }
+        if self.struct_value_size(expr).is_some() {
+            let addr = self.compute_array_element_addr(base, index);
+            return Operand::Value(addr);
+        }
+        if self.expr_ctype(base).is_bitpacked_bool_vector() {
+            if let Some(lv) = self.lower_lvalue(expr) {
+                let elem_ty = self.get_expr_type(expr);
+                return self.load_lvalue_typed(&lv, elem_ty);
+            }
+        }
+        {
+            let elem_ct = self.expr_ctype(expr);
+            if elem_ct.is_complex() || elem_ct.is_vector() {
+                let addr = self.compute_array_element_addr(base, index);
+                return Operand::Value(addr);
+            }
+        }
+        // The element's space is the subscript's own space: the pointee of a
+        // pointer operand, the object of an array operand (member arrays of
+        // segment-qualified structs have Array CType), or, for the
+        // reversed form `i[p]`, the pointer operand that is the index.
+        let addr_space = self.get_addr_space_of_struct_expr(expr);
+        let elem_ty = self.get_expr_type(expr);
+        let addr = self.compute_array_element_addr(base, index);
+        let dest = self.fresh_value();
+        let is_vol = self.expr_access_is_volatile(expr);
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: addr,
+            ty: elem_ty,
+            seg_override: addr_space,
+        });
+        if self.expr_ctype(expr) == CType::Bool {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), elem_ty);
+        }
+        Operand::Value(dest)
+    }
+
+    // -----------------------------------------------------------------------
+    // Member access (s.field, p->field)
+    // -----------------------------------------------------------------------
+
+    /// Clang ext-vector element selection as an rvalue: `v.x` loads one lane
+    /// (through the lane helper, so 10-byte x87 lanes are right); `v.zyx`
+    /// builds a fresh vector of the named lanes in order. Nested selections
+    /// read straight out of the root vector.
+    fn lower_vector_component_rvalue(&mut self, sel: &ExtVectorSelection<'_>) -> Operand {
+        let (addr_space, volatile) = self.ext_vector_selection_access(sel);
+        // Any vector-valued root: an object's address, or the temporary an
+        // rvalue (call, arithmetic) was built in.
+        let src = self.ext_vector_selection_base(sel);
+        if let [lane] = sel.lanes[..] {
+            return self.load_vector_lane(src, &sel.vector_ct, lane, addr_space, volatile);
+        }
+        let result_ct = &sel.result_ct;
+        let elem_ir_ty = Self::vector_elem_ir_type(sel.elem_ct());
+        let total_size = result_ct.size();
+        let align = self.ctype_align(result_ct);
+        let result = self.emit_entry_alloca(IrType::Ptr, total_size, align, false);
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(result_ct, sel.lanes.len()) {
+            self.zero_init_alloca(result, total_size);
+        }
+        for (i, &lane) in sel.lanes.iter().enumerate() {
+            let v = self.load_vector_lane(src, &sel.vector_ct, lane, addr_space, volatile);
+            self.store_vector_lane(
+                result,
+                result_ct,
+                i,
+                v,
+                elem_ir_ty,
+                AddressSpace::Default,
+                false,
+            );
+        }
+        Operand::Value(result)
+    }
+
+    fn lower_member_access_impl(
+        &mut self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> Operand {
+        if let Some(sel) = self.ext_vector_selection_parts(base_expr, field_name, is_pointer) {
+            return self.lower_vector_component_rvalue(&sel);
+        }
+        let (field_offset, field_ty, bitfield, field_ctype) = if is_pointer {
+            self.resolve_pointer_member_access_with_ctype(base_expr, field_name)
+        } else {
+            self.resolve_member_access_with_ctype(base_expr, field_name)
+        };
+        // Extract address space: for p->field from the pointer type,
+        // for s.field from the struct variable's address space qualifier.
+        let addr_space = if is_pointer {
+            self.get_addr_space_of_ptr_expr(base_expr)
+        } else {
+            self.get_addr_space_of_struct_expr(base_expr)
+        };
+
+        let base_addr = if is_pointer {
+            let ptr_val = self.lower_expr(base_expr);
+            let v = self.operand_to_value(ptr_val);
+            self.emit_ubsan_null_check(v, addr_space);
+            v
+        } else {
+            self.get_struct_base_addr(base_expr)
+        };
+
+        let vla_offset = self.get_vla_field_offset(base_expr, field_name, is_pointer);
+        let offset = if let Some(vo) = vla_offset {
+            Operand::Value(vo)
+        } else {
+            Operand::Const(IrConst::ptr_int(field_offset as i64))
+        };
+
+        // Reverse SSO bitfields sharing a multi-byte unit access the WHOLE
+        // unit (byte-swapped); compute the effective storage type up front so
+        // the field address carries the right access width.
+        let (sso, sso_unit_ty) = self.sso_storage_of_member(base_expr, is_pointer, field_name);
+        let storage_ty = if bitfield.is_some() {
+            match sso {
+                SsoMode::ByteSwapUnit(_) => sso_unit_ty
+                    .as_ref()
+                    .map(IrType::from_ctype)
+                    .unwrap_or(field_ty),
+                _ => field_ty,
+            }
+        } else {
+            field_ty
+        };
+
+        let field_addr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: field_addr,
+            base: base_addr,
+            offset,
+            ty: storage_ty,
+        });
+
+        let is_addr_type = match &field_ctype {
+            Some(ct) => Self::is_aggregate_or_complex(ct),
+            None => {
+                let resolved = self.resolve_field_ctype(base_expr, field_name, is_pointer);
+                resolved
+                    .as_ref()
+                    .map(Self::is_aggregate_or_complex)
+                    .unwrap_or(false)
+            }
+        };
+        if is_addr_type {
+            return Operand::Value(field_addr);
+        }
+
+        // Volatility is resolved BEFORE the bitfield branch, because a bitfield
+        // access emits its own loads and stores in `extract_bitfield_from_addr`
+        // and must pass the same answer down.  Resolving it afterwards left the
+        // bitfield path emitting non-volatile accesses for a volatile object.
+        //
+        // p->f dereferences p; s.f accesses s directly. Either the base
+        // object or the field itself can make the access volatile.
+        let is_vol = self.member_is_volatile(base_expr, is_pointer, field_name)
+            || if is_pointer {
+                self.pointee_expr_is_volatile(base_expr)
+            } else {
+                self.expr_access_is_volatile(base_expr)
+            };
+
+        // For bitfields, use extract_bitfield_from_addr which handles split loads
+        // (packed bitfields that span storage unit boundaries).
+        if let Some((bit_offset, bit_width)) = bitfield {
+            return self.extract_bitfield_from_addr(
+                field_addr, storage_ty, bit_offset, bit_width, sso, is_vol, addr_space,
+            );
+        }
+
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: field_addr,
+            ty: field_ty,
+            seg_override: addr_space,
+        });
+        if field_ctype.as_ref().is_some_and(|ct| *ct == CType::Bool) {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), field_ty);
+        }
+        // Reverse scalar_storage_order: byte-fix-up the loaded scalar value.
+        let sso = self.sso_mode_of_member(base_expr, is_pointer, field_name);
+        self.emit_sso_load_fixup(Operand::Value(dest), field_ty, sso)
+    }
+
+    pub(super) fn lower_member_access(&mut self, base_expr: &Expr, field_name: &str) -> Operand {
+        self.lower_member_access_impl(base_expr, field_name, false)
+    }
+
+    pub(super) fn lower_pointer_member_access(
+        &mut self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> Operand {
+        self.lower_member_access_impl(base_expr, field_name, true)
+    }
+
+    /// Check if a CType is an aggregate (array/struct/union) or complex type.
+    /// These types are always accessed by address rather than loaded by value.
+    fn is_aggregate_or_complex(ct: &CType) -> bool {
+        matches!(
+            ct,
+            CType::Array(_, _)
+                | CType::Struct(_)
+                | CType::Union(_)
+                | CType::ComplexFloat
+                | CType::ComplexDouble
+                | CType::ComplexLongDouble
+                | CType::Vector(_, _)
+                | CType::ExtVector(_, _)
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // Statement expressions (GCC extension)
+    // -----------------------------------------------------------------------
+
+    pub(super) fn lower_stmt_expr(&mut self, compound: &CompoundStmt) -> Operand {
+        // If this statement expression has __label__ declarations, push a local
+        // label scope so that labels are uniquified per expansion.
+        let has_local_labels = !compound.local_labels.is_empty();
+        if has_local_labels {
+            let scope_id = self.next_local_label_scope;
+            self.next_local_label_scope += 1;
+            let mut scope = crate::common::fx_hash::FxHashMap::default();
+            for name in &compound.local_labels {
+                scope.insert(name.clone(), format!("{}$ll{}", name, scope_id));
+            }
+            self.local_label_scopes.push(scope);
+        }
+
+        // Push a scope so that variables declared inside the statement expression
+        // don't leak into the enclosing scope.  Without this, nested statement
+        // expressions that re-declare the same variable name (extremely common in
+        // kernel macros like READ_ONCE, per-CPU accessors, container_of) permanently
+        // overwrite the outer binding, producing wrong code.
+        let has_declarations = Self::block_needs_scope(compound);
+        if has_declarations {
+            self.push_scope();
+        }
+
+        let mut last_val = Operand::Const(IrConst::ptr_int(0));
+        for item in &compound.items {
+            match item {
+                BlockItem::Statement(stmt) => {
+                    // Peel through Label wrappers to find the innermost statement.
+                    // A label like `out: sz;` parses as Label("out", Expr(Some(sz))).
+                    // We need to lower the labels (creating branch targets) and then
+                    // capture the final expression value, rather than discarding it
+                    // via lower_stmt.  This is critical for goto inside statement
+                    // expressions: the goto jumps to the label, and the expression
+                    // after the label is the statement expression's value.
+                    let mut inner = stmt;
+                    let mut labels = Vec::new();
+                    while let Stmt::Label(name, sub_stmt, _span) = inner {
+                        labels.push(name.as_str());
+                        inner = sub_stmt;
+                    }
+                    if !labels.is_empty() {
+                        // Lower each label: terminate current block, start label block
+                        for label_name in &labels {
+                            let label = self.get_or_create_user_label(label_name);
+                            self.terminate(Terminator::Branch(label));
+                            self.start_block(label);
+                        }
+                        // Now lower the innermost statement
+                        if let Stmt::Expr(Some(expr)) = inner {
+                            last_val = self.lower_expr(expr);
+                        } else {
+                            self.lower_stmt(inner);
+                        }
+                    } else if let Stmt::Expr(Some(expr)) = stmt {
+                        self.declare_type_name_tags_in(expr);
+                        last_val = self.lower_expr(expr);
+                    } else {
+                        self.lower_stmt(stmt);
+                    }
+                }
+                BlockItem::Declaration(decl) => {
+                    self.declare_local_decl_tags(decl);
+                    self.lower_local_decl(decl);
+                }
+                // Decided by sema; a static assertion generates nothing.
+                BlockItem::StaticAssert(_) => {}
+                BlockItem::NestedFunction(_) => {
+                    // Nested function definitions inside statement
+                    // expressions are not lowered here: a definition is not
+                    // an expression. (GCC accepts the shape; lowering the
+                    // function itself happens through the enclosing
+                    // function-body walk, which re-visits all items.)
+                }
+            }
+        }
+
+        if has_declarations {
+            self.pop_scope();
+        }
+
+        if has_local_labels {
+            self.local_label_scopes.pop();
+        }
+
+        last_val
+    }
+
+    // -----------------------------------------------------------------------
+    // va_arg
+    // -----------------------------------------------------------------------
+
+    /// __builtin_convertvector(expr, TYPE): element-wise conversion between
+    /// 4-lane 32-bit vectors (v4si <-> v4sf), the only combination kernel
+    /// code uses (NAP governor fast_log2f_sse). int->float = cvtdq2ps,
+    /// float->int = cvttps2dq (C cast semantics = truncation). The result is
+    /// returned as the ALLOCA POINTER, matching every other vector
+    /// expression convention (a raw-builtin caller then loads through it).
+    pub(super) fn lower_convertvector(
+        &mut self,
+        src_expr: &Expr,
+        type_spec: &TypeSpecifier,
+    ) -> Operand {
+        use crate::ir::intrinsics::IntrinsicOp;
+        let dst_ct = self.type_spec_to_ctype(type_spec);
+        let src_ct = self.expr_ctype(src_expr);
+        let (src_is_float, dst_is_float) = (
+            matches!(&src_ct, CType::Vector(elem, _) | CType::ExtVector(elem, _) if elem.is_floating()),
+            matches!(&dst_ct, CType::Vector(elem, _) | CType::ExtVector(elem, _) if elem.is_floating()),
+        );
+        let src_size = if src_ct.is_vector() {
+            src_ct.size()
+        } else {
+            16
+        };
+        let dst_size = if dst_ct.is_vector() {
+            dst_ct.size()
+        } else {
+            16
+        };
+        if src_size != 16 || dst_size != 16 {
+            panic!(
+                "__builtin_convertvector: only 16-byte vectors are supported (got {} -> {})",
+                src_size, dst_size
+            );
+        }
+        let src_ptr_op = self.lower_expr(src_expr);
+        let src_ptr = self.operand_to_value(src_ptr_op);
+        let result = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: result,
+            ty: IrType::Ptr,
+            size: 16,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        let op = match (src_is_float, dst_is_float) {
+            (false, true) => IntrinsicOp::CvtEp32ToPs128, // cvtdq2ps
+            (true, false) => IntrinsicOp::CvttPs2Ep32_128, // cvttps2dq (truncate)
+            other => panic!(
+                "__builtin_convertvector: unsupported lane conversion {:?} (only int<->float 32-bit lanes)",
+                other
+            ),
+        };
+        let dest_val = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest_val),
+            op,
+            dest_ptr: Some(result),
+            args: vec![Operand::Value(src_ptr)],
+        });
+        Operand::Value(result)
+    }
+
+    pub(super) fn lower_va_arg(&mut self, ap_expr: &Expr, type_spec: &TypeSpecifier) -> Operand {
+        // VaArg instruction expects a pointer to the va_list "object" so it can
+        // both read from and advance the va_list state.
+        //
+        // The correct pointer depends on the target's va_list representation:
+        //
+        // x86-64 / AArch64: va_list is an array type (char[24] / char[32]).
+        //   - LOCAL va_list:  alloca IS the array, lower_expr returns the alloca
+        //     address (array-to-pointer decay) → pointer to the struct. ✓
+        //   - PARAM va_list:  array decayed to char* when passed; the alloca holds
+        //     a pointer to the caller's va_list struct, lower_expr loads that
+        //     pointer value → pointer to the struct. ✓
+        //   So lower_expr gives the correct va_list pointer on these targets.
+        //
+        // RISC-V: va_list is a scalar pointer type (void *).
+        //   - LOCAL va_list:  alloca holds the void* value. va_arg needs the
+        //     ADDRESS of the alloca (to read the current pointer and write back
+        //     the advanced one). lower_address_of returns this. ✓
+        //   - PARAM va_list:  alloca holds a copy of the void* parameter.
+        //     Same as local: need the ADDRESS of the alloca. lower_address_of
+        //     returns this. ✓
+        //   So lower_address_of gives the correct va_list pointer on RISC-V.
+
+        // Check if the requested type is a complex type. Complex types map to
+        // IrType::Ptr, but the backend va_arg code only handles scalar types
+        // (integer, float). We decompose complex va_arg into two component
+        // va_arg calls (one for real, one for imaginary) and reassemble.
+        let ctype = self.type_spec_to_ctype(type_spec);
+        if ctype.is_complex() {
+            return self.lower_va_arg_complex(ap_expr, &ctype);
+        }
+
+        // Check if the requested type is a struct/union. Struct types are passed
+        // by value in variadic arguments (their bytes are inline on the va_list),
+        // but IrType maps structs to Ptr. We need to read the struct data as
+        // individual slots and store to a temporary alloca.
+        // Use the resolved ctype rather than pattern-matching on the TypeSpecifier,
+        // because typeof(expr) produces TypeSpecifier::Typeof which would not be
+        // recognized by is_type_struct_or_union but resolves correctly via ctype.
+        if ctype.is_struct_or_union() {
+            return self.lower_va_arg_struct(ap_expr, type_spec, &ctype);
+        }
+        if ctype.is_vector() {
+            return self.lower_va_arg_vector(ap_expr, type_spec, &ctype);
+        }
+
+        // Vector-shaped va_arg on x86-64 rides the same classified machinery:
+        // a vector vararg occupies ONE XMM register (its SysV carrier classes
+        // from `sysv_vector_carrier`), or the 16-aligned overflow area, and
+        // GCC/Clang read it byte-identically through the struct fetch. The
+        // temporary alloca VaArgStruct fills IS the vector's address carrier
+        // (vector rvalues are addresses in LCCC IR), so the result needs no
+        // reassembly.  32-bit targets keep their legacy pointer convention.
+        if ctype.is_vector() && self.target == Target::X86_64 {
+            let size = ctype.size();
+            let align = ctype.align_ctx(&*self.types.borrow_struct_layouts());
+            let ap_val = self.lower_va_list_pointer(ap_expr);
+            let va_list_ptr = self.operand_to_value(ap_val);
+            let num_slots = size.div_ceil(8);
+            let alloc_size = if size > 0 { num_slots * 8 } else { 8 };
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: alloc_size,
+                ty: IrType::I64,
+                align,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            // Per the SysV vector carrier: one XMM slot, one GP slot, or
+            // (carrier None, e.g. >16 bytes) the 16-aligned overflow area.
+            // The alloca is the vector's address carrier, so the result
+            // needs no reassembly.
+            let classes = ctype
+                .sysv_vector_carrier()
+                .map(|(classes, _pair)| classes)
+                .unwrap_or_default();
+            self.emit(Instruction::VaArgVector {
+                dest_ptr: alloca,
+                va_list_ptr,
+                size,
+                align,
+                eightbyte_classes: classes,
+            });
+            return Operand::Value(alloca);
+        }
+
+        use crate::backend::Target;
+        let ap_val = if self.target == Target::Riscv64 || self.target == Target::I686 {
+            // RISC-V / i686: va_list is a pointer, need address of the variable holding it
+            self.lower_address_of(ap_expr)
+        } else {
+            // x86-64 / AArch64: va_list is an array type, lower_expr handles
+            // both local (array decay) and parameter (load pointer) cases
+            self.lower_expr(ap_expr)
+        };
+        let va_list_ptr = self.operand_to_value(ap_val);
+        if ctype.is_half_float() {
+            // Across all 4 psABIs (x86-64 XMM/overflow, i686 4B stack, AArch64 VR/stack,
+            // RISC-V LP64D GP/stack), variadic _Float16 / __bf16 occupies the exact low
+            // 16 bits of the same slot as `float`.
+            let f_dest = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest: f_dest,
+                va_list_ptr,
+                result_ty: IrType::F32,
+            });
+            let slot = self.emit_entry_alloca(IrType::F32, 4, 4, false);
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(f_dest),
+                ptr: slot,
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            });
+            let h_dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: h_dest,
+                ptr: slot,
+                ty: IrType::U16,
+                seg_override: AddressSpace::Default,
+            });
+            return Operand::Value(h_dest);
+        }
+        let result_ty = self.resolve_va_arg_type(type_spec);
+        let dest = self.fresh_value();
+        self.emit(Instruction::VaArg {
+            dest,
+            va_list_ptr,
+            result_ty,
+        });
+        Operand::Value(dest)
+    }
+
+    /// Lower `va_arg` of a by-value vector. A vector is an aggregate on the
+    /// va_list, never a pointer to one: x86-64 reads it as the SysV class
+    /// its callers pass it with (one 16-byte `%xmm` save slot, GP slots, or
+    /// the overflow area); i686 ext vectors read the carriers their callers
+    /// pass (`CType::i386_ext_vector_arg`); anything else is read like a
+    /// struct of the same size.
+    fn lower_va_arg_vector(
+        &mut self,
+        ap_expr: &Expr,
+        type_spec: &TypeSpecifier,
+        ctype: &CType,
+    ) -> Operand {
+        use crate::backend::Target;
+        use crate::common::types::I386ExtVectorCarrier;
+        match self.target {
+            Target::X86_64 => {
+                let size = ctype.size();
+                let align = self.ctype_align(ctype);
+                let eightbyte_classes = self
+                    .sysv_arg_abi(ctype)
+                    .map(|(classes, _)| classes)
+                    .unwrap_or_default();
+                let ap_val = self.lower_va_list_pointer(ap_expr);
+                let va_list_ptr = self.operand_to_value(ap_val);
+                let dest_ptr =
+                    self.emit_entry_alloca(IrType::Ptr, size.div_ceil(8).max(1) * 8, align, false);
+                self.emit(Instruction::VaArgStruct {
+                    dest_ptr,
+                    va_list_ptr,
+                    size,
+                    align,
+                    eightbyte_classes,
+                });
+                Operand::Value(dest_ptr)
+            }
+            Target::I686 => match ctype.i386_ext_vector_arg() {
+                Some(I386ExtVectorCarrier::Xmm { pieces }) => {
+                    self.lower_i386_va_arg_ext_vector_xmm(ap_expr, ctype, pieces)
+                }
+                Some(I386ExtVectorCarrier::Lanes) => {
+                    self.lower_i386_va_arg_ext_vector_lanes(ap_expr, ctype)
+                }
+                // 16-byte SIMD class on a baseline without the XMM carrier
+                // (pre-SSE `-march`, `-mno-sse`): the va ABI (GCC 4.6)
+                // 16-byte-aligns it in the va area on ANY baseline — read
+                // one 16-byte slot from the aligned cursor. Pure GP loads
+                // (no XMM needed); GCC 16.2 and Clang 23.1.3 agree on this
+                // read (measured: both realign the cursor and take 16
+                // bytes, then advance 16).
+                _ if ctype.is_i386_16b_simd_vector() => {
+                    self.lower_i386_va_arg_ext_vector_xmm(ap_expr, ctype, 1)
+                }
+                _ => self.lower_va_arg_struct(ap_expr, type_spec, ctype),
+            },
+            _ => self.lower_va_arg_struct(ap_expr, type_spec, ctype),
+        }
+    }
+
+    /// Lower va_arg for struct/union types.
+    ///
+    /// Struct variadic arguments are passed by value: their bytes are stored
+    /// inline on the va_list (or in registers, for the first few args).
+    /// However, IrType maps structs to IrType::Ptr, so the backend's emit_va_arg
+    /// would read a pointer-sized value and treat it as an address — causing a
+    /// segfault when dereferenced.
+    ///
+    /// Fix: read the struct data as individual 8-byte (or 4-byte on i686) slots
+    /// via scalar VaArg instructions, store them to a temporary alloca, and
+    /// return the alloca address.
+    ///
+    /// Exception: on ARM64/RISC-V, structs larger than 16 bytes are passed by
+    /// reference (a pointer is on the va_list), so we read one pointer.
+    fn lower_va_arg_struct(
+        &mut self,
+        ap_expr: &Expr,
+        type_spec: &TypeSpecifier,
+        ctype: &CType,
+    ) -> Operand {
+        use crate::backend::Target;
+
+        // Variable-size aggregate variadic arguments are passed by reference
+        // by GCC on the supported ABIs. `va_arg(ap, typeof(vla_struct))` is a
+        // non-lvalue expression; all valid consumers either copy from it or pass
+        // it onward by value. Returning the referenced object pointer preserves
+        // that internal representation and avoids an unnecessary temporary copy
+        // here; assignment/call lowering already copies the runtime size when a
+        // destination object is required.  The static sizeof is zero for these
+        // GCC-extension types, so falling through to VaArgStruct(size=0) would
+        // silently consume/copy nothing (gcc.c-torture/execute/20020412-1.c).
+        if self.compute_vla_size_from_type_spec(type_spec).is_some() {
+            let ap_val = self.lower_va_list_pointer(ap_expr);
+            let va_list_ptr = self.operand_to_value(ap_val);
+            let ptr = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest: ptr,
+                va_list_ptr,
+                result_ty: IrType::Ptr,
+            });
+            return Operand::Value(ptr);
+        }
+
+        let struct_size = self.sizeof_type(type_spec);
+        let struct_align = self.alignof_type(type_spec);
+
+        // On ARM64 and RISC-V, structs > 16 bytes are passed by reference:
+        // a pointer to the struct is placed in the va_list. Read the pointer
+        // and return it directly (the pointer IS the struct address).
+        let large_struct_by_ref = matches!(self.target, Target::Aarch64 | Target::Riscv64);
+        if large_struct_by_ref && struct_size > 16 {
+            let ap_val = self.lower_va_list_pointer(ap_expr);
+            let va_list_ptr = self.operand_to_value(ap_val);
+            let dest = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest,
+                va_list_ptr,
+                result_ty: IrType::Ptr,
+            });
+            return Operand::Value(dest);
+        }
+
+        // On x86-64 and AArch64, structs use VaArgStruct for correct ABI handling.
+        // Both the SysV x86-64 ABI and AAPCS64 require that multi-register structs
+        // are passed entirely in registers OR entirely on the stack - never split
+        // across the boundary. By using VaArgStruct, the backend can atomically
+        // check if all required register slots are available and fall back to the
+        // overflow/stack area if not.
+        if self.target == Target::X86_64 || self.target == Target::Aarch64 {
+            let eightbyte_classes = if self.target == Target::X86_64 && struct_size <= 16 {
+                if let Some((classes, _pair)) = ctype.sysv_vector_carrier() {
+                    // Vector va_arg: the SysV vector carrier decides the
+                    // register classes (see `lower_va_arg` routing above);
+                    // struct layouts do not exist for vector types.
+                    classes
+                } else if let Some(layout) = self.get_struct_layout_for_ctype(ctype) {
+                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new() // AArch64 or >16 bytes on x86 = no eightbyte classes needed
+            };
+
+            let ap_val = self.lower_va_list_pointer(ap_expr);
+            let va_list_ptr = self.operand_to_value(ap_val);
+            let num_slots = struct_size.div_ceil(8);
+            let alloc_size = if struct_size > 0 { num_slots * 8 } else { 8 };
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: alloc_size,
+                ty: IrType::I64,
+                align: struct_align,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            self.emit(Instruction::VaArgStruct {
+                dest_ptr: alloca,
+                va_list_ptr,
+                size: struct_size,
+                align: struct_align,
+                eightbyte_classes,
+            });
+            return Operand::Value(alloca);
+        }
+
+        // Non-x86-64 targets: small structs passed by value inline.
+        // Read each slot from the va_list and store to a temporary alloca.
+        let slot_size = if self.target == Target::I686 { 4 } else { 8 };
+        let default_slot_ty = if self.target == Target::I686 {
+            IrType::I32
+        } else {
+            IrType::I64
+        };
+
+        // Number of slots needed (round up)
+        let num_slots = struct_size.div_ceil(slot_size);
+        let alloc_size = if struct_size > 0 {
+            num_slots * slot_size
+        } else {
+            slot_size
+        };
+
+        // Allocate temporary storage for the struct
+        let alloca = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: alloca,
+            size: alloc_size,
+            ty: default_slot_ty,
+            align: struct_align,
+            volatile: false,
+            semantic_volatile: false,
+        });
+
+        // Get the va_list pointer (same logic as scalar va_arg)
+        let ap_val = self.lower_va_list_pointer(ap_expr);
+        let va_list_ptr = self.operand_to_value(ap_val);
+
+        // Wide i386 GNU vectors have naturally aligned MEMORY slots. Use
+        // one backend operation so the cursor is aligned once and the copy
+        // does not repeatedly load/store the va_list for every four bytes.
+        if self.target == Target::I686 && matches!(ctype, CType::Vector(..)) && struct_align > 16 {
+            self.emit(Instruction::VaArgStruct {
+                dest_ptr: alloca,
+                va_list_ptr,
+                size: struct_size,
+                align: struct_align,
+                eightbyte_classes: Vec::new(),
+            });
+            return Operand::Value(alloca);
+        }
+
+        // On RISC-V, structs containing long double (f128) require 16-byte alignment
+        // in the variadic argument area. The RISC-V LP64D ABI specifies that 2*XLEN-bit
+        // scalars (and structs containing them) are aligned to 2*XLEN (16 bytes) on the
+        // stack. Without this alignment, reading a struct {long double f;} via va_arg
+        // reads from the wrong offset, corrupting the value and misaligning all
+        // subsequent va_arg reads.
+        //
+        // We align the va_list pointer before reading slots:
+        //   ptr = load(va_list_ptr)
+        //   aligned_ptr = (ptr + align - 1) & ~(align - 1)
+        //   store(aligned_ptr, va_list_ptr)
+        if self.target == Target::Riscv64 && struct_align > slot_size {
+            let cur_ptr = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: cur_ptr,
+                ptr: va_list_ptr,
+                ty: IrType::Ptr,
+                seg_override: AddressSpace::Default,
+            });
+            let align_val = struct_align as i64;
+            let added = self.emit_binop_val(
+                IrBinOp::Add,
+                Operand::Value(cur_ptr),
+                Operand::Const(IrConst::I64(align_val - 1)),
+                IrType::Ptr,
+            );
+            let aligned = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(added),
+                Operand::Const(IrConst::I64(-align_val)),
+                IrType::Ptr,
+            );
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(aligned),
+                ptr: va_list_ptr,
+                ty: IrType::Ptr,
+                seg_override: AddressSpace::Default,
+            });
+        }
+
+        // Read each slot and store it into the alloca.
+        for i in 0..num_slots {
+            let slot_val = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest: slot_val,
+                va_list_ptr,
+                result_ty: default_slot_ty,
+            });
+            if i == 0 {
+                // Store directly to the alloca base
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(slot_val),
+                    ptr: alloca,
+                    ty: default_slot_ty,
+                    seg_override: AddressSpace::Default,
+                });
+            } else {
+                // Store at offset i * slot_size
+                let offset = (i * slot_size) as i64;
+                let offset_ptr = self.fresh_value();
+                self.emit(Instruction::BinOp {
+                    dest: offset_ptr,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(alloca),
+                    rhs: Operand::Const(IrConst::I64(offset)),
+                    ty: IrType::Ptr,
+                });
+                self.emit(Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(slot_val),
+                    ptr: offset_ptr,
+                    ty: default_slot_ty,
+                    seg_override: AddressSpace::Default,
+                });
+            }
+        }
+
+        // Return the alloca address — callers will use this as a pointer to the struct data
+        Operand::Value(alloca)
+    }
+
+    /// Lower va_arg for complex types by decomposing into component va_arg calls.
+    ///
+    /// Complex float (_Complex float) is special: on x86-64 and RISC-V it's passed
+    /// as two F32 values packed into a single 8-byte slot (one XMM register on x86,
+    /// one integer register on RISC-V). We read one F64/I64 and bitcast-unpack it.
+    /// On ARM64, float _Complex occupies two separate register slots per AAPCS64.
+    ///
+    /// Complex double (_Complex double) is passed as two F64 values on all platforms.
+    ///
+    /// Complex long double on x86-64: passed on stack (MEMORY class), reading as
+    /// two F128 values from the FP area.
+    /// TODO: handle _Complex long double specially on x86-64 if needed.
+    fn lower_va_arg_complex(&mut self, ap_expr: &Expr, ctype: &CType) -> Operand {
+        use crate::backend::Target;
+
+        // Get va_list pointer using the shared helper (handles target differences)
+        let ap_val = self.lower_va_list_pointer(ap_expr);
+        let va_list_ptr = self.operand_to_value(ap_val);
+
+        // Handle float _Complex specially: packed into one 8-byte slot on x86-64 and RISC-V.
+        // The two F32 components (real, imag) are packed into a single 8-byte value:
+        // - x86-64: packed in one XMM register, read as F64
+        // - RISC-V: packed in one integer register, read as I64
+        if *ctype == CType::ComplexFloat
+            && (self.target == Target::X86_64 || self.target == Target::Riscv64)
+        {
+            let read_ty = if self.target == Target::X86_64 {
+                IrType::F64
+            } else {
+                IrType::I64
+            };
+            let packed = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest: packed,
+                va_list_ptr,
+                result_ty: read_ty,
+            });
+
+            // Store the packed 8 bytes to a temp alloca, then read back as 2 x F32
+            let tmp_alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: tmp_alloca,
+                ty: IrType::Ptr,
+                size: 8,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(packed),
+                ptr: tmp_alloca,
+                ty: read_ty,
+                seg_override: AddressSpace::Default,
+            });
+
+            // Load real part (first F32 at offset 0)
+            let real_dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: real_dest,
+                ptr: tmp_alloca,
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            });
+
+            // Load imag part (second F32 at offset +4)
+            let imag_ptr = self.fresh_value();
+            let ptr_int_ty = crate::common::types::target_int_ir_type();
+            self.emit(Instruction::BinOp {
+                dest: imag_ptr,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(tmp_alloca),
+                rhs: Operand::Const(IrConst::ptr_int(4)),
+                ty: ptr_int_ty,
+            });
+            let imag_dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: imag_dest,
+                ptr: imag_ptr,
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            });
+
+            // Allocate and store the complex float value
+            let alloca = self.alloca_complex(ctype);
+            self.store_complex_parts(
+                alloca,
+                Operand::Value(real_dest),
+                Operand::Value(imag_dest),
+                ctype,
+            );
+            return Operand::Value(alloca);
+        }
+
+        // For complex double, complex long double, and float complex on ARM64:
+        // read two separate values from the va_list
+        let comp_ir_ty = Self::complex_component_ir_type(ctype);
+
+        // On x86-64, _Complex double is classified as [Sse, Sse] - two SSE eightbytes.
+        // Use VaArgStruct to atomically check that both FP slots are available,
+        // preventing the complex value from being split across register and overflow areas.
+        // _Complex long double (F128) is >16 bytes so it's MEMORY class and handled
+        // via the overflow-only path (empty eightbyte_classes).
+        if self.target == Target::X86_64 && comp_ir_ty == IrType::F64 {
+            let alloca = self.alloca_complex(ctype);
+            self.emit(Instruction::VaArgStruct {
+                dest_ptr: alloca,
+                va_list_ptr,
+                size: 16, // 2 x 8 bytes
+                // _Complex double = 2 doubles, alignment 8 on LP64.
+                align: 8,
+                eightbyte_classes: vec![
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::Sse,
+                ],
+            });
+            return Operand::Value(alloca);
+        }
+
+        // Retrieve real part via va_arg
+        let real_dest = self.fresh_value();
+        self.emit(Instruction::VaArg {
+            dest: real_dest,
+            va_list_ptr,
+            result_ty: comp_ir_ty,
+        });
+
+        // Retrieve imaginary part via va_arg
+        let imag_dest = self.fresh_value();
+        self.emit(Instruction::VaArg {
+            dest: imag_dest,
+            va_list_ptr,
+            result_ty: comp_ir_ty,
+        });
+
+        // Allocate stack space and store both components
+        let alloca = self.alloca_complex(ctype);
+        self.store_complex_parts(
+            alloca,
+            Operand::Value(real_dest),
+            Operand::Value(imag_dest),
+            ctype,
+        );
+
+        Operand::Value(alloca)
+    }
+
+    /// Get a pointer to the va_list struct from an expression.
+    /// Used by va_start, va_end, va_copy builtins.
+    ///
+    /// Target-dependent behavior (same logic as lower_va_arg):
+    /// - x86-64/AArch64: va_list is array type, lower_expr handles both local
+    ///   (array decay gives address) and parameter (loads pointer) cases.
+    /// - RISC-V: va_list is void*, always need address-of the variable.
+    pub(super) fn lower_va_list_pointer(&mut self, ap_expr: &Expr) -> Operand {
+        use crate::backend::Target;
+        if self.target == Target::Riscv64 || self.target == Target::I686 {
+            // RISC-V / i686: va_list is a pointer, need address of the variable
+            self.lower_address_of(ap_expr)
+        } else {
+            self.lower_expr(ap_expr)
+        }
+    }
+
+    pub(super) fn resolve_va_arg_type(&self, type_spec: &TypeSpecifier) -> IrType {
+        // Use type_spec_to_ctype for typedef resolution, then canonical CType-to-IrType
+        let ctype = self.type_spec_to_ctype(type_spec);
+        IrType::from_ctype(&ctype)
+    }
+}
+
+/// Whether an explicit cast `from_ty -> to_ty` lowers to its operand
+/// unchanged: same type, or a same-width integer/pointer -> pointer cast.
+///
+/// An explicit pointer -> integer cast is NOT an identity even at the same
+/// width: it is emitted as a no-op `Cast { Ptr -> int }` because it is where
+/// the address leaves pointer provenance (C's PNVI-ae model "exposes" the
+/// object). Pointer arithmetic (`a + i`) is lowered as an integer `Add` on
+/// the pointer value, so without the marker `(char *)((uintptr_t)a + d)` is
+/// the same IR as `a + d`, and GVN's base tracking -- which follows only
+/// `Ptr -> Ptr` casts -- rooted it in `a` and kept a cached load of an
+/// unrelated object across the store through it (GCC, Clang and ICX all
+/// reload). The backends lower the same-width cast as a move.
+fn cast_is_operand_identity(from_ty: IrType, to_ty: IrType) -> bool {
+    to_ty == from_ty
+        || (to_ty == IrType::Ptr
+            && !super::expr::pointer_integer_cast_changes_width(
+                from_ty,
+                to_ty,
+                crate::common::types::target_ptr_size(),
+            ))
+}

@@ -1,0 +1,283 @@
+//! ArmCodegen: floating-point binary operations.
+
+use super::emit::{ArmCodegen, arm_fp_name, is_arm_fp_phys};
+use crate::backend::cast::FloatOp;
+use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrConst, Operand, Value};
+
+impl ArmCodegen {
+    pub(super) fn float_operand_reg(&mut self, op: &Operand, ty: IrType, scratch: &str) -> String {
+        if let Operand::Value(v) = op {
+            if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                if is_arm_fp_phys(phys) {
+                    return arm_fp_name(phys, ty);
+                }
+            }
+        }
+        self.float_operand_to_reg(op, ty, scratch);
+        scratch.to_string()
+    }
+
+    pub(super) fn float_operand_to_reg(&mut self, op: &Operand, ty: IrType, target: &str) {
+        if let Operand::Value(v) = op {
+            if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                if is_arm_fp_phys(phys) {
+                    let source = arm_fp_name(phys, ty);
+                    if source != target {
+                        self.state
+                            .emit_fmt(format_args!("    fmov {}, {}", target, source));
+                    }
+                    return;
+                }
+            }
+            // A non-alloca FP value with a stack home is a value spill (or a
+            // stack-passed FP parameter), not an address. Load its bits
+            // directly into the requested FP register. The generic path below
+            // bounces them through x0 (`ldr x0` + `fmov dN,x0`), adding one
+            // instruction and a cross-domain dependency without changing the
+            // value. Allocas remain on the pointer path. (levkropp 0c5134cc,
+            // Agent B assembly gate.)
+            if !self.state.is_alloca(v.0) {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    self.emit_load_from_sp(target, slot.0, "ldr");
+                    return;
+                }
+            }
+        }
+        // FP constants load from the .rodata constant pool by page address
+        // plus low-12 offset, GCC's `-mcmodel=small` sequence (2
+        // instructions vs. a 5-instruction movz/movk + fmov sequence). A
+        // one-instruction literal load (`ldr dN, label`, LD_PREL_LO19) only
+        // reaches +-1 MiB, and the pool is another section: everything
+        // linked between this function and .rodata counts against that, so
+        // past ~1 MiB of code GNU ld refuses the link ("relocation truncated
+        // to fit") and the target wraps. x17 (IP1) is outside both
+        // allocation pools and every other codegen use of it is a
+        // self-contained set-then-use sequence; nothing can intervene here.
+        if let Operand::Const(c) = op {
+            let bits = match (c, ty) {
+                (IrConst::F64(v), IrType::F64) => Some(v.to_bits()),
+                (IrConst::F32(v), IrType::F32) => Some(v.to_bits() as u64),
+                _ => None,
+            };
+            if let Some(bits) = bits {
+                if bits == 0 {
+                    let zero = if ty == IrType::F32 { "wzr" } else { "xzr" };
+                    self.state
+                        .emit_fmt(format_args!("    fmov {}, {}", target, zero));
+                } else {
+                    let label = self.state.get_fp_const_label(bits);
+                    self.state.emit_fmt(format_args!("    adrp x17, {label}"));
+                    self.state
+                        .emit_fmt(format_args!("    ldr {target}, [x17, :lo12:{label}]"));
+                }
+                return;
+            }
+        }
+        self.operand_to_x0(op);
+        if ty == IrType::F32 {
+            self.state.emit_fmt(format_args!("    fmov {}, w0", target));
+        } else {
+            self.state.emit_fmt(format_args!("    fmov {}, x0", target));
+        }
+    }
+
+    pub(super) fn store_float_reg(&mut self, dest: &Value, ty: IrType, source: &str) {
+        if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+            if is_arm_fp_phys(phys) {
+                let target = arm_fp_name(phys, ty);
+                if target != source {
+                    self.state
+                        .emit_fmt(format_args!("    fmov {}, {}", target, source));
+                }
+                return;
+            }
+        }
+        // Stack-homed dest with a slot: store the FP register directly
+        // (`str dN, [slot]`) instead of round-tripping through x0
+        // (`fmov x0, dN; str x0, [slot]`).
+        if !self.state.is_alloca(dest.0) {
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.emit_store_to_sp(source, slot.0, "str");
+                return;
+            }
+        }
+        if ty == IrType::F32 {
+            self.state.emit_fmt(format_args!("    fmov w0, {}", source));
+        } else {
+            self.state.emit_fmt(format_args!("    fmov x0, {}", source));
+        }
+        self.store_x0_to(dest);
+    }
+
+    pub(super) fn emit_fused_mul_add_impl(
+        &mut self,
+        _mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        add_dest: &Value,
+        ty: IrType,
+    ) {
+        let (r0, r1, r2) = if ty == IrType::F32 {
+            ("s0", "s1", "s2")
+        } else {
+            ("d0", "d1", "d2")
+        };
+        let acc_reg = self.float_operand_reg(acc, ty, r2);
+        let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
+        let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
+        let output = self
+            .reg_assignments
+            .get(&add_dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
+            .unwrap_or_else(|| r0.to_string());
+        self.state.emit_fmt(format_args!(
+            "    fmadd {}, {}, {}, {}",
+            output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_float_reg(add_dest, ty, &output);
+    }
+
+    /// Fused multiply-subtract (levkropp e3b21b8f, audited port).
+    /// `mul_is_lhs == false`: sub_dest = acc - lhs*rhs   -> fmsub  (Rd = Ra - Rn*Rm)
+    /// `mul_is_lhs == true` : sub_dest = lhs*rhs - acc   -> fnmsub (Rd = Rn*Rm - Ra)
+    /// All three sources are read before the destination is written (single
+    /// instruction), so `output` aliasing any source register is safe.
+    /// Load order matches emit_fused_mul_add_impl (acc, lhs, rhs) so the
+    /// accumulator-flow staging behaviour is identical to the shipped fmadd.
+    pub(super) fn emit_fused_mul_sub_impl(
+        &mut self,
+        _mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        sub_dest: &Value,
+        ty: IrType,
+        mul_is_lhs: bool,
+    ) {
+        let (r0, r1, r2) = if ty == IrType::F32 {
+            ("s0", "s1", "s2")
+        } else {
+            ("d0", "d1", "d2")
+        };
+        let acc_reg = self.float_operand_reg(acc, ty, r2);
+        let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
+        let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
+        let output = self
+            .reg_assignments
+            .get(&sub_dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
+            .unwrap_or_else(|| r0.to_string());
+        let mnemonic = if mul_is_lhs { "fnmsub" } else { "fmsub" };
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, {}, {}",
+            mnemonic, output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_float_reg(sub_dest, ty, &output);
+    }
+
+    /// The four-way signed FMA hook.  AArch64's spelling inverts the x86
+    /// roles: `sub` negates the PRODUCT (Rd = Ra - Rn*Rm) and the `n` prefix
+    /// negates the ADDEND, so — with (negate_product, negate_addend) flags —
+    ///   (+,+) fmadd · (+,-) fnmsub (Rd = Rn*Rm - Ra) ·
+    ///   (-,+) fmsub  (Rd = Ra - Rn*Rm) · (-,-) fnmadd (Rd = -(Rn*Rm) - Ra)
+    /// each mapping verified against GCC's aarch64 contraction of the six
+    /// negation source shapes under -ffp-contract=fast.
+    pub(super) fn emit_fused_fma_signed_impl(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        dest: &Value,
+        ty: IrType,
+        negate_product: bool,
+        negate_addend: bool,
+    ) {
+        let (r0, r1, r2) = if ty == IrType::F32 {
+            ("s0", "s1", "s2")
+        } else {
+            ("d0", "d1", "d2")
+        };
+        let acc_reg = self.float_operand_reg(acc, ty, r2);
+        let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
+        let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
+        let output = self
+            .reg_assignments
+            .get(&dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
+            .unwrap_or_else(|| r0.to_string());
+        let mnemonic = match (negate_product, negate_addend) {
+            (false, false) => "fmadd",
+            (false, true) => "fnmsub",
+            (true, false) => "fmsub",
+            (true, true) => "fnmadd",
+        };
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, {}, {}",
+            mnemonic, output, lhs_reg, rhs_reg, acc_reg
+        ));
+        self.store_float_reg(dest, ty, &output);
+    }
+
+    pub(super) fn emit_float_binop_impl(
+        &mut self,
+        dest: &Value,
+        op: FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        if ty == IrType::F128 {
+            crate::backend::f128_softfloat::f128_emit_binop(self, dest, op, lhs, rhs);
+            return;
+        }
+        // Non-F128: use default path.
+        let mnemonic = self.emit_float_binop_mnemonic(op);
+        let scratch0 = if ty == IrType::F32 { "s0" } else { "d0" };
+        let r1 = if ty == IrType::F32 { "s1" } else { "d1" };
+        let output = self
+            .reg_assignments
+            .get(&dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
+            .unwrap_or_else(|| scratch0.to_string());
+        let lhs_reg = self.float_operand_reg(lhs, ty, scratch0);
+        let rhs_reg = self.float_operand_reg(rhs, ty, r1);
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, {}",
+            mnemonic, output, lhs_reg, rhs_reg
+        ));
+        self.store_float_reg(dest, ty, &output);
+    }
+
+    pub(super) fn emit_float_binop_body(&mut self, mnemonic: &str, ty: IrType) {
+        self.state.emit("    mov x2, x0");
+        if ty == IrType::F32 {
+            self.state.emit("    fmov s0, w1");
+            self.state.emit("    fmov s1, w2");
+            self.state
+                .emit_fmt(format_args!("    {} s0, s0, s1", mnemonic));
+            self.state.emit("    fmov w0, s0");
+            self.state.emit("    mov w0, w0"); // zero-extend
+        } else {
+            self.state.emit("    fmov d0, x1");
+            self.state.emit("    fmov d1, x2");
+            self.state
+                .emit_fmt(format_args!("    {} d0, d0, d1", mnemonic));
+            self.state.emit("    fmov x0, d0");
+        }
+    }
+
+    pub(super) fn emit_f128_neg_impl(&mut self, dest: &Value, src: &Operand) {
+        self.emit_f128_neg_full(dest, src);
+    }
+}

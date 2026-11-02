@@ -1,0 +1,63 @@
+# One translation unit per row: id, verdict (accept|reject), the first error
+# lccc must give, GCC 16.2's first error ('=' when it is the same), source.
+# Measured with gcc-16 -std=gnu17 -c (a tentative definition is diagnosed
+# only when the translation unit ends, not under -fsyntax-only).
+alignof_arr	reject	declaration of type name as array of voids	=	int n = _Alignof(void[2]);
+arr	reject	declaration of 'a' as array of voids	=	void a[3];
+arr2	reject	declaration of 'a' as array of voids	=	void a[2][3];
+arr_extern	reject	declaration of 'a' as array of voids	=	extern void a[];
+arr_typedef	reject	declaration of 'V' as array of voids	=	typedef void V[2];
+arr_typedef_use	reject	declaration of 'V' as array of voids	=	typedef void V[2]; V x;
+bs_arr	reject	declaration of 'a' as array of voids	=	void f(void){ void a[2]; }
+bs_extern	accept	-	=	void f(void){ extern void v; (void)&v; }
+bs_init	reject	variable or field 'x' declared void	=	void f(void){ void x = 0; }
+bs_obj	reject	variable or field 'x' declared void	=	void f(void){ void x; }
+bs_static	reject	variable or field 'x' declared void	=	void f(void){ static void x; }
+cast_arr	reject	declaration of type name as array of voids	=	void f(void){ (void)(void(*)[2])0; }
+cl	reject	invalid initializer	=	void f(void){ (void){0}; }
+cl_empty	reject	invalid use of void expression	=	void f(void){ (void){}; }
+cl_typedef	reject	invalid initializer	=	typedef void V; void f(void){ (void)(V){0}; }
+flex	reject	declaration of 'tail' as array of voids	=	struct S { int n; void tail[]; };
+fn_def_param	reject	'void' must be the only parameter and unnamed	=	int f(void x) { return 0; }
+fptr_member_param	reject	'void' must be the only parameter and unnamed	=	struct S { void (*cb)(void x); };
+fptr_param_named	reject	'void' must be the only parameter and unnamed	=	void f(void (*cb)(void x));
+fs_extern	accept	-	=	extern void v; void *p = &v;
+fs_init	reject	variable 'x' has initializer but incomplete type	=	void x = 0;
+fs_obj	reject	storage size of 'x' isn't known	=	void x;
+fs_static	reject	variable or field 'x' declared void	=	static void x;
+fs_static_init	reject	variable or field 'x' declared void	=	static void x = 0;
+kr_void	reject	parameter 'x' declared with void type	=	int f(x) void x; { return 0; }
+kr_void_arr	reject	declaration of 'x' as array of voids	=	int f(x) void x[2]; { return 0; }
+member	reject	variable or field 'v' declared void	=	struct S { int i; void v; };
+member_typedef	reject	variable or field 'v' declared void	=	typedef void V; struct S { int i; V v; };
+nested_member	reject	variable or field 'v' declared void	=	struct O { struct { void v; } in; };
+ok_cl	accept	-	=	int f(void){ return (int){3} + ((int[2]){1, 2})[1]; }
+ok_fptr_arr	accept	-	=	void (*fp[3])(int); void *pa[3]; void (*fpp)(void); void (*(*q)[2])(void);
+ok_param_arrays	accept	-	=	int f(int a[2][3], void (*g)(int b[]), char c[]); int f(int a[2][3], void (*g)(int b[]), char c[]) { return a[1][2] + c[0]; }
+ok_param_arrays2	accept	-	=	void f(int a[2], ...); void k(x) int x[2]; { (void)x; }
+ok_sc_valid	accept	-	=	int (*f(void))[3]; int (*a[2])(void); int (*h(void))(int); int (*(*k)(void))[2]; int z[2][3]; int (*(*q[2])(void))[3]; int (*(*r)(void))(int); void (*signal2(int, void (*)(int)))(int);
+ok_sizeof_void	accept	-	=	int n = sizeof(void); int m = _Alignof(void); void *vp; int k = sizeof(void *[2]);
+ok_typedef_param	accept	-	=	typedef void V; int f(V); int g(V) { return 0; }
+param_arr	reject	declaration of 'a' as array of voids	=	void f(void a[2]);
+param_const_void	reject	'void' as only parameter may not be qualified	=	int f(const void);
+param_named	reject	'void' must be the only parameter and unnamed	=	int f(int a, void x);
+param_unnamed_second	reject	'void' must be the only parameter and unnamed	=	int f(int, void);
+param_void_ellipsis	reject	'void' must be the only parameter	=	int f(void, ...);
+ptr_arr	reject	declaration of 'p' as array of voids	=	void (*p)[3];
+# ret_arr: both reject; GCC builds the element type first and so reports the
+# array of voids, lccc's parser reports the function returning an array.
+ret_arr	reject	'g' declared as function returning an array	declaration of 'g' as array of voids	void g(void)[2];
+sc_arr_of_fn	reject	declaration of 'a' as array of functions	=	int a[2](void);
+sc_fn_ret_arr	reject	'g' declared as function returning an array	=	int g(void)[2];
+sc_fn_ret_fn	reject	'g' declared as function returning a function	=	int g(void)(void);
+sc_member_fn_ret_arr	reject	'g' declared as function returning an array	=	struct S { int g(void)[2]; };
+sc_paren_arr_of_fn	reject	declaration of 'a' as array of functions	=	int (a[2])(void);
+sc_paren_fn_ret_arr	reject	'g' declared as function returning an array	=	int (g(void))[2];
+sizeof_arr	reject	declaration of type name as array of voids	=	int n = sizeof(void[2]);
+sizeof_struct_def	reject	variable or field 'v' declared void	=	int n = sizeof(struct T { void v; });
+typedef_void_ok	accept	-	=	typedef void V; V *p;
+typeof_arr	reject	declaration of type name as array of voids	=	typeof(void[2]) *p;
+typeof_obj	reject	storage size of 'x' isn't known	=	typeof(void) x;
+typeof_sizeof	reject	declaration of type name as array of voids	=	void f(void){ (void)sizeof(typeof(void[2])); }
+umember	reject	variable or field 'v' declared void	=	union U { void v; int i; };
+va_arg_arr	reject	declaration of type name as array of voids	=	void f(int n, ...){ __builtin_va_list ap; __builtin_va_start(ap, n); (void)__builtin_va_arg(ap, void[2]); __builtin_va_end(ap); }

@@ -1,0 +1,231 @@
+{
+  "schema": 1,
+  "semantic_loop_equivalence_verified": false,
+  "flags": "-O2 -march=x86-64-v3",
+  "local_flags": "-O2 -march=x86-64-v3",
+  "oracles": [
+    "gcc16.2",
+    "clang",
+    "icx"
+  ],
+  "ranked": [
+    {
+      "benchmark": "sqlite_varint",
+      "symbol": "sqlite_put_varint",
+      "lccc_insns": 6,
+      "lccc_bytes_per_trip": 1,
+      "lccc_density": 6.0,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB10",
+      "best_oracle": "clang",
+      "best_density": 0.25,
+      "ratio": 24.0,
+      "oracles": {
+        "gcc16.2": null,
+        "clang": 0.25,
+        "icx": null
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "linux_find_bit",
+      "symbol": "main",
+      "lccc_insns": 18,
+      "lccc_bytes_per_trip": 8,
+      "lccc_density": 2.25,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB13",
+      "best_oracle": "clang",
+      "best_density": 0.3125,
+      "ratio": 7.2,
+      "oracles": {
+        "gcc16.2": 0.8125,
+        "clang": 0.3125,
+        "icx": 0.875
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "sqlite_varint",
+      "symbol": "main",
+      "lccc_insns": 19,
+      "lccc_bytes_per_trip": 8,
+      "lccc_density": 2.375,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB32",
+      "best_oracle": "icx",
+      "best_density": 0.875,
+      "ratio": 2.7142857142857144,
+      "oracles": {
+        "gcc16.2": 4.0,
+        "clang": 2.0,
+        "icx": 0.875
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "gzip_crc32",
+      "symbol": "main",
+      "lccc_insns": 8,
+      "lccc_bytes_per_trip": 1,
+      "lccc_density": 8.0,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB8",
+      "best_oracle": "icx",
+      "best_density": 3.75,
+      "ratio": 2.1333333333333333,
+      "oracles": {
+        "gcc16.2": 8.0,
+        "clang": 4.5,
+        "icx": 3.75
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "glibc_memcmp",
+      "symbol": "main",
+      "lccc_insns": 16,
+      "lccc_bytes_per_trip": 8,
+      "lccc_density": 2.0,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB28",
+      "best_oracle": "icx",
+      "best_density": 1.40625,
+      "ratio": 1.4222222222222223,
+      "oracles": {
+        "gcc16.2": 1.75,
+        "clang": 1.5625,
+        "icx": 1.40625
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "glibc_memcmp",
+      "symbol": "glibc_memcmp_common_alignment",
+      "lccc_insns": 21,
+      "lccc_bytes_per_trip": 32,
+      "lccc_density": 0.65625,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB8",
+      "best_oracle": "gcc16.2",
+      "best_density": 0.625,
+      "ratio": 1.05,
+      "oracles": {
+        "gcc16.2": 0.625,
+        "clang": 0.65625,
+        "icx": 0.65625
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "expat_siphash24",
+      "symbol": "sip24_update",
+      "lccc_insns": 10,
+      "lccc_bytes_per_trip": 1,
+      "lccc_density": 10.0,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB4",
+      "best_oracle": "gcc16.2",
+      "best_density": 10.0,
+      "ratio": 1.0,
+      "oracles": {
+        "gcc16.2": 10.0,
+        "clang": null,
+        "icx": null
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "expat_siphash24",
+      "symbol": "main",
+      "lccc_insns": 33,
+      "lccc_bytes_per_trip": 32,
+      "lccc_density": 1.03125,
+      "lccc_vector_bits": 256,
+      "lccc_loop": ".LBB77",
+      "best_oracle": "clang",
+      "best_density": 1.375,
+      "ratio": 0.75,
+      "oracles": {
+        "gcc16.2": 5.0,
+        "clang": 1.375,
+        "icx": 10.0
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "zlib_ng_adler32",
+      "symbol": "main",
+      "lccc_insns": 14,
+      "lccc_bytes_per_trip": 32,
+      "lccc_density": 0.4375,
+      "lccc_vector_bits": 256,
+      "lccc_loop": ".LBB17",
+      "best_oracle": "icx",
+      "best_density": 3.25,
+      "ratio": 0.1346153846153846,
+      "oracles": {
+        "gcc16.2": 3.375,
+        "clang": 3.375,
+        "icx": 3.25
+      },
+      "note": ""
+    }
+  ],
+  "unranked": [
+    {
+      "benchmark": "gzip_crc32",
+      "symbol": "gzip_crc32_update",
+      "lccc_insns": 8,
+      "lccc_bytes_per_trip": 1,
+      "lccc_density": 8.0,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB2",
+      "best_oracle": null,
+      "best_density": null,
+      "ratio": null,
+      "oracles": {
+        "gcc16.2": null,
+        "clang": null,
+        "icx": null
+      },
+      "note": "only 0 oracle(s) emit a comparable 'gzip_crc32_update' (inlining differs): not ranked"
+    },
+    {
+      "benchmark": "linux_find_bit",
+      "symbol": "linux_find_next_andnot_bit",
+      "lccc_insns": 10,
+      "lccc_bytes_per_trip": 8,
+      "lccc_density": 1.25,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB4",
+      "best_oracle": null,
+      "best_density": null,
+      "ratio": null,
+      "oracles": {
+        "gcc16.2": null,
+        "clang": null,
+        "icx": null
+      },
+      "note": "only 0 oracle(s) emit a comparable 'linux_find_next_andnot_bit' (inlining differs): not ranked"
+    },
+    {
+      "benchmark": "glibc_memcmp",
+      "symbol": "glibc_memcmp_bytes",
+      "lccc_insns": 7,
+      "lccc_bytes_per_trip": 1,
+      "lccc_density": 7.0,
+      "lccc_vector_bits": 0,
+      "lccc_loop": ".LBB2",
+      "best_oracle": null,
+      "best_density": null,
+      "ratio": null,
+      "oracles": {
+        "gcc16.2": null,
+        "clang": null,
+        "icx": null
+      },
+      "note": "only 0 oracle(s) emit a comparable 'glibc_memcmp_bytes' (inlining differs): not ranked"
+    }
+  ]
+}

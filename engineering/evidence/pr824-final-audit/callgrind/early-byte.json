@@ -1,0 +1,476 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "binary_trees",
+    "byte_load_reassembly",
+    "expat_siphash24",
+    "expat_xml_scan",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "lz4_match_extend",
+    "mandelbrot",
+    "sha256_transform",
+    "sieve",
+    "spectral_norm",
+    "sqlite_varint",
+    "strlen_bench",
+    "switch_dispatch",
+    "zlib_ng_adler32_combine"
+  ],
+  "results": {
+    "sieve": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=100000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3536,
+          3536
+        ],
+        "d1_misses": [
+          51854,
+          51854
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          242,
+          242
+        ],
+        "ir_mine": 1623131,
+        "ir_ratio": 1.0,
+        "ir_ref": 1623131,
+        "ll_misses": [
+          4468,
+          4468
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/sieve/manifest.json"
+    },
+    "binary_trees": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "metrics": {
+        "conditional_mispredicts": [
+          207634,
+          207634
+        ],
+        "d1_misses": [
+          54337,
+          54337
+        ],
+        "i1_misses": [
+          1378,
+          1378
+        ],
+        "indirect_mispredicts": [
+          238,
+          238
+        ],
+        "ir_mine": 31600975,
+        "ir_ratio": 1.0,
+        "ir_ref": 31600975,
+        "ll_misses": [
+          4971,
+          4971
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/binary_trees/manifest.json"
+    },
+    "spectral_norm": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          8574,
+          8574
+        ],
+        "d1_misses": [
+          1939,
+          1939
+        ],
+        "i1_misses": [
+          1421,
+          1421
+        ],
+        "indirect_mispredicts": [
+          233,
+          233
+        ],
+        "ir_mine": 8259357,
+        "ir_ratio": 1.0,
+        "ir_ref": 8259357,
+        "ll_misses": [
+          2969,
+          2969
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/spectral_norm/manifest.json"
+    },
+    "mandelbrot": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DWIDTH=128 -DHEIGHT=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          15485,
+          15485
+        ],
+        "d1_misses": [
+          1889,
+          1889
+        ],
+        "i1_misses": [
+          1354,
+          1354
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 6006332,
+        "ir_ratio": 1.0,
+        "ir_ref": 6006332,
+        "ll_misses": [
+          2899,
+          2899
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/mandelbrot/manifest.json"
+    },
+    "strlen_bench": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DNSTRINGS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          132016,
+          132016
+        ],
+        "d1_misses": [
+          221248,
+          221248
+        ],
+        "i1_misses": [
+          1385,
+          1385
+        ],
+        "indirect_mispredicts": [
+          251,
+          251
+        ],
+        "ir_mine": 9286182,
+        "ir_ratio": 1.0,
+        "ir_ref": 9286182,
+        "ll_misses": [
+          5365,
+          5365
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/strlen_bench/manifest.json"
+    },
+    "switch_dispatch": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3297,
+          3297
+        ],
+        "d1_misses": [
+          1883,
+          1883
+        ],
+        "i1_misses": [
+          1361,
+          1361
+        ],
+        "indirect_mispredicts": [
+          18994,
+          18994
+        ],
+        "ir_mine": 553802,
+        "ir_ratio": 1.0,
+        "ir_ref": 553802,
+        "ll_misses": [
+          2904,
+          2904
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/switch_dispatch/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm ",
+      "metrics": {
+        "conditional_mispredicts": [
+          23361,
+          23360
+        ],
+        "d1_misses": [
+          1955,
+          1959
+        ],
+        "i1_misses": [
+          1382,
+          1383
+        ],
+        "indirect_mispredicts": [
+          237,
+          237
+        ],
+        "ir_mine": 82351400,
+        "ir_ratio": 0.999271775630497,
+        "ir_ref": 82411414,
+        "ll_misses": [
+          2993,
+          2993
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/byte_load_reassembly/manifest.json"
+    },
+    "zlib_ng_adler32_combine": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=10000",
+      "metrics": {
+        "conditional_mispredicts": [
+          5525,
+          5525
+        ],
+        "d1_misses": [
+          1913,
+          1913
+        ],
+        "i1_misses": [
+          1382,
+          1382
+        ],
+        "indirect_mispredicts": [
+          234,
+          234
+        ],
+        "ir_mine": 21845309,
+        "ir_ratio": 1.0,
+        "ir_ref": 21845309,
+        "ll_misses": [
+          2947,
+          2947
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/zlib_ng_adler32_combine/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25500,
+          25500
+        ],
+        "d1_misses": [
+          2189,
+          2189
+        ],
+        "i1_misses": [
+          1364,
+          1364
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 1667473,
+        "ir_ratio": 1.0,
+        "ir_ref": 1667473,
+        "ll_misses": [
+          3163,
+          3163
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/expat_xml_scan/manifest.json"
+    },
+    "expat_siphash24": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          116275,
+          116275
+        ],
+        "d1_misses": [
+          1901,
+          1901
+        ],
+        "i1_misses": [
+          1422,
+          1422
+        ],
+        "indirect_mispredicts": [
+          1429,
+          1429
+        ],
+        "ir_mine": 15209792,
+        "ir_ratio": 1.0,
+        "ir_ref": 15209792,
+        "ll_misses": [
+          2973,
+          2973
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/expat_siphash24/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          12583,
+          12583
+        ],
+        "d1_misses": [
+          2239,
+          2239
+        ],
+        "i1_misses": [
+          1375,
+          1375
+        ],
+        "indirect_mispredicts": [
+          2054,
+          2054
+        ],
+        "ir_mine": 823381,
+        "ir_ratio": 1.0,
+        "ir_ref": 823381,
+        "ll_misses": [
+          3208,
+          3208
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/sqlite_varint/manifest.json"
+    },
+    "linux_find_bit": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=32",
+      "metrics": {
+        "conditional_mispredicts": [
+          11862,
+          11862
+        ],
+        "d1_misses": [
+          137239,
+          137239
+        ],
+        "i1_misses": [
+          1358,
+          1358
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 5958770,
+        "ir_ratio": 1.0,
+        "ir_ref": 5958770,
+        "ll_misses": [
+          6999,
+          6999
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/linux_find_bit/manifest.json"
+    },
+    "linux_find_bit_scaled": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DPASSES=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          36572,
+          36572
+        ],
+        "d1_misses": [
+          530619,
+          530619
+        ],
+        "i1_misses": [
+          1365,
+          1365
+        ],
+        "indirect_mispredicts": [
+          232,
+          232
+        ],
+        "ir_mine": 22942668,
+        "ir_ratio": 1.0,
+        "ir_ref": 22942668,
+        "ll_misses": [
+          7006,
+          7006
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/linux_find_bit_scaled/manifest.json"
+    },
+    "sha256_transform": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          4883,
+          4883
+        ],
+        "d1_misses": [
+          1903,
+          1903
+        ],
+        "i1_misses": [
+          1386,
+          1386
+        ],
+        "indirect_mispredicts": [
+          236,
+          236
+        ],
+        "ir_mine": 1822935,
+        "ir_ratio": 1.0,
+        "ir_ref": 1822935,
+        "ll_misses": [
+          2935,
+          2935
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/sha256_transform/manifest.json"
+    },
+    "lz4_match_extend": {
+      "flags": "-O2 -march=x86-64-v3 -fwrapv -Wl,--no-as-needed -lm -DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          8271,
+          8271
+        ],
+        "d1_misses": [
+          14195,
+          14195
+        ],
+        "i1_misses": [
+          1407,
+          1407
+        ],
+        "indirect_mispredicts": [
+          244,
+          244
+        ],
+        "ir_mine": 1154579,
+        "ir_ratio": 1.0,
+        "ir_ref": 1154579,
+        "ll_misses": [
+          4411,
+          4411
+        ]
+      },
+      "manifest": "/home/user/.cache/pr824-measurements/early-byte/lz4_match_extend/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "sieve",
+    "binary_trees",
+    "spectral_norm",
+    "mandelbrot",
+    "strlen_bench",
+    "switch_dispatch",
+    "zlib_ng_adler32_combine",
+    "expat_xml_scan",
+    "expat_siphash24",
+    "sqlite_varint",
+    "linux_find_bit",
+    "linux_find_bit_scaled",
+    "sha256_transform",
+    "lz4_match_extend",
+    "byte_load_reassembly"
+  ]
+}

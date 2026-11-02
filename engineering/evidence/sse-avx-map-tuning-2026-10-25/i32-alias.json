@@ -1,0 +1,136 @@
+{
+  "complete": true,
+  "source_sha256": "89bdbea5499c5dff66f246fcaa1e42a70380bd92d7c0c9029f538bb9bb9eb42e",
+  "arms": [
+    {
+      "name": "gcc",
+      "command": [
+        "/home/user/.cache/oracle-bin/gcc-16",
+        "-O2",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/gcc"
+      ],
+      "env": {},
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d"
+    },
+    {
+      "name": "clang",
+      "command": [
+        "/home/user/artifacts/sse/clang23-gcc16",
+        "-O2",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/clang"
+      ],
+      "env": {},
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d"
+    },
+    {
+      "name": "sse2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/sse2"
+      ],
+      "env": {},
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d",
+      "packed_multiply_count": 4,
+      "assembly_sha256": "2e5d9e577f06d5fb7ca177bef594f64eee9c786d24de290395d5d51a252c45bf"
+    },
+    {
+      "name": "sse2-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/sse2-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_I32_UNROLL": "1"
+      },
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "794384308d53c2c32537f657cfb14944d5f2c46ed6afd4b4bdbcd0b0333a2ec9"
+    },
+    {
+      "name": "sse41",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/sse41"
+      ],
+      "env": {},
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "daf9de7f967eb92006f85814aa5069b9a8cad0012dbdc07a77d80d8eb74ddb6a"
+    },
+    {
+      "name": "sse41-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/sse41-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_I32_UNROLL": "1"
+      },
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "53c7aabf4bbd6a22ed7276224b7bad0240c716448c3683a64bc9ae7b15a23a82"
+    },
+    {
+      "name": "avx2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/avx2"
+      ],
+      "env": {},
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "e19d0325db8863997a3380cc78ce53218c32694f11d29c0be4e466d5d9e5a0cf"
+    },
+    {
+      "name": "avx2-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/i32_map_unroll_alias.c",
+        "-o",
+        "/tmp/i32-map-unroll-skzvztzv/avx2-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_I32_UNROLL": "1"
+      },
+      "cases": 10605,
+      "sha256": "71c8f899643c5d800715701e89a83aab56d2216cbf11e462aa23f30351a3b04d",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "c2c925d432ebf2e60bc7535f74e200cb2568dceb3eb8936223d2233bd1c37e83"
+    }
+  ]
+}

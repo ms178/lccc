@@ -1,0 +1,12 @@
+   Compiling lccc v0.1.0 (/home/user/.cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 05s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 4 tests
+test passes::loop_bound::tests::affine_bound_exit_overflow_and_u64_carriers ... ok
+test passes::loop_bound::tests::affine_bound_matcher_preserves_ssa_metadata_and_is_idempotent ... ok
+test passes::loop_bound::tests::affine_bound_refusals_are_transactional ... ok
+test passes::loop_bound::tests::affine_bound_exhaustive_four_bit_modular_trajectories ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 4723 filtered out; finished in 0.00s
+

@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""Compare two CTest JUnit reports -- by identity, not by length.
+
+The Expat workload builds the same upstream suite twice, once with GCC and once
+with LCCC, and the workload is only a *differential* if both runs executed the
+same set of tests.  Counting `<testcase>` elements is not that check: a
+candidate configuration that silently dropped `runtests` (or renamed a test, or
+gained an extra one) produced the same "2 versus 1, status: pass" summary that a
+matching run produces.  Two equal counts over different test sets is the most
+convincing kind of nothing.
+
+So this module compares the *multiset of testcase identities* and each test's
+status, and it compares the CTest/CMake feature configuration that produced
+them -- equal test names must not excuse a weaker candidate build.
+
+Compiler-free by design: `--self-test` runs the whole contract against
+in-memory fixtures, which is what makes it a CI gate (`ci_local.sh`
+`expat-junit-contract`) rather than a claim about an Expat build.
+
+Usage:
+  junit_check.py --reference ctest-gcc.xml --candidate ctest-lccc.xml \
+      [--reference-config cmake-cache-gcc.txt --candidate-config cmake-cache-lccc.txt] \
+      [--out comparison.json]
+  junit_check.py --self-test
+"""
+from __future__ import annotations
+
+import argparse
+import tempfile
+import json
+import os
+import re
+import shlex
+import sys
+import xml.etree.ElementTree as ET
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+
+# CTest's `--output-junit` writes <testsuites><testsuite><testcase .../>; older
+# or hand-written reports may start at <testsuite>. Both are accepted, and
+# nothing else is.
+ALLOWED_ROOTS = ("testsuites", "testsuite")
+# Every status a `<testcase>` can carry.  A report element we do not model must
+# not be readable as a pass: that is how a new CTest failure class becomes a
+# silent green.
+STATUSES = ("pass", "failure", "error", "skipped")
+# Only these CMake cache keys may differ between the two configurations: they
+# *are* the point of the differential (which compiler produced the objects) or
+# describe where the build happened.  Everything else that changes the compiled
+# surface -- EXPAT_* feature switches, build type, generator -- must match.
+#
+# `CMAKE_*_FLAGS*` must stay off this list: it would put the flags themselves inside
+# "the compiler under test differs".  That is the one hole wide enough to lose the
+# measurement: -O2 against -O0, a dropped -DNDEBUG, a stray -m32 all sit in those
+# entries, and each would have been waved through while the JUnit rows still
+# matched.  They are compared now, with the paths that legitimately differ removed
+# -- see flag_signature.
+CONFIG_ALLOWLIST = (
+    "CMAKE_C_COMPILER",
+    "CMAKE_C_COMPILER_LAUNCHER",
+    "CMAKE_CXX_COMPILER",
+    "CMAKE_HOME_DIRECTORY",
+    "CMAKE_CACHEFILE_DIR",
+    "PROJECT_SOURCE_DIR",
+    "PROJECT_BINARY_DIR",
+    "CMAKE_INSTALL_PREFIX",
+)
+
+# `-I<dir>` and friends name a *location*, and the two build trees are different
+# locations; `run.sh` even adds an extra `-I$(gcc -print-file-name=include)` to the
+# lccc arm only, because the wrapper needs the compiler's own headers.  Those are
+# the legitimate delta, so the token and its argument are normalised away.  The
+# space-taking forms are listed too: `-isystem <dir>` would otherwise survive as
+# the bare word `-isystem` on one side and nothing on the other.
+_PATH_TAKING = ("-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros",
+                "-MF", "-MT", "-MQ", "-F", "-iframework", "-ifcse", "-gcc-toolchain")
+
+FLAGS_KEY = re.compile(r"^CMAKE_(C|CXX|OBJC|OBJCXX|ASM|ASM_MARM|Linker)_FLAGS")
+
+
+def flag_signature(value: str) -> tuple[str, ...]:
+    """The flags that change the program, with header-search paths removed.
+
+    Everything not consumed as a path is kept, including the cosmetic-looking
+    `-f` switches: guessing which of them are cosmetic is how a flag that changes
+    codegen ends up normalised away.  A false alarm here costs one run and buys a
+    rule that cannot be quietly widened.
+    """
+    try:
+        parts = shlex.split(value or "")
+    except ValueError:
+        parts = value.split()  # unbalanced quoting: judge the raw string, not nothing
+    kept: list[str] = []
+    skip_argument = False
+    for part in parts:
+        if skip_argument:
+            skip_argument = False
+            continue
+        if part in _PATH_TAKING:
+            skip_argument = True
+            continue
+        if part.startswith(_PATH_TAKING):
+            continue
+        kept.append(part)
+    return tuple(kept)
+
+
+@dataclass(frozen=True)
+class Case:
+    classname: str
+    name: str
+    status: str
+
+
+class ReportError(ValueError):
+    """A report that cannot be compared, as opposed to one that differs."""
+
+
+_ATTR_STATUS = {
+    "fail": "failure", "failed": "failure", "notrun": "skipped", "skipped": "skipped",
+    "timeout": "failure", "passed": "pass", "disabled": "skipped",
+}
+
+
+def _status_of(element: ET.Element) -> str:
+    """Separate execution state from outcome, validating every channel.
+
+    CTest's status="run" says the test executed; success is the absence of
+    failure/error/skipped records, not an early return from that attribute.
+    Never let one known attribute hide another unknown or conflicting one.
+    """
+    outcomes = {tag for tag in ("failure", "error", "skipped")
+                if element.find(tag) is not None}
+    executed = False
+    for attribute in ("status", "result"):
+        value = element.get(attribute)
+        if value is None:
+            continue
+        token = value.strip().lower()
+        if attribute == "status" and token == "run":
+            executed = True
+            continue
+        normalized = _ATTR_STATUS.get(token)
+        if normalized is None:
+            raise ReportError(f"unrecognised {attribute}={value!r} on a <testcase>; "
+                              f"refusing to read an unknown status as a pass")
+        outcomes.add(normalized)
+    if len(outcomes) > 1 or (executed and "skipped" in outcomes):
+        raise ReportError(f"contradictory testcase status: executed={executed}, "
+                          f"outcomes={sorted(outcomes)}")
+    return next(iter(outcomes), "pass")
+
+
+def _validate_counts(root: ET.Element) -> None:
+    """Suite summaries must agree with the records they claim to summarize.
+
+    Counters are optional in JUnit. When present, validate each suite against
+    its own subtree, including nested suites; an aggregate failure must not
+    disappear simply because a truncated report omitted its failing testcase.
+    CTest counts disabled tests separately from runtime skips in its summary,
+    although both remain non-passing outcomes for the workload comparison.
+    """
+    for suite in root.iter():
+        if suite.tag not in ALLOWED_ROOTS:
+            continue
+        cases = list(suite.iter("testcase"))
+        counts = Counter(_status_of(case) for case in cases)
+        disabled = sum(any((case.get(attr) or "").strip().lower() == "disabled"
+                           for attr in ("status", "result")) for case in cases)
+        expected = {"tests": len(cases), "failures": counts["failure"],
+                    "errors": counts["error"], "skipped": counts["skipped"] - disabled,
+                    "disabled": disabled}
+        for attribute in expected:
+            value = suite.get(attribute)
+            if value is None:
+                continue
+            if re.fullmatch(r"[0-9]+", value) is None:
+                raise ReportError(f"invalid suite {attribute}={value!r}")
+            actual = int(value)
+            if actual != expected[attribute]:
+                raise ReportError(f"suite {attribute}={value} disagrees with testcase records")
+
+
+def parse_junit(path: Path) -> list[Case]:
+    """Every `<testcase>` in a CTest JUnit file, with a usable identity.
+
+    Raises `ReportError` rather than returning a shorter list when the report is
+    malformed: an unreadable XML file, no testcases at all, or a testcase
+    without a name are all reasons the *comparison* is invalid, not reasons to
+    compare fewer tests.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise ReportError(f"{path}: cannot be parsed as JUnit XML: {exc}") from exc
+    if root.tag not in ALLOWED_ROOTS:
+        raise ReportError(f"{path}: unexpected JUnit root <{root.tag}>, "
+                          f"expected one of {list(ALLOWED_ROOTS)}")
+    cases: list[Case] = []
+    for element in root.iter("testcase"):
+        name = (element.get("name") or "").strip()
+        if not name:
+            raise ReportError(f"{path}: a <testcase> without a name cannot be "
+                              f"compared; refusing to treat it as absent or as a pass")
+        cases.append(Case((element.get("classname") or "").strip(), name,
+                          _status_of(element)))  # ReportError propagates: unknown is fatal
+    if not cases:
+        raise ReportError(f"{path}: contains no <testcase> elements; an empty CTest "
+                          f"report is not a passing differential")
+    _validate_counts(root)
+    return cases
+
+
+def _index(cases: list[Case], label: str) -> dict[tuple[str, str], Counter]:
+    index: dict[tuple[str, str], Counter] = {}
+    for case in cases:
+        index.setdefault((case.classname, case.name), Counter())[case.status] += 1
+    for key, statuses in index.items():
+        if sum(statuses.values()) > 1 and len(statuses) > 1:
+            # Same identity, different recorded status: which one is the run?
+            raise ReportError(f"{label}: {key[0]}/{key[1]} appears with mixed statuses "
+                              f"{dict(statuses)}; the report is self-contradictory")
+    return index
+
+
+def compare(reference: list[Case], candidate: list[Case], *,
+            reference_label: str = "reference", candidate_label: str = "candidate") -> dict:
+    """Multiset identity + status comparison, with every difference named."""
+    problems: list[str] = []
+    ref = _index(reference, reference_label)
+    cand = _index(candidate, candidate_label)
+    missing = sorted(set(ref) - set(cand))
+    extra = sorted(set(cand) - set(ref))
+    if missing:
+        problems.append(f"{candidate_label} did not run {len(missing)} test(s) the "
+                        f"{reference_label} ran: "
+                        + ", ".join(f"{a}/{b}" for a, b in missing[:20]))
+    if extra:
+        problems.append(f"{candidate_label} ran {len(extra)} test(s) the {reference_label} "
+                        f"did not: " + ", ".join(f"{a}/{b}" for a, b in extra[:20]))
+    status_changes = []
+    for key in sorted(set(ref) & set(cand)):
+        if ref[key] != cand[key]:
+            status_changes.append(f"{key[0]}/{key[1]}: {dict(ref[key])} vs {dict(cand[key])}")
+    if status_changes:
+        problems.append(f"{len(status_changes)} test(s) changed status: "
+                        + "; ".join(status_changes[:20]))
+    not_green = []
+    for label, cases in ((reference_label, reference), (candidate_label, candidate)):
+        bad = [c for c in cases if c.status != "pass"]
+        if bad:
+            not_green.append(f"{label}: {len(bad)} non-passing test(s), e.g. "
+                             + ", ".join(f"{c.classname}/{c.name}({c.status})" for c in bad[:10]))
+    if not_green:
+        problems.extend(not_green)
+    return {
+        "comparable": not problems,
+        "problems": problems,
+        "reference_tests": len(reference),
+        "candidate_tests": len(candidate),
+        "reference_unique": len(ref),
+        "candidate_unique": len(cand),
+        "duplicate_identities": {
+            reference_label: sum(v for k, v in
+                                 Counter((c.classname, c.name) for c in reference).items() if v > 1),
+            candidate_label: sum(v for k, v in
+                                 Counter((c.classname, c.name) for c in candidate).items() if v > 1),
+        },
+    }
+
+
+_CACHE_LINE = re.compile(r"^(?P<key>[^:]+):(?P<type>[^=]*)=(?P<value>.*)$")
+
+
+def config_manifest(text: str) -> dict[str, str]:
+    """`KEY=VALUE` pairs from a CMakeCache.txt that describe the built surface."""
+    manifest: dict[str, str] = {}
+    for line in text.splitlines():
+        match = _CACHE_LINE.match(line.strip())
+        if not match:
+            continue
+        key = match.group("key")
+        if key.startswith(("EXPAT_", "CMAKE_BUILD_TYPE", "CMAKE_GENERATOR", "CMAKE_C_FLAGS",
+                           "CMAKE_INSTALL_PREFIX", "BUILD_SHARED")) or FLAGS_KEY.match(key):
+            manifest[key] = match.group("value")
+    return manifest
+
+
+def compare_config(reference: dict[str, str], candidate: dict[str, str]) -> list[str]:
+    """Configuration differences that are NOT the compiler under test."""
+    problems = []
+    for key in sorted(set(reference) | set(candidate)):
+        if FLAGS_KEY.match(key):
+            want = flag_signature(reference.get(key, ""))
+            got = flag_signature(candidate.get(key, ""))
+            if want != got:
+                problems.append(
+                    f"configuration differs on {key} beyond header search paths: "
+                    f"{' '.join(want)!r} vs {' '.join(got)!r} -- the two builds did "
+                    f"not compile the same program")
+            continue
+        if any(key == allowed or key.startswith(allowed + "-") for allowed in CONFIG_ALLOWLIST):
+            continue
+        if reference.get(key) != candidate.get(key):
+            problems.append(f"configuration differs on {key}: "
+                            f"{reference.get(key)!r} vs {candidate.get(key)!r}")
+    return problems
+
+
+def self_test() -> int:
+    """The witnesses this module exists to refuse, plus the control that passes."""
+    ok = 0
+    ref = [Case("s", "alpha", "pass"), Case("s", "beta", "pass")]
+    same = [Case("s", "alpha", "pass"), Case("s", "beta", "pass")]
+
+    def expect(label: str, want_problem: bool, result: dict) -> None:
+        nonlocal ok
+        got = not result["comparable"]
+        if got != want_problem:
+            raise AssertionError(f"{label}: expected problem={want_problem}, got {result}")
+        ok += 1
+
+    expect("identical suites pass", False, compare(ref, same))
+    expect("omitted test is a problem", True, compare(ref, same[:1]))
+    expect("equal count, different test is a problem", True,
+           compare(ref, [Case("s", "alpha", "pass"), Case("s", "gamma", "pass")]))
+    expect("status change is a problem", True,
+           compare(ref, [Case("s", "alpha", "failure"), Case("s", "beta", "pass")]))
+    expect("skipped is a problem", True,
+           compare(ref, [Case("s", "alpha", "skipped"), Case("s", "beta", "pass")]))
+    expect("duplicates on one side only are a problem", True,
+           compare(ref, [Case("s", "alpha", "pass"), Case("s", "alpha", "pass")]))
+    doubled = [Case("s", "alpha", "pass"), Case("s", "alpha", "pass"), Case("s", "beta", "pass")]
+    expect("matched duplicates are matched, not masked", False, compare(doubled, list(doubled)))
+    mixed = [Case("s", "alpha", "pass"), Case("s", "alpha", "failure"), Case("s", "beta", "pass")]
+    try:
+        compare(mixed, list(mixed))
+    except ReportError:
+        ok += 1
+    else:
+        raise AssertionError("a self-contradictory report must be refused, not compared")
+    # Parse-level controls exercise the same public API as the workload runner.
+    fixtures = [
+        ("run-pass", '<testcase name="a" status="run"/>', "pass"),
+        ("run-failure", '<testcase name="a" status="run"><failure/></testcase>', "failure"),
+        ("run-error", '<testcase name="a" status="run"><error/></testcase>', "error"),
+        ("run-result", '<testcase name="a" status="run" result="failed"/>', "failure"),
+        ("notrun", '<testcase name="a" status="notrun"/>', "skipped"),
+        ("conflicting-attrs", '<testcase name="a" status="passed" result="failed"/>', None),
+        ("conflicting-child", '<testcase name="a" status="passed"><failure/></testcase>', None),
+        ("conflicting-children", '<testcase name="a"><error/><failure/></testcase>', None),
+        ("run-skipped", '<testcase name="a" status="run"><skipped/></testcase>', None),
+        ("unknown-later-attr", '<testcase name="a" status="passed" result="mystery"/>', None),
+        ("unknown-with-child", '<testcase name="a" status="mystery"><failure/></testcase>', None),
+        ("run-is-not-an-outcome", '<testcase name="a" result="run"/>', None),
+        ("unnamed", '<testcase classname="s"/>', None),
+    ]
+    with tempfile.TemporaryDirectory(prefix="lccc-expat-junit-") as tmp:
+        path = Path(tmp) / "report.xml"
+        for label, body, outcome in fixtures:
+            path.write_text('<testsuite>' + body + '</testsuite>')
+            try:
+                cases = parse_junit(path)
+            except ReportError:
+                if outcome is not None:
+                    raise AssertionError(f"{label}: valid outcome rejected") from None
+            else:
+                if outcome is None or cases[0].status != outcome:
+                    raise AssertionError(f"{label}: unexpected result {cases}")
+            ok += 1
+        for bad in ('<testsuites/>', '<Foo/>', '<testsuite>',
+                    '<testsuite failures="1"><testcase name="a" status="run"/></testsuite>',
+                    '<testsuite tests="2"><testcase name="a"/></testsuite>',
+                    '<testsuite errors="0"><testcase name="a"><error/></testcase></testsuite>',
+                    '<testsuite skipped="1"><testcase name="a"/></testsuite>',
+                    '<testsuite disabled="1"><testcase name="a"/></testsuite>',
+                    '<testsuite tests="-1"><testcase name="a"/></testsuite>',
+                    '<testsuite failures="unknown"><testcase name="a"/></testsuite>',
+                    '<testsuites failures="1"><testsuite><testcase name="a"/></testsuite></testsuites>'):
+            path.write_text(bad)
+            try:
+                parse_junit(path)
+            except ReportError:
+                ok += 1
+            else:
+                raise AssertionError(f"invalid report accepted: {bad}")
+        path.write_text('<testsuites tests="1" failures="1"><testsuite tests="1" failures="1">'
+                        '<testcase name="a" status="run"><failure/></testcase>'
+                        '</testsuite></testsuites>')
+        if parse_junit(path)[0].status != "failure":
+            raise AssertionError("nested matching failure counts lost")
+        ok += 1
+    # Captured from a real CTest producer; the .cmake companion replays all
+    # four outcomes without a compiler. Never weaken fail/skip verdicts.
+    producer = Path(__file__).with_name("ctest-3.31.6-outcomes.xml")
+    observed = parse_junit(producer)
+    if [case.status for case in observed] != ["pass", "failure", "skipped", "skipped"]:
+        raise AssertionError("real CTest outcomes were not preserved")
+    expect("real CTest failures/skips remain non-passing", True, compare(observed, observed))
+    with tempfile.TemporaryDirectory(prefix="lccc-junit-producer-") as tmp:
+        path = Path(tmp) / "report.xml"
+        original = producer.read_text()
+        for old, new in [('skipped="1"', 'skipped="2"'),
+                         ('disabled="1"', 'disabled="0"'),
+                         ('status="disabled"', 'status="notrun"'),
+                         ('status="fail"', 'status="passed"')]:
+            if old not in original:
+                raise AssertionError("producer mutation did not land")
+            path.write_text(original.replace(old, new))
+            try:
+                parse_junit(path)
+            except ReportError:
+                ok += 1
+            else:
+                raise AssertionError("mutated producer report accepted: " + new)
+    config_problems = compare_config({"EXPAT_BUILD_TESTS": "ON"}, {"EXPAT_BUILD_TESTS": "OFF"})
+    if not config_problems:
+        raise AssertionError("a feature switch that differs must be a problem")
+    ok += 1
+    if compare_config({"CMAKE_C_COMPILER": "/usr/bin/gcc"},
+                      {"CMAKE_C_COMPILER": "/tmp/lccc"}):
+        raise AssertionError("the compiler under test is an allowed difference")
+    ok += 1
+    # The flags rule, in both directions.  The first pair is what `run.sh` actually
+    # passes today (`-I$(gcc -print-file-name=include)` on the lccc arm only) and
+    # must be accepted; the rest must be refused, because each one is a different
+    # *program* being compared and the JUnit rows alone would not show it.
+    gcc_flags = "-O2 -DNDEBUG"
+    # `-isystem <dir>` names a location and must normalise away like `-I<dir>`;
+    # a rule that only understands `-I<path>` would fail the real harness pair.
+    if compare_config({"CMAKE_C_FLAGS_RELEASE": "-O2 -DNDEBUG -isystem /tmp/a/inc"},
+                      {"CMAKE_C_FLAGS_RELEASE": "-O2 -DNDEBUG"}):
+        raise AssertionError("a spaced include-path argument must normalise too")
+    ok += 1
+    lccc_flags = "-O2 -DNDEBUG -I/usr/lib/gcc/x86_64-linux-gnu/14/include"
+    if compare_config({"CMAKE_C_FLAGS_RELEASE": gcc_flags},
+                      {"CMAKE_C_FLAGS_RELEASE": lccc_flags}):
+        raise AssertionError("a header path into each build tree is the allowed delta")
+    ok += 1
+    for label, other in (("-O0 instead of -O2", "-O0 -DNDEBUG"),
+                         ("-DNDEBUG dropped", "-O2"),
+                         ("-m32 appears on one side", "-O2 -DNDEBUG -m32"),
+                         ("-fwrapv appears on one side", "-O2 -DNDEBUG -fwrapv"),
+                         ("-UNDEBUG cancels the define", "-O2 -DNDEBUG -UNDEBUG"),
+                         ("empty on the candidate side", "")):
+        if not compare_config({"CMAKE_C_FLAGS_RELEASE": gcc_flags},
+                              {"CMAKE_C_FLAGS_RELEASE": other}):
+            raise AssertionError(f"{label}: a flag difference must be a problem")
+        ok += 1
+    if not compare_config({"CMAKE_C_FLAGS": gcc_flags}, {}):
+        raise AssertionError("a flags entry present on one side only must be a problem")
+    ok += 1
+    print(f"expat JUnit contract: {ok} checks passed")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--reference", type=Path)
+    ap.add_argument("--candidate", type=Path)
+    ap.add_argument("--reference-config", type=Path)
+    ap.add_argument("--candidate-config", type=Path)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args(argv)
+    if args.self_test:
+        return self_test()
+    if not (args.reference and args.candidate):
+        ap.error("--reference and --candidate are required (or --self-test)")
+    reference = parse_junit(args.reference)
+    candidate = parse_junit(args.candidate)
+    result = compare(reference, candidate)
+    if args.reference_config and args.candidate_config:
+        problems = compare_config(config_manifest(args.reference_config.read_text()),
+                                  config_manifest(args.candidate_config.read_text()))
+        result["configuration_problems"] = problems
+        if problems:
+            result["comparable"] = False
+            result["problems"].extend(problems)
+    elif args.reference_config or args.candidate_config:
+        ap.error("--reference-config and --candidate-config come in pairs; a "
+                 "differential without both configurations is not comparable")
+    result["reference_path"] = str(args.reference)
+    result["candidate_path"] = str(args.candidate)
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        # A per-write temp name: the workload's own lock serialises writers, but
+        # a fixed `summary.json.tmp` in a shared artifact dir is one stray
+        # process away from two writers truncating each other.
+        tmp = args.out.with_name(f"{args.out.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        tmp.replace(args.out)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["comparable"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

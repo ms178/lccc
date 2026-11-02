@@ -1,0 +1,2 @@
+NAME                        TYPE SIZE USED PRIO
+/home/user/.cache/lccc.swap file   4G 349M   -2

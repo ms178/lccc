@@ -1,0 +1,1418 @@
+#!/usr/bin/env python3
+"""Mutation tests: CI/local gate parity (universal invocation contracts).
+
+Every guard in check_ci_gate_parity.py has at least one test here that
+FAILS when the guard is deleted — that convention is what keeps a guard
+from rotting: remove the mention rule and test_decoys_are_flagged fails,
+remove the universal loop and test_a_second_unregistered_invocation_fails
+fails, remove the job-level semantics and test_job_level_soft_fails fails.
+The map:
+
+  guard (function/behaviour)                          -> tests
+  ------------------------------------------------------------------
+  _reduce_head wrapper grammar                        -> BenignWrapperTest
+  _find_invocation mention rule                       -> UniversalContractTest
+                                                         .test_decoys_...
+  _Cmd.quote_problem (single-quote/backslash $)       -> .test_single_quoted_pin...
+                                                         .test_backslash_...
+  _canonical brace form                               -> .test_brace_home_...
+  _contract_status option/rest multisets              -> .test_duplicate_option...
+                                                         .test_swapped_pins...
+                                                         .test_lookalike_pins...
+  universal loop (every invocation conforms)          -> .test_a_second_unregis...
+                                                         (R1/R2/R3/R4 repros)
+  per-contract coverage                               -> .test_every_contract_...
+  suite env channels (W6)                             -> .test_suite_channels...
+  gate_registrations parsed, speed pinned             -> GateRegistrationTest
+  job/workflow-level if/continue-on-error/env (W2)    -> StepSemanticsGuardTest
+  workflow `on:` trigger semantics (never-PR          -> WorkflowTriggerSemanticsTest
+    workflows are not coverage)
+  per-program env channels (W3)                       -> .test_hidden_channels...
+  duplicate-key refusing loader (W9)                  -> .test_duplicate_keys...
+  aggregated main (all checks run)                    -> .test_main_reports_all
+  quote-aware comment cutting (a quoted `#` is        -> QuoteAwareCommentStrippingTest
+    data; the regex cut truncated such lines,
+    shlex refused them, and the invocation
+    escaped the universal contracts)
+  structured hosted diagnostics + per-step bodies    -> StructuredHostedDiagnosticsTest
+    (workflow/job/step address instead of a
+    synthetic line number; a step-boundary
+    continuation used to swallow the next
+    step's first line in the joined form)
+"""
+from __future__ import annotations
+
+from contextlib import redirect_stderr
+from io import StringIO
+from pathlib import Path
+import importlib
+import tempfile
+import unittest
+from unittest import mock
+
+import check_ci_gate_parity as parity
+
+
+def hosted_bodies() -> str:
+    return "\n".join(
+        parity.run_script_bodies(p)
+        for p in sorted(parity.WORKFLOWS.glob("*.yml"))
+    )
+
+
+class UniversalContractTest(unittest.TestCase):
+    """Every command-position invocation of a contracted program conforms.
+
+    The audit's central finding, pinned from both directions: a conforming
+    invocation existing proves NOTHING about the invocations around it (the
+    old checker's `any()' accepted a second unpinned asmdiff line, a second
+    unpinned step, an extra encdiff --32, and a filtered linker run next to
+    the strict one), and a contract nothing satisfies is a gate that no
+    longer exists.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.local = parity.LOCAL.read_text()
+        cls.hosted = hosted_bodies()
+        cls.x64 = next(
+            line.strip() for line in cls.hosted.splitlines()
+            if line.strip().startswith("python3 scripts/asmdiff.py")
+            and "--32" not in line
+        )
+        cls.i686 = next(
+            line.strip() for line in cls.hosted.splitlines()
+            if line.strip().startswith("python3 scripts/asmdiff.py") and "--32" in line
+        )
+
+    def check(self, local: str | None = None, hosted: str | None = None) -> int:
+        with redirect_stderr(StringIO()):
+            return parity.check_invocation_contracts(
+                self.local if local is None else local,
+                self.hosted if hosted is None else hosted,
+            )
+
+    def test_pr824_cross_target_matrix_cannot_be_removed_from_both_mirrors(self) -> None:
+        command = "tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross"
+        shortened = command.removesuffix(" --cross")
+        self.assertIn(command, self.local)
+        self.assertIn(command, self.hosted)
+        self.assertEqual(self.check(local=self.local.replace(command, shortened),
+                                    hosted=self.hosted.replace(command, shortened)), 1)
+
+    def test_pr824_result_record_cannot_be_removed_from_both_mirrors(self) -> None:
+        record = " --json target/redteam/boundaries.json"
+        self.assertIn(record, self.local)
+        self.assertIn(record, self.hosted)
+        self.assertEqual(self.check(local=self.local.replace(record, ""),
+                                    hosted=self.hosted.replace(record, "")), 1)
+
+    def test_real_mirrors_pass(self) -> None:
+        self.assertEqual(self.check(), 0)
+
+    def test_every_contract_is_satisfied_on_each_declared_side(self) -> None:
+        # The coverage direction: removing a contract's conforming invocations
+        # from EITHER side is a failure — the gate is gone.
+        #
+        # Every occurrence, not just the first. Several jobs legitimately run
+        # the same provisioner, because each job is its own runner: the pinned
+        # GNU as is installed in `backend`, `backend-contracts-a` and
+        # `backend-contracts-b`. Mutating only the first occurrence left the
+        # other two in place, so the contract was still satisfied, the checker
+        # correctly reported nothing, and this test failed on a tree that was
+        # fine. The mutation has to remove the gate everywhere before its
+        # absence means anything.
+        for i, contract in enumerate(parity.INVOCATION_CONTRACTS):
+            for side in sorted(contract.sides):
+                with self.subTest(contract=contract.name, side=side):
+                    if side == "local":
+                        local = self.local.replace(contract.program, "true")
+                        self.assertNotEqual(local, self.local)
+                        self.assertEqual(self.check(local=local), 1)
+                    else:
+                        hosted = self.hosted.replace(contract.program, "true")
+                        self.assertNotEqual(hosted, self.hosted)
+                        self.assertEqual(self.check(hosted=hosted), 1)
+
+    # ── the audit's four existential bypasses, as compositions ──────────
+
+    def test_a_second_unregistered_asmdiff_line_fails(self) -> None:
+        # R1: the old checker proved *a* conforming line exists; the
+        # unpinned twin beside it was invisible. Universal: both must
+        # conform or neither runs.
+        local = self.local.replace(
+            'gate "i686-tls-ie-relax" fast',
+            "python3 scripts/asmdiff.py --jobs 2 --as as --objdump objdump"
+            " --lccc target/fastbuild/lccc-x86\n"
+            'gate "i686-tls-ie-relax" fast', 1)
+        self.assertEqual(self.check(local=local), 1)
+
+    def test_a_second_unregistered_hosted_step_fails(self) -> None:
+        # R2: a GENUINE second workflow step (active, hard, no env) with
+        # the unpinned command — invisible to the existential check.
+        hosted = self.hosted.replace(
+            self.i686,
+            "python3 scripts/asmdiff.py --jobs 2 --as as --objdump objdump"
+            " --lccc target/fastbuild/lccc-x86\n" + self.i686, 1)
+        self.assertEqual(self.check(hosted=hosted), 1)
+
+    def test_an_extra_unpinned_encdiff_step_fails(self) -> None:
+        # R3: encdiff --32 against unpinned tools next to the real gate.
+        hosted = self.hosted.replace(
+            "python3 scripts/encdiff.py --offline --quiet",
+            "python3 scripts/encdiff.py --32 --objdump objdump --as as\n"
+            "python3 scripts/encdiff.py --offline --quiet", 1)
+        self.assertEqual(self.check(hosted=hosted), 1)
+
+    def test_an_extra_filtered_linker_run_fails(self) -> None:
+        # R4 and the abbreviation variant: a second linker invocation that
+        # runs a --filter subset (full env prefix or none) fails even
+        # though the strict full-suite invocation beside it conforms.
+        # argparse resolves `--filt' to `--filter' (allow_abbrev), so a
+        # denylist of full spellings never sees it — the exact-token
+        # contract does.
+        anchor = "python3 tests/linker/run_linker_tests.py"
+        for extra in (
+            "python3 tests/linker/run_linker_tests.py --strict --filter i386_",
+            "python3 tests/linker/run_linker_tests.py --strict --filt i386_",
+            "python3 tests/linker/run_linker_tests.py --strict --tag dynamic",
+        ):
+            with self.subTest(extra=extra.split()[-1]):
+                hosted = self.hosted.replace(
+                    anchor, extra + "\n" + anchor, 1)
+                self.assertEqual(self.check(hosted=hosted), 1)
+
+    def test_a_local_filtered_linker_gate_fails(self) -> None:
+        # The local mirror's own weakening, same class.
+        local = self.local.replace(
+            "python3 tests/linker/run_linker_tests.py --lccc"
+            " target/fastbuild/lccc --strict",
+            "python3 tests/linker/run_linker_tests.py --lccc"
+            " target/fastbuild/lccc --strict --filter i386_", 1)
+        self.assertEqual(self.check(local=local), 1)
+
+    # ── token-level contract pins (unchanged doctrine, kept from the
+    #    previous suite: each mutation must still fail) ──────────────────
+
+    def test_duplicate_option_override_cannot_satisfy_a_gate(self) -> None:
+        # argparse `store' is LAST-occurrence-wins: the second --objdump
+        # is what runs while the first spells the pin.
+        for side, text, other in (
+            ("local", self.local, self.hosted),
+            ("hosted", self.hosted, self.local),
+        ):
+            with self.subTest(side=side):
+                mutated = text.replace(
+                    '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"',
+                    '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"'
+                    " --objdump objdump", 1)
+                self.assertNotEqual(mutated, text)
+                if side == "local":
+                    self.assertEqual(self.check(local=mutated), 1)
+                else:
+                    self.assertEqual(self.check(hosted=mutated), 1)
+
+    def test_swapped_pin_values_cannot_satisfy_a_gate(self) -> None:
+        # Same flat token bag, different pairing: --objdump <as> --as <objdump>.
+        swapped = self.hosted.replace(
+            '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"'
+            ' --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"',
+            '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"'
+            ' --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"', 1)
+        self.assertNotEqual(swapped, self.hosted)
+        self.assertEqual(self.check(hosted=swapped), 1)
+
+    def test_lookalike_pin_paths_are_rejected(self) -> None:
+        # Exact tokens, not containment: suffixed/prefixed/sibling paths
+        # spelled next to the pin are unregistered invocations.
+        pin = "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
+        for lookalike in (
+            pin + "-untrusted",
+            "/untrusted/" + pin,
+            pin + "s",
+        ):
+            with self.subTest(lookalike=lookalike):
+                mutated = self.hosted.replace(self.x64, self.x64.replace(
+                    '"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"',
+                    lookalike), 1)
+                self.assertEqual(self.check(hosted=mutated), 1)
+
+    def test_injected_mode_flag_cannot_satisfy_the_64_bit_gate(self) -> None:
+        # `--32' on the x86-64 invocation runs the 32-bit corpus under a
+        # 64-bit-validated contract.
+        mutated = self.hosted.replace(self.x64, self.x64 + " --32", 1)
+        self.assertEqual(self.check(hosted=mutated), 1)
+
+    def test_decoys_are_flagged_not_ignored(self) -> None:
+        # echo/false&&/xargs/if-false lines that name a contracted program
+        # are unverifiable mentions and FAIL — the mirrors' gate files have
+        # no legitimate way to name these programs except to run them.
+        provision = "bash scripts/ensure_gas_247.sh x86_64-linux-gnu"
+        for decoy in (
+            "echo " + provision,
+            "false && " + provision,
+            "if false; then " + provision + "; fi",
+            "sh -c 'xargs " + provision + "'",
+        ):
+            with self.subTest(decoy=decoy.split()[0]):
+                local = self.local.replace(provision, decoy, 1)
+                self.assertEqual(self.check(local=local), 1)
+
+    def test_suite_env_channels_are_part_of_the_contract(self) -> None:
+        # W6: the contract suites' real-toolchain legs run against the
+        # provisioned 2.47 pair, and a missing pin is an error, not a
+        # skip. The env channels are pinned like every other token. Each
+        # mutation is anchored to the invocation's own continuation line
+        # (the module's comments legitimately mention the channel names).
+        for old, new in (
+            # require-mode turned off on the encdiff suite: silent skips return
+            ("LCCC_REQUIRE_PINNED_ORACLE=1 \\\n    python3 scripts/test_encdiff.py",
+             "LCCC_REQUIRE_PINNED_ORACLE=0 \\\n    python3 scripts/test_encdiff.py"),
+            ("LCCC_REQUIRE_PINNED_ORACLE=1 \\\n    python3 scripts/test_asmdiff.py",
+             "LCCC_REQUIRE_PINNED_ORACLE=0 \\\n    python3 scripts/test_asmdiff.py"),
+            # the legs' tool channels redirected to the distro binaries
+            ('ENCDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"',
+             'ENCDIFF_TEST_OBJDUMP="/usr/bin/objdump"'),
+            ('ASMDIFF_TEST_AS="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
+             'ASMDIFF_TEST_AS="/usr/bin/as"'),
+        ):
+            with self.subTest(new=new.splitlines()[0][:60]):
+                local = self.local.replace(old, new, 1)
+                self.assertNotEqual(local, self.local)
+                self.assertEqual(self.check(local=local), 1)
+
+    def test_single_quoted_pin_is_refused(self) -> None:
+        # R6: '$HOME/...' passes a LITERAL path (no expansion) — the tool
+        # gets an unopenable string while the checker's token compared
+        # equal. The raw spelling is checked now: a $ behind single quotes
+        # can never be the expanding pin.
+        local = self.local.replace(
+            '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
+            "--as '$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as'", 1)
+        self.assertEqual(self.check(local=local), 1)
+
+    def test_backslash_escaped_dollar_pin_is_refused(self) -> None:
+        # "\$HOME/..." is the same literal-path defect with escaped dollars.
+        local = self.local.replace(
+            '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
+            '--as "\\$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"', 1)
+        self.assertEqual(self.check(local=local), 1)
+
+    def test_brace_home_spelling_is_accepted(self) -> None:
+        # R7: ${HOME} and $HOME expand identically — a working gate must
+        # not be rejected for the spelling.
+        local = self.local.replace(
+            '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as"',
+            '--as "${HOME}/.cache/gas-2.47-x86_64-linux-gnu/bin/as"', 1)
+        self.assertNotEqual(local, self.local)
+        self.assertEqual(self.check(local=local), 0)
+
+    def test_bash_c_payload_with_expansions_is_judged_at_payload_level(self) -> None:
+        # A `bash -c' line's outer token is a single-quoted string that may
+        # legitimately CONTAIN dollar references — the quoting that matters
+        # is the payload's own, where the invocation resolves. Wrapping the
+        # whole conforming x64 gate in bash -c must still pass.
+        inner = (
+            'python3 scripts/asmdiff.py --jobs 2 '
+            '--as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" '
+            '--objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" '
+            '--lccc target/fastbuild/lccc-x86')
+        hosted = self.hosted.replace(self.x64, "bash -c '" + inner + "'", 1)
+        self.assertNotEqual(hosted, self.hosted)
+        self.assertEqual(self.check(hosted=hosted), 0)
+        # But a literal-dollar pin INSIDE the payload is still refused
+        # (single quotes within the payload make the path literal).
+        bad = ('bash -c "python3 scripts/asmdiff.py --jobs 2 '
+               "--as '$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as'\"")
+        hosted = self.hosted.replace(self.x64, bad, 1)
+        self.assertEqual(self.check(hosted=hosted), 1)
+
+    def test_local_gate_registrations_are_speed_pinned(self) -> None:
+        # The registration checks live in the contract walk: name AND
+        # speed class, parsed (comment-immune). Demoting a fast gate to
+        # slow drops it from --fast runs, which is a coverage change.
+        for contract in parity.INVOCATION_CONTRACTS:
+            if contract.local_gate is None:
+                continue
+            name, speed = contract.local_gate
+            with self.subTest(gate=name):
+                local = self.local.replace(f'gate "{name}" {speed}',
+                                           f'gate "{name}" slow', 1)
+                self.assertEqual(self.check(local=local), 1)
+
+
+class BenignWrapperTest(unittest.TestCase):
+    """Execution-transparent wrappers are resolved, decoys are not.
+
+    W5: `timeout 300 bash ...' is a legitimate refactor the old grammar
+    rejected as a false alarm; the wrapper list is a fixed grammar (any
+    unknown spelling still fails) so tolerance cannot become a hole.
+    """
+
+    PROVISION = "bash scripts/ensure_gas_247.sh x86_64-linux-gnu"
+    local: str
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.local = parity.LOCAL.read_text()
+        cls.hosted = hosted_bodies()
+
+    def wrapped(self, spelling: str) -> int:
+        local = self.local.replace(self.PROVISION, spelling, 1)
+        self.assertNotEqual(local, self.local, "mutation did not apply")
+        with redirect_stderr(StringIO()):
+            return parity.check_invocation_contracts(local, self.hosted)
+
+    def test_execution_transparent_wrappers_satisfy_the_contract(self) -> None:
+        # Each spelling REPLACES the provision invocation and must still
+        # satisfy the exact contract (no env perturbation: the wrappers
+        # are execution-transparent, and env additions are coverage
+        # changes that fail by design — see the contract test).
+        for spelling in (
+            "timeout 300 " + self.PROVISION,
+            "timeout 10m " + self.PROVISION,
+            "nice " + self.PROVISION,
+            "nice -n 5 " + self.PROVISION,
+            "command " + self.PROVISION,
+            "setsid " + self.PROVISION,
+            "setsid -w " + self.PROVISION,
+            "time " + self.PROVISION,
+            "nohup " + self.PROVISION,
+            "env -u GAS_CACHE " + self.PROVISION,
+            "/usr/bin/env " + self.PROVISION,
+            "bash -c '" + self.PROVISION + "'",
+            "timeout 300 env -u GAS_CACHE nice bash -c '" + self.PROVISION + "'",
+        ):
+            with self.subTest(spelling=spelling.split()[0]):
+                self.assertEqual(self.wrapped(spelling), 0)
+
+    def test_env_additions_are_contract_changes_not_refactors(self) -> None:
+        # The grammar RESOLVES an assignment prefix (command position),
+        # but the contract pins the env exactly: an added variable is a
+        # conscious contract update, never a silent wrapper.
+        self.assertEqual(self.wrapped("VAR=x=1 " + self.PROVISION), 1)
+
+
+    def test_wrapper_grammar_is_closed(self) -> None:
+        # Unknown flags and malformed arguments are not guessed at: a
+        # spelling outside the grammar fails until it is registered.
+        for spelling in (
+            "timeout " + self.PROVISION,            # missing duration
+            "timeout 300 --kill-after 10 " + self.PROVISION,  # unregistered flag
+            "nice -N 5 " + self.PROVISION,          # unknown nice flag
+            "env --split-output " + self.PROVISION, # unknown env flag
+            "command -v " + self.PROVISION,         # -v prints, does not run
+            "exec -a fake " + self.PROVISION,       # unregistered wrapper
+        ):
+            with self.subTest(spelling=spelling.split()[0]):
+                self.assertEqual(self.wrapped(spelling), 1)
+
+    def test_program_args_resolves_the_grammar(self) -> None:
+        toks = "gate x fast env A=1 timeout 300 nice -n 2 python3 prog.py --x".split()
+        self.assertEqual(parity.program_args(toks, "prog.py"), ["--x"])
+        self.assertIsNone(parity.program_args("echo prog.py".split(), "prog.py"))
+        self.assertIsNone(parity.program_args(
+            "xargs python3 prog.py".split(), "prog.py"))
+
+
+def _invocation_block(text: str, program: str) -> str:
+    """The full continuation block of the FIRST invocation of `program'.
+
+    Mutations are anchored to the invocation's own lines: a bare
+    `--strict' or `LCCC_REQUIRE_I386=1' replace would hit a comment or an
+    unrelated step first, silently mutating nothing that runs.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if program in line:
+            start = i
+            while start > 0 and lines[start - 1].rstrip().endswith("\\"):
+                start -= 1
+            end = i
+            while lines[end].rstrip().endswith("\\") and end + 1 < len(lines):
+                end += 1
+            return "\n".join(lines[start:end + 1])
+    raise AssertionError(f"no invocation of {program}")
+
+
+class LinkerContractTest(unittest.TestCase):
+    """The whole linker suite, strictly, on both sides — now as exact
+    per-side invocation contracts (env prefix + options + rest), verified
+    by mutating the REAL mirror texts with invocation-anchored blocks
+    (the universal check requires every contract to be satisfied, so
+    isolated fixtures could only ever fail)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.local = parity.LOCAL.read_text()
+        cls.hosted = hosted_bodies()
+
+    def check(self, local: str | None = None, hosted: str | None = None) -> int:
+        with redirect_stderr(StringIO()):
+            return parity.check_invocation_contracts(
+                self.local if local is None else local,
+                self.hosted if hosted is None else hosted)
+
+    def test_real_mirrors_satisfy_the_linker_contracts(self) -> None:
+        self.assertEqual(self.check(), 0)
+
+    def test_every_weakening_fails_on_either_side(self) -> None:
+        mutations = (
+            ("--strict", ""),                                   # SKIPs would pass
+            ("--strict", "--strict --filter i386_"),            # the old CI subset
+            ("--strict", "--strict --filt i386_"),              # abbreviation bypass
+            ("--strict", "--strict --tag dynamic"),
+            ("--strict", "--strict --list"),                    # runs nothing
+            ("LCCC_REQUIRE_I386=1", "LCCC_REQUIRE_I386=0"),
+            ("LCCC_RELOCS_TOOL=", "LCCC_RELOCS_TOOX="),
+            ("LCCC_BFD_LD=", "LCCC_BFD_LD_MISSING="),
+            ("gas-2.47-x86_64-linux-gnu/bin:", "gas-2.42/bin:"),  # unpinned assembler
+            ("python3 tests/linker/run_linker_tests.py",
+             "echo python3 tests/linker/run_linker_tests.py"),
+        )
+        for side in ("local", "hosted"):
+            text = self.local if side == "local" else self.hosted
+            block = _invocation_block(text, "tests/linker/run_linker_tests.py")
+            for old, new in mutations:
+                with self.subTest(side=side, old=old, new=new):
+                    mutated_block = block.replace(old, new, 1)
+                    self.assertNotEqual(mutated_block, block, "mutation did not land")
+                    mutated = text.replace(block, mutated_block, 1)
+                    self.assertEqual(self.check(**{side: mutated}), 1)
+        # The relocs-tool provisioning invocation, weakened on either side.
+        for side in ("local", "hosted"):
+            text = self.local if side == "local" else self.hosted
+            with self.subTest(side=side, old="setup_kernel_tools"):
+                mutated = text.replace(
+                    'bash tests/linker/setup_kernel_tools.sh --prefix',
+                    "echo tests/linker/setup_kernel_tools.sh --prefix", 1)
+                self.assertNotEqual(mutated, text)
+                self.assertEqual(self.check(**{side: mutated}), 1)
+
+    def test_a_second_filtered_invocation_beside_the_strict_one_fails(self) -> None:
+        # The audit's R4 as a composition: the strict invocation stays,
+        # the filtered twin appears beside it.
+        extra = "python3 tests/linker/run_linker_tests.py --strict --filter i386_"
+        self.assertEqual(self.check(local=self.local + "\n" + extra), 1)
+        self.assertEqual(self.check(hosted=self.hosted + "\n" + extra), 1)
+
+    def test_comment_is_not_an_invocation(self) -> None:
+        # The linker invocation commented out of the hosted mirror: the
+        # contract loses its conforming invocation.
+        block = _invocation_block(self.hosted, "tests/linker/run_linker_tests.py")
+        commented = "\n".join("# " + line for line in block.splitlines())
+        hosted = self.hosted.replace(block, commented, 1)
+        self.assertEqual(self.check(hosted=hosted), 1)
+
+    def test_python_regression_gates_are_path_tracked(self) -> None:
+        for name in ("address", "popcount"):
+            path = f"tests/regression/check_arm_{name}_contract.py"
+            self.assertEqual(parity.COMMAND.findall("python3 " + path), [path])
+
+    def test_hosted_popcount_cannot_drop_required_runtime(self) -> None:
+        block = _invocation_block(self.hosted, "tests/regression/check_arm_popcount_contract.py")
+        self.assertIn("--run", block)
+        mutated = self.hosted.replace(block, block.replace(" --run", ""), 1)
+        self.assertEqual(self.check(hosted=mutated), 1)
+
+    def test_popcount_missing_qemu_fails_before_compilation(self) -> None:
+        import runpy
+        from unittest.mock import patch
+        path = parity.ROOT / "tests/regression/check_arm_popcount_contract.py"
+        module = runpy.run_path(str(path))
+        with patch("sys.argv", [str(path), "--run"]), \
+             patch("shutil.which", return_value=None), \
+             patch("subprocess.run") as compiler, \
+             redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                module["main"]()
+            self.assertEqual(result.exception.code, 2)
+            compiler.assert_not_called()
+
+    def test_linker_scripts_are_path_tracked(self) -> None:
+        self.assertEqual(parity.COMMAND.findall("python3 tests/linker/fuzz_ld.py"),
+                         ["tests/linker/fuzz_ld.py"])
+
+
+class StepSemanticsGuardTest(unittest.TestCase):
+    """Contracted programs must be real, failing, unperturbed steps.
+
+    A workflow can display a gate while not running it as one: a step- or
+    JOB-level `if:` that keeps it off the green-path run, step- or
+    job-level `continue-on-error:` that swallows its red, a hidden env
+    channel (workflow/job/step) for the program's override variables, or
+    an unverifiable mention in a run body. None are visible to any
+    text-level parity check — the walker itself must carry the semantics.
+    """
+
+    GATE_STEP = (
+        "      - name: Verify x86-64 assembly differential\n"
+        "        run: python3 scripts/asmdiff.py --jobs 2 --as p --objdump q"
+        " --lccc target/fastbuild/lccc-x86\n"
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        importlib.import_module("yaml")  # the checker requires PyYAML
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.wf = Path(cls.dir.name) / "ci.yml"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.dir.cleanup()
+
+    def workflow(self, extra: str = "", step_attrs: str = "",
+                 env: str = "", job_env: str = "", job_attrs: str = "",
+                 wf_env: str = "") -> Path:
+        self.wf.write_text(
+            "name: CI\n"
+            "on: [push, pull_request]\n"
+            + (f"env:\n{wf_env}" if wf_env else "")
+            + "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            + job_attrs
+            + (f"    env:\n{job_env}" if job_env else "")
+            + "    steps:\n"
+            + self.GATE_STEP.replace("        run:", step_attrs + "        run:")
+            .replace("      - name:", extra + "      - name:")
+            + (env or "")
+        )
+        return self.wf
+
+    def test_active_gate_step_passes(self) -> None:
+        path = self.workflow()
+        self.assertEqual(parity.check_step_guards([path]), 0)
+        self.assertIn("python3 scripts/asmdiff.py", parity.run_script_bodies(path))
+
+    def test_conditional_gate_step_is_not_coverage(self) -> None:
+        # `if:` anything-but-always/success: the gate never runs on the
+        # green-path PR run, so its body is excluded from parity AND the
+        # guard reports it by name. `failure()` is the classic shape: a
+        # gate that only runs once something else already failed.
+        for cond in ("failure()", "runner.os == 'Windows'",
+                     "${{ github.event_name == 'schedule' }}"):
+            with self.subTest(cond=cond):
+                path = self.workflow(
+                    step_attrs=f"        if: {cond}\n")
+                self.assertEqual(parity.check_step_guards([path]), 1)
+                self.assertNotIn("python3 scripts/asmdiff.py",
+                                 parity.run_script_bodies(path))
+
+    def test_always_and_success_conditions_stay_active(self) -> None:
+        for cond in ("always()", "${{ always() }}", "success()"):
+            with self.subTest(cond=cond):
+                path = self.workflow(step_attrs=f"        if: {cond}\n")
+                self.assertEqual(parity.check_step_guards([path]), 0)
+                self.assertIn("python3 scripts/asmdiff.py",
+                              parity.run_script_bodies(path))
+
+    def test_continue_on_error_gate_is_not_a_gate(self) -> None:
+        # The step runs, but its failure cannot fail the build: a red
+        # gate that CI reports green is not coverage. (The body still
+        # counts as EXECUTED for path parity — the guard is what refuses
+        # the soft-fail semantics.)
+        path = self.workflow(step_attrs="        continue-on-error: true\n")
+        self.assertEqual(parity.check_step_guards([path]), 1)
+        self.assertIn("python3 scripts/asmdiff.py", parity.run_script_bodies(path))
+
+    def test_job_level_semantics_are_visible(self) -> None:
+        # W2: one word at the JOB level used to make an entire gate set
+        # non-gating while the checker read only step fields.
+        path = self.workflow(job_attrs="    continue-on-error: true\n")
+        self.assertEqual(parity.check_step_guards([path]), 1)
+        path = self.workflow(job_attrs="    if: github.event_name == 'schedule'\n")
+        self.assertEqual(parity.check_step_guards([path]), 1)
+        # A job-level active condition keeps the step coverage.
+        path = self.workflow(job_attrs="    if: always()\n")
+        self.assertEqual(parity.check_step_guards([path]), 0)
+        self.assertIn("python3 scripts/asmdiff.py", parity.run_script_bodies(path))
+
+    def test_workflow_level_env_reaches_the_guard(self) -> None:
+        # W2/W3: workflow-level `env:` merges into every step's
+        # environment; the old walker never read it.
+        path = self.workflow(wf_env="  LCCC_OBJDUMP: /usr/bin/objdump\n")
+        self.assertEqual(parity.check_step_guards([path]), 1)
+
+    def test_hidden_tool_override_env_is_rejected(self) -> None:
+        # Per-program channels: LCCC/LCCC_GAS/LCCC_OBJCOPY/LCCC_OBJDUMP
+        # for the differential tools (the argparse-default override
+        # channels), GAS_DL_DIR/GAS_CACHE for the provisioner, the
+        # suite-test channels, the linker reference compilers. Other
+        # variables are not channels for these programs and must not
+        # trip the guard.
+        for env in (
+            "        env:\n          LCCC_GAS: /untrusted/as\n",
+            "        env:\n          LCCC: /untrusted/lccc\n",
+            "        env:\n          LCCC_OBJDUMP: /usr/bin/objdump\n",
+        ):
+            with self.subTest(env=env.strip().splitlines()[-1]):
+                path = self.workflow(env=env)
+                self.assertEqual(parity.check_step_guards([path]), 1)
+        # Job-level env is inherited by every step of the job.
+        path = self.workflow(job_env="      LCCC_OBJDUMP: /untrusted/objdump\n")
+        self.assertEqual(parity.check_step_guards([path]), 1)
+        # Not channels: CCC (unrelated), PATH, the linker's scratch root.
+        for env in ("        env:\n          CCC: target/fastbuild/lccc\n",
+                    "        env:\n          PATH: /usr/bin\n"):
+            with self.subTest(env=env.strip().splitlines()[-1]):
+                path = self.workflow(env=env)
+                self.assertEqual(parity.check_step_guards([path]), 0)
+
+    def test_arm_regression_env_channels_are_guarded_at_every_scope(self) -> None:
+        for gate in ("address", "popcount"):
+            for var in ("CCC_ARM", "PYTHONOPTIMIZE"):
+                for scope in ("workflow", "job", "step"):
+                    with self.subTest(gate=gate, var=var, scope=scope):
+                        prefix = "name: CI\non: [push, pull_request]\n"
+                        if scope == "workflow":
+                            prefix += f"env:\n  {var}: override\n"
+                        prefix += "jobs:\n  test:\n    runs-on: ubuntu-latest\n"
+                        if scope == "job":
+                            prefix += f"    env:\n      {var}: override\n"
+                        prefix += "    steps:\n      - name: arm contract\n"
+                        if scope == "step":
+                            prefix += f"        env:\n          {var}: override\n"
+                        self.wf.write_text(prefix +
+                            "        run: env CCC_ARM=target/fastbuild/lccc-arm "
+                            f"python3 tests/regression/check_arm_{gate}_contract.py\n")
+                        self.assertEqual(parity.check_step_guards([self.wf]), 1)
+
+    def test_arm_regression_gates_refuse_disabled_assertions(self) -> None:
+        # Import only: runpy's non-main name cannot enter either compile loop.
+        # A normal import succeeds; all optimized forms must fail beforehand.
+        import os
+        import subprocess
+        import sys
+        for gate in ("address", "popcount"):
+            path = parity.ROOT / f"tests/regression/check_arm_{gate}_contract.py"
+            script = f"import runpy; runpy.run_path({str(path)!r})"
+            for flags, optimize in (([], ""), (["-O"], ""), (["-OO"], ""), ([], "1")):
+                with self.subTest(gate=gate, flags=flags, optimize=optimize):
+                    env = {**os.environ, "PYTHONOPTIMIZE": optimize}
+                    result = subprocess.run([sys.executable, *flags, "-c", script],
+                        env=env, capture_output=True, text=True, timeout=10)
+                    if flags or optimize:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("require Python assertions", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_provisioner_cache_redirects_are_channels(self) -> None:
+        # W3: GAS_DL_DIR/GAS_CACHE can point provisioning at a doctored
+        # tarball or source tree — hidden channels for a guarded program.
+        for var in ("GAS_DL_DIR", "GAS_CACHE"):
+            with self.subTest(var=var):
+                self.wf.write_text(
+                    "name: CI\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n"
+                    "    steps:\n      - name: g\n"
+                    f"        env:\n          {var}: /tmp/doctored\n"
+                    "        run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu\n")
+                self.assertEqual(parity.check_step_guards([self.wf]), 1)
+
+    def test_linker_reference_compilers_are_channels(self) -> None:
+        # LINKTEST_CC/CXX pick the reference side of the linker
+        # comparisons; LCCC_I386_SCRATCH_ROOT only redirects scratch
+        # space (the hosted step sets it legitimately) and must pass.
+        self.wf.write_text(
+            "name: CI\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - name: g\n"
+            "        env:\n          LINKTEST_CC: /untrusted/gcc\n"
+            "        run: python3 tests/linker/run_linker_tests.py --strict\n")
+        self.assertEqual(parity.check_step_guards([self.wf]), 1)
+        self.wf.write_text(
+            "name: CI\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - name: g\n"
+            "        env:\n          LCCC_I386_SCRATCH_ROOT: /scratch\n"
+            "        run: python3 tests/linker/run_linker_tests.py --strict\n")
+        self.assertEqual(parity.check_step_guards([self.wf]), 0)
+
+    def test_unverifiable_mention_in_a_step_body_is_reported(self) -> None:
+        # A run body that names a contracted program without running it
+        # (echo, xargs) is a problem in its own right — gate files name
+        # these programs to run them.
+        for body in ("echo bash scripts/ensure_gas_247.sh x86_64-linux-gnu\n",
+                     "find . -name x | xargs python3 scripts/asmdiff.py\n"):
+            with self.subTest(body=body.split()[0]):
+                self.wf.write_text(
+                    "name: CI\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n"
+                    "    steps:\n      - name: g\n"
+                    f"        run: |\n          {body}")
+                self.assertEqual(parity.check_step_guards([self.wf]), 1)
+
+    def test_duplicate_yaml_keys_are_refused(self) -> None:
+        # W9: PyYAML silently keeps the LAST of two same-named keys, so a
+        # workflow edit that adds a second `run:` to a step parses as
+        # something other than what a reader sees. The loader refuses.
+        self.wf.write_text(
+            "name: CI\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n"
+            "    steps:\n      - name: g\n"
+            "        run: echo first\n"
+            "        run: python3 scripts/asmdiff.py\n")
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(parity.check_step_guards([self.wf]), 1)
+        self.assertIn("duplicate", err.getvalue())
+        with self.assertRaises(ValueError):
+            parity.run_script_bodies(self.wf)
+
+    def test_all_registered_programs_are_guarded_like_the_gates(self) -> None:
+        # W8: the guarded set is derived from the contract registry — a
+        # program added to INVOCATION_CONTRACTS is automatically held to
+        # the execution semantics, no hand-maintained list to forget.
+        for program in parity.GUARDED_PROGRAMS:
+            with self.subTest(program=program):
+                interp = "bash" if program.endswith(".sh") else "python3"
+                self.wf.write_text(
+                    "name: CI\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n"
+                    "    steps:\n      - name: g\n"
+                    f"        if: failure()\n        run: {interp} {program}\n")
+                self.assertEqual(parity.check_step_guards([self.wf]), 1)
+
+
+class QuoteAwareCommentStrippingTest(unittest.TestCase):
+    """A `#` inside a quoted argument is data, not a comment.
+
+    The pre-hardening `re.search(r"\\s#", line)` cut in
+    _strip_run_comments truncated any hosted line carrying a double-quoted
+    ` # ` — the truncated remnant had an unbalanced quote, shlex refused
+    it, and _logical_command_lines DROPPED it: a contracted invocation
+    with a quoted-# argument silently escaped the universal contract
+    check entirely. The quote-aware _cut_shell_comment keeps the line
+    intact, so the invocation reaches the contract layer and a weakened
+    one FAILS there instead of vanishing.
+    """
+
+    def setUp(self) -> None:
+        importlib.import_module("yaml")  # the checker requires PyYAML
+        self._dir = tempfile.TemporaryDirectory()
+        self.wf = Path(self._dir.name) / "ci.yml"
+        self.addCleanup(self._dir.cleanup)
+
+    def _workflow(self, *run_lines: str) -> Path:
+        # A block scalar's content must be indented deeper than `run:`.
+        body = "\n".join("          " + line for line in run_lines)
+        self.wf.write_text(
+            "name: CI\n"
+            "on: [push, pull_request]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: gate step\n"
+            f"        run: |\n{body}\n")
+        return self.wf
+
+    def test_quoted_hash_argument_survives_stripping(self) -> None:
+        line = ('python3 scripts/asmdiff.py --jobs 2 --as p --objdump q '
+                '--lccc target/fastbuild/lccc-x86 --note "gas # 2.47"')
+        self.assertEqual(parity._cut_shell_comment(line), line)
+        # A trailing REAL comment is still cut, quote-aware:
+        self.assertEqual(
+            parity._cut_shell_comment('echo "a # b"  # real comment'),
+            'echo "a # b"')
+        # ...including single-quoted data and a backslash-escaped quote:
+        self.assertEqual(
+            parity._cut_shell_comment("echo 'x # y' # tail"),
+            "echo 'x # y'")
+        self.assertEqual(
+            parity._cut_shell_comment('echo "a \\"# b"'),
+            'echo "a \\"# b"')
+
+    def test_weakened_invocation_with_quoted_hash_is_checked_not_dropped(self) -> None:
+        # THE escape-hatch repro: a second, WEAKENED invocation of a
+        # contracted program whose extra argument carries a quoted ` # `.
+        # Pre-fix it vanished from the contract layer (truncated →
+        # untokenizable → dropped) and the conforming invocation beside it
+        # kept the contract green. Post-fix it is checked — and fails.
+        path = self._workflow(
+            "python3 scripts/asmdiff.py --jobs 2 --as p --objdump q \\",
+            "  --lccc target/fastbuild/lccc-x86",
+            'python3 scripts/asmdiff.py --jobs 2 --as p --objdump q '
+            '--lccc target/fastbuild/lccc-x86 --note "pin # 2"')
+        steps = [s for s in parity.workflow_run_steps(path) if s.active]
+        bodies = "\n".join(s.body for s in steps)
+        # The weakened line survived comment-stripping intact:
+        self.assertIn('--note "pin # 2"', bodies)
+        err = StringIO()
+        with redirect_stderr(err):
+            rc = parity.check_invocation_contracts(
+                parity.LOCAL.read_text(), steps)
+        self.assertEqual(rc, 1)
+        out = err.getvalue()
+        # And the contract layer SAW it (a no-contract-match diagnostic
+        # naming the extra token — not silence):
+        self.assertIn("--note", out)
+
+    def test_step_body_comment_line_does_not_satisfy_anything(self) -> None:
+        # The fix must not overcorrect: a fully commented-out gate line
+        # still strips (executes nothing, satisfies nothing).
+        path = self._workflow(
+            "# python3 scripts/asmdiff.py --jobs 2 --as p --objdump q \\",
+            "#  --lccc target/fastbuild/lccc-x86",
+            "true")
+        steps = [s for s in parity.workflow_run_steps(path) if s.active]
+        self.assertEqual(
+            [cmd.display() for cmd in parity._logical_command_lines(
+                "\n".join(s.body for s in steps))],
+            ["true"])
+
+
+class StructuredHostedDiagnosticsTest(unittest.TestCase):
+    """Hosted violations must carry their real address, not a line number
+    into a synthetic concatenation of every workflow's bodies.
+
+    `hosted line 742` points into no file anyone can open; every hosted
+    diagnostic now names the workflow file, the job id and the step
+    (GitHub's own addressing), plus the line within that step's body.
+    The records interface also fixes a real over-join: the joined-text
+    form let a trailing line-continuation at the END of one `run:` block
+    swallow the first line of the NEXT block, though separate steps are
+    separate shells.
+    """
+
+    CONFORMING = ("python3 scripts/asmdiff.py --jobs 2 --as p --objdump q "
+                  "--lccc target/fastbuild/lccc-x86")
+
+    def setUp(self) -> None:
+        importlib.import_module("yaml")  # the checker requires PyYAML
+        self._dir = tempfile.TemporaryDirectory()
+        self.wf = Path(self._dir.name) / "ci.yml"
+        self.addCleanup(self._dir.cleanup)
+
+    def _workflow(self, step_bodies: list[tuple[str, str]]) -> Path:
+        steps = []
+        for name, body in step_bodies:
+            steps.append(f"      - name: {name}\n        run: |\n")
+            for line in body.splitlines():
+                steps.append(f"          {line}\n")
+        self.wf.write_text(
+            "name: CI\n"
+            "on: [push, pull_request]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n" + "".join(steps))
+        return self.wf
+
+    def test_violation_names_workflow_job_and_step(self) -> None:
+        path = self._workflow([
+            ("good gate", self.CONFORMING),
+            ("sabotaged gate",
+             "python3 scripts/asmdiff.py --jobs 2 --as p --objdump q "
+             "--lccc /evil/lccc"),
+        ])
+        steps = [s for s in parity.workflow_run_steps(path) if s.active]
+        err = StringIO()
+        with redirect_stderr(err):
+            rc = parity.check_invocation_contracts(
+                parity.LOCAL.read_text(), steps)
+        self.assertEqual(rc, 1)
+        out = err.getvalue()
+        self.assertIn('ci.yml job=test step="sabotaged gate"', out)
+        self.assertIn("body-line 1", out)
+
+    def test_step_boundary_continuation_does_not_swallow_next_step(self) -> None:
+        # Step A ends with a dangling continuation; step B is a clean
+        # contracted invocation. In the joined-text form A's backslash
+        # joined B's first line into an `echo ...` mention — the contract
+        # lost its match. Per-step bodies are separate shells: B's
+        # invocation must stand on its own.
+        path = self._workflow([
+            ("trailing", "echo hello \\"),
+            ("good gate", self.CONFORMING),
+        ])
+        steps = list(parity.workflow_run_steps(path))
+        trailing = next(s for s in steps if s.step == "trailing")
+        gate = next(s for s in steps if s.step == "good gate")
+        # The invocation resolves in command position inside its own step:
+        found = parity._find_invocation(
+            parity._logical_command_lines(gate.body)[0],
+            "scripts/asmdiff.py")
+        self.assertIsInstance(found, tuple)
+        # And the trailing backslash did not reach across the boundary:
+        cmds_a = parity._logical_command_lines(trailing.body)
+        self.assertTrue(all("asmdiff" not in c.display() for c in cmds_a))
+
+    def test_str_interface_still_accepted_for_synthetic_blobs(self) -> None:
+        # The mutation tests drive the checker with plain strings; that
+        # interface is load-bearing and must keep working.
+        local = parity.LOCAL.read_text()
+        with redirect_stderr(StringIO()):
+            rc_str = parity.check_invocation_contracts(local, self.CONFORMING)
+        self.assertEqual(rc_str, 1)  # (one step satisfies nothing else)
+
+
+class WorkflowTriggerSemanticsTest(unittest.TestCase):
+    """A workflow that never runs on the push/pull_request path is not
+    coverage. The same-class completion of W2: the walker already read
+    step- and job-level `if:`/`continue-on-error`, but a workflow whose
+    `on:` declares only schedule/dispatch/release events executes on NO
+    PR path at all — a gate hosted only there used to count as hosted
+    coverage while CI-on-the-PR never ran it.
+    """
+
+    GATE_STEP = (
+        "      - name: Verify x86-64 assembly differential\n"
+        "        run: python3 scripts/asmdiff.py --jobs 2 --as p --objdump q"
+        " --lccc target/fastbuild/lccc-x86\n"
+    )
+
+    def setUp(self) -> None:
+        importlib.import_module("yaml")  # the checker requires PyYAML
+        self._dir = tempfile.TemporaryDirectory()
+        self.wf = Path(self._dir.name) / "ci.yml"
+        self.addCleanup(self._dir.cleanup)
+
+    def workflow(self, on_decl: str) -> Path:
+        self.wf.write_text(
+            "name: CI\n" + on_decl + "jobs:\n"
+            "  test:\n    runs-on: ubuntu-latest\n    steps:\n"
+            + self.GATE_STEP)
+        return self.wf
+
+    def test_schedule_only_workflow_is_not_coverage(self) -> None:
+        # Both spellings: the unquoted mapping key (`on:` — which PyYAML
+        # resolves to the BOOLEAN True, the YAML 1.1 gotcha) and the list
+        # form. Neither ever fires on a push or a pull_request.
+        for on_decl in ("on:\n  schedule:\n    - cron: '0 3 * * *'\n",
+                        "on: [schedule]\n"):
+            with self.subTest(on_decl=on_decl.splitlines()[0]):
+                path = self.workflow(on_decl)
+                self.assertEqual(parity.check_step_guards([path]), 1)
+                self.assertNotIn("python3 scripts/asmdiff.py",
+                                 parity.run_script_bodies(path))
+
+    def test_dispatch_release_only_workflows_are_not_coverage(self) -> None:
+        for on_decl in ("on: workflow_dispatch\n",
+                        "on:\n  release:\n    types: [published]\n",
+                        "on: [workflow_dispatch, release]\n"):
+            with self.subTest(on_decl=on_decl.splitlines()[0]):
+                path = self.workflow(on_decl)
+                self.assertEqual(parity.check_step_guards([path]), 1)
+                self.assertNotIn("python3 scripts/asmdiff.py",
+                                 parity.run_script_bodies(path))
+
+    def test_workflow_without_on_declares_nothing(self) -> None:
+        # GitHub refuses to run a workflow with no `on:`; the walker must
+        # not treat a missing trigger spec as "runs on everything".
+        path = self.workflow("")
+        self.assertEqual(parity.check_step_guards([path]), 1)
+        self.assertNotIn("python3 scripts/asmdiff.py",
+                         parity.run_script_bodies(path))
+
+    def test_pr_path_triggers_stay_active(self) -> None:
+        # push and pull_request (alone, together, mapping or list form,
+        # with branch filters) are the events that exercise the code
+        # under review.
+        for on_decl in ("on: push\n",
+                        "on: pull_request\n",
+                        "on: [push, pull_request]\n",
+                        "on:\n  push:\n  pull_request:\n"
+                        "    branches: [main]\n"):
+            with self.subTest(on_decl=on_decl.splitlines()[0]):
+                path = self.workflow(on_decl)
+                self.assertEqual(parity.check_step_guards([path]), 0)
+                self.assertIn("python3 scripts/asmdiff.py",
+                              parity.run_script_bodies(path))
+
+    def test_mixed_triggers_stay_pr_path_coverage(self) -> None:
+        # A workflow that runs on push AND on a nightly schedule is
+        # PR-path coverage (the push leg); the schedule leg is extra.
+        path = self.workflow("on: [push, schedule]\n")
+        self.assertEqual(parity.check_step_guards([path]), 0)
+        self.assertIn("python3 scripts/asmdiff.py",
+                      parity.run_script_bodies(path))
+
+    def test_quoted_on_key_is_read_too(self) -> None:
+        # `"on":` (quoted) parses as the string key, not the boolean —
+        # both spellings must be recognised.
+        path = self.workflow('"on": [schedule]\n')
+        self.assertEqual(parity.check_step_guards([path]), 1)
+        self.assertNotIn("python3 scripts/asmdiff.py",
+                         parity.run_script_bodies(path))
+
+    def test_unquoted_on_lands_under_the_yaml_boolean_true(self) -> None:
+        # The gotcha itself, pinned: PyYAML resolves an unquoted `on` key
+        # to boolean True, so a naive doc.get("on") reads NOTHING for
+        # every normally-written workflow. The trigger extractor must
+        # read both spellings — this is the probe that fails if someone
+        # "simplifies" it back to a single key.
+        doc = parity._load_workflow(self.workflow("on: [schedule]\n"))
+        self.assertIn(True, doc)
+        self.assertNotIn("on", doc)
+        self.assertEqual(parity._workflow_triggers(doc), {"schedule"})
+        doc = parity._load_workflow(self.workflow('"on": [push]\n'))
+        self.assertNotIn(True, doc)
+        self.assertIn("on", doc)
+        self.assertEqual(parity._workflow_triggers(doc), {"push"})
+
+
+class GateRegistrationTest(unittest.TestCase):
+    """Registrations are parsed from comment-stripped `gate NAME fast'
+    lines: a comment can never satisfy a contract (W4), a duplicated name
+    re-runs a gate and inflates the PASSED count, and a malformed speed
+    class silently changes --fast behaviour."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.local = parity.LOCAL.read_text()
+
+    def test_real_tree_has_no_duplicate_or_malformed_registrations(self) -> None:
+        self.assertEqual(parity.check_gate_name_uniqueness(self.local), 0)
+        registrations, malformed = parity.gate_registrations(self.local)
+        self.assertEqual(malformed, [])
+        self.assertGreater(len(registrations), 50)
+
+    def test_a_repeated_registration_is_rejected(self) -> None:
+        line = next(
+            line
+            for line in self.local.splitlines()
+            if line.startswith('gate "') and line.endswith("\\")
+        )
+        name = line.split('"')[1]
+        mutated = self.local + f'\n{line}\n    true\n'
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(parity.check_gate_name_uniqueness(mutated), 1)
+        self.assertIn(name, err.getvalue())
+        self.assertIn("registered 2x", err.getvalue())
+
+    def test_a_malformed_speed_class_is_rejected(self) -> None:
+        # `gate NAME medium' runs as a fast gate (the runner only tests
+        # for "slow") — a typo silently changes --fast behaviour.
+        mutated = self.local + '\ngate "typo-demo" medium \\\n    true\n'
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(parity.check_gate_name_uniqueness(mutated), 1)
+        self.assertIn("malformed", err.getvalue())
+
+    def test_a_comment_cannot_satisfy_a_gate_registration(self) -> None:
+        # W4: demote the real registration to slow, leave the required
+        # spelling in a comment — the old substring check passed while
+        # the gate left the fast set.
+        mutated = self.local.replace('gate "encdiff-corpus" fast',
+                                     'gate "encdiff-corpus" slow', 1)
+        mutated = mutated.replace(
+            "# The encdiff corpus (index-fold-64",
+            '# gate "encdiff-corpus" fast (documentation)\n'
+            "# The encdiff corpus (index-fold-64", 1)
+        self.assertIn('gate "encdiff-corpus" slow', mutated)
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(
+                parity.check_invocation_contracts(mutated, hosted_bodies()), 1)
+        self.assertIn('gate "encdiff-corpus" must be registered', err.getvalue())
+
+    def test_the_same_script_under_different_arguments_is_not_a_duplicate(self) -> None:
+        # Pins the design decision, because the obvious alternative is wrong.
+        # Comparing command-path multiplicity (a Counter over COMMAND.findall)
+        # fails the CLEAN tree: asmdiff.py and fuzz_diff.py legitimately run
+        # once per mode, check_volatile_destructuring.py runs as --self-test and
+        # then for real, and COMMAND.findall also matches paths named in prose.
+        # Uniqueness is therefore asserted on gate names only.
+        text = (
+            'gate "asmdiff-x64" fast \\\n'
+            "    python3 scripts/asmdiff.py --corpus a\n"
+            'gate "asmdiff-i686" fast \\\n'
+            "    python3 scripts/asmdiff.py --32 --corpus a\n"
+            'gate "destructuring-selftest" fast \\\n'
+            "    python3 scripts/check_volatile_destructuring.py --self-test\n"
+            'gate "destructuring" fast \\\n'
+            "    python3 scripts/check_volatile_destructuring.py\n"
+        )
+        with redirect_stderr(StringIO()):
+            self.assertEqual(parity.check_gate_name_uniqueness(text), 0)
+
+
+class FuzzDiscoveryParityTest(unittest.TestCase):
+    """Executable discovery in both mirrors, and a FAST local gate."""
+
+    def test_real_mirrors_and_negative_mutations(self):
+        local = parity.LOCAL.read_text()
+        hosted = hosted_bodies()
+        self.assertEqual(parity.check_fuzz_test_gate_parity(local, hosted), 0)
+        for mutated_local, mutated_hosted in (
+            (local.replace("-p 'test_*.py'", "-p 'test_broken.py'", 1), hosted),
+            (local.replace('gate "fuzz-harness-tests" fast',
+                           'gate "fuzz-harness-tests" slow', 1), hosted),
+            (local, hosted.replace("tests/fuzz", "tests/other", 1)),
+        ):
+            with self.subTest():
+                self.assertNotEqual((mutated_local, mutated_hosted), (local, hosted))
+                self.assertEqual(
+                    parity.check_fuzz_test_gate_parity(mutated_local, mutated_hosted),
+                    1)
+
+
+class HostedStepsMirroredTest(unittest.TestCase):
+    """The reverse direction: hosted-only steps are coverage CI can fail
+    on that ci_local never sees."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.local = parity.LOCAL.read_text()
+        cls.hosted = hosted_bodies()
+
+    def test_mirrored_tree_passes(self) -> None:
+        self.assertEqual(
+            parity.check_hosted_steps_mirrored(self.local, self.hosted), 0)
+
+    def test_hosted_only_script_fails(self) -> None:
+        hosted = self.hosted + "\npython3 scripts/check_new_gate.py\n"
+        with redirect_stderr(StringIO()):
+            self.assertEqual(
+                parity.check_hosted_steps_mirrored(self.local, hosted), 1)
+
+    def test_comment_does_not_mirror_a_script_or_a_build_mode(self) -> None:
+        local = self.local.replace("cargo build", "# cargo build", 1)
+        self.assertNotEqual(local, self.local)
+        with redirect_stderr(StringIO()):
+            self.assertEqual(
+                parity.check_hosted_steps_mirrored(local, self.hosted), 1)
+
+    def test_missing_build_mode_fails_in_every_spelling(self) -> None:
+        for old, new in (
+            ("cargo build", "cargo test"),
+            ("--config profile=dev", "--config profile=frobnicate"),
+        ):
+            local = self.local.replace(old, new, 1)
+            if local == self.local:
+                continue
+            with self.subTest(new=new):
+                with redirect_stderr(StringIO()):
+                    self.assertEqual(
+                        parity.check_hosted_steps_mirrored(local, self.hosted), 1)
+
+    def test_missing_cargo_subcommand_fails(self) -> None:
+        # `cargo doc' is not one of ci_local's build/fmt/clippy/test runs.
+        self.assertNotIn("cargo doc", self.local)
+        hosted = self.hosted + "\ncargo doc\n"
+        with redirect_stderr(StringIO()):
+            self.assertEqual(
+                parity.check_hosted_steps_mirrored(self.local, hosted), 1)
+
+    def test_allowlist_exempts_and_must_shrink(self) -> None:
+        allow = "scripts/check_hosted_only_demo.py"
+        hosted = self.hosted + f"python3 {allow}\n"
+        with redirect_stderr(StringIO()):
+            self.assertEqual(
+                parity.check_hosted_steps_mirrored(self.local, hosted), 1)
+        allowlist = parity.HOSTED_ONLY
+        original = allowlist.read_text()
+        try:
+            allowlist.write_text(original + f"{allow}  # test entry\n")
+            with redirect_stderr(StringIO()):
+                self.assertEqual(
+                    parity.check_hosted_steps_mirrored(self.local, hosted), 0)
+            # An entry ci_local now mirrors is stale and must be deleted.
+            local = self.local + f"python3 {allow}\n"
+            with redirect_stderr(StringIO()):
+                self.assertEqual(
+                    parity.check_hosted_steps_mirrored(local, hosted), 1)
+        finally:
+            allowlist.write_text(original)
+
+    def test_repository_is_mirrored(self) -> None:
+        self.assertEqual(
+            parity.check_hosted_steps_mirrored(self.local, self.hosted), 0)
+
+
+class AggregatedDiagnosticsTest(unittest.TestCase):
+    """main() runs EVERY check and reports all failures (W10): one run,
+    every violation — not first-fail with the rest silently unreported."""
+
+    def test_main_reports_every_failing_check(self) -> None:
+        import subprocess
+        import sys as _sys
+        # Mutate both a contract (unregistered invocation) and the step
+        # semantics (job-level continue-on-error) in one tree copy.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "scripts").mkdir(parents=True)
+            (root / ".github" / "workflows").mkdir(parents=True)
+            local = parity.LOCAL.read_text().replace(
+                "bash scripts/ensure_gas_247.sh x86_64-linux-gnu",
+                "echo bash scripts/ensure_gas_247.sh x86_64-linux-gnu", 1)
+            (root / "scripts" / "ci_local.sh").write_text(local)
+            import yaml
+            original = (parity.WORKFLOWS / "ci.yml").read_text()
+            document = yaml.safe_load(original)
+            guarded = [job for job in document["jobs"].values()
+                       if any(program in str(step.get("run", ""))
+                              for step in job.get("steps", [])
+                              for program in parity.GUARDED_PROGRAMS)]
+            self.assertTrue(guarded, "mutation needs a contract-bearing job")
+            guarded[0]["continue-on-error"] = True
+            # Preserve YAML 1.1's boolean interpretation of GitHub's `on` key.
+            if True in document:
+                document["on"] = document.pop(True)
+            wf = yaml.safe_dump(document, sort_keys=False)
+            self.assertNotEqual(original, wf)
+            (root / ".github" / "workflows" / "ci.yml").write_text(wf)
+            # Preserve the real caller's reusable lane in this reduced tree.
+            (root / ".github" / "workflows" / "bench.yml").write_text(
+                (parity.WORKFLOWS / "bench.yml").read_text())
+            checker = Path(parity.__file__).read_text()
+            (root / "scripts" / "check_ci_gate_parity.py").write_text(checker)
+            p = subprocess.run(
+                [_sys.executable, str(root / "scripts" / "check_ci_gate_parity.py")],
+                capture_output=True, text=True, cwd=root)
+            self.assertEqual(p.returncode, 1)
+            # BOTH violation families are reported in one run.
+            self.assertIn("invocation contracts", p.stderr)
+            self.assertIn("workflow step guards", p.stderr)
+
+
+# The __main__ block lives at the very END of the module on purpose: it
+# sat above the last test class for its whole life, so direct execution
+# (`python3 scripts/test_ci_gate_parity.py`) collected tests only from
+# the classes defined ABOVE it — three gate-uniqueness tests were dead
+# code in the very execution mode CI uses, and the suite reported 24/24
+# while they never ran. Discovery imports were unaffected; direct
+# execution was the blind spot.
+class ReusableInputSemanticsTest(unittest.TestCase):
+    """A reusable lane's inputs are resolved, not refused.
+
+    The pipeline splits a long lane by calling one workflow file several times
+    with different `with:` values (the benchmark corpus runs as shards). The
+    checker used to REFUSE any caller that passed `with:` -- which would have
+    turned every sharded lane into "unverifiable", and an unverifiable gate is
+    one the checker silently stops protecting. The replacement is stricter, not
+    looser: the caller's values are substituted into the step conditions and
+    the run bodies, so a step that an input disables is still not coverage, and
+    a body whose arguments come from an input is checked with its REAL
+    arguments.
+    """
+
+    CHILD = (
+        "name: Child\n"
+        "on:\n"
+        "  workflow_call:\n"
+        "    inputs:\n"
+        "      jobs_arg:\n"
+        "        type: string\n"
+        "        default: '2'\n"
+        "      run_it:\n"
+        "        type: boolean\n"
+        "        default: true\n"
+        "      hidden:\n"
+        "        type: boolean\n"
+        "        default: false\n"
+        "jobs:\n"
+        "  work:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Verify assembly differential\n"
+        "        if: inputs.run_it\n"
+        "        run: python3 scripts/asmdiff.py --jobs ${{ inputs.jobs_arg }}"
+        " --as p --objdump q --lccc target/fastbuild/lccc-x86\n"
+        "      - name: Never on the green path\n"
+        "        if: inputs.hidden\n"
+        "        run: python3 scripts/asmdiff.py --jobs 2 --as p --objdump q"
+        " --lccc target/fastbuild/lccc-x86\n"
+    )
+
+    def setUp(self) -> None:
+        importlib.import_module("yaml")
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name) / ".github" / "workflows"
+        self.root.mkdir(parents=True)
+        (self.root / "child.yml").write_text(self.CHILD)
+
+    def caller(self, with_block: str = "", secrets: str = "") -> Path:
+        path = self.root / "caller.yml"
+        path.write_text(
+            "name: Caller\non: [pull_request]\njobs:\n"
+            "  shard:\n"
+            "    uses: ./.github/workflows/child.yml\n"
+            + with_block + secrets)
+        return path
+
+    def test_input_defaults_apply_when_the_caller_passes_nothing(self) -> None:
+        # `if: inputs.run_it` defaults true -> coverage, with the default
+        # argument; `if: inputs.hidden` defaults false -> not coverage at all.
+        body = parity.run_script_bodies(self.caller())
+        self.assertIn("--jobs 2", body)
+        self.assertEqual(body.count("scripts/asmdiff.py"), 1,
+                         "a step disabled by an input default must not count as coverage")
+
+    def test_caller_values_are_substituted_into_the_body(self) -> None:
+        path = self.caller("    with:\n      jobs_arg: '7'\n")
+        body = parity.run_script_bodies(path)
+        self.assertIn("--jobs 7", body,
+                      "the caller's input must reach the invocation the checker parses")
+
+    def test_a_caller_that_disables_the_step_loses_the_coverage(self) -> None:
+        path = self.caller("    with:\n      run_it: false\n")
+        body = parity.run_script_bodies(path)
+        self.assertNotIn("scripts/asmdiff.py", body,
+                         "a step an input turns off is not green-path coverage")
+
+    def test_undeclared_inputs_and_secrets_are_still_refused(self) -> None:
+        with self.assertRaisesRegex(parity._WorkflowError, "undeclared inputs"):
+            parity.run_script_bodies(self.caller("    with:\n      typo_input: '1'\n"))
+        with self.assertRaisesRegex(parity._WorkflowError, "reusable secrets"):
+            parity.run_script_bodies(self.caller(secrets="    secrets:\n      token: x\n"))
+
+    def test_an_unresolvable_condition_stays_conservative(self) -> None:
+        (self.root / "child.yml").write_text(
+            "name: Child\non:\n  workflow_call:\n"
+            "jobs:\n  work:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - name: Expression gate\n"
+            "        if: github.event_name == 'push'\n"
+            "        run: python3 scripts/asmdiff.py --jobs 2 --as p --objdump q"
+            " --lccc target/fastbuild/lccc-x86\n")
+        self.assertNotIn("scripts/asmdiff.py",
+                         parity.run_script_bodies(self.caller()))
+
+
+class OrphanGateDiscoveryTest(unittest.TestCase):
+    """Mutation coverage for the allowlist that cannot grow.
+
+    A brand-new `tests/regression/check_*.sh` that neither mirror executes
+    must fail the audit; allowlisting it is the intended temporary escape, and
+    wiring it into either mirror must then make that entry stale.  Before this
+    test the only coverage was the real tree passing, which a deleted guard
+    would not necessarily break.
+    """
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+        self.reg = self.root / "tests" / "regression"
+        self.reg.mkdir(parents=True)
+        (self.reg / "check_new_gate.sh").write_text("#!/bin/sh\nexit 0\n")
+        self.allow = self.root / "scripts" / "ci_gate_allowlist.txt"
+        self.allow.parent.mkdir(parents=True)
+        self.allow.write_text("")
+
+    def check(self, local: str, hosted: str) -> int:
+        with unittest.mock.patch.object(parity, "ROOT", self.root), \
+             unittest.mock.patch.object(parity, "REGRESSION_DIR", self.reg), \
+             unittest.mock.patch.object(parity, "ALLOWLIST", self.allow), \
+             redirect_stderr(StringIO()):
+            return parity.check_orphaned_gates(local, hosted)
+
+    def test_an_unwired_unallowlisted_gate_fails(self) -> None:
+        self.assertEqual(self.check("bash other.sh", "bash other.sh"), 1)
+
+    def test_an_allowlisted_gate_passes_until_it_is_wired(self) -> None:
+        self.allow.write_text("tests/regression/check_new_gate.sh  # pending wiring\n")
+        self.assertEqual(self.check("bash other.sh", "bash other.sh"), 0)
+        # Wiring it locally makes the entry stale; the allowlist must shrink.
+        self.assertEqual(self.check("bash tests/regression/check_new_gate.sh", ""), 1)
+        self.allow.write_text("")
+        self.assertEqual(self.check("bash tests/regression/check_new_gate.sh", ""), 0)
+
+    def test_hosted_wiring_is_sufficient_coverage(self) -> None:
+        self.assertEqual(self.check("", "bash tests/regression/check_new_gate.sh"), 0)
+
+    def test_the_real_tree_passes(self) -> None:
+        with redirect_stderr(StringIO()):
+            rc = parity.check_orphaned_gates(
+                parity.LOCAL.read_text(), hosted_bodies()
+            )
+        self.assertEqual(rc, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

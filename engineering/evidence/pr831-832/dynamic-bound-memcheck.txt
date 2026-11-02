@@ -1,0 +1,59 @@
+==421748== Memcheck, a memory error detector
+==421748== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.
+==421748== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info
+==421748== Command: /home/user/.cache/pr831-research/dynamic-bounds/lccc-O2
+==421748== 
+0
+0
+0
+123456789
+493827156
+2677857237
+2210050400
+248590293
+618960660
+618960660
+4017504736
+4017504736
+4017504736
+2144028873
+1271423587
+411747950
+1192622250
+2416036055
+3061338805
+646184452
+850230916
+1693045749
+383273495
+1162901674
+1396720494
+802806307
+336705673
+3412895328
+1008580456
+2725530465
+3013217803
+2611017510
+2330020466
+1185388463
+4046633629
+4244757244
+4285688972
+3601739533
+1458122303
+1928315362
+2483326390
+2500755835
+2501302513
+2501319640
+2501320176
+==421748== 
+==421748== HEAP SUMMARY:
+==421748==     in use at exit: 0 bytes in 0 blocks
+==421748==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated
+==421748== 
+==421748== All heap blocks were freed -- no leaks are possible
+==421748== 
+==421748== For lists of detected and suppressed errors, rerun with: -s
+==421748== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)

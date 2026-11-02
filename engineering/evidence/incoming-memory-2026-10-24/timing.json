@@ -1,0 +1,108 @@
+{
+  "metric": "call-inclusive dependent sum_big",
+  "cpu": 0,
+  "driver_flags": [
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror"
+  ],
+  "iterations_per_sample": 30000000,
+  "samples_ns": [
+    {
+      "new": 206208826,
+      "original": 199695200
+    },
+    {
+      "original": 199836840,
+      "new": 205756734
+    },
+    {
+      "new": 202820127,
+      "original": 199791939
+    },
+    {
+      "original": 198892041,
+      "new": 201948724
+    },
+    {
+      "new": 206030772,
+      "original": 200396604
+    },
+    {
+      "original": 200122986,
+      "new": 199155856
+    },
+    {
+      "new": 199661183,
+      "original": 200926747
+    },
+    {
+      "original": 200337205,
+      "new": 201010818
+    },
+    {
+      "new": 206065791,
+      "original": 199724802
+    },
+    {
+      "original": 199786186,
+      "new": 200285233
+    },
+    {
+      "new": 200311285,
+      "original": 200211082
+    },
+    {
+      "original": 198443435,
+      "new": 206414184
+    },
+    {
+      "new": 199092425,
+      "original": 200122514
+    },
+    {
+      "original": 205795122,
+      "new": 207771154
+    },
+    {
+      "new": 203417694,
+      "original": 199706577
+    },
+    {
+      "original": 200191630,
+      "new": 201435909
+    },
+    {
+      "new": 200528284,
+      "original": 201706124
+    },
+    {
+      "original": 206127232,
+      "new": 210392968
+    },
+    {
+      "new": 199968737,
+      "original": 198843875
+    },
+    {
+      "original": 201414432,
+      "new": 200627825
+    },
+    {
+      "new": 205870318,
+      "original": 202010126
+    }
+  ],
+  "median_before_over_after": 0.9904893823711447,
+  "ratio_median_absolute_deviation": 0.010764470652612323,
+  "before_kernel": ".globl original\n.type original,@function\noriginal:\n.cfi_startproc\n    subq $24, %rsp\n    .cfi_def_cfa_offset 32\n    # LCCC_RET_XMM 0\n    # LCCC_RET_XMM_BITS 512\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    movq 32(%rsp), %rax\n    movq %rax, 0(%rsp)\n    movq 40(%rsp), %rax\n    movq %rax, 8(%rsp)\n    movq 48(%rsp), %rax\n    movq %rax, 16(%rsp)\n    movq 0(%rsp), %rax\n    addq 8(%rsp), %rax\n    addq 16(%rsp), %rax\n    addq $24, %rsp\n    .cfi_def_cfa_offset 8\n    ret\n.cfi_endproc\n.size original, .-original\n",
+  "after_kernel": ".globl optimized\n.type optimized,@function\noptimized:\n.cfi_startproc\n    # LCCC_RET_XMM 0\n    # LCCC_RET_XMM_BITS 512\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    movq 8(%rsp), %rax\n    addq 16(%rsp), %rax\n    addq 24(%rsp), %rax\n    ret\n.cfi_endproc\n.size optimized, .-optimized\n",
+  "driver_sha256": "d1c1872a9ef8304d2bc7e1d8dbb024f6ea9b25b3d98174af102e910f32dc67ae",
+  "harness_sha256": "d642aa150b08964ed2861bebb1fed5ac04ab9ff7bdedb2e6e0861982b4e264ec",
+  "before_sha256": "68663e9afec7997fa5c307e743bcdf92e8977eec4427baa418acc3e51320eb19",
+  "after_sha256": "e6c5bbaf4fa209cff54daaf4167de34e63e09125be846dc2dcb62b88f5b74989",
+  "compiler": "gcc-16 (GCC) 16.2.0",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "caveat": "Virtualized single host; no PMU or general workload speed claim."
+}

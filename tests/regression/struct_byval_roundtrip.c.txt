@@ -1,0 +1,1 @@
+struct-by-value copies (aggregate SROA) must preserve every field across copy, argument passing and return

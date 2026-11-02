@@ -1,0 +1,321 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "binary_trees",
+    "byte_load_reassembly",
+    "chacha20_block",
+    "expat_xml_scan",
+    "gzip_longest_match",
+    "hot_web_loop",
+    "llvm_scalar_facts",
+    "nbody",
+    "sqlite_varint",
+    "switch_dispatch"
+  ],
+  "results": {
+    "llvm_scalar_facts": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DSCALAR_FACTS_TRIPS=1024",
+      "metrics": {
+        "conditional_mispredicts": [
+          3420,
+          3440
+        ],
+        "d1_misses": [
+          1828,
+          1828
+        ],
+        "i1_misses": [
+          1322,
+          1323
+        ],
+        "indirect_mispredicts": [
+          205,
+          210
+        ],
+        "ir_mine": 310053,
+        "ir_ratio": 0.9650403847051683,
+        "ir_ref": 321285,
+        "ll_misses": [
+          2795,
+          2799
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/llvm_scalar_facts/manifest.json"
+    },
+    "hot_web_loop": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DHOT_WEB_TRIPS=4096",
+      "metrics": {
+        "conditional_mispredicts": [
+          3434,
+          3452
+        ],
+        "d1_misses": [
+          1824,
+          1823
+        ],
+        "i1_misses": [
+          1301,
+          1305
+        ],
+        "indirect_mispredicts": [
+          204,
+          209
+        ],
+        "ir_mine": 222055,
+        "ir_ratio": 0.9955480434704638,
+        "ir_ref": 223048,
+        "ll_misses": [
+          2776,
+          2783
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/hot_web_loop/manifest.json"
+    },
+    "nbody": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3575,
+          3592
+        ],
+        "d1_misses": [
+          1851,
+          1856
+        ],
+        "i1_misses": [
+          1395,
+          1399
+        ],
+        "indirect_mispredicts": [
+          202,
+          206
+        ],
+        "ir_mine": 816719,
+        "ir_ratio": 1.1269581943698936,
+        "ir_ref": 724711,
+        "ll_misses": [
+          2875,
+          2881
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/nbody/manifest.json"
+    },
+    "binary_trees": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DTREE_DEPTH=10",
+      "metrics": {
+        "conditional_mispredicts": [
+          203637,
+          198141
+        ],
+        "d1_misses": [
+          54214,
+          54264
+        ],
+        "i1_misses": [
+          1310,
+          1331
+        ],
+        "indirect_mispredicts": [
+          206,
+          235
+        ],
+        "ir_mine": 31174974,
+        "ir_ratio": 1.0185078799741614,
+        "ir_ref": 30608476,
+        "ll_misses": [
+          4834,
+          4850
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/binary_trees/manifest.json"
+    },
+    "switch_dispatch": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -fwrapv -DN=20000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3390,
+          3427
+        ],
+        "d1_misses": [
+          1822,
+          1821
+        ],
+        "i1_misses": [
+          1293,
+          1298
+        ],
+        "indirect_mispredicts": [
+          18962,
+          18816
+        ],
+        "ir_mine": 548203,
+        "ir_ratio": 1.0951575204267134,
+        "ir_ref": 500570,
+        "ll_misses": [
+          2767,
+          2775
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/switch_dispatch/manifest.json"
+    },
+    "byte_load_reassembly": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm",
+      "metrics": {
+        "conditional_mispredicts": [
+          23443,
+          23481
+        ],
+        "d1_misses": [
+          1893,
+          1895
+        ],
+        "i1_misses": [
+          1314,
+          1313
+        ],
+        "indirect_mispredicts": [
+          205,
+          210
+        ],
+        "ir_mine": 38760992,
+        "ir_ratio": 2.1439021538364194,
+        "ir_ref": 18079646,
+        "ll_misses": [
+          2849,
+          2853
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/byte_load_reassembly/manifest.json"
+    },
+    "expat_xml_scan": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DXML_SIZE=16384 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          25592,
+          25321
+        ],
+        "d1_misses": [
+          2123,
+          2121
+        ],
+        "i1_misses": [
+          1297,
+          1304
+        ],
+        "indirect_mispredicts": [
+          201,
+          206
+        ],
+        "ir_mine": 1503741,
+        "ir_ratio": 1.1115915202893,
+        "ir_ref": 1352782,
+        "ll_misses": [
+          3026,
+          3035
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/expat_xml_scan/manifest.json"
+    },
+    "sqlite_varint": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DVALUE_COUNT=2048 -DPASSES=4",
+      "metrics": {
+        "conditional_mispredicts": [
+          12425,
+          12471
+        ],
+        "d1_misses": [
+          2163,
+          2172
+        ],
+        "i1_misses": [
+          1314,
+          1317
+        ],
+        "indirect_mispredicts": [
+          2023,
+          2028
+        ],
+        "ir_mine": 816371,
+        "ir_ratio": 1.1551139378417958,
+        "ir_ref": 706745,
+        "ll_misses": [
+          3075,
+          3082
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/sqlite_varint/manifest.json"
+    },
+    "chacha20_block": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DBLOCK_COUNT=256 -DPASSES=2",
+      "metrics": {
+        "conditional_mispredicts": [
+          3950,
+          3978
+        ],
+        "d1_misses": [
+          1827,
+          1830
+        ],
+        "i1_misses": [
+          1315,
+          1315
+        ],
+        "indirect_mispredicts": [
+          204,
+          209
+        ],
+        "ir_mine": 528885,
+        "ir_ratio": 0.7466130418885936,
+        "ir_ref": 708379,
+        "ll_misses": [
+          2788,
+          2795
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/chacha20_block/manifest.json"
+    },
+    "gzip_longest_match": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -DWINDOW_SIZE=4096 -DPASSES=1",
+      "metrics": {
+        "conditional_mispredicts": [
+          4573,
+          4643
+        ],
+        "d1_misses": [
+          4501,
+          4450
+        ],
+        "i1_misses": [
+          1328,
+          1328
+        ],
+        "indirect_mispredicts": [
+          205,
+          210
+        ],
+        "ir_mine": 535127,
+        "ir_ratio": 1.5458770987162154,
+        "ir_ref": 346164,
+        "ll_misses": [
+          5173,
+          5183
+        ]
+      },
+      "manifest": "/home/user/audit/worst-ten-profiles/gzip_longest_match/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "byte_load_reassembly",
+    "gzip_longest_match",
+    "sqlite_varint",
+    "nbody",
+    "expat_xml_scan",
+    "switch_dispatch",
+    "binary_trees",
+    "hot_web_loop",
+    "llvm_scalar_facts",
+    "chacha20_block"
+  ]
+}

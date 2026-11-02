@@ -1,0 +1,43 @@
+{
+  "source_commit": "987a2a7ebd5b62be726da83b313f73435bcaa271",
+  "source_tree": "9874c5c8a1f4deb00ecc15efe1ed042e89574a64",
+  "compiler_identities": {
+    "candidate": {
+      "path": "/home/user/.cache/pr828-narrow-reuse-compiler",
+      "sha256": "c2cfec4e3451107087a3a05ed74d40fc087ec6b4aea4286963d95a0fab8a69b7"
+    },
+    "main": {
+      "path": "/home/user/.cache/pr828-main/target/fastbuild/lccc",
+      "sha256": "184ab6b10afa83b83f0093ddd6f60b07cf8712e762b8f39900eba4f5213aee31"
+    }
+  },
+  "ratios": {
+    "nbody": [
+      0.9984867378772616,
+      0.9984867378772616,
+      0.9984867378772616
+    ],
+    "fannkuch": [
+      0.9930050720902538,
+      0.9930050720902538,
+      0.9930050720902538
+    ],
+    "histogram": [
+      0.9247983141061648,
+      0.9247983141061648,
+      0.9247983141061648
+    ],
+    "libm_round_family": [
+      0.994001213762196,
+      0.994001213762196,
+      0.994001213762196
+    ],
+    "lz4_match_extend": [
+      0.9882261053655662,
+      0.9882261053655662,
+      0.9882261053655662
+    ]
+  },
+  "metric": "simulated Ir, not native cycles",
+  "full_acceptance": "PENDING on changed production tree"
+}

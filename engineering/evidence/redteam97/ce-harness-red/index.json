@@ -1,0 +1,364 @@
+[
+  {
+    "family": "vector",
+    "stage": "original",
+    "compiler": "gcc16.2",
+    "expected_exit": 0,
+    "source_sha256": "53e2ea85c29dd337bab559dab25110a846636681d0376f6234ffcc825f2ac1d8",
+    "time": 1792094789.0688543,
+    "execution": {
+      "code": 0,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "16.2.0"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 27,
+      "processExecutionResultTime": 0.020059999078512192,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 61,
+        "processExecutionResultTime": 0.003426000475883484,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerIPtHx3/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "-no-pie",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/gcc-16.2.0/lib",
+          "/opt/compiler-explorer/gcc-16.2.0/lib32",
+          "/opt/compiler-explorer/gcc-16.2.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 36
+      }
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": true
+  },
+  {
+    "family": "vector",
+    "stage": "original",
+    "compiler": "clang23.1",
+    "expected_exit": 0,
+    "source_sha256": "53e2ea85c29dd337bab559dab25110a846636681d0376f6234ffcc825f2ac1d8",
+    "time": 1792094789.7094746,
+    "error": "cclang2310: compilation exit missing or unsuccessful: 1: clang: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  },
+  {
+    "family": "vector",
+    "stage": "original",
+    "compiler": "icx",
+    "expected_exit": 0,
+    "source_sha256": "53e2ea85c29dd337bab559dab25110a846636681d0376f6234ffcc825f2ac1d8",
+    "time": 1792094790.066487,
+    "error": "cicxlatest: compilation exit missing or unsuccessful: 1: icx: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "compiler": "gcc16.2",
+    "expected_exit": 1,
+    "source_sha256": "ccca4d919cd2498fab6037f3c896b234bd43f9630d6cabd85958adb9186c994a",
+    "time": 1792094791.5932071,
+    "execution": {
+      "code": 1,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [
+        {
+          "text": "16.2.0"
+        }
+      ],
+      "stderr": [],
+      "truncated": false,
+      "execTime": 26,
+      "processExecutionResultTime": 0.020610995590686798,
+      "didExecute": true,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 0,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [],
+        "truncated": false,
+        "execTime": 84,
+        "processExecutionResultTime": 0.0035209953784942627,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerW0HxWr/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "-no-pie",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ],
+        "preparedLdPaths": [
+          "/opt/compiler-explorer/gcc-16.2.0/lib",
+          "/opt/compiler-explorer/gcc-16.2.0/lib32",
+          "/opt/compiler-explorer/gcc-16.2.0/lib64"
+        ],
+        "defaultExecOptions": {
+          "timeoutMs": 20000,
+          "maxErrorOutput": 5000,
+          "env": {
+            "LD_LIBRARY_PATH": "",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",
+            "HOME": "/home/ce"
+          }
+        },
+        "packageStoreTime": 37
+      }
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": true
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "compiler": "clang23.1",
+    "expected_exit": 1,
+    "source_sha256": "ccca4d919cd2498fab6037f3c896b234bd43f9630d6cabd85958adb9186c994a",
+    "time": 1792094792.2283227,
+    "error": "cclang2310: compilation exit missing or unsuccessful: 1: clang: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  },
+  {
+    "family": "vector",
+    "stage": "before",
+    "compiler": "icx",
+    "expected_exit": 1,
+    "source_sha256": "ccca4d919cd2498fab6037f3c896b234bd43f9630d6cabd85958adb9186c994a",
+    "time": 1792094792.6862257,
+    "error": "cicxlatest: compilation exit missing or unsuccessful: 1: icx: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  },
+  {
+    "family": "padding",
+    "stage": "original",
+    "compiler": "gcc16.2",
+    "expected_exit": 0,
+    "source_sha256": "69596d38ea5f7dd8850f5e1a58f960a1d5d12a20484de9a4980e8b827dec023f",
+    "time": 1792094793.4282947,
+    "execution": {
+      "code": -1,
+      "didExecute": false,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 1,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [
+          {
+            "text": "/tmp/ccEEuVrW.s: Assembler messages:"
+          },
+          {
+            "text": "/tmp/ccEEuVrW.s:51: Error: symbol `.LBB2' is already defined"
+          },
+          {
+            "text": "/tmp/ccEEuVrW.s:59: Error: symbol `.LBB3' is already defined"
+          },
+          {
+            "text": "/tmp/ccEEuVrW.s:468: Error: invalid operands (.text.startup and .text sections) for `-'"
+          },
+          {
+            "text": "/tmp/ccEEuVrW.s:471: Error: invalid operands (.text.startup and .text sections) for `-'"
+          },
+          {
+            "text": "/tmp/ccEEuVrW.s:473: Error: invalid operands (.text.startup and .text sections) for `-'"
+          },
+          {
+            "text": "/tmp/ccEEuVrW.s:474: Error: invalid operands (.text.startup and .text sections) for `-'"
+          }
+        ],
+        "truncated": false,
+        "execTime": 43,
+        "processExecutionResultTime": 0.03481400012969971,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compilerCJWdNu/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "-no-pie",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ]
+      },
+      "stderr": [
+        {
+          "text": "Build failed"
+        }
+      ],
+      "stdout": [],
+      "timedOut": false
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": false
+  },
+  {
+    "family": "padding",
+    "stage": "original",
+    "compiler": "clang23.1",
+    "expected_exit": 0,
+    "source_sha256": "69596d38ea5f7dd8850f5e1a58f960a1d5d12a20484de9a4980e8b827dec023f",
+    "time": 1792094793.938025,
+    "error": "cclang2310: compilation exit missing or unsuccessful: 1: clang: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  },
+  {
+    "family": "padding",
+    "stage": "original",
+    "compiler": "icx",
+    "expected_exit": 0,
+    "source_sha256": "69596d38ea5f7dd8850f5e1a58f960a1d5d12a20484de9a4980e8b827dec023f",
+    "time": 1792094794.2333152,
+    "error": "cicxlatest: compilation exit missing or unsuccessful: 1: icx: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "compiler": "gcc16.2",
+    "expected_exit": 13,
+    "source_sha256": "39648d27cf4b689db8bb59db9c61d0efa03d85a5e4683af7360d73d9102e0bf3",
+    "time": 1792094795.1203375,
+    "execution": {
+      "code": -1,
+      "didExecute": false,
+      "buildResult": {
+        "inputFilename": "example.c",
+        "code": 1,
+        "okToCache": true,
+        "timedOut": false,
+        "stdout": [],
+        "stderr": [
+          {
+            "text": "/tmp/ccBnWzpE.s: Assembler messages:"
+          },
+          {
+            "text": "/tmp/ccBnWzpE.s:55: Error: symbol `.LBB3' is already defined"
+          },
+          {
+            "text": "/tmp/ccBnWzpE.s:466: Error: invalid operands (.text and .text.startup sections) for `-'"
+          }
+        ],
+        "truncated": false,
+        "execTime": 44,
+        "processExecutionResultTime": 0.031654998660087585,
+        "instructionSet": "amd64",
+        "downloads": [],
+        "executableFilename": "/nosym/tmp/compiler-explorer-compileraEEacJ/output.s",
+        "compilationOptions": [
+          "-g",
+          "-o",
+          "/app/output.s",
+          "-fno-verbose-asm",
+          "-fdiagnostics-color=always",
+          "-O2",
+          "-Werror",
+          "-no-pie",
+          "/app/example.c",
+          "-L./lib",
+          "-Wl,-rpath,./lib"
+        ]
+      },
+      "stderr": [
+        {
+          "text": "Build failed"
+        }
+      ],
+      "stdout": [],
+      "timedOut": false
+    },
+    "metadata": {
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": ""
+    },
+    "pass_result": false
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "compiler": "clang23.1",
+    "expected_exit": 13,
+    "source_sha256": "39648d27cf4b689db8bb59db9c61d0efa03d85a5e4683af7360d73d9102e0bf3",
+    "time": 1792094795.561744,
+    "error": "cclang2310: compilation exit missing or unsuccessful: 1: clang: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  },
+  {
+    "family": "padding",
+    "stage": "before",
+    "compiler": "icx",
+    "expected_exit": 13,
+    "source_sha256": "39648d27cf4b689db8bb59db9c61d0efa03d85a5e4683af7360d73d9102e0bf3",
+    "time": 1792094795.9117365,
+    "error": "cicxlatest: compilation exit missing or unsuccessful: 1: icx: ^[[0;1;31merror: ^[[0m^[[1margument unused during compilation: '-no-pie' [-Werror,-Wunused-command-line-argument]^[[0m",
+    "pass_result": false
+  }
+]

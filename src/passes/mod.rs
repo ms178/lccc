@@ -1,0 +1,5246 @@
+//! Optimization passes for the IR.
+//!
+//! This module contains various optimization passes that transform the IR
+//! to produce better code.
+//!
+//! Optimization levels are distinct but intentionally conservative:
+//! - O0: no optimization pipeline (only inline-asm symbol resolution)
+//! - O1: mem2reg + constant folding + copy propagation + DCE
+//! - O2: the default full pipeline
+//! - O3: O2 plus loop unrolling
+//! - Os: O2 with code-size-increasing transforms disabled
+//! - Oz: Os with inlining disabled
+
+mod policy;
+use policy::fp_environment_blocks_reordering;
+
+mod address_form;
+pub(crate) mod aggregate_copy_forward;
+pub(crate) mod aggregate_pair_roundtrip;
+
+pub(crate) mod aggregate_sroa;
+pub(crate) mod alias;
+pub(crate) mod arx_vectorize;
+pub(crate) mod backedge_pre;
+pub(crate) mod bit_idioms;
+pub(crate) mod block_layout;
+pub(crate) mod bool_thread;
+pub(crate) mod builtin_policy;
+pub(crate) mod byte_load;
+pub(crate) mod cfg_simplify;
+pub(crate) mod const_array_promote;
+pub(crate) mod constant_fold;
+pub(crate) mod copy_prop;
+pub(crate) mod cvp;
+pub(crate) mod dce;
+mod dead_statics;
+pub(crate) mod difference_compare;
+pub(crate) mod div_by_const;
+pub(crate) mod dse;
+pub(crate) mod expr_sink;
+pub(crate) mod fma_neg_peel;
+pub(crate) mod fortify_fold;
+pub(crate) mod fp_const_hoist;
+pub(crate) mod fp_double;
+pub(crate) mod global_addr_cse;
+pub(crate) mod gvn;
+pub(crate) mod if_convert;
+pub(crate) mod inline;
+pub(crate) mod instrument;
+pub(crate) mod int_const_hoist;
+pub(crate) mod integer_bounds;
+pub(crate) mod interval_compare;
+pub(crate) mod ip_purity;
+pub(crate) mod ipa_pta;
+pub(crate) mod ipcp;
+pub(crate) mod iv_strength_reduce;
+pub(crate) mod iv_widen;
+mod join_store_forward;
+pub(crate) mod jump_thread;
+pub(crate) mod licm;
+pub(crate) mod live_range_shrinkage;
+pub(crate) mod load_forward;
+pub(crate) mod loop_align;
+pub(crate) mod loop_analysis;
+pub(crate) mod loop_bound;
+pub(crate) mod loop_carried_forward;
+pub(crate) mod loop_idiom;
+pub(crate) mod loop_invert;
+pub(crate) mod loop_memory_promote;
+pub(crate) mod loop_memset;
+pub(crate) mod loop_preheader;
+pub(crate) mod loop_rotate;
+pub(crate) mod loop_square;
+pub(crate) mod loop_unroll;
+mod module_symbol_facts;
+pub(crate) mod narrow;
+pub(crate) mod outline_switch;
+mod pair_load_carry;
+pub(crate) mod phi_relay_fold;
+pub(crate) mod ptr_iv_collapse;
+pub(crate) mod quadratic_sr;
+pub(crate) mod range_check;
+pub(crate) mod reassoc_accum;
+pub(crate) mod reassoc_latency;
+pub(crate) mod recursion_to_iter;
+pub(crate) mod redundant_loads;
+mod resolve_asm;
+pub(crate) mod round_cap;
+pub(crate) mod saturating_sub;
+pub(crate) mod sccp;
+pub(crate) mod set_membership;
+pub(crate) mod sign_magnitude;
+pub(crate) mod simplify;
+pub(crate) mod slp_vectorizer;
+pub(crate) mod sret_copy_elision;
+pub(crate) mod store_load_forward;
+pub(crate) mod switch_lut;
+pub(crate) mod tail_call_elim;
+pub(crate) mod univsr;
+pub(crate) mod use_def;
+pub(crate) mod vec_addr_fold;
+pub(crate) mod vec_arx;
+pub(crate) mod vec_fma_contract;
+pub(crate) mod vec_interleave;
+pub(crate) mod vec_load_sink;
+mod vec_relations;
+pub(crate) mod vec_ssa;
+pub(crate) mod vector_fill;
+pub(crate) mod vector_temp_promotion;
+pub(crate) mod vectorize;
+pub(crate) mod verify;
+pub(crate) mod volatile_reduce;
+
+// Compatibility controls introduced with the original transform. Resolve once
+// at the TU boundary, never inside per-function or per-candidate scans.
+fn volatile_reduction_enabled() -> bool {
+    match std::env::var("CCC_VOLATILE_REDUCE_LANES") {
+        Ok(value) => match value.trim() {
+            "0" => false,
+            "4" => true,
+            "2" | "8" => {
+                eprintln!(
+                    "volatile_reduce: non-default lanes={} requested but only 4 is validated; using 4",
+                    value.trim()
+                );
+                true
+            }
+            _ => {
+                eprintln!(
+                    "volatile_reduce: invalid CCC_VOLATILE_REDUCE_LANES={value:?}, using 4 (expected 0/2/4/8)"
+                );
+                true
+            }
+        },
+        Err(_) => true,
+    }
+}
+
+pub(crate) mod web_congruence;
+
+use crate::common::fp_contract::FpContract;
+use crate::common::fx_hash::FxHashSet;
+use crate::ir::analysis::CfgAnalysis;
+use crate::ir::reexports::{BasicBlock, Instruction, IrFunction, IrModule, Operand};
+
+/// CCC_VALIDATE_SSA=1 debug validator: every Value id must have exactly one
+/// defining instruction, InlineAsm outputs and Phi dests included, and every
+/// def must be strictly below the function's `next_value_id` watermark.
+///
+/// A stale watermark is the *origin* of duplicate-def bugs: the offending
+/// pass clones or synthesizes instructions with ids at/above `next_value_id`,
+/// and a later pass that allocates "fresh" ids from the watermark silently
+/// collides with them. The RA then computes one merged live range for two
+/// unrelated values and the backend's no-home hard gate fires far from the
+/// cause (glibc __libc_start_main_impl: Cast and GetElementPtr both defining
+/// v356). Panics at the FIRST violating phase so the bisection is exact.
+///
+/// `strict`: before phi elimination the IR is SSA and every duplicate def is
+/// a violation. After `eliminate_phis` the IR is *conventional* SSA — a phi
+/// home is legally assigned by one `Copy` per predecessor edge — so
+/// duplicates are tolerated iff every def of that id is a `Copy`.
+/// `CCC_DEBUG_VEC_AVAIL=1` enables the vector-availability divergence trace
+/// (`vectorize::rewrite_uses_where_available`): every use the oracle refuses is
+/// reported, and the count belongs in the measurement record.
+///
+/// Resolved ONCE per process.  The trace is consulted for every refused use, so
+/// a per-call `environ` scan there is exactly the cost the env-read ratchet in
+/// `tests/regression/check_env_test_hygiene.sh` exists to prevent; the accessor
+/// lives here, beside the other once-resolved pipeline configuration.
+pub(crate) fn debug_vec_avail() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_VEC_AVAIL").is_some());
+    *ENABLED
+}
+
+/// `CCC_NO_PHI_COALESCE` — kill switch for the post-phi copy fold.
+///
+/// The switch is a *pipeline* knob (it also reaches `regalloc`'s own
+/// coalescing), so it is resolved here rather than inside `copy_prop`: an
+/// environment read in a pass body runs on every function, and the env-read
+/// ratchet in `tests/regression/check_env_test_hygiene.sh` counts exactly
+/// those reads.  The fold's diagnostics use the same two levers.
+pub(crate) fn phi_coalesce_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_PHI_COALESCE").is_none());
+    *ENABLED
+}
+
+/// `CCC_AGG_BYVAL_DEBUG` — trace of `aggregate_sroa`'s by-value copy form.
+pub(crate) fn debug_agg_byval() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_AGG_BYVAL_DEBUG").is_some());
+    *ENABLED
+}
+
+/// `LCCC_IFCONV_ARM_BUDGET=<n|off>` — A/B lever and kill switch for the
+/// loop-resident arm budget of `if_convert`, resolved once per process.
+///
+/// A positive integer replaces the in-loop budget (so `=8` reproduces the
+/// pre-loop-aware behaviour of every diamond, in or out of a loop, while
+/// `=1`/`=2` measure a stricter prior).  `off`/`full`/`0` disables the
+/// loop-aware restriction entirely.  An unparsable value is ignored rather
+/// than aborting a build, matching `LCCC_PEEPHOLE_PAIR_PARALLEL`.
+///
+/// It lives here, beside `debug_vec_avail`, because a pipeline-wide switch is
+/// resolved once at the pipeline boundary -- the same rule the env-read
+/// ratchet in `tests/regression/check_env_test_hygiene.sh` states: a new
+/// switch belongs to `run_passes`, not to the pass body that consumes it.
+pub(crate) fn ifconv_arm_budget_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("LCCC_IFCONV_ARM_BUDGET").ok()?;
+        let raw = raw.trim();
+        if raw == "0" || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("full") {
+            return Some(usize::MAX);
+        }
+        // A budget of 0 would mean "never if-convert", which is spelled `off`;
+        // treat it as the default rather than silently disabling the pass.
+        raw.parse::<usize>().ok().filter(|&n| n > 0)
+    })
+}
+
+pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
+    let strict = !tag.starts_with("backend:eliminate_phis")
+        && !tag.starts_with("backend:post-phi")
+        && !tag.starts_with("backend:pre-codegen");
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let mut def_of: crate::common::fx_hash::FxHashMap<u32, (String, bool)> =
+            crate::common::fx_hash::FxHashMap::default();
+        let mut max_def: u32 = 0;
+        let mut check = |id: u32, what: String, is_copy: bool| {
+            max_def = max_def.max(id);
+            if let Some((prev, prev_copy)) = def_of.insert(id, (what.clone(), is_copy)) {
+                if strict || !(is_copy && prev_copy) {
+                    panic!(
+                        "SSA VIOLATION after phase '{}': value v{} in function '{}' \
+                         defined twice:\n  first : {}\n  second: {}",
+                        tag, id, func.name, prev, what
+                    );
+                }
+            }
+        };
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    let is_copy = matches!(inst, Instruction::Copy { .. });
+                    check(d.0, format!("block {} {:?}", bi, inst), is_copy);
+                }
+                // NOTE: InlineAsm `outputs` carry value_POINTERS (addresses
+                // the asm stores through) — they are uses, not defs, and may
+                // legitimately repeat a GEP dest. They are deliberately not
+                // checked here.
+            }
+        }
+        // `0` is the documented “unknown / not yet computed” sentinel. It is
+        // deliberately not a bound: several frontend-only functions have a
+        // perfectly valid v0 while retaining that sentinel until a pass needs
+        // to allocate a fresh id. Checking `v0 >= 0` here turns the validator
+        // into a false-positive machine and would make an SSA CI gate unusable.
+        if func.next_value_id != 0 && max_def >= func.next_value_id {
+            panic!(
+                "SSA WATERMARK VIOLATION after phase '{}': function '{}' has \
+                 def v{} >= next_value_id {} — the phase that created it did \
+                 not bump the watermark; later passes will allocate colliding \
+                 'fresh' ids",
+                tag, func.name, max_def, func.next_value_id
+            );
+        }
+
+        // PHI-INCOMING DOMINANCE: an incoming (v, pred) is evaluated at the
+        // END OF pred, so v must be defined in a block dominating pred. The
+        // case passes actually get wrong: substituting a SIBLING phi's dest
+        // as an incoming on a FORWARD edge (value equality reasoning that is
+        // only true under sequential-copy semantics). On a backedge the phi
+        // block dominates the latch and sibling-dest incomings are the
+        // classic legal swap-loop shape. glibc _dl_lookup_symbol_x: v445's
+        // entry-edge incoming was rewritten v8 -> v454 (sibling phi),
+        // eliminate_phis then emitted `v445 = Copy(v454)` before v454's own
+        // edge copy — every ld.so symbol lookup hashed a stale register
+        // (LK-27).
+        if strict {
+            let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+            // `CfgAnalysis::idom` deliberately uses usize::MAX for CFG-dead
+            // blocks.  A dead predecessor does not have an executable phi
+            // edge, so there is no dynamic phi use to dominance-check.  More
+            // importantly, never feed the sentinel back into `idom`: doing so
+            // used to panic the opt-in validator before it could report a real
+            // SSA defect.
+            let reachable =
+                |b: usize| -> bool { cfg.idom.get(b).is_some_and(|&idom| idom != usize::MAX) };
+            let dominates = |a: usize, b: usize| -> bool {
+                if !reachable(a) || !reachable(b) {
+                    return false;
+                }
+                let mut x = b;
+                loop {
+                    if x == a {
+                        return true;
+                    }
+                    let n = cfg.idom[x];
+                    if n == x {
+                        return false;
+                    }
+                    // `x` is reachable and every dominator of a reachable
+                    // block is reachable, but retain the guard so a malformed
+                    // analysis can never make this debug checker panic.
+                    if n == usize::MAX {
+                        return false;
+                    }
+                    x = n;
+                }
+            };
+            let mut label_of: crate::common::fx_hash::FxHashMap<u32, usize> =
+                crate::common::fx_hash::FxHashMap::default();
+            for (bi, block) in func.blocks.iter().enumerate() {
+                label_of.insert(block.label.0, bi);
+            }
+            let mut def_block: crate::common::fx_hash::FxHashMap<u32, usize> =
+                crate::common::fx_hash::FxHashMap::default();
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Some(d) = inst.dest() {
+                        def_block.insert(d.0, bi);
+                    }
+                }
+            }
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        for (op, pred) in incoming {
+                            if let Operand::Value(v) = op {
+                                if let (Some(&db), Some(&pb)) =
+                                    (def_block.get(&v.0), label_of.get(&pred.0))
+                                {
+                                    // An unreachable predecessor executes no
+                                    // incoming edge.  Its local IR can be
+                                    // cleaned up later without imposing a
+                                    // reachable-SSA dominance constraint.
+                                    if reachable(pb) && !dominates(db, pb) {
+                                        panic!(
+                                            "SSA PHI-DOMINANCE VIOLATION after phase '{}': \
+                                             function '{}' block {} phi v{} incoming v{} \
+                                             from pred block {} is not dominated by the \
+                                             defining block {}",
+                                            tag, func.name, bi, dest.0, v.0, pb, db
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // PHI-ARITY: for every φ in a REACHABLE block, the incoming
+            // set must (a) COVER every reachable CFG predecessor and
+            // (b) name only actual CFG predecessors.  phi elimination
+            // materializes one edge copy per (reachable pred, incoming)
+            // pair and never visits unreachable blocks, so a missing
+            // REACHABLE predecessor leaves the φ home without a copy on a
+            // live edge — the value reads whatever the register/slot held
+            // (the defect class this check exists for; Csmith 20260945).
+            // Everything else is legal: an entry for a statically present
+            // but dead predecessor is never materialized (inert — the
+            // frontend and switch/loop lowering leave those routinely,
+            // e.g. switch_dispatch's 16-pred join), a φ inside an
+            // unreachable block never executes (adler_inline_tail
+            // `like_ssse3` block 113), and duplicate per-pred entries are
+            // rejected by the phi-prefix checks.  Checking here
+            // attributes the malformed φ to the exact pass that created
+            // it instead of to a backend abort.
+            for (bi, block) in func.blocks.iter().enumerate() {
+                if !reachable(bi) {
+                    continue;
+                }
+                let mut named: crate::common::fx_hash::FxHashSet<u32> =
+                    crate::common::fx_hash::FxHashSet::default();
+                let mut has_phi = false;
+                for inst in &block.instructions {
+                    let Instruction::Phi { incoming, .. } = inst else {
+                        continue;
+                    };
+                    has_phi = true;
+                    for (_, p) in incoming {
+                        named.insert(p.0);
+                    }
+                }
+                if !has_phi {
+                    continue;
+                }
+                let mut reachable_preds: crate::common::fx_hash::FxHashSet<u32> =
+                    crate::common::fx_hash::FxHashSet::default();
+                let mut static_preds: crate::common::fx_hash::FxHashSet<u32> =
+                    crate::common::fx_hash::FxHashSet::default();
+                for &p in cfg.preds.row(bi) {
+                    let pidx = p as usize;
+                    if pidx < func.blocks.len() {
+                        let label = func.blocks[pidx].label.0;
+                        static_preds.insert(label);
+                        if reachable(pidx) {
+                            reachable_preds.insert(label);
+                        }
+                    }
+                }
+                let missing: Vec<u32> = reachable_preds.difference(&named).copied().collect();
+                let stray: Vec<u32> = named.difference(&static_preds).copied().collect();
+                if !missing.is_empty() || !stray.is_empty() {
+                    panic!(
+                        "SSA PHI-ARITY VIOLATION after phase '{}': function '{}' \
+                         block {} φ incoming pred labels {named:?} violates the \
+                         reachable-pred contract (missing {missing:?}, not-a-CFG-pred \
+                         {stray:?})",
+                        tag, func.name, block.label.0
+                    );
+                }
+            }
+        }
+
+        // SAME-BLOCK ORDER: a use of v inside the block that defines v must
+        // come AFTER the definition. Uniqueness alone does not catch a pass
+        // that swaps two instructions (glibc _dl_lookup_symbol_x: the
+        // `s = undef_name` copy was emitted before undef_name's own home
+        // copy, so the inlined _dl_new_hash hashed a stale register and
+        // every symbol lookup against ld.so's map failed — LK-27). Cross-
+        // block dominance is deliberately not modelled here; the same-block
+        // case is the one instruction-motion bugs actually produce, and it
+        // needs no CFG analysis. Skipped in the conventional-SSA backend
+        // phases where phi-home Copies legitimately repeat.
+        // In conventional-SSA backend phases, cross-block flow can make a
+        // same-block late def legal (loop-rotated phi homes) — but the ENTRY
+        // block has no predecessors: use-before-def there is a bug in every
+        // phase. Check all blocks in strict phases, entry-only afterwards.
+        let order_blocks = if strict { usize::MAX } else { 1 };
+        {
+            for (bi, block) in func.blocks.iter().enumerate().take(order_blocks) {
+                let mut defined_here: crate::common::fx_hash::FxHashMap<u32, usize> =
+                    crate::common::fx_hash::FxHashMap::default();
+                for (ii, inst) in block.instructions.iter().enumerate() {
+                    if let Some(d) = inst.dest() {
+                        // `Alloca` is a static frame-object declaration in
+                        // LCCC: stack layout collects it function-wide and the
+                        // backend emits its storage in the prologue, not at
+                        // this instruction position. Inlined vector bodies may
+                        // therefore retain an alloca after an already-emitted
+                        // user of its address. A dynamic alloca is different —
+                        // it mutates SP at this point — and remains ordered.
+                        if !matches!(inst, Instruction::Alloca { .. }) {
+                            defined_here.entry(d.0).or_insert(ii);
+                        }
+                    }
+                }
+                for (ii, inst) in block.instructions.iter().enumerate() {
+                    // Phi incoming values are PARALLEL COPIES on predecessor
+                    // EDGES: a loop-carried value is legally defined later in
+                    // the same (header) block, arriving via the backedge.
+                    // Order only constrains straight-line uses.
+                    if matches!(inst, Instruction::Phi { .. }) {
+                        continue;
+                    }
+                    let mut bad: Option<u32> = None;
+                    inst.for_each_used_value(|v| {
+                        if bad.is_none() {
+                            if let Some(&di) = defined_here.get(&v) {
+                                if di > ii {
+                                    bad = Some(v);
+                                }
+                            }
+                        }
+                    });
+                    if let Some(v) = bad {
+                        panic!(
+                            "SSA ORDER VIOLATION after phase '{}': function '{}' \
+                             block {} instruction {} uses v{} which is only \
+                             defined later in the same block (index {}):\n  use: {:?}",
+                            tag, func.name, bi, ii, v, defined_here[&v], inst
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Debug hook: dump only functions whose name contains one of the comma-
+/// separated substrings in `CCC_DUMP_FUNC` (empty = dump all), in the same
+/// compact per-block format as the backend's CCC_DUMP_IR.
+/// Environment-gated; never changes codegen.
+fn dump_ir_filtered(module: &IrModule, tag: &str) {
+    if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+        validate_unique_defs(module, tag);
+    }
+    dump_ir_filtered_inner(module, tag);
+}
+
+/// Dump half of [`dump_ir_filtered`] without the SSA validation gate, for
+/// checkpoints that must show the IR *before* reporting a violation (the
+/// lowering:entry checkpoint dumps the input shape first so the phi-arity
+/// panic is inspectable at all).
+fn dump_ir_filtered_inner(module: &IrModule, tag: &str) {
+    if std::env::var_os("CCC_DUMP_EACH_PASS").is_none() {
+        return;
+    }
+    use std::fmt::Write as _;
+    let filters: Vec<String> = std::env::var("CCC_DUMP_FUNC")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut out = String::new();
+    let _ = writeln!(out, "==== IR {} ====", tag);
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let matched = filters.is_empty() || filters.iter().any(|f| func.name.contains(f.as_str()));
+        if matched {
+            let _ = writeln!(
+                out,
+                "--- function {} ({} blocks, {} instrs) ---",
+                func.name,
+                func.blocks.len(),
+                func.blocks
+                    .iter()
+                    .map(|b| b.instructions.len())
+                    .sum::<usize>()
+            );
+            for (bi, block) in func.blocks.iter().enumerate() {
+                let _ = writeln!(out, "block {} ({}):", bi, block.label);
+                for inst in &block.instructions {
+                    let _ = writeln!(out, "  {:?}", inst);
+                }
+                let _ = writeln!(out, "  term: {:?}", block.terminator);
+            }
+        }
+    }
+    let _ = writeln!(out, "==== END IR {} ====", tag);
+    eprintln!("{}", out);
+}
+
+/// Run a per-function pass only on functions in the visit set.
+///
+/// `visit` indicates which functions to process in this iteration.
+/// `changed` accumulates which functions were modified by any pass
+/// (so the next iteration knows what to re-visit).
+fn run_on_visited<F>(module: &mut IrModule, visit: &[bool], changed: &mut [bool], mut f: F) -> usize
+where
+    F: FnMut(&mut IrFunction) -> usize,
+{
+    let mut total = 0;
+    for (i, func) in module.functions.iter_mut().enumerate() {
+        if func.is_declaration {
+            continue;
+        }
+        if i < visit.len() && !visit[i] {
+            continue;
+        }
+        let n = f(func);
+        if n > 0 {
+            if i < changed.len() {
+                changed[i] = true;
+            }
+            total += n;
+        }
+    }
+    total
+}
+
+/// Run GVN, LICM, and IVSR with shared CFG analysis per function.
+///
+/// For each dirty function, builds CFG/dominator/loop analysis once and passes
+/// it to all three passes. This eliminates redundant analysis computation that
+/// previously occurred when each pass independently computed build_label_map +
+/// build_cfg + compute_dominators (+ find_natural_loops for LICM/IVSR).
+///
+/// Returns (gvn_changes, licm_changes, ivsr_changes).
+fn run_gvn_licm_ivsr_shared(
+    module: &mut IrModule,
+    visit: &[bool],
+    changed: &mut [bool],
+    run_gvn: bool,
+    run_licm: bool,
+    run_ivsr: bool,
+    run_ivsr_scalar: bool,
+    run_ivsr_ptr_add: bool,
+    ivsr_x86_sib_cost: bool,
+    run_univsr: bool,
+    run_ptr_iv_collapse: bool,
+    time_passes: bool,
+    iter: usize,
+) -> (usize, usize, usize) {
+    let mut gvn_total = 0usize;
+    let mut licm_total = 0usize;
+    let mut ivsr_total = 0usize;
+    let gvn_context = gvn::GvnContext::for_module(module);
+    let licm_safe_globals = if run_licm {
+        licm::speculation_safe_globals(module)
+    } else {
+        licm::SpeculationSafeGlobals::default()
+    };
+
+    for (i, func) in module.functions.iter_mut().enumerate() {
+        if func.is_declaration {
+            continue;
+        }
+        if i < visit.len() && !visit[i] {
+            continue;
+        }
+        let num_blocks = func.blocks.len();
+        if num_blocks == 0 {
+            continue;
+        }
+
+        // GVN fast path: single-block functions don't need CFG analysis.
+        if num_blocks == 1 {
+            if run_gvn {
+                let n = gvn::run_gvn_function_with_context(func, &gvn_context);
+                verify::verify_after_func_pass(func, "gvn");
+                if n > 0 {
+                    gvn_total += n;
+                    if i < changed.len() {
+                        changed[i] = true;
+                    }
+                }
+            }
+            // LICM and IVSR need loops (>= 2 blocks), so skip.
+            continue;
+        }
+
+        // Build CFG analysis once for this function.
+        let cfg = CfgAnalysis::build(func);
+
+        // Run GVN with shared analysis.
+        if run_gvn {
+            let t0 = if time_passes {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let n = gvn::run_gvn_with_analysis_and_context(func, &cfg, &gvn_context);
+            verify::verify_after_func_pass(func, "gvn");
+            if let Some(t0) = t0 {
+                eprintln!(
+                    "[PASS] iter={} gvn (func {}): {:.4}s ({} changes)",
+                    iter,
+                    func.name,
+                    t0.elapsed().as_secs_f64(),
+                    n
+                );
+            }
+            if n > 0 {
+                gvn_total += n;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+            }
+        }
+
+        // Run LICM with shared analysis.
+        // GVN does not modify the CFG (only replaces operands), so analysis is still valid.
+        if run_licm {
+            let t0 = if time_passes {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let n = licm::licm_with_analysis(func, &cfg, &licm_safe_globals);
+            verify::verify_after_func_pass(func, "licm");
+            if let Some(t0) = t0 {
+                eprintln!(
+                    "[PASS] iter={} licm (func {}): {:.4}s ({} changes)",
+                    iter,
+                    func.name,
+                    t0.elapsed().as_secs_f64(),
+                    n
+                );
+            }
+            if n > 0 {
+                licm_total += n;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+            }
+        }
+
+        // Run IVSR with shared analysis.
+        // LICM hoists instructions to preheaders but does not add/remove blocks,
+        // so CFG analysis is still valid.
+        // W4 (2026-08-10): reduce_loop gates every candidate GEP on
+        // is_loop_invariant(base) — loop-VARIANT bases (the historical matmul
+        // address-doubling bug) are skipped, so the pointer recurrence can
+        // never compound with a moving base. Full battery verified with the
+        // pass forced ON. The overlap guard now excludes nested-loop cases
+        // that previously miscompiled matrix-style code, and the safe pass
+        // reduces redundant induction casts in disjoint array loops. Keep
+        // CCC_NO_IVSR=1 as a targeted diagnostic escape hatch.
+        if run_ivsr {
+            // One transformation can expose another independent pointer IV in
+            // the same loop (notably the two source/destination GEPs created
+            // by vectorization). Iterate locally; IVSR changes instructions
+            // and phis but not CFG edges, so the shared analysis stays valid.
+            let mut n = 0;
+            for _ in 0..4 {
+                let round = iv_strength_reduce::ivsr_with_analysis(
+                    func,
+                    &cfg,
+                    run_ivsr_scalar,
+                    run_ivsr_ptr_add,
+                    ivsr_x86_sib_cost,
+                );
+                verify::verify_after_func_pass(func, "ivsr");
+                n += round;
+                if round == 0 {
+                    break;
+                }
+            }
+            if n > 0 {
+                ivsr_total += n;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+            }
+        }
+
+        // Un-IVSR (x86-64 only): revert IVSR pointer IVs to indexed form so
+        // the backend can use SIB addressing (base + index*scale + disp).
+        // Runs directly after IVSR while the CFG analysis is still valid;
+        // the pass rewrites instructions in place and never edits the CFG.
+        if run_univsr {
+            let n = univsr::run_univsr(func);
+            verify::verify_after_func_pass(func, "univsr");
+            if n > 0 {
+                ivsr_total += n;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+                if time_passes {
+                    eprintln!(
+                        "[PASS] iter={} univsr (func {}): {} pointer IVs reverted",
+                        iter, func.name, n
+                    );
+                }
+            }
+        }
+
+        // Pointer-IV collapse: a scan over several arrays keeps one pointer
+        // induction variable per array, so the loop pays one 64-bit increment
+        // per array per iteration.  Collapsing the group onto the loop's own
+        // integer index turns those increments into SIB addressing
+        // (`(%base,%index,1)`), which is what GCC and Clang emit; measured on
+        // zlib-ng's compare256 kernel that is 1.19 vs 1.78 cycles per 8-byte
+        // compare.  Runs after univsr so it sees the final IV shape, and its
+        // own legality rules (constant step, constant trip bound, addresses
+        // only) are documented in the pass.
+        if run_ptr_iv_collapse {
+            let n = ptr_iv_collapse::run(func);
+            verify::verify_after_func_pass(func, "ptr_iv_collapse");
+            if n > 0 {
+                ivsr_total += n;
+                if i < changed.len() {
+                    changed[i] = true;
+                }
+                if time_passes {
+                    eprintln!(
+                        "[PASS] iter={} ptr_iv_collapse (func {}): {} pointer IVs collapsed",
+                        iter, func.name, n
+                    );
+                }
+            }
+        }
+    }
+
+    if time_passes {
+        eprintln!("[PASS] iter={} gvn_total: {} changes", iter, gvn_total);
+        eprintln!("[PASS] iter={} licm_total: {} changes", iter, licm_total);
+        eprintln!("[PASS] iter={} ivsr_total: {} changes", iter, ivsr_total);
+    }
+
+    (gvn_total, licm_total, ivsr_total)
+}
+
+/// Run all optimization passes on the module.
+///
+/// The pass pipeline is:
+/// 1. CFG simplification (remove dead blocks, thread jump chains, simplify branches)
+/// 2. Copy propagation (replace uses of copies with original values)
+/// 3. Algebraic simplification (strength reduction)
+/// 4. Constant folding (evaluate const exprs at compile time)
+/// 5. GVN / CSE (dominator-based value numbering, eliminates redundant
+///    BinOp, UnaryOp, Cmp, Cast, GetElementPtr, and Load across dominated blocks)
+/// 6. LICM (hoist loop-invariant code to preheaders)
+/// 7. If-conversion (convert branch+phi diamonds to Select)
+/// 8. Copy propagation (clean up copies from GVN/simplify/LICM)
+/// 9. Dead code elimination (remove dead instructions)
+/// 10. CFG simplification (clean up after DCE may have made blocks dead)
+/// 11. Dead static function elimination (remove unreferenced internal-linkage functions)
+///
+struct DisabledPasses {
+    cfg: bool,
+    copyprop: bool,
+    narrow: bool,
+    simplify: bool,
+    constfold: bool,
+    gvn: bool,
+    licm: bool,
+    ifconv: bool,
+    dce: bool,
+    dse: bool,
+    ipcp: bool,
+    unroll: bool,
+}
+
+impl DisabledPasses {
+    fn from_env(disabled: &str) -> Self {
+        DisabledPasses {
+            cfg: pass_disabled(&disabled, "cfg"),
+            copyprop: pass_disabled(&disabled, "copyprop"),
+            narrow: pass_disabled(&disabled, "narrow"),
+            simplify: pass_disabled(&disabled, "simplify"),
+            constfold: pass_disabled(&disabled, "constfold"),
+            gvn: pass_disabled(&disabled, "gvn"),
+            licm: pass_disabled(&disabled, "licm"),
+            ifconv: pass_disabled(&disabled, "ifconv"),
+            dce: pass_disabled(&disabled, "dce"),
+            dse: pass_disabled(&disabled, "dse"),
+            ipcp: pass_disabled(&disabled, "ipcp"),
+            unroll: pass_disabled(&disabled, "unroll"),
+        }
+    }
+}
+
+/// Restore the invariant that every phi forms a contiguous prefix of its block.
+///
+/// Several passes rewrite a phi into a non-phi *in place* — `univsr` turns a
+/// reverted pointer-IV phi into a `Copy`, `cfg_simplify` collapses a
+/// single-predecessor phi the same way. When the rewritten phi is not the last
+/// one in the block, every phi after it is suddenly preceded by a non-phi, and
+/// passes that assume contiguity (`loop_rotate`, `mem2reg`, phi elimination)
+/// silently read the wrong instruction range.
+///
+/// Sinking the non-phis below the phi prefix is always sound: phis are defined
+/// to execute simultaneously on entry to the block, so no phi may read a value
+/// defined by a non-phi in that same block. (A phi's back-edge operand is
+/// evaluated at the end of the *predecessor*, not here.) A stable partition
+/// therefore preserves program semantics exactly while restoring the
+/// invariant, and it keeps the relative order within each group so unrelated
+/// diffs do not appear in dumps.
+///
+/// Returns `true` if anything moved. Runs in O(n) and allocates only when a
+/// repair is actually needed, so callers can invoke it unconditionally.
+pub(crate) fn restore_phi_prefix(block: &mut BasicBlock) -> bool {
+    let insts = &block.instructions;
+    // Fast path: find the first non-phi, then check nothing after it is a phi.
+    let first_non_phi = match insts
+        .iter()
+        .position(|i| !matches!(i, Instruction::Phi { .. }))
+    {
+        Some(p) => p,
+        None => return false, // all phis (or empty): already contiguous
+    };
+    if !insts[first_non_phi + 1..]
+        .iter()
+        .any(|i| matches!(i, Instruction::Phi { .. }))
+    {
+        return false; // already contiguous
+    }
+
+    // `source_spans` is parallel to `instructions`; permute it identically or
+    // the backend emits .loc directives against the wrong instruction. Passes
+    // have been observed to leave it desynchronised, so only touch it when the
+    // lengths agree.
+    let spans_valid = block.source_spans.len() == block.instructions.len();
+
+    let n = block.instructions.len();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    order.extend((0..n).filter(|&i| matches!(block.instructions[i], Instruction::Phi { .. })));
+    order.extend((0..n).filter(|&i| !matches!(block.instructions[i], Instruction::Phi { .. })));
+
+    let mut old_insts = std::mem::take(&mut block.instructions);
+    let mut taken: Vec<Option<Instruction>> = old_insts.drain(..).map(Some).collect();
+    block.instructions = order
+        .iter()
+        .map(|&i| taken[i].take().expect("each index used once"))
+        .collect();
+
+    if spans_valid {
+        let old_spans = std::mem::take(&mut block.source_spans);
+        block.source_spans = order.iter().map(|&i| old_spans[i]).collect();
+    }
+    true
+}
+
+/// Apply [`restore_phi_prefix`] to every block of a function.
+pub(crate) fn restore_phi_prefix_in_function(func: &mut IrFunction) -> usize {
+    func.blocks
+        .iter_mut()
+        .map(|b| usize::from(restore_phi_prefix(b)))
+        .sum()
+}
+
+/// Run Phase 0: function inlining and post-inline optimization passes.
+fn run_inline_phase(
+    module: &mut IrModule,
+    disabled: &str,
+    allow_inline: bool,
+    size_profile: bool,
+    target: crate::backend::Target,
+    pic: bool,
+    ra_config: &crate::backend::regalloc::RaConfig,
+) {
+    let dump_pre =
+        std::env::var("CCC_DUMP_EACH_PASS").is_ok() || std::env::var("CCC_VALIDATE_SSA").is_ok();
+    macro_rules! iphase_dump {
+        ($name:expr_2021) => {
+            if dump_pre {
+                dump_ir_filtered(module, &format!("pre-loop {}", $name));
+            }
+            verify::verify_after_pass(module, $name);
+        };
+    }
+    // Canonicalize before cost analysis so inlining decisions use optimized
+    // IR sizes (GVN shrinks helpers like expat's sip_round 229->84, making
+    // them inlineable). GVN never rewrites param-alloca loads (see gvn.rs),
+    // so the inliner's store-into-param-alloca argument passing stays intact.
+    // Keep parameter allocas until after inlining.
+    if !std::env::var("CCC_NO_MEM2REG").is_ok() {
+        crate::ir::mem2reg::promote_allocas(module);
+    }
+    iphase_dump!("mem2reg");
+    constant_fold::run(module);
+    iphase_dump!("canonicalize-fold");
+    copy_prop::run(module);
+    iphase_dump!("canonicalize-copyprop");
+    simplify::run(module);
+    iphase_dump!("canonicalize-simplify");
+    // Expose byte-decoding helpers' real cost before inlining and before GVN
+    // gives their byte loads multiple users. The established late run remains
+    // for chains exposed by later simplification. This is the SAME checked
+    // load plan (width/order/volatility/alias-window proofs), not a new matcher.
+    // Profitability is measured on x86-64; other targets and size profiles
+    // retain their existing placement. The legacy postinline switch also
+    // suppresses this additional scheduling opportunity, without disabling
+    // primary inlining itself. Preserve that existing diagnostic contract.
+    if target == crate::backend::Target::X86_64
+        && !size_profile
+        && !pass_disabled(disabled, "byte_load")
+        && !pass_disabled(disabled, "byte_load_early")
+        && !pass_disabled(disabled, "postinline")
+    {
+        module.for_each_function(|f| byte_load::run_function(f, target));
+        iphase_dump!("byte-load-before-inline");
+    }
+    // Class-aware GlobalAddr CSE *before* the first GVN. GVN already CSEs
+    // GlobalAddr into same-block Copies, so a late-only run after
+    // post-structural-inline never sees duplicates.
+    if !pass_disabled(&disabled, "gaddrcse") {
+        global_addr_cse::run_module(module);
+    }
+    iphase_dump!("global_addr_cse-pre-gvn");
+    if !pass_disabled(&disabled, "gvn") {
+        // Use the module context (GNU alias canonicalization, global epoch
+        // facts) exactly like the main pass loop: with the default context,
+        // loads across stores to GNU-alias'd globals are CSE'd and produce
+        // wrong code (regression gvn_global_symbol_alias).
+        let gvn_ctx = gvn::GvnContext::for_module(module);
+        module.for_each_function(|f| gvn::run_gvn_function_with_context(f, &gvn_ctx));
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+    constant_fold::run(module);
+    copy_prop::run(module);
+    // Keep native reversal semantics explicit before inlining and shift
+    // reassociation obscure the portable ladder's first stage. The late
+    // bit_idioms pass then sees private reversal conjugation networks.
+    if target == crate::backend::Target::Aarch64 && !pass_disabled(disabled, "bit_idioms") {
+        module.for_each_function(|func| {
+            let n = bit_idioms::recognize_reverse_ladders(func);
+            if n > 0 {
+                dce::eliminate_dead_code(func);
+            }
+            n
+        });
+        iphase_dump!("bit_reverse_ladders");
+    }
+    // Early cleanup changes the inliner's cost input. A smaller emitted body
+    // need not execute less work: the measured SipHash control shrank code but
+    // increased dynamic Ir. Keep the established late cleanup unconditional on
+    // this opt-in; evaluate early placement separately from its shared proofs.
+    if preinline_memory_enabled(
+        std::env::var_os("CCC_ENABLE_PREINLINE_MEMORY").is_some(),
+        disabled,
+    ) {
+        module.for_each_function(redundant_loads::run);
+        if !pass_disabled(&disabled, "dse") {
+            module.for_each_function(dse::eliminate_dead_stores);
+        }
+        if !pass_disabled(&disabled, "dce") {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+        iphase_dump!("memory-values-before-inline");
+    }
+
+    if !pass_disabled(&disabled, "inline") {
+        if size_profile {
+            // -Os/-Oz: retain tiny/small and profitable one-use/loop
+            // inlines, but reject repeated cold medium-body expansion.
+            inline::run_size_optimized(module);
+        } else if allow_inline {
+            inline::run(module);
+        }
+    }
+    if ra_config.dump_ir
+        || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
+        || std::env::var("CCC_VALIDATE_SSA").is_ok()
+    {
+        dump_ir_filtered(module, "pre-loop after inliner");
+    }
+    verify::verify_after_pass(module, "inline");
+
+    // After inlining, convert extern inline gnu_inline functions to declarations —
+    // but ONLY when no calls remain. The bodies were only needed for inlining;
+    // they must not be emitted as standalone definitions when fully inlined away,
+    // because their internal calls (e.g., `call btowc`) would resolve to the local
+    // definition instead of the external library symbol, causing infinite recursion.
+    // However, if any call site was NOT inlined (e.g. the caller was skipped by the
+    // inliner), the function MUST still be emitted as a local (static) definition —
+    // GNU89 `extern inline` semantics provide an inline definition usable locally.
+    // Dropping it here made glibc's rtld link fail with undefined references to
+    // `free`, `__bsearch` etc.
+    let mut still_called: FxHashSet<String> = FxHashSet::default();
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Call { func: callee, .. } = inst {
+                    still_called.insert(callee.clone());
+                }
+            }
+        }
+    }
+    for func in &mut module.functions {
+        if func.is_gnu_inline_def && !func.is_declaration && !still_called.contains(&func.name) {
+            func.is_declaration = true;
+            func.blocks.clear();
+        }
+    }
+
+    if !std::env::var("CCC_NO_MEM2REG_PARAMS").is_ok() {
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+    }
+    iphase_dump!("cleanup-mem2reg-params");
+    if !std::env::var("CCC_NO_CLEANUP_FOLD1").is_ok() {
+        constant_fold::run(module);
+    }
+    iphase_dump!("cleanup-fold1");
+    if !std::env::var("CCC_NO_CLEANUP_CP1").is_ok() {
+        copy_prop::run(module);
+    }
+    iphase_dump!("cleanup-copyprop1");
+    // Sret copy elision: point a structure-returning call straight at the
+    // aggregate it is copied to (when nothing can observe that aggregate
+    // before the copy), deleting the hidden-slot copy, then forward
+    // whole-object copies into the reads they own. It runs before the
+    // aggregate forwarders, which require a single writer of the copy.
+    if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
+        module.for_each_function(sret_copy_elision::run);
+    }
+    verify::verify_after_pass(module, "sret_copy_elision");
+    iphase_dump!("sret-copy-elision");
+    // Copy forwarding can expose another temporary in a copy chain
+    // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
+    if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+        for _ in 0..8 {
+            if module.for_each_function(|func| {
+                aggregate_copy_forward::run_with_symbol_facts(func, &symbol_facts)
+            }) == 0
+            {
+                break;
+            }
+        }
+    }
+    iphase_dump!("cleanup-agg-copy-forward");
+    // Promote loop-carried memory locations (struct fields / array cells with
+    // invariant addresses) into SSA values across the loop body.
+    if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
+        module.for_each_function(loop_memory_promote::run);
+    }
+    iphase_dump!("cleanup-loop-memory-promote");
+    // Loop-carried store-to-load forwarding (distance-1 predictive
+    // commoning): `a[i] = f(a[i-1])` keeps the recurrence in a register
+    // instead of a store-forwarding round trip per iteration.
+    loop_carried_forward::run_module(module);
+    verify::verify_after_pass(module, "loop_carried_forward");
+    iphase_dump!("cleanup-loop-carried-forward");
+    // Resolve constant branches exposed by inlining before the bounded
+    // constant-call evaluator in ipcp examines the surviving call sites.
+    //
+    // SCCP leads here because this is where it pays the most: inlining has
+    // just substituted literal arguments into a callee body, so whole
+    // parameter-dependent branches are now decidable. `cfg_simplify` can only
+    // fold a branch whose condition is *already* a constant operand; SCCP
+    // proves the condition constant in the first place, including through the
+    // phis that inlining leaves at the callee's return join.
+    if !pass_disabled(disabled, "sccp") {
+        module.for_each_function(sccp::run_function);
+    }
+    iphase_dump!("cleanup-sccp");
+    if !std::env::var("CCC_NO_CLEANUP_CFGSIMP").is_ok() {
+        for _ in 0..3 {
+            let n = module.for_each_function(cfg_simplify::run_function);
+            constant_fold::run(module);
+            copy_prop::run(module);
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    iphase_dump!("cleanup-cfg-simplify");
+    if !std::env::var("CCC_NO_CLEANUP_SIMP").is_ok() {
+        simplify::run(module);
+    }
+    iphase_dump!("cleanup-simplify");
+    if !std::env::var("CCC_NO_CLEANUP_FOLD2").is_ok() {
+        constant_fold::run(module);
+    }
+    if !std::env::var("CCC_NO_CLEANUP_CP2").is_ok() {
+        copy_prop::run(module);
+    }
+    iphase_dump!("cleanup-fold2-copyprop2");
+    // Inlining + GEP+0 folding can turn `&local` stores back into stores
+    // through the alloca itself. Re-run mem2reg so those scalars become SSA
+    // before the main loop (otherwise they stay slotted across the callee
+    // body that was just pasted in).
+    if !std::env::var("CCC_NO_MEM2REG_PARAMS").is_ok() {
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+    }
+    iphase_dump!("cleanup-mem2reg-after-gep0");
+    resolve_asm::resolve_inline_asm_symbols(module);
+    iphase_dump!("post-inline cleanup");
+}
+
+/// Exact-token pass-disable matching for the comma-separated list shared by
+/// `CCC_DISABLE_PASSES` and the m16 size policy. The previous substring test
+/// let a longer pass name disable an unrelated shorter one: the m16 policy's
+/// "postinline" entry silently disabled the primary "inline" phase (every
+/// -m16 -Os/-Oz compile ran without ANY inlining — the exact corpus where
+/// helper inlining matters most), and "univsr" likewise disabled "ivsr".
+/// Tokens are compared trimmed and exactly; "all" keeps its global meaning.
+pub(crate) fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
+    disabled.as_ref().split(',').any(|tok| {
+        let tok = tok.trim();
+        tok == "all" || tok == pass
+    })
+}
+
+/// True when an inline-asm constraint can only name memory, an immediate or a
+/// literal — never a register.
+///
+/// Conservative by construction: every character that could select a register
+/// class (`r`, `g`, `a`, `b`, `c`, `d`, `S`, `D`, `A`, `f`, `t`, `u`, `x`, `y`,
+/// `v`, `q`, `Q`, `R`, `l`, `Y`, `k`, `X`) is absent from the allow list, so an
+/// unrecognised constraint keeps the instruction rather than dropping it.
+fn asm_constraint_names_no_register(constraint: &str) -> bool {
+    constraint.chars().all(|c| {
+        c.is_ascii_digit()
+            // `%` is deliberately absent: `%0` matches another operand, which
+            // may well be a register. Neither is `,`: an alternative list is
+            // only inert when every alternative is.
+            || matches!(c, '=' | '+' | '&' | '#' | '*')
+            || matches!(
+                c,
+                'm' | 'o'
+                    | 'V'
+                    | '<'
+                    | '>'
+                    | 'i'
+                    | 'n'
+                    | 'I'
+                    | 'J'
+                    | 'K'
+                    | 'L'
+                    | 'M'
+                    | 'N'
+                    | 'O'
+                    | 'P'
+                    | 'e'
+                    | 'Z'
+                    | 's'
+            )
+    })
+}
+
+/// Drop inline asm that assembles to nothing and names no register.
+///
+/// See the call site for why this is the last IR transform: the barrier's only
+/// job is to order memory operations for the optimisers, and none are left.
+/// Returns the number of instructions removed.
+fn remove_inert_inline_asm(f: &mut crate::ir::reexports::IrFunction) -> usize {
+    use crate::ir::reexports::Instruction;
+    let mut removed = 0;
+    for block in &mut f.blocks {
+        let before = block.instructions.len();
+        // `retain_insts` keeps `source_spans` parallel to `instructions`.
+        // A bare `instructions.retain` left one stale span per removed asm,
+        // which the next structural verifier (phi_relay_fold) reported as a
+        // span/instruction count mismatch and which `.loc` emission would
+        // otherwise index past the shorter instruction list.
+        block.retain_insts(|inst| {
+            !matches!(
+                inst,
+                Instruction::InlineAsm {
+                    template,
+                    outputs,
+                    inputs,
+                    goto_labels,
+                    ..
+                } if goto_labels.is_empty()
+                    && crate::backend::inline_asm::inline_asm_template_has_no_instructions(template.as_str())
+                    && outputs.iter().all(|(c, _, _)| asm_constraint_names_no_register(c))
+                    && inputs.iter().all(|(c, _, _)| asm_constraint_names_no_register(c))
+            )
+        });
+        removed += before - block.instructions.len();
+    }
+    removed
+}
+
+#[cfg(test)]
+mod inert_asm_tests {
+    use super::remove_inert_inline_asm;
+    use crate::common::source::Span;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+    };
+
+    fn inert_asm() -> Instruction {
+        Instruction::InlineAsm {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: Vec::new(),
+            clobbers: vec!["memory".to_string()],
+            operand_types: Vec::new(),
+            goto_labels: Vec::new(),
+            input_symbols: Vec::new(),
+            seg_overrides: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn removing_inert_asm_keeps_source_spans_parallel() {
+        // The late inert-asm cleanup runs after `.loc` tracking is live. A
+        // bare `instructions.retain` deleted the asm but kept its span, so
+        // the next structural verifier saw N+1 spans for N instructions and
+        // debug emission could index past the instruction list.
+        let mut func = IrFunction::new("inert_asm_spans".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(crate::ir::reexports::IrConst::I32(1)),
+                },
+                inert_asm(),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![Span::new(1, 2, 0), Span::new(3, 4, 0), Span::new(5, 6, 0)],
+        });
+        assert_eq!(remove_inert_inline_asm(&mut func), 1);
+        let block = &func.blocks[0];
+        assert_eq!(block.instructions.len(), 2);
+        assert_eq!(
+            block.source_spans,
+            vec![Span::new(1, 2, 0), Span::new(5, 6, 0)],
+            "the removed asm's span must go with it"
+        );
+    }
+}
+
+/// Apply the driver-level `-fno-tree-vectorize` policy to every automatic
+/// vectorizer entry in the pass pipeline. Explicit vector types and intrinsics
+/// are unaffected; the disable list gates only automatic transformations.
+fn apply_tree_vectorize_policy(disabled: &mut String, disable: bool) {
+    if !disable || pass_disabled(disabled.as_str(), "all") {
+        return;
+    }
+
+    for pass in [
+        "vectorize",
+        "slp",
+        "vec_arx",
+        "arx_vectorize",
+        "vec_interleave",
+    ] {
+        if pass_disabled(disabled.as_str(), pass) {
+            continue;
+        }
+        if !disabled.is_empty() && !disabled.ends_with(',') {
+            disabled.push(',');
+        }
+        disabled.push_str(pass);
+    }
+}
+
+fn preinline_memory_enabled(requested: bool, disabled: &str) -> bool {
+    requested
+        && !pass_disabled(disabled, "preinline_memory")
+        && !pass_disabled(disabled, "redundantloads")
+}
+
+#[cfg(test)]
+mod tree_vectorize_policy_tests {
+    use super::{apply_tree_vectorize_policy, pass_disabled};
+
+    #[test]
+    fn no_tree_vectorize_disables_every_automatic_vectorizer_only() {
+        let mut disabled = "licm,vec_arx".to_string();
+        apply_tree_vectorize_policy(&mut disabled, true);
+
+        for pass in [
+            "vectorize",
+            "slp",
+            "vec_arx",
+            "arx_vectorize",
+            "vec_interleave",
+        ] {
+            assert!(pass_disabled(&disabled, pass), "{pass} should be disabled");
+        }
+        assert!(pass_disabled(&disabled, "licm"));
+        assert!(!pass_disabled(&disabled, "inline"));
+    }
+
+    #[test]
+    fn enabled_or_globally_disabled_policy_does_not_mutate_list() {
+        let mut enabled = "licm".to_string();
+        apply_tree_vectorize_policy(&mut enabled, false);
+        assert_eq!(enabled, "licm");
+
+        let mut all = "all".to_string();
+        apply_tree_vectorize_policy(&mut all, true);
+        assert_eq!(all, "all");
+    }
+}
+
+#[cfg(test)]
+mod preinline_memory_policy_tests {
+    use super::preinline_memory_enabled;
+
+    #[test]
+    fn early_cleanup_requires_opt_in_and_disable_controls_dominate() {
+        for disabled in ["", "dse", "dce", "notpreinline_memory"] {
+            assert!(!preinline_memory_enabled(false, disabled));
+            assert!(preinline_memory_enabled(true, disabled));
+        }
+        for disabled in [
+            "all",
+            "preinline_memory",
+            "redundantloads",
+            "gvn, preinline_memory ",
+        ] {
+            assert!(!preinline_memory_enabled(false, disabled));
+            assert!(!preinline_memory_enabled(true, disabled));
+        }
+    }
+}
+
+/// Scalar ANDN (BMI1) fusion permission as the middle end sees it — the
+/// mirror of the x86-64 backend's emission-time contract
+/// (`supports_and_not` in codegen/emit.rs): target class + resolved BMI1
+/// + the `CCC_NO_ANDN_FUSION` kill switch.  Single-sourced (audit P2-12)
+/// so the two bit_idioms invocations — and therefore the fold-time defer
+/// prediction vs. the emission-time fusion decision — can never drift
+/// within one compilation.  `run_passes` snapshots this ONCE at the top and
+/// hands the same value to both bit_idioms invocations (a second resolution
+/// mid-pipeline would re-read the environment and break the snapshot
+/// contract — env reads belong in the runner preamble only).
+fn scalar_andn_available(target: crate::backend::Target, x86_bmi1: bool) -> bool {
+    target == crate::backend::Target::X86_64
+        && x86_bmi1
+        && crate::backend::generation::andn_fusion_env_enabled()
+}
+
+fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32) {
+    if !code16gcc || opt_level < 4 {
+        return;
+    }
+    // Measurement hook: CCC_M16_KEEP=<pass,...> removes individual passes
+    // from the disable list so each can be A/B-measured in isolation. The
+    // defaults are unchanged — this exists so the policy's entries stay
+    // evidence-backed instead of cargo-culted from a conflated measurement.
+    let keep: Vec<String> = std::env::var("CCC_M16_KEEP")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
+    for pass in ["postinline", "ifconv", "gaddrcse", "licm"] {
+        if keep.iter().any(|k| k == pass) {
+            continue;
+        }
+        if !disabled.is_empty() {
+            disabled.push(',');
+        }
+        disabled.push_str(pass);
+    }
+}
+
+/// x86-64 code-generation ISA permission for the translation unit being
+/// compiled — the same struct the backend consumes (`backend::x86::isa`),
+/// so the middle end and the emitters can never disagree about what is
+/// legal.  See that module for the policy (x86-64 default: every
+/// post-baseline class needs its explicit flag, `-march` sets the ceiling,
+/// `-mno-*` denials are sticky).
+pub(crate) use crate::backend::x86::isa::X86Isa;
+
+/// Widest rotate (in bits) `target` can lower to a single native instruction
+/// sequence, or 0 when the target should keep the portable shift/or triple.
+///
+/// Every backend has a rotate lowering, but i686 sends I64/U64 arithmetic
+/// through its paired-register path (`emit_i128_binop`) instead of the 32-bit
+/// ALU path that owns `rol`/`ror`, so only its 32-bit form is wired.
+fn target_rotate_bits(target: crate::backend::Target) -> u32 {
+    match target {
+        crate::backend::Target::X86_64
+        | crate::backend::Target::Aarch64
+        | crate::backend::Target::Riscv64 => 64,
+        crate::backend::Target::I686 => 32,
+    }
+}
+
+/// Whether the target lowers `Bswap` to a single instruction at every width the
+/// bit-idiom pass matches (32 and 64 bits).  x86-64 (`bswapl`/`bswapq`), i686
+/// (`bswapl` pairs, plus a two-register helper for 64 bits) and AArch64 (`rev`)
+/// do; RISC-V has no `rev8` in this backend, so its `Bswap` expands into the
+/// very shift/mask sequence a portable network is already written in.  Partial
+/// byte swaps are therefore folded only where the swap is actually cheaper.
+fn target_native_bswap(target: crate::backend::Target) -> bool {
+    match target {
+        crate::backend::Target::X86_64
+        | crate::backend::Target::I686
+        | crate::backend::Target::Aarch64 => true,
+        crate::backend::Target::Riscv64 => false,
+    }
+}
+
+/// Narrowest rotate the target lowers natively.  x86 `rolb`/`rolw` rotate at
+/// the operand width — the hardware count is `(count & 31) mod width`, so the
+/// sub-word forms are exact — while AArch64 (`ror`/`extr`) and RISC-V
+/// (`rol`/`ror`, Zbb) only rotate at the full register width.  This gates the
+/// truncation-aware narrow-rotate pattern so those backends never receive a
+/// sub-word rotate node.
+fn target_min_rotate_bits(target: crate::backend::Target) -> u32 {
+    match target {
+        crate::backend::Target::X86_64 | crate::backend::Target::I686 => 8,
+        crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64 => 32,
+    }
+}
+
+/// Run optimization passes for the requested optimization level.
+///
+/// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
+/// ONE dispatch table for the early vectorizer run and the late (post
+/// if-conversion) rerun.
+///
+/// Sharing it is deliberate: a loop that only becomes analyzable once its
+/// branch diamond is if-converted must be transformed with exactly the
+/// ISA/FP configuration the early pass used. A second, divergent table is
+/// how "the late pass vectorizes something the early pass would have
+/// refused" bugs start.
+fn vectorize_entry(
+    target: crate::backend::Target,
+    fp_reassoc: bool,
+    fp_contract: FpContract,
+    x86_avx: bool,
+) -> vectorize::VectorizeEntryMode {
+    use vectorize::VectorizeEntryMode::{Main, TwoWide};
+    match (target, fp_reassoc, fp_contract, x86_avx) {
+        (crate::backend::Target::Aarch64, fast_math, _, _) => TwoWide { fast_math },
+        (_, true, FpContract::Fast, enable_fixed_slp) => Main {
+            fp_reassoc: true,
+            fp_contract: FpContract::Fast,
+            enable_fixed_slp,
+        },
+        (_, true, FpContract::Off | FpContract::OnExpr, enable_fixed_slp) => Main {
+            fp_reassoc: true,
+            fp_contract: FpContract::default(),
+            enable_fixed_slp,
+        },
+        // contract=fast without reassoc: reductions stay order-locked,
+        // map trees may fuse (GCC-parity for -ffp-contract=fast).
+        (_, false, FpContract::Fast, _) => Main {
+            fp_reassoc: false,
+            fp_contract: FpContract::Fast,
+            enable_fixed_slp: false,
+        },
+        (_, false, _, _) => Main {
+            fp_reassoc: false,
+            fp_contract: FpContract::default(),
+            enable_fixed_slp: false,
+        },
+    }
+}
+
+/// The LATE rerun's entry point. Differs from `vectorize_entry` in exactly
+/// one arm, and deliberately so.
+///
+/// `vectorize_entry` selects `vectorize_function_two_wide_fast_math` for
+/// AArch64 under `-ffast-math`. Sharing it with the late rerun silently
+/// changed AArch64's late behaviour from `two_wide` (fp_reassoc = false) to
+/// `two_wide_fast_math` (fp_reassoc = true) -- an unmeasured new class of
+/// late reassociation on a target this work otherwise does not touch.
+///
+/// Measured on `lccc-arm`, it is also a regression rather than a wash:
+///
+/// ```text
+/// float dot-product + float max, -O2 -ffast-math
+///   two_wide_fast_math   95 insns
+///   two_wide (previous)  73 insns   (-23 %)
+/// whole arm corpus (14 files x 3 configs)
+///   two_wide_fast_math   6260 insns
+///   two_wide (previous)  6264 insns (+0.06 %, noise)
+/// ```
+///
+/// So the fast-math late entry costs 23 % on the code it actually affects and
+/// buys nothing anywhere else. The late rerun keeps the previous AArch64
+/// entry; reopening this needs a measurement that shows the reassociation
+/// wins on real AArch64 float kernels, not a smaller total elsewhere.
+///
+/// x86-64 and every other target are unaffected: they fall through to the
+/// same `vectorize_entry` the early pass uses.
+fn late_vectorize_entry(
+    target: crate::backend::Target,
+    fp_reassoc: bool,
+    fp_contract: FpContract,
+    x86_avx: bool,
+) -> vectorize::VectorizeEntryMode {
+    if matches!(target, crate::backend::Target::Aarch64) {
+        // Preserve the pre-existing non-reassociating AArch64 late entry.
+        return vectorize::VectorizeEntryMode::TwoWide { fast_math: false };
+    }
+    vectorize_entry(target, fp_reassoc, fp_contract, x86_avx)
+}
+
+/// Temporarily apply a function's `__attribute__((target("...")))` x86-64 SIMD
+/// capabilities around a middle-end vectorization callback, then restore the
+/// TU baseline immediately. Zero-cost when `target_features` is empty.
+pub(crate) fn with_function_x86_vec_isa<R>(
+    target: crate::backend::Target,
+    base_isa: crate::backend::x86::isa::X86Isa,
+    base_avx512vl: bool,
+    features: &[String],
+    body: impl FnOnce(crate::backend::x86::isa::X86Isa) -> R,
+) -> R {
+    if target != crate::backend::Target::X86_64 || features.is_empty() {
+        return body(base_isa);
+    }
+    // The TU's features with the module's selections, then the function's
+    // options in GCC's semantics: an `arch=haswell` function loses the TU's
+    // AVX512VL, and `no-avx2` every AVX-512 subset.
+    let tu = crate::common::x86_features::effective().raw();
+    let base = crate::backend::x86::isa::with_feature(
+        base_isa.overlay(tu),
+        crate::common::x86_features::X86Feature::Avx512Vl,
+        base_avx512vl,
+    );
+    let set = crate::common::x86_features::EffectiveFeatures::from_raw(
+        crate::backend::x86::isa::fold_target_features(base, features),
+    );
+    let fn_isa = crate::backend::x86::isa::X86Isa::from_feature_bits(set.raw());
+    let fn_avx512vl = fn_isa.ymm
+        && set.contains(crate::common::x86_features::X86Feature::Avx512F)
+        && set.contains(crate::common::x86_features::X86Feature::Avx512Vl);
+    vectorize::set_x86_simd_isa(fn_isa.simd, fn_isa.ymm, fn_isa.sse41, fn_avx512vl);
+    vectorize::set_x86_fma_enabled(fn_isa.fma);
+    vectorize::set_x86_strict_recip_avx2_enabled(fn_isa.ymm && fn_isa.sse41);
+    let result = body(fn_isa);
+    vectorize::set_x86_simd_isa(base_isa.simd, base_isa.ymm, base_isa.sse41, base_avx512vl);
+    vectorize::set_x86_fma_enabled(base_isa.fma);
+    vectorize::set_x86_strict_recip_avx2_enabled(base_isa.ymm && base_isa.sse41);
+    result
+}
+
+pub(crate) fn run_passes(
+    module: &mut IrModule,
+    opt_level: u32,
+    target: crate::backend::Target,
+    loop_idiom_capabilities: loop_idiom::Capabilities,
+    code16gcc: bool,
+    wrap_signed_overflow: bool,
+    fp_environment_observable: bool,
+    fp_reassoc: bool,
+    fp_contract: crate::common::fp_contract::FpContract,
+    // `-fmath-errno` (the C default; cleared by -fno-math-errno/-ffast-math).
+    math_errno: bool,
+    x86_isa: X86Isa,
+    x86_sse1: bool,
+    x86_avx: bool,
+    x86_fma: bool,
+    x86_bmi1: bool,
+    x86_avx512vl: bool,
+    disable_tree_vectorize: bool,
+    ra_config: &crate::backend::regalloc::RaConfig,
+    // pic: `-fPIC`/`-shared` semantic interposition — external definitions
+    // in this unit are interposable, so the inliner keeps calls to them
+    // (GCC's default `-fsemantic-interposition` at -fPIC).
+    pic: bool,
+    // `-ftls-model=` (the floor of `common::tls::TlsPolicy`); with `pic` it is
+    // the policy every TLS model decision in the pipeline is made under.
+    tls_floor: Option<crate::ir::reexports::TlsModel>,
+) {
+    let policy = crate::common::pass_policy::PassPolicy::new(
+        wrap_signed_overflow,
+        fp_environment_observable,
+    );
+    for func in &mut module.functions {
+        // Re-stamp the two command-line semantics this entry owns; the
+        // builtin policy is a per-TU fact `builtin_policy::apply` already
+        // derived from the definitions after lowering, and resetting it here
+        // would let loop_memset turn the TU's own `memset` loop into a
+        // `call memset` (infinite recursion).
+        func.pass_policy = policy.with_builtins(func.pass_policy.builtins);
+    }
+    let fp_reassoc = fp_reassoc && !fp_environment_observable;
+    let fp_contract = if fp_environment_observable {
+        FpContract::Off
+    } else {
+        fp_contract
+    };
+    // Checkpoint the lowering output BEFORE any optimizer runs: the SSA
+    // validators in this function attribute a violation to the phase that
+    // created it, and at -O0 the optimizer phase loop is the empty set —
+    // without this entry checkpoint a malformed phi from the frontend
+    // (Csmith 20260945: a φ missing its entry-edge incoming) would only be
+    // reported by the backend's pre-eliminate_phis tag, falsely implicating
+    // everything in between.
+    if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+        // Dump BEFORE validating so a phi-arity/dominance panic at the
+        // entry checkpoint is inspectable (post-pass checkpoints validate
+        // first inside dump_ir_filtered; there the IR is the pass's output
+        // and a dump of a violating shape is still wanted — but the panic
+        // in validate_unique_defs would suppress it, which is acceptable
+        // there because the pass tag alone identifies the offender).
+        dump_ir_filtered_inner(module, "lowering:entry");
+        validate_unique_defs(module, "lowering:entry");
+    }
+    // x86 SIMD register-file availability for the middle end. Under `-mno-sse`
+    // / `-mgeneral-regs-only` there is no xmm state on the target at all, so
+    // the vectorizer must not rewrite a single loop (see the gate in
+    // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
+    // 128-bit SSE2 instead of disabling vectorization outright.
+    vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41, x86_avx512vl);
+    vectorize::set_x86_sse1_available(target == crate::backend::Target::X86_64 && x86_sse1);
+    // I64 maps and unfused packed multiply/add are x86-64-only lowerings.
+    // Refresh the per-thread gate for every TU: a worker may compile i686
+    // immediately after x86-64 in the same process.
+    vectorize::set_x86_64_vector_intrinsics_available(target == crate::backend::Target::X86_64);
+    // Pass B (two-block guard-free unroll) kill switch, resolved once here for
+    // the same reason as the ISA gates above: the unroller is a hot path and
+    // must not read the process environment per call, and per-thread state
+    // keeps the kill-switch unit test from racing its siblings (see
+    // `TWO_BLOCK_UNROLL_ENABLED` in loop_unroll.rs).
+    loop_unroll::set_two_block_unroll_enabled(std::env::var("CCC_NO_TWO_BLOCK_UNROLL").is_err());
+    let self_recursion_clone = std::env::var("CCC_NO_SELF_RECURSION_CLONE").is_err();
+    inline::set_self_recursion_clone_enabled(self_recursion_clone);
+    // Resolve this diagnostic toggle once per translation unit, alongside the
+    // other pass configuration, rather than rescanning the process environment
+    // during parameter remapping.
+    inline::set_paramref_debug_enabled(std::env::var_os("CCC_INLINE_PARAMREF_DEBUG").is_some());
+    loop_unroll::set_persist_gate_legacy(std::env::var("CCC_UNROLL_LEGACY_PERSIST_GATE").is_ok());
+    loop_unroll::set_persist_gate_trace(std::env::var("CCC_UNROLL_GATE_TRACE").is_ok());
+    // Every remaining pass switch, resolved here for the same reason.  No pass
+    // reads the process environment any more: each of these was an `environ`
+    // scan (and an `OsString` or `String` allocation) PER FUNCTION — eight of
+    // them across the interleave, load-sink, backedge-PRE and loop-alignment
+    // passes — and because the environment is process-global, each pass's
+    // kill-switch test had to mutate it underneath every sibling test on cargo's
+    // thread pool.  `tests/regression/check_env_test_hygiene.sh` fails the build
+    // if a pass grows an env read again or a test mutates the environment
+    // without `test_support::EnvGuard`.
+    // FMA operand-negation peel kill switch (both tier tails below consult
+    // the resolved local; the pass itself never reads the environment).
+    let fma_neg_peel_enabled = std::env::var_os("CCC_NO_FMA_NEG_PEEL").is_none();
+    vec_interleave::set_vec_interleave_env(vec_interleave::InterleaveEnv {
+        enabled: std::env::var_os("CCC_NO_VEC_INTERLEAVE").is_none(),
+        trace: std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some()
+            || std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some(),
+        // 2, 4 and 8 are the only forces the knob documents; anything else
+        // leaves the CPU model in charge.
+        forced_factor: std::env::var("CCC_VEC_INTERLEAVE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|f| matches!(f, 2 | 4 | 8))
+            .unwrap_or(0),
+    });
+    vec_load_sink::set_vec_load_sink_env(vec_load_sink::SinkEnv {
+        enabled: std::env::var_os("CCC_NO_VEC_LOAD_SINK").is_none(),
+        trace: std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some(),
+    });
+    // Form 4 of `aggregate_sroa` runs per function and used to scan the
+    // environment per call (three switches, one of them allocating); it reads
+    // the resolved copy instead, like every other pass here.
+    aggregate_sroa::split::set_split_env(aggregate_sroa::split::SplitEnv {
+        enabled: std::env::var_os("CCC_NO_AGGREGATE_SPLIT").is_none(),
+        debug: std::env::var_os("CCC_AGG_SPLIT_DEBUG").is_some(),
+        // A malformed cap keeps the default rather than silently refusing every
+        // candidate: the knob is a debugging aid, not a contract.
+        max_fields: std::env::var("CCC_AGG_SPLIT_MAX_FIELDS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(aggregate_sroa::split::SPLIT_ENV_DEFAULT_MAX_FIELDS),
+        sroa_trace: std::env::var_os("CCC_DEBUG_SROA").is_some(),
+    });
+    backedge_pre::set_backedge_pre_env(backedge_pre::EnvConfig::from_env());
+    loop_align::set_tight_loop_mode(loop_align::TightLoopMode::from_env());
+    // Scalar ANDN (BMI1) capability for the bool-mux algebra's CH fold.
+    // Resolved ONCE per compilation: both bit_idioms invocations below
+    // receive this same snapshot, so the fold-time defer prediction can
+    // never observe a different capability value than its sibling (or a
+    // re-read environment variable mid-pipeline).
+    let has_scalar_andn = scalar_andn_available(target, x86_bmi1);
+    // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
+    // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
+    // ignores this.
+    vectorize::set_x86_fma_enabled(x86_isa.fma && target == crate::backend::Target::X86_64);
+    // The four-wide AVX2 strict reciprocal spelling uses VPINSRD (SSE4.1).
+    // SSE2 has a separate two-packet spelling under the x86-64 SIMD gate.
+    // Do not infer permission for the AVX2 spelling from generic x86
+    // vectorization or from AVX alone; the pass must fail closed for a target
+    // which does not permit both required ISA subsets. Raw driver request
+    // bits are NOT permissions: `x86_isa` is the RESOLVED ceiling, which an
+    // explicit `-march=`/`-m*` grant raises and `-mno-*` denials lower.
+    vectorize::set_x86_strict_recip_avx2_enabled(
+        target == crate::backend::Target::X86_64 && x86_isa.ymm && x86_isa.sse41,
+    );
+    // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
+    // fused form is required for the C99 single-rounding semantics, so the
+    // fold must only fire when the backend can actually emit vfmadd*.
+    // FMA3 is opt-in on x86-64 (`-mfma`, or an `-march=` profile that carries
+    // it) and `-mno-fma` clears it; `-mno-sse` clears the whole
+    // SIMD register file (vfmadd is a VEX-encoded SSE instruction, so a
+    // kernel TU built with `-mno-sse` would #UD on the folded form).
+    simplify::set_math_errno(math_errno);
+    simplify::set_has_fma3(match target {
+        crate::backend::Target::X86_64 => x86_isa.fma,
+        crate::backend::Target::I686 => x86_fma,
+        crate::backend::Target::Aarch64 => true,
+        _ => false,
+    });
+    // SSE4.1 directed rounding (`roundsd`/`vroundsd`) for the floor/ceil/
+    // trunc/rint/nearbyint libcall fold.  x86-64 needs the ISA bit; i686
+    // lowers the intrinsic through x87 `frndint` and AArch64 through
+    // `frint*`, both baseline.
+    simplify::set_has_round_insn(match target {
+        crate::backend::Target::X86_64 => x86_isa.sse41,
+        crate::backend::Target::I686 | crate::backend::Target::Aarch64 => true,
+        _ => false,
+    });
+    let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
+    iv_strength_reduce::set_compare_recurrence_enabled(
+        target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "scalar_compare_iv"),
+    );
+    loop_unroll::set_reduction_enabled(
+        target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "reduction_unroll"),
+    );
+    div_by_const::set_exact_enabled(!pass_disabled(&disabled, "exact_signed_div"));
+    // Diagnostic kill switches are resolved here, once per translation unit, so
+    // no pass reads the environment per call site (the env-read ratchet in
+    // tests/regression/check_env_test_hygiene.sh). `mod.rs` is deliberately
+    // outside that count.
+    let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
+    vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
+    vectorize::set_strided_reduce_trace(std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some());
+    inline::set_ssa_param_config(inline::SsaParamConfig {
+        enabled: std::env::var("CCC_NO_SSA_PARAM").is_err(),
+        skip: std::env::var("CCC_SSA_PARAM_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        log: std::env::var("CCC_SSA_PARAM_LOG").is_ok(),
+    });
+    vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
+    vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
+    // Snapshot the map policy switches once, like the other pass-pipeline
+    // knobs.  Both the pre-unroll constant-trip entry and the main vectorizer
+    // must make the same decision without re-reading the environment per
+    // function or candidate loop.
+    let no_map_vec = std::env::var("CCC_NO_MAP_VEC").is_ok();
+    let no_map_i64_unroll = std::env::var_os("CCC_NO_MAP_I64_UNROLL").is_some();
+    // ZERO-REM-1: restorable kill switch for "omit the provably-dead vectorizer
+    // remainder loop". Off by default; `CCC_NO_MAP_ZERO_REM=1` restores the
+    // previous always-emit-the-mirror behaviour so the win stays re-measurable
+    // without rebuilding a historical tree.
+    let no_map_zero_rem = std::env::var_os("CCC_NO_MAP_ZERO_REM").is_some();
+    // Byte-compare epic kill switch.  Snapshotted in the same place for the
+    // same reason: the arm's pattern scan runs per candidate loop, so the
+    // environment read must not live in the scan (see the section doc in
+    // `vectorize.rs`; the ratchet in
+    // tests/regression/check_env_test_hygiene.sh counts reads OUTSIDE this
+    // file, which is exactly the discipline being enforced).
+    let no_bytecmp_vec = std::env::var_os("LCCC_NO_BYTECMP_VEC").is_some();
+    vectorize::set_no_map_vec(no_map_vec);
+    vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
+    vectorize::set_no_map_i32_unroll(std::env::var_os("CCC_NO_MAP_I32_UNROLL").is_some());
+    vectorize::set_no_map_fp_unroll(std::env::var_os("CCC_NO_MAP_FP_UNROLL").is_some());
+    vectorize::set_no_map_zero_rem(no_map_zero_rem);
+    vectorize::set_no_bytecmp_vec(no_bytecmp_vec);
+    // Fixed-distance SLP kill switch, snapshotted here like the map
+    // switches above so the transform never reads the environment itself.
+    vectorize::set_no_fixed_slp(std::env::var_os("CCC_NO_FIXED_SLP").is_some());
+    // Generator-map vectorizer (vectorize_generator_map.rs): kill switch and
+    // the `[VEC-GEN]` trace, resolved here like the switches above.
+    vectorize::set_generator_map_policy(
+        std::env::var_os("CCC_NO_GENERATOR_MAP").is_none() && !vectorize::sse2_forced(),
+        std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some(),
+    );
+    // The inliner's extension kill switches (A/B and triage), same rule.
+    let inline_enabled = |name: &str| std::env::var_os(name).is_none();
+    inline::set_semantic_interposition(pic);
+    inline::set_features(inline::InlineFeatures {
+        devirt: inline_enabled("CCC_NO_INLINE_DEVIRT"),
+        snapshot_refresh: inline_enabled("CCC_NO_INLINE_SNAPSHOT_REFRESH"),
+        joint_fixpoint: inline_enabled("CCC_NO_INLINE_JOINT_FIXPOINT"),
+        hot_leaf: inline_enabled("CCC_NO_INLINE_HOT_LEAF"),
+        snapshot_cleanup: inline_enabled("CCC_NO_INLINE_SNAPSHOT_CLEANUP"),
+        caller_cleanup: inline_enabled("CCC_NO_INLINE_CALLER_CLEANUP"),
+        hot_direct: inline_enabled("CCC_NO_INLINE_HOT_DIRECT"),
+    });
+    // The affine exit-compare fold's knobs, same rule as the byte-compare arm:
+    // resolved here (the ratchet in check_env_test_hygiene.sh excludes this
+    // file) and handed to the pass, never read per loop.
+    loop_rotate::set_affine_fold_knobs(
+        std::env::var_os("CCC_NO_AFFINE_EXIT_FOLD").is_none(),
+        std::env::var_os("CCC_DEBUG_AFFINE_FOLD").is_some(),
+    );
+    // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
+    // and only six generally usable GPRs.  On the real linux-cachymod setup
+    // corpus these four transformations increase final machine-code size by
+    // merging live ranges faster than they remove operations.  This is not a
+    // generic i686 policy: ordinary -m32 keeps the throughput-oriented
+    // pipeline.  Restrict the measured size profile to explicit -m16 -Os/-Oz.
+    if std::env::var_os("CCC_M16_FULL_PIPELINE").is_none() {
+        apply_m16_size_policy(&mut disabled, code16gcc, opt_level);
+    }
+    // Debug hook: dump the module IR to stderr before optimization.
+    if ra_config.dump_ir {
+        eprintln!("==== IR before passes (opt_level={}) ====", opt_level);
+        eprintln!("{:#?}", module);
+        eprintln!("==== END IR ====");
+    }
+    if pass_disabled(&disabled, "all") {
+        return;
+    }
+
+    let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
+    // -fdump-tree-all equivalent: dump the module after every pass.
+    let dump_each_pass =
+        std::env::var("CCC_DUMP_EACH_PASS").is_ok() || std::env::var("CCC_VALIDATE_SSA").is_ok();
+
+    // -O0: preserve the alloca-based IR and skip the optimizer completely.
+    // Inline asm symbol resolution is not an optimization; it is required for
+    // correct backend emission of asm operands.
+    if opt_level == 0 {
+        resolve_asm::resolve_inline_asm_symbols(module);
+        // GCC semantics: always_inline is a correctness constraint, honored at
+        // every optimization level.  gnu_inline wrappers (glibc
+        // _FORTIFY_SOURCE, gcc.c-torture va-arg-pack-1.c) have no out-of-line
+        // body, so an un-inlined always_inline call cannot link.  This tier
+        // clones only always_inline callees; everything else is untouched.
+        if !pass_disabled(&disabled, "inline") {
+            inline::run_always_inline_only(module);
+        }
+        // _Float128 math builtins lower to libgcc helper calls (__copysigntf3,
+        // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
+        // inline intrinsics even at -O0 (semantics-preserving rename).
+        simplify::fold_math_intrinsic_calls(module);
+        // Unreachable internal-linkage functions go at every level, as with
+        // GCC's call graph: lowering keeps a static function on a superset
+        // of its AST references (an unevaluated `sizeof`/`typeof` operand
+        // counts), and only the IR knows which survive.  An unreachable one
+        // may call functions defined nowhere, which must not reach the link.
+        dead_statics::eliminate_dead_statics_at_o0(module);
+        // -O0 runs one budgeted fixpoint above: the always-inline rounds,
+        // whose second-pass budget is a correctness budget (an unexpanded
+        // must-inline call cannot link).  Its cap hits must surface too.
+        if time_passes {
+            round_cap::report();
+        }
+        return;
+    }
+
+    // -O1: cheap scalar cleanup only.  This tier is intentionally small and
+    // predictable for faster debug-style builds while still removing obvious
+    // dead/copy/constant IR introduced by lowering.
+    if opt_level == 1 {
+        // Per-pass checkpoint for the -O1 tier: the same CCC_DUMP_EACH_PASS /
+        // CCC_DUMP_FUNC dump and CCC_VERIFY_IR structural check the -O2+
+        // tiers run after every pass. Without it an -O1-only miscompile
+        // cannot be attributed to a pass (the verifier only ever saw the
+        // module after the final FMA peel). Both are no-ops unless the
+        // corresponding environment variable is set.
+        macro_rules! o1_checkpoint {
+            ($name:expr_2021) => {
+                if dump_each_pass {
+                    dump_ir_filtered(module, &format!("O1 {}", $name));
+                }
+                verify::verify_after_pass(module, $name);
+            };
+        }
+        // Parameter allocas are promoted up front so the folding passes
+        // below see ParamRef-SSA operands (range_fold + simplify need that
+        // shape to fold 20041114-1's unsigned-range disjunction). The
+        // reassociation single-use guard in simplify.rs removed the one
+        // rewrite that mis-compiled this shape (va-arg-21's glibc
+        // extern-inline vprintf body: the multi-use reassociation re-based a
+        // def onto a different register web while the inlined va_list ABI
+        // kept the old home).
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        if time_passes {
+            eprintln!("[PASS] o1 mem2reg");
+        }
+        o1_checkpoint!("o1 mem2reg");
+        ip_purity::run(module);
+        o1_checkpoint!("ip_purity");
+        if !pass_disabled(&disabled, "fortifyfold") {
+            fortify_fold::run(module, target.is_32bit());
+        }
+        o1_checkpoint!("fortifyfold");
+        constant_fold::run(module);
+        copy_prop::run(module);
+        o1_checkpoint!("constfold+copyprop");
+        if !pass_disabled(&disabled, "libmemcpy") {
+            builtin_policy::canonicalize_library_memcpy(
+                module,
+                builtin_policy::library_memcpy_inline_max(
+                    target,
+                    loop_idiom_capabilities.i686_sse,
+                    opt_level >= 4,
+                ),
+            );
+        }
+        o1_checkpoint!("libmemcpy");
+        // Local simplifier at -O1: shift identity folds (x>>0 -> x, 0<<x -> 0,
+        // all-ones arithmetic shr), `fabs(x) < 0.0` -> false and related
+        // per-instruction canonicalizations. gcc.c-torture shiftopt-1 and
+        // 20020720-1 leave their link_error calls reachable without these
+        // folds; GCC's front end / match.pd applies them at every level, so
+        // -O1 parity requires them here. One linear per-function sweep keeps
+        // the -O1 tier cheap and predictable.
+        if !pass_disabled(&disabled, "simplify") {
+            simplify::run_with_config(module, true);
+        }
+        o1_checkpoint!("simplify");
+        // Inlining at -O1: GCC's -O1 tier inlines always_inline and
+        // extern-inline functions plus called-once/small static helpers, and
+        // several torture cases depend on the resulting constant propagation
+        // (20010119-1: __builtin_constant_p through extern inline; 990208-1:
+        // label-address static inline must duplicate per call site; bcp-1:
+        // opt0/opt1 inlined-constant answers). The inliner's own size and
+        // budget heuristics bound the expansion. Range-check folding runs
+        // after the post-inline promotion below: the fold matches on SSA
+        // compare operands, which only exist for actuals once param allocas
+        // are promoted (same rationale as the -O2 loop, which runs
+        // range_fold after mem2reg).
+        if !pass_disabled(&disabled, "inline") {
+            inline::run(module);
+        }
+        o1_checkpoint!("inline");
+        // Post-inline parameter promotion: with the inliner done, param
+        // allocas can become SSA values. Constants passed through inlined
+        // calls (20010119-1: a = 10) become visible to the propagation
+        // chain below, exactly like the -O2 tier's post-inline mem2reg.
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        o1_checkpoint!("post-inline mem2reg");
+        // GlobalAddr CSE: -O1 runs no GVN, so every source-level access kept
+        // its own address materialization -- for dynamic TLS one descriptor
+        // or __tls_get_addr call per access (GCC's -O1 CSE pass merges
+        // them). Same class-aware pass and kill switch as the -O2 tier.
+        if !pass_disabled(&disabled, "gaddrcse") {
+            global_addr_cse::run_module(module);
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+        o1_checkpoint!("gaddrcse");
+        // Range-check folding at -O1 (same transform as the -O2 loop's
+        // "range_fold" pass): (x >= lo && x <= hi) ->
+        // (unsigned)(x - lo) <= (hi - lo) plus the complement form.
+        // gcc.c-torture 20041114-1 needs it at -O1; the pass is
+        // O(instructions), idempotent, and runs before DCE so folded
+        // comparisons feed the same cleanup chain as at -O2.
+        if !pass_disabled(&disabled, "range_fold") {
+            module.for_each_function(range_check::run_function);
+        }
+        o1_checkpoint!("range_fold");
+        // Second copy-prop + constant-fold round: simplify rewrites shift
+        // identities into Copies (x>>0 => Copy(x)), so comparisons against the
+        // original value only become identical-operand compares after the new
+        // Copies are propagated (gcc.c-torture shiftopt-1: `(x >> 0) != x`).
+        // The -O2+ tier reaches the same fixpoint via its iterative loop; at
+        // -O1 this explicit second round keeps the tier loop-free while
+        // preserving parity. Both passes are linear and idempotent.
+        copy_prop::run(module);
+        constant_fold::run(module);
+        o1_checkpoint!("copyprop2+constfold2");
+        // Same f128-builtin fold as -O0 (see above).
+        simplify::fold_math_intrinsic_calls(module);
+        module.for_each_function(dce::eliminate_dead_code);
+        o1_checkpoint!("mathfold+dce");
+        // Same-block dead store elimination is cheap and removes the
+        // store-overwritten lowering residue at -O1 too.
+        module.for_each_function(dse::eliminate_dead_stores);
+        o1_checkpoint!("dse");
+        module.for_each_function(store_load_forward::run);
+        o1_checkpoint!("slforward");
+        constant_fold::run(module);
+        module.for_each_function(cfg_simplify::simplify_cfg);
+        o1_checkpoint!("constfold3+cfg");
+        // Literal strlen/strcmp/memcmp answer before the IsConstant resolver, so
+        // a folded compare can still prove a __builtin_constant_p query in this
+        // tier. -O0 deliberately keeps the call: that tier's contract is "skip the
+        // optimizer completely", and a folded literal compare is exactly the kind
+        // of thing a debugger single-steps through. Both reference compilers fold
+        // at -O1 (measured: gcc 14.2 and clang 23.1.3 print the sign at -O1/-O2
+        // and glibc's magnitude at -O0), so this is parity, not aggression.
+        constant_fold::fold_string_library_calls(module);
+        o1_checkpoint!("string_library_fold");
+        // Resolve remaining __builtin_constant_p queries BEFORE the final DCE:
+        // an unresolved IsConstant node keeps both select arms alive, so the
+        // not-taken arm's calls (20010119-1: undef()) only become removable
+        // after resolution. The final DCE then collects them; previously the
+        // resolver ran last and the dead branches survived to codegen.
+        constant_fold::resolve_remaining_is_constant(module);
+        o1_checkpoint!("is_constant");
+        // Post-resolution prune: resolving IsConstant turns previously
+        // both-arms-alive diamonds into constant branches, so one more
+        // cfg_simplify + DCE round folds the taken edge and deletes the
+        // dead arm's blocks (20010119-1: undef() inside the extern-inline
+        // body's not-constant arm reached codegen before this round).
+        module.for_each_function(cfg_simplify::simplify_cfg);
+        module.for_each_function(dce::eliminate_dead_code);
+        o1_checkpoint!("cfg+dce");
+        // Bool-phi merge-diamond branch threading (same call as the -O2+
+        // tier's late phase; see there for the rationale).
+        if !pass_disabled(&disabled, "boolthread") && std::env::var("CCC_NO_BOOL_THREAD").is_err() {
+            let n = module.for_each_function(bool_thread::run);
+            if n > 0 {
+                module.for_each_function(cfg_simplify::simplify_cfg);
+                module.for_each_function(dce::eliminate_dead_code);
+            }
+            o1_checkpoint!("boolthread");
+        }
+        // FMA operand-negation peel (same call as the -O2+ tail; see Phase
+        // 11f there). GCC folds fma(-a,b,-c) to one vfnmsub at -O1, so the
+        // tier that already folds the fma libcall to the intrinsic gets the
+        // sign algebra too. The verify hook matters here for the same
+        // reason it does at the -O2+ tail: this is the LAST IR transform,
+        // and nothing downstream would otherwise re-check the module — a
+        // malformed peel was invisible to CCC_VERIFY_IR exactly once
+        // already (the deleted-under-a-surviving-reader chain).
+        if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
+            fma_neg_peel::run(module);
+            verify::verify_after_pass(module, "fmanegpeel");
+        }
+        resolve_asm::resolve_inline_asm_symbols(module);
+        // Unreachable internal-linkage functions go, as at -O0 and -O2+.
+        dead_statics::eliminate_dead_static_functions(module);
+        restore_entry_param_prefix(module);
+        if time_passes {
+            round_cap::report();
+        }
+        if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
+            eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
+            eprintln!("{:#?}", module);
+            eprintln!("==== END IR after all passes ====");
+        }
+        return;
+    }
+
+    let optimize_for_size = opt_level >= 4;
+    // -Os/-Oz are size profiles. Full inlining inflates spill-heavy TUs; but
+    // disabling inlining ENTIRELY makes -Os binaries LARGER than -O3 (every
+    // memread/memcmp helper emitted standalone). GCC inlines tiny/small callees
+    // even at -Os: run the size-aware inliner so helper bodies fold away while
+    // repeated cold medium-body expansion stays out. -O1/-O2/-O3 keep full
+    // inlining.
+
+    macro_rules! preloop_dump {
+        ($name:expr_2021) => {
+            if dump_each_pass {
+                dump_ir_filtered(module, &format!("pre-loop {}", $name));
+            }
+            // Structural verification runs independently of dumping; see
+            // `passes::verify` (CCC_VERIFY_IR=1 / =abort).
+            verify::verify_after_pass(module, $name);
+        };
+    }
+    let allow_inline = opt_level != 4 && opt_level != 5;
+    preloop_dump!("lowering(pre-O2)");
+    // The one-level self-recursion clone waits for the post-structural
+    // inliner below. Run here, it would expand recursion that rec2iter and
+    // tce_acc rewrite into loops -- `return 1 + f(l) + f(r)` became four real
+    // calls instead of one call plus a loop -- and it would leave
+    // `self_inline` (which owns small frame-neutral bodies, three levels)
+    // nothing to see: Callgrind, binary_trees -O2, clone-first 15.160G Ir /
+    // 43.9M mispredicts against 14.571G / 42.1M with self_inline owning the
+    // tree walks. -O1 has neither rewrite and keeps the clone in its inliner.
+    inline::suspend_self_recursion_clone(true, self_recursion_clone);
+    run_inline_phase(
+        module,
+        &disabled,
+        allow_inline,
+        optimize_for_size,
+        target,
+        pic,
+        ra_config,
+    );
+    inline::suspend_self_recursion_clone(false, self_recursion_clone);
+    preloop_dump!("inline_phase");
+    // The regular simplify loop folds math libcalls at -O2+, but strict
+    // -frounding-math/-ftrapping-math functions bypass that transform.  The
+    // dedicated fold knows which sign-bit-only operations remain legal under
+    // a strict FP environment and is also the lowering authority for compiler
+    // runtime helpers such as __fabstf2 that LCCC deliberately does not link.
+    simplify::guard_errno_sqrt_calls(module);
+    simplify::fold_math_intrinsic_calls(module);
+    preloop_dump!("math_intrinsic_fold");
+    if !pass_disabled(&disabled, "fortifyfold") {
+        fortify_fold::run(module, target.is_32bit());
+        preloop_dump!("fortify_fold");
+    }
+    // Fold strlen("literal") after inlining so __builtin_constant_p patterns
+    // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
+    // disappears.
+    constant_fold::fold_string_library_calls(module);
+    constant_fold::resolve_remaining_is_constant(module);
+    // A library `memcpy` of small constant length gets the native Memcpy
+    // the `__builtin_` spelling already lowers to (see the pass doc); again
+    // after the post-inline fold below, which makes more lengths literal.
+    if !pass_disabled(&disabled, "libmemcpy") {
+        builtin_policy::canonicalize_library_memcpy(
+            module,
+            builtin_policy::library_memcpy_inline_max(
+                target,
+                loop_idiom_capabilities.i686_sse,
+                opt_level >= 4,
+            ),
+        );
+        preloop_dump!("libmemcpy");
+    }
+
+    // Switch case outlining: extract case bodies from large switch statements
+    // (like SQLite's VdbeExec with 170+ cases) into separate functions.
+    // OPT-IN ONLY (CCC_OUTLINE_SWITCH=1): the pass miscompiles dispatch
+    // loops whose cursor lives in a caller-saved register (see the header
+    // comment in outline_switch.rs). Previously the pass ran on every
+    // compile with an unreachable threshold (999999), paying a full module
+    // walk for guaranteed no-ops; now the walk is skipped entirely unless
+    // explicitly requested for experiments.
+    if std::env::var("CCC_OUTLINE_SWITCH").is_ok() && !pass_disabled(&disabled, "outline") {
+        outline_switch::run(module);
+    }
+    preloop_dump!("outline");
+
+    // Tail-call-to-loop transformation.
+    // Converts self-recursive tail calls into back-edge branches before the
+    // main optimization loop so that LICM, IVSR, and GVN can optimize the
+    // resulting loops (e.g., hoist invariants, reduce induction variables).
+    if !pass_disabled(&disabled, "tce") {
+        module.for_each_function(tail_call_elim::tail_calls_to_loops);
+    }
+    // Collapse the canonical accumulator-sum loop after TCE. This is a
+    // semantics-preserving closed form for the strict int/long recurrence and
+    // removes O(n) work without touching arbitrary loops.
+    if !pass_disabled(&disabled, "tail_sum_formula") {
+        module.for_each_function(tail_call_elim::closed_form_tail_sum);
+    }
+    preloop_dump!("tce");
+
+    // Binary recursion → iterative accumulator (e.g., Fibonacci).
+    // Runs after TCE so it catches patterns TCE can't handle (non-tail binary recursion).
+    if !pass_disabled(&disabled, "rec2iter") {
+        module.for_each_function(recursion_to_iter::recursion_to_iteration);
+    }
+    preloop_dump!("rec2iter");
+
+    // Accumulator recursion elimination (`return 1 + f(l) + f(r)`): after
+    // rec2iter, whose closed loop for `f(n - 1) + f(n - 2)` is better.
+    if !pass_disabled(&disabled, "tce_acc") {
+        module.for_each_function(tail_call_elim::accumulator_calls_to_loops);
+    }
+    preloop_dump!("tce_acc");
+
+    // Bounded recursive self-inlining (see `inline::self_recursion`): after
+    // the recursion-to-loop rewrites, so it copies what recursion is left.
+    if allow_inline && !pass_disabled(&disabled, "self_inline") {
+        inline::inline_self_recursion(module);
+    }
+    preloop_dump!("self_inline");
+
+    // Cost the compact form of byte-decoding accessors, not their expanded
+    // shifts/ORs. Reuse the existing legality proof before the already-bounded
+    // second inliner; do not raise any inline threshold. Limit this extra walk
+    // to straight-line private helpers on the i686 target. Size
+    // profiles retain their existing scheduling and inlining decisions.
+    if !optimize_for_size
+        && target == crate::backend::Target::I686
+        && !pass_disabled(&disabled, "byte_load")
+        && !pass_disabled(&disabled, "postinline")
+    {
+        module.for_each_function(|func| {
+            if !func.is_static || func.blocks.len() != 1 {
+                return 0;
+            }
+            // Do not DCE parameter homes here: the second inliner still
+            // uses those ABI bridges for surviving ParamRef instructions.
+            // The fold itself removes its consumed chain; normal cleanup
+            // after inlining removes any remaining dead copies/addresses.
+            byte_load::run_function(func, target)
+        });
+        preloop_dump!("byte-accessors-before-inline");
+    }
+
+    // Post-structural inlining: TCE and recursion-to-iteration can turn a
+    // previously recursive static helper into a small, ordinary loop. A second
+    // bounded inlining pass exposes constant call arguments and lets the scalar
+    // cleanup pipeline fold the caller (e.g. tce_sum's sum(10_000_000, 0)).
+    // This is intentionally after the recursion transforms: doing it before
+    // them would either reject the recursive callee or clone the call tree.
+    //
+    // Preserve the size profile here.  The primary inline phase deliberately
+    // uses the size-aware policy at -Os/-Oz, so running the unrestricted
+    // inliner unconditionally in this later phase defeats that decision and
+    // can clone medium helpers at every call site after the first cleanup.
+    // "inline" gates the LATE phase too: the pass name is the A/B kill
+    // switch for inlining as a whole, and a late phase that re-inlines
+    // everything the disabled primary phase skipped made
+    // CCC_DISABLE_PASSES=inline a silent no-op for the final binary.
+    if !pass_disabled(&disabled, "postinline") && !pass_disabled(&disabled, "inline") {
+        if optimize_for_size {
+            inline::run_size_optimized(module);
+        } else {
+            inline::run(module);
+        }
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        constant_fold::run(module);
+        copy_prop::run(module);
+        if !pass_disabled(&disabled, "libmemcpy") {
+            builtin_policy::canonicalize_library_memcpy(
+                module,
+                builtin_policy::library_memcpy_inline_max(
+                    target,
+                    loop_idiom_capabilities.i686_sse,
+                    opt_level >= 4,
+                ),
+            );
+        }
+        simplify::run(module);
+        module.for_each_function(cfg_simplify::run_function);
+        module.for_each_function(dce::eliminate_dead_code);
+        copy_prop::forward_memcpy_chains(module);
+        copy_prop::forward_large_memcpy_loads(module);
+    }
+    // Aggregate SROA: replace struct/array Memcpy copies with scalar field
+    // accesses so the surrounding mem2reg can promote the fields to SSA
+    // (by-value struct args/returns and struct assignment after the final
+    // inlining). Covers the cases the narrower memcpy forwards miss: copies
+    // below the 128-byte large-copy threshold, sources that are GEPs into a
+    // local alloca, and the copy-out write path.
+    //
+    // Enabled by default. It was previously opt-in because the IR it produced
+    // violated SSA def-before-use -- the planner's insert and remove indices
+    // both referenced the ORIGINAL instruction list, but removals were applied
+    // first, so every later insert landed one slot too late and a fresh
+    // GetElementPtr ended up AFTER the Load consuming it. The backend then
+    // faithfully emitted `movsd (%r11),%xmm5` before `leaq 8(%rdx),%r11` and
+    // struct_copy segfaulted. That was misattributed to a backend scheduling
+    // defect; the backend is innocent. Edits are now applied in a single
+    // index-stable rebuild per block. Two further soundness holes are fixed:
+    // the escape scan is an allowlist (Intrinsic operands used to be invisible,
+    // which deleted live SIMD copies), and dead aggregate allocas are dropped
+    // only after re-checking the final instruction stream.
+    if std::env::var("CCC_DISABLE_AGGREGATE_SROA").is_err() {
+        // Constant-fold AND copy-propagate before the split, mirroring the
+        // post-unroll sequence: SROA only models GEPs whose offset OPERAND
+        // is a literal constant, so folded `Copy Const` defs must also be
+        // substituted into the uses before the split sees them.
+        constant_fold::run(module);
+        copy_prop::run(module);
+        aggregate_sroa::run(module);
+        // The pass rewrites pointers in place, replaces values, deletes
+        // instructions and appends block-relative inserts, all in one plan
+        // applied against one snapshot. Charge it with its own verification
+        // point: nothing downstream should be the first thing to notice a
+        // malformed rebuild (`CCC_VERIFY_IR=abort`).
+        verify::verify_after_pass(module, "aggregate_sroa");
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        copy_prop::run(module);
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+    preloop_dump!("post-structural-inline");
+
+    // Second GlobalAddr CSE: post-structural inlining can clone callers and
+    // re-duplicate address materializations after the pre-GVN run.
+    // Pass name for CCC_DISABLE_PASSES: "gaddrcse".
+    if !pass_disabled(&disabled, "gaddrcse") {
+        global_addr_cse::run_module(module);
+        if !pass_disabled(&disabled, "dce") {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+    }
+
+    let iterations = 3;
+    let num_funcs = module.functions.len();
+    let mut dirty = vec![true; num_funcs];
+    let dis = DisabledPasses::from_env(&disabled);
+
+    // `changed` accumulates which functions were modified during each iteration.
+    let mut changed = vec![false; num_funcs];
+
+    // Per-pass change counts from the previous iteration, used for skip decisions.
+    // Pass indices: 0=cfg1, 1=copyprop1, 2=narrow, 3=simplify, 4=constfold,
+    //               5=gvn, 6=licm, 7=ifconv, 8=copyprop2, 9=dce, 10=cfg2
+    const NUM_PASSES: usize = 11;
+    let mut prev_pass_changes = [usize::MAX; NUM_PASSES]; // MAX = "assume changed" for iter 0
+    let mut prev_purity_changes = 1usize;
+
+    // Track first iteration's total changes for diminishing-returns early exit.
+    let mut iter0_total_changes = 0usize;
+
+    for iter in 0..iterations {
+        let mut total_changes = 0usize;
+        let mut total_changes_excl_dce = 0usize; // Exclude DCE for diminishing-returns check
+        let mut cur_pass_changes = [0usize; NUM_PASSES];
+
+        // Clear the changed accumulator for this iteration
+        changed.iter_mut().for_each(|c| *c = false);
+
+        macro_rules! timed_pass {
+            ($name:expr_2021, $body:expr_2021) => {{
+                if time_passes {
+                    let t0 = std::time::Instant::now();
+                    let n = $body;
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[PASS] iter={} {}: {:.4}s ({} changes)",
+                        iter, $name, elapsed, n
+                    );
+                    if dump_each_pass {
+                        dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
+                    }
+                    verify::verify_after_pass(module, $name);
+                    n
+                } else {
+                    let n = $body;
+                    if dump_each_pass {
+                        dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
+                    }
+                    verify::verify_after_pass(module, $name);
+                    n
+                }
+            }};
+        }
+
+        // Helper: check if a pass should run based on upstream pass changes.
+        // A pass runs if it or any of its upstream passes made changes last iteration.
+        // On iteration 0, all passes run (prev_pass_changes are MAX).
+        //
+        // Pass dependency graph (which passes create opportunities for which):
+        //   cfg_simplify → copy_prop, gvn, dce (simpler CFG)
+        //   copy_prop → simplify, constfold, gvn, narrow (propagated values)
+        //   narrow → simplify, constfold (smaller types)
+        //   simplify → constfold, copy_prop, gvn (reduced expressions, folded casts to copies)
+        //   constfold → cfg_simplify, copy_prop, dce (constant branches/dead code, folded exprs to copies)
+        //   gvn → copy_prop, dce (eliminated redundant computations)
+        //   licm → copy_prop, dce (hoisted code)
+        //   if_convert → copy_prop, dce (eliminated branches)
+        //   dce → cfg_simplify (empty blocks)
+        macro_rules! should_run {
+            ($self_idx:expr_2021, $($upstream:expr_2021),*) => {{
+                prev_pass_changes[$self_idx] > 0 $(|| prev_pass_changes[$upstream] > 0)*
+            }};
+        }
+
+        // Phase 1: CFG simplification
+        // Upstream: constfold (constant branches), dce (empty blocks)
+        if !dis.cfg && should_run!(0, 4, 9) {
+            let n = timed_pass!(
+                "cfg_simplify1",
+                run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function)
+            );
+            cur_pass_changes[0] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2: Copy propagation
+        // Upstream: cfg_simplify (simpler CFG), gvn (eliminated exprs), licm (hoisted code), if_convert
+        if !dis.copyprop && should_run!(1, 0, 5, 6, 7) {
+            let n = timed_pass!(
+                "copy_prop1",
+                run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies)
+            );
+            cur_pass_changes[1] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Observe quotient/remainder consumers before materializing magic
+        // multipliers. The same bit_idioms disable policy covers both entries.
+        if !pass_disabled(&disabled, "bit_idioms") {
+            let n = timed_pass!(
+                "bit_observations_pre_div",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    bit_idioms::observe_before_division
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2a: Division-by-constant strength reduction.
+        // Replaces slow div/idiv instructions with fast multiply-and-shift sequences.
+        // Run early so subsequent passes (narrowing, simplify, constant folding, DCE)
+        // can optimize the expanded instruction sequences. It runs on EVERY
+        // iteration (dirty functions only): the loop transforms later in this
+        // iteration create constant divisions of their own -- the vectorizer's
+        // signed trip bound `limit /s 8` reached the backend as
+        // `movl $8, %ecx; idivl %ecx` in every vectorized `int n` reduction
+        // (p15..p18 in simd_fp_oracle.c, 20-90 cycles at each loop entry).
+        // The rewrite only touches Div/Rem by a constant, so a rerun is a
+        // no-op scan once none is left; the next iteration's simplify, cvp
+        // and constfold still clean up the expansion.
+        //
+        // Disabled on i686: the pass generates I64 multiply + shift-right-32 sequences
+        // to extract the high 32 bits of a widened multiplication. The i686 backend
+        // cannot execute 64-bit arithmetic correctly (it truncates to 32 bits), so these
+        // sequences produce wrong results. Fall back to hardware idiv/div instead.
+        // TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement
+        // a 32-bit-aware variant that uses single-operand imull for mulhi.
+        if !pass_disabled(&disabled, "divconst") && !target.is_32bit() {
+            let n = timed_pass!(
+                "div_by_const",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    div_by_const::div_by_const_function
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-arx: lane-parallel ARX vectorization (ChaCha20/Salsa
+        // quarter-round packing) — x86-64, -O2+, iter 0, BEFORE any
+        // unrolling so the round loop is still rolled when the transform
+        // fires (the rolled vector body is the ICX-beating shape: one
+        // ~46-instruction body executed `trip` times). The unrollers
+        // refuse loops containing the ARX marker intrinsics, keeping the
+        // shape intact through every later unroll phase.
+        // Pass name for CCC_DISABLE_PASSES: "vec_arx".
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "vec_arx")
+        {
+            let n = timed_pass!(
+                "vec_arx",
+                run_on_visited(module, &dirty, &mut changed, |f| {
+                    let feats = f.target_features.clone();
+                    with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                        vec_arx::vec_arx_function(f)
+                    })
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Put proven finite unsigned affine guards in IV-vs-bound form before
+        // the unroller/vectorizer make their decisions. Unlike signed affine
+        // folding this proves both IV and sum nonwrapping through the final
+        // exit observation, so -fwrapv does not weaken its contract.
+        if loop_bound::scheduled(iter, opt_level, optimize_for_size, target, &disabled) {
+            let n = timed_pass!(
+                "loop_bound",
+                run_on_visited(module, &dirty, &mut changed, loop_bound::run)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-pre: pre-unroll CONST-TRIP map vectorization. The complete
+        // unroller below runs BEFORE the Phase 2b-vec vectorizer and steals
+        // every constant-trip elementwise loop (limit <= 16), leaving 16
+        // scalar copies where ONE packed op per iteration is strictly better
+        // (4x lanes, 1/4 the memory ops). This focused entry takes exactly
+        // the map-shaped const-trip 5..=16 loops FIRST (the map transform
+        // itself declines trips <= the vector width); the unroller then
+        // either unrolls the remaining vector iterations (trip <= 4 — the
+        // ideal no-branch shape) or leaves them rolled.
+        // Pass name for CCC_DISABLE_PASSES: "vectorize".
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && !dis.unroll
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "vectorize")
+        {
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+            let n = timed_pass!(
+                "vectorize_const_trip_maps",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    |f: &mut crate::ir::reexports::IrFunction| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            vectorize::vectorize_const_trip_map_loops(
+                                f,
+                                fp_contract,
+                                no_map_vec,
+                                &symbol_facts,
+                            )
+                        })
+                    }
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // The strided-I32 reducer (AVX2 or SSE2) needs the original IV step and
+        // guard-safe scalar remainder. Give that narrowly-scoped matcher first
+        // refusal before early scalar unrolling rewrites the IV increment.
+        // All other loops are unchanged and continue through the unroller.
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && !dis.unroll
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "vectorize")
+        {
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+            let n = timed_pass!(
+                "vectorize_strided_reduce_pre_unroll",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    |f: &mut crate::ir::reexports::IrFunction| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            vectorize::vectorize_strided_i32_reductions_before_unroll(
+                                f,
+                                &symbol_facts,
+                            )
+                        })
+                    }
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
+        // subsequent passes can optimize the unrolled copies.
+        // Pass name for CCC_DISABLE_PASSES: "unroll"
+        //
+        // Loop rotation runs AFTER vectorize+post-unroll+gaddr-cse (see the
+        // block below). Running it before vectorize corrupted the
+        // vectorizer's base-dependence analysis on the rotated self-loop
+        // form (vectorize_iv_dependent_base SIGSEGV, simd_vecreg miscode).
+        // Vector bodies contain Vec* intrinsics which `is_cloneable_pure`
+        // rejects, so rotation bails on vectorized loops and only fires on
+        // the residual scalar counted loops the vectorizer left alone.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size && !dis.unroll {
+            let n = timed_pass!(
+                "loop_unroll",
+                run_on_visited(module, &dirty, &mut changed, |f| {
+                    loop_unroll::unroll_loops(f, loop_unroll::UnrollPhase::Early)
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+            if n > 0 && std::env::var("CCC_DISABLE_AGGREGATE_SROA").is_err() {
+                // Constant-fold AND copy-propagate BEFORE the split: the
+                // unroller substitutes the IV with literals, leaving
+                // `Cast(Const)`/`Shl(Const, Const)` chains whose defs fold
+                // to `Copy Const` — but the GEP offsets still NAME those
+                // values until copy-propagation substitutes the constants
+                // into the operands, and aggregate SROA only models GEPs
+                // whose offset operand is a LITERAL constant. Fold →
+                // copyprop → split turns every cloned access into
+                // `GEP base, Const(k)`; the old order (split first) left
+                // chacha20's `u32 x[16]` unsplit, so the whole ARX state
+                // lived in stack slots at the backend (10x vs GCC).
+                constant_fold::run(module);
+                copy_prop::run(module);
+                aggregate_sroa::run(module);
+                verify::verify_after_pass(module, "aggregate_sroa");
+                crate::ir::mem2reg::promote_allocas_with_params(module);
+                copy_prop::run(module);
+                module.for_each_function(dce::eliminate_dead_code);
+            }
+        }
+
+        // Phase 2b-idiom: loop-idiom recognition — iter 0 only, immediately
+        // before vectorize. Byte-copy loops become one `memcpy` libcall
+        // instead of versioned-vectorize + runtime check + scalar
+        // remainder; everything unmatched still flows to the vectorizer.
+        // All targets, -O2+ including -Os/-Oz. Default-on; the original
+        // loop remains as the fallback when pointer overlap is possible.
+        // Pass name for CCC_DISABLE_PASSES: "loop_idiom"
+        if iter == 0 && opt_level >= 2 && !pass_disabled(&disabled, "loop_idiom") {
+            // Shared module facts keep aliases, assembler labels, weak
+            // definitions, and opaque top-level assembly out of disjointness
+            // proofs. Other memory transforms use this same contract.
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+            let n = timed_pass!(
+                "loop_idiom",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    loop_idiom::run_function(func, &symbol_facts, loop_idiom_capabilities)
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+            if n > 0 {
+                crate::passes::verify::verify_after_pass(module, "loop_idiom");
+            }
+        }
+
+        // Phase 2b-pre-vec: constant-argument propagation BEFORE iteration 0's
+        // vectorizer and post-vectorize unroller.
+        //
+        // IPCP's own slot is at the END of every iteration (Phase 10.5), which
+        // is the right place for call-site simplification but the wrong place
+        // for a callee whose trip count only becomes constant once its `n`
+        // parameter is specialized: `static float sum(const float *v, int n)`
+        // called once with 65536 stays a dynamic-trip loop for the whole
+        // iteration-0 unroller, and by the next iteration `loop_rotate` has
+        // already turned it into the rotated self-loop form that no unroller
+        // accepts.  The unrollers therefore never see the constant trip at
+        // all, and such callees keep one element per branch while the
+        // reference compilers unroll them 4x.  callgrind on
+        // `reduction_vecreg` (the corpus' worst row): 3,277,948,036 insns,
+        // ratio 1.905 against GCC 16.2; with this ordering fix 1,803,403,033,
+        // ratio 1.048 — 1.47e9 instructions, and no other benchmark in the
+        // 86-program corpus moves by even 1% except where it also improved
+        // (libm_round_family -143M, spectral_norm -121M, global_addr_pressure
+        // -1.7M, loop_patterns -0.25M).
+        //
+        // Placement is load-bearing: running it before the Early unroller
+        // instead perturbs shapes that two codegen contracts depend on (their
+        // small constant-trip fixtures then unroll completely and lose the
+        // hoisted store / indexed segment operand the gates count).  After the
+        // Early unroller the reduction unroll still fires — it is the
+        // POST-vectorize phase that needs the constant trip — and those shapes
+        // are untouched.
+        //
+        // The call is idempotent and the late one stays, so nothing that
+        // depends on end-of-iteration IPCP changes shape; only iteration 0's
+        // loop transforms see the specialized body.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size && !dis.ipcp {
+            let n = timed_pass!("ipcp_early", ipcp::run(module));
+            if n > 0 {
+                changed.iter_mut().for_each(|c| *c = true);
+            }
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.
+        // Run before GVN/LICM/etc to catch IR in simpler state.
+        // Phase 2b-affold-pre: the affine exit-compare fold, once more right
+        // before the vectorizer.  Every vectorizer arm requires the IV itself
+        // on the left of the exit compare, so the unfolded `iv + C < N` of
+        // `for (i = 0; i + C < N; i++)` kept those loops scalar: the regular
+        // affold run sits after rotation (below), i.e. after the vectorizer.
+        // The fold is a value equivalence with its own domain certificate
+        // (constant seed and step, type bounds), so running it earlier needs
+        // nothing the later passes provide; the later run folds what the
+        // early run could not see (the compares rotation clones, loops the
+        // vectorizer refused).  `affold` kills both runs; `affold_prevec`
+        // only this one (the gates use it to keep the late clone fold's own
+        // mechanism under test: on their corpora the early run otherwise
+        // folds every loop before rotation clones it).
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && matches!(
+                target,
+                crate::backend::Target::X86_64 | crate::backend::Target::Aarch64
+            )
+            && !pass_disabled(&disabled, "affold")
+            && !pass_disabled(&disabled, "affold_prevec")
+            && !pass_disabled(&disabled, "vectorize")
+        {
+            let n = timed_pass!(
+                "affold_prevec",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    loop_rotate::fold_affine_exit_compares
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // The vectorizer currently emits Vec* intrinsics backed by XMM/YMM
+        // registers. Other backends deliberately reject those intrinsics, so
+        // running this pass for them turns ordinary scalar loops into a compiler
+        // panic instead of preserving the valid scalar program.
+        // Pass name for CCC_DISABLE_PASSES: "vectorize"
+        // Vectorize: x86-64 gets the full SSE/AVX-shaped pass; AArch64 gets
+        // the 128-bit (2-wide F64 / 4-wide I32) NEON variant. -Os/-Oz skip
+        // vectorization entirely (code size).
+        if iter == 0
+            && !optimize_for_size
+            && matches!(
+                target,
+                crate::backend::Target::X86_64 | crate::backend::Target::Aarch64
+            )
+            && !pass_disabled(&disabled, "vectorize")
+        {
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+            let n = timed_pass!(
+                "vectorize",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    let feats = func.target_features.clone();
+                    with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |fn_isa| {
+                        let mode =
+                            vectorize_entry(target, fp_reassoc, fp_contract, x86_avx || fn_isa.avx);
+                        vectorize::vectorize_function_with_symbol_facts(func, &symbol_facts, mode)
+                    })
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+            // Vector-reduction accumulator interleaving (x86-64 only): split
+            // each latency-bound single-accumulator reduction loop the
+            // vectorizer produced into IF independent chains feeding a
+            // displacement-folded main loop, with the original loop kept
+            // verbatim as the epilogue (ICX's vfmadd231pd YMM accumulator
+            // style, Rule 15).  Runs BEFORE vec_load_sink so the sink's
+            // single-use load relocation sees the interleaved, folded order.
+            // AArch64 is deliberately excluded: its vector-load emitter reads
+            // args[0..2] only and would silently drop a folded displacement
+            // argument.
+            // Pass name for CCC_DISABLE_PASSES: "vec_interleave"
+            if target == crate::backend::Target::X86_64
+                && !pass_disabled(&disabled, "vec_interleave")
+            {
+                let n = timed_pass!(
+                    "vec_interleave",
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            vec_interleave::run(f, fp_reassoc)
+                        })
+                    })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // ARX lane vectorization, phi-spelling form (PR #455 port with
+            // the integration audit's three CFG fixes): ChaCha20-style
+            // 16-word Add-Rotate-Xor permutation loops whose state lives
+            // in 16 SCALAR u32 phi-carried locals — the spelling the
+            // memory-form `vec_arx` pass (Phase 2b-arx, before promotion)
+            // deliberately declines.  The matcher PROVES the loop is
+            // exactly the generic double round (symbolic term comparison)
+            // before replacing it with the 4-lane SIMD form.  Runs after
+            // the map vectorizer: ARX loops have no memory traffic in the
+            // body, so the two passes are disjoint.
+            // Pass name for CCC_DISABLE_PASSES: "arx_vectorize"
+            if iter == 0
+                && opt_level >= 2
+                && !optimize_for_size
+                && matches!(target, crate::backend::Target::X86_64)
+                && !pass_disabled(&disabled, "arx_vectorize")
+            {
+                let n = timed_pass!(
+                    "arx_vectorize",
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            arx_vectorize::run(f)
+                        })
+                    })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // Single-use vector-load sinking (x86 only): place each stream
+            // load directly before its unique consumer so the emitter's
+            // VLFOLD window folds it as a memory operand instead of staging
+            // it through %ymm0 and a 32-byte spill slot (saxpy-shaped
+            // `y[i] = y[i] OP f(x[i])` bodies at -ffp-contract=off).  Runs
+            // before the post-vectorize unroll so every unrolled copy
+            // inherits the folded order.  Pure reordering of reads; a
+            // "changed" signal is not needed downstream.
+            // Pass name for CCC_DISABLE_PASSES: "vec_load_sink"
+            if target == crate::backend::Target::X86_64
+                && !pass_disabled(&disabled, "vec_load_sink")
+            {
+                let mut scratch = vec![false; module.functions.len()];
+                timed_pass!(
+                    "vec_load_sink",
+                    run_on_visited(
+                        module,
+                        &dirty,
+                        &mut scratch,
+                        vec_load_sink::sink_vector_loads
+                    )
+                );
+            }
+
+            // Post-vectorize unroll: the matmul/map vector body is often a
+            // single intrinsic — unrolling it 2–4× exposes independent FMA
+            // chains (GCC's multi-accum style) without growing scalar code.
+            // The PostVec phase also unlocks the guard-free two-block partial
+            // unroll (see `UnrollPhase`): loops the vectorizer declined are
+            // exactly its feedstock, and the k concatenated bodies in one
+            // block feed the BB-SLP packer right below.
+            if !dis.unroll {
+                let n = timed_pass!(
+                    "loop_unroll_post_vec",
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        loop_unroll::unroll_loops(f, loop_unroll::UnrollPhase::PostVec)
+                    })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // Post-vectorize DCE. The vectorizer can bail out of a loop
+            // AFTER hoisting setup intrinsics into the preheader (a map
+            // loop over a global array left two dead VecBroadcastF64x4
+            // defs); no DCE ran again before codegen, and the x86
+            // intrinsic emitter ICEs storing a vector value that never
+            // received a register or slot home ("value 36 has no
+            // register, stack slot, Copy, or GlobalAddr definition" on
+            // `for (i...) gd[i] = gd[i]*k + c;` with a global `gd`).
+            // Pure intrinsics with an unused dest are DCE-eligible, so
+            // one sweep here removes every orphaned setup def regardless
+            // of which bailout path produced it.
+            module.for_each_function(dce::eliminate_dead_code);
+
+            // Phase 2c-slp: basic-block SLP vectorization — x86-64 only,
+            // -O2+, iter 0. Runs AFTER the post-vectorize unroll (unrolled
+            // bodies are the feedstock: 2-8 isomorphic stores per block)
+            // and its DCE (orphaned GEPs/lanes must not confuse the seed
+            // collector). Seeded from consecutive-address store runs; see
+            // passes/slp_vectorizer.rs for the legality and cost design.
+            // Pass name for CCC_DISABLE_PASSES: "slp"; kill switch
+            // CCC_NO_BB_SLP.
+            if iter == 0
+                && opt_level >= 2
+                && !optimize_for_size
+                && matches!(target, crate::backend::Target::X86_64)
+                && !pass_disabled(&disabled, "slp")
+            {
+                let n = timed_pass!(
+                    "slp",
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                        })
+                    })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+                if n > 0 {
+                    verify::verify_after_pass(module, "slp");
+                }
+            }
+        }
+
+        // Volatile reductions cannot vectorize their accesses. Split only
+        // tiny unsigned invariant-address reductions into independent scalar
+        // chains, after vectorization and before rotation obscures the phis.
+        if iter == 0
+            && opt_level >= 3
+            && !optimize_for_size
+            && target == crate::backend::Target::X86_64
+            && !dis.unroll
+            && !pass_disabled(&disabled, "volatile_reduce")
+            && volatile_reduction_enabled()
+        {
+            let costly_tls = volatile_reduce::costly_tls_symbols(
+                module,
+                crate::common::tls::TlsPolicy {
+                    shlib: pic,
+                    floor: tls_floor,
+                },
+            );
+            let enforce_block_budget =
+                std::env::var("CCC_VOLATILE_REDUCE_BUDGET").as_deref() != Ok("0");
+            let n = timed_pass!(
+                "volatile_reduce",
+                run_on_visited(module, &dirty, &mut changed, |f| volatile_reduce::run(
+                    f,
+                    &costly_tls,
+                    enforce_block_budget
+                ))
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Unroll/vectorize can clone loop bodies that still contained
+        // GlobalAddr. Re-CSE is O(n) and idempotent once addresses live in entry.
+        if iter == 0 && !pass_disabled(&disabled, "gaddrcse") {
+            let n = timed_pass!(
+                "global_addr_cse_post_unroll",
+                global_addr_cse::run_module(module)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-ivw: Induction-variable widening — iter 0, BEFORE
+        // loop_rotate (so loops are still in guard-at-top form: preheader
+        // + header + latch, the shape the pass's phi candidacy expects).
+        // Also AFTER vectorize+unroll (vectorizer-managed loops keep
+        // their own I32 IVs and are not touched here; the residual scalar
+        // counted loops the vectorizer left alone are the widening
+        // candidates). Widens I32/U32 IVs whose only 64-bit use is
+        // addressing (a Cast I32→I64 that feeds a GEP offset) to I64,
+        // eliminating the per-iteration `movslq` the x86 backend must
+        // emit after every 32-bit `addl` (the upper 32 bits are clobbered
+        // and the next GEP use would read garbage without re-extension).
+        // Gated by `CCC_NO_IV_WIDEN`. -O2+, not -Os/-Oz.
+        // The widening analyzer selects UB-based or explicit range proofs
+        // according to the TU's signed-wrapping contract.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size {
+            let n = timed_pass!(
+                "iv_widen",
+                run_on_visited(module, &dirty, &mut changed, iv_widen::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Loop-carried store-to-load forwarding — iter 0, AFTER iv_widen
+        // (the `int i` address chains are now pointer-width affine forms)
+        // and BEFORE loop rotation / IVSR (guard-at-top preheader+header+
+        // latch shape, plain `GEP(base, i<<k)` addresses). Turns
+        // `a[i] = f(a[i-1])` into a register recurrence: removes the load
+        // and the L1D store-forwarding round trip from the loop's critical
+        // path (tls_seg_access 2.19× → parity with GCC's tree-predcom).
+        // Kill switch `CCC_NO_LOOP_CARRIED_FWD`. -O2+.
+        if iter == 0 && opt_level >= 2 && !pass_disabled(&disabled, "loop_carried_forward") {
+            let n = timed_pass!(
+                "loop_carried_forward",
+                loop_carried_forward::run_module(module)
+            );
+            if n > 0 {
+                for c in changed.iter_mut() {
+                    *c = true;
+                }
+                verify::verify_after_pass(module, "loop_carried_forward");
+            }
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Predictive commoning of an existing floating-point square. Before
+        // rotation/copy propagation, while the recurrence is explicit SSA.
+        // Never speculate arithmetic on entry; x87 is deliberately excluded.
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && target == crate::backend::Target::X86_64
+            && x86_isa.simd
+            && !pass_disabled(&disabled, "loop_square")
+        {
+            let n = timed_pass!(
+                "loop_square",
+                run_on_visited(module, &dirty, &mut changed, loop_square::run)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+            // timed_pass! already performs the structural checkpoint; do not
+            // verify the same module twice when the recurrence changed.
+        }
+
+        // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
+        // widened phi flows through the rotated form and emits `addq`
+        // directly). Transforms "guard-at-top" loops into "test-at-bottom"
+        // self-loop form (one fewer branch per iteration in the hot path;
+        // the exit falls through). Every scalar counted loop the vectorizer
+        // left alone benefits. The transform is conservative (pure-SSA cond
+        // setup only, `is_cloneable_pure` rejects Vec* intrinsics so
+        // vectorized loops bail) and the exit-merge-phi reads the body's
+        // post-iteration value (latch incoming) on the test-exit edge.
+        // -O2+, not -Os/-Oz (cloned cond grows code size). Opt-in via
+        // `CCC_LOOP_ROTATE=1`; kill-switch `CCC_NO_LOOP_ROTATE` wins.
+        // Runs at iter 0 so the rotated form flows through
+        // GVN/LICM/if-convert/dce/cfg_simplify.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size {
+            let n = timed_pass!(
+                "loop_rotate",
+                run_on_visited(module, &dirty, &mut changed, loop_rotate::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-affold: the affine exit-compare fold — iter 0, immediately
+        // AFTER rotation so a rotated latch's cloned compare is folded too, and
+        // after iv_widen so the phi it reasons about is pointer-width where
+        // that mattered.  Unlike rotation this is DEFAULT-ON at -O2+ and on the
+        // size pipelines: it needs no CFG surgery (it is a value equivalence)
+        // and it is the only way the fold reaches the inner loop of a nest,
+        // which is where every filter kernel's hot loop lives.  Kill switch
+        // `CCC_NO_AFFINE_EXIT_FOLD`; report `CCC_DEBUG_AFFINE_FOLD`.
+        if iter == 0 && (opt_level >= 2 || optimize_for_size) && !pass_disabled(&disabled, "affold")
+        {
+            let n = timed_pass!(
+                "affold",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    loop_rotate::fold_affine_exit_compares
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2c: Integer narrowing
+        // Upstream: copy_prop (propagated values expose narrowing)
+        if !dis.narrow && should_run!(2, 1) {
+            let n = timed_pass!(
+                "narrow",
+                run_on_visited(module, &dirty, &mut changed, narrow::narrow_function)
+            );
+            cur_pass_changes[2] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+
+            // Phase 2c-slp-late: second basic-block SLP sweep, AFTER integer
+            // narrowing. C's integer promotion leaves sub-word lane math in
+            // the promoted width (`u16 * u16` is an I32 mul feeding a U16
+            // store); the narrow pass shrinks it to the store width, which
+            // is what the pack builder's strict lane-type match needs. The
+            // early sweep (Phase 2c-slp) still catches the f64/u64 chains
+            // before GVN reshapes them; this one catches byte/halfword ALU.
+            // Same gates as the early sweep.
+            if iter == 0
+                && n > 0
+                && opt_level >= 2
+                && !optimize_for_size
+                && matches!(target, crate::backend::Target::X86_64)
+                && !pass_disabled(&disabled, "slp")
+            {
+                let n = timed_pass!(
+                    "slp_late",
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                        })
+                    })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+                if n > 0 {
+                    verify::verify_after_pass(module, "slp_late");
+                }
+            }
+        }
+
+        // Phase 3: Algebraic simplification
+        // Upstream: copy_prop1/copy_prop2 (propagated values from GVN/constfold/if_convert),
+        //           narrow (smaller types), constfold (folded constant operands)
+        if !dis.simplify && should_run!(3, 1, 2, 4, 8) {
+            let n = timed_pass!(
+                "simplify",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    simplify::simplify_function(func)
+                })
+            );
+            cur_pass_changes[3] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+
+            // Sign-magnitude lowering: `x < 0 ? -x : x` and
+            // `a > b ? a - b : b - a` become the branch-free
+            // mask/XOR/subtract identity, which needs no compare and no
+            // conditional move.  Runs before if-conversion, so the frontend's
+            // own select is still visible, and after `simplify`, which may
+            // already have folded the arms.  Pass name for
+            // CCC_DISABLE_PASSES: "signmag".
+            if !pass_disabled(&disabled, "signmag") {
+                let n = timed_pass!(
+                    "signmag",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        sign_magnitude::run(func)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let max_rotate_bits = target_rotate_bits(target);
+            let min_rotate_bits = target_min_rotate_bits(target);
+            let native_bswap = target_native_bswap(target);
+            // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
+            // mux fold must defer to the backend's Not+And -> andn fusion
+            // when the 3-operand form is selectable (emit_and_not_impl).
+            // `has_scalar_andn` is the per-compilation snapshot resolved at
+            // the top of run_passes (same value as the post-ifconv call).
+            // The early placement must honor the same exact-token disable
+            // policy as the post-if-conversion placement.
+            let n = if pass_disabled(&disabled, "bit_idioms") {
+                0
+            } else {
+                timed_pass!(
+                    "bit_idioms",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        bit_idioms::recognize_function(
+                            func,
+                            enable_bit_reverse,
+                            max_rotate_bits,
+                            min_rotate_bits,
+                            has_scalar_andn,
+                            native_bswap,
+                        )
+                    })
+                )
+            };
+            cur_pass_changes[3] += n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+
+            // Byte-load reassembly: `p[0] | p[1] << 8 | ...` is an unaligned
+            // little-endian load spelled out, and GCC/Clang/ICX all fold it
+            // back (see the pass module docs for the measured gap). Placed
+            // right after bit_idioms, which must see the byte version of the
+            // chain (its `bswap` idiom is the big-endian twin) and never an
+            // already-widened one.
+            if !pass_disabled(&disabled, "byte_load") {
+                let n = timed_pass!(
+                    "byte_load",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        byte_load::run_function(func, target)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+
+            // Correlated value propagation: fold compares, selects and
+            // branches whose outcome is implied by dominating conditional
+            // edges (GCC evrp / LLVM CVP).  Runs after bit_idioms so the
+            // zero guards it materializes are folded on paths that already
+            // established non-zero.  Pass name for CCC_DISABLE_PASSES: "cvp".
+            if !pass_disabled(&disabled, "cvp") {
+                let defined_syms = cvp::defined_nonweak_symbols(module);
+                let n = timed_pass!(
+                    "cvp",
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        cvp::run_function_with_symbols(f, &defined_syms)
+                    })
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+        }
+
+        // Phase 3b: Loop-carried accumulator reassociation.
+        // `sum1 += b[i]; sum2 += sum1;` (unsigned) is reassociated into the
+        // closed form sum2' = sum2 + N*sum1 + Σ (N-i)*b[i], breaking the serial
+        // dependency between the two chains (ICC's Adler-32 rotation). Idempotent
+        // (the pattern no longer matches after the rewrite). Pass name for
+        // CCC_DISABLE_PASSES: "reassoc_accum".
+        if !pass_disabled(&disabled, "reassoc_accum") {
+            let n = timed_pass!(
+                "reassoc_accum",
+                run_on_visited(module, &dirty, &mut changed, reassoc_accum::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 4: Sparse conditional constant propagation, then constant folding
+        //
+        // SCCP runs first because it is the strictly stronger analysis: it
+        // discovers constants that only hold on the *reachable* paths, which
+        // `constant_fold` (a local, unconditional folder) cannot see. Feeding
+        // it first means the folder and the passes after it work on IR where
+        // dead arms are already gone and joins have collapsed.
+        //
+        // It emits `Copy { dest, Const }` at each proven definition, which is
+        // exactly the form `constant_fold` and `copy_prop` already consume, so
+        // the two compose without any new plumbing.
+        //
+        // Gated at -O2+ (including -Os/-Oz, where it is a size win: folded
+        // branches delete whole blocks). Kill switch: CCC_DISABLE_PASSES=sccp.
+        //
+        // Upstream: same producers as constfold — inlining and copy_prop turn
+        //           arguments into constants, if_convert creates Selects, and
+        //           cfg_simplify exposes newly single-predecessor joins.
+        if opt_level >= 2 && !pass_disabled(&disabled, "sccp") && should_run!(4, 0, 1, 2, 3, 7, 8) {
+            let n = timed_pass!(
+                "sccp",
+                run_on_visited(module, &dirty, &mut changed, sccp::run_function)
+            );
+            cur_pass_changes[4] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Upstream: copy_prop (propagated constants), narrow, simplify (reduced exprs),
+        //           if_convert (creates Select that constfold can fold with known-constant cond),
+        //           copy_prop2 (propagates constants into Select/Cmp operands after if_convert)
+        if !dis.constfold && should_run!(4, 1, 2, 3, 7, 8) {
+            let n = timed_pass!(
+                "constfold",
+                run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function)
+            );
+            cur_pass_changes[4] += n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 5-pre: dedicated loop preheaders (LOOP-PREHEADER-1).
+        //
+        // Runs immediately BEFORE the shared GVN/LICM/IVSR analysis, because
+        // that block computes one CFG snapshot and shares it across all three
+        // passes: inserting a block after the snapshot is taken would leave it
+        // describing a CFG that no longer exists.  Doing it here also means
+        // GVN and IVSR see the same shape LICM does.
+        //
+        // WHY IT EXISTS: LICM refuses to hoist a derived-pointer load (a
+        // parameter, a call result, a GEP chain — anything that can fault)
+        // unless the loop's preheader is dedicated, because hoisting one into a
+        // preheader that also branches elsewhere dereferences on paths that
+        // never entered the loop (the SQLite jsonCacheSearch NULL segfault).
+        // That gate is correct — but LCCC never CREATED a dedicated preheader,
+        // and the frontend lowers a counted loop with the guard's conditional
+        // branch as the loop's only outside edge.  A preheader with two
+        // successors is never dedicated, so the gate refused essentially every
+        // invariant load in the corpus:
+        //
+        //     for (i = 0; i < n; i++) t += c[0];   // `addl (%rdi), %edx`
+        //                                          // reloaded every iteration
+        //
+        // Splicing an empty block onto that edge makes the preheader
+        // dedicated.  The new block runs exactly when the loop is entered, and
+        // LICM additionally requires the hoisted load's original block to
+        // dominate every loop block, so nothing executes on a path that never
+        // entered the loop.
+        //
+        // -O2+ only (an -Os build would rather reload).  Kill switches:
+        // `CCC_DISABLE_PASSES=loop_preheader`.
+        if opt_level >= 2 && !optimize_for_size && loop_preheader::enabled(&disabled) {
+            let n = timed_pass!(
+                "loop_preheader",
+                run_on_visited(module, &dirty, &mut changed, loop_preheader::run_function)
+            );
+            if n > 0 {
+                verify::verify_after_pass(module, "loop_preheader");
+                for c in changed.iter_mut() {
+                    *c = true;
+                }
+            }
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "address_form") {
+            let n = timed_pass!(
+                "address_form",
+                run_on_visited(module, &dirty, &mut changed, address_form::run)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phases 5-6a: GVN + LICM + IVSR with shared CFG analysis.
+        //
+        // These three passes all need CFG + dominator + loop analysis. Since GVN
+        // does not modify the CFG (it only replaces instruction operands within
+        // existing blocks), the analysis computed for GVN remains valid for LICM
+        // and IVSR. We compute it once per function and share it across all three.
+        {
+            // GVN is enabled; CCC_DISABLE_PASSES=gvn is the diagnostic kill switch.
+            let gvn_enabled = true;
+            let run_gvn =
+                gvn_enabled && !dis.gvn && (should_run!(5, 0, 1, 3, 6) || prev_purity_changes > 0);
+            let run_licm = !dis.licm && (should_run!(6, 0, 1, 5) || prev_purity_changes > 0);
+            let run_ivsr = iter == 0
+                && std::env::var("CCC_NO_IVSR").is_err()
+                && !pass_disabled(&disabled, "ivsr");
+            // Scalar derived-IV flavor (iv*C without a GEP → secondary
+            // recurrence): OPT-IN via CCC_IVSR_SCALAR_DERIVED=1.  Measured
+            // (2026-09-23) as a net runtime loss on this backend while the
+            // latch phi-web parking exists — the 5-golden-workload codegen
+            // regressions it caused were the PR #602 CI RED.  The full data
+            // lives in the scalar section's comment in iv_strength_reduce.rs;
+            // revisit after the Unit-4 allocator work.
+            let run_ivsr_scalar = ivsr_scalar_derived_enabled(run_ivsr);
+            // IVSR-PTRADD-1: the address-forming-Add scan is ON by default and
+            // read HERE, once, rather than inside the pass — see the env-read
+            // ratchet in tests/regression/check_env_test_hygiene.sh.
+            let run_ivsr_ptr_add = run_ivsr && std::env::var_os("CCC_NO_IVSR_PTR_ADD").is_none();
+            // The x86 SIB cost rule inside IVSR is a TARGET property (scaled-
+            // index addressing is free on x86, absent on RISC-V / limited on
+            // AArch64); on other targets it reshaped constant usage enough to
+            // flip RA/GLA decisions (double_reduction riscv64 +14 insns, the
+            // RA-GLA-03 cascade). x86 keeps the measured stencil5/CTZ wins.
+            let ivsr_x86_sib_cost = matches!(
+                target,
+                crate::backend::Target::X86_64 | crate::backend::Target::I686
+            );
+            // Un-IVSR only pays off on targets with scaled-index addressing
+            // (x86-64 SIB). Gated for diagnostics like the other loop passes.
+            let run_univsr = run_ivsr
+                && matches!(target, crate::backend::Target::X86_64)
+                && std::env::var("CCC_NO_UNIVSR").is_err()
+                && !pass_disabled(&disabled, "univsr");
+            // Pointer-IV collapse is a scaled-index transformation for the
+            // same reason as univsr: it replaces per-array pointer increments
+            // with one SIB base+index operand, which only x86-64 has in that
+            // form.  It runs after univsr (see the pass comment) and only
+            // once, on the same iteration as IVSR: by then the induction
+            // shapes are canonical, and running it again after the pointer
+            // phis are gone is a no-op anyway.
+            // It follows the *canonical* CFG, not IVSR's first iteration: the
+            // pointer phis this pass needs appear only after mem2reg and the
+            // first simplify rounds have run, so it rides the same schedule
+            // as GVN and reaches its fixpoint in the second iteration.
+            let run_ptr_iv_collapse = (run_gvn || prev_purity_changes > 0)
+                && matches!(target, crate::backend::Target::X86_64)
+                && std::env::var("CCC_NO_PTR_IV_COLLAPSE").is_err()
+                && !pass_disabled(&disabled, "ptr_iv_collapse");
+
+            if run_gvn || run_licm || run_ivsr {
+                let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    run_gvn,
+                    run_licm,
+                    run_ivsr,
+                    run_ivsr_scalar,
+                    run_ivsr_ptr_add,
+                    ivsr_x86_sib_cost,
+                    run_univsr,
+                    run_ptr_iv_collapse,
+                    time_passes,
+                    iter,
+                );
+                cur_pass_changes[5] = gvn_n;
+                total_changes += gvn_n;
+                total_changes_excl_dce += gvn_n;
+                cur_pass_changes[6] = licm_n;
+                total_changes += licm_n;
+                total_changes_excl_dce += licm_n;
+                total_changes += ivsr_n;
+                total_changes_excl_dce += ivsr_n;
+            }
+        }
+
+        // Phase 7: If-conversion
+        // Upstream: cfg_simplify (simpler CFG), constfold (simplified conditions)
+        // -Os/-Oz: skip if-conversion. `cmov` is 4-6 bytes vs a 2-byte jcc +
+        // the skipped block, so branches are usually smaller (and often faster
+        // on the short branch path); GCC makes the same trade-off at -Os.
+        // if_convert also RUNS at -Os: measured on the kernel's real-mode
+        // number()/printf.c reproducer, -Os WITHOUT if-conversion is LARGER
+        // than -O2 WITH it (1156 vs 955 bytes i686 .text) -- the branchy
+        // select lowering produces two arms full of slot round-trips, which
+        // is strictly bigger than the setcc/cmov form. GCC if-converts at
+        // -Os for the same reason.
+        if !dis.ifconv && should_run!(7, 0, 4) {
+            // Forward redundant reloads first: removing a load from a
+            // conditional arm makes the arm side-effect-free so
+            // if-conversion can fire.
+            module.for_each_function(load_forward::run);
+            let forwarded = if !pass_disabled(&disabled, "join_store_forward") {
+                run_on_visited(module, &dirty, &mut changed, join_store_forward::run)
+            } else {
+                0
+            };
+            verify::verify_after_pass(module, "load_forward");
+            let n = timed_pass!(
+                "if_convert",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    if_convert::if_convert_function
+                )
+            );
+            cur_pass_changes[7] = n + forwarded;
+            total_changes += n + forwarded;
+            total_changes_excl_dce += n + forwarded;
+        }
+
+        // Re-run bit-idiom recognition after if-conversion. Portable trees such
+        // as Linux __ffs are initially CFG diamonds; only this placement sees
+        // the parallel value/count Select chains needed for Ctz recognition.
+        // The pass is idempotent and remains behind the normal disable switch.
+        if !pass_disabled(&disabled, "bit_idioms") {
+            let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let max_rotate_bits = target_rotate_bits(target);
+            let min_rotate_bits = target_min_rotate_bits(target);
+            let native_bswap = target_native_bswap(target);
+            // Same per-compilation `has_scalar_andn` snapshot as the first
+            // bit_idioms call (resolved at the top of run_passes).
+            let n = timed_pass!(
+                "bit_idioms_post_ifconv",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    bit_idioms::recognize_function(
+                        func,
+                        enable_bit_reverse,
+                        max_rotate_bits,
+                        min_rotate_bits,
+                        has_scalar_andn,
+                        native_bswap,
+                    )
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Redundant zero-guard elimination for Clz/Ctz. If-conversion turns a
+        // guarded `x ? __builtin_clz(x) : width` ternary (the k09_clz `lz`
+        // kernel shape) into a Select whose intrinsic arm ALREADY yields the
+        // width constant at zero — the IR defines Clz(0)/Ctz(0) == operand
+        // width. Collapsing the Select onto the intrinsic arm stops codegen
+        // from re-selecting the same answer and emitting the dead cmov tail
+        // after the bsr/bsf zero fix-up. Idempotent; shares the simplify
+        // disable switch.
+        if !pass_disabled(&disabled, "simplify") {
+            let n = timed_pass!(
+                "bitop_zero_guard_fold",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    simplify::remove_redundant_bitop_guards
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Correlated value propagation after if-conversion: the post-ifconv
+        // bit_idioms placement (Ctz from the __ffs Select chain) emits a
+        // `v == 0 ? 63 : ctz(v)` guard whose block is dominated by the
+        // `while (!v)` exit edge; only a dominance-scoped fold removes it.
+        if !pass_disabled(&disabled, "cvp") {
+            let defined_syms = cvp::defined_nonweak_symbols(module);
+            let n = timed_pass!(
+                "cvp_post_ifconv",
+                run_on_visited(module, &dirty, &mut changed, |f| {
+                    cvp::run_function_with_symbols(f, &defined_syms)
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 7b: Range-check folding.
+        // (x >= lo && x <= hi) -> (unsigned)(x - lo) <= (hi - lo), and the
+        // complement (x < lo || x > hi) -> (unsigned)(x - lo) > (hi - lo).
+        // Runs right after if-conversion, which produces the Select form from
+        // short-circuit branches. Idempotent and O(instructions), so it also
+        // folds Selects produced earlier (mem2reg in the pre-loop phase).
+        // Pass name for CCC_DISABLE_PASSES: "range_fold".
+        if !pass_disabled(&disabled, "range_fold") {
+            let n = timed_pass!(
+                "range_fold",
+                run_on_visited(module, &dirty, &mut changed, range_check::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Sparse small-set membership: `x==C1 || x==C2 || ...` CondBranch
+        // chains (multi-way OR stays control flow here — if_convert leaves
+        // it, range_fold has already folded contiguous runs) collapse into
+        // sub+range-guard+BitTest. GCC's Expat/SQLite classify idiom;
+        // consumes the BitTest op (IS-06). Runs right after range_fold so
+        // folded ranges join the chain as bit runs.
+        // Pass name for CCC_DISABLE_PASSES: "set_membership".
+        if !pass_disabled(&disabled, "set_membership") {
+            let n = timed_pass!(
+                "set_membership",
+                run_on_visited(module, &dirty, &mut changed, set_membership::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Register bit-packed switch lookup table: folds multi-arm constant-
+        // returning or constant-Phi-merging `Switch` terminators into a single
+        // range-checked bit-packed immediate shift (`1/2/4/8`-bit entries),
+        // eliminating jump tables and `.rodata` memory loads.
+        // Pass name for CCC_DISABLE_PASSES: "switch_lut".
+        if opt_level >= 2 && !pass_disabled(&disabled, "switch_lut") {
+            let is_32bit = target.is_32bit();
+            let n = timed_pass!(
+                "switch_lut",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    switch_lut::run_function(func, is_32bit)
+                })
+            );
+            if n > 0 {
+                cur_pass_changes[7] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+        }
+
+        // Phase 8: Copy propagation again
+        // Upstream: simplify (folded casts to copies), constfold (folded exprs to copies),
+        //           gvn (produced copies), licm (hoisted code), if_convert (select values)
+        // Note: simplify and constfold run earlier in this iteration, so we check
+        // cur_pass_changes for them (not just prev_pass_changes via should_run!).
+        if !dis.copyprop
+            && (should_run!(8, 5, 6, 7) || cur_pass_changes[3] > 0 || cur_pass_changes[4] > 0)
+        {
+            let n = timed_pass!(
+                "copy_prop2",
+                run_on_visited(module, &dirty, &mut changed, copy_prop::propagate_copies)
+            );
+            cur_pass_changes[8] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 9: Dead code elimination
+        // Upstream: gvn, licm, if_convert, copy_prop2 (produced dead instructions)
+        // Note: DCE changes are excluded from the diminishing-returns comparison
+        // (total_changes_excl_dce) because DCE is a cleanup pass that removes dead
+        // instructions. Its large change count (often 5000+ in iteration 0) inflates
+        // iter0_total_changes, and by removing instructions, DCE actually reduces
+        // the work subsequent passes can do in later iterations. This combination
+        // causes the diminishing-returns heuristic to exit too early, preventing
+        // the optimizer from completing multi-iteration constant propagation chains
+        // (e.g., kernel's cpucap_is_possible switch folding through inlined
+        // system_supports_sme -> alternative_has_cap_unlikely -> cpucap_is_possible).
+        if !dis.dce && should_run!(9, 5, 6, 7, 8) {
+            let n = timed_pass!(
+                "dce",
+                run_on_visited(module, &dirty, &mut changed, dce::eliminate_dead_code)
+            );
+            cur_pass_changes[9] = n;
+            total_changes += n;
+            // Intentionally NOT added to total_changes_excl_dce
+        }
+
+        // Phase 9.5: Dead store elimination (same-block overwritten stores).
+        // Runs right after DCE so stores made dead by folding are gone and
+        // the values stored by eliminated instructions feed the next DCE
+        // round. Like DCE, its change count is excluded from the
+        // diminishing-returns comparison (pure cleanup pass).
+        // Expression sinking: move a pure computation (and, transitively, the
+        // address chain feeding it) to the deepest block dominating all its
+        // uses. Late, after the CFG has settled, so dominance and the
+        // memory-path test see the final shape.
+        if !pass_disabled(&disabled, "expr_sink") && should_run!(9, 5, 6, 7, 8) {
+            total_changes += timed_pass!(
+                "expr_sink",
+                run_on_visited(module, &dirty, &mut changed, expr_sink::sink_expressions)
+            );
+        }
+        if !dis.dse && !dis.dce && should_run!(9, 5, 6, 7, 8) {
+            let n = timed_pass!(
+                "dse",
+                run_on_visited(module, &dirty, &mut changed, dse::eliminate_dead_stores)
+            );
+            total_changes += n;
+            // Re-run DCE when DSE removed stores: the stored values may now
+            // be dead. Cheap and bounded (next iteration's DCE is gated by
+            // the same should_run! heuristics).
+            if n > 0 {
+                let m = timed_pass!(
+                    "dce-post-dse",
+                    run_on_visited(module, &dirty, &mut changed, dce::eliminate_dead_code)
+                );
+                total_changes += m;
+            }
+        }
+
+        // Phase 10: CFG simplification again
+        // Upstream: constfold (constant branches), dce (dead blocks), if_convert
+        if !dis.cfg && should_run!(10, 4, 7, 9) {
+            let n = timed_pass!(
+                "cfg_simplify2",
+                run_on_visited(module, &dirty, &mut changed, cfg_simplify::run_function)
+            );
+            cur_pass_changes[10] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 10.5: Interprocedural constant propagation (IPCP).
+        // Run on every iteration, not just iter 0, because later iterations may
+        // have simplified call arguments to constants (e.g., phi nodes collapsed
+        // after CFG simplification resolved dead branches from IS_ENABLED() checks).
+        let mut ipcp_changes = 0;
+        let mut purity_changes = 0;
+        if !dis.ipcp {
+            ipcp_changes = timed_pass!("ipcp", ipcp::run(module));
+            purity_changes = ip_purity::run(module);
+            if ipcp_changes > 0 || purity_changes > 0 {
+                changed.iter_mut().for_each(|c| *c = true);
+            }
+            total_changes += ipcp_changes + purity_changes;
+            total_changes_excl_dce += ipcp_changes + purity_changes;
+        }
+
+        if iter == 0 {
+            iter0_total_changes = total_changes_excl_dce;
+        }
+
+        // Early exit: if no passes changed anything, additional iterations are useless.
+        if total_changes == 0 {
+            break;
+        }
+
+        // Diminishing returns: if this iteration produced very few changes relative
+        // to the first iteration, another iteration is unlikely to be worthwhile.
+        // The optimizer converges quickly: typically iter 0 finds ~264K changes,
+        // iter 1 finds ~10K, iter 2 finds ~200. Stopping when an iteration yields
+        // less than 5% of the first iteration's output saves one full pipeline
+        // iteration with negligible impact on optimization quality.
+        //
+        // We use total_changes_excl_dce for this comparison because DCE is a
+        // cleanup pass whose large change count (removing dead instructions)
+        // inflates iter0's total and makes subsequent iterations look like
+        // diminishing returns even when they're still making meaningful progress.
+        // DCE also reduces the number of instructions available for other passes,
+        // naturally lowering their change counts in later iterations.
+        //
+        // Exception: if IPCP made changes this iteration, always run another
+        // iteration regardless of diminishing returns. IPCP changes (constant
+        // argument propagation, dead call elimination) create opportunities for
+        // constant folding, DCE, and CFG simplification that require a full pass
+        // to clean up. Without this, dead code referencing undefined symbols
+        // (like the kernel's convert_to_fxsr) would survive.
+        // We require iter > 1 (at least 2 full iterations) because multi-step
+        // constant propagation chains (e.g., kernel's switch folding through
+        // inlined cpucap_is_possible -> alternative_has_cap_unlikely) need at
+        // least 2 iterations to complete: iter0 for initial folding, iter1 for
+        // propagating results through the control flow.
+        const DIMINISHING_RETURNS_FACTOR: usize = 20; // 1/20 = 5% threshold
+        if iter > 1
+            && ipcp_changes == 0
+            && purity_changes == 0
+            && iter0_total_changes > 0
+            && total_changes_excl_dce * DIMINISHING_RETURNS_FACTOR < iter0_total_changes
+        {
+            break;
+        }
+
+        // Save per-pass change counts for next iteration's skip decisions.
+        prev_pass_changes = cur_pass_changes;
+        prev_purity_changes = purity_changes;
+
+        // Prepare dirty set for next iteration: only re-visit functions that changed.
+        std::mem::swap(&mut dirty, &mut changed);
+    }
+
+    // Loops the two late vectorizer entries below produced; both feed the
+    // single late interleave after the x86 twin.
+    let mut late_vectorized = 0usize;
+    // Late vectorization (levkropp 8ef1978f concept, audited): Select-
+    // shaped reductions (max, conditional sums) only exist after the main
+    // loop's if_convert phase, so the early vectorizer never sees them.
+    // Re-running the pass here catches the converted form; already-
+    // vectorized loops contain Vec* intrinsics and fail the scalar-shape
+    // analyzers, so this is idempotent. -Os/-Oz skip it like the early pass.
+    // AArch64 reruns the two-wide NEON pass; x86-64 reruns the AVX2 pass
+    // (conditional I64 sums are the x86 shape: the widening reduction
+    // machinery handles the Select-guard form).
+    // CCC_DISABLE_PASSES=latevec disables.
+    if matches!(
+        target,
+        crate::backend::Target::Aarch64 | crate::backend::Target::X86_64
+    ) && !optimize_for_size
+        && !pass_disabled(&disabled, "latevec")
+        && !pass_disabled(&disabled, "vectorize")
+    {
+        // SAME entry point as the early pass (see the shared dispatch table
+        // above): x86-64 therefore reruns the AVX2 vectorizer, which is what
+        // unlocks Select-shaped reductions - integer min/max and guarded
+        // sums - that only exist after this loop's if_convert phase.
+        //
+        // BE CAREFUL WHAT THIS IS ATTRIBUTED TO. Before this change this
+        // rerun was AArch64-only, and x86-64 was served by the separate
+        // `vectorize_function_late` twin further down, which passes the
+        // same analysis flags. So "the VecMaxI32x8 machinery was dead code
+        // on x86" is FALSE and must not be repeated: x86-64 did rerun the
+        // vectorizer. What the twin lacked, and what this entry supplies,
+        // is the mode wrapper's diamond/if-chain PRE-CONVERSION (the Select
+        // a min/max reduction needs is created there) plus its two legality
+        // bails. The measured win (min/max over int[]: 1.5 -> 0.1250
+        // insn/byte, matching gcc 16.2 and icx) is attributable to that
+        // pre-conversion and to the admission fixes, NOT to "opening" a
+        // rerun that was already open.
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+        // SCOPE: min/max reductions, plus the guarded I32→I64 widening
+        // sum (`if (a[i] > k) s += a[i]`) — the only reduction the early
+        // run can structurally never transform (its guard is a body
+        // branch before if_convert, and the Select form only exists
+        // after). The unrestricted rerun also transformed the unguarded
+        // s1/s2 class (measured +1.05 % retired instructions, callgrind
+        // whole program, on `zlib_ng_adler32`) for a denser but more
+        // spill- and prologue-heavy loop; admitting only the structurally
+        // forced shape above keeps every judgment-declined kernel
+        // byte-identical. See `set_late_minmax_only`.
+        // RAII via block scope, not set/reset and not a bare named binding
+        // with a hand-written `drop()`: a panic between the two calls used to
+        // leave the restriction set for the rest of this worker thread's life,
+        // and because the flag is thread-local it leaked into the next
+        // translation unit compiled on that thread. The block also scopes the
+        // guard to exactly the calls it is meant to cover.
+        let n = {
+            let _scope = vectorize::LateMinMaxOnlyScope::enter();
+            module.for_each_function(|func| {
+                let feats = func.target_features.clone();
+                with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |fn_isa| {
+                    let mode = late_vectorize_entry(
+                        target,
+                        fp_reassoc,
+                        fp_contract,
+                        x86_avx || fn_isa.avx,
+                    );
+                    vectorize::vectorize_function_with_symbol_facts(func, &symbol_facts, mode)
+                })
+            })
+        };
+        late_vectorized += n;
+        if n > 0 {
+            // The vectorizer's block surgery does not maintain source_spans;
+            // drop any that no longer align with their block's instructions
+            // (debug-info line table would otherwise attribute wrong lines).
+            for func in &mut module.functions {
+                for block in &mut func.blocks {
+                    if !block.source_spans.is_empty()
+                        && block.source_spans.len() != block.instructions.len()
+                    {
+                        block.source_spans.clear();
+                    }
+                }
+            }
+            module.for_each_function(|f| {
+                let removed = dce::eliminate_dead_code(f);
+                if std::env::var("CCC_PROBE_DCE").is_ok() {
+                    // Count remaining VecBroadcast dests and their uses.
+                    let mut bcasts = Vec::new();
+                    for b in &f.blocks {
+                        for i in &b.instructions {
+                            if let crate::ir::reexports::Instruction::Intrinsic {
+                                dest: Some(d),
+                                op,
+                                ..
+                            } = i
+                            {
+                                if format!("{op:?}").starts_with("VecBroadcast") {
+                                    bcasts.push(d.0);
+                                }
+                            }
+                        }
+                    }
+                    for id in &bcasts {
+                        let mut uses = 0u32;
+                        for b in &f.blocks {
+                            for i in &b.instructions {
+                                crate::backend::liveness::for_each_operand_in_instruction(
+                                    i,
+                                    |op| {
+                                        if let crate::ir::reexports::Operand::Value(v) = op {
+                                            if v.0 == *id {
+                                                uses += 1;
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                        }
+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
+                    }
+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
+                }
+                removed
+            });
+        }
+    }
+
+    // x86-64 twin: rerun the AVX2 vectorizer for Select-shaped reductions
+    // (conditional sums) that if_convert materialized. Same idempotence and
+    // cleanup contract as the AArch64 branch above.
+    // AUD-4 / AUD-6: the x86-64 late rerun. Kept, but now SCOPED.
+    //
+    // It used to run outside `LateMinMaxOnlyScope`, so every reduction the
+    // scope flag deliberately excludes -- guarded sums above all -- was
+    // reachable through it, which is the direct cause of the
+    // `zlib_ng_adler32` +1.05 % retired-instruction regression the flag was
+    // introduced to prevent.
+    //
+    // The static shape of that, on `zlib_ng_adler32` at
+    // `-O2 -march=x86-64-v3`: unscoped 312 instructions / 74 memory
+    // references / 49 ymm refs / a `subq $584, %rsp` spill frame; scoped
+    // 259 / 57 / 24 / none. Every vector-op count is exactly 2x, i.e. the
+    // twin re-vectorized the whole loop into a second, spilled copy rather
+    // than declining it. Causal isolation: `CCC_DISABLE_PASSES=latevec`
+    // reproduces the scoped output byte-for-byte, so the twin is the sole
+    // cause and not a co-factor. Output was correct in both cases, so this
+    // is code size and frame pressure, not a wrong-answer bug -- and
+    // runtime is neutral within +-1 % at 10x workload scale.
+    //
+    // `LateMinMaxOnlyScope` and that measured effect are ALREADY ON `main`.
+    // The numbers above record the shape of the flag for a reviewer to
+    // re-derive; they are not a result claimed for this commit, whose changes
+    // in this area are documentation only.
+    //
+    // Deleting it instead is NOT the fix. Measured over 857 corpus +
+    // benchmark files (-O2 -march=x86-64-v3) it is 1 429 instructions
+    // SMALLER without the twin (-0.71 %), and 24 files shrink -- but that
+    // number is a mirage: the twin is also what vectorizes the late
+    // map-shaped loops, and `check_vec_dead_remainder.sh` catches one of
+    // them (`shape_u16_tail`, `d[i] = (u16)(s[i] + 5u)`) dropping to
+    // scalar. Losing real vectorization makes code smaller; it is not a
+    // win. The correct fix is to scope the twin, not to remove it.
+    //
+    // Scoping it required narrowing the flag: `LATE_MINMAX_ONLY` used to
+    // gate the map and stencil vectorizers as well as reduction admission,
+    // which would have killed the same u16 map loop. It now restricts
+    // reduction admission only (see `vectorize.rs`), which is the part the
+    // zlib_ng_adler32 measurement actually justifies.
+    if matches!(target, crate::backend::Target::X86_64)
+        && !optimize_for_size
+        && !pass_disabled(&disabled, "latevec")
+        && !pass_disabled(&disabled, "vectorize")
+    {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+        let n = {
+            let _scope = vectorize::LateMinMaxOnlyScope::enter();
+            module.for_each_function(|func| {
+                let feats = func.target_features.clone();
+                with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                    vectorize::vectorize_function_late_with_symbol_facts(func, &symbol_facts)
+                })
+            })
+        };
+        late_vectorized += n;
+        if n > 0 {
+            for func in &mut module.functions {
+                for block in &mut func.blocks {
+                    if !block.source_spans.is_empty()
+                        && block.source_spans.len() != block.instructions.len()
+                    {
+                        block.source_spans.clear();
+                    }
+                }
+            }
+            module.for_each_function(|f| {
+                let removed = dce::eliminate_dead_code(f);
+                if std::env::var("CCC_PROBE_DCE").is_ok() {
+                    // Count remaining VecBroadcast dests and their uses.
+                    let mut bcasts = Vec::new();
+                    for b in &f.blocks {
+                        for i in &b.instructions {
+                            if let crate::ir::reexports::Instruction::Intrinsic {
+                                dest: Some(d),
+                                op,
+                                ..
+                            } = i
+                            {
+                                if format!("{op:?}").starts_with("VecBroadcast") {
+                                    bcasts.push(d.0);
+                                }
+                            }
+                        }
+                    }
+                    for id in &bcasts {
+                        let mut uses = 0u32;
+                        for b in &f.blocks {
+                            for i in &b.instructions {
+                                crate::backend::liveness::for_each_operand_in_instruction(
+                                    i,
+                                    |op| {
+                                        if let crate::ir::reexports::Operand::Value(v) = op {
+                                            if v.0 == *id {
+                                                uses += 1;
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                        }
+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
+                    }
+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
+                }
+                removed
+            });
+        }
+    }
+
+    // Interleave the loops the late entries produced (the guarded sums'
+    // masked steps), exactly as the early pipeline interleaves the early
+    // vectorizer's loops. Hooked HERE, after both entries: the guarded sums
+    // come from the shared `late_vectorize_entry` rerun above, and the x86
+    // twin normally finds nothing left (n == 0), so a hook inside either
+    // block alone misses loops. Both blocks already ran DCE, so the dead
+    // Select/Cmp remnants are gone and the bodies are pure. `run_late`
+    // admits only late-only steps, so early loops and the verbatim
+    // epilogues their interleave left behind are never re-sliced (and on
+    // AArch64 nothing qualifies).
+    // Hoist the masked steps' run-time guard splats into their preheaders
+    // first, so the interleave slices below inherit one shared splat.
+    if late_vectorized > 0 {
+        module.for_each_function(vectorize::hoist_masked_guard_splats);
+        verify::verify_after_pass(module, "masked_guard_splat_hoist");
+    }
+    if late_vectorized > 0 && !pass_disabled(&disabled, "vec_interleave") {
+        module.for_each_function(|f| vec_interleave::run_late(f, fp_reassoc));
+        verify::verify_after_pass(module, "vec_interleave_late");
+    }
+    // Pre-loop sret copy elision (see the earlier site for the rationale).
+    if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
+        module.for_each_function(sret_copy_elision::run);
+    }
+    verify::verify_after_pass(module, "sret_copy_elision");
+    if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+        for _ in 0..8 {
+            if module.for_each_function(|func| {
+                aggregate_copy_forward::run_with_symbol_facts(func, &symbol_facts)
+            }) == 0
+            {
+                break;
+            }
+        }
+    }
+    // Forward alloca-field stores to later loads of the same constant-offset
+    // field (the SROA effect for scalarized aggregates: struct memory traffic
+    // becomes SSA dataflow). Hardened rewrite of levkropp's 0980060d pass:
+    // default-closed transfer function, volatile/escape/segment guards.
+    // Iterate: each round can expose new dead stores for the next.
+    //
+    // A forwarded load can be the last reader of its field. The store it
+    // read is then dead, but the aggregate dead-field-store proof above ran
+    // before the forward and cannot see it, and a forwarded constant leaves a
+    // `Cast Const` the backend materializes (`xorl; movsbq`). Functions the
+    // forward changed re-run exactly those two existing proofs (e.g. an
+    // inlined TU `memset` writing U8 bytes that the caller reads as `char`:
+    // the in-loop forwarders refuse the U8/I8 pair, this pass does not).
+    if !pass_disabled(&disabled, "slforward") {
+        let agg_cleanup = std::env::var_os("CCC_NO_AGG_COPY_FWD").is_none();
+        module.for_each_function(|func| {
+            let mut forwarded = 0;
+            for _ in 0..4 {
+                let n = store_load_forward::run(func);
+                if n == 0 {
+                    break;
+                }
+                forwarded += n;
+            }
+            if forwarded > 0 {
+                constant_fold::fold_function(func);
+                if agg_cleanup {
+                    aggregate_copy_forward::eliminate_dead_aggregate_field_stores(func);
+                }
+            }
+            forwarded
+        });
+    }
+    module.for_each_function(dce::eliminate_dead_code);
+    if std::env::var("LCCC_DUMP_IR_PROMOTE").is_ok() {
+        for func in &module.functions {
+            if func.is_declaration {
+                continue;
+            }
+            eprintln!("=== IR(pre-promote) {} ===", func.name);
+            for (bi, b) in func.blocks.iter().enumerate() {
+                eprintln!("  block {} (label {}):", bi, b.label.0);
+                for inst in &b.instructions {
+                    eprintln!("    {:?}", inst);
+                }
+                eprintln!("    term: {:?}", b.terminator);
+            }
+        }
+    }
+    // Run memory-recurrence promotion again after CFG and copy cleanup have
+    // exposed canonical natural loops.
+    if !std::env::var("CCC_NO_LOOP_MEM_PROMOTE").is_ok() {
+        module.for_each_function(loop_memory_promote::run);
+        module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
+    }
+    // Late loop-carried forwarding: IVSR / CFG cleanup expose marching-pointer
+    // recurrences that the early run could not normalise.
+    loop_carried_forward::run_module(module);
+    verify::verify_after_pass(module, "loop_carried_forward_late");
+    // Loop-memset recognition (LMR): constant-byte fill loops → memset(3).
+    // Companion to the early loop_idiom pass (byte-COPY loops → memcpy):
+    // its census refuses stored load results, so the two passes are
+    // structurally disjoint. Runs LATE — the settled post-IVSR/CFG shape is
+    // what the while-form/do-while recognizers match — and before redundant
+    // load elimination, so the call acts as the memory barrier the removed
+    // stores were. Kill switches: `CCC_NO_MEMSET_LOOP`, per-gate refusal
+    // tracing via `CCC_MEMSET_LOOP_TRACE`. Pass name for CCC_DISABLE_PASSES:
+    // "loop_memset".
+    if !pass_disabled(&disabled, "loop_memset") && std::env::var_os("CCC_NO_MEMSET_LOOP").is_none()
+    {
+        for function in &mut module.functions {
+            let changed = loop_memset::run(function);
+            if changed > 0 {
+                // A constant trip count leaves `n = bound - init` and an
+                // `n != 0` guard that no later pass folds (this runs after
+                // the last constant-fold / CFG-simplify round): fold them
+                // here, on the rewritten functions only.
+                constant_fold::fold_function(function);
+                cfg_simplify::run_function(function);
+                verify::verify_after_func_pass(function, "loop_memset");
+            }
+        }
+    }
+    // Vector fill: the fills loop_memset cannot express (a 16/32/64-bit
+    // element that is not one repeated byte, a float constant, a run-time
+    // value) get a 16-byte store pre-loop; the scalar loop finishes the tail.
+    // Same placement argument as loop_memset (settled loop shape, before
+    // redundant-load elimination); a tree-vectorizer transform, so it obeys
+    // -fno-tree-vectorize and stays off at -O1/-Os/-Oz like GCC's.
+    if target == crate::backend::Target::X86_64
+        && matches!(opt_level, 2 | 3)
+        && !disable_tree_vectorize
+        && !pass_disabled(&disabled, "vector_fill")
+    {
+        for function in &mut module.functions {
+            let feats = function.target_features.clone();
+            let changed = with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |isa| {
+                vector_fill::run(function, isa.simd)
+            });
+            if changed > 0 {
+                // A constant-multiple fill leaves its scalar loop unreachable.
+                constant_fold::fold_function(function);
+                cfg_simplify::run_function(function);
+                verify::verify_after_func_pass(function, "vector_fill");
+            }
+        }
+    }
+    // Late redundant-load elimination: post-IVSR field accesses have constant
+    // offsets, so same-address loads merge when intervening stores are
+    // provably non-aliasing (volatile loads are exempt by construction).
+    if !pass_disabled(&disabled, "redundantloads") {
+        module.for_each_function(redundant_loads::run);
+        // Forwarded field reads expose overwritten stores. Reuse the same
+        // audited DSE proof rather than inventing a second store-kill engine.
+        if !pass_disabled(&disabled, "dse") {
+            module.for_each_function(dse::eliminate_dead_stores);
+        }
+        // Merged loads orphan their (now dead) address computations.
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+    // Second-order strength reduction for slope-1 triangular loop indices
+    // (t(t+1)/2 recurrences): carries the index as two counters instead of
+    // recomputing mul+corrected-div every iteration. Evenness does NOT make
+    // division commute with a wrapped product; the current proof relies on
+    // signed-overflow UB. Keep it off under the explicit wrapping contract.
+    if !wrap_signed_overflow && !pass_disabled(&disabled, "quadsr") {
+        module.for_each_function(quadratic_sr::run);
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+
+    // Run after the algebraic simplifiers and before constant hoisting,
+    // so neither x+x canonicalization nor a hoisted 2.0 hides the fold.
+    if target == crate::backend::Target::X86_64
+        && x86_isa.simd
+        && !pass_disabled(&disabled, "fp_double")
+    {
+        let start = time_passes.then(std::time::Instant::now);
+        let keep_contraction_inputs = fp_contract != FpContract::Off && x86_isa.fma;
+        let changes = module.for_each_function(|f| fp_double::run(f, keep_contraction_inputs));
+        if changes > 0 {
+            verify::verify_after_pass(module, "fp_double");
+        }
+        if let Some(start) = start {
+            eprintln!(
+                "[PASS-TIME] fp_double: {:.3} ms ({changes} changes)",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+
+    // Hoist FP constants used in loop bodies into preheader Copies so they can
+    // stay in FP registers across the loop (AArch64 constant-pool literal loads
+    // otherwise sit in the loop's dependency path every iteration).
+    if !pass_disabled(&disabled, "fpconst") {
+        module.for_each_function(fp_const_hoist::run);
+    }
+
+    // Hoist large integer constants (not encodable as target immediates) out
+    // of loop bodies. Target-aware since the Lev-Kropp-audit session:
+    //
+    // * AArch64: anything outside imm12/cmn pays movz/movk per iteration
+    //   (sieve's loop bound was the original case).
+    // * x86-64: imm32 is directly encodable in cmp/add/imul, so the pass now
+    //   hoists ONLY true 64-bit constants — dominated by div_by_const's
+    //   magic multipliers (`movabsq $2454267027` was re-materialized inside
+    //   every division loop iteration; sum_div7 paid it per element).
+    //   Small imm32 constants are deliberately NOT hoisted (they are free
+    //   in-place; hoisting them burns a register and a callee-saved push —
+    //   the old sieve regression the AArch64-only gate existed for).
+    // * RISC-V (RV64): the ALU emitters are register-form-only, so constants
+    //   outside imm12 pay `lui`+`addi` per iteration — RISC-V under-hoisted
+    //   exactly the way AArch64 did before fix B, because this gate (not
+    //   the in-pass model) was what silenced the pass there.
+    // * i686: no-op (nothing this pass sees pays a 64-bit materialization).
+    if let Some(model) =
+        int_const_hoist::model_for(target).filter(|_| !pass_disabled(&disabled, "intconst"))
+    {
+        int_const_hoist::set_target_model(model);
+        module.for_each_function(int_const_hoist::run);
+    }
+
+    if !pass_disabled(&disabled, "bepre") {
+        let n = module.for_each_function(backedge_pre::run);
+        if n > 0 {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+    }
+
+    // Phase 10.9: Bool-phi merge-diamond branch threading.
+    // Value-context short-circuits (`int ok = a && b; if (ok) ...`) and
+    // explicit `if (a) ok = 1; else ok = cmp;` merges keep a phi-only block
+    // whose sole terminator is a branch on the phi. With if-conversion off
+    // (-m16 size profile) that diamond survives every pipeline phase and
+    // phi elimination materializes one arm store per predecessor plus a
+    // reload-and-test in the merge (~18 bytes per site, ~40 sites in the
+    // boot corpus). GCC's jump threader folds it while still SSA; this is
+    // the same transform: each predecessor branches on its own incoming
+    // value, the phi, the stores, the merge test, and (all preds threaded)
+    // the merge block die. IR-level, so every backend benefits; strictly
+    // fewer executed instructions on the threaded paths (no store, no
+    // reload, no extra branch) — a size and speed win at every tier.
+    // Fail-closed soundness rules in the pass header; nothing is ever
+    // duplicated. Kill switches: CCC_NO_BOOL_THREAD=1,
+    // CCC_DISABLE_PASSES=boolthread.
+    // Jump threading of branches a dominating test already decided (the
+    // list-merge `while (a && b)` re-test of the pointer that did not
+    // advance); see `jump_thread`. It duplicates up to a few instructions
+    // per thread, so -Os/-Oz and -O1 keep the merged shape.
+    // CCC_DISABLE_PASSES=jump_thread disables.
+    if opt_level >= 2 && !optimize_for_size && !pass_disabled(&disabled, "jump_thread") {
+        if dump_each_pass {
+            dump_ir_filtered(module, "before jump_thread");
+        }
+        let n = module.for_each_function(jump_thread::run);
+        if dump_each_pass {
+            dump_ir_filtered(module, "after jump_thread");
+        }
+        verify::verify_after_pass(module, "jump_thread");
+        if n > 0 {
+            // Clones end in jumps to single-predecessor blocks and carry
+            // phi-turned-Copy instructions: merge, propagate, collect.
+            module.for_each_function(cfg_simplify::simplify_cfg);
+            module.for_each_function(copy_prop::propagate_copies);
+            module.for_each_function(dce::eliminate_dead_code);
+            verify::verify_after_pass(module, "jump_thread_cleanup");
+        }
+    }
+
+    if !pass_disabled(&disabled, "boolthread") && std::env::var("CCC_NO_BOOL_THREAD").is_err() {
+        let n = module.for_each_function(bool_thread::run);
+        if n > 0 {
+            // Threaded merges leave unreachable phi-only blocks and dead
+            // arm computations behind; cfg_simplify removes the blocks and
+            // DCE collects the dead def chains (compare feeds, arm values).
+            module.for_each_function(cfg_simplify::simplify_cfg);
+            module.for_each_function(|f| {
+                let removed = dce::eliminate_dead_code(f);
+                if std::env::var("CCC_PROBE_DCE").is_ok() {
+                    // Count remaining VecBroadcast dests and their uses.
+                    let mut bcasts = Vec::new();
+                    for b in &f.blocks {
+                        for i in &b.instructions {
+                            if let crate::ir::reexports::Instruction::Intrinsic {
+                                dest: Some(d),
+                                op,
+                                ..
+                            } = i
+                            {
+                                if format!("{op:?}").starts_with("VecBroadcast") {
+                                    bcasts.push(d.0);
+                                }
+                            }
+                        }
+                    }
+                    for id in &bcasts {
+                        let mut uses = 0u32;
+                        for b in &f.blocks {
+                            for i in &b.instructions {
+                                crate::backend::liveness::for_each_operand_in_instruction(
+                                    i,
+                                    |op| {
+                                        if let crate::ir::reexports::Operand::Value(v) = op {
+                                            if v.0 == *id {
+                                                uses += 1;
+                                            }
+                                        }
+                                    },
+                                );
+                            }
+                        }
+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
+                    }
+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
+                }
+                removed
+            });
+        }
+    }
+
+    // Phase 11a: 16-byte aggregate round-trip collapse (`aggcopy16`). An
+    // inlined SSE intrinsic returns its `__m128*` value in the SysV
+    // register-pair carrier (packed as I128), so every such copy lowers to a
+    // load/load/shl/or + shr/store/store sequence.  Collapsing it to the
+    // intrinsic 128-bit copy pair is what lets the existing `movdqu` lowering
+    // and memory-operand folding see the copy at all; see
+    // engineering/SSE2-CODEGEN-MATRIX.md.
+    if !pass_disabled(&disabled, "aggcopy16") {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+        module.for_each_function(|func| {
+            aggregate_pair_roundtrip::run_with_symbol_facts(func, &symbol_facts)
+        });
+        verify::verify_after_pass(module, "aggcopy16");
+    }
+
+    // Phase 11a': Whole-vector SSA promotion. GNU-vector objects that the
+    // SIMD lowering touches only through full-width VecLoad/VecStore pairs
+    // leave memory here (mem2reg for register images); the cleanups below
+    // then see register-valued vector chains instead of slot round trips.
+    if !pass_disabled(&disabled, "vecssa") {
+        vec_ssa::promote_vector_allocas(module, target, x86_isa, x86_avx512vl);
+        verify::verify_after_pass(module, "vecssa");
+    }
+
+    // Exact packed integer and register-image relations. Scalar-typed
+    // simplifiers must not inspect vector placeholder values after vecssa.
+    if !pass_disabled(&disabled, "vecrelations") {
+        if vec_relations::run(module) > 0 {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+        verify::verify_after_pass(module, "vecrelations");
+    }
+
+    // Phase 11a'': Packed FMA contraction over the register-valued vector
+    // chains `vecssa` just exposed (`VecMul*` → `VecAdd*`/`VecSub*` of one
+    // float family becomes the family's fused op). Same FMA3 / -ffp-contract
+    // gate as the scalar mul+add fusion in the backend detector.
+    if !pass_disabled(&disabled, "vecfma") {
+        vec_fma_contract::contract_module(module, fp_contract);
+        verify::verify_after_pass(module, "vecfma");
+    }
+
+    // Phase 11b: Vector temp promotion. Runs on the final IR (after inlining and
+    // the optimization loop) so every vector intrinsic chain is seen whole. This
+    // removes the temp alloca + Memcpy that vector intrinsic lowering introduces
+    // for `__m256i x = _mm256_*(...)`, writing results directly into the variable
+    // slot and enabling the backend's memory-operand folding.
+    if !pass_disabled(&disabled, "vecpromote") {
+        vector_temp_promotion::promote_vector_temps(module);
+    }
+
+    // Phase 11c: Forward direct vector loads into compatible consumers while
+    // the original alignment facts are still available. This must precede
+    // alignment relaxation: deleting a load can make its temporary's expensive
+    // >16-byte alignment completely unobservable.
+    if !pass_disabled(&disabled, "vecpromote") {
+        vector_temp_promotion::fuse_vector_loads(module);
+    }
+
+    // Phase 11c': dead 16-byte load-into-a-private-slot.  Both phases above
+    // leave these behind: `aggcopy16` inserted a `Loaddqu` for the aggregate
+    // round trip, and the load forwarder just rewrote its consumer to read the
+    // producing slot directly, so the load's result has no users and its
+    // destination slot has no readers — a stack store plus a reload per
+    // occurrence.  `dse` cannot help: it has already run for this round, and
+    // the shape did not exist then.  Measured on the SSE2 codegen matrix:
+    // `minpd`/`maxpd`/`divpd`/`sqrtpd` and every `shufps`/`cmppd` row carried
+    // this traffic (19-30 instructions against 11-14 for the same kernel
+    // written with `addpd`).
+    if !pass_disabled(&disabled, "deadslotload") {
+        module.for_each_function(dse::eliminate_dead_private_slot_loads);
+        verify::verify_after_pass(module, "deadslotload");
+    }
+
+    // Phase 11d: Relax only the alignment left unobservable by the final use
+    // set. Aligned/non-temporal, atomic, volatile, address-observing and
+    // unaudited intrinsic positions retain their required alignment.
+    if !pass_disabled(&disabled, "vecpromote") {
+        vector_temp_promotion::downgrade_nonescaping_vector_align(module);
+    }
+
+    // Phase 11e: Constant-array promotion. Local arrays whose surviving
+    // stores are all constants tiling the object exactly, and whose address
+    // only feeds loads and provably read-only direct callees, become
+    // `.rodata` globals (`.LCA_n`) — the 48 scalar `movb`s of a
+    // constant-initialized 16-byte array collapse to zero instructions and
+    // rip-relative references, exactly what GCC and Clang emit for the
+    // shape. Runs last: it needs the post-unroll, post-SCCP store image,
+    // and it removes stores no earlier pass could classify.
+    // Pass name for CCC_DISABLE_PASSES: "constarr".
+    if !pass_disabled(&disabled, "constarr") {
+        const_array_promote::run(module);
+        module.for_each_function(dce::eliminate_dead_code);
+    }
+
+    // Phase 11a: Dead global stores. Delete stores to never-loaded static
+    // globals (TU-closed DSE: `out[i] = ...` with no reader in the TU), with
+    // a DCE chaser on touched functions; the Phase 11 pass below then removes
+    // globals left unreferenced. Pass name for CCC_DISABLE_PASSES:
+    // "globaldse".
+    //
+    // ORDER: after 11e (constarr), not before 11b. Evidence-consuming
+    // passes run before evidence-deleting ones: a dead `keep = a` escape
+    // store is constarr's proof that the address escapes, and deleting it
+    // first would let constarr promote an escaping array (the
+    // const-array-promote escape-shape gate pins the rejection). Deleting
+    // the dead escape store AFTER constarr has refused keeps both the
+    // rejection and the deletion.
+    if !pass_disabled(&disabled, "globaldse") {
+        dead_statics::eliminate_dead_global_stores(module);
+    }
+
+    // Phase 11: Dead static function elimination.
+    // After all optimizations, remove internal-linkage (static) functions that are
+    // never referenced by any other function or global initializer. This is critical
+    // for `static inline` functions from headers: after intra-procedural optimizations
+    // eliminate dead code paths (e.g., `if (1 || expr)` removes the else branch),
+    // some static inline callees may become completely unreferenced and can be removed.
+    // Without this, the dead functions may reference undefined external symbols
+    // (e.g., kernel's `___siphash_aligned` calling `__siphash_aligned` which doesn't
+    // exist on x86 where CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is set).
+    //
+    // ORDER: runs after 11e alongside 11a (moved as a pair — 11a's deleted
+    // stores leave globals unreferenced for this pass to remove). The 11b-e
+    // passes are function-local transforms with no reachability dependence,
+    // so nothing between the old and new positions observes the move.
+    dead_statics::eliminate_dead_static_functions(module);
+
+    // Phase 11g: Latency-driven reassociation of associative integer trees
+    // inside loops (see reassoc_latency.rs): the operands of a single-use
+    // Add/And/Or/Xor tree are recombined in order of availability, so the
+    // loop-carried operand is added last (SHA-256's t1: 8 -> 5 ops on the
+    // e->e recurrence). A separately gated x86-64 terminal-return extension
+    // handles only wrapping Add trees. ORDER: after every range/overflow-reasoning pass
+    // (IV widening, CVP, SCCP) -- the soundness argument for signed sums --
+    // and after the unroller and vectorizers, whose matchers expect source
+    // shape; before the FMA peel, which stays the last IR transform. Pass
+    // name for CCC_DISABLE_PASSES: "reassoc_lat".
+    if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "pair_load_carry") {
+        module.for_each_function(pair_load_carry::run);
+        verify::verify_after_pass(module, "pair_load_carry");
+    }
+    if !pass_disabled(&disabled, "reassoc_lat") {
+        // The straight-line extension is intentionally narrow: only x86-64,
+        // terminal-return wrapping Add trees, with a block-local pressure gate.
+        // Resolve the bisection knob once per module, not in each function.
+        let straightline_enabled = target == crate::backend::Target::X86_64
+            && std::env::var_os("CCC_NO_REASSOC_STRAIGHTLINE").is_none();
+        module.for_each_function(|function| {
+            reassoc_latency::run_function_with_straightline(function, straightline_enabled)
+        });
+        verify::verify_after_pass(module, "reassoc_lat");
+    }
+
+    // Producer ranges survive copies/casts without conflating carrier widths.
+    // Run after transformations that reason about signed integer domains.
+    if !pass_disabled(&disabled, "intbounds") {
+        module.for_each_function(|f| {
+            let changed = integer_bounds::run(f);
+            if changed != 0 {
+                if !pass_disabled(&disabled, "copyprop") {
+                    copy_prop::propagate_copies(f);
+                }
+                if !pass_disabled(&disabled, "dce") {
+                    dce::eliminate_dead_code(f);
+                }
+            }
+            changed
+        });
+        verify::verify_after_pass(module, "intbounds");
+    }
+
+    // Expose the addresses the x86 vector emitter actually consumes before
+    // register allocation. Constant GEP pointer homes otherwise survive SLP
+    // even when the ISA can encode their displacement directly.
+    if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "vecaddr") {
+        module.for_each_function(|f| {
+            let changed = vec_addr_fold::run(f);
+            if changed != 0 && !pass_disabled(&disabled, "dce") {
+                dce::eliminate_dead_code(f);
+            }
+            changed
+        });
+        verify::verify_after_pass(module, "vecaddr");
+    }
+
+    // Late scalar usub_sat canonicalization. This deliberately runs after
+    // every vectorizer: packed U16 maps keep their proven select/min-max
+    // input, while scalar remainders and i686 (whose vector backend has a
+    // different, stack-based contract) can use the same pure 32-bit IR
+    // operation. Signed compares require the pass's nonnegative-domain proof;
+    // shared compare/subtract nodes and all other widths stay unchanged.
+    // Pass name for CCC_DISABLE_PASSES: "satsub".
+    // Late predicate canonicalization.  These two rewrites are profitable
+    // wherever they apply but *destructive* to shapes other passes still want:
+    // an interval test written as two compares is exactly what the
+    // vectorizers' mask-fusion matchers and `range_check`'s branch folds
+    // recognize, and a difference compare is a shape `div_by_const` and the
+    // conditional-move selector both prefer.  Measured on 3,016 test files,
+    // running them early cost 141 instructions in
+    // tests/regression/vec_range_mask_fusion.c and 19 in range_fold_branch.c
+    // while gaining nothing those passes did not already recover; run here,
+    // after every vectorizer and after range_check, scalar leftovers still
+    // fold and no optimized pattern is taken apart.  Both passes only replace
+    // a node and never insert a duplicate computation, so they are safe to run
+    // last.  Pass names: "interval" and "diffcmp".
+    if !pass_disabled(&disabled, "interval") {
+        let n = interval_compare::run_on_module(module);
+        verify::verify_after_pass(module, "interval");
+        let _ = n;
+    }
+    if !pass_disabled(&disabled, "diffcmp") {
+        let n = difference_compare::run_on_module(module);
+        verify::verify_after_pass(module, "diffcmp");
+        let _ = n;
+    }
+
+    if matches!(
+        target,
+        crate::backend::Target::X86_64 | crate::backend::Target::I686
+    ) && !pass_disabled(&disabled, "satsub")
+    {
+        module.for_each_function(|f| {
+            let changed = saturating_sub::run(f);
+            if changed != 0 && !pass_disabled(&disabled, "dce") {
+                dce::eliminate_dead_code(f);
+            }
+            changed
+        });
+        verify::verify_after_pass(module, "satsub");
+    }
+
+    // Phase 11f: FMA operand-negation peel. LAST IR transform: after every
+    // vectorizer (their SLP matchers must not see the Signed variants) and
+    // in phi-SSA form (the rewrite's soundness argument is dominance, and
+    // eliminate_phis still runs after us in the driver). Absorbs the
+    // operand Negations feeding a FmaScalarF{32,64} site (plain or already
+    // Signed — the flags compose by XOR) into the signed families:
+    // `__builtin_fma(-a, b, -c)` becomes ONE vfnmsub instead of vxorpd +
+    // vxorpd + vfmadd (GCC parity at -O1 and above; GCC keeps the negations
+    // materialised at -O0 and so do we). Gated on the same has_fma3 signal
+    // as the fma libcall fold, so targets without the families never see
+    // the variant. Kill switches: CCC_NO_FMA_NEG_PEEL=1 /
+    // CCC_DISABLE_PASSES=fmanegpeel (both resolved once above, with the
+    // other pass switches). The verify hook is load-bearing: the peel is
+    // the last IR transform in this tier too, so without it a malformed
+    // rewrite here is invisible to CCC_VERIFY_IR (that is exactly how the
+    // chain defect — a Neg deleted under a surviving reader — reached
+    // codegen as an ICE instead of failing the armed regression gates).
+    if !pass_disabled(&disabled, "fmanegpeel") && fma_neg_peel_enabled {
+        fma_neg_peel::run(module);
+        verify::verify_after_pass(module, "fmanegpeel");
+    }
+    restore_entry_param_prefix(module);
+
+    // An inline asm that assembles to nothing and names no register is a
+    // compiler barrier with no code behind it: `asm volatile("" : "+m"(x))`.
+    // Its operands exist to tell the optimiser that `x` is read and written,
+    // and every memory pass that could have used that fact (LICM, the
+    // dead-store eliminators, store/load forwarding, the scheduler) has already
+    // run by now. Dropping the instruction here removes the last two things it
+    // still costs: the operands count as uses, so a memory operand's address is
+    // materialised into a register instead of folding into the addressing modes
+    // of the accesses that dominate it (zlib_ng_slide_hash's `ref_slide_chain`
+    // paid two `leaq`s per iteration for an address both its load and its store
+    // can encode), and the value keeps a home alive across the block. The
+    // register refusal below is what keeps `asm("" : "=r"(x) : "0"(x))` — the
+    // kernel's OPTIMIZER_HIDE_VAR — intact: that one names a register, and the
+    // tied value must still be delivered to the output home.
+    // Kill switch: CCC_DISABLE_PASSES=inertasm.
+    if !pass_disabled(&disabled, "inertasm") {
+        module.for_each_function(remove_inert_inline_asm);
+    }
+
+    if time_passes {
+        round_cap::report();
+    }
+    if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
+        eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
+        eprintln!("{:#?}", module);
+        eprintln!("==== END IR after all passes ====");
+    }
+}
+
+/// Move every entry-block `ParamRef` into the block's leading
+/// `Alloca`/`ParamRef` run, keeping the relative order of the moved
+/// `ParamRef`s and of everything else.
+///
+/// Lowering emits that prefix, and the x86-64 allocator grants parameters
+/// caller-saved homes only when it still holds
+/// (`regalloc::x86_param_caller_homes_safe_with_config`: a parameter read at
+/// its `ParamRef` must be read before any instruction can clobber its ABI
+/// register). Passes that insert into the entry block -- LICM placing a
+/// hoisted `GlobalAddr` into a preheader that is block 0 -- broke it, and a
+/// leaf loop such as `for (...) if (p[i]) c += E;` then pushed `%rbx` and
+/// `%r12` to copy both parameters into them (GCC 16.2, Clang 23.1.4 and ICX
+/// 2026.2 use none). Moving a `ParamRef` earlier is always sound: it has no
+/// operands and denotes the same value at every point of the function.
+/// `source_spans` (parallel to the instructions under `-g`) move with it,
+/// so the code is identical with and without debug info.
+pub(crate) fn restore_entry_param_prefix(module: &mut IrModule) {
+    for func in &mut module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let Some(entry) = func.blocks.first_mut() else {
+            continue;
+        };
+        let insts = &entry.instructions;
+        let prefix = insts
+            .iter()
+            .take_while(|i| matches!(i, Instruction::Alloca { .. } | Instruction::ParamRef { .. }))
+            .count();
+        if !insts[prefix..]
+            .iter()
+            .any(|i| matches!(i, Instruction::ParamRef { .. }))
+        {
+            continue;
+        }
+        // A stable sort on (prefix, moved ParamRef, rest) is the permutation.
+        let keys: Vec<u8> = insts
+            .iter()
+            .enumerate()
+            .map(|(k, i)| match (k < prefix, i) {
+                (true, _) => 0,
+                (false, Instruction::ParamRef { .. }) => 1,
+                _ => 2,
+            })
+            .collect();
+        let mut insts: Vec<(u8, Instruction)> = keys
+            .iter()
+            .copied()
+            .zip(std::mem::take(&mut entry.instructions))
+            .collect();
+        insts.sort_by_key(|(key, _)| *key);
+        entry.instructions = insts.into_iter().map(|(_, inst)| inst).collect();
+        if entry.source_spans.len() == keys.len() {
+            let mut spans: Vec<(u8, crate::common::source::Span)> = keys
+                .iter()
+                .copied()
+                .zip(std::mem::take(&mut entry.source_spans))
+                .collect();
+            spans.sort_by_key(|(key, _)| *key);
+            entry.source_spans = spans.into_iter().map(|(_, span)| span).collect();
+        }
+    }
+}
+
+/// Opt-in gate for the scalar derived-IV flavor of IVSR (`iv*C` without a
+/// GEP → secondary recurrence).  Factored out of `run_passes` so the
+/// default-OFF contract is unit-testable: the flavor measured as a net
+/// runtime loss while latch phi-web parking exists (the PR #602 golden
+/// regressions), so an unset environment must NEVER enable it.
+fn ivsr_scalar_derived_enabled(run_ivsr: bool) -> bool {
+    run_ivsr && std::env::var("CCC_IVSR_SCALAR_DERIVED").is_ok()
+}
+
+#[cfg(test)]
+mod inert_inline_asm_tests {
+    use super::{asm_constraint_names_no_register, remove_inert_inline_asm};
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator, Value,
+    };
+
+    fn asm_func(
+        template: &str,
+        outputs: Vec<(&str, Value)>,
+        inputs: Vec<(&str, Value)>,
+    ) -> IrFunction {
+        let mut func = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::InlineAsm {
+                template: template.to_string(),
+                outputs: outputs
+                    .into_iter()
+                    .map(|(c, v)| (c.to_string(), v, None))
+                    .collect(),
+                inputs: inputs
+                    .into_iter()
+                    .map(|(c, v)| (c.to_string(), Operand::Value(v), None))
+                    .collect(),
+                clobbers: vec!["memory".to_string()],
+                operand_types: vec![IrType::I64],
+                goto_labels: vec![],
+                input_symbols: vec![],
+                seg_overrides: vec![],
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 8;
+        func
+    }
+
+    #[test]
+    fn memory_only_barrier_is_dropped() {
+        // `asm volatile("" : "+m"(x))`: read-write memory, no register.
+        let mut func = asm_func("", vec![("+m", Value(0))], vec![]);
+        assert_eq!(remove_inert_inline_asm(&mut func), 1);
+        assert!(func.blocks[0].instructions.is_empty());
+    }
+
+    #[test]
+    fn register_operand_keeps_the_instruction() {
+        // The kernel's OPTIMIZER_HIDE_VAR: `asm("" : "=r"(x) : "0"(x))` must
+        // survive, because the tied value still has to reach the output home.
+        let mut func = asm_func("", vec![("=r", Value(1))], vec![("0", Value(1))]);
+        assert_eq!(remove_inert_inline_asm(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.len(), 1);
+    }
+
+    #[test]
+    fn non_empty_template_keeps_the_instruction() {
+        // A real instruction is a real memory barrier for the assembler.
+        let mut func = asm_func(
+            "\n\tlock addq $1, (%rdi)\n\t",
+            vec![],
+            vec![("m", Value(0))],
+        );
+        assert_eq!(remove_inert_inline_asm(&mut func), 0);
+        assert_eq!(func.blocks[0].instructions.len(), 1);
+    }
+
+    #[test]
+    fn asm_goto_is_never_dropped() {
+        let mut func = asm_func("", vec![], vec![("m", Value(0))]);
+        if let Instruction::InlineAsm { goto_labels, .. } = &mut func.blocks[0].instructions[0] {
+            goto_labels.push(("fail".to_string(), BlockId(1)));
+        }
+        assert_eq!(remove_inert_inline_asm(&mut func), 0);
+    }
+
+    #[test]
+    fn constraint_classifier_is_conservative() {
+        for c in [
+            "m", "+m", "=m", "o", "V", "i", "n", "I", "K", "e", "Z", "s", "0", "1",
+        ] {
+            assert!(asm_constraint_names_no_register(c), "{c}");
+        }
+        for c in [
+            "r", "=r", "+r", "g", "a", "b", "c", "d", "S", "D", "A", "f", "x", "v", "q", "Q", "R",
+            "l", "{r12}", "X", "%0",
+        ] {
+            assert!(!asm_constraint_names_no_register(c), "{c}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ivsr_scalar_derived_gate_tests {
+    use super::ivsr_scalar_derived_enabled;
+    use crate::test_support::EnvGuard;
+
+    #[test]
+    fn scalar_derived_ivsr_is_off_by_default() {
+        if !crate::test_support::env_isolate(
+            "passes::ivsr_scalar_derived_gate_tests::scalar_derived_ivsr_is_off_by_default",
+        ) {
+            return;
+        }
+        // Unset environment: the measured-regression flavor stays off even
+        // when IVSR itself runs.
+        let _guard = EnvGuard::unset("CCC_IVSR_SCALAR_DERIVED");
+        assert!(
+            !ivsr_scalar_derived_enabled(true),
+            "default (unset) must not enable scalar derived IVs"
+        );
+    }
+
+    #[test]
+    fn scalar_derived_ivsr_opt_in_and_ivsr_gate() {
+        if !crate::test_support::env_isolate(
+            "passes::ivsr_scalar_derived_gate_tests::scalar_derived_ivsr_opt_in_and_ivsr_gate",
+        ) {
+            return;
+        }
+        let _set = EnvGuard::set("CCC_IVSR_SCALAR_DERIVED", "1");
+        assert!(
+            ivsr_scalar_derived_enabled(true),
+            "explicit opt-in enables the flavor when IVSR runs"
+        );
+        assert!(
+            !ivsr_scalar_derived_enabled(false),
+            "opt-in still requires IVSR itself to be on"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ssa_validator_tests {
+    use super::validate_unique_defs;
+    use crate::common::types::IrType;
+    use crate::ir::module::{IrFunction, IrModule};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrConst, Operand, Terminator, Value,
+    };
+
+    fn module_with_blocks(blocks: Vec<BasicBlock>, next_value_id: u32) -> IrModule {
+        let mut func = IrFunction::new("validator_unit".to_string(), IrType::Void, vec![], false);
+        func.blocks = blocks;
+        func.next_value_id = next_value_id;
+        let mut module = IrModule::new();
+        module.functions.push(func);
+        module
+    }
+
+    fn entry(instructions: Vec<Instruction>) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        }
+    }
+
+    #[test]
+    fn unknown_zero_watermark_uses_the_documented_scan_fallback() {
+        // `0` means “not cached”, not “there are no values”.  This is the
+        // normal shape for small frontend-only functions before a mutating
+        // pass has needed to allocate a fresh id.
+        let module = module_with_blocks(
+            vec![entry(vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(7)),
+            }])],
+            0,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    #[should_panic(expected = "SSA WATERMARK VIOLATION")]
+    fn nonzero_watermark_remains_a_hard_upper_bound() {
+        let module = module_with_blocks(
+            vec![entry(vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I32(7)),
+            }])],
+            1,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    fn static_alloca_is_a_function_frame_declaration_not_an_ordered_def() {
+        // The backend allocates a fixed Alloca in the function prologue.  An
+        // inlined vector body can consequently retain the declaration after a
+        // preceding intrinsic/store has named its address; that is not a
+        // straight-line use-before-definition.  DynAlloca remains ordered.
+        let module = module_with_blocks(
+            vec![entry(vec![
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+            ])],
+            1,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    #[should_panic(expected = "SSA ORDER VIOLATION")]
+    fn dynamic_alloca_remains_an_ordered_definition() {
+        let module = module_with_blocks(
+            vec![entry(vec![
+                Instruction::StackRestore { ptr: Value(0) },
+                Instruction::DynAlloca {
+                    dest: Value(0),
+                    size: Operand::Const(IrConst::I64(16)),
+                    align: 16,
+                },
+            ])],
+            1,
+        );
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    #[test]
+    fn unreachable_phi_predecessor_cannot_crash_the_validator() {
+        // CFG analysis represents dead blocks with usize::MAX in `idom`.
+        // Their incoming phi edges never execute, so the validator must skip
+        // the dynamic dominance relation rather than indexing idom[MAX].
+        let dead = BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(1)),
+                },
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![(Operand::Value(Value(0)), BlockId(1))],
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        };
+        let module = module_with_blocks(vec![entry(vec![]), dead], 2);
+        validate_unique_defs(&module, "unit:strict");
+    }
+
+    // ── phi arity vs reachable predecessors ────────────────────────────────
+
+    fn join_with_phi(incomings: Vec<(Operand, BlockId)>) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(2),
+            instructions: vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: incomings,
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        }
+    }
+
+    fn diamond(phi_block: BasicBlock) -> IrModule {
+        // Classic diamond: entry cond-branches into arm 1 / the join, and
+        // arm 1 falls through into the join, so the join's reachable pred
+        // set is {1 (arm), 0 (entry's false arm)}.
+        let arm = BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        };
+        let entry_blk = BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: vec![],
+        };
+        module_with_blocks(vec![entry_blk, arm, phi_block], 4)
+    }
+
+    #[test]
+    fn phi_covering_all_reachable_preds_is_accepted() {
+        let join = join_with_phi(vec![
+            (Operand::Const(IrConst::I32(1)), BlockId(1)),
+            (Operand::Const(IrConst::I32(2)), BlockId(0)),
+        ]);
+        validate_unique_defs(&diamond(join), "unit:strict");
+    }
+
+    #[test]
+    #[should_panic(expected = "SSA PHI-ARITY VIOLATION")]
+    fn reachable_pred_without_phi_incoming_is_a_violation() {
+        // The live-edge defect class: phi elimination emits one copy per
+        // (reachable pred, incoming) pair, so a reachable predecessor with
+        // no φ entry leaves the φ home without a definition on that edge.
+        let join = join_with_phi(vec![(Operand::Const(IrConst::I32(1)), BlockId(1))]);
+        validate_unique_defs(&diamond(join), "unit:strict");
+    }
+
+    #[test]
+    fn unreachable_pred_legally_has_no_phi_incoming() {
+        // Csmith 20260945 shape: the frontend leaves a dead edge into a
+        // φ block.  phi elimination never visits unreachable blocks, so
+        // the missing incoming is the CONTRACT, not a defect — comparing
+        // against the static pred set instead of the reachable set made
+        // GLA abort every plan on such functions.  The join names BOTH
+        // reachable preds ({1, 0}); only the dead block's edge is absent.
+        let join = join_with_phi(vec![
+            (Operand::Const(IrConst::I32(1)), BlockId(1)),
+            (Operand::Const(IrConst::I32(2)), BlockId(0)),
+        ]);
+        let mut module = diamond(join);
+        // Append a dead block (label 3) branching into the join: a static
+        // predecessor no execution ever takes.
+        let dead = BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        };
+        if let Some(func) = module.functions.first_mut() {
+            func.blocks.push(dead);
+        }
+        validate_unique_defs(&module, "unit:strict");
+    }
+}
+
+#[cfg(test)]
+mod m16_size_policy_tests {
+    use super::apply_m16_size_policy;
+
+    #[test]
+    fn policy_is_limited_to_size_optimized_code16() {
+        for (code16, level) in [(false, 4), (true, 0), (true, 2), (false, 5)] {
+            let mut disabled = String::new();
+            apply_m16_size_policy(&mut disabled, code16, level);
+            assert!(disabled.is_empty(), "code16={code16} level={level}");
+        }
+
+        let mut disabled = "vectorize".to_string();
+        apply_m16_size_policy(&mut disabled, true, 4);
+        assert_eq!(disabled, "vectorize,postinline,ifconv,gaddrcse,licm");
+    }
+
+    // ── restore_phi_prefix ──────────────────────────────────────────────────
+
+    mod phi_prefix {
+        use super::super::restore_phi_prefix;
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{
+            BasicBlock, BlockId, Instruction, IrConst, Operand, Terminator, Value,
+        };
+
+        fn phi(dest: u32) -> Instruction {
+            Instruction::Phi {
+                dest: Value(dest),
+                ty: IrType::I32,
+                incoming: vec![(Operand::Const(IrConst::I32(0)), BlockId(0))],
+            }
+        }
+
+        fn copy(dest: u32) -> Instruction {
+            Instruction::Copy {
+                dest: Value(dest),
+                src: Operand::Const(IrConst::I32(1)),
+            }
+        }
+
+        fn block(instructions: Vec<Instruction>) -> BasicBlock {
+            BasicBlock {
+                label: BlockId(1),
+                instructions,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            }
+        }
+
+        fn shape(b: &BasicBlock) -> Vec<(bool, u32)> {
+            b.instructions
+                .iter()
+                .map(|i| match i {
+                    Instruction::Phi { dest, .. } => (true, dest.0),
+                    _ => (false, i.dest().map(|d| d.0).unwrap_or(u32::MAX)),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn an_already_contiguous_block_is_left_alone() {
+            let mut b = block(vec![phi(1), phi(2), copy(3), copy(4)]);
+            let before = shape(&b);
+            assert!(!restore_phi_prefix(&mut b));
+            assert_eq!(shape(&b), before);
+        }
+
+        #[test]
+        fn a_block_with_no_phis_is_left_alone() {
+            let mut b = block(vec![copy(3), copy(4)]);
+            assert!(!restore_phi_prefix(&mut b));
+            assert_eq!(shape(&b), vec![(false, 3), (false, 4)]);
+        }
+
+        #[test]
+        fn an_empty_block_is_left_alone() {
+            let mut b = block(vec![]);
+            assert!(!restore_phi_prefix(&mut b));
+        }
+
+        #[test]
+        fn a_stranded_phi_is_lifted_above_the_copy() {
+            // Exactly what univsr and cfg_simplify produce: one phi of several
+            // is rewritten into a Copy in place, stranding those after it.
+            let mut b = block(vec![phi(1), copy(9), phi(2), phi(3)]);
+            assert!(restore_phi_prefix(&mut b));
+            assert_eq!(shape(&b), vec![(true, 1), (true, 2), (true, 3), (false, 9)]);
+        }
+
+        #[test]
+        fn relative_order_is_preserved_within_each_group() {
+            let mut b = block(vec![copy(7), phi(1), copy(8), phi(2), copy(9)]);
+            assert!(restore_phi_prefix(&mut b));
+            assert_eq!(
+                shape(&b),
+                vec![(true, 1), (true, 2), (false, 7), (false, 8), (false, 9)]
+            );
+        }
+
+        #[test]
+        fn source_spans_are_permuted_with_their_instructions() {
+            use crate::common::source::Span;
+            let mut b = block(vec![phi(1), copy(9), phi(2)]);
+            // Distinguishable spans, parallel to the instructions.
+            let mk = |start: u32| Span::new(start, start + 1, 0);
+            b.source_spans = vec![mk(10), mk(20), mk(30)];
+            assert!(restore_phi_prefix(&mut b));
+            assert_eq!(shape(&b), vec![(true, 1), (true, 2), (false, 9)]);
+            // The span must follow its instruction, or -g emits .loc against
+            // the wrong line.
+            let starts: Vec<u32> = b.source_spans.iter().map(|s| s.start).collect();
+            assert_eq!(starts, vec![10, 30, 20]);
+        }
+
+        #[test]
+        fn a_desynchronised_span_vector_is_left_untouched() {
+            // Passes have been observed to drop instructions without shrinking
+            // source_spans; permuting a mismatched vector would make it worse.
+            let mut b = block(vec![phi(1), copy(9), phi(2)]);
+            b.source_spans = Vec::new();
+            assert!(restore_phi_prefix(&mut b));
+            assert!(b.source_spans.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod signed_wrap_policy_tests {
+    use super::*;
+    use crate::common::pass_policy::PassPolicy;
+
+    fn apply(module: &mut IrModule, level: u32, wrap: bool, fenv: bool) {
+        run_passes(
+            module,
+            level,
+            crate::backend::Target::X86_64,
+            loop_idiom::Capabilities::default(),
+            false,
+            wrap,
+            fenv,
+            false,
+            FpContract::Off,
+            true,
+            X86Isa::default(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            &crate::backend::regalloc::RaConfig::default(),
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    fn wrapping_policy_resets_for_every_translation_unit_and_level() {
+        let mut first = IrModule::new();
+        first.functions.push(IrFunction::new(
+            "first".into(),
+            crate::common::types::IrType::Void,
+            vec![],
+            false,
+        ));
+        let mut second = IrModule::new();
+        second.functions.push(first.functions[0].clone());
+        // A TU-derived builtin policy (here: the TU defines `memset`) is not
+        // the entry's to reset.
+        let mut defined = crate::common::pass_policy::BuiltinPolicy::HOSTED;
+        defined.withdraw_libcall(crate::common::pass_policy::Libcall::Memset);
+        first.functions[0].pass_policy.builtins = defined;
+        for level in 0..=3 {
+            for wrap in [false, true] {
+                for fenv in [false, true] {
+                    apply(&mut first, level, wrap, fenv);
+                    let expected = PassPolicy::new(wrap, fenv).with_builtins(defined);
+                    assert_eq!(first.functions[0].pass_policy, expected);
+                    // A second TU on the SAME thread must neither inherit nor
+                    // overwrite the first TU's independent contract.
+                    apply(&mut second, 3 - level, !wrap, !fenv);
+                    assert_eq!(
+                        second.functions[0].pass_policy,
+                        PassPolicy::new(!wrap, !fenv)
+                    );
+                    assert_eq!(first.functions[0].pass_policy, expected);
+                    let moved = first.functions[0].clone();
+                    assert_eq!(
+                        std::thread::spawn(move || moved.pass_policy)
+                            .join()
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod entry_param_prefix_tests {
+    use super::restore_entry_param_prefix;
+    use crate::common::source::Span;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrFunction, IrModule, Operand, Terminator, Value,
+    };
+
+    fn param(dest: u32, idx: usize) -> Instruction {
+        Instruction::ParamRef {
+            dest: Value(dest),
+            param_idx: idx,
+            ty: IrType::I32,
+        }
+    }
+
+    fn module(insts: Vec<Instruction>, spans: bool) -> IrModule {
+        let mut f = IrFunction::new("f".to_string(), IrType::I32, vec![], false);
+        let source_spans = if spans {
+            (0u32..)
+                .take(insts.len())
+                .map(|k| Span::new(k, k + 1, 0))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans,
+        }];
+        let mut m = IrModule::new();
+        m.functions = vec![f];
+        m
+    }
+
+    fn shape(m: &IrModule) -> Vec<String> {
+        m.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .map(|i| match i {
+                Instruction::ParamRef { dest, .. } => format!("p{}", dest.0),
+                Instruction::GlobalAddr { dest, .. } => format!("g{}", dest.0),
+                Instruction::Copy { dest, .. } => format!("c{}", dest.0),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn late_param_refs_rejoin_the_prefix_with_their_spans() {
+        let ga = |d| Instruction::GlobalAddr {
+            dest: Value(d),
+            name: "E".to_string(),
+        };
+        let cp = |d| Instruction::Copy {
+            dest: Value(d),
+            src: Operand::Value(Value(0)),
+        };
+        for spans in [false, true] {
+            let mut m = module(
+                vec![param(0, 0), ga(9), param(1, 1), cp(5), param(2, 2)],
+                spans,
+            );
+            restore_entry_param_prefix(&mut m);
+            assert_eq!(shape(&m), ["p0", "p1", "p2", "g9", "c5"]);
+            let got: Vec<u32> = m.functions[0].blocks[0]
+                .source_spans
+                .iter()
+                .map(|s| s.start)
+                .collect();
+            assert_eq!(got, if spans { vec![0, 2, 4, 1, 3] } else { vec![] });
+        }
+    }
+
+    #[test]
+    fn a_well_formed_prefix_is_left_alone() {
+        let mut m = module(
+            vec![
+                param(0, 0),
+                param(1, 1),
+                Instruction::GlobalAddr {
+                    dest: Value(9),
+                    name: "E".to_string(),
+                },
+            ],
+            true,
+        );
+        restore_entry_param_prefix(&mut m);
+        assert_eq!(shape(&m), ["p0", "p1", "g9"]);
+    }
+}

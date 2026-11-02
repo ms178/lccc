@@ -1,0 +1,4 @@
+# Regenerate with ./generate_seeds.sh — toolchain-specific, not committed.
+*.o
+*.a
+*.lds

@@ -1,0 +1,950 @@
+//! Preprocessor conditional expression evaluation.
+//!
+//! This module handles evaluation of preprocessor conditional expressions (`#if`, `#elif`),
+//! including `defined()` operator resolution, `__has_builtin()`, `__has_attribute()`,
+//! `__has_include()`, and `__has_include_next()` detection,
+//! and replacing undefined identifiers with 0 per the C standard.
+//!
+//! All scanning operates on byte slices for performance (no `Vec<char>` allocation).
+
+use super::pipeline::Preprocessor;
+use super::utils::{
+    bytes_to_str, c23_dialect, is_digit_separator, is_ident_cont_byte, is_ident_start_byte,
+};
+
+impl Preprocessor {
+    /// Replace remaining identifiers (not keywords) with 0 in a #if expression.
+    /// Per C standard, after macro expansion, undefined identifiers in #if evaluate to 0.
+    pub(super) fn replace_remaining_idents_with_zero(&self, expr: &str) -> String {
+        let mut result = String::with_capacity(64);
+        let bytes = expr.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            // Skip character literals verbatim
+            if bytes[i] == b'\'' && !is_digit_separator(bytes, i) {
+                result.push(bytes[i] as char);
+                i += 1;
+                while i < len && bytes[i] != b'\'' {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    } else {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+                if i < len && bytes[i] == b'\'' {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+            // Skip string literals verbatim
+            if bytes[i] == b'"' {
+                result.push(bytes[i] as char);
+                i += 1;
+                while i < len && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    } else {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+                if i < len && bytes[i] == b'"' {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i].is_ascii_digit() {
+                // Skip entire number literal
+                result.push(bytes[i] as char);
+                i += 1;
+                if i < len
+                    && bytes[i - 1] == b'0'
+                    && (bytes[i] == b'x'
+                        || bytes[i] == b'X'
+                        || bytes[i] == b'b'
+                        || bytes[i] == b'B')
+                {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.') {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            } else if is_ident_start_byte(bytes[i]) {
+                let start = i;
+                i += 1;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let ident = bytes_to_str(bytes, start, i);
+                if ident == "defined" || (c23_dialect() && (ident == "true" || ident == "false")) {
+                    result.push_str(ident);
+                } else {
+                    result.push('0');
+                }
+            } else {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Replace `defined(X)`, `defined X`, `__has_builtin(X)`, `__has_attribute(X)`,
+    /// `__has_feature(X)`, `__has_extension(X)`, `__has_include(X)`, and
+    /// `__has_include_next(X)` with 0 or 1 in a #if expression.
+    /// Replace `__has_builtin(X)`, `__has_attribute(X)`, `__has_feature(X)`
+    /// and `__has_extension(X)` with 0/1 in an ORDINARY code line.
+    ///
+    /// GCC and Clang implement these as preprocessor built-in macros, so they
+    /// expand EVERYWHERE — not just inside #if. The kernel relies on that:
+    /// kernel/trace/trace.c computes `10*1000 + 4*100 + __has_attribute(
+    /// btf_type_tag)` in a plain C expression. Note `defined` and
+    /// `__has_include` are NOT handled here: `defined` is only an operator
+    /// inside #if/#elif (a code-line `defined` is an ordinary identifier),
+    /// and __has_include's argument grammar (<...>) is directive-only.
+    /// `diag_line` is the 1-BASED source line of the code line being
+    /// expanded (same convention as `process_directive`): any diagnostic
+    /// produced here (`__has_warning` contract violations) must point at
+    /// the line the programmer wrote.
+    pub(super) fn resolve_has_macros_in_code(&mut self, line: &str, diag_line: usize) -> String {
+        // Fast path: the overwhelming majority of lines have no __has_ token.
+        if !line.contains("__has_") {
+            return line.to_string();
+        }
+        let mut result = String::with_capacity(64);
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            // Skip string and char literals verbatim: `"__has_attribute"` in
+            // a string must not be rewritten.
+            if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
+                let quote = bytes[i];
+                result.push(bytes[i] as char);
+                i += 1;
+                while i < len && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < len {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                continue;
+            }
+            if is_ident_start_byte(bytes[i]) {
+                let start = i;
+                i += 1;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let ident = bytes_to_str(bytes, start, i);
+                match ident {
+                    "__has_builtin" => {
+                        let val = self.resolve_has_builtin_call_bytes(bytes, &mut i);
+                        result.push_str(val);
+                    }
+                    "__has_attribute" => {
+                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, false);
+                        result.push_str(val);
+                    }
+                    "__has_c_attribute" => {
+                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
+                        result.push_str(val);
+                    }
+                    "__has_feature" | "__has_extension" => {
+                        self.skip_paren_arg_bytes(bytes, &mut i);
+                        result.push('0');
+                    }
+                    "__has_warning" => {
+                        let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
+                        result.push_str(&val);
+                    }
+                    _ => result.push_str(ident),
+                }
+                continue;
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+        result
+    }
+
+    /// Does this `-W...` name correspond to a warning this compiler
+    /// actually implements (individual flag or accepted group)?
+    fn is_recognized_warning_flag(flag: &str) -> bool {
+        let Some(rest) = flag.strip_prefix("-W") else {
+            return false;
+        };
+        // -Wno-<name> asks about the same warning as -W<name>.
+        let rest = rest.strip_prefix("no-").unwrap_or(rest);
+        // The driver and preprocessor must consult the same registry.
+        crate::common::error::WarningConfig::recognizes_name(rest)
+    }
+
+    /// Clang's `__has_warning("-Wflag")` operator (full contract, Clang
+    /// Preprocessor/__has_warning semantics):
+    ///   * missing '('           -> error, yields 0
+    ///   * zero arguments        -> error (too few arguments), yields 0
+    ///   * non-string argument   -> error, yields 0
+    ///   * not "-W..."           -> warning (__has_warning expected option
+    ///                              name), yields 0
+    ///   * unknown -W flag       -> silently yields 0
+    ///   * recognized flag       -> yields 1
+    /// The verdict consults `is_recognized_warning_flag`, never a blanket
+    /// truth value. Adjacent string literals are concatenated; escapes are
+    /// honoured; the closing ')' is required.
+    fn resolve_has_warning_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        diag_line: usize,
+    ) -> String {
+        macro_rules! diag {
+            ($msg:expr) => {
+                self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                    file: self.current_file(),
+                    line: diag_line,
+                    col: 0,
+                    message: $msg.to_string(),
+                })
+            };
+        }
+        // Clang-severity split: syntactic violations of the operator are
+        // errors; a well-formed call whose argument is not a "-W..."
+        // option name is only a WARNING (it must not reject the TU).
+        macro_rules! warn {
+            ($msg:expr) => {
+                self.warnings.push(super::pipeline::PreprocessorDiagnostic {
+                    file: self.current_file(),
+                    line: diag_line,
+                    col: 0,
+                    message: $msg.to_string(),
+                })
+            };
+        }
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            diag!("missing '(' after '__has_warning'".to_string());
+            return "0".to_string();
+        }
+        *i += 1;
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i < len && bytes[*i] == b')' {
+            *i += 1;
+            diag!("too few arguments to function call, expected 1, have 0".to_string());
+            return "0".to_string();
+        }
+        if *i >= len || bytes[*i] != b'"' {
+            diag!("expected string literal in '__has_warning'".to_string());
+            while *i < len && bytes[*i] != b')' {
+                *i += 1;
+            }
+            if *i < len {
+                *i += 1;
+            } else {
+                diag!("missing ')' after '__has_warning'".to_string());
+            }
+            return "0".to_string();
+        }
+        // Concatenated string literals, escape-aware.
+        let mut arg = String::new();
+        let mut terminated = true;
+        while *i < len && bytes[*i] == b'"' {
+            *i += 1;
+            let mut closed = false;
+            while *i < len {
+                let c = bytes[*i];
+                if c == b'\\' && *i + 1 < len {
+                    arg.push(c as char);
+                    arg.push(bytes[*i + 1] as char);
+                    *i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    closed = true;
+                    *i += 1;
+                    break;
+                }
+                arg.push(c as char);
+                *i += 1;
+            }
+            if !closed {
+                terminated = false;
+                break;
+            }
+            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+                *i += 1;
+            }
+        }
+        if !terminated {
+            diag!("unterminated string literal in '__has_warning'".to_string());
+            while *i < len && bytes[*i] != b')' {
+                *i += 1;
+            }
+            if *i < len {
+                *i += 1;
+            }
+            return "0".to_string();
+        }
+        // Anything but ')' after the literal is malformed.
+        let mut junk = false;
+        while *i < len && bytes[*i] != b')' {
+            if bytes[*i] != b' ' && bytes[*i] != b'\t' {
+                junk = true;
+            }
+            *i += 1;
+        }
+        if *i < len {
+            *i += 1;
+        } else {
+            diag!("missing ')' after '__has_warning'".to_string());
+            return "0".to_string();
+        }
+        if junk {
+            // Malformed tail: treat as not-a-warning without advertising.
+            return "0".to_string();
+        }
+        if !arg.starts_with("-W") {
+            warn!("__has_warning expected option name".to_string());
+            return "0".to_string();
+        }
+        if Self::is_recognized_warning_flag(&arg) {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        }
+    }
+
+    pub(super) fn resolve_defined_in_expr(&mut self, expr: &str, diag_line: usize) -> String {
+        let mut result = String::with_capacity(64);
+        let bytes = expr.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        while i < len {
+            if is_ident_start_byte(bytes[i]) {
+                let start = i;
+                i += 1;
+                while i < len && is_ident_cont_byte(bytes[i]) {
+                    i += 1;
+                }
+                let ident = bytes_to_str(bytes, start, i);
+
+                if ident == "defined" {
+                    while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                        i += 1;
+                    }
+                    let has_paren = if i < len && bytes[i] == b'(' {
+                        i += 1;
+                        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                            i += 1;
+                        }
+                        true
+                    } else {
+                        false
+                    };
+
+                    let name_start = i;
+                    while i < len && is_ident_cont_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    let name = bytes_to_str(bytes, name_start, i);
+
+                    if has_paren {
+                        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                            i += 1;
+                        }
+                        if i < len && bytes[i] == b')' {
+                            i += 1;
+                        }
+                    }
+
+                    let is_def = self.macros.is_defined(name);
+                    result.push_str(if is_def { "1" } else { "0" });
+                } else if ident == "__has_builtin" {
+                    let val = self.resolve_has_builtin_call_bytes(bytes, &mut i);
+                    result.push_str(val);
+                } else if ident == "__has_attribute" {
+                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, false);
+                    result.push_str(val);
+                } else if ident == "__has_c_attribute" {
+                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
+                    result.push_str(val);
+                } else if ident == "__has_feature" || ident == "__has_extension" {
+                    self.skip_paren_arg_bytes(bytes, &mut i);
+                    result.push('0');
+                } else if ident == "__has_include" {
+                    let val = self.resolve_has_include_call_bytes(bytes, &mut i, false);
+                    result.push_str(val);
+                } else if ident == "__has_include_next" {
+                    let val = self.resolve_has_include_call_bytes(bytes, &mut i, true);
+                    result.push_str(val);
+                } else if ident == "__has_embed" {
+                    let val = self.resolve_has_embed_call_bytes(bytes, &mut i, diag_line);
+                    result.push_str(&val);
+                } else if ident == "__has_warning" {
+                    let val = self.resolve_has_warning_call_bytes(bytes, &mut i, diag_line);
+                    result.push_str(&val);
+                } else {
+                    result.push_str(ident);
+                }
+                continue;
+            }
+
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+
+        result
+    }
+
+    /// Parse `(name)` after `__has_builtin` and return "1" or "0" (byte-oriented).
+    fn resolve_has_builtin_call_bytes(&self, bytes: &[u8], i: &mut usize) -> &'static str {
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            return "0";
+        }
+        *i += 1;
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        let start = *i;
+        while *i < len && is_ident_cont_byte(bytes[*i]) {
+            *i += 1;
+        }
+        let name = bytes_to_str(bytes, start, *i);
+        while *i < len && bytes[*i] != b')' {
+            *i += 1;
+        }
+        if *i < len {
+            *i += 1;
+        }
+        // GCC 16.2 conditions many GNU x86 builtins on a target flag
+        // (measured: `__has_builtin(__builtin_ia32_maxps256)` is 0 at
+        // default and 1 under -mavx, while the call itself already errors
+        // without the extension). The availability table mirrors that
+        // sweep; the feature macros it names are defined by exactly the
+        // same flags GCC uses to answer, implication chain included.
+        if Self::is_supported_builtin(name)
+            && crate::common::x86_builtin_availability::x86_builtin_feature_macro(name)
+                .is_none_or(|feature_macro| self.macros.is_defined(feature_macro))
+        {
+            "1"
+        } else {
+            "0"
+        }
+    }
+
+    /// Parse `(attribute-token)` after `__has_attribute` (`c_syntax` false)
+    /// or `__has_c_attribute` (true) and return its value, following GCC
+    /// 16.2 in every dialect:
+    /// * a standard attribute (C23 6.7.13), in either spelling, is
+    ///   `202311` under both operators;
+    /// * `gnu::name` / `__gnu__::__name__` is 1 when `name` is a supported
+    ///   GNU attribute, and any other vendor scope is 0;
+    /// * an unscoped GNU attribute is 1 under `__has_attribute` but 0 under
+    ///   `__has_c_attribute` (the `[[...]]` syntax spells it `gnu::name`).
+    fn resolve_has_attribute_call_bytes(
+        &self,
+        bytes: &[u8],
+        i: &mut usize,
+        c_syntax: bool,
+    ) -> &'static str {
+        let len = bytes.len();
+        let skip_blanks = |i: &mut usize| {
+            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+                *i += 1;
+            }
+        };
+        let ident = |i: &mut usize| {
+            let start = *i;
+            while *i < len && is_ident_cont_byte(bytes[*i]) {
+                *i += 1;
+            }
+            bytes_to_str(bytes, start, *i)
+        };
+        skip_blanks(i);
+        if *i >= len || bytes[*i] != b'(' {
+            return "0";
+        }
+        *i += 1;
+        skip_blanks(i);
+        let first = ident(i);
+        skip_blanks(i);
+        let scoped = *i + 1 < len && bytes[*i] == b':' && bytes[*i + 1] == b':';
+        let (scope, name) = if scoped {
+            *i += 2;
+            skip_blanks(i);
+            (Some(first), ident(i))
+        } else {
+            (None, first)
+        };
+        while *i < len && bytes[*i] != b')' {
+            *i += 1;
+        }
+        if *i < len {
+            *i += 1;
+        }
+        attribute_token_value(scope, name, c_syntax)
+    }
+
+    /// Parse `(<header.h>)` or `("header.h")` after `__has_include` / `__has_include_next`
+    /// and return "1" or "0" based on whether the header can be found.
+    fn resolve_has_include_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        is_next: bool,
+    ) -> &'static str {
+        let len = bytes.len();
+        // Skip whitespace
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            return "0";
+        }
+        *i += 1; // skip '('
+        // Skip whitespace
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+
+        // Determine if system include (<...>) or quoted ("...")
+        let (header_name, is_system) = if *i < len && bytes[*i] == b'<' {
+            *i += 1; // skip '<'
+            let start = *i;
+            while *i < len && bytes[*i] != b'>' {
+                *i += 1;
+            }
+            let name = bytes_to_str(bytes, start, *i);
+            if *i < len {
+                *i += 1;
+            } // skip '>'
+            (name, true)
+        } else if *i < len && bytes[*i] == b'"' {
+            *i += 1; // skip '"'
+            let start = *i;
+            while *i < len && bytes[*i] != b'"' {
+                *i += 1;
+            }
+            let name = bytes_to_str(bytes, start, *i);
+            if *i < len {
+                *i += 1;
+            } // skip closing '"'
+            (name, false)
+        } else {
+            // Fallback: try to read as identifier (e.g. macro-expanded argument)
+            let start = *i;
+            while *i < len && bytes[*i] != b')' {
+                *i += 1;
+            }
+            let name = bytes_to_str(bytes, start, *i).trim();
+            (name, false)
+        };
+
+        // Skip to closing paren
+        while *i < len && bytes[*i] != b')' {
+            *i += 1;
+        }
+        if *i < len {
+            *i += 1;
+        } // skip ')'
+
+        if header_name.is_empty() {
+            return "0";
+        }
+
+        // Use the preprocessor's include path resolution
+        let found = if is_next {
+            self.resolve_include_next_path(header_name).is_some()
+        } else {
+            self.resolve_include_path(header_name, is_system).is_some()
+        };
+
+        if found { "1" } else { "0" }
+    }
+
+    /// C23 `__has_embed(...)`: parse the balanced parenthesized argument
+    /// (filename spec + optional embed parameters) and probe the resource.
+    /// Yields the numeric `__STDC_EMBED_*` value: 0 not found / unsupported
+    /// parameter, 1 found and non-empty, 2 found but empty.
+    fn resolve_has_embed_call_bytes(
+        &mut self,
+        bytes: &[u8],
+        i: &mut usize,
+        diag_line: usize,
+    ) -> String {
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i >= len || bytes[*i] != b'(' {
+            // Malformed operand; the #if evaluator treats it as absent.
+            return "0".to_string();
+        }
+        *i += 1; // skip '('
+        let start = *i;
+        let mut depth = 1usize;
+        // Literal-aware balance scan: parens inside string/char literals
+        // do not terminate the operand.
+        while *i < len && depth > 0 {
+            let c = bytes[*i];
+            if c == b'"' || c == b'\'' {
+                let quote = c;
+                *i += 1;
+                while *i < len && bytes[*i] != quote {
+                    if bytes[*i] == b'\\' && *i + 1 < len {
+                        *i += 1;
+                    }
+                    *i += 1;
+                }
+            } else {
+                match c {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth > 0 {
+                *i += 1;
+            }
+        }
+        let inner = bytes_to_str(bytes, start, *i);
+        if *i < len {
+            *i += 1; // skip ')'
+        }
+        (self.probe_embed(inner, diag_line) as i64).to_string()
+    }
+
+    /// Skip a parenthesized argument (byte-oriented).
+    fn skip_paren_arg_bytes(&self, bytes: &[u8], i: &mut usize) {
+        let len = bytes.len();
+        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+            *i += 1;
+        }
+        if *i < len && bytes[*i] == b'(' {
+            *i += 1;
+            let mut depth = 1;
+            while *i < len && depth > 0 {
+                if bytes[*i] == b'(' {
+                    depth += 1;
+                } else if bytes[*i] == b')' {
+                    depth -= 1;
+                }
+                *i += 1;
+            }
+        }
+    }
+
+    /// Check if a builtin function name is supported by this compiler.
+    /// Delegates to the sema builtin registry (BUILTIN_MAP + atomic builtins)
+    /// and adds a few names handled as special syntax rather than function calls.
+    pub(super) fn is_supported_builtin(name: &str) -> bool {
+        // Check the canonical builtin registry (covers BUILTIN_MAP, __builtin_choose_expr,
+        // __builtin_unreachable, __builtin_trap, and all __atomic_*/__sync_* builtins)
+        if crate::frontend::sema::builtins::is_builtin(name) {
+            return true;
+        }
+        // These are handled as special syntax (dedicated AST nodes or parser keywords)
+        // rather than through the normal builtin function call path, so they are not
+        // in the sema builtin registry but are still supported.
+        matches!(
+            name,
+            "__builtin_va_arg" |              // Special token (BuiltinVaArg)
+            "__builtin_types_compatible_p" |  // Special AST node (BuiltinTypesCompatibleP)
+            "__builtin_convertvector" |       // Special AST node (ConvertVector)
+            "__builtin_bit_cast" |            // Special AST node (BitCast)
+            "__builtin_offsetof" |            // Predefined macro
+            "__builtin_LINE" |                // Expanded by the preprocessor
+            "__builtin_FILE" |
+            "__builtin_FUNCTION"
+        )
+    }
+
+    /// Check if an attribute is supported by this compiler.
+    pub(super) fn is_supported_attribute(name: &str) -> bool {
+        matches!(
+            name,
+            "aligned"
+                | "__aligned__"
+                | "packed"
+                | "__packed__"
+                | "unused"
+                | "__unused__"
+                | "used"
+                | "__used__"
+                | "weak"
+                | "__weak__"
+                | "alias"
+                | "__alias__"
+                | "ifunc"
+                | "__ifunc__"
+                | "counted_by"
+                | "__counted_by__"
+                | "section"
+                | "__section__"
+                | "visibility"
+                | "__visibility__"
+                | "deprecated"
+                | "__deprecated__"
+                | "noreturn"
+                | "__noreturn__"
+                | "noinline"
+                | "__noinline__"
+                | "always_inline"
+                | "__always_inline__"
+                | "stack_protect"
+                | "__stack_protect__"
+                | "no_stack_protector"
+                | "__no_stack_protector__"
+                | "diagnose_as"
+                | "__diagnose_as"
+                | "__diagnose_as__"
+                | "diagnose_as_builtin"
+                | "__diagnose_as_builtin__"
+                | "constructor"
+                | "__constructor__"
+                | "destructor"
+                | "__destructor__"
+                | "format"
+                | "__format__"
+                | "warn_unused_result"
+                | "__warn_unused_result__"
+                | "nonnull"
+                | "__nonnull__"
+                | "const"
+                | "__const__"
+                | "pure"
+                | "__pure__"
+                | "cold"
+                | "__cold__"
+                | "hot"
+                | "__hot__"
+                | "malloc"
+                | "__malloc__"
+                | "sentinel"
+                | "__sentinel__"
+                | "may_alias"
+                | "__may_alias__"
+                | "transparent_union"
+                | "__transparent_union__"
+                | "error"
+                | "__error__"
+                | "warning"
+                | "__warning__"
+                | "cleanup"
+                | "__cleanup__"
+                | "fallthrough"
+                | "__fallthrough__"
+                | "flatten"
+                | "__flatten__"
+                | "nonstring"
+                | "__nonstring__"
+                | "uninitialized"
+                | "__uninitialized__"
+                | "annotate"
+                | "__annotate__"
+                | "no_instrument_function"
+                | "__no_instrument_function__"
+                | "alloc_size"
+                | "__alloc_size__"
+                | "format_arg"
+                | "__format_arg__"
+                | "no_sanitize"
+                | "__no_sanitize__"
+                | "no_sanitize_address"
+                | "__no_sanitize_address__"
+                | "no_sanitize_thread"
+                | "__no_sanitize_thread__"
+                | "no_sanitize_undefined"
+                | "__no_sanitize_undefined__"
+                | "zero_call_used_regs"
+                | "__zero_call_used_regs__"
+                | "noclone"
+                | "__noclone__"
+                | "optimize"
+                | "__optimize__"
+                | "target"
+                | "__target__"
+                | "target_clones"
+                | "__target_clones__"
+                | "assume_aligned"
+                | "__assume_aligned__"
+                | "returns_nonnull"
+                | "__returns_nonnull__"
+                | "externally_visible"
+                | "__externally_visible__"
+                | "artificial"
+                | "__artificial__"
+                | "leaf"
+                | "__leaf__"
+                | "access"
+                | "__access__"
+                | "fd_arg"
+                | "__fd_arg__"
+                | "tls_model"
+                | "__tls_model__"
+                // Type attributes the parser implements (parse.rs attribute
+                // dispatch) but that were missing here, so feature-tested
+                // code (`#if __has_attribute(vector_size)`) silently fell
+                // back to its scalar path under lccc while GCC 16 and Clang
+                // answer 1 for every one of them (GCC: all but
+                // `ext_vector_type`/`address_space`; Clang: all but the
+                // GCC-only `mode`/`symver`/`scalar_storage_order`).
+                | "vector_size"
+                | "__vector_size__"
+                | "ext_vector_type"
+                | "__ext_vector_type__"
+                | "mode"
+                | "__mode__"
+                | "address_space"
+                | "__address_space__"
+                | "scalar_storage_order"
+                | "__scalar_storage_order__"
+                | "common"
+                | "__common__"
+                | "weakref"
+                | "__weakref__"
+                | "symver"
+                | "__symver__"
+                | "gnu_inline"
+                | "__gnu_inline__"
+                | "fastcall"
+                | "__fastcall__"
+                | "regparm"
+                | "__regparm__"
+                | "naked"
+                | "__naked__"
+        )
+    }
+}
+
+/// Strip the reserved `__x__` spelling of an attribute name or scope.
+fn attribute_base_name(name: &str) -> &str {
+    name.strip_prefix("__")
+        .and_then(|n| n.strip_suffix("__"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or(name)
+}
+
+/// The value of `__has_attribute` / `__has_c_attribute` for one attribute
+/// token (see `Preprocessor::resolve_has_attribute_call_bytes`).
+fn attribute_token_value(scope: Option<&str>, name: &str, c_syntax: bool) -> &'static str {
+    let supported_gnu = |n: &str| Preprocessor::is_supported_attribute(attribute_base_name(n));
+    match scope.map(attribute_base_name) {
+        Some("gnu") => {
+            if supported_gnu(name) {
+                "1"
+            } else {
+                "0"
+            }
+        }
+        Some(_) => "0",
+        None => match attribute_base_name(name) {
+            "deprecated" | "fallthrough" | "maybe_unused" | "nodiscard" | "noreturn"
+            | "_Noreturn" | "unsequenced" | "reproducible" => "202311",
+            _ if !c_syntax && supported_gnu(name) => "1",
+            _ => "0",
+        },
+    }
+}
+
+#[cfg(test)]
+mod has_attribute_tests {
+    /// `__has_attribute` / `__has_c_attribute` values, measured on GCC 16.2
+    /// (identical under -std=gnu17 and -std=c23).
+    #[test]
+    fn attribute_token_values_match_gcc() {
+        use super::attribute_token_value as v;
+        for std_attr in [
+            "nodiscard",
+            "__nodiscard__",
+            "deprecated",
+            "fallthrough",
+            "maybe_unused",
+            "noreturn",
+            "_Noreturn",
+            "unsequenced",
+            "reproducible",
+        ] {
+            assert_eq!(v(None, std_attr, true), "202311", "{std_attr}");
+            assert_eq!(v(None, std_attr, false), "202311", "{std_attr}");
+        }
+        assert_eq!(v(Some("gnu"), "packed", true), "1");
+        assert_eq!(v(Some("__gnu__"), "__packed__", false), "1");
+        assert_eq!(v(Some("gnu"), "nonexistent_zz", true), "0");
+        assert_eq!(v(Some("clang"), "fallthrough", true), "0");
+        assert_eq!(v(None, "packed", true), "0");
+        assert_eq!(v(None, "packed", false), "1");
+        assert_eq!(v(None, "foo_zz", false), "0");
+    }
+
+    use super::*;
+
+    /// Every attribute the parser's attribute dispatch implements must be
+    /// reported by `__has_attribute`, otherwise feature-tested code takes
+    /// its fallback path under lccc. The list mirrors the named arms in
+    /// `parse.rs` (`parse_gnu_attribute_list`); extend both together.
+    #[test]
+    fn parser_implemented_attributes_are_reported() {
+        for name in [
+            "aligned",
+            "packed",
+            "vector_size",
+            "ext_vector_type",
+            "mode",
+            "address_space",
+            "scalar_storage_order",
+            "common",
+            "weakref",
+            "ifunc",
+            "symver",
+            "gnu_inline",
+            "fastcall",
+            "regparm",
+            "naked",
+            "cleanup",
+            "transparent_union",
+            "may_alias",
+        ] {
+            assert!(
+                Preprocessor::is_supported_attribute(name),
+                "__has_attribute({name}) must be 1"
+            );
+            let underscored = format!("__{name}__");
+            assert!(
+                Preprocessor::is_supported_attribute(&underscored),
+                "__has_attribute({underscored}) must be 1"
+            );
+        }
+        assert!(!Preprocessor::is_supported_attribute("no_such_attribute"));
+    }
+}

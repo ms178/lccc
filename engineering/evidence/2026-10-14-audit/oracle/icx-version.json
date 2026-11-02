@@ -1,0 +1,59 @@
+{
+  "inputFilename": "example.c",
+  "code": 0,
+  "okToCache": true,
+  "timedOut": false,
+  "stdout": [
+    {
+      "text": "Intel(R) oneAPI DPC++/C++ Compiler 2024.0.0 (2024.0.0.20231017)"
+    },
+    {
+      "text": "Target: x86_64-unknown-linux-gnu"
+    },
+    {
+      "text": "Thread model: posix"
+    },
+    {
+      "text": "InstalledDir: /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler"
+    },
+    {
+      "text": "Configuration file: /cefs/33/33ffeb1993568d15542a3061_consolidated/compilers_c++_intel-cpp_2024.0.0.49524/compiler/2024.0/bin/compiler/../icx.cfg"
+    }
+  ],
+  "stderr": [
+    {
+      "text": "icx: ^[[0;1;34mremark: ^[[0m^[[1mNote that use of '-g' without any optimization-level option will turn off most compiler optimizations similar to use of '-O0'; use '-Rno-debug-disables-optimization' to disable this remark [-Rdebug-disables-optimization]^[[0m"
+    }
+  ],
+  "truncated": false,
+  "execTime": 243,
+  "processExecutionResultTime": 0.0647369995713234,
+  "instructionSet": "amd64",
+  "compilationOptions": [
+    "-g",
+    "-o",
+    "/app/output.s",
+    "-fno-verbose-asm",
+    "-S",
+    "--gcc-toolchain=/opt/compiler-explorer/gcc-13.2.0",
+    "-fcolor-diagnostics",
+    "-fno-crash-diagnostics",
+    "--version",
+    "/app/example.c"
+  ],
+  "downloads": [],
+  "tools": [],
+  "asm": [
+    {
+      "text": "<No output file>",
+      "source": null,
+      "labels": []
+    }
+  ],
+  "optOutput": [],
+  "labelDefinitions": {},
+  "parsingTime": 0,
+  "filteredCount": 0,
+  "popularArguments": {},
+  "queueTime": 4
+}

@@ -1,0 +1,56 @@
+[
+  {
+    "arm": "main63",
+    "compiler_sha256": "34d37df9c6d7e805acff976ab5798d36bae53bc1d99f58005326cc7e3cdff8aa",
+    "command": [
+      "/home/user/.cache/pr831/arms/main63/lccc",
+      "-O2",
+      "-fwrapv",
+      "tests/regression/rotation_signed_wrap.c",
+      "-o",
+      "/tmp/tmpo9a7__fb/main63"
+    ],
+    "env": {
+      "CCC_LOOP_ROTATE": "1"
+    },
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "==535138== Memcheck, a memory error detector\n==535138== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==535138== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==535138== Command: /tmp/tmpo9a7__fb/main63\n==535138== \n==535138== \n==535138== HEAP SUMMARY:\n==535138==     in use at exit: 0 bytes in 0 blocks\n==535138==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==535138== \n==535138== All heap blocks were freed -- no leaks are possible\n==535138== \n==535138== For lists of detected and suppressed errors, rerun with: -s\n==535138== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+  },
+  {
+    "arm": "pr831-refreshed",
+    "compiler_sha256": "a7ed15ca95057f8e8ca6723e80149ee244e3190cabfe9c3e93e7ad1d3abdf4ce",
+    "command": [
+      "/home/user/.cache/pr831/arms/pr831-refreshed/lccc",
+      "-O2",
+      "-fwrapv",
+      "tests/regression/rotation_signed_wrap.c",
+      "-o",
+      "/tmp/tmpo9a7__fb/pr831-refreshed"
+    ],
+    "env": {
+      "CCC_LOOP_ROTATE": "1"
+    },
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "==535141== Memcheck, a memory error detector\n==535141== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==535141== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==535141== Command: /tmp/tmpo9a7__fb/pr831-refreshed\n==535141== \n==535141== \n==535141== HEAP SUMMARY:\n==535141==     in use at exit: 0 bytes in 0 blocks\n==535141==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==535141== \n==535141== All heap blocks were freed -- no leaks are possible\n==535141== \n==535141== For lists of detected and suppressed errors, rerun with: -s\n==535141== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+  },
+  {
+    "arm": "final",
+    "compiler_sha256": "3b78f2e710e8c0d7fd3949a005623d3abcbe3455fbba085caeb44df2b9f40656",
+    "command": [
+      "/home/user/.cache/pr831/arms/final/lccc",
+      "-O2",
+      "-fwrapv",
+      "tests/regression/rotation_signed_wrap.c",
+      "-o",
+      "/tmp/tmpo9a7__fb/final"
+    ],
+    "env": {
+      "CCC_LOOP_ROTATE": "1"
+    },
+    "returncode": 0,
+    "stdout": "",
+    "stderr": "==535144== Memcheck, a memory error detector\n==535144== Copyright (C) 2002-2026, and GNU GPL'd, by Julian Seward et al.\n==535144== Using Valgrind-3.27.1 and LibVEX; rerun with -h for copyright info\n==535144== Command: /tmp/tmpo9a7__fb/final\n==535144== \n==535144== \n==535144== HEAP SUMMARY:\n==535144==     in use at exit: 0 bytes in 0 blocks\n==535144==   total heap usage: 0 allocs, 0 frees, 0 bytes allocated\n==535144== \n==535144== All heap blocks were freed -- no leaks are possible\n==535144== \n==535144== For lists of detected and suppressed errors, rerun with: -s\n==535144== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+  }
+]

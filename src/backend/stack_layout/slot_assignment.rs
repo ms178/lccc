@@ -1,0 +1,2111 @@
+//! Slot assignment: classification of instructions into allocation tiers,
+//! block-local greedy slot reuse (Tier 3), liveness-based packing (Tier 2),
+//! deferred slot finalization, copy alias resolution, and wide value propagation.
+//!
+//! This module implements Phases 2-7 of the three-tier stack allocation scheme.
+
+use crate::backend::liveness::{
+    compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
+};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::StackSlot;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator, Value};
+
+use super::{BlockLocalValue, DeferredSlot, MultiBlockValue, StackLayoutContext};
+
+/// Place `func.ssp.stack_guard_alloca` at the start of `non_local_space` on
+/// negative-offset architectures (x86-64, i686, RISC-V), where smaller
+/// displacement from FP corresponds to the highest local stack address.
+pub(super) fn place_stack_guard_early(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    non_local_space: &mut i64,
+) {
+    let Some(guard) = func.ssp.stack_guard_alloca else {
+        return;
+    };
+    let ptr_size = crate::common::types::target_ptr_size() as i64;
+    let (probe_slot, _) = assign_slot(*non_local_space, ptr_size, ptr_size);
+    if probe_slot < 0 {
+        let (slot, new_space) = assign_slot(*non_local_space, ptr_size, ptr_size);
+        let word_ty = if ptr_size == 4 {
+            IrType::U32
+        } else {
+            IrType::U64
+        };
+        state.alloca_values.insert(guard.0);
+        state.alloca_types.insert(guard.0, word_ty);
+        state.protected_slot_values.insert(guard.0);
+        state.volatile_alloca_values.insert(guard.0);
+        state.value_locations.insert(guard.0, StackSlot(slot));
+        *non_local_space = new_space;
+    }
+}
+
+/// Place `func.ssp.stack_guard_alloca` at the top of `total_space` on
+/// positive-offset architectures (AArch64), where larger offset from `x29`/`sp`
+/// corresponds to the highest local stack address.
+pub(super) fn place_stack_guard_late(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    total_space: i64,
+) -> i64 {
+    let Some(guard) = func.ssp.stack_guard_alloca else {
+        return total_space;
+    };
+    if state.value_locations.contains_key(&guard.0) {
+        return total_space;
+    }
+    let ptr_size = crate::common::types::target_ptr_size() as i64;
+    let (slot, new_space) = assign_slot(total_space, ptr_size, ptr_size);
+    let word_ty = if ptr_size == 4 {
+        IrType::U32
+    } else {
+        IrType::U64
+    };
+    state.alloca_values.insert(guard.0);
+    state.alloca_types.insert(guard.0, word_ty);
+    state.protected_slot_values.insert(guard.0);
+    state.volatile_alloca_values.insert(guard.0);
+    state.value_locations.insert(guard.0, StackSlot(slot));
+    new_space
+}
+
+/// Whether `func` contains a `__builtin_setjmp` intrinsic (a returns-twice
+/// function).  Such functions must never rely on liveness models that only
+/// cover the ordinary CFG: the resume edge from any call that longjmps back
+/// into the setjmp frame re-enters the function at the setjmp site.
+pub(crate) fn has_builtin_setjmp(func: &IrFunction) -> bool {
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                    ..
+                }
+            )
+        })
+    })
+}
+
+/// Determine if a non-alloca value can be assigned to a block-local pool slot (Tier 3).
+/// Returns `Some(def_block_idx)` if the value is defined and used only within a
+/// single block, making it safe to share stack space with values from other blocks.
+/// Maximum number of IR instructions in a block for Tier 3 greedy slot reuse.
+/// Above this threshold, the accumulator-based codegen's instruction ordering
+/// diverges too much from IR instruction order, making the greedy coloring's
+/// liveness analysis unreliable. Large blocks use Tier 2 (liveness-packed)
+/// which uses proper live interval computation instead.
+pub(super) const MAX_TIER3_BLOCK_INSTRUCTIONS: usize = 200;
+
+pub(super) fn coalescable_group(
+    val_id: u32,
+    ctx: &StackLayoutContext,
+    state: &crate::backend::state::CodegenState,
+) -> Option<usize> {
+    if !ctx.coalesce {
+        return None;
+    }
+    // Protected values (DynAlloca results, vector temps) must use Tier 2 (multi-block)
+    // to get permanent, non-reusable slots. Tier 3 (block-local) slots are shared
+    // across blocks via deferred finalization, which can cause aliasing issues.
+    if state.protected_slot_values.contains(&val_id) {
+        return None;
+    }
+    // Values defined in multiple blocks (from phi elimination) must use Tier 2.
+    if ctx.multi_def_values.contains(&val_id) {
+        return None;
+    }
+    if let Some(&def_blk) = ctx.def_block.get(&val_id) {
+        // Values used as phi incoming must NOT be block-local because phi
+        // elimination places Copies at predecessor block ends. If the source
+        // value's slot was already reused (Tier 3 block-local), the phi Copy
+        // reads garbage. Check all blocks for phi references.
+        if ctx.phi_incoming_values.contains(&val_id) {
+            return None;
+        }
+
+        if let Some(blocks) = ctx.use_blocks_map.get(&val_id) {
+            let mut unique: Vec<usize> = blocks.clone();
+            unique.sort_unstable();
+            unique.dedup();
+
+            if unique.is_empty() {
+                return Some(def_blk); // Dead value, safe to coalesce.
+            }
+
+            // Single-block value: defined and used in the same block.
+            // Skip Tier 3 for large blocks where greedy coloring is unreliable.
+            if unique.len() == 1 && unique[0] == def_blk {
+                if ctx.large_blocks.contains(&def_blk) {
+                    return None; // Use Tier 2 for large blocks
+                }
+                return Some(def_blk);
+            }
+        } else {
+            return Some(def_blk); // No uses - dead value.
+        }
+    }
+    None
+}
+
+/// Walk all instructions and classify each into Tier 1 (permanent alloca slots),
+/// Tier 2 (multi-block, liveness-packed), or Tier 3 (block-local, greedy reuse).
+pub(super) fn classify_instructions(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    ctx: &StackLayoutContext,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    reg_assigned: &FxHashMap<u32, PhysReg>,
+    non_local_space: &mut i64,
+    deferred_slots: &mut Vec<DeferredSlot>,
+    multi_block_values: &mut Vec<MultiBlockValue>,
+    block_local_values: &mut Vec<BlockLocalValue>,
+    block_space: &mut FxHashMap<usize, i64>,
+    max_block_local_space: &mut i64,
+) {
+    let mut collected_values: FxHashSet<u32> = FxHashSet::default();
+
+    // Values whose codegen materialisation width is >4 bytes: the emitters
+    // move these with `movq`, so a 4-byte small slot would make the reload
+    // read four bytes of the neighbouring slot (`ZSTD_decodeLiteralsBlock`
+    // in the -O2 preboot decompressor stored `movl %eax,80(%rsp)` on one CFG
+    // path and the join reloaded `movq 80(%rsp),%rax`). Sizing the slot from
+    // the defining instruction's `result_type()` alone is not enough because
+    // Copy/Phi dests inherit their type from an incoming value that may be
+    // wider. Refusing the narrow slot is strictly conservative: slots only
+    // ever get bigger, never smaller.
+    let wide_typed: FxHashSet<u32> = crate::backend::common::wide_typed_values(func);
+
+    // Copy has no result type in the IR, but on i686 a copy of a value no
+    // wider than one GPR is itself no wider than one GPR.  Infer that fact to
+    // a fixed point before assigning slots.  Doing this during the allocation
+    // walk is insufficient: phi elimination may put a backedge Copy before
+    // the typed producer in block order, and an 8-byte fallback slot then
+    // prevents otherwise-safe copy-slot coalescing with its 4-byte source.
+    //
+    // This set is intentionally i686-only.  x86-64's established small-slot
+    // contract remains unchanged; pointers and ordinary integer Copy webs are
+    // eight bytes there unless an instruction carries an explicit narrow type.
+    let mut compact_i686_values: FxHashSet<u32> = FxHashSet::default();
+    if crate::common::types::target_is_32bit()
+        && crate::common::types::target_small_slots()
+        && std::env::var_os("CCC_NO_SMALL_SLOTS").is_none()
+    {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (Some(dest), Some(ty)) = (inst.dest(), inst.result_type()) {
+                    if ty != IrType::Void && ty.size() <= 4 {
+                        compact_i686_values.insert(dest.0);
+                    }
+                }
+                if let Instruction::Copy {
+                    dest,
+                    src:
+                        Operand::Const(
+                            IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::F32(_),
+                        ),
+                } = inst
+                {
+                    compact_i686_values.insert(dest.0);
+                }
+            }
+        }
+        loop {
+            let before = compact_i686_values.len();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    } = inst
+                    {
+                        if compact_i686_values.contains(&src.0) {
+                            compact_i686_values.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            if compact_i686_values.len() == before {
+                break;
+            }
+        }
+        // Copy/Phi dests fed by zero-extended `I64` constants (from_i64's
+        // U32/U16/U8 storage form) have none of the narrow seeds above:
+        // Copy carries no result type and the constant arm admits only
+        // I8/I16/I32/F32 spellings. Their width is proven by the shared
+        // value-type map's strong def/use evidence instead; admit them to
+        // the single-word class exactly when that evidence is ≤4 bytes.
+        // Decimals are excluded to match the constant arm (no D32 there);
+        // the width invariant (CCC_VERIFY_SLOT_WIDTHS) cross-checks every
+        // admitted value against the same map.
+        for (&v, t) in &crate::backend::common::compute_value_type_map(func) {
+            if t.size() <= 4 && !matches!(t, IrType::D32 | IrType::D64) {
+                compact_i686_values.insert(v);
+            }
+        }
+    }
+
+    // F128 Copy webs.  Copy carries no result type after phi elimination, so
+    // a Copy of an F128 value (loads that mem2reg turned into copies, phi
+    // elimination temps, staging values for x87 compares) would otherwise be
+    // classified by the default 8-byte arm.  fstpt spills 10 raw bytes of
+    // 80-bit x87 data, so an 8-byte slot lets the store run into the low half
+    // of the adjacent slot and corrupts it (observed as va-arg-pack-1.c
+    // aborting its long-double compare on i686 at -O1/-O2).  Propagate
+    // F128-ness to a fixed point over Copy{src: Value} edges and give the
+    // whole web the wide F128 slot class.  Target-independent: x86-64's
+    // 16-byte movdqu spills have exactly the same overflow shape.
+    let mut f128_web_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                if inst.result_type() == Some(IrType::F128) {
+                    f128_web_values.insert(dest.0);
+                }
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::LongDouble(..)),
+                } = inst
+                {
+                    f128_web_values.insert(dest.0);
+                }
+            }
+        }
+    }
+    loop {
+        let before = f128_web_values.len();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } = inst
+                {
+                    if f128_web_values.contains(&src.0) {
+                        f128_web_values.insert(dest.0);
+                    }
+                }
+            }
+        }
+        if f128_web_values.len() == before {
+            break;
+        }
+    }
+
+    // Build set of values that are defined (as dest) by non-InlineAsm
+    // instructions. This identifies "indirect" asm output pointers:
+    //
+    // When an InlineAsm output is "=r"(*ptr), the output value is the
+    // loaded pointer (from a Load that became a Copy after mem2reg).
+    // This value is defined by a Copy/Load/Phi instruction, AND it
+    // appears as an InlineAsm output. The asm result must be stored
+    // THROUGH the pointer, not directly into a stack slot.
+    //
+    // When an InlineAsm output is "=r"(x) and x was promoted by mem2reg,
+    // the output value is a fresh SSA value created by mem2reg. This
+    // value is NOT defined by any other instruction -- it only appears
+    // in the InlineAsm outputs. This value DOES need a direct stack slot.
+    //
+    // The distinction: if an InlineAsm output value is also the dest of
+    // a non-InlineAsm instruction, it's an indirect pointer that should
+    // NOT be promoted to a direct asm output slot.
+    let mut non_asm_defined: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if !matches!(inst, Instruction::InlineAsm { .. }) {
+                if let Some(dest) = inst.dest() {
+                    non_asm_defined.insert(dest.0);
+                }
+            }
+        }
+    }
+
+    // Pre-scan: find param allocas whose memory is modified after the initial
+    // emit_store_params Store. The ParamRef optimization (reusing the alloca
+    // slot for the initial parameter value) is only safe when the alloca's
+    // content is never overwritten. If any additional store targets the param
+    // alloca (directly, through a GEP, or via an escaped pointer to a callee),
+    // the alloca may hold a different value than the ParamRef expects.
+    let modified_param_allocas: FxHashSet<u32> = {
+        let param_alloca_set: FxHashSet<u32> =
+            func.param_alloca_values.iter().map(|v| v.0).collect();
+
+        // Map GEP dest -> param alloca root (for chained GEPs)
+        let mut gep_to_param: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::GetElementPtr { dest, base, .. } = inst {
+                    if param_alloca_set.contains(&base.0) {
+                        gep_to_param.insert(dest.0, base.0);
+                    } else if let Some(&root) = gep_to_param.get(&base.0) {
+                        gep_to_param.insert(dest.0, root);
+                    }
+                }
+            }
+        }
+
+        // Count stores to each param alloca. The initial emit_store_params
+        // generates exactly one store per param. Any additional store means
+        // the param alloca is modified.
+        let mut store_count: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut escaped = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Store { ptr, .. } => {
+                        // Direct store to param alloca
+                        if param_alloca_set.contains(&ptr.0) {
+                            *store_count.entry(ptr.0).or_insert(0) += 1;
+                        }
+                        // Store through GEP of param alloca
+                        if let Some(&root) = gep_to_param.get(&ptr.0) {
+                            *store_count.entry(root).or_insert(0) += 1;
+                        }
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        // If param alloca address (or GEP of it) is passed to
+                        // a call, the callee may modify it.
+                        for arg in &info.args {
+                            if let Operand::Value(v) = arg {
+                                if let Some(&root) = gep_to_param.get(&v.0) {
+                                    escaped.insert(root);
+                                }
+                                if param_alloca_set.contains(&v.0) {
+                                    escaped.insert(v.0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // A param alloca is "modified" if it has more than 1 store (the
+        // initial emit_store_params store) or its address escapes to a call.
+        let mut modified = escaped;
+        for (&alloca_id, &count) in &store_count {
+            if count > 1 {
+                modified.insert(alloca_id);
+            }
+        }
+        modified
+    };
+
+    if func.ssp.stack_guard_alloca.is_some() {
+        classify_ssp_allocas(
+            state,
+            func,
+            ctx,
+            assign_slot,
+            non_local_space,
+            deferred_slots,
+            block_space,
+            max_block_local_space,
+        );
+    }
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca {
+                dest,
+                size,
+                ty,
+                align,
+                semantic_volatile,
+                ..
+            } = inst
+            {
+                if func.ssp.stack_guard_alloca.is_some() {
+                    continue;
+                }
+                if *semantic_volatile {
+                    state.volatile_alloca_values.insert(dest.0);
+                }
+                classify_alloca(
+                    state,
+                    dest,
+                    *size,
+                    *ty,
+                    *align,
+                    *semantic_volatile,
+                    false,
+                    ctx,
+                    assign_slot,
+                    non_local_space,
+                    deferred_slots,
+                    block_space,
+                    max_block_local_space,
+                );
+            } else if let Instruction::InlineAsm {
+                outputs,
+                operand_types,
+                ..
+            } = inst
+            {
+                // Promoted InlineAsm output values need stack slots to hold
+                // the output register value. These are "direct" slots (like
+                // allocas) -- the slot contains the value itself, not a pointer.
+                //
+                // However, values defined by non-InlineAsm instructions (Copy,
+                // Load, Phi, etc.) are pointer dereference outputs (e.g.,
+                // "=r"(*ptr)). After mem2reg, the Load that produced the
+                // pointer becomes a Copy, but the value still represents a
+                // pre-existing pointer. These must NOT be promoted to direct
+                // slots -- their stack slot holds the pointer itself, and
+                // store_output_from_reg must store the asm result THROUGH
+                // the pointer. Promoting them would cause the result to be
+                // written to the slot instead of through the pointer.
+                //
+                // This check is more robust than checking reg_assigned alone,
+                // because it also handles the case where the pointer value
+                // is NOT register-allocated (e.g., due to register pressure
+                // forcing the pointer to a stack slot).
+                for (out_idx, (_, out_val, _)) in outputs.iter().enumerate() {
+                    if !state.alloca_values.contains(&out_val.0)
+                        && !non_asm_defined.contains(&out_val.0)
+                        && collected_values.insert(out_val.0)
+                    {
+                        let slot_size: i64 = if out_idx < operand_types.len() {
+                            match operand_types[out_idx] {
+                                IrType::I128 | IrType::U128 | IrType::F128 => 16,
+                                _ => 8,
+                            }
+                        } else {
+                            8
+                        };
+                        state.asm_output_values.insert(out_val.0);
+                        // On 32-bit targets, track 64-bit asm output values as "wide"
+                        // so that Copy instructions referencing them use the multi-word
+                        // copy path (copying both 32-bit halves) instead of only copying
+                        // the low 32 bits. Without this, mem2reg-promoted 64-bit inline
+                        // asm outputs (e.g., "+r" on unsigned long long) lose their high
+                        // 32 bits when the value is copied to subsequent uses.
+                        if crate::common::types::target_is_32bit() && out_idx < operand_types.len()
+                        {
+                            let is_wide = matches!(
+                                operand_types[out_idx],
+                                IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64
+                            );
+                            if is_wide {
+                                state.wide_values.insert(out_val.0);
+                            }
+                        }
+                        multi_block_values.push(MultiBlockValue {
+                            dest_id: out_val.0,
+                            slot_size,
+                        });
+                    }
+                }
+            } else if let Instruction::ParamRef {
+                dest,
+                param_idx,
+                ty,
+            } = inst
+            {
+                // ParamRef loads a parameter value from its alloca slot.
+                // Instead of allocating a separate stack slot for the ParamRef
+                // dest, reuse the param alloca's slot. This saves 8 bytes per
+                // promoted parameter (significant for kernel functions with
+                // many parameters where frame size is critical).
+                //
+                // Safety: the alloca slot is rounded up to 8 bytes (by the
+                // assign_slot callback), so storing a full 8-byte movq is safe.
+                // emit_param_ref loads from the alloca with sign/zero extension,
+                // then stores back to the same slot, which is a valid self-update
+                // that sets the upper bytes to the correct extension.
+                //
+                // Exception: when the param alloca is modified after the initial
+                // store (e.g., by an inlined callee writing to it directly, or
+                // its address escaping to a call), the ParamRef must have its
+                // own separate slot. Otherwise the ParamRef would read back the
+                // modified value instead of the original parameter value.
+                //
+                // Second exception: OVER-ALIGNED (>16) param allocas. Their
+                // slot is padded and every access — including the prologue
+                // capture — targets the EFFECTIVE align_up'd address, not the
+                // raw base. A ParamRef dest sharing that slot would access the
+                // RAW base (its accesses resolve as a plain value), so the
+                // capture (aligned) and the dest (raw) desync by the alignment
+                // pad: the dest reads/writes padding garbage and, worse,
+                // writes it back over the captured value (the garbage-copy
+                // regression with runtime-nondeterministic results). The dest
+                // keeps its own plain slot and emit_param_ref materializes it
+                // FROM the alloca through the aligned address.
+                if *param_idx < func.param_alloca_values.len() {
+                    let alloca_val = func.param_alloca_values[*param_idx];
+                    if !modified_param_allocas.contains(&alloca_val.0)
+                        && !state.alloca_alignments.contains_key(&alloca_val.0)
+                        && !reg_assigned.contains_key(&dest.0)
+                    {
+                        if let Some(&slot) = state.value_locations.get(&alloca_val.0) {
+                            state.value_locations.insert(dest.0, slot);
+                            // Propagate type tracking even when reusing the alloca
+                            // slot, so downstream Copy instructions use the correct
+                            // multi-word paths for wide/i128/f128 values.
+                            if matches!(ty, IrType::I128 | IrType::U128) {
+                                state.i128_values.insert(dest.0);
+                            }
+                            if crate::common::types::target_is_32bit()
+                                && matches!(
+                                    ty,
+                                    IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64
+                                )
+                            {
+                                state.wide_values.insert(dest.0);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Fallthrough: if alloca not found or modified, classify normally.
+                classify_value(
+                    state,
+                    *dest,
+                    inst,
+                    ctx,
+                    reg_assigned,
+                    &compact_i686_values,
+                    &f128_web_values,
+                    &wide_typed,
+                    &mut collected_values,
+                    multi_block_values,
+                    block_local_values,
+                );
+            } else if let Some(dest) = inst.dest() {
+                classify_value(
+                    state,
+                    dest,
+                    inst,
+                    ctx,
+                    reg_assigned,
+                    &compact_i686_values,
+                    &f128_web_values,
+                    &wide_typed,
+                    &mut collected_values,
+                    multi_block_values,
+                    block_local_values,
+                );
+            }
+        }
+    }
+
+    // Debug-only cross-check of the width invariant the whole small-slot
+    // scheme rests on: a value in `small_slot_values` (4-byte slot, accessed
+    // with ≤4-byte instructions on every path) must never be typed wider than
+    // 4 bytes by the *single source of truth* the emitters consult
+    // (`compute_value_type_map`, now a fixed point). Any violation here is a
+    // future `movl store + movq reload` corruption waiting to happen — catch
+    // it at compile time instead of as a kernel-boot miscompile.
+    if std::env::var_os("CCC_VERIFY_SLOT_WIDTHS").is_some() && !state.small_slot_values.is_empty() {
+        let map = crate::backend::common::compute_value_type_map(func);
+        let mut bad: Vec<u32> = state
+            .small_slot_values
+            .iter()
+            .copied()
+            .filter(|v| map.get(v).is_some_and(|t| t.size() > 4))
+            .collect();
+        bad.sort_unstable();
+        if !bad.is_empty() {
+            panic!(
+                "CCC_VERIFY_SLOT_WIDTHS: {} small-slot value(s) typed wider than \
+                 4 bytes by compute_value_type_map in '{}': {:?}",
+                bad.len(),
+                func.name,
+                bad
+            );
+        }
+    }
+}
+
+/// ProPolice 2-tier local ordering for SSP-instrumented functions: place array,
+/// byte-buffer, and address-taken non-parameter allocas directly below the
+/// stack canary, and place scalar/pointer/parameter allocas below all buffers
+/// so an upward buffer overflow hits the canary before corrupting local
+/// pointers or loop bounds.
+#[allow(clippy::too_many_arguments)]
+fn classify_ssp_allocas(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    ctx: &StackLayoutContext,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    non_local_space: &mut i64,
+    deferred_slots: &mut Vec<DeferredSlot>,
+    block_space: &mut FxHashMap<usize, i64>,
+    max_block_local_space: &mut i64,
+) {
+    let param_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
+    let mut addr_taken: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GetElementPtr { base, .. } => {
+                    addr_taken.insert(base.0);
+                }
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ..
+                } => {
+                    addr_taken.insert(v.0);
+                }
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    for arg in &info.args {
+                        if let Operand::Value(v) = arg {
+                            addr_taken.insert(v.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let ptr_size = crate::common::types::target_ptr_size();
+    let downward = assign_slot(0, 8, 8).0 < 0;
+    let pass_order = if downward {
+        [true, false]
+    } else {
+        [false, true]
+    };
+    for want_buffer in pass_order {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Instruction::Alloca {
+                    dest,
+                    size,
+                    ty,
+                    align,
+                    semantic_volatile,
+                    ..
+                } = inst
+                else {
+                    continue;
+                };
+                if func.ssp.stack_guard_alloca == Some(*dest) {
+                    continue;
+                }
+                let is_buffer = !param_set.contains(&dest.0)
+                    && (*size > ptr_size
+                        || matches!(*ty, IrType::I8 | IrType::U8)
+                        || addr_taken.contains(&dest.0));
+                if is_buffer != want_buffer {
+                    continue;
+                }
+                if *semantic_volatile {
+                    state.volatile_alloca_values.insert(dest.0);
+                }
+                classify_alloca(
+                    state,
+                    dest,
+                    *size,
+                    *ty,
+                    *align,
+                    *semantic_volatile,
+                    is_buffer,
+                    ctx,
+                    assign_slot,
+                    non_local_space,
+                    deferred_slots,
+                    block_space,
+                    max_block_local_space,
+                );
+            }
+        }
+    }
+    if !downward {
+        *non_local_space = place_stack_guard_late(state, func, assign_slot, *non_local_space);
+    }
+}
+
+/// Classify a single Alloca instruction into Tier 1 (permanent) or Tier 3 (block-local).
+#[allow(clippy::too_many_arguments)]
+fn classify_alloca(
+    state: &mut crate::backend::state::CodegenState,
+    dest: &Value,
+    size: usize,
+    ty: IrType,
+    align: usize,
+    semantic_volatile: bool,
+    pin_near_canary: bool,
+    ctx: &StackLayoutContext,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    non_local_space: &mut i64,
+    deferred_slots: &mut Vec<DeferredSlot>,
+    block_space: &mut FxHashMap<usize, i64>,
+    max_block_local_space: &mut i64,
+) {
+    // `Alloca.align` is authoritative, for parameter allocas too: the
+    // lowering homes a parameter alloca at `max(struct_align, param_align)`
+    // (func_lowering.rs, `allocate_function_params`), and the only pass that
+    // lowers it afterwards is `downgrade_nonescaping_vector_align`, which
+    // does so exactly when it has proven every use alignment-insensitive
+    // (the capture store and every x86 param copy are unaligned moves).
+    // Re-raising it here from `IrParam` undid that proof for every
+    // 32-byte `vector_size` parameter the SIMD lowering did not take whole:
+    // a per-access `leaq; addq $31; andq $-32` realign for each lane.
+    let effective_align = align;
+    let extra = if effective_align > 16 {
+        effective_align - 1
+    } else {
+        0
+    };
+    let ptr_size = crate::common::types::target_ptr_size() as i64;
+    // Alloca slots must be at least pointer-sized (8 bytes on 64-bit, 4 on 32-bit)
+    // to safely hold ParamRef values that store via movq/sd (full register width).
+    let raw_size = if size == 0 {
+        ptr_size
+    } else {
+        (size as i64).max(ptr_size)
+    };
+
+    state.alloca_values.insert(dest.0);
+    state.alloca_types.insert(dest.0, ty);
+    if state.asm_cc_branch_output_ptrs.contains(&dest.0) {
+        // The condition-code result is consumed only by certified branches;
+        // no machine output store or stack object survives that proof.
+        return;
+    }
+    // The caller already created this callee-owned by-value object. Its
+    // checked ABI alignment satisfies Alloca.align, including >16 alignment;
+    // do not register a runtime align-up or reserve a second local object.
+    if let Some(&slot) = state.incoming_byval_slots.get(&dest.0) {
+        state.value_locations.insert(dest.0, slot);
+        return;
+    }
+    if effective_align > 16 {
+        state.alloca_alignments.insert(dest.0, effective_align);
+    }
+
+    // Skip dead param allocas (still registered so backend recognizes them).
+    if ctx.dead_param_allocas.contains(&dest.0) {
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            eprintln!("[SLOTS]   alloca v{} SKIPPED: dead param", dest.0);
+        }
+        return;
+    }
+
+    // Skip dead non-param allocas (never referenced by any instruction).
+    if ctx.coalescable_allocas.dead.contains(&dest.0) {
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            eprintln!(
+                "[SLOTS]   alloca v{} SKIPPED: dead (no recorded uses)",
+                dest.0
+            );
+        }
+        return;
+    }
+
+    // Single-block allocas: use block-local coalescing (Tier 3).
+    // Over-aligned allocas (> 16) are excluded because their alignment
+    // padding complicates coalescing.
+    // Allocas whose single use-block is inside a LOOP are excluded too: the
+    // block-local region shares offsets across blocks assuming exclusive
+    // execution, but loop bodies re-enter, so a loop-carried alloca (written
+    // in iteration N, read in N+1) is clobbered by other values at the same
+    // offset (simd_avx2_256 / vector_defer_multidef_slot regressions). Loop
+    // allocas get permanent Tier-1 slots instead.
+    let use_block_in_loop = ctx
+        .coalescable_allocas
+        .single_block
+        .get(&dest.0)
+        .map(|&ub| ctx.block_loop_depth.get(ub).copied().unwrap_or(1) != 0)
+        .unwrap_or(false);
+    if effective_align <= 16 && !semantic_volatile && !pin_near_canary && !use_block_in_loop {
+        if let Some(&use_block) = ctx.coalescable_allocas.single_block.get(&dest.0) {
+            let alloca_size = raw_size + extra as i64;
+            let alloca_align = align as i64;
+            let bs = block_space.entry(use_block).or_insert(0);
+            let before = *bs;
+            let (_, new_space) = assign_slot(*bs, alloca_size, alloca_align);
+            *bs = new_space;
+            if new_space > *max_block_local_space {
+                *max_block_local_space = new_space;
+            }
+            deferred_slots.push(DeferredSlot {
+                dest_id: dest.0,
+                size: alloca_size,
+                align: alloca_align,
+                block_offset: before,
+            });
+            return;
+        }
+    }
+
+    // Non-coalescable allocas get permanent Tier 1 slots.
+    let (slot, new_space) = assign_slot(*non_local_space, raw_size + extra as i64, align as i64);
+    state.value_locations.insert(dest.0, StackSlot(slot));
+    *non_local_space = new_space;
+}
+
+/// Classify a non-alloca value into Tier 2 (multi-block) or Tier 3 (block-local).
+fn classify_value(
+    state: &mut crate::backend::state::CodegenState,
+    dest: Value,
+    inst: &Instruction,
+    ctx: &StackLayoutContext,
+    reg_assigned: &FxHashMap<u32, PhysReg>,
+    compact_i686_values: &FxHashSet<u32>,
+    f128_web_values: &FxHashSet<u32>,
+    wide_typed: &FxHashSet<u32>,
+    collected_values: &mut FxHashSet<u32>,
+    multi_block_values: &mut Vec<MultiBlockValue>,
+    block_local_values: &mut Vec<BlockLocalValue>,
+) {
+    let mut is_i128 = matches!(inst.result_type(), Some(IrType::I128) | Some(IrType::U128));
+    let is_f128 = matches!(inst.result_type(), Some(IrType::F128))
+        || matches!(
+            inst,
+            Instruction::Copy {
+                src: Operand::Const(IrConst::LongDouble(..)),
+                ..
+            }
+        )
+        || f128_web_values.contains(&dest.0);
+
+    // Copy instructions have result_type() = None, so we must check whether
+    // the source operand is an I128 value. If it is, the Copy dest also needs
+    // a 16-byte slot; otherwise the codegen's emit_copy_i128 will overflow an
+    // 8-byte slot into the adjacent stack slot, corrupting other values.
+    if !is_i128 {
+        if let Instruction::Copy {
+            src: Operand::Value(src_val),
+            ..
+        } = inst
+        {
+            if state.i128_values.contains(&src_val.0) {
+                is_i128 = true;
+            }
+        }
+    }
+
+    // Detect values whose spill representation fits in four bytes.  x86-64
+    // uses this for explicitly typed ≤32-bit results.  i686 additionally uses
+    // the fixed-point Copy inference above because pointers and all ordinary
+    // scalar GPR values are naturally four bytes, while Copy itself carries no
+    // result type after phi elimination.
+    //
+    // Slot sharing is partitioned by exact size class (Tier 3 free lists,
+    // Tier 2 graph coloring, copy aliases), so a 4-byte slot is never shared
+    // with an 8-byte value.  That makes the old stale-upper-half hazard
+    // structurally impossible rather than dependent on allocation order.
+    let small_slots_enabled = crate::common::types::target_small_slots()
+        && std::env::var_os("CCC_NO_SMALL_SLOTS").is_none();
+    // A narrow `result_type()` is necessary but NOT sufficient: Copy/Phi dests
+    // inherit their type from an incoming value, so a value the emitters will
+    // move with `movq` can still be defined here with a 32-bit result type.
+    // Such a value must keep an 8-byte slot (see `wide_typed` above).
+    let is_small = small_slots_enabled
+        && !wide_typed.contains(&dest.0)
+        && (compact_i686_values.contains(&dest.0)
+            || matches!(
+                inst.result_type(),
+                Some(IrType::I8)
+                    | Some(IrType::U8)
+                    | Some(IrType::I16)
+                    | Some(IrType::U16)
+                    | Some(IrType::I32)
+                    | Some(IrType::U32)
+                    | Some(IrType::F32)
+            ));
+    let is_vector = state.vector_values.contains(&dest.0);
+    let is_vector128 = state.vector128_values.contains(&dest.0);
+    let memcpy_width = ctx.memcpy_value_sizes.get(&dest.0).copied().unwrap_or(0) as i64;
+    let mut slot_size: i64 = if is_vector && !is_vector128 {
+        32 // AVX2 256-bit vectors need 32 bytes
+    } else if is_vector128 {
+        16 // SSE 128-bit vectors need 16 bytes
+    } else if is_i128 || is_f128 {
+        16
+    } else if is_small {
+        // Width-partitioned small slot: only ever shared with other 4-byte
+        // values, and only accessed with ≤4-byte instructions.
+        4
+    } else {
+        8
+    };
+    // A value that is a Memcpy dest/src can need a wider slot than its type
+    // suggests: struct-by-value temps are copied through their pointer, and
+    // the documented regression (simd_avx2_256 mul_ps) had a 32-byte vector
+    // copy overflowing an 8-byte fallback slot. That protection is bounded
+    // at 32 bytes on purpose: `Memcpy`'s dest/src operands are POINTERS
+    // (backend/generation.rs marks them ptr_uses), and any copy larger than
+    // a vector is by construction a buffer copy through those pointers —
+    // the pointer value's own home stays 8 bytes. Unbounded, the floor
+    // handed ZSTD_decodeLiteralsBlock's 64 KiB literal-buffer copies
+    // (rep movsb / memmove of 65536 bytes) 65536-byte spill slots: the
+    // frame ballooned to 131 KB, the boot stack ran out of .bss, spilled
+    // frames landed INSIDE .text, and the overwritten code triple-faulted
+    // the preboot decompressor (session-35 kernel boot failure).
+    //
+    // The widened size is rounded up to a canonical slot class (8/16/32).
+    // The block-local (Tier-3) pool packs entries at their exact size, while
+    // every arch closure reserves `size` rounded up to 4 or 8 when the final
+    // mapping `assign_slot(base + offset, size, ..)` runs.  A raw width such
+    // as 5 (an i686 pointer that feeds a 5-byte `__builtin_memcpy`) therefore
+    // advanced the pool by 5 but was placed 8 deep: the second such value
+    // landed 4 bytes below the emitted `subl $N, %esp`, where the memcpy's own
+    // `pushl %esi` overwrote the source pointer (torture memcpy-a1/a2 -O1,
+    // i686).  Canonical classes are also the only sizes the pool's free
+    // lists can share.
+    if memcpy_width > slot_size && memcpy_width <= 32 {
+        slot_size = (memcpy_width as u64).next_power_of_two().max(8) as i64;
+    }
+
+    if is_i128 {
+        state.i128_values.insert(dest.0);
+    }
+
+    // On 32-bit targets, track values wider than 32 bits for multi-word copy handling.
+    if crate::common::types::target_is_32bit() {
+        let is_wide = matches!(
+            inst.result_type(),
+            Some(IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64)
+        );
+        if is_wide {
+            state.wide_values.insert(dest.0);
+        }
+    }
+
+    // SIMD home metadata comes from IntrinsicOp::vector_home_width in the
+    // stack-layout pre-scan, then propagates through value copies and PHIs.
+    // These homes need protected slots to prevent reuse from corrupting data.
+    // vector_result_width describes actual results instead; a store's source
+    // home metadata is neither a produced value nor a memory-effect proof.
+    if is_vector || is_vector128 {
+        state.protected_slot_values.insert(dest.0);
+    }
+
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+
+    // Skip values codegen will fold away entirely (no code, no slot).
+    if state.never_materialized_values.contains(&dest.0) {
+        return;
+    }
+    // Skip register-assigned values (no stack slot needed).
+    if reg_assigned.contains_key(&dest.0) {
+        if debug_protect && state.protected_slot_values.contains(&dest.0) {
+            eprintln!(
+                "[CLASSIFY] SSA {} is protected but register-assigned, skipping slot",
+                dest.0
+            );
+        }
+        return;
+    }
+
+    // Skip dead values (defined but never used).
+    if !ctx.used_values.contains(&dest.0) {
+        if debug_protect && state.protected_slot_values.contains(&dest.0) {
+            eprintln!(
+                "[CLASSIFY] SSA {} is protected but not in used_values, skipping slot",
+                dest.0
+            );
+        }
+        return;
+    }
+
+    // Skip copy-aliased values (they'll share root's slot). Not for i128/f128.
+    // Also don't skip protected values (vectors, DynAlloca results) - they need
+    // unique slots even if copy-aliased, to prevent corruption from slot reuse.
+    // Also don't skip multi-defined values (from phi elimination): they have
+    // complex liveness across blocks that makes slot sharing unsafe. The alias
+    // root might be block-local (Tier 3, reusable), but the multi-def value
+    // needs persistence across blocks.
+    let is_copy_aliased = ctx.copy_alias.contains_key(&dest.0);
+    let is_protected = state.protected_slot_values.contains(&dest.0);
+    let is_multi_def = ctx.multi_def_values.contains(&dest.0);
+    // Don't skip copy-aliased values that have cross-block uses: the alias
+    // root might be block-local (Tier 3, reusable), but this value needs
+    // its data to persist across blocks.
+    let has_cross_block_use = ctx.use_blocks_map.get(&dest.0).is_some_and(|blks| {
+        blks.iter()
+            .any(|&b| ctx.def_block.get(&dest.0).is_none_or(|&db| b != db))
+    });
+    // Always classify copy-aliased values into their own slots. The
+    // resolve_copy_aliases phase may later share the slot with the alias root
+    // when safe (no interference), but values must have their own fallback slot
+    // in case resolve_copy_aliases blocks the sharing due to liveness conflicts.
+    // Skipping classification here can leave a live value without a location.
+    if !is_i128
+        && !is_f128
+        && !is_protected
+        && !is_multi_def
+        && !has_cross_block_use
+        && is_copy_aliased
+    {
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
+            // When slot coalescing is fully disabled, classify normally (fall through).
+        }
+        // Otherwise: fall through to normal classification — give the value its own slot.
+    }
+    if debug_protect && is_protected && is_copy_aliased {
+        eprintln!(
+            "[CLASSIFY] SSA {} is protected AND copy-aliased, allocating slot anyway",
+            dest.0
+        );
+    }
+
+    // Skip immediately-consumed values: produced and consumed in adjacent
+    // instructions, kept alive in the accumulator register cache without
+    // needing a stack slot. Values wider than the accumulator never get here:
+    // the allocator's accumulator-home selection excludes them by their
+    // value-type-map width (which, unlike `result_type()`, also types Copy
+    // destinations). Not for i128/f128 (need 16-byte special handling).
+    if !is_i128 && !is_f128 && ctx.immediately_consumed.contains(&dest.0) {
+        return;
+    }
+
+    // Dedup multi-def values (phi results appear in multiple blocks).
+    if !collected_values.insert(dest.0) {
+        return;
+    }
+
+    // Track values that use 4-byte slots so store/load paths can emit
+    // 4-byte instructions (movl, sw/lw, str/ldr w-reg) instead of 8-byte.
+    if is_small {
+        state.small_slot_values.insert(dest.0);
+    }
+
+    if let Some(target_blk) = coalescable_group(dest.0, ctx, state) {
+        block_local_values.push(BlockLocalValue {
+            dest_id: dest.0,
+            slot_size,
+            block_idx: target_blk,
+        });
+    } else {
+        multi_block_values.push(MultiBlockValue {
+            dest_id: dest.0,
+            slot_size,
+        });
+    }
+}
+
+/// Assign stack slots for block-local values using intra-block greedy reuse.
+///
+/// Within a single block, values have short lifetimes. By tracking when each
+/// value is last used, we can reuse its stack slot for later values. This is
+/// critical for functions like blake2s_compress_generic where macro expansion
+/// creates thousands of short-lived intermediates in a single loop body block.
+pub(super) fn assign_tier3_block_local_slots(
+    state: &crate::backend::state::CodegenState,
+    func: &IrFunction,
+    ctx: &StackLayoutContext,
+    coalesce: bool,
+    block_local_values: &[BlockLocalValue],
+    deferred_slots: &mut Vec<DeferredSlot>,
+    block_space: &mut FxHashMap<usize, i64>,
+    max_block_local_space: &mut i64,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+) {
+    if block_local_values.is_empty() {
+        return;
+    }
+
+    if !coalesce {
+        // Fallback: no reuse, just accumulate. Offsets keep natural
+        // alignment (8 for ≥8-byte slots) so the finalize-time mapping
+        // cannot shift a wide slot onto a neighbour (see the coalescing
+        // path's alignment note).
+        for blv in block_local_values {
+            let bs = block_space.entry(blv.block_idx).or_insert(0);
+            // 16/32-byte vector slots are 16-byte aligned in the pool:
+            // legacy-SSE memory-form consumers (andnpd/pandn/memfolds) read
+            // vector homes directly and fault on unaligned operands.
+            let vec_align = blv.slot_size >= 16;
+            let before = if vec_align {
+                (*bs + 15) & !15
+            } else if blv.slot_size >= 8 {
+                (*bs + 7) & !7
+            } else {
+                *bs
+            };
+            let (_, new_space) = assign_slot(before, blv.slot_size, if vec_align { 16 } else { 0 });
+            // new_space already includes the closure's FPO shift for the
+            // align-16 entries, so the bs advance absorbs it exactly.
+            *bs = new_space.max(before + blv.slot_size);
+            if new_space > *max_block_local_space {
+                *max_block_local_space = new_space;
+            }
+            deferred_slots.push(DeferredSlot {
+                dest_id: blv.dest_id,
+                size: blv.slot_size,
+                align: if vec_align { 16 } else { 0 },
+                block_offset: before,
+            });
+        }
+        return;
+    }
+
+    // Probe the arch closure's FPO alignment shift ONCE (x86 FPO returns
+    // -24 for a 16-byte/16-aligned probe allocation, everything else -16 or
+    // a positive slot): 16/32-byte deferred entries map with align=16 and
+    // their finalize-time +8 address shift must be pre-absorbed here by
+    // advancing the block space past the shifted window, exactly like the
+    // single-block coalescable-alloca path already does via assign_slot's
+    // new_space.
+    let fpo_vec_shift = {
+        let probe = assign_slot(0, 16, 16).0;
+        if probe < 0 { (-16 - probe).max(0) } else { 0 }
+    };
+    // Effective window of a deferred entry: align-16 entries sit +shift
+    // into their pool reservation (the finalize mapping rounds the END up
+    // and shifts by the same amount).
+    let window = |off: i64, size: i64| -> (i64, i64) {
+        if size >= 16 {
+            (off + fpo_vec_shift, size)
+        } else {
+            (off, size)
+        }
+    };
+
+    // Pre-compute per-block last-use and definition instruction indices.
+    let block_local_set: FxHashSet<u32> = block_local_values.iter().map(|v| v.dest_id).collect();
+    let mut last_use: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut def_inst_idx: FxHashMap<u32, usize> = FxHashMap::default();
+
+    for block in &func.blocks {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                if block_local_set.contains(&dest.0) {
+                    def_inst_idx.insert(dest.0, inst_idx);
+                }
+            }
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if block_local_set.contains(&v.0) {
+                        last_use.insert(v.0, inst_idx);
+                    }
+                    // Extend copy-alias root's last_use when the aliased
+                    // value is used as an operand.
+                    if let Some(&root) = ctx.copy_alias.get(&v.0) {
+                        if block_local_set.contains(&root) {
+                            let root_last = last_use.get(&root).copied().unwrap_or(0);
+                            if inst_idx > root_last {
+                                last_use.insert(root, inst_idx);
+                            }
+                        }
+                    }
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                if block_local_set.contains(&v.0) {
+                    last_use.insert(v.0, inst_idx);
+                }
+                // Extend copy-alias root's last_use when the aliased
+                // value is used as a value reference (e.g., dest_ptr in
+                // Intrinsic, ptr in Store/Load).
+                if let Some(&root) = ctx.copy_alias.get(&v.0) {
+                    if block_local_set.contains(&root) {
+                        let root_last = last_use.get(&root).copied().unwrap_or(0);
+                        if inst_idx > root_last {
+                            last_use.insert(root, inst_idx);
+                        }
+                    }
+                }
+            });
+            // Extend last_use for InlineAsm output pointer values: Phase 4 reads
+            // these from stack slots AFTER the asm executes. Also extend
+            // copy-alias roots which hold the actual slot.
+            if let Instruction::InlineAsm { outputs, .. } = inst {
+                for (_, v, _) in outputs {
+                    let extended = inst_idx + 1;
+                    if block_local_set.contains(&v.0) {
+                        last_use.insert(v.0, extended);
+                    }
+                    if let Some(&root) = ctx.copy_alias.get(&v.0) {
+                        if block_local_set.contains(&root) {
+                            last_use.insert(root, extended);
+                        }
+                    }
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if block_local_set.contains(&v.0) {
+                    last_use.insert(v.0, block.instructions.len());
+                }
+            }
+        });
+
+        // F128 source pointer liveness extension (Tier 3 block-local mirror).
+        //
+        // When an F128 Load uses a pointer, the codegen records that pointer so
+        // Call emission can reload the full 128-bit value later. The pointer's
+        // slot must stay live until the F128 dest's last use, otherwise the
+        // greedy slot coloring reuses it and the Call dereferences garbage.
+        for inst in &block.instructions {
+            if let Instruction::Load { dest, ptr, ty, .. } = inst {
+                if *ty == IrType::F128 && block_local_set.contains(&ptr.0) {
+                    if let Some(&dest_last) = last_use.get(&dest.0) {
+                        let ptr_last = last_use.get(&ptr.0).copied().unwrap_or(0);
+                        if dest_last > ptr_last {
+                            last_use.insert(ptr.0, dest_last);
+                        }
+                        if let Some(&root) = ctx.copy_alias.get(&ptr.0) {
+                            if block_local_set.contains(&root) {
+                                let root_last = last_use.get(&root).copied().unwrap_or(0);
+                                if dest_last > root_last {
+                                    last_use.insert(root, dest_last);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Group block-local values by block, preserving definition order.
+    let mut per_block: FxHashMap<usize, Vec<(u32, i64)>> = FxHashMap::default();
+    for blv in block_local_values {
+        per_block
+            .entry(blv.block_idx)
+            .or_default()
+            .push((blv.dest_id, blv.slot_size));
+    }
+
+    // For each block, assign slots with greedy coloring.
+    //
+    // PROCESSING ORDER IS A SOUNDNESS INVARIANT: values MUST be visited in
+    // definition order. The expiry rule (`active[i].0 < my_def`) frees an
+    // occupant's slot relative to the CURRENT value's def point; visiting a
+    // later-defined value first would free slots that an earlier-defined,
+    // still-unprocessed value (whose lifetime encloses the occupant's) must
+    // not reuse — the zlib-ng build_tree v89/v319 overlap was exactly this
+    // bug when a size-descending reorder was tried. Size-class packing gains
+    // must come from the exact-size free lists alone, never from reordering.
+    let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
+    for (blk_idx, values) in &per_block {
+        let mut active: Vec<(usize, i64, i64)> = Vec::new(); // (last_use, offset, size)
+        let mut free_4: Vec<i64> = Vec::new();
+        let mut free_8: Vec<i64> = Vec::new();
+        let mut free_16: Vec<i64> = Vec::new();
+        let mut free_32: Vec<i64> = Vec::new();
+        let mut block_peak: i64 = block_space.get(blk_idx).copied().unwrap_or(0);
+
+        for &(dest_id, slot_size) in values {
+            let my_def = def_inst_idx.get(&dest_id).copied().unwrap_or(0);
+
+            // Release expired slots.
+            let mut i = 0;
+            while i < active.len() {
+                if active[i].0 < my_def {
+                    let (_, off, sz) = active.swap_remove(i);
+                    if sz >= 32 {
+                        free_32.push(off);
+                    } else if sz == 16 {
+                        free_16.push(off);
+                    } else if sz == 8 {
+                        free_8.push(off);
+                    } else {
+                        free_4.push(off);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Try to reuse a freed slot of EXACTLY matching size. The exact-
+            // size partition is what makes 4-byte slots sound: a 4-byte store
+            // into a slot previously owned by an 8-byte value would leave that
+            // value's stale upper half readable by later 64-bit accesses.
+            // Protected values (DynAlloca results, vector temps) must get unique slots.
+            //
+            // Reuse is additionally gated to the four canonical size classes.
+            // The release side buckets EVERY non-16/8 size into free_4, so a
+            // 12-byte value used to reuse a 4-byte slot: its 12-byte extent
+            // then overlapped the two slots following that offset (silent
+            // corruption of live neighbours) AND block_peak never grew, so
+            // total_space undercounted and the deepest slot landed below the
+            // emitted `subl $N` frame — where the prologue's push-staging
+            // (push %esi/%edi) clobbers it (stdarg-3 va_arg temp: s2 written
+            // to fini_array instead of the global). Non-canonical sizes are
+            // never freed into a list they can safely share: allocate fresh,
+            // reserving what the arch closure will actually occupy (below).
+            let can_reuse = !state.protected_slot_values.contains(&dest_id)
+                && matches!(slot_size, 4 | 8 | 16 | 32);
+            let free_list = if slot_size >= 32 {
+                &mut free_32
+            } else if slot_size == 16 {
+                &mut free_16
+            } else if slot_size == 8 {
+                &mut free_8
+            } else {
+                &mut free_4
+            };
+            let mut reused_offset: Option<i64> = None;
+            if can_reuse && free_list.len() > 0 {
+                let reused = free_list.pop().unwrap();
+                // OCCUPANCY CHECK — the exact-size free lists are not
+                // cross-checked, so an entry can be STALE: the offset may
+                // have been re-allocated to a value from a DIFFERENT size
+                // list that is still live (free_16 keeps offset O after its
+                // 16-byte owner expired; an 8-byte value then takes O from
+                // free_8 and is live when a later 16-byte value pops O from
+                // free_16 again). Reuse only when no active entry's WINDOW
+                // overlaps this one's; otherwise fall through to a fresh
+                // pool slot (the stale entry is dropped, not re-pushed).
+                let (rstart, rsize) = window(reused, slot_size);
+                let overlaps_active = active.iter().any(|&(_, aoff, asz)| {
+                    let (astart, asize) = window(aoff, asz);
+                    rstart < astart + asize && astart < rstart + rsize
+                });
+                if !overlaps_active {
+                    if debug_protect {
+                        eprintln!(
+                            "[PROTECT-T3] SSA {} reused block-local slot {}",
+                            dest_id, reused
+                        );
+                    }
+                    reused_offset = Some(reused);
+                }
+            }
+            let offset = if let Some(reused) = reused_offset {
+                reused
+            } else {
+                // Natural alignment inside the pool is what keeps the final
+                // `assign_slot(nls + block_offset, size, ..)` mapping
+                // shift-free: finalize rounds an 8-byte value at a 4-mod-8
+                // pool offset up to the next 8-byte boundary, silently
+                // shifting it ONTO the following small slot's bytes (the
+                // rot() v11/v14 [40,48) vs [44,48) overlap). Reused offsets
+                // are already size-aligned by construction.
+                //
+                // 16/32-byte vector slots additionally align to 16 (see the
+                // fallback path note): legacy-SSE memory-form consumers of a
+                // vector home require it. Reused 16-class offsets inherit
+                // the alignment because every 16-class slot entered the
+                // free list from this same 16-aligned placement.
+                //
+                // The reservation must also cover what the finalize-time
+                // `assign_slot` occupies, not just `slot_size`: every arch
+                // closure rounds a non-4-byte allocation up to a multiple of
+                // 8 (and places it at an 8-aligned depth), so a size outside
+                // the canonical classes (none are produced today; see the
+                // memcpy-width note in `classify_value`) is placed 8-aligned
+                // and reserves its rounded extent.  Packing it at its exact
+                // size let the finalize mapping push the deepest slot below
+                // the frame.
+                let canonical = matches!(slot_size, 4 | 8 | 16 | 32);
+                let off = if slot_size >= 16 {
+                    (block_peak + 15) & !15
+                } else if (slot_size >= 8 || !canonical) && block_peak % 8 != 0 {
+                    (block_peak + 7) & !7
+                } else {
+                    block_peak
+                };
+                let extent = if slot_size >= 16 {
+                    (slot_size + 15) & !15
+                } else if canonical {
+                    slot_size
+                } else {
+                    (slot_size + 7) & !7
+                };
+                // Absorb the FPO address shift into the block space so the
+                // NEXT entry's reservation starts past this entry's shifted
+                // window (mirrors assign_slot's new_space bookkeeping).
+                block_peak = off + extent + if slot_size >= 16 { fpo_vec_shift } else { 0 };
+                if debug_protect && !can_reuse {
+                    eprintln!(
+                        "[PROTECT-T3] SSA {} is protected, forced new slot at offset {}",
+                        dest_id, off
+                    );
+                }
+                off
+            };
+
+            let my_last = last_use.get(&dest_id).copied().unwrap_or(my_def);
+            active.push((my_last, offset, slot_size));
+
+            deferred_slots.push(DeferredSlot {
+                dest_id,
+                size: slot_size,
+                // >=16 entries carry align=16: the closure's FPO +8 makes
+                // their final ADDRESS 16-aligned; the pool advance above
+                // pre-absorbs the shift, so the mapping stays collision-free.
+                align: if slot_size >= 16 { 16 } else { 0 },
+                block_offset: offset,
+            });
+        }
+
+        if block_peak > *max_block_local_space {
+            *max_block_local_space = block_peak;
+        }
+    }
+}
+
+/// Assign stack slots for multi-block values using liveness-based packing.
+///
+/// Uses a greedy interval coloring algorithm: sort by start point, greedily assign
+/// to the first slot whose previous occupant's interval has ended. This is optimal
+/// for interval graphs (chromatic number equals clique number).
+pub(super) fn assign_tier2_liveness_packed_slots(
+    state: &mut crate::backend::state::CodegenState,
+    coalesce: bool,
+    cached_liveness: Option<crate::backend::liveness::LivenessResult>,
+    func: &IrFunction,
+    multi_block_values: &[MultiBlockValue],
+    non_local_space: &mut i64,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+) {
+    if multi_block_values.is_empty() {
+        return;
+    }
+
+    // RA-23 makes accumulator homes explicit and the caller quarantines
+    // copy/phi/multi-def webs whose edge semantics are resolved later. Ordinary
+    // SSA values use hole-aware closed-boundary coloring by default.
+    //
+    // Returns-twice functions (__builtin_setjmp) must never use packed slots:
+    // the resume edge from any call that longjmps back into the setjmp frame
+    // is not modeled by the plain-CFG liveness that drives the packing, so a
+    // packed slot can be handed to an unrelated value in another block while
+    // a setjmp-live value still occupies it.  gcc.c-torture
+    // execute/built-in-setjmp.c at -O2 caught exactly this: the "test" string
+    // pointer's slot was reused by the alloca/loop else-branch, so after the
+    // longjmp landed, strcmp compared against a clobbered pointer and the
+    // test aborted.  Fall back to distinct permanent slots instead.
+    //
+    // TIER-2 SLOT SHARING IS ON BY DEFAULT (opt out with CCC_NO_TIER2_GRAPH=1;
+    // CCC_TIER2_GRAPH=1 is accepted as a historical no-op alias).
+    //
+    // Why this is sound after PR #358's width fix: the -O2 preboot-ZSTD
+    // corruption ("ZSTD-compressed data is corrupt", errcode=20 at
+    // zstd_decompress_block.c:242) was a *width* bug, not a coloring bug.
+    // ZSTD_decodeLiteralsBlock stored one CFG path's value with
+    // `movl %eax,80(%rsp)` (a 4-byte small slot) and the join reloaded it
+    // with `movq 80(%rsp),%rax`, so the high half was a neighbour's bytes.
+    // The layout's own evidence proves the coloring was never the trigger:
+    //   * convex-hull (fat) interference instead of per-segment holes: still
+    //     FAILS  ->  even fat-interval-disjoint sharing could not help,
+    //     because the corrupting store/reload pair was a SINGLE value whose
+    //     slot was simply too narrow for one of its own accesses.
+    //   * CCC_NO_SMALL_SLOTS=1 (all 8-byte slots) -> MATCH  (the width veto)
+    //   * disabling every IR pass individually (34 names): no change.
+    // Once a value whose materialisation width exceeds 4 bytes is refused a
+    // 4-byte slot (backend::common::wide_typed_values + the fixpoint
+    // compute_value_type_map), every small slot is accessed ≤4 bytes wide on
+    // ALL paths, so sharing between width-partitioned slot classes cannot
+    // resurrect the stale-high-half read.
+    //
+    // The colorer itself (graph_coloring::color_stack_slots) compares the
+    // CONVEX HULL of each value's segments — i.e. it colours fat intervals,
+    // the same model the linear-scan register allocator uses. Two values
+    // share a slot only when their full live ranges are disjoint, so the
+    // CFG-hole under-recording that the old per-segment test was exposed to
+    // cannot hand a live slot to a neighbour (a value live across an
+    // unrecorded hole keeps its hull spanning that hole, and the neighbour's
+    // hull overlaps it -> no sharing). CCC_TIER2_SEGMENTS=1 opts back into
+    // the maximum per-segment sharing for A/B measurement only; it is the
+    // risky model (requires the liveness to record every hole exactly) and is
+    // therefore never the default.
+    if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() || has_builtin_setjmp(func) {
+        for mbv in multi_block_values {
+            // Vector slots (16/32 bytes) are 16-aligned — see the Tier-3
+            // note; the same legacy-SSE memory-form consumers apply.
+            let align = if mbv.slot_size >= 16 { 16 } else { 0 };
+            let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, align);
+            state.value_locations.insert(mbv.dest_id, StackSlot(slot));
+            *non_local_space = new_space;
+        }
+        return;
+    }
+
+    let liveness = cached_liveness.unwrap_or_else(|| compute_live_intervals(func));
+    let values: Vec<(u32, i64)> = multi_block_values
+        .iter()
+        .map(|value| (value.dest_id, value.slot_size))
+        .collect();
+    super::graph_coloring::color_stack_slots(
+        state,
+        func,
+        &liveness,
+        &values,
+        non_local_space,
+        assign_slot,
+    );
+}
+
+/// Assign final offsets for deferred block-local values. All deferred values
+/// share a pool starting at `non_local_space`; each value's final slot is
+/// computed by adding its block-local offset to the global base.
+///
+/// When coalescable allocas with alignment > 8 are mixed with non-aligned
+/// block-local values, `assign_slot(nls + block_offset, size, align)` can
+/// produce overlapping slot offsets because alignment rounding in assign_slot
+/// may cause differently-sized/aligned values to collapse to the same final
+/// offset. To prevent this, we align `non_local_space` up to the maximum
+/// alignment required by any deferred slot before computing final offsets.
+/// This ensures that `nls + block_offset` preserves the alignment invariants
+/// that were established during the block-space accumulation phase.
+pub(super) fn finalize_deferred_slots(
+    state: &mut crate::backend::state::CodegenState,
+    deferred_slots: &[DeferredSlot],
+    non_local_space: i64,
+    max_block_local_space: i64,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+) -> i64 {
+    if !deferred_slots.is_empty() && max_block_local_space > 0 {
+        // Find the maximum alignment required by any deferred slot and align
+        // non_local_space to it. This prevents alignment rounding in assign_slot
+        // from causing adjacent slots to overlap when nls is not aligned.
+        // 16/32-byte deferred slots (vector temps) demand a 16-aligned base:
+        // their pool offsets are 0 mod 16 (see the Tier-3 allocator), so a
+        // 0-mod-16 base makes every final ADDRESS 16-aligned — the
+        // legacy-SSE memory-form consumers of vector homes require exactly
+        // that. ds.align itself stays 0: the deferred mapping is positional
+        // and must never trigger the arch closure's >=16 address shift (on
+        // x86 FPO that shift slides a slot's extent 8 bytes onto its pool
+        // neighbour's bytes).
+        let max_align = deferred_slots
+            .iter()
+            .map(|ds| {
+                if ds.align > 0 {
+                    ds.align
+                } else if ds.size >= 16 {
+                    16
+                } else {
+                    8
+                }
+            })
+            .max()
+            .unwrap_or(8);
+        // ALWAYS 8-align the deferred-region base: Tier-2 small slots leave
+        // non_local_space at a 4-mod-8 value, and the pool offsets of 8-byte
+        // values are 8-aligned only relative to an 8-aligned base. With a
+        // 4-mod-8 base, finalize's alignment rounding shifts wide slots onto
+        // small slots' bytes (rot() v11/v14 overlap).
+        let aligned_nls = if max_align > 8 {
+            crate::common::types::align_up(non_local_space as usize, max_align as usize) as i64
+        } else {
+            (non_local_space + 7) & !7
+        };
+        // NOTE: the base must stay 0 mod 16 (NOT shifted by the closure's
+        // FPO +8). The deferred mapping is only self-consistent when
+        // round_up(B + o + s, a) == B + round_up(o + s, a) for every entry,
+        // which requires B == 0 mod a; each align-16 entry's per-slot FPO
+        // shift is then exactly absorbed by the +shift advance its
+        // allocation site already baked into the block-space sequence
+        // (site-607 allocas always did this; the Tier-3 pool/fallback do it
+        // via the same probed shift).
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            eprintln!(
+                "[SLOTS]   block-region base aligned_nls={} max_block_local_space={} n_deferred={}",
+                aligned_nls,
+                max_block_local_space,
+                deferred_slots.len()
+            );
+        }
+        // The pool accounting (`max_block_local_space`) and the placement
+        // below must agree: a slot whose extent reaches past the returned
+        // space lies outside the emitted frame, where pushes, calls and
+        // signal frames overwrite it.  The returned space therefore covers
+        // the deepest placement unconditionally; debug builds additionally
+        // insist that the pool accounting already did.
+        let pool_end = aligned_nls + max_block_local_space;
+        let mut deepest_end = pool_end;
+        for ds in deferred_slots {
+            let (slot, end) = assign_slot(aligned_nls + ds.block_offset, ds.size, ds.align);
+            debug_assert!(
+                end <= pool_end,
+                "deferred slot v{} (pool offset {}, size {}) ends at {} past the block-local \
+                 region end {}",
+                ds.dest_id,
+                ds.block_offset,
+                ds.size,
+                end,
+                pool_end
+            );
+            deepest_end = deepest_end.max(end);
+            if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+                eprintln!(
+                    "[SLOTS]   deferred v{} block_offset={} size={} align={} -> slot {}",
+                    ds.dest_id, ds.block_offset, ds.size, ds.align, slot
+                );
+            }
+            state.value_locations.insert(ds.dest_id, StackSlot(slot));
+        }
+        deepest_end
+    } else {
+        non_local_space
+    }
+}
+
+/// Propagate stack slots from root values to their copy aliases.
+/// Each aliased value gets the same StackSlot as its root, eliminating
+/// a separate slot allocation and making the Copy a harmless self-move.
+pub(super) fn resolve_copy_aliases(
+    state: &mut crate::backend::state::CodegenState,
+    copy_alias: &FxHashMap<u32, u32>,
+    phi_web_aliases: &FxHashSet<u32>,
+    loop_phi_aliases: &FxHashSet<u32>,
+    func: &crate::ir::reexports::IrFunction,
+) {
+    let debug_slot_coalesce = std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok();
+    let mut resolved_count = 0usize;
+    let mut blocked_overlap_count = 0usize;
+    let mut blocked_width_mismatch_count = 0usize;
+    let mut blocked_missing_root_count = 0usize;
+    // Build liveness intervals for interference checking.
+    // We use a lightweight approach: compute def-point and last-use-point for
+    // each value by scanning all instructions. Two values interfere if their
+    // [def, last_use] intervals overlap.
+    let mut def_point: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut last_use: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // Record definition point
+            if let Some(dest) = inst.dest() {
+                def_point.entry(dest.0).or_insert(point);
+            }
+            // Record uses
+            inst.for_each_used_value(|vid| {
+                last_use.insert(vid, point);
+            });
+            point += 1;
+        }
+        // Terminator uses
+        block.terminator.for_each_used_value(|vid| {
+            last_use.insert(vid, point);
+        });
+        point += 1;
+    }
+
+    for (&dest_id, &root_id) in copy_alias {
+        // An over-aligned (>16) alloca's slot is PADDED: the effective
+        // address (align_up) differs from the raw slot base, and every
+        // access routes through the aligned address. A plain SSA value
+        // sharing that slot would read/write the RAW base and desync
+        // from the aligned accesses (the parameter capture writes the
+        // aligned slot; ParamRef copies read it through the same aligned
+        // address). Refuse the share for BOTH endpoints so the aliased
+        // value keeps its own plain slot — its accesses are then correct
+        // by construction, and the copy between the two runs through the
+        // aligned address on the alloca side.
+        if state.alloca_alignments.contains_key(&dest_id)
+            || state.alloca_alignments.contains_key(&root_id)
+        {
+            continue;
+        }
+        // For phi-web coalesced values, force-overwrite the existing slot with
+        // the root's slot. These values were checked for interference during
+        // phi-web analysis and are safe to share. Loop-backedge phi aliases are
+        // likewise certified (by detect_phi_coalesce_groups) and must also
+        // overwrite the Tier-3 slot the backedge source already received.
+        if !phi_web_aliases.contains(&dest_id) && !loop_phi_aliases.contains(&dest_id) {
+            // For non-phi-web aliases, skip values that already have slots.
+            if state.value_locations.contains_key(&dest_id) {
+                continue;
+            }
+        }
+
+        // Skip non-phi-web aliases when slot coalescing is disabled.
+        // Copy aliases can incorrectly share slots between values with
+        // different lifetimes in complex functions (e.g., sqlite3_str_vappendf).
+        // Phi-web aliases have been verified for interference during analysis.
+        // Skip ALL copy aliases when slot coalescing is disabled.
+        // Both regular and phi-web aliases can cause slot collisions
+        // in large functions like sqlite3_str_vappendf (24KB, 500+ locals).
+        if std::env::var("CCC_NO_SLOT_COALESCE").is_ok() {
+            continue;
+        }
+
+        // The CFG-aware coalescer has already proven that every member of this
+        // alias class is non-interfering on real CFG edges. Its members must
+        // therefore override their fallback slots. The legacy heuristic retains
+        // its old linear interval guard when explicitly selected for bisection.
+        let cfg_proven = std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
+            && phi_web_aliases.contains(&dest_id);
+        // Width-class UNIFICATION for a web whose root already owns the wider
+        // slot.
+        //
+        // A copy/phi web carries one C type, yet its members can land in
+        // different width classes: `is_small` requires `!wide_typed`, and a
+        // Copy/Phi dest is `wide_typed` because its emitter moves it with
+        // `movq`, while the BinOp feeding it has a narrow `result_type()` and
+        // is classified small. Every member is then rejected below as a width
+        // mismatch and the web never coalesces.
+        //
+        // Measured cost of that rejection on `arith_loop` (32 loop-carried
+        // ints): the CFG coalescer proved all 21 phi pairs non-interfering and
+        // `resolve=0, blocked_width_mismatch=21`. Each rejected pair keeps two
+        // slots and a latch copy, so `c += d*e` compiled to
+        // `movl slot_old,%eax; imull; addl slot_other,%eax; movl %eax,slot_new`
+        // — three stack references where GCC emits one in-place
+        // `addl %r15d, slot`. Hot-loop stack refs: lccc 123, GCC 50.
+        //
+        // Unify toward the WIDER class, and only when the root is the wide
+        // one: the dest then stores through `movq` into the root's 8-byte
+        // slot, so every access to the shared slot is 8 bytes wide and no
+        // stale upper half can survive. (A 32-bit x86-64 ALU result is
+        // zero-extended into the full register, so the `movq` store of a
+        // narrow value writes a well-defined zero-extended image.) The
+        // opposite direction — a wide dest into a 4-byte root slot — would
+        // overrun the slot and is still refused.
+        if state.small_slot_values.contains(&dest_id) && !state.small_slot_values.contains(&root_id)
+        {
+            state.small_slot_values.remove(&dest_id);
+        }
+        // Width-class guard: never share a slot across 4-byte/8-byte classes.
+        // A small value storing movl into an 8-byte root's slot leaves the
+        // root's stale upper half for later 64-bit readers; conversely an
+        // 8-byte movq store into a 4-byte slot corrupts the slot's neighbour.
+        // Copy/phi webs carry one type, so a mismatch here can only come from
+        // a Cast-fed copy web — keep both values in their own slots instead.
+        if state.small_slot_values.contains(&dest_id) != state.small_slot_values.contains(&root_id)
+        {
+            blocked_width_mismatch_count += 1;
+            continue;
+        }
+        if let Some(&slot) = state.value_locations.get(&root_id) {
+            // Loop-backedge phi aliases are certified by
+            // detect_phi_coalesce_groups: the phi dest (root) is provably dead
+            // after the backedge source (dest) is defined, so the generic
+            // def/last-use check — which conservatively rejects them because
+            // the phi dest is used again on later iterations — does not apply.
+            // CFG-proven aliases (phi-web analysis) carry their own proof too.
+            if std::env::var("CCC_DEBUG_LOOP_PHI").is_ok() && loop_phi_aliases.contains(&dest_id) {
+                eprintln!(
+                    "[LOOP_PHI-RESOLVE] dest=v{} root=v{} slot={} certified",
+                    dest_id, root_id, slot.0
+                );
+            }
+            if !cfg_proven && !loop_phi_aliases.contains(&dest_id) {
+                let dest_def = def_point.get(&dest_id).copied().unwrap_or(u32::MAX);
+                let root_last = last_use.get(&root_id).copied().unwrap_or(0);
+                if dest_def <= root_last {
+                    blocked_overlap_count += 1;
+                    continue; // Root still live when dest is defined
+                }
+            }
+            state.value_locations.insert(dest_id, slot);
+            resolved_count += 1;
+        } else {
+            blocked_missing_root_count += 1;
+            continue;
+        }
+        // Propagate small-slot property
+        if state.small_slot_values.contains(&root_id) {
+            state.small_slot_values.insert(dest_id);
+        }
+        // Propagate alloca status
+        if state.alloca_values.contains(&root_id) {
+            state.alloca_values.insert(dest_id);
+        }
+        if let Some(&align) = state.alloca_alignments.get(&root_id) {
+            state.alloca_alignments.insert(dest_id, align);
+        }
+    }
+
+    if debug_slot_coalesce && !copy_alias.is_empty() {
+        eprintln!(
+            "[SLOT-COALESCE] resolve fn={} requested={} resolved={} blocked_overlap={} blocked_missing_root={} blocked_width_mismatch={}",
+            func.name,
+            copy_alias.len(),
+            resolved_count,
+            blocked_overlap_count,
+            blocked_missing_root_count,
+            blocked_width_mismatch_count,
+        );
+    }
+}
+
+/// On 32-bit targets, propagate wide-value status through Copy chains.
+///
+/// Copy instructions for 64-bit values (F64, I64, U64) need 8-byte copies
+/// (two movl instructions) instead of the default 4-byte. The initial
+/// wide_values set only includes typed instructions; phi elimination creates
+/// Copy chains where the destination has no type info. We propagate using
+/// fixpoint iteration to handle cycles from phi copies.
+pub(super) fn propagate_wide_values(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    copy_alias: &FxHashMap<u32, u32>,
+) {
+    if !crate::common::types::target_is_32bit() {
+        return;
+    }
+
+    let is_wide_ty =
+        |ty: IrType| matches!(ty, IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64);
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                if let Some(ty) = inst.result_type() {
+                    if is_wide_ty(ty) {
+                        state.wide_values.insert(dest.0);
+                    }
+                }
+            }
+            match inst {
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ty,
+                    ..
+                } if is_wide_ty(*ty) => {
+                    state.wide_values.insert(v.0);
+                }
+                Instruction::Call { info, .. } => {
+                    for (arg, &arg_ty) in info.args.iter().zip(&info.arg_types) {
+                        if is_wide_ty(arg_ty) {
+                            if let Operand::Value(v) = arg {
+                                state.wide_values.insert(v.0);
+                            }
+                        }
+                    }
+                }
+                Instruction::BinOp {
+                    op, lhs, rhs, ty, ..
+                } if is_wide_ty(*ty) => {
+                    if let Operand::Value(v) = lhs {
+                        state.wide_values.insert(v.0);
+                    }
+                    if !matches!(
+                        op,
+                        crate::ir::ops::IrBinOp::Shl
+                            | crate::ir::ops::IrBinOp::LShr
+                            | crate::ir::ops::IrBinOp::AShr
+                    ) {
+                        if let Operand::Value(v) = rhs {
+                            state.wide_values.insert(v.0);
+                        }
+                    }
+                }
+                Instruction::Cmp { lhs, rhs, ty, .. } if is_wide_ty(*ty) => {
+                    if let Operand::Value(v) = lhs {
+                        state.wide_values.insert(v.0);
+                    }
+                    if let Operand::Value(v) = rhs {
+                        state.wide_values.insert(v.0);
+                    }
+                }
+                Instruction::Cast {
+                    src: Operand::Value(v),
+                    from_ty,
+                    ..
+                } if is_wide_ty(*from_ty) => {
+                    state.wide_values.insert(v.0);
+                }
+                Instruction::UnaryOp {
+                    src: Operand::Value(v),
+                    ty,
+                    ..
+                } if is_wide_ty(*ty) => {
+                    state.wide_values.insert(v.0);
+                }
+                Instruction::Phi { dest, ty, incoming } if is_wide_ty(*ty) => {
+                    state.wide_values.insert(dest.0);
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            state.wide_values.insert(v.0);
+                        }
+                    }
+                }
+                Instruction::Select {
+                    true_val,
+                    false_val,
+                    ty,
+                    ..
+                } if is_wide_ty(*ty) => {
+                    if let Operand::Value(v) = true_val {
+                        state.wide_values.insert(v.0);
+                    }
+                    if let Operand::Value(v) = false_val {
+                        state.wide_values.insert(v.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Terminator::Return(Some(Operand::Value(v))) = &block.terminator {
+            if is_wide_ty(func.return_type) {
+                state.wide_values.insert(v.0);
+            }
+        }
+    }
+
+    if state.wide_values.is_empty() {
+        return;
+    }
+
+    let mut copy_edges: Vec<(u32, u32)> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(src_val),
+            } = inst
+            {
+                copy_edges.push((dest.0, src_val.0));
+                copy_edges.push((src_val.0, dest.0));
+            }
+        }
+    }
+    // Also propagate through copy aliases in both directions.
+    for (&dest_id, &root_id) in copy_alias {
+        copy_edges.push((dest_id, root_id));
+        copy_edges.push((root_id, dest_id));
+    }
+
+    if copy_edges.is_empty() {
+        return;
+    }
+
+    // Fixpoint iteration: propagate wide status until stable.
+    let mut changed = true;
+    let mut iters = 0;
+    while changed && iters < 100 {
+        changed = false;
+        iters += 1;
+        for &(dest_id, src_id) in &copy_edges {
+            if state.wide_values.contains(&src_id) && !state.wide_values.contains(&dest_id) {
+                state.wide_values.insert(dest_id);
+                changed = true;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scalar_lane_slot_tests {
+    use super::*;
+    use crate::common::types::{self, AddressSpace};
+    use crate::ir::reexports::{BasicBlock, BlockId, IntrinsicOp};
+
+    struct TargetGuard(usize, bool);
+    impl Drop for TargetGuard {
+        fn drop(&mut self) {
+            types::set_target_ptr_size(self.0);
+            types::set_target_small_slots(self.1);
+        }
+    }
+
+    #[test]
+    fn scalar_lane_slots_are_width_partitioned_even_without_fp_homes() {
+        let _restore = TargetGuard(types::target_ptr_size(), types::target_small_slots());
+        types::set_target_ptr_size(8);
+        types::set_target_small_slots(true);
+        let mut f = IrFunction::new("lane_slots".into(), IrType::Void, vec![], false);
+        let mut ins = vec![Instruction::Copy {
+            dest: Value(99),
+            src: Operand::Const(IrConst::I64(4096)),
+        }];
+        let ops = [
+            (
+                IntrinsicOp::VecZeroF32x4,
+                IntrinsicOp::VecExtractLaneF32x4,
+                IrType::F32,
+            ),
+            (
+                IntrinsicOp::VecZeroF32x8,
+                IntrinsicOp::VecExtractLaneF32x8,
+                IrType::F32,
+            ),
+            (
+                IntrinsicOp::VecZeroF64x2,
+                IntrinsicOp::VecExtractLaneF64x2,
+                IrType::F64,
+            ),
+            (
+                IntrinsicOp::VecZeroF64x4,
+                IntrinsicOp::VecExtractLaneF64x4,
+                IrType::F64,
+            ),
+        ];
+        for (i, (zero, _, _)) in ops.iter().enumerate() {
+            ins.push(Instruction::Intrinsic {
+                dest: Some(Value(100 + i as u32)),
+                op: zero.clone(),
+                dest_ptr: None,
+                args: vec![],
+            });
+        }
+        for (i, (_, extract, _)) in ops.iter().enumerate() {
+            ins.push(Instruction::Intrinsic {
+                dest: Some(Value(i as u32)),
+                op: extract.clone(),
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(Value(100 + i as u32)),
+                    Operand::Const(IrConst::I32(1)),
+                ],
+            });
+        }
+        // All four results overlap in liveness. No adjacent-use deferral can
+        // replace their slots; each store also supplies an independent width.
+        for (i, (_, _, ty)) in ops.iter().enumerate() {
+            ins.push(Instruction::Store {
+                ptr: Value(99),
+                val: Operand::Value(Value(i as u32)),
+                ty: *ty,
+                volatile: true,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: ins,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        f.next_value_id = 104;
+        let mut state = crate::backend::state::CodegenState::new_with_ra_config(
+            std::sync::Arc::new(crate::backend::regalloc::RaConfig::default()),
+        );
+        assert!(!state.ra_config.fp_extract_homes);
+        let total = super::super::calculate_stack_space_common(
+            &mut state,
+            &f,
+            0,
+            |space, size, align| {
+                // align=0 means natural alignment in the allocator API.
+                let align = if align == 0 { size.min(8) } else { align };
+                let start = (space + align - 1) & -align;
+                (start, start + size)
+            },
+            &FxHashMap::default(),
+            &[],
+            None,
+        );
+        let mut spans = Vec::new();
+        for (i, (_, _, ty)) in ops.iter().enumerate() {
+            assert_eq!(state.small_slot_values.contains(&(i as u32)), i < 2);
+            let start = state.value_locations[&(i as u32)].0 as usize;
+            spans.push((start, start + ty.size()));
+        }
+        for i in 0..4 {
+            for j in i + 1..4 {
+                assert!(
+                    spans[i].1 <= spans[j].0 || spans[j].1 <= spans[i].0,
+                    "overlapping live scalar lanes"
+                );
+            }
+        }
+        assert_eq!(
+            spans[0].0.abs_diff(spans[1].0),
+            4,
+            "exercise an actual adjacent four-byte boundary"
+        );
+        let patterns: [u64; 4] = [
+            0x80000000,
+            0x3fa00000,
+            0x400921fb54442d18,
+            0xbff0000000000000,
+        ];
+        let mut memory = vec![0xa5; total as usize];
+        for (i, (lo, hi)) in spans.iter().copied().enumerate() {
+            memory[lo..hi].copy_from_slice(&patterns[i].to_le_bytes()[..hi - lo]);
+        }
+        for (i, (lo, hi)) in spans.iter().copied().enumerate() {
+            assert_eq!(&memory[lo..hi], &patterns[i].to_le_bytes()[..hi - lo]);
+        }
+    }
+}

@@ -1,0 +1,101 @@
+{
+  "date": "2026-09-27",
+  "base": "e9f572eb36f5cd98c9ea1f077bc2922bd001177e",
+  "target": "x86-64 I64/U64 map; two-lane XMM lowering",
+  "kernel": "tests/bench/k_map64_sub.c",
+  "method": {
+    "harness": "scripts/bench_kernels.py",
+    "samples": 15,
+    "inner": 10000,
+    "selection": "best-of",
+    "pinning": "taskset CPU 0",
+    "driver": "one common GCC-compiled driver; interleaved arms; volatile sink/output check",
+    "host": "sandbox VM; PMU unavailable; not Raptor Lake"
+  },
+  "runtime_ab": {
+    "flags": "-O2 -march=x86-64-v3",
+    "default_vs_no_i64_unroll": {
+      "lccc_ms": 1.676165,
+      "ccc_no_map_i64_unroll_ms": 2.437622,
+      "gcc_14_2_ms": 1.383508,
+      "default_speedup_vs_rolled": 1.454,
+      "default_ratio_vs_gcc": 0.825,
+      "timed_function_hashes": {
+        "lccc": "f628dbb95a21eed6",
+        "ccc_no_map_i64_unroll": "ec3b5e4ee0be604f",
+        "gcc": "f7dd282bdf26e3f2"
+      }
+    },
+    "default_vs_scalar": {
+      "lccc_ms": 1.647828,
+      "ccc_no_map_vec_ms": 3.442241,
+      "gcc_14_2_ms": 1.441977,
+      "default_speedup_vs_scalar": 2.089,
+      "default_ratio_vs_gcc": 0.875,
+      "timed_function_hashes": {
+        "lccc": "f628dbb95a21eed6",
+        "ccc_no_map_vec": "99ba0b9dc0043948",
+        "gcc": "f7dd282bdf26e3f2"
+      }
+    }
+  },
+  "runtime_baseline_isa": {
+    "flags": "-O2 -march=x86-64",
+    "lccc_ms": 1.613023,
+    "ccc_no_map_vec_ms": 3.412215,
+    "gcc_14_2_ms": 2.411559,
+    "speedup_vs_scalar": 2.115,
+    "ratio_vs_gcc": 1.495
+  },
+  "static_oracle": {
+    "source": "tests/regression/map_i64_two_lane.c",
+    "function": "sub64",
+    "flags": "-O2 -march=x86-64-v3",
+    "instruction_counts": {
+      "lccc": 55,
+      "gcc16.2": 33,
+      "clang23.1.0": 50,
+      "icc2021.10.0": 74,
+      "icx_latest": 25
+    },
+    "artifact": "scratch/oracle-map64.json",
+    "interpretation": "static code shape only; not a throughput ranking"
+  },
+  "assembly_contract": {
+    "x86_64_v3": {
+      "packed_ops_in_sub64": 4,
+      "packed_op": "vpsubq",
+      "vector_byte_step": 64,
+      "vector_register_width": 128,
+      "unrolled_displacement_lea": 0
+    },
+    "x86_64_sse2": {
+      "packed_ops_in_sub64": 4,
+      "packed_op": "psubq",
+      "vector_byte_step": 64,
+      "vector_register_width": 128,
+      "unrolled_displacement_lea": 0
+    },
+    "i686": "scalar assembly; no packed I64 map operation"
+  },
+  "correctness": {
+    "gate": "tests/regression/check_map_i64_two_lane.sh",
+    "trip_counts": "0..259",
+    "cases": [
+      "unsigned 64-bit wraparound",
+      "invariant subtraction",
+      "untouched tails",
+      "shifted/overlapping destination alias guard",
+      "GCC and CCC_NO_MAP_VEC output differential",
+      "x86-64-v3 and x86-64/SSE2",
+      "i686 -m32 -msse2 assembly"
+    ],
+    "result": "PASS"
+  },
+  "limitations": [
+    "No native i7-14700KF/Raptor Lake PMU or hardware timing was available.",
+    "The local VM has GCC 14.2; GCC 16.2, Clang 23.1, ICC 2021.10 and ICX latest were used as static Compiler Explorer oracles only.",
+    "A 256-bit I64 intrinsic or ABI change remains out of scope.",
+    "The runtime numbers are for one synthetic 1024-element kernel and do not establish package-wide gains."
+  ]
+}

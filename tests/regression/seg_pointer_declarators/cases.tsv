@@ -1,0 +1,17 @@
+id	expect	payload
+variable_rejects_loss	reject	typedef struct { int x; } pe; extern pe * __seg_gs *gs; pe **v = gs;
+parameter_rejects_loss	reject	typedef struct { int x; } pe; extern pe * __seg_gs *gs; void f(pe * __seg_gs *p) { pe **q = p; (void)q; }
+member_rejects_loss	reject	typedef struct { int x; } pe; extern pe * __seg_gs *gs; struct h { pe * __seg_gs *m; }; void f(struct h *hp) { pe **q = hp->m; (void)q; }
+typedef_rejects_loss	reject	typedef struct { int x; } pe; extern pe * __seg_gs *gs; typedef pe * __seg_gs *gsp; void f(void) { gsp t = gs; pe **q = t; (void)q; }
+return_type_keeps_space	accept	typedef struct { int x; } pe; extern pe * __seg_gs *gs; pe * __seg_gs *f(void) { return gs; }
+return_type_keeps_space_void	accept	typedef struct { int x; } pe; extern void __seg_gs *gv; pe * __seg_gs *f(void) { return gv; }
+return_through_cast	accept	typedef struct { int x; } pe; pe * __seg_gs *f(pe * __seg_gs *p) { return (pe * __seg_gs *)(unsigned long)p; }
+return_fs_space	accept	typedef struct { int x; } pe; extern pe * __seg_fs *fs; pe * __seg_fs *f(void) { return fs; }
+same_space_ok	accept	typedef struct { int x; } pe; extern pe * __seg_gs *gs; void f(void) { pe * __seg_gs *copy = gs; (void)copy; }
+cross_space_rejected	reject	typedef struct { int x; } pe; extern pe * __seg_gs *gs; pe * __seg_fs *f(void) { return gs; }
+cast_paren_ptr_to_array_loss	reject	extern __seg_gs int ga[4]; void f(void) { int (*p)[4] = (int __seg_gs (*)[4])&ga; (void)p; }
+cast_paren_ptr_to_array_keep	accept	extern __seg_gs int ga[4]; void f(void) { int __seg_gs (*p)[4] = (int __seg_gs (*)[4])&ga; (void)p; }
+cast_nested_seg_ptr_to_array_loss	reject	typedef int (*pa_t)[4]; extern pa_t __seg_gs *gpa; void f(void) { int (**p)[4] = (int (* __seg_gs *)[4])gpa; (void)p; }
+cast_nested_seg_ptr_to_array_keep	accept	typedef int (*pa_t)[4]; extern pa_t __seg_gs *gpa; void f(void) { pa_t __seg_gs *p = (int (* __seg_gs *)[4])gpa; (void)p; }
+fptr_ret_seg_ptr_call_loss	reject	extern int * __seg_gs *(*gf)(void); void f(void) { int **p = gf(); (void)p; }
+fptr_ret_seg_ptr_call_keep	accept	extern int * __seg_gs *(*gf)(void); void f(void) { int * __seg_gs *p = gf(); (void)p; }

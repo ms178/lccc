@@ -1,0 +1,469 @@
+//! Numeric local label resolution for x86 and i686 assemblers.
+//!
+//! GNU assembler numeric labels (e.g., `1:`, `42:`) can be defined multiple
+//! times. Forward references (`1f`) resolve to the NEXT definition, backward
+//! references (`1b`) resolve to the MOST RECENT definition.
+//!
+//! This module provides the resolution logic shared by x86 and i686 ELF
+//! writers. Both architectures use the same x86 parser AST types
+//! (AsmItem, Operand, Displacement, DataValue, etc.), so these functions
+//! operate on those types directly.
+//!
+//! ARM and RISC-V use different parser types and don't have this pattern
+//! (ARM has no numeric labels; RISC-V has its own pre-pass).
+
+use crate::backend::x86::assembler::parser::{
+    AsmItem, DataValue, Displacement, ImmediateValue, Instruction, MemoryOperand, Operand,
+};
+use crate::common::fx_hash::FxHashMap;
+
+/// Check if a string is a numeric local label (just digits, e.g., "1", "42").
+pub fn is_numeric_label(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Check if a string is a numeric forward/backward reference like "1f" or "2b".
+/// Returns Some((number_str, is_forward)) if it is, None otherwise.
+pub fn parse_numeric_ref(name: &str) -> Option<(&str, bool)> {
+    if name.len() < 2 {
+        return None;
+    }
+    let last = name.as_bytes()[name.len() - 1];
+    let num_part = &name[..name.len() - 1];
+    if !num_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    match last {
+        b'f' => Some((num_part, true)),
+        b'b' => Some((num_part, false)),
+        _ => None,
+    }
+}
+
+/// Resolve numeric local labels (1:, 2:, etc.) and their references (1f, 1b)
+/// into unique internal label names.
+///
+/// GNU assembler numeric labels can be defined multiple times. Each forward
+/// reference `Nf` refers to the next definition of `N`, and each backward
+/// reference `Nb` refers to the most recent definition of `N`.
+///
+/// This function renames each definition to a unique `.Lnum_N_K` name and
+/// updates all references accordingly. Used by both x86 and i686 ELF writers.
+pub fn resolve_numeric_labels(items: &[AsmItem]) -> Vec<AsmItem> {
+    // First pass: find all numeric label definitions and assign unique names.
+    let mut defs: FxHashMap<String, Vec<(usize, String)>> = FxHashMap::default();
+    let mut unique_counter: FxHashMap<String, usize> = FxHashMap::default();
+
+    for (i, item) in items.iter().enumerate() {
+        if let AsmItem::Label(name) = item {
+            if is_numeric_label(name) {
+                let count = unique_counter.entry(name.clone()).or_insert(0);
+                let unique_name = format!(".Lnum_{}_{}", name, *count);
+                *count += 1;
+                defs.entry(name.clone()).or_default().push((i, unique_name));
+            }
+        }
+    }
+
+    if defs.is_empty() {
+        return items.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            AsmItem::Label(name) if is_numeric_label(name) => {
+                if let Some(def_list) = defs.get(name) {
+                    if let Some((_, unique_name)) = def_list.iter().find(|(idx, _)| *idx == i) {
+                        result.push(AsmItem::Label(unique_name.clone()));
+                        continue;
+                    }
+                }
+                result.push(item.clone());
+            }
+            AsmItem::Instruction(instr) => {
+                let new_ops: Vec<Operand> = instr
+                    .operands
+                    .iter()
+                    .map(|op| resolve_numeric_operand(op, i, &defs))
+                    .collect();
+                result.push(AsmItem::Instruction(Instruction {
+                    prefixes: instr.prefixes.clone(),
+                    mnemonic: instr.mnemonic.clone(),
+                    operands: new_ops,
+                    nf: instr.nf,
+                    force_evex: instr.force_evex,
+                    vex_hint: instr.vex_hint,
+                    force_rex2: instr.force_rex2,
+                    dfv: instr.dfv,
+                }));
+            }
+            AsmItem::Short(vals) => {
+                result.push(AsmItem::Short(resolve_numeric_data_values(vals, i, &defs)));
+            }
+            AsmItem::Long(vals) => {
+                result.push(AsmItem::Long(resolve_numeric_data_values(vals, i, &defs)));
+            }
+            AsmItem::Quad(vals) => {
+                result.push(AsmItem::Quad(resolve_numeric_data_values(vals, i, &defs)));
+            }
+            AsmItem::Addr(vals) => {
+                result.push(AsmItem::Addr(resolve_numeric_data_values(vals, i, &defs)));
+            }
+            AsmItem::Byte(vals) => {
+                result.push(AsmItem::Byte(resolve_numeric_data_values(vals, i, &defs)));
+            }
+            AsmItem::Uleb128(vals) => {
+                result.push(AsmItem::Uleb128(resolve_numeric_data_values(
+                    vals, i, &defs,
+                )));
+            }
+            AsmItem::Sleb128(vals) => {
+                result.push(AsmItem::Sleb128(resolve_numeric_data_values(
+                    vals, i, &defs,
+                )));
+            }
+            AsmItem::SkipExpr(expr, fill) => {
+                let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
+                result.push(AsmItem::SkipExpr(new_expr, *fill));
+            }
+            AsmItem::Set(name, expr) => {
+                let new_expr = resolve_numeric_refs_in_expr(expr, i, &defs);
+                result.push(AsmItem::Set(name.clone(), new_expr));
+            }
+            AsmItem::Org(sym, offset, fill) => {
+                if let Some(resolved) = resolve_numeric_name(sym, i, &defs) {
+                    result.push(AsmItem::Org(resolved, *offset, *fill));
+                } else {
+                    result.push(item.clone());
+                }
+            }
+            _ => result.push(item.clone()),
+        }
+    }
+
+    result
+}
+
+/// Resolve numeric label references in a single operand.
+fn resolve_numeric_operand(
+    op: &Operand,
+    current_idx: usize,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
+) -> Operand {
+    match op {
+        Operand::Label(name) => {
+            if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                Operand::Label(resolved)
+            } else {
+                op.clone()
+            }
+        }
+        Operand::Memory(mem) => {
+            if let Some(new_disp) =
+                resolve_numeric_displacement(&mem.displacement, current_idx, defs)
+            {
+                Operand::Memory(MemoryOperand {
+                    segment: mem.segment.clone(),
+                    displacement: new_disp,
+                    base: mem.base.clone(),
+                    index: mem.index.clone(),
+                    scale: mem.scale,
+                    mask: mem.mask.clone(),
+                    zeroing: mem.zeroing,
+                    broadcast: mem.broadcast,
+                })
+            } else {
+                op.clone()
+            }
+        }
+        Operand::Immediate(ImmediateValue::SymbolDiff(lhs, rhs)) => {
+            let new_lhs =
+                resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+            let new_rhs =
+                resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+            Operand::Immediate(ImmediateValue::SymbolDiff(new_lhs, new_rhs))
+        }
+        // A bare reference, or one inside an expression the operand parser
+        // kept as text (`$_GLOBAL_OFFSET_TABLE_+[.-1b]`, musl's i386 PIC
+        // idiom): the definitions are renamed, so a raw `1b` left in the
+        // text would never resolve.
+        Operand::Immediate(ImmediateValue::Symbol(name)) => {
+            Operand::Immediate(ImmediateValue::Symbol(
+                resolve_numeric_name(name, current_idx, defs)
+                    .unwrap_or_else(|| resolve_numeric_refs_in_expr(name, current_idx, defs)),
+            ))
+        }
+        Operand::Immediate(ImmediateValue::SymbolPlusOffset(name, off)) => {
+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(
+                resolve_numeric_name(name, current_idx, defs)
+                    .unwrap_or_else(|| resolve_numeric_refs_in_expr(name, current_idx, defs)),
+                *off,
+            ))
+        }
+        Operand::Indirect(inner) => {
+            let resolved_inner = resolve_numeric_operand(inner, current_idx, defs);
+            Operand::Indirect(Box::new(resolved_inner))
+        }
+        _ => op.clone(),
+    }
+}
+
+/// Resolve numeric label references in data values (.long, .quad, .byte directives).
+fn resolve_numeric_data_values(
+    vals: &[DataValue],
+    current_idx: usize,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
+) -> Vec<DataValue> {
+    vals.iter()
+        .map(|val| {
+            match val {
+                DataValue::Symbol(name) => {
+                    if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                        DataValue::Symbol(resolved)
+                    } else {
+                        val.clone()
+                    }
+                }
+                DataValue::SymbolDiff(lhs, rhs) => {
+                    let new_lhs =
+                        resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                    let new_rhs =
+                        resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                    DataValue::SymbolDiff(new_lhs, new_rhs)
+                }
+                DataValue::SymbolOffset(name, offset) => {
+                    if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
+                        DataValue::SymbolOffset(resolved, *offset)
+                    } else {
+                        val.clone()
+                    }
+                }
+                // A numeric label reference is equally valid in the ADDEND and
+                // expression forms. Leaving them in the catch-all below meant a
+                // difference such as
+                //     .long 770b + 1 - 760b        (SymbolDiffAddend)
+                //     .long (770b - 760b) * 4      (Expr)
+                // kept the raw names `770b`/`760b`, while the DEFINITIONS had
+                // already been renamed to `.Lnum_770_0`/`.Lnum_760_0`. Nothing
+                // downstream could ever match them, so the assembler aborted with
+                // "undefined label in .byte diff: 770b". The plain `SymbolDiff`
+                // form worked only because it is listed above -- which is exactly
+                // why this must be an exhaustive match rather than a catch-all.
+                DataValue::SymbolDiffAddend(lhs, rhs, addend) => {
+                    let new_lhs =
+                        resolve_numeric_name(lhs, current_idx, defs).unwrap_or_else(|| lhs.clone());
+                    let new_rhs =
+                        resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
+                    DataValue::SymbolDiffAddend(new_lhs, new_rhs, *addend)
+                }
+                DataValue::Expr(expr) => {
+                    DataValue::Expr(resolve_numeric_refs_in_expr(expr, current_idx, defs))
+                }
+                // Exhaustive on purpose: every future DataValue variant that can
+                // carry a symbol name must be considered here explicitly.
+                DataValue::Integer(_) => val.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Resolve a numeric label reference name (e.g., "1f" -> ".Lnum_1_0").
+pub fn resolve_numeric_name(
+    name: &str,
+    current_idx: usize,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
+) -> Option<String> {
+    // A numeric reference may carry a source-level addend (`jmp 1f+300`,
+    // `ja 2b-0x70`): split it off, resolve the base reference, and splice
+    // it back. The combined spelling (`.Lnum_1_0+300`) then flows through
+    // every label-plus-constant consumer — relocation recording splits it
+    // at the choke point, jump-target parsing splits it for relaxation —
+    // exactly like a named label with an addend. Without the rewrite the
+    // raw `1f+300` escapes the whole resolution pipeline and becomes an
+    // external relocation against a symbol literally named `1f+300`
+    // (undefined at link time; GAS resolves the constant at assembly
+    // time). Non-numeric bases fall through to the exact-match path and
+    // return None, leaving named `foo+4` operands to their own paths.
+    // The recursion is depth-1 by construction: the splitter folds the
+    // WHOLE offset expression at the first separator (`1f+4+8` splits as
+    // base `1f` + offset 12 -- parse_integer_expr evaluates `4+8`), and
+    // the returned base is always a symbol-charset slice (no '+'/'-'),
+    // so the recursive call can never split again. A `.Lnum_1_0+4+8`
+    // spelling cannot arise (probed: `jmp 1f+4+8` assembles to the same
+    // bytes as GAS).
+    if let Some((base, addend)) =
+        crate::backend::x86::assembler::parser::split_relocation_symbol_addend(name)
+    {
+        return resolve_numeric_name(base, current_idx, defs)
+            .map(|resolved| format!("{resolved}{addend:+}"));
+    }
+    let (num, is_forward) = parse_numeric_ref(name)?;
+    let def_list = defs.get(num)?;
+
+    if is_forward {
+        def_list
+            .iter()
+            .find(|(idx, _)| *idx > current_idx)
+            .map(|(_, name)| name.clone())
+    } else {
+        def_list
+            .iter()
+            .rev()
+            .find(|(idx, _)| *idx < current_idx)
+            .map(|(_, name)| name.clone())
+    }
+}
+
+/// Resolve numeric label references in a displacement.
+fn resolve_numeric_displacement(
+    disp: &Displacement,
+    current_idx: usize,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
+) -> Option<Displacement> {
+    match disp {
+        Displacement::Symbol(name) => {
+            resolve_numeric_name(name, current_idx, defs).map(Displacement::Symbol)
+        }
+        Displacement::SymbolAddend(name, addend) => resolve_numeric_name(name, current_idx, defs)
+            .map(|n| Displacement::SymbolAddend(n, *addend)),
+        Displacement::SymbolMod(name, modifier) => resolve_numeric_name(name, current_idx, defs)
+            .map(|n| Displacement::SymbolMod(n, modifier.clone())),
+        Displacement::SymbolPlusOffset(name, offset) => {
+            resolve_numeric_name(name, current_idx, defs)
+                .map(|n| Displacement::SymbolPlusOffset(n, *offset))
+        }
+        // Label differences as displacements (efi-mixed.S:
+        // `leal (_bss - 1b)(%ecx), %edi`): EITHER side may be a numeric
+        // label reference. Returning Some whenever at least one side
+        // resolved keeps the other side's name unchanged.
+        Displacement::SymbolDiff(lhs, rhs) => {
+            let new_lhs = resolve_numeric_name(lhs, current_idx, defs);
+            let new_rhs = resolve_numeric_name(rhs, current_idx, defs);
+            if new_lhs.is_none() && new_rhs.is_none() {
+                None
+            } else {
+                Some(Displacement::SymbolDiff(
+                    new_lhs.unwrap_or_else(|| lhs.clone()),
+                    new_rhs.unwrap_or_else(|| rhs.clone()),
+                ))
+            }
+        }
+        Displacement::SymbolDiffAddend(lhs, rhs, addend) => {
+            let new_lhs = resolve_numeric_name(lhs, current_idx, defs);
+            let new_rhs = resolve_numeric_name(rhs, current_idx, defs);
+            if new_lhs.is_none() && new_rhs.is_none() {
+                None
+            } else {
+                Some(Displacement::SymbolDiffAddend(
+                    new_lhs.unwrap_or_else(|| lhs.clone()),
+                    new_rhs.unwrap_or_else(|| rhs.clone()),
+                    *addend,
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve numeric label references (`6651f`, `661b`) within an expression
+/// string ([`crate::backend::asm_expr::rewrite_numeric_label_refs`]).
+pub fn resolve_numeric_refs_in_expr(
+    expr: &str,
+    current_idx: usize,
+    defs: &FxHashMap<String, Vec<(usize, String)>>,
+) -> String {
+    crate::backend::asm_expr::rewrite_numeric_label_refs(expr, |r| {
+        resolve_numeric_name(r, current_idx, defs)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+
+    fn defs() -> FxHashMap<String, Vec<(usize, String)>> {
+        let mut d: FxHashMap<String, Vec<(usize, String)>> = FxHashMap::default();
+        d.insert("1".to_string(), vec![(2, ".Lnum_1_0".to_string())]);
+        d.insert(
+            "7".to_string(),
+            vec![(1, ".Lnum_7_0".to_string()), (5, ".Lnum_7_1".to_string())],
+        );
+        d
+    }
+
+    #[test]
+    fn references_inside_expression_immediates_resolve() {
+        // `$_GLOBAL_OFFSET_TABLE_+[.-1b]` stays one text symbol in the
+        // operand parser; its `1b` must follow the definition's rename (a
+        // raw `1b` left behind escaped as an undefined symbol of that name).
+        let d = defs();
+        let op = Operand::Immediate(ImmediateValue::Symbol(
+            "_GLOBAL_OFFSET_TABLE_+[.Ldotpos_0_7-1b]".to_string(),
+        ));
+        match resolve_numeric_operand(&op, 3, &d) {
+            Operand::Immediate(ImmediateValue::Symbol(s)) => {
+                assert_eq!(s, "_GLOBAL_OFFSET_TABLE_+[.Ldotpos_0_7-.Lnum_1_0]")
+            }
+            other => panic!("unexpected operand {other:?}"),
+        }
+        // Digits inside identifiers and hex literals are not references.
+        let op = Operand::Immediate(ImmediateValue::SymbolPlusOffset(
+            "sym1b+0x1b".to_string(),
+            4,
+        ));
+        match resolve_numeric_operand(&op, 3, &d) {
+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(s, 4)) => {
+                assert_eq!(s, "sym1b+0x1b")
+            }
+            other => panic!("unexpected operand {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_references_resolve_unchanged() {
+        let d = defs();
+        // Forward: the next definition after the reference site.
+        assert_eq!(
+            resolve_numeric_name("1f", 0, &d),
+            Some(".Lnum_1_0".to_string())
+        );
+        // Backward: the most recent definition before the reference site.
+        assert_eq!(
+            resolve_numeric_name("7b", 6, &d),
+            Some(".Lnum_7_1".to_string())
+        );
+        assert_eq!(
+            resolve_numeric_name("7f", 0, &d),
+            Some(".Lnum_7_0".to_string())
+        );
+        assert_eq!(resolve_numeric_name("notnumeric", 0, &d), None);
+    }
+
+    #[test]
+    fn reference_with_addend_resolves_and_recombines() {
+        // `jmp 1f+300` must become `.Lnum_1_0+300` so the relocation choke
+        // point can split it into the base label plus a link-time addend.
+        // Before this rewrite the raw `1f+300` escaped as an external
+        // relocation against a symbol literally named `1f+300` (undefined
+        // at link time; GAS resolves the constant at assembly time).
+        let d = defs();
+        assert_eq!(
+            resolve_numeric_name("1f+300", 0, &d),
+            Some(".Lnum_1_0+300".to_string())
+        );
+        assert_eq!(
+            resolve_numeric_name("7b-0x70", 6, &d),
+            Some(".Lnum_7_1-112".to_string())
+        );
+        // Offset-first spellings keep their order.
+        assert_eq!(
+            resolve_numeric_name("4+1f", 0, &d),
+            Some(".Lnum_1_0+4".to_string())
+        );
+        // A named (non-numeric) base never resolves here — `foo+4` flows
+        // through the named-label paths unchanged.
+        assert_eq!(resolve_numeric_name("foo+4", 0, &d), None);
+    }
+}

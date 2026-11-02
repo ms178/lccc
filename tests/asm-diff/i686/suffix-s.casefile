@@ -1,0 +1,135 @@
+# The `.s` (swap/store-direction) suffix and the direction-bit families
+# in 32-bit mode: the x86-64 `suffix-s.casefile` runs --64, so every i686
+# s_flip arm needs its own oracle lines. Every expected byte below was
+# GAS 2.47.20260726 --32-probed while wiring the laws; asmdiff re-derives
+# both sides per run.
+;;; alu_s_reg_reg
+.text
+add.s %edx,%ecx
+sub.s %edx,%ecx
+mov.s %eax,%ebx
+test.s %edx,%ecx
+add.s %dl,%cl
+addb.s %dl,%cl
+;;; unary_width
+.text
+# The 1-operand imul/mul/neg width matrix (the imulw regression pin:
+# encode_imul must not push a second 0x66 ahead of encode_unary_rm's).
+imul %ax
+imul %dx
+imulw %dx
+mul %ax
+neg %cx
+;;; string_seg_laws
+.text
+# Per-side string-op segment law: the EDI side drops %es as its
+# architectural default, the ESI side drops %ds, any other override is
+# kept — and the scan must not stop at the first operand.
+cmpsb %es:(%edi),%fs:(%esi)
+movsb %fs:(%esi),%es:(%edi)
+movsw %fs:(%esi),%es:(%edi)
+lodsb %fs:(%esi)
+stosb %es:(%edi)
+# the dword string form with explicit operands (movsl two-memory arm)
+movsl (%esi),%es:(%edi)
+movsl %ds:(%esi),%es:(%edi)
+# the ES-slot is picked by OPERAND POSITION (movs: second, cmps: first),
+# not by register name — a reversed order turns the %es into a generic
+# KEPT override on the other side (2.47: cmpsb (%esi),%es:(%edi) = 26 a6,
+# movsb %es:(%edi),(%esi) = 26 a4)
+cmpsb (%esi),%es:(%edi)
+movsb %es:(%edi),(%esi)
+# accumulator spellings: STOS/LODS only, canonical order, size-matched
+# register (stosb %al,(%edi) = aa, lodsw (%esi),%ax = 66 ad)
+stosb %al,(%edi)
+stosb %al,%es:(%edi)
+stosl %eax,(%edi)
+lodsw (%esi),%ax
+lodsl (%ebx),%eax
+# INS/OUTS: the port is (%dx) or %dx; OUTS addresses ESI so a non-%ds
+# override on it is KEPT (outsl %fs:(%esi),%dx = 64 6f), INS addresses
+# EDI and must stay %es-or-none
+insb (%dx),%es:(%edi)
+insb %dx,(%edi)
+outsb (%esi),%dx
+outsl %fs:(%esi),%dx
+outsb %es:(%esi),%dx
+# 32-bit-class index components are tolerated and ignored (a4)
+movsb (%esi,%eax),%es:(%edi)
+;;; string_seg_rejects reject
+.text
+movsb %gs:(%esi),%fs:(%edi)
+# the ES-slot names the operand by its 1-based source position
+# (2.47: "`movs' operand 2 must use `%es' segment")
+movsb (%esi),%fs:(%edi)
+# two non-default overrides on one string op: GAS rejects (the old scan
+# spliced 64 65 a4)
+movsb %gs:(%esi),%fs:(%ebx)
+movsb %es:(%edi),%fs:(%esi)
+# accumulator spellings take only the size-matched accumulator in the
+# canonical slot; SCAS takes none
+stosb %ebx,%es:(%edi)
+stosb (%edi),%al
+lodsb %al,(%esi)
+scasb %eax,(%edi)
+# INS/OUTS: wrong port register, wrong order, one-operand spelling
+insb (%eax),%es:(%edi)
+insb (%edx),%es:(%edi)
+outsb (%esi),%eax
+outsb %dx,(%esi)
+insb (%dx)
+outsb (%esi)
+# the two explicit operands must agree on address-size class
+movsb (%si),%es:(%edi)
+movsb (%esi),%es:(%di)
+# 16-bit-class operands take no index component
+movsb (%bx,%si),%es:(%di)
+;;; sse_movsd_seg
+.text
+# SSE movsd/cmpsd take XMM operands, so the stem-strip trap does not
+# apply: they follow the GENERIC segment law (kept when non-default).
+movsd %es:(%edi),%xmm0
+movsd %fs:(%edi),%xmm0
+movsd (%eax),%xmm0
+movsd %ds:(%eax),%xmm0
+;;; sse_movsd_rejects reject
+.text
+movsd (%esi),(%edi)
+;;; xchg_s
+.text
+# The .s suffix swaps the ModR/M roles (87 d1 -> 87 ca) but the
+# accumulator short form is unaffected (xchg.s %eax,%ecx = 91), and the
+# memory operand rides r/m in both spellings (xchg (%ebx),%eax = 87 03).
+xchg.s %edx,%ecx
+xchg %edx,%ecx
+xchg.s %dl,%cl
+xchg.s %eax,%ecx
+xchg (%ebx),%eax
+xchg %eax,(%ebx)
+xchg.s (%ebx),%eax
+;;; string_code16
+.code16
+# Explicit-operand string forms in real mode: the 32-bit address
+# spellings need 0x67 (movsl (mem),(mem) = 67 66 a5 — sized_op and
+# pending_addr32 both ride the central inversion), the 16-bit spellings
+# are the mode default (movsb (%bx),%es:(%di) = a4, no prefix), the
+# monitor/umonitor hint prefixes follow the same mode law, and GAS's
+# prefix run is FWAIT/segments/67/66/group-1-last.
+movsl (%esi),%es:(%edi)
+movsw (%esi),%es:(%edi)
+movsb (%esi),%es:(%edi)
+cmpsb (%esi),%es:(%edi)
+cmpsl (%esi),%es:(%edi)
+stosl %eax,%es:(%edi)
+lodsl (%esi),%eax
+outsl (%esi),%dx
+insl (%dx),%es:(%edi)
+movsb (%bx),%es:(%di)
+movsb 8(%bx),%es:(%di)
+rep movsb (%esi),%es:(%edi)
+rep movsl (%esi),%es:(%edi)
+lock addl %eax,%gs:(%ebx)
+umonitor %eax
+umonitor %ax
+monitor %eax,%ecx,%edx
+monitor %ax,%ecx,%edx

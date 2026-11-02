@@ -1,0 +1,2760 @@
+{
+  "scope": "Tracked .py parsed with ast.parse and .sh checked with bash -n; no semantic certification",
+  "records": [
+    {
+      "path": ".github/scripts/ci-bench.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": ".github/scripts/ci-codegen-gate.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": ".github/scripts/test_ci_codegen_gate.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "artifacts/repros/delta_shrink.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "artifacts/repros/gen_flat_chacha.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "artifacts/repros/killswitch_bisect.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "engineering/evidence/2026-09-25-redteam/post-merge/run-on-i7-14700kf.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "engineering/evidence/2026-09-26-followups/run-on-i7-14700kf.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "engineering/evidence/2026-09-26-pr630-review/generate_mode_matrix.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "engineering/evidence/2026-09-26-pr630-review/verify_isolated_probes.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "engineering/evidence/2026-10-07-ivsr-audit-response/descending-spelling-probe.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_doccheck_2026_09.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_encoder_differential.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_encoder_gap_report.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_execute_suite.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_family_sweeps.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_legality_probe_differ.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_operand_legality_matrix.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/aarch64_sysreg_table.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ab_focused_remeasure.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/ab_interleaved.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ab_pair_sweep.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/align_decision_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/align_policy_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/align_size_calibrate.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/arena_session_restore.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/asmdiff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/audit_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/audit_contract_probes.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/audit_levkropp_since.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/audit_peephole_utf8.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/audit_tree_inventory.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/bench_iv_widen_ab.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/bench_kernels.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/bench_rank.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/benchmark_fp_memfold_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/benchmark_reduction_vecreg_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/benchmark_vecreg_new_ops_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/benchmark_vector_remainder_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/bisect_boot_size.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_ab_size.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_flags.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_fn_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_insn_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_isel_hist.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_kconfigless_stage.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_offsets.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_size_oracle.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/boot_stage_bisect.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/build_kernel_boot.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/build_kernel_compressed.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/build_kernel_full.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/build_kernel_vm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/build_lccc_fast.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/build_lccc_o1_j2.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/callgrind_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/callgrind_corpus.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/census_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/census_full_delta.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_arm_codegen_assembles.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_avx_sse_transitions.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_benchmark_outputs.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_bit_count_codegen.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_ci_gate_parity.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_ci_workflow_shell.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_codegen_refactor_identity.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_conditionals_family.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_decimal_const_agrees_with_gcc.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_deep_nesting_robustness.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_doc_links.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_ill_typed_builtins.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_inline_asm_utf8.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_loop_alignment.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_minmax_shapes.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_no_conflict_markers.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_peephole_directive_step.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_pipefail_sigpipe.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_pr_claim_fidelity.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_script_imports.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_switch_bound_shape.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/check_volatile_destructuring.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ci_corpus_tools.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/ci_local.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/ci_ubuntu_chroot.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/coalesce_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/codegen_oracle.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/codegen_sweep_compare.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/comdat_registration_bench.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/corpus_selection.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/cpu_model_audit.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/cpu_supports_name_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/cross_backend_check.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/csmith_diff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/differential_corpus.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/directive_legality_matrix.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/distill_bcst_elem.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/distill_evex_opcodes.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/edg_changes_mine.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/edg_corpus_mine.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/elf_sections.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/elfprobe.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/encdiff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ensure_arm_a64_xml.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/ensure_cross_toolchains.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/ensure_gas_247.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/ensure_gcc_torture.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/ensure_gcc_torture_git.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ensure_swap.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/flag_consumer_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/fp_recurrence_evidence.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/fuzz_decimal_vs_gcc.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/fuzz_diff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gas_fill_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gas_isa_scan.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_aarch64_dispatcher_goldens.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_apx_asmdiff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_asmdiff_corpus.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_encoding_sweep.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_fp_stress.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_gep_chain_stress.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_lcccsimd.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gen_slot_stress.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/gla_equiv_check.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/gla_fire_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/glibc_check_triage.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/godbolt.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/godbolt_cache.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/host_tools_userdeb.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/hot_loop_metric.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/i686_alu_redteam.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/i686_size_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/icf_scale_corpus.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/icount_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/in_vm_codegen_bench.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/insndiff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/inventory_integer_narrowing.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ir_verify_sweep.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/isa_gap_sweep.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/isel_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/kernel_boot_isa.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/kernel_count.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/kernel_isolate.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/kernel_tool_identity.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/lccc-bootstrap.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/lccc-harness-snapshot.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/lccc-snapshot.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/lccc_delivery.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/lccc_recover.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ld_feature_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ldconst_differential.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/loop_density_oracle.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/loop_invert_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/loop_latency.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/make_bzimage_from_stub.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/memwatch.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/mixed_width_slots.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/mountinfo.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/oracle_asm.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/oracle_delta_gate.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/paired_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/peephole_families.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/peephole_trace_bisect.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/perf_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/prepare_kernel_tree.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/qemu_boot_test.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/qemu_gdbstub_probe.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/qemu_icount_plugin/build.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/qemu_pmemsave.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/qemu_qmp_probe.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ra_ab_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/ra_quality_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/realmode_corpus.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/repro_claims.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/reproduce_historical_peephole_utf8.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/repros_replay.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/run_gep_chain_stress.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/run_regression_suite.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/run_slot_stress.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/rust_toolchain.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/session_bundle.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/snapshot_ms178.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/snapshot_policy.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/stack_census.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/strip_scalar_dups.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/symstr_migrate.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_asmdiff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_audit_levkropp_since.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_bench_rank.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_ci_gate_parity.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_codegen_oracle.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_differential_corpus_paths.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_encdiff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_glibc_check_triage.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_godbolt_cache.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_hot_loop_metric.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/test_oracle_delta_gate.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/textdiff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/tight_loop_oracle.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/torture_evidence.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/tune_oracle.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/uarch_probe.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/unroll_stress.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/uops_info_probe.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/uops_xml.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/vec_opt.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/verify_fib_perf.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/worktree_tree.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/wrap_ring_sweep.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/x86_gcc_torture.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/x86_gcc_torture_i686.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/x86_gcc_torture_slice.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/yarpgen_diff.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "scripts/zstd_oracle_cc.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "scripts/zstd_preboot_oracle.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "src/backend/arm/asm_stub.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "src/backend/arm/ld_stub.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "src/backend/riscv/asm_stub.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "src/backend/riscv/ld_stub.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "src/backend/x86/asm_stub.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "src/backend/x86/ld_stub.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/aarch64/test_dispatcher_region_contract.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/asm-diff/run.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/benchmark/run_benchmarks.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/benchmark/run_pgo_ab.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/compat_test.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/run_clang_c_corpus.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_alias_regression_contract.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_callgrind_compare.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_callgrind_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_callgrind_corpus.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_census_extraction.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_changes_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_ci_corpus_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_delivery_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_diagnostic_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_gcc_git_provision.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_godbolt_compile_evidence.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_godbolt_local_binary.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_intrinsic_store_inventory.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_matching_exhaustive.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_memory_script_context.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_miner_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_native_diagnostic_adapter.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_oracle_arch_guard.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_perf_ab_link_flags.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_process_publication_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_recovery_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_redteam_boundaries.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_regression_oracle_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_result_invariants.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_retained_perf_evidence.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_runner_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_schema_directive_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_seg_conv_gate.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_select_compare_control.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_selection_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_snapshot_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_switch_bound_shape.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_workload_extraction_safety.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/corpus/test_x86_torture_contracts.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/correctness/run_correctness.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/aarch64_fuzz.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/alias_fuzz_m32.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/alu_torture_m32.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/differential_fuzz.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/fuzz_intcmp_thread.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/m32_differential_fuzz.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/phi_cfg_fuzz.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/regparm_differential.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/slot_rmw_differential.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/fuzz/test_phi_cfg_fuzz.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/integration/test_progressive.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/intrinsics/run_intrin_tests.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/check_dyn_hash.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/check_gc_eh_frame.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/fuzz_elf_grammar.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/fuzz_ld.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/fuzz_seeds/generate_seeds.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/gen_many_syms.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/i386_userspace.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/probe_script_features.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/real_workloads.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/run_linker_tests.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/setup_kernel_tools.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/setup_oracles.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/setup_workloads.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/linker/test_reloc_oracle_verdict.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_a9987_salvage.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_abi_reg_hints.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_affine_exit_compare.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_affine_loop_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_affine_map_vectorization_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_aggregate_call_abi.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_alu_audit_fixes.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_andn_fusion.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_arm_csinc_select.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_arm_direct_select.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_arm_fp_stack_reload.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_arx_frame_latency.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_asm_case_insensitive.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_asm_goto_phi_edge.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_asm_missing_include_fatal.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_atomic_backends.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_audit_loop_contracts.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_backedge_pre_fp_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_backedge_pre_int_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_nested_ifconv.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_v3_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_v4_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_v5_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_v6_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_v7_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bb_slp_v8_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bit_test_canonical.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bitop_nonneg_zext.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bool_pair_prune.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bool_pair_tail_jmp.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_boot_size_measurement.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_bytecmp_vec_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_call_arg_staging.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_call_secondary_cache.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_cfg_leaf_param_homes.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_cfi_invariants.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ch_maj_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_chroot_bind.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_clz_ctz_target_isa.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_clz_zero_guard_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_cmp_cast_branch_fusion.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_code16_string_ops.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_comdat_signature_identity.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_const_array_promote.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_const_trip_loop_inline.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_copy64_ymm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_copy_alias_sizes.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_cpu_supports_runtime.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_crc32_zeroext_moves.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_crc_index_home.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_cross_pr_redteam.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_custom_section_progbits.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_dash_o_stdout.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_debug_code_parity.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_debug_info_flags.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_decimal32_indexed_fold_arm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_decimal64_indexed_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_demorgan_branch_split.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_dep_files.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_destructive_guards.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_div64_bypass_asm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_eh_frame_unwind.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_empty_aggregate_abi.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_empty_leaf_frame.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ensure_gcc_torture.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_env_test_hygiene.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_f128_copy_fusion.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_findbit_inline.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fixed_slp_distances_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fma_dest_coalesce_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fma_gating.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fma_matcher_guards.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fortify_diagnose_as.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fp_contract_parity.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fp_extract_homes.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_fp_recurrence.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_frontend_diagnostic_recovery.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_function_alignment_definition.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gas_isa_scan.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gla_backedge_no_trampoline.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gla_cross_reach_band.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gla_remat_policy.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_global_addr_cse.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_global_addr_remat.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_got64_old_spelling.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_got_slot_local_addend.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gpr_leaf_param_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gvn_cross_block_mul_dot.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gvn_disjoint_epochs.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_gvn_xsign_load_cse.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i386_call_staging_asm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i386_regparm_small_struct_abi.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i386_run_policy.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i686_atomics.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i686_boot_asm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i686_code16_relax.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i686_const_div.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i686_integer_isa_parity.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i686_overalign_interop.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_i686_tls_ie_relax.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_imm_store_movl_sib.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_indexed_fold_scratch_index.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_inline_multisite_loop_wrapper_policy.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_integer_reduction_vecreg_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_isa_gate_escape.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ivsr_domains.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ivsr_scalar_derived_default.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ivwiden_exposed_latch.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_kernel_boot_isa.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_kernel_tool_identity.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_kernel_tree_clear.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_lea_hoist_rorx.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_licm_alias_disjoint.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_linker_notype_code.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_linker_oracle_versions.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_load_widen_cast_no_relay.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_loop_idiom.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_loop_memset.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_loop_preheader.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_loop_rotate_pressure.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_loop_store_motion.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_machinst_fallback_replay.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_machinst_window_alloc.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_machinst_window_alloc_wide_copy.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_map_i64_shapes.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_map_i64_two_lane.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_mcount.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_memory_fold_liveness.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_memory_value_contracts.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_minmax_reduction.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_movabs_symdiff.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_multi_entry_loop.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_multi_reduction_vectorize.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_multiple_fp_reductions_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_narrow_cmp_flag_law.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_narrow_cond_width.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_nbody_perf_shapes.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_no_sse_fp_diag.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_nocfi_peephole_parity.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_o0_no_regalloc.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_os_nested_loop_inline_policy.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_os_postinline_size_policy.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_overalign_typed_census.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_peephole_phi_hoist_safety.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_peephole_trace_bisect.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_peephole_whitespace.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_percpu_add_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_percpu_reloc_hide_ice.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_pfe_section.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_phi_acyclic_order.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_provenance_int_param.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ptr_to_float_cast.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ra_allocstats.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_ra_web_inloop_use.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_range_fold_branch.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_reassoc_latency.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_rec2iter.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_record_tag_identity.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_reduction_vecreg_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_redundant_flags_compare.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_redundant_test_elimination.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_reg_src_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_replay_gap_home_rewrite.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_return_32bit_zeroext.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_riscv_int_canon.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_riscv_nested_fn.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_rmw_sib_folds.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_rust_toolchain_selector.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_scoped_noreturn_diagnostics.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_cast_warning.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_const_offset_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_conv_diagnostics.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_copy_sweep.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_declarator_space.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_direct_home.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_gs_runtime.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_named_decl_qualifier.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_pointee_chain_asm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_prefix_full_matrix.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_prefix_rmw_encoding.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_seg_target_diagnostics.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_segfs_typeof_nosteal.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_select_from_compare.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_self_test_after_arith.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_sema_constraints.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_single_site_static_inline.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_slotaddr_reg.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_static_call_pcrel.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_store_alu_cross_join.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_strict_computed_recip_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_switch_threshold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_symver_indirect_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_temp_symlink.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_tier2_graph_default.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_tight_loop_align.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_tls_model_selection.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_tls_pie_preemptible.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_two_block_unroll_redteam.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_u32_i32_cast_no_relay.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_unary_rmw_copy_propagation.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_unroll_gate_verdicts.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_va_arg_pack_len.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vararg_overalign_interop.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vec_adler_epic.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vec_chain_exit_phi.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vec_dead_remainder.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vec_interleave_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vec_remainder_shapes.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vecreg_new_ops_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vector_copy_elimination.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vector_dot_fma_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vector_remainder_codegen.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_vectorize_isa_gate.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_volatile_access_semantics.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_volatile_bitfield_split.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_volatile_licm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_volatile_pointer_subscript.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_volatile_spin_loop.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_wide_cond_zero_test.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_wide_const_imm_stores.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_widened_byte_chain.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_widened_signed_byte_relops.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/check_zero_ext_cmp_fold.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/gen_string_init_matrix.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/i386_exec.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/lib_loop_bounds.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/run_pgo_roundtrip.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/run_regression.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/run_regression.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/run_regression_arm.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/seg_gs_runtime/gen_seg_copy_sweep.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/regression/verify_pr713_audit.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/stress/abi_family.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/stress/cemu.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/stress/families.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/stress/reduce_ice.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/stress/run_stress.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/workloads/dispatch/run.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/workloads/expat-2.8.5/junit_check.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/workloads/expat-2.8.5/run.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/workloads/glibc-2.44/build_lccc.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/workloads/gzip-1.14/run.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tests/workloads/sqlite-3.53.4/run.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tests/workloads/zlib-ng-2.3.3/run.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tools/corpus/__init__.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/corpus/diagnostics.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/corpus/directives.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/corpus/evidence.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/corpus/process.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/corpus/publication.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/corpus/schema.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/ir_shape_check.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/linker/oracle_cmp.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/linker/oracle_versions.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tools/linker/recover_env.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tools/linker/reloc_number_audit.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/linker/setup_oracles.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tools/oracle/callgrind_compare.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    },
+    {
+      "path": "tools/oracle/callgrind_own_ir.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/oracle/godbolt_oracle.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/oracle/godbolt_oracle_selftest.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/oracle/hot_instr.py",
+      "kind": "python-ast",
+      "ok": true
+    },
+    {
+      "path": "tools/workspace_dirs.sh",
+      "kind": "bash-syntax",
+      "ok": true
+    }
+  ]
+}

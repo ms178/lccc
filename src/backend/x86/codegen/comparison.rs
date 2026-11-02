@@ -1,0 +1,2955 @@
+//! X86Codegen: comparison and select operations.
+
+use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32};
+use crate::backend::regalloc::PhysReg;
+use crate::common::types::IrType;
+use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
+
+/// IR-level scan for compare-replay candidates, shared by the x86-64
+/// prologue (which consumes `replay` as the emitter contract) and the RA
+/// link builder (which consumes `operand_links` to extend operand live
+/// intervals) — allocator and emitter can never disagree about which
+/// values the backend reads at the consumer position.
+///
+/// A Cmp is a replay candidate when its destination has exactly one use,
+/// the compare is an integer compare of non-wide type, it is not already
+/// handled by the better ADJACENT flag fusion (`fused`), and that single
+/// use is a same-block Select or the block-terminator CondBranch. The
+/// consumer then re-emits the comparison from the recorded operands right
+/// before its cmov/jcc instead of testing a materialized boolean.
+///
+/// `operand_links` maps each Value operand to the Cmp DEST: the dest's
+/// single use IS the consumer, so the dest's live-interval end marks the
+/// replay position. Extending the operand's interval to that end (via
+/// RegAllocConfig::folded_index_uses, whose contract — "the backend reads
+/// this value at the consumer's position" — covers this case exactly)
+/// guarantees register homes survive intervening instructions. Operands
+/// that end up with no home at all (never-materialized values) are
+/// pruned post-RA by the prologue; slot-homed operands never needed the
+/// extension (the slot is written at every definition).
+pub(crate) struct CmpReplayScan {
+    pub replay: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    pub operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
+    /// FP-Cmp records for the FP-SELECT blend (S05): float Cmp dests whose
+    /// single use is a Select; keyed by Cmp dest with the recorded operands
+    /// re-derived as a vcmpsd/vcmpss mask by the select.
+    pub fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    /// De Morgan branch records: `CondBranch(And/Or(CmpA, CmpB))` where the
+    /// And/Or and both Cmps are single-use and same-block. Keyed by the
+    /// And/Or dest; the branch re-emits both comparisons with a
+    /// short-circuit jump between them (cmpA; jcc; cmpB; jcc) instead of
+    /// materializing two booleans plus the conjunction (cmp; setcc; movzbl;
+    /// cmp; setcc; movzbl; and; test; jcc). The two Cmp dests are recorded
+    /// in [`DemorganRec::cmp_dests`] so emission can skip all three
+    /// instructions. Operand links for both Cmps' operands ride the shared
+    /// `operand_links` map (consumer = the And/Or dest, whose live end is
+    /// the terminator).
+    pub demorgan: crate::common::fx_hash::FxHashMap<u32, DemorganRec>,
+    /// Multi-select replay counts: Cmp dests whose EVERY use is a direct
+    /// same-block Select (2+). Each select re-emits the recorded compare
+    /// (see take_replay_cmp's countdown); entries without a count here
+    /// are legacy single-consumer records, consumed by one take.
+    pub replay_multi: crate::common::fx_hash::FxHashMap<u32, u32>,
+    /// Emission-gap positions for every replay-family record (replay,
+    /// fp_select, and both De Morgan Cmps): Cmp dest -> (block_idx,
+    /// cmp_idx, last_consumer_idx). The re-emission reads the Cmp's
+    /// operands at the CONSUMER position, so the open instruction range
+    /// (cmp_idx, last_consumer_idx) is the gap in which the operand's
+    /// machine home may be legitimately re-written (coalesce-sibling
+    /// definitions, calls). The IR-level redefinition guards in this
+    /// scan cannot see register-home sharing, so the post-RA prune in
+    /// the prologue audits this gap before trusting a register-homed
+    /// operand (kernel 6.18.50 get_pcore_mask: a min/max accumulator
+    /// coalesced with the Select result sharing r15 was evicted by the
+    /// select's own cmov and the second select's replay panicked — and
+    /// a silent variant would compare the WRONG value).
+    pub replay_gaps: crate::common::fx_hash::FxHashMap<u32, (usize, usize, usize)>,
+}
+
+/// One De Morgan branch-split candidate. See [`CmpReplayScan::demorgan`].
+#[derive(Clone)]
+pub(crate) struct DemorganRec {
+    /// True for `And` (short-circuit on false), false for `Or`
+    /// (short-circuit on true).
+    pub is_and: bool,
+    /// First comparison (op, lhs, rhs, ty), re-emitted first.
+    pub a: (IrCmpOp, Operand, Operand, IrType),
+    /// Second comparison, re-emitted after the short-circuit jump.
+    pub b: (IrCmpOp, Operand, Operand, IrType),
+    /// The two Cmp dest value ids (emission skips them and the And/Or).
+    pub cmp_dests: [u32; 2],
+    /// Copy/Cast indirection between the And/Or and the branch, if any:
+    /// `bool c = a&&b; if (c)` (or the `|`/`||` Or equivalents) leaves a
+    /// single-use same-block Copy/Cast whose dest is the branch cond and
+    /// whose src is the And/Or. Emission skips it alongside the And/Or
+    /// (the branch replays the original comparisons, so the renamed value
+    /// is never read); `None` when the And/Or feeds the branch directly.
+    /// Always equals the recorded consumer id when present.
+    pub passthru: Option<u32>,
+    /// The And/Or BinOp's own dest id: equals the map key (the branch
+    /// cond) in the direct case, the passthru's src in the indirect case.
+    /// Emission skips it alongside the Cmps and the passthru.
+    pub binop_id: u32,
+}
+
+/// Env-gated trace for the De Morgan branch split: prints scan matches,
+/// prune decisions, and emission fires to stderr. Zero cost when off.
+pub(crate) fn demorgan_debug_enabled() -> bool {
+    demorgan_debug_env()
+        // Exploratory (metric-only) emissions of the dual-layout selection
+        // do not describe shipped code: their traces would double the
+        // count-based assertions in check_demorgan_branch_split.
+        && !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get)
+}
+
+pub(crate) fn compute_cmp_replay_scan(
+    func: &crate::ir::reexports::IrFunction,
+    use_counts: &crate::common::fx_hash::FxHashMap<u32, u32>,
+    fused: &crate::common::fx_hash::FxHashMap<u32, u32>,
+) -> CmpReplayScan {
+    let mut replay = crate::common::fx_hash::FxHashMap::default();
+    let mut operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>> =
+        crate::common::fx_hash::FxHashMap::default();
+    let mut fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
+        crate::common::fx_hash::FxHashMap::default();
+    let mut demorgan: crate::common::fx_hash::FxHashMap<u32, DemorganRec> =
+        crate::common::fx_hash::FxHashMap::default();
+    let mut replay_multi: crate::common::fx_hash::FxHashMap<u32, u32> =
+        crate::common::fx_hash::FxHashMap::default();
+    let mut replay_gaps: crate::common::fx_hash::FxHashMap<u32, (usize, usize, usize)> =
+        crate::common::fx_hash::FxHashMap::default();
+    let demorgan_enabled = !demorgan_disabled();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let insts = &block.instructions;
+        for (ii, inst) in insts.iter().enumerate() {
+            let (cdest, cop, clhs, crhs, cty) = match inst {
+                crate::ir::reexports::Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => (dest.0, *op, lhs.clone(), rhs.clone(), *ty),
+                _ => continue,
+            };
+            let n_uses = use_counts.get(&cdest).copied().unwrap_or(0);
+            if n_uses != 1 {
+                // MULTI-SELECT REPLAY: every use is a direct same-block
+                // Select (2+, the min/max/clamp shape: binary_search's
+                // lo/hi updates share one bounds compare). Each select
+                // re-emits the compare from the recorded operands, so
+                // the Cmp emits nothing — saving setcc+movzbl plus one
+                // test per select over the materialized path. Coverage
+                // must be TOTAL: any non-select use (or a select behind
+                // a Copy) would read the never-materialized boolean.
+                // Integer-only (FP keeps the single-use fp_select path;
+                // wide ints cannot replay, same as the single path).
+                if n_uses >= 2
+                    && !fused.contains_key(&cdest)
+                    && cty.is_integer()
+                    && !crate::backend::generation::is_wide_int_type(cty)
+                {
+                    let mut sel_idxs: Vec<usize> = Vec::new();
+                    for (jj, other) in insts.iter().enumerate() {
+                        if jj == ii {
+                            continue;
+                        }
+                        if let crate::ir::reexports::Instruction::Select {
+                            cond: Operand::Value(v),
+                            ..
+                        } = other
+                        {
+                            if v.0 == cdest {
+                                sel_idxs.push(jj);
+                            }
+                        }
+                    }
+                    // The block-terminator CondBranch may join as the last
+                    // consumer (loop-back on a shared bounds bool): the
+                    // branch re-emits the compare like any select (it
+                    // already consumes replay records on the single-use
+                    // branch path), so select+branch mixes replay fully.
+                    let mut n_consumers = sel_idxs.len();
+                    if let crate::ir::reexports::Terminator::CondBranch {
+                        cond: Operand::Value(v),
+                        ..
+                    } = &block.terminator
+                    {
+                        if v.0 == cdest {
+                            n_consumers += 1;
+                        }
+                    }
+                    if n_consumers == n_uses as usize && !sel_idxs.is_empty() {
+                        // Redefinition guard to the LAST consumer (covers
+                        // every re-emission point — same contract as the
+                        // single-consumer guard below).
+                        let last = if n_consumers > sel_idxs.len() {
+                            insts.len()
+                        } else {
+                            sel_idxs.iter().copied().max().unwrap_or(ii)
+                        };
+                        let operand_ids: [Option<u32>; 2] = [&clhs, &crhs].map(|op| match op {
+                            Operand::Value(v) => Some(v.0),
+                            Operand::Const(_) => None,
+                        });
+                        let redefined = operand_ids.iter().flatten().any(|&vid| {
+                            insts[ii + 1..last]
+                                .iter()
+                                .any(|other| other.dest().is_some_and(|d| d.0 == vid))
+                        });
+                        if !redefined {
+                            for op in [&clhs, &crhs] {
+                                if let Operand::Value(v) = op {
+                                    operand_links.entry(v.0).or_default().push(cdest);
+                                }
+                            }
+                            replay.insert(cdest, (cop, clhs, crhs, cty));
+                            replay_multi.insert(cdest, n_consumers as u32);
+                            // The LAST consumer's emission is where the
+                            // final re-emission reads the operands; every
+                            // instruction strictly before it (including the
+                            // earlier selects of this record) is the gap the
+                            // prologue prune must audit.
+                            replay_gaps.insert(cdest, (bi, ii, last));
+                        }
+                    }
+                }
+                continue;
+            }
+            // Already handled by the (better) adjacent fusion (integer
+            // Cmp→Select adjacency; FP Cmp→CondBranch adjacency). For FP
+            // Cmp→Select there is NO fusion (the prologue fuse gate excludes
+            // it — FP fusion is CondBranch-only), so the FP-SELECT branch
+            // below remains reachable for every FP Cmp whose single use is a
+            // Select.
+            if fused.contains_key(&cdest) {
+                continue;
+            }
+            // Locate the single use: a same-block Select or the
+            // block-terminator CondBranch. `consumer_idx` is the position the
+            // compare will actually be re-emitted at -- the Select's index, or
+            // past the last instruction for the terminator.
+            let mut select_idx: Option<usize> = None;
+            for (jj, other) in insts.iter().enumerate() {
+                if jj == ii {
+                    continue;
+                }
+                if let crate::ir::reexports::Instruction::Select {
+                    cond: Operand::Value(v),
+                    ..
+                } = other
+                {
+                    if v.0 == cdest {
+                        select_idx = Some(jj);
+                        break;
+                    }
+                }
+            }
+            let used_by_select = select_idx.is_some();
+            let mut used_by_branch = false;
+            if !used_by_select {
+                if let crate::ir::reexports::Terminator::CondBranch {
+                    cond: Operand::Value(v),
+                    ..
+                } = &block.terminator
+                {
+                    if v.0 == cdest {
+                        used_by_branch = true;
+                    }
+                }
+            }
+            if !used_by_select && !used_by_branch {
+                continue;
+            }
+            // REPLAY REDEFINITION GUARD. The replay re-reads the compare's
+            // operands at the consumer position, so it is only sound if
+            // nothing between the Cmp and the consumer redefines them. The
+            // `operand_links` contract below stops the *allocator* from
+            // handing the register to a later value, but it says nothing about
+            // an IR-level redefinition of the same value: a phi-elimination
+            // latch copy absorbed into this block writes the loop-carried
+            // operand in place, and the replay would then compare the NEXT
+            // iteration's value. Emit the Cmp at its own position instead --
+            // one extra instruction, always correct.
+            let consumer_idx = select_idx.unwrap_or(insts.len());
+            let operand_ids: [Option<u32>; 2] = [&clhs, &crhs].map(|op| match op {
+                Operand::Value(v) => Some(v.0),
+                Operand::Const(_) => None,
+            });
+            let redefined_before_consumer = operand_ids.iter().flatten().any(|&vid| {
+                insts[ii + 1..consumer_idx]
+                    .iter()
+                    .any(|other| other.dest().is_some_and(|d| d.0 == vid))
+            });
+            if redefined_before_consumer {
+                continue;
+            }
+            // FP-SELECT blend (S05): a float Cmp consumed ONLY by a Select
+            // emits no boolean — the select re-derives the VEX blend mask
+            // (vcmpsd/vcmpss) and blends the FP arms (vblendvpd/vblendvps).
+            // A CondBranch consumer is excluded: branches keep the (better)
+            // flag-fusion jcc path or the materialized boolean. The operand
+            // links use the SAME consumer-position contract as the integer
+            // replay above, so register homes survive to the select.
+            if matches!(cty, IrType::F64 | IrType::F32) {
+                if used_by_select {
+                    for op in [&clhs, &crhs] {
+                        if let Operand::Value(v) = op {
+                            operand_links.entry(v.0).or_default().push(cdest);
+                        }
+                    }
+                    fp_select.insert(cdest, (cop, clhs, crhs, cty));
+                    replay_gaps.insert(cdest, (bi, ii, consumer_idx));
+                }
+                continue;
+            }
+            // Integer comparisons only: float comparisons use ucomiss/
+            // ucomisd with a different flag contract (PF for NaN, the
+            // setnp/sete dance) — replaying them as integer cmps produces
+            // wrong selects (simd_sse2_arith regression). WIDE (I128)
+            // compares are excluded too: emit_cmp routes them to
+            // emit_i128_cmp, which ignores cmp_replay AND could not be
+            // replayed by emit_int_cmp_replay_insn (multi-instruction
+            // 128-bit compare). This gate sits AFTER the FP-SELECT branch:
+            // float Cmps reach the branch above first.
+            if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
+                continue;
+            }
+            for op in [&clhs, &crhs] {
+                if let Operand::Value(v) = op {
+                    operand_links.entry(v.0).or_default().push(cdest);
+                }
+            }
+            replay.insert(cdest, (cop, clhs, crhs, cty));
+            // Single consumer: gap = (Cmp, consumer). A branch consumer
+            // sits at the terminator, i.e. index == insts.len().
+            replay_gaps.insert(cdest, (bi, ii, consumer_idx));
+        }
+        // De Morgan branch split: `CondBranch(And/Or(CmpA, CmpB))` with all
+        // three single-use and same-block. The terminator re-emits cmpA,
+        // short-circuit-jumps, then re-emits cmpB — instead of
+        // materializing two booleans plus the conjunction. Operand links
+        // for both Cmps' operands ride the shared map (consumer = the
+        // And/Or dest, whose live end is the terminator).
+        if demorgan_enabled {
+            if let crate::ir::reexports::Terminator::CondBranch {
+                cond: Operand::Value(cond_v),
+                ..
+            } = &block.terminator
+            {
+                if use_counts.get(&cond_v.0).copied().unwrap_or(0) == 1
+                    && let Some(rec) = check_demorgan_pattern(insts, cond_v.0, use_counts, fused)
+                {
+                    if demorgan_debug_enabled() {
+                        eprintln!(
+                            "[demorgan] scan andor={} is_and={} fuzz=({},{})",
+                            cond_v.0, rec.is_and, rec.cmp_dests[0], rec.cmp_dests[1]
+                        );
+                    }
+                    for op in [&rec.a.1, &rec.a.2, &rec.b.1, &rec.b.2] {
+                        if let Operand::Value(v) = op {
+                            operand_links.entry(v.0).or_default().push(cond_v.0);
+                        }
+                    }
+                    // Gap positions for the two Cmps (the branch re-reads
+                    // their operands at the terminator, so each Cmp's gap
+                    // ends at insts.len()). check_demorgan_pattern has
+                    // already proven exactly-one-def, so the position scan
+                    // cannot miss.
+                    for &cd in &rec.cmp_dests {
+                        if let Some(pos) = insts
+                            .iter()
+                            .position(|other| other.dest().is_some_and(|d| d.0 == cd))
+                        {
+                            replay_gaps.insert(cd, (bi, pos, insts.len()));
+                        }
+                    }
+                    demorgan.insert(cond_v.0, rec);
+                }
+            }
+        }
+    }
+    CmpReplayScan {
+        replay,
+        operand_links,
+        fp_select,
+        demorgan,
+        replay_multi,
+        replay_gaps,
+    }
+}
+
+/// Match `And/Or(CmpA, CmpB)` for the De Morgan branch split: the And/Or
+/// producer must be a same-block `BinOp` with `And`/`Or` opcode, both arms
+/// single-use same-block *integer* (non-wide) Cmps, and neither Cmp's
+/// operands redefined between the Cmp and the block end (the replay
+/// re-reads them at the terminator — same contract as the Cmp-replay
+/// redefinition guard above).
+fn check_demorgan_pattern(
+    insts: &[crate::ir::reexports::Instruction],
+    andor_id: u32,
+    use_counts: &crate::common::fx_hash::FxHashMap<u32, u32>,
+    fused: &crate::common::fx_hash::FxHashMap<u32, u32>,
+) -> Option<DemorganRec> {
+    use crate::ir::reexports::{Instruction, IrBinOp};
+    // Resolve the branch cond to its And/Or producer: either directly
+    // (`if (a&&b)`, the cond IS the And/Or) or through one single-use
+    // same-block Copy/Cast (`bool c = a&&b; if (c)` — and the `|`/`||` Or
+    // equivalents, which ONLY arise in this materialized form: the frontend
+    // control-flow-lowers direct `||` and if-conversion never merges the
+    // Or-nest back). The cond must be defined EXACTLY once in this block:
+    // post-phi coalescing webs can carry position-dependent multi-defs
+    // (#490), and the terminator reads the LAST one — recording the first
+    // would replay the wrong arms. The And/Or itself must likewise be
+    // single-use (its only reader is the branch or the passthru — both are
+    // skipped, so nothing else may observe its never-written home).
+    let mut cond_defs: Vec<&Instruction> = Vec::new();
+    for inst in insts {
+        if inst.dest().is_some_and(|d| d.0 == andor_id) {
+            cond_defs.push(inst);
+        }
+    }
+    let [cond_def] = cond_defs.as_slice() else {
+        return None;
+    };
+    let (andor_src_id, passthru) = match cond_def {
+        Instruction::BinOp { .. } => (andor_id, None),
+        Instruction::Copy {
+            src: Operand::Value(s),
+            ..
+        }
+        | Instruction::Cast {
+            src: Operand::Value(s),
+            ..
+        } => {
+            if use_counts.get(&s.0).copied().unwrap_or(0) != 1 {
+                return None;
+            }
+            (s.0, Some(andor_id))
+        }
+        _ => return None,
+    };
+    let mut producer: Option<(bool, Operand, Operand)> = None;
+    for inst in insts {
+        if let Instruction::BinOp {
+            dest, op, lhs, rhs, ..
+        } = inst
+            && dest.0 == andor_src_id
+        {
+            if producer.is_some() {
+                return None;
+            }
+            match op {
+                IrBinOp::And => producer = Some((true, lhs.clone(), rhs.clone())),
+                IrBinOp::Or => producer = Some((false, lhs.clone(), rhs.clone())),
+                _ => return None,
+            }
+        }
+    }
+    let (is_and, a_op, b_op) = producer?;
+    if use_counts.get(&andor_src_id).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    let mut found: [Option<(IrCmpOp, Operand, Operand, IrType, u32, usize)>; 2] = [None, None];
+    for (slot, arm) in [a_op, b_op].into_iter().enumerate() {
+        let arm_v = match arm {
+            Operand::Value(v) => v.0,
+            Operand::Const(_) => return None,
+        };
+        if use_counts.get(&arm_v).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        // Flag-fusion owns adjacent Cmp→Select/branch pairs: a fused Cmp's
+        // consumer reads live FLAGS, not a replayed compare. (Unreachable
+        // today — a fused Cmp's consumer is a Select/branch, never the
+        // And/Or — but free insurance against future fusion extensions.)
+        if fused.contains_key(&arm_v) {
+            return None;
+        }
+        // Exactly one same-block definition (same multi-def rationale as
+        // the And/Or guard above).
+        for (ci, inst) in insts.iter().enumerate() {
+            if let Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+                && dest.0 == arm_v
+            {
+                if found[slot].is_some() {
+                    return None;
+                }
+                if !ty.is_integer() || crate::backend::generation::is_wide_int_type(*ty) {
+                    return None;
+                }
+                found[slot] = Some((*op, lhs.clone(), rhs.clone(), *ty, arm_v, ci));
+            }
+        }
+    }
+    let [
+        Some((aop, alhs, arhs, aty, adest, aidx)),
+        Some((bop, blhs, brhs, bty, bdest, bidx)),
+    ] = found
+    else {
+        return None;
+    };
+    // Redefinition guard: each Cmp's value operands must not be redefined
+    // between the Cmp and the terminator (the And/Or itself emits nothing,
+    // so only real defs in between can disturb the replayed reads).
+    for (op_a, op_b, cidx) in [(&alhs, &arhs, aidx), (&blhs, &brhs, bidx)] {
+        for op in [op_a, op_b] {
+            if let Operand::Value(v) = op
+                && insts[cidx + 1..]
+                    .iter()
+                    .any(|other| other.dest().is_some_and(|d| d.0 == v.0))
+            {
+                return None;
+            }
+        }
+    }
+    Some(DemorganRec {
+        is_and,
+        a: (aop, alhs, arhs, aty),
+        b: (bop, blhs, brhs, bty),
+        cmp_dests: [adest, bdest],
+        passthru,
+        binop_id: andor_src_id,
+    })
+}
+
+// The compare/select A/B and trace knobs, read once per process. The hot
+// ones were asked per instruction (every Cmp, every Select, every FP-select
+// blend), each ask a `getenv` scan under the environment lock. The driver
+// never changes its environment mid-process, so caching is exact; same
+// convention as `emit.rs`'s `trace_notes_enabled`.
+macro_rules! cached_knob {
+    ($(#[$doc:meta])* $fn:ident, $name:literal) => {
+        $(#[$doc])*
+        fn $fn() -> bool {
+            static ON: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os($name).is_some());
+            *ON
+        }
+    };
+}
+
+cached_knob!(
+    /// `CCC_NO_FLAG_FUSION`: always materialise a compare's boolean.
+    no_flag_fusion,
+    "CCC_NO_FLAG_FUSION"
+);
+cached_knob!(
+    /// `CCC_V9_SELECT`: the legacy v9 select emission.
+    v9_select,
+    "CCC_V9_SELECT"
+);
+cached_knob!(
+    /// `CCC_NO_INPLACE_SELECT`: no in-place test of a materialised condition.
+    no_inplace_select,
+    "CCC_NO_INPLACE_SELECT"
+);
+cached_knob!(
+    /// `CCC_NO_FP_SELECT`: no VEX blend / cmov lowering of FP-compare selects.
+    fp_select_disabled,
+    "CCC_NO_FP_SELECT"
+);
+cached_knob!(
+    /// `CCC_DEBUG_FP_SELECT`: trace the FP-select lowering to stderr.
+    fp_select_debug,
+    "CCC_DEBUG_FP_SELECT"
+);
+cached_knob!(
+    /// `CCC_NO_DEMORGAN`: no De Morgan branch split.
+    demorgan_disabled,
+    "CCC_NO_DEMORGAN"
+);
+cached_knob!(
+    /// `LCCC_DEBUG_DEMORGAN`, the environment half of `demorgan_debug_enabled`.
+    demorgan_debug_env,
+    "LCCC_DEBUG_DEMORGAN"
+);
+
+impl X86Codegen {
+    /// Materialize the FP boolean (`setcc` chain) — used by
+    /// `emit_float_cmp_impl` right after the ucomisd and by the FP-SELECT
+    /// fallback at a non-adjacent position (flags were just set there).
+    fn emit_fp_cmp_setcc(&mut self, dest: &Value, op: IrCmpOp) {
+        match op {
+            IrCmpOp::Eq => {
+                self.state.emit("    setnp %al");
+                self.state.emit("    sete %cl");
+                self.state.emit("    andb %cl, %al");
+            }
+            IrCmpOp::Ne => {
+                self.state.emit("    setp %al");
+                self.state.emit("    setne %cl");
+                self.state.emit("    orb %cl, %al");
+            }
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => {
+                self.state.emit("    seta %al");
+            }
+            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => {
+                self.state.emit("    setae %al");
+            }
+        }
+        // The Eq/Ne chains WRITE %cl — a partial clobber of %rcx. The
+        // secondary cache claims "rcx holds K"; a later select reuses the
+        // claim as its true-arm staging register (select_operand_to_reg
+        // skips the reload for a claimed constant), so the stale claim
+        // would feed the CORRUPTED arm. Drop it for the chains that touch
+        // %cl; seta/setae are pure %al.
+        if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+            self.state.reg_cache.invalidate_sec();
+        }
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
+    /// Re-materialize an FP comparison at a NON-Cmp position. The FP-SELECT
+    /// fallback: the Cmp elided its boolean (its result feeds only Selects)
+    /// but the select could not use the blend — re-emit the loads + ucomisd
+    /// so the ordinary select path below is sound.
+    ///
+    /// RELATIONAL ops need no boolean at all: the flags just set are the
+    /// condition, returned as the cmov condition code (`a`/`ae`: unordered
+    /// clears CF=0&&ZF=0 / CF=0, so NaN selects the false arm, C99) — the
+    /// select then runs its register-direct or accumulator cmov path with
+    /// the in-place flags and no setcc/movzbl/test. Eq/Ne need two flags
+    /// (ZF and PF), which no single cmov reads, so they materialize the
+    /// boolean via the setcc chain, return `None`, and the select tests the
+    /// materialized value (the %cl clobber in that chain is handled inside
+    /// emit_fp_cmp_setcc). Returning the code, rather than parking it in
+    /// `pending_fp_cmp`, keeps the select's mapping total: the CondBranch
+    /// fusion's two-flag pair sentinels cannot reach a cmov.
+    #[must_use]
+    pub(super) fn emit_fp_cmp_boolean(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) -> Option<&'static str> {
+        let swap_operands = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
+        let (first, second) = if swap_operands {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+        // Register-direct compare (same contract as emit_float_cmp_impl):
+        // zero/one staging instead of the xmm0+xmm1 pair.
+        if !self.try_emit_fp_cmp_direct(first, second, ty) {
+            self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+            self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+            if ty == IrType::F64 {
+                self.state.emit("    ucomisd %xmm1, %xmm0");
+            } else {
+                self.state.emit("    ucomiss %xmm1, %xmm0");
+            }
+        }
+        match op {
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => Some("a"),
+            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => Some("ae"),
+            IrCmpOp::Eq | IrCmpOp::Ne => {
+                self.emit_fp_cmp_setcc(dest, op);
+                None
+            }
+        }
+    }
+
+    /// Classify an FP operand for the ucomis/vcmp SOURCE position — the
+    /// memory-capable operand slot: a fresh XMM home renders as `%xmmN`, an
+    /// FP constant as its RIP-relative pool label, a stack slot as its frame
+    /// reference. Returns None for anything needing the GPR shuttle or the
+    /// accumulator cache (the caller falls back to the staged path).
+    ///
+    /// Mirrors `emit_fp_operand_to_xmm`'s decision order (register home,
+    /// then slot) so the two paths read the same location for the same
+    /// operand; the one deviation is freshness: a clobbered XMM home
+    /// declines here (the staged path's exact behavior is preserved by the
+    /// caller's fallback rather than risking a stale-register read).
+    fn fp_src_mem_operand(&mut self, op: &Operand, _ty: IrType) -> Option<String> {
+        match op {
+            Operand::Value(v) => {
+                if let Some(reg) = self.fresh_home_of(v.0).filter(|r| is_xmm_reg(*r)) {
+                    return Some(format!("%{}", phys_reg_name(reg)));
+                }
+                // A live (non-clobbered) GPR home needs the shuttle; a
+                // clobbered XMM home must take the fallback, not the slot
+                // (matching the staged path's register-first order).
+                if self.reg_assignments.contains_key(&v.0) {
+                    return None;
+                }
+                let slot = self.state.get_slot(v.0)?;
+                Some(self.slot_ref(slot.0))
+            }
+            Operand::Const(IrConst::F64(c)) => Some(format!(
+                "{}(%rip)",
+                self.state.get_fp_const_label(c.to_bits())
+            )),
+            Operand::Const(IrConst::F32(c)) => Some(format!(
+                "{}(%rip)",
+                self.state.get_fp_const_label(c.to_bits() as u64)
+            )),
+            _ => None,
+        }
+    }
+
+    /// Register-direct ucomisd/ucomiss: emit the FP compare with zero or one
+    /// staging instruction instead of the staged `first→xmm0, second→xmm1`
+    /// pair. The ucomis source position accepts registers AND m32/m64
+    /// memory, so when the FIRST operand is XMM-homed its home is the
+    /// destination directly and the second rides the source slot. One load
+    /// into %xmm0 remains only when the FIRST operand is itself a constant
+    /// or slot (the destination must be a register).
+    ///
+    /// Flags semantics are bit-identical to the staged form: EFLAGS compare
+    /// FIRST vs SECOND, so the setcc tables, `pending_fp_cmp` fusion jcc's,
+    /// and replay re-emission all apply unchanged.
+    fn try_emit_fp_cmp_direct(&mut self, first: &Operand, second: &Operand, ty: IrType) -> bool {
+        if !matches!(ty, IrType::F32 | IrType::F64) {
+            // Binary floats only: decimals keep the staged path (they carry
+            // opaque BID bit patterns through the same emitters).
+            return false;
+        }
+        let mnemonic = if ty == IrType::F64 {
+            "ucomisd"
+        } else {
+            "ucomiss"
+        };
+        match first {
+            Operand::Value(fv) => {
+                let first_home = self.fresh_home_of(fv.0).filter(|r| is_xmm_reg(*r));
+                if let Some(freg) = first_home {
+                    if let Some(src) = self.fp_src_mem_operand(second, ty) {
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, %{}",
+                            mnemonic,
+                            src,
+                            phys_reg_name(freg)
+                        ));
+                        return true;
+                    }
+                    return false;
+                }
+                // FIRST slot-resident (no register home): one load into the
+                // %xmm0 scratch, second operand from the source slot. Still
+                // strictly fewer stagings than the pair being replaced.
+                if self.reg_assignments.contains_key(&fv.0) {
+                    return false; // GPR-homed: shuttle required
+                }
+                let Some(slot) = self.state.get_slot(fv.0) else {
+                    return false;
+                };
+                let Some(src) = self.fp_src_mem_operand(second, ty) else {
+                    return false;
+                };
+                let mov = if ty == IrType::F32 { "movss" } else { "movsd" };
+                let sr = self.slot_ref(slot.0);
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", mov, sr));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", mnemonic, src));
+                true
+            }
+            Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::F32(_)) => {
+                // Constant FIRST: materialize into %xmm0 (pool load or xor),
+                // compare the second operand from its source slot.
+                let Some(src) = self.fp_src_mem_operand(second, ty) else {
+                    return false;
+                };
+                self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", mnemonic, src));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn emit_float_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        // FP-SELECT blend (S05): a float Cmp whose boolean feeds ONLY Selects
+        // emits nothing here — every select re-derives the VEX blend mask
+        // (vcmpsd/vcmpss, see try_emit_fp_select_blend) from the recorded
+        // operands and blends the FP arms. The scan excluded `fused` dests,
+        // so no pending-flag handshake state is skipped with it.
+        if !fp_select_disabled() && self.fp_select_cmps.contains_key(&dest.0) {
+            if fp_select_debug() {
+                eprintln!(
+                    "[FP-SELECT] cmp %{} emits nothing (blend at select)",
+                    dest.0
+                );
+            }
+            return;
+        }
+        let swap_operands = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
+        let (first, second) = if swap_operands {
+            (rhs, lhs)
+        } else {
+            (lhs, rhs)
+        };
+
+        // REGISTER-DIRECT COMPARE: when the FIRST operand is XMM-homed, its
+        // home IS the ucomis destination — no staging. The SECOND operand
+        // rides the memory-capable source position (a register home, a
+        // RIP-relative pool constant, or a stack slot all encode directly).
+        // The staged `vmovsd home,home,%xmm0` + `vmovsd home,home,%xmm1`
+        // pair this replaces sat ON THE COMPARE'S LATENCY CHAIN in every
+        // FP loop: vector-register moves are not eliminated at rename on
+        // many cores (move elimination covers GPRs; XMM rename arrived
+        // only with Ice Lake), so each stage costs a full FP-op latency
+        // slot ahead of the ucomisd. Mandelbrot's escape check —
+        // `|z|² > 4.0` with |z|² in a home and 4.0 in the pool — measured
+        // 1.51s → 1.21s from this fix alone (the compare gates the loop
+        // backedge). Flags semantics are IDENTICAL to the staged form
+        // (compare FIRST vs SECOND); every downstream consumer — setcc
+        // tables, pending_fp_cmp fusion, replay re-emission — is
+        // operand-order-agnostic.
+        if self.try_emit_fp_cmp_direct(first, second, ty) {
+            // flags set; fall through to the shared fusion/setcc logic
+        } else {
+            // Load first operand → %xmm0 (use constant pool for FP constants)
+            self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+            // Load second operand → %xmm1
+            self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+
+            if ty == IrType::F64 {
+                self.state.emit("    ucomisd %xmm1, %xmm0");
+            } else {
+                self.state.emit("    ucomiss %xmm1, %xmm0");
+            }
+        }
+
+        // FLAG FUSION: when this FP Cmp's boolean result is consumed ONLY by
+        // an immediately-following Select/CondBranch (precomputed in
+        // fused_cmp_dests), skip the boolean materialization. The ucomisd
+        // above set EFLAGS; the relational ordered comparisons map cleanly
+        // to `ja`/`jae` (NaN → unordered → not-taken = false, which is the
+        // C99 result for NaN in any relational). Eq/Ne need the parity bit
+        // too: a self-compare is PF alone (`jnp`/`jp`), anything else is a
+        // two-flag pair the CondBranch consumer expands
+        // (`emit_fp_eq_ne_pair_branch`). The consumer reads `pending_fp_cmp`
+        // for the pre-computed jcc — distinct from the integer `pending_cmp` because the FP
+        // flag→jcc mapping differs (ja vs jg).
+        let fusion_disabled = no_flag_fusion();
+        if !fusion_disabled {
+            if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
+                let jcc: Option<&'static str> = match op {
+                    IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => Some("ja"),
+                    IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => Some("jae"),
+                    // Self-compare: PF alone is the answer. Otherwise the
+                    // CondBranch consumer expands the two-flag pair.
+                    IrCmpOp::Eq if is_self_compare(lhs, rhs) => Some("jnp"),
+                    IrCmpOp::Ne if is_self_compare(lhs, rhs) => Some("jp"),
+                    IrCmpOp::Eq => Some(FP_EQ_PAIR),
+                    IrCmpOp::Ne => Some(FP_NE_PAIR),
+                };
+                if let Some(jcc) = jcc {
+                    self.pending_fp_cmp = Some((chain_end, jcc));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+
+        self.emit_fp_cmp_setcc(dest, op);
+    }
+
+    /// Consume a pending FP fused-Cmp's live flags for a boolean condition.
+    /// Returns the pre-computed jcc if `cond` matches the fused Cmp's dest
+    /// (or the chain-end value of a flag-neutral Copy/Cast chain), else None.
+    fn take_pending_fp_cmp(&mut self, cond: &Operand) -> Option<&'static str> {
+        if let Operand::Value(v) = cond {
+            if let Some((dest, jcc)) = self.pending_fp_cmp {
+                if dest == v.0 {
+                    self.pending_fp_cmp = None;
+                    return Some(jcc);
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn emit_f128_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
+        let swap_x87 = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
+        let (first_x87, second_x87) = if swap_x87 { (lhs, rhs) } else { (rhs, lhs) };
+        self.emit_f128_load_to_x87(first_x87);
+        self.emit_f128_load_to_x87(second_x87);
+        self.state.emit("    fucomip %st(1), %st");
+        self.state.emit("    fstp %st(0)");
+        match op {
+            IrCmpOp::Eq => {
+                self.state.emit("    setnp %al");
+                self.state.emit("    sete %cl");
+                self.state.emit("    andb %cl, %al");
+            }
+            IrCmpOp::Ne => {
+                self.state.emit("    setp %al");
+                self.state.emit("    setne %cl");
+                self.state.emit("    orb %cl, %al");
+            }
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => {
+                self.state.emit("    seta %al");
+            }
+            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => {
+                self.state.emit("    setae %al");
+            }
+        }
+        // %cl partial-clobber (see emit_fp_cmp_setcc): drop the sec claim.
+        if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+            self.state.reg_cache.invalidate_sec();
+        }
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
+    pub(super) fn emit_int_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        // COMPARE-REPLAY: the Cmp's single use is a non-adjacent Select or
+        // CondBranch (recorded in cmp_replay). Skip the ENTIRE instruction —
+        // including the cmp itself — because the consumer re-emits the
+        // comparison from the recorded operands right before its cmov/jcc.
+        // Emitting the cmp here too would double the compare in the hot loop.
+        if self.cmp_replay.contains_key(&dest.0) {
+            // The comparison re-emits later from the recorded operands, so
+            // any deferred narrowing widens (PF-15) must materialize NOW:
+            // the replay will read these homes at a distance where the
+            // adjacency guarantee no longer holds.
+            self.flush_pending_widen_impl();
+            return;
+        }
+        // DE MORGAN SPLIT: this Cmp's boolean feeds a skipped And/Or whose
+        // CondBranch re-emits the comparison from the recorded operands —
+        // skip the entire instruction (same contract as compare-replay).
+        if self.demorgan_skip.contains(&dest.0) {
+            self.flush_pending_widen_impl();
+            return;
+        }
+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
+
+        // FLAG FUSION: when this Cmp's boolean result is consumed ONLY by the
+        // immediately-following Select or CondBranch (precomputed in
+        // fused_cmp_dests from the IR adjacency), skip the boolean
+        // materialization entirely — the flags set by the cmp/test above are
+        // still live, and the consumer emits jcc/cmovcc directly. This saves
+        // setcc + movzbl + (movq/testq) per comparison in branch-heavy hot
+        // loops (gzip's longest_match). The dispatch loop runs instructions
+        // strictly in order, so the consumer is guaranteed to be the next
+        // emission; if anything else intervenes (cannot happen by
+        // construction), the consumer falls back to materializing the bool —
+        // but that path is unreachable for fused cmps.
+        //
+        // SOUNDNESS: flag fusion is DISABLED when a select fallback that
+        // materializes the condition via `operand_to_rax(cond)` is forced
+        // (CCC_V9_SELECT = legacy v9 select emission; CCC_NO_INPLACE_SELECT =
+        // disable the in-place condition test). Those legacy paths READ the
+        // materialized boolean from the Cmp's register/slot, so the Cmp MUST
+        // emit the setcc+movzbl — otherwise the legacy select reads a stale
+        // register (it was never written because the Cmp skipped the
+        // materialization). Without this gate, setting either flag produced
+        // wrong select results (differential test: got 660 vs expected 1320).
+        let fusion_disabled = no_flag_fusion() || v9_select() || no_inplace_select();
+        if !fusion_disabled {
+            if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
+                // The consumer is the next instruction(s) (possibly after a
+                // flag-neutral Copy chain); record pending flags under the
+                // chain-end value so the consumer's cond matches.
+                self.pending_cmp = Some((chain_end, op));
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
+        let set_instr = match op {
+            IrCmpOp::Eq => "sete",
+            IrCmpOp::Ne => "setne",
+            IrCmpOp::Slt => "setl",
+            IrCmpOp::Sle => "setle",
+            IrCmpOp::Sgt => "setg",
+            IrCmpOp::Sge => "setge",
+            IrCmpOp::Ult => "setb",
+            IrCmpOp::Ule => "setbe",
+            IrCmpOp::Ugt => "seta",
+            IrCmpOp::Uge => "setae",
+        };
+        self.state.emit_fmt(format_args!("    {} %al", set_instr));
+
+        // Register-direct: movzbl %al, %dest_reg_32 — skip %rax relay.
+        // Safe because %al is part of %rax, never overlaps callee-saved registers.
+        if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name_32(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    movzbl %al, %{}", d_name));
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
+    pub(super) fn emit_fused_cmp_branch_impl(
+        &mut self,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        true_label: &str,
+        false_label: &str,
+    ) {
+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
+
+        let jcc = match op {
+            IrCmpOp::Eq => "je",
+            IrCmpOp::Ne => "jne",
+            IrCmpOp::Slt => "jl",
+            IrCmpOp::Sle => "jle",
+            IrCmpOp::Sgt => "jg",
+            IrCmpOp::Sge => "jge",
+            IrCmpOp::Ult => "jb",
+            IrCmpOp::Ule => "jbe",
+            IrCmpOp::Ugt => "ja",
+            IrCmpOp::Uge => "jae",
+        };
+        self.state
+            .emit_fmt(format_args!("    {} {}", jcc, true_label));
+        self.state.out.emit_jmp_label(false_label);
+        self.state.reg_cache.invalidate_all();
+    }
+
+    pub(super) fn emit_fused_cmp_branch_blocks_impl(
+        &mut self,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        self.emit_int_cmp_insn_typed(lhs, rhs, ty);
+
+        let jcc = match op {
+            IrCmpOp::Eq => "je",
+            IrCmpOp::Ne => "jne",
+            IrCmpOp::Slt => "jl",
+            IrCmpOp::Sle => "jle",
+            IrCmpOp::Sgt => "jg",
+            IrCmpOp::Sge => "jge",
+            IrCmpOp::Ult => "jb",
+            IrCmpOp::Ule => "jbe",
+            IrCmpOp::Ugt => "ja",
+            IrCmpOp::Uge => "jae",
+        };
+        if self.state.next_block_label == Some(true_block) {
+            self.state
+                .out
+                .emit_jcc_block(Self::invert_jcc(jcc), false_block.0);
+        } else {
+            self.state.out.emit_jcc_block(jcc, true_block.0);
+            if self.state.next_block_label != Some(false_block) {
+                self.state.out.emit_jmp_block(false_block.0);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Fused BitTest→CondBranch: `bt index, base` then `jc/jnc`. CF holds
+    /// the selected bit; nothing is materialized. The base (mask) prefers
+    /// its register home; constants and slot-resident values stage through
+    /// %rax (the accumulator scratch — dead here because the BitTest result
+    /// was never materialized). A variable index stages through %rcx.
+    pub(super) fn emit_fused_bit_test_branch_blocks_impl(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        let use_32bit = ty.size() <= 4;
+        // Stage the BASE for the r/m operand of BT.
+        let base_reg: String = match base {
+            Operand::Value(v) => {
+                // XMM-homed base (bit-punned float word): no GPR names;
+                // stage through the accumulator, which handles xmm->GPR.
+                if let Some(&reg) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .filter(|r| !super::emit::is_xmm_reg(**r))
+                {
+                    if use_32bit {
+                        format!("%{}", super::emit::phys_reg_name_32(reg))
+                    } else {
+                        format!("%{}", super::emit::phys_reg_name(reg))
+                    }
+                } else {
+                    self.operand_to_rax(base);
+                    if use_32bit {
+                        "%eax".to_string()
+                    } else {
+                        "%rax".to_string()
+                    }
+                }
+            }
+            Operand::Const(_) => {
+                self.operand_to_rax(base);
+                if use_32bit {
+                    "%eax".to_string()
+                } else {
+                    "%rax".to_string()
+                }
+            }
+        };
+        // BT with an immediate index; otherwise index in a register.
+        let const_index = match index {
+            Operand::Const(c) => c.to_i64().filter(|v| *v >= 0 && *v <= i32::MAX as i64),
+            _ => None,
+        };
+        let bt = if use_32bit { "btl" } else { "btq" };
+        if let Some(imm) = const_index {
+            let width: u32 = if use_32bit { 32 } else { 64 };
+            let bit = (imm as u32) % width;
+            self.state
+                .emit_fmt(format_args!("    {bt} ${bit}, {base_reg}"));
+        } else {
+            // The index register: prefer its home when it does not alias the
+            // staged base; otherwise stage through %rcx.
+            let idx_reg: String = match index {
+                Operand::Value(v) => match self
+                    .reg_assignments
+                    .get(&v.0)
+                    .filter(|r| !super::emit::is_xmm_reg(**r))
+                {
+                    Some(&reg) => {
+                        let name = if use_32bit {
+                            format!("%{}", super::emit::phys_reg_name_32(reg))
+                        } else {
+                            format!("%{}", super::emit::phys_reg_name(reg))
+                        };
+                        if name == base_reg {
+                            // Same register for base and index: bt r,r is
+                            // still well-defined (tests bit idx%width of the
+                            // same value) — keep it.
+                            name
+                        } else {
+                            name
+                        }
+                    }
+                    None => {
+                        self.operand_to_rcx(index);
+                        if use_32bit {
+                            "%ecx".to_string()
+                        } else {
+                            "%rcx".to_string()
+                        }
+                    }
+                },
+                _ => {
+                    self.operand_to_rcx(index);
+                    if use_32bit {
+                        "%ecx".to_string()
+                    } else {
+                        "%rcx".to_string()
+                    }
+                }
+            };
+            self.state
+                .emit_fmt(format_args!("    {bt} {idx_reg}, {base_reg}"));
+        }
+        // CF = tested bit. jc = branch when set (BitTest result nonzero).
+        if self.state.next_block_label == Some(true_block) {
+            self.state.out.emit_jcc_block("jnc", false_block.0);
+        } else {
+            self.state.out.emit_jcc_block("jc", true_block.0);
+            if self.state.next_block_label != Some(false_block) {
+                self.state.out.emit_jmp_block(false_block.0);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Map an integer comparison opcode to the jcc mnemonic for the
+    /// condition "the comparison is true".
+    fn cmp_jcc(op: IrCmpOp) -> &'static str {
+        match op {
+            IrCmpOp::Eq => "je",
+            IrCmpOp::Ne => "jne",
+            IrCmpOp::Slt => "jl",
+            IrCmpOp::Sle => "jle",
+            IrCmpOp::Sgt => "jg",
+            IrCmpOp::Sge => "jge",
+            IrCmpOp::Ult => "jb",
+            IrCmpOp::Ule => "jbe",
+            IrCmpOp::Ugt => "ja",
+            IrCmpOp::Uge => "jae",
+        }
+    }
+
+    /// Map an integer comparison opcode to the cmov CONDITION CODE (the part
+    /// between "cmov" and the size suffix, e.g. "g" for cmovgq). The caller
+    /// composes `cmov{cc}q`.
+    fn cmp_cmov(op: IrCmpOp) -> &'static str {
+        match op {
+            IrCmpOp::Eq => "e",
+            IrCmpOp::Ne => "ne",
+            IrCmpOp::Slt => "l",
+            IrCmpOp::Sle => "le",
+            IrCmpOp::Sgt => "g",
+            IrCmpOp::Sge => "ge",
+            IrCmpOp::Ult => "b",
+            IrCmpOp::Ule => "be",
+            IrCmpOp::Ugt => "a",
+            IrCmpOp::Uge => "ae",
+        }
+    }
+
+    /// If `cond` is the destination of a fused Cmp whose flags are still
+    /// pending, consume the pending flags and return the comparison opcode.
+    fn take_pending_cmp(&mut self, cond: &Operand) -> Option<IrCmpOp> {
+        if let Operand::Value(v) = cond {
+            if let Some((dest, op)) = self.pending_cmp {
+                if dest == v.0 {
+                    self.pending_cmp = None;
+                    return Some(op);
+                }
+            }
+        }
+        None
+    }
+
+    /// If `cond` is the destination of a Cmp eligible for compare-replay,
+    /// consume the replay record (op + operands) so the consumer can re-emit
+    /// the comparison and use cmovcc/jcc directly. Multi-select records
+    /// (see CmpReplayScan::replay_multi) are consumed by countdown: each
+    /// select clones the record and only the last one removes it.
+    fn take_replay_cmp(&mut self, cond: &Operand) -> Option<(IrCmpOp, Operand, Operand, IrType)> {
+        if let Operand::Value(v) = cond {
+            if let Some(rec) = self.cmp_replay.get(&v.0).cloned() {
+                if let Some(n) = self.cmp_replay_multi.get_mut(&v.0) {
+                    if *n <= 1 {
+                        self.cmp_replay.remove(&v.0);
+                        self.cmp_replay_multi.remove(&v.0);
+                    } else {
+                        *n -= 1;
+                    }
+                } else {
+                    self.cmp_replay.remove(&v.0);
+                }
+                return Some(rec);
+            }
+        }
+        None
+    }
+
+    /// If `cond` is the destination of an And/Or eligible for the De Morgan
+    /// branch split, consume the record so the branch can re-emit both
+    /// comparisons with a short-circuit jump between them.
+    fn take_demorgan(&mut self, cond: &Operand) -> Option<(u32, DemorganRec)> {
+        if let Operand::Value(v) = cond {
+            if let Some(rec) = self.demorgan_branch.remove(&v.0) {
+                return Some((v.0, rec));
+            }
+        }
+        None
+    }
+
+    /// FP `==`/`!=` on live `ucomis` flags (PF = unordered, ZF = equal or
+    /// unordered): `!=` holds when PF or !ZF, `==` when !PF and ZF. The PF
+    /// test always comes first; a jcc to the next block is kept where it
+    /// shields the ZF test from the unordered case.
+    fn emit_fp_eq_ne_pair_branch(&mut self, eq: bool, t: BlockId, f: BlockId) {
+        let next = self.state.next_block_label;
+        let out = &mut self.state.out;
+        if eq {
+            out.emit_jcc_block("jp", f.0);
+            if next == Some(t) {
+                out.emit_jcc_block("jne", f.0);
+            } else {
+                out.emit_jcc_block("je", t.0);
+                if next != Some(f) {
+                    out.emit_jmp_block(f.0);
+                }
+            }
+        } else {
+            out.emit_jcc_block("jp", t.0);
+            if next == Some(t) {
+                out.emit_jcc_block("je", f.0);
+            } else {
+                out.emit_jcc_block("jne", t.0);
+                if next != Some(f) {
+                    out.emit_jmp_block(f.0);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn invert_jcc(cc: &str) -> &'static str {
+        match crate::common::asm_constraints::inverse_jcc(cc) {
+            Some(inverse) => inverse,
+            // A silent fallback here would branch on the wrong condition.
+            None => unreachable!("invert_jcc: unexpected condition {cc}"),
+        }
+    }
+
+    pub(super) fn emit_cond_branch_blocks_impl(
+        &mut self,
+        cond: &Operand,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        let next = self.state.next_block_label;
+        // Profile-driven fallthrough. The layout pass recorded which
+        // successor carries more profile executions (the hot edge); the
+        // codegen driver sets it before this call. We make that successor the
+        // physical fallthrough (emit a conditional jump to the COLD successor
+        // instead), so the hot path takes no branch — Intel branch-prediction
+        // guidance — without reordering blocks and thus without perturbing
+        // register allocation. When no hint is present (or it is ambiguous),
+        // we default to preferring the TRUE successor, preserving the original
+        // behavior.
+        let pref_true = crate::pgo::take_cond_fallthrough()
+            .map(|h| h == true_block.0)
+            .unwrap_or(true);
+        let (hot, cold) = if pref_true {
+            (true_block, false_block)
+        } else {
+            (false_block, true_block)
+        };
+        let hot_next = next == Some(hot);
+        let cold_next = next == Some(cold);
+
+        // GNU asm-goto flag outputs describe the live hardware condition
+        // flags. For the proven single-use branch shape, avoid reloading and
+        // testing the stored bool; setcc/mov/store and the output-edge
+        // trampoline preserve EFLAGS, so this branch can consume them here.
+        if let Operand::Value(value) = cond {
+            if let Some(cc) = self.state.asm_cc_branch_values.remove(&value.0) {
+                // The analysis stores the full `jcc` mnemonic, so this reads the
+                // condition the template produced without re-parsing a suffix:
+                // one fewer table lookup and one fewer unreachable site than
+                // mapping a string back through the shared table here.
+                let jcc = cc.as_str();
+                let jcc_hot = if pref_true {
+                    jcc
+                } else {
+                    Self::invert_jcc(jcc)
+                };
+                if hot_next {
+                    self.state
+                        .out
+                        .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+                } else {
+                    self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                    if !cold_next {
+                        self.state.out.emit_jmp_block(cold.0);
+                    }
+                }
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+        }
+
+        // DE MORGAN SPLIT: `CondBranch(And/Or(CmpA, CmpB))` with all three
+        // skipped at their own positions. Re-emit cmpA, short-circuit-jump
+        // on the decided outcome (And: !A → false; Or: A → true), re-emit
+        // cmpB, then branch on B with the usual hot/cold layout. Kills two
+        // boolean materializations (setcc+movzbl each) plus the And/Or plus
+        // the test per branch (lz4's match-length checks). The jumps always
+        // emit (even to the next block — a jcc to next skips the rest of
+        // this block, which is exactly the short-circuit semantic).
+        if let Some((andor_id, rec)) = self.take_demorgan(cond) {
+            if demorgan_debug_enabled() {
+                eprintln!("[demorgan] fire andor={} is_and={}", andor_id, rec.is_and);
+            }
+            self.state.reg_cache.invalidate_acc();
+            self.emit_int_cmp_replay_insn(&rec.a.1, &rec.a.2, rec.a.3);
+            if rec.is_and {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(Self::cmp_jcc(rec.a.0)), false_block.0);
+            } else {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::cmp_jcc(rec.a.0), true_block.0);
+            }
+            self.emit_int_cmp_replay_insn(&rec.b.1, &rec.b.2, rec.b.3);
+            let jcc_b = Self::cmp_jcc(rec.b.0);
+            let jcc_hot = if pref_true {
+                jcc_b
+            } else {
+                Self::invert_jcc(jcc_b)
+            };
+            if hot_next {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        // FLAG FUSION (FP): the condition is the direct result of an
+        // immediately-preceding float Cmp whose ucomisd flags are still
+        // live. Branch on the pre-computed FP jcc (ja/jae family) directly,
+        // skipping the setcc + movzbl + testq chain — the mandelbrot
+        // `if (zr*zr + zi*zi > 4.0) break` drops from 6 instructions
+        // (ucomisd; seta; movzbl; movq; test; jne) to 2 (ucomisd; ja).
+        if let Some(jcc) = self.take_pending_fp_cmp(cond) {
+            if jcc == FP_EQ_PAIR || jcc == FP_NE_PAIR {
+                self.emit_fp_eq_ne_pair_branch(jcc == FP_EQ_PAIR, true_block, false_block);
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+            let jcc_hot = if pref_true {
+                jcc
+            } else {
+                Self::invert_jcc(jcc)
+            };
+            if hot_next {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        // FLAG FUSION: the condition is the direct result of the immediately
+        // preceding Cmp; its flags are live — branch on them directly,
+        // skipping the testq of the materialized boolean.
+        if let Some(op) = self.take_pending_cmp(cond) {
+            let jcc = Self::cmp_jcc(op);
+            let jcc_hot = if pref_true {
+                jcc
+            } else {
+                Self::invert_jcc(jcc)
+            };
+            if hot_next {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        // COMPARE-REPLAY: non-adjacent Cmp consumed by this branch. Re-emit
+        // the comparison (fresh flags) and branch on the condition code
+        // directly — kills the setcc/movzbl + testq chain per branch.
+        if let Some((op, lhs, rhs, ty)) = self.take_replay_cmp(cond) {
+            self.state.reg_cache.invalidate_acc();
+            self.emit_int_cmp_replay_insn(&lhs, &rhs, ty);
+            let jcc = Self::cmp_jcc(op);
+            let jcc_hot = if pref_true {
+                jcc
+            } else {
+                Self::invert_jcc(jcc)
+            };
+            if hot_next {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        // Register-direct: test the condition register directly, skip %rax relay.
+        // WIDE conditions never take this arm: their homes are the 16-byte
+        // slot or the rax:rdx pair (never a single GPR), and a single-half
+        // test is unsound — they route to the two-half form below.
+        if let Operand::Value(v) = cond {
+            if !self.cond_is_wide(v.0) {
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if !is_xmm_reg(reg) {
+                        self.emit_cond_gpr_test(v.0, reg);
+                        let jcc_hot = if pref_true { "jne" } else { "je" };
+                        if hot_next {
+                            self.state
+                                .out
+                                .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+                        } else {
+                            self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                            if !cold_next {
+                                self.state.out.emit_jmp_block(cold.0);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        // WIDE conditions: two half-width tests (lo, hi) — a wide value is
+        // zero iff BOTH halves are zero. A single 64-bit test of either half
+        // misclassifies `(__int128)1 << 64` (low half 0, high half 1) as
+        // zero and branches to the wrong arm.
+        if matches!(cond, Operand::Value(v) if self.cond_is_wide(v.0)) {
+            self.emit_wide_cond_branch(cond, hot, cold, hot_next, cold_next, pref_true);
+            return;
+        }
+        self.operand_to_rax(cond);
+        self.state.emit("    testq %rax, %rax");
+        let jcc_hot = if pref_true { "jne" } else { "je" };
+        if hot_next {
+            self.state
+                .out
+                .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+        } else {
+            self.state.out.emit_jcc_block(jcc_hot, hot.0);
+            if !cold_next {
+                self.state.out.emit_jmp_block(cold.0);
+            }
+        }
+    }
+
+    /// Emit `test{size} %reg, %reg` for a GPR-homed condition value, sized to
+    /// the value's IR type.
+    ///
+    /// The historical form was always `testq %r64, %r64`. That is wrong for
+    /// every condition narrower than 64 bits: the SysV x86-64 ABI leaves the
+    /// bits above a parameter's width UNDEFINED, so `testq` on a 32-bit
+    /// condition reads garbage that may set/clear ZF regardless of the actual
+    /// value — an `if (c)` / `c ? a : b` on a zero `int` could spuriously
+    /// branch/select the true arm when the caller passed stale high bits.
+    /// Size the test to the value's own width (`testl`/`testw`/`testb`),
+    /// exactly as the stack-slot path already sizes its memory compare
+    /// (`emit_cmp_zero_mem` → `cmpl` for I32 homed bools).
+    fn emit_cond_gpr_test(&mut self, val_id: u32, reg: PhysReg) {
+        // Only integer (and pointer) conditions carry a zero/nonzero
+        // semantic worth testing; bools arrive as I8. For every other
+        // recorded type keep the historical full-width test.
+        if let Some(ty) = self.value_types.get(&val_id).copied() {
+            match ty {
+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
+                    let (_, test_mnem, _) = super::emit::cmp_width_info(ty);
+                    let name = super::emit::typed_phys_reg_name(reg, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", test_mnem, name, name));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let name = phys_reg_name(reg);
+        self.state
+            .emit_fmt(format_args!("    testq %{}, %{}", name, name));
+    }
+
+    /// Test the select condition in place, WITHOUT materializing it into a
+    /// register and WITHOUT `pushfq`/`popfq`:
+    ///
+    ///   * register-allocated cond → `test{size} %reg, %reg` (no clobbers;
+    ///                               sized to the condition's IR width so a
+    ///                               32-bit condition never reads the
+    ///                               undefined upper register bits)
+    ///   * stack-slot cond         → `cmpl $0, off(%rsp/%rbp)` (no clobbers;
+    ///                               bools are stored as zero-extended I32)
+    ///   * accumulator-cached cond → `testq %rax, %rax`
+    ///
+    /// Returns true when the flags were set in place (so the caller can emit a
+    /// cmov directly). `pushfq`/`popfq` are serializing (~20-50 cycles each) and
+    /// additionally disable the store-forwarding peephole phases, so avoiding
+    /// them in the common case is a large hot-loop win.
+    fn test_select_cond_in_place(&mut self, cond: &Operand) -> bool {
+        if let Operand::Value(v) = cond {
+            if !self.state.is_alloca(v.0) {
+                // WIDE (128-bit) conditions: zero-ness is (lo | hi) == 0, so a
+                // single 64-bit test on either half is unsound — a value with
+                // a zero low half and a nonzero high half is NOT zero (this
+                // is the `(__int128)1 << 64` class). Route to the wide
+                // in-place form BEFORE any single-register path can claim the
+                // condition: a wide value's homes are the 16-byte slot or the
+                // rax:rdx accumulator pair, never a single GPR.
+                if self.cond_is_wide(v.0) {
+                    return self.test_wide_cond_in_place(v.0);
+                }
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if !is_xmm_reg(reg) {
+                        self.emit_cond_gpr_test(v.0, reg);
+                        return true;
+                    }
+                }
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    // Size the memory compare to the value's recorded IR
+                    // type. The historical unconditional `cmpl` under-read
+                    // every slot wider than 4 bytes: an I64-homed condition
+                    // whose low 4 bytes are zero is NOT zero (1 << 32), yet
+                    // `cmpl` reported zero. Reading fewer bytes than the
+                    // store defined is always sound (the low bytes of a
+                    // stored value are always defined), so the recorded type
+                    // width is the safe choice; an untracked type keeps the
+                    // historical form.
+                    let mnem = self
+                        .value_types
+                        .get(&v.0)
+                        .map(|ty| super::emit::cmp_width_info(*ty).0)
+                        .unwrap_or("cmpl");
+                    self.state.out.emit_cmp_zero_mem_sized(slot.0, mnem);
+                    return true;
+                }
+                if self.state.acc_has_verified(v.0, false) || self.state.acc_has_verified(v.0, true)
+                {
+                    self.state.emit("    testq %rax, %rax");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// True when `val_id`'s recorded IR type is a WIDE integer (I128/U128):
+    /// a value whose zero-ness spans two 64-bit halves, so any single-width
+    /// zero test (`testq`, `cmpq`, `cmpl`) on one half is unsound.
+    fn cond_is_wide(&self, val_id: u32) -> bool {
+        self.value_types
+            .get(&val_id)
+            .map(|ty| crate::backend::generation::is_wide_int_type(*ty))
+            .unwrap_or(false)
+    }
+
+    /// In-place zero test for a WIDE condition, SELECT context (flags must
+    /// survive into a following cmovcc, so no clobber of the accumulator and
+    /// no branch). Zero-ness is `(lo | hi) == 0`; `orq` sets ZF from exactly
+    /// that.
+    ///
+    ///   * slot home      → `movq slot(%rbp), %rcx; orq slot+8(%rbp), %rcx`
+    ///   * acc-pair home  → `movq %rax, %rcx; orq %rdx, %rcx`
+    ///     (rax = lo, rdx = hi — the i128 accumulator-pair invariant)
+    ///
+    /// Only %rcx is written, and the SELECT flow stages its arms into %rcx
+    /// strictly AFTER the test, so the clobber is consumed before any live
+    /// use. The secondary-register cache is invalidated to keep the
+    /// `select_operand_to_reg` discipline (a stale "rcx holds K" claim must
+    /// not survive a register it no longer describes).
+    ///
+    /// Returns false when the condition's home is neither a known slot nor
+    /// the tracked accumulator pair (the caller falls back to the generic
+    /// materialize-and-test path).
+    fn test_wide_cond_in_place(&mut self, val_id: u32) -> bool {
+        if let Some(slot) = self.state.get_slot(val_id) {
+            // lo at slot+0, hi at slot+8 (the i128 slot layout used by
+            // emit_store_pair_to_slot / the Mov128 path).
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+            self.state
+                .out
+                .emit_instr_rbp_reg("    orq", slot.0 + 8, "rcx");
+            self.state.reg_cache.invalidate_sec();
+            return true;
+        }
+        if self.state.acc_has_verified(val_id, false) {
+            self.state.emit("    movq %rax, %rcx");
+            self.state.emit("    orq %rdx, %rcx");
+            self.state.reg_cache.invalidate_sec();
+            return true;
+        }
+        false
+    }
+
+    /// Branch-context zero test for a WIDE condition: fold the two halves
+    /// into the accumulator and let ONE conditional branch decide — the
+    /// GCC shape (`movq lo, %rax; orq hi, %rax; jcc`). Zero-ness of a wide
+    /// value is `(lo | hi) == 0`, so the fold is exact; two independent
+    /// half-tests would each need the OTHER half's verdict to place a jump
+    /// (a zero low half does NOT imply a zero value), which is exactly the
+    /// trap this fold avoids.
+    ///
+    ///   * slot home     → `movq slot(%rbp), %rax; orq slot+8(%rbp), %rax`
+    ///   * acc-pair home → `orq %rdx, %rax` (rax already holds lo)
+    ///   * anything else → stage the pair with `operand_to_rax_rdx` (handles
+    ///     I128 constants, indirect homes, alloca addressing), then fold
+    ///
+    /// Clobbering rax (and rdx when staging) at a block-terminating branch
+    /// matches the generic fallback's contract — the accumulator is staging
+    /// territory here and the cache is invalidated on exit.
+    fn emit_wide_cond_branch(
+        &mut self,
+        cond: &Operand,
+        hot: BlockId,
+        cold: BlockId,
+        hot_next: bool,
+        cold_next: bool,
+        pref_true: bool,
+    ) {
+        let val_id = match cond {
+            Operand::Value(v) => v.0,
+            Operand::Const(_) => u32::MAX, // constants: stage via operand_to_rax_rdx
+        };
+        let slot = match cond {
+            Operand::Value(v) => self.state.get_slot(v.0),
+            Operand::Const(_) => None,
+        };
+        if let Some(slot) = slot {
+            // lo at slot+0, hi at slot+8 (the i128 slot layout used by
+            // emit_store_pair_to_slot / the Mov128 path).
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+            self.state
+                .out
+                .emit_instr_rbp_reg("    orq", slot.0 + 8, "rax");
+        } else if self.state.acc_has_verified(val_id, false) {
+            // rax = lo, rdx = hi (the i128 accumulator-pair invariant).
+            self.state.emit("    orq %rdx, %rax");
+        } else {
+            self.operand_to_rax_rdx(cond);
+            self.state.emit("    orq %rdx, %rax");
+        }
+        let jcc_hot = if pref_true { "jne" } else { "je" };
+        if hot_next {
+            self.state
+                .out
+                .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+        } else {
+            self.state.out.emit_jcc_block(jcc_hot, hot.0);
+            if !cold_next {
+                self.state.out.emit_jmp_block(cold.0);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Legacy-path condition test (pushfq/popfq sites): stage the condition
+    /// and set ZF from its zero-ness. WIDE conditions stage the full rax:rdx
+    /// pair and fold the halves with `orq` — a wide value is zero iff BOTH
+    /// halves are zero, so a single-half `testq` misclassifies
+    /// `(__int128)1 << 64`. Everything else keeps the historical
+    /// single-register form. The callers save/restore flags around their arm
+    /// staging (pushfq/popfq), so the fold's register mutation is safe.
+    fn emit_legacy_cond_test(&mut self, cond: &Operand) {
+        let wide = matches!(cond, Operand::Value(v) if self.cond_is_wide(v.0));
+        if wide {
+            self.operand_to_rax_rdx(cond);
+            self.state.emit("    orq %rdx, %rax");
+        } else {
+            self.operand_to_rax(cond);
+            self.state.emit("    testq %rax, %rax");
+        }
+    }
+
+    /// Materialize a select operand into a register using ONLY flag-neutral
+    /// instructions. The generic `operand_to_rcx`/`operand_to_callee_reg`
+    /// materialize zero constants as `xorl %reg, %reg`, which clobbers the
+    /// condition flags — unacceptable between the in-place condition test and
+    /// the cmov (that is exactly why the legacy path needed pushfq/popfq).
+    /// Value operands are always flag-neutral in the existing helpers
+    /// (mov/movl/movslq/leaq family), so only constants are handled here.
+    fn select_operand_to_reg(&mut self, op: &Operand, reg64: &str, reg32: &str) {
+        if let Operand::Const(c) = op {
+            // The raw immediate emitters below bypass the register cache
+            // bookkeeping that `operand_to_rcx`/`operand_to_rax` maintain.
+            // Writing %rcx/%rax without invalidating the corresponding
+            // cache entry left a STALE "rcx holds K" claim alive: the next
+            // `operand_to_rcx(K)` then skipped the reload and the consumer
+            // read the clobbered register (`(h^v)*K` after a
+            // `movq $0,%rcx; cmoveq` select returned 0-multiplied garbage —
+            // bitops_builtins). The copy-propagation peephole had been
+            // masking this by rewriting the consumers off %rcx; any RA
+            // perturbation that broke that rescue exposed the miscompile.
+            if reg64 == "rcx" {
+                self.state.reg_cache.invalidate_sec();
+            } else if reg64 == "rax" {
+                self.state.reg_cache.invalidate_acc();
+            }
+            // CG-07r: Only all-zero bit patterns may materialize via `movl $0`.
+            // IEEE-754 negative zero (-0.0f / -0.0) and non-canonical decimal
+            // zeros have non-zero sign/exponent bits that `c.is_zero()` ignores.
+            if c.is_all_zero_bits() {
+                // PF-16: movl $0 writes the same canonical value (zero-extend)
+                // two bytes shorter; neither form touches flags.
+                self.state.emit_fmt(format_args!("    movl $0, %{}", reg32));
+                return;
+            }
+            let emit_int_imm = |this: &mut Self, v: i64| {
+                if v >= 0 && v <= i32::MAX as i64 {
+                    this.state.out.emit_instr_imm_reg("    movl", v, reg32);
+                } else if v >= i32::MIN as i64 && v < 0 {
+                    this.state.out.emit_instr_imm_reg("    movq", v, reg64);
+                } else {
+                    this.state.out.emit_instr_imm_reg("    movabsq", v, reg64);
+                }
+            };
+            match c {
+                IrConst::I8(v) => emit_int_imm(self, *v as i64),
+                IrConst::I16(v) => emit_int_imm(self, *v as i64),
+                IrConst::I32(v) => emit_int_imm(self, *v as i64),
+                IrConst::I64(v) => emit_int_imm(self, *v),
+                IrConst::F32(v) => {
+                    // PF-16: 5-byte `movl` into the 32-bit sub-register avoids
+                    // 10-byte `movabsq` whenever bit 31 (sign bit) is set.
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movl", v.to_bits() as i32 as i64, reg32);
+                }
+                IrConst::F64(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movabsq", v.to_bits() as i64, reg64);
+                }
+                IrConst::LongDouble(v, _) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movabsq", v.to_bits() as i64, reg64);
+                }
+                // Decimal FP bit containers: opaque bit patterns.
+                IrConst::D32(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movl", *v as i32 as i64, reg32);
+                }
+                IrConst::D64(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movabsq", *v as i64, reg64);
+                }
+                IrConst::I128(v) => emit_int_imm(self, *v as i64),
+                IrConst::Zero => {
+                    // PF-16: movl $0 writes the same canonical value (zero-extend)
+                    // two bytes shorter; neither form touches flags.
+                    self.state.emit_fmt(format_args!("    movl $0, %{}", reg32));
+                }
+            }
+            return;
+        }
+        if reg64 == "rcx" {
+            self.operand_to_rcx(op);
+        } else if reg64 == "rax" {
+            self.operand_to_rax(op);
+        } else {
+            // Register-direct destination: find the PhysReg by name.
+            let phys = match reg64 {
+                "rbx" => Some(PhysReg(1)),
+                "r12" => Some(PhysReg(2)),
+                "r13" => Some(PhysReg(3)),
+                "r14" => Some(PhysReg(4)),
+                "r15" => Some(PhysReg(5)),
+                "rbp" => Some(PhysReg(6)),
+                "r11" => Some(PhysReg(10)),
+                "r10" => Some(PhysReg(11)),
+                "r8" => Some(PhysReg(12)),
+                "r9" => Some(PhysReg(13)),
+                "rdi" => Some(PhysReg(14)),
+                "rsi" => Some(PhysReg(15)),
+                "rdx" => Some(PhysReg(16)),
+                _ => None,
+            };
+            if let Some(p) = phys {
+                self.operand_to_callee_reg(op, p);
+            } else {
+                self.operand_to_rax(op);
+            }
+        }
+    }
+
+    /// `cmovl`/`cmovq` chosen by type. 32-bit cmov is restricted to unsigned
+    /// types: `cmovl` zero-extends dest, which is the U32 home invariant but
+    /// would drop the sign of a negative I32 that a later 64-bit signed use
+    /// (without an explicit `movslq`) would read.
+    fn emit_cmov_typed(&mut self, cc: &str, src64: &str, dst64: &str, ty: IrType) {
+        if ty.size() <= 4 {
+            // 32-bit cmov: only the low 32 bits of each operand are selected
+            // and written, which is exactly the semantics of an I32/U32 select
+            // regardless of signedness. (64-bit cmovs on 32-bit data would
+            // additionally require every arm to be sign-extended to 64 bits.)
+            self.state.emit_fmt(format_args!(
+                "    cmov{}l %{}, %{}",
+                cc,
+                super::emit::reg_name_to_32(src64),
+                super::emit::reg_name_to_32(dst64),
+            ));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    cmov{}q %{}, %{}", cc, src64, dst64));
+        }
+    }
+
+    /// The min/max canonical shape: a Select whose condition is a relational
+    /// FP compare and whose arms are the compare's operands verbatim —
+    /// `a > b ? a : b` and its three siblings. One `maxsd`/`minsd` (SECOND
+    /// OPERAND WINS on NaN and on ties, Intel SDM MAXSD/MINSD) replaces the
+    /// whole vcmp+blend (AVX) or ucomisd+cmov (SSE2) sequence, and the
+    /// hardware semantics match the C select exactly. The dst is always the
+    /// TRUE arm and the src the FALSE arm (the false arm is exactly where
+    /// NaN and ties land, because the condition is false there); the
+    /// INSTRUCTION follows the arms' orientation relative to the predicate:
+    ///
+    ///   ogt(a,b) ? a : b  ==  maxsd dst=a, src=b   (NaN → b, tie → b)
+    ///   olt(a,b) ? a : b  ==  minsd dst=a, src=b
+    ///   ogt(a,b) ? b : a  ==  minsd dst=b, src=a   (NaN → a, tie → a)
+    ///   olt(a,b) ? b : a  ==  maxsd dst=b, src=a
+    ///
+    /// (`a > b ? b : a` selects b when b is the SMALLER side's opposite —
+    /// the true arm is the predicate's RHS, so the T-vs-F relation that
+    /// selects the true arm is `T < F`, which is minsd.) The swapped-arm
+    /// mapping was first derived backwards (max for both gt shapes); the
+    /// bit-exact differential against gcc-16 over NaN/±0/SNaN corners
+    /// caught the transposition, and the table above is the corrected,
+    /// re-verified algebra.
+    ///
+    /// `ge`/`le` are deliberately NOT folded: their tie arm (`a`, picked
+    /// when `a == b`) is the opposite of the hardware's tie arm (src), and
+    /// `eq`/`ne` are not min/max at all — GCC leaves those un-folded too,
+    /// for the same reason. Exception parity: `ucomisd`/`ucomiss` raise #IA
+    /// on SNaN and so do `maxsd`/`minsd`/`maxss`/`minss`, so the fold
+    /// cannot change the select's exception behavior.
+    ///
+    /// Arm identity is VALUE identity (same SSA id) or bit-identical FP
+    /// constants — the strongest possible precondition. Bitcast arms (the
+    /// frontend's integer-spelled FP selects) keep their distinct SSA ids,
+    /// fail the identity test, and stay on the blend path below rather
+    /// than being guessed at.
+    ///
+    /// Returns true when the min/max was emitted; false when the shape is
+    /// not the canonical one (the caller proceeds to the blend/fallback).
+    /// Emit the scalar MIN/MAX with the ABI-active encoding. AVX requires
+    /// the three-operand VEX form (src2, src1, dest in AT&T order); repeating
+    /// the true-arm destination as src1 preserves the legacy two-operand
+    /// semantics while avoiding an AVX-to-legacy-SSE transition.
+    fn emit_fp_select_minmax_instruction(&mut self, minmax: &str, false_src: &str, true_dst: &str) {
+        if self.isa.avx {
+            self.state.emit_fmt(format_args!(
+                "    v{minmax} {false_src}, %{true_dst}, %{true_dst}"
+            ));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {minmax} {false_src}, %{true_dst}"));
+        }
+    }
+
+    fn try_emit_fp_select_minmax(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> bool {
+        let Some(gt_form) = (match op {
+            IrCmpOp::Sgt | IrCmpOp::Ugt => Some(true),
+            IrCmpOp::Slt | IrCmpOp::Ult => Some(false),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let same_operand = |a: &Operand, b: &Operand| -> bool {
+            match (a, b) {
+                (Operand::Value(x), Operand::Value(y)) => x.0 == y.0,
+                (Operand::Const(x), Operand::Const(y)) => match (x, y) {
+                    (IrConst::F64(p), IrConst::F64(q)) => p.to_bits() == q.to_bits(),
+                    (IrConst::F32(p), IrConst::F32(q)) => p.to_bits() == q.to_bits(),
+                    _ => false,
+                },
+                _ => false,
+            }
+        };
+        // dst is always the TRUE arm, src the FALSE arm (second operand wins
+        // on NaN and ties, which is exactly where the C select's condition
+        // is false). The INSTRUCTION depends on the arms' orientation:
+        //   * true arm is the predicate's LHS: cond == (T > F) resp. (T < F)
+        //     -> maxsd/minsd(dst=T, src=F);
+        //   * true arm is the predicate's RHS: cond == (F > T) resp. (F < T),
+        //     i.e. the SELECTED-on-true relation between T and F is the
+        //     opposite one -> minsd/maxsd(dst=T, src=F).
+        // (The swapped case was derived the hard way: an earlier draft
+        // mapped `a > b ? b : a` to maxsd and the differential hash caught
+        // it — gt_sw and lt_sw came back transposed.)
+        let (true_is_lhs, true_is_rhs) = (
+            same_operand(true_val, lhs) && same_operand(false_val, rhs),
+            same_operand(true_val, rhs) && same_operand(false_val, lhs),
+        );
+        if !true_is_lhs && !true_is_rhs {
+            return false;
+        }
+        let is_max = if true_is_lhs { gt_form } else { !gt_form };
+        let is_f64 = ty == IrType::F64;
+        let minmax = if is_max {
+            if is_f64 { "maxsd" } else { "maxss" }
+        } else if is_f64 {
+            "minsd"
+        } else {
+            "minss"
+        };
+        if fp_select_debug() {
+            eprintln!("[FP-SELECT] min/max canonical shape -> {minmax}");
+        }
+        // Case A: XMM-homed destination — dst arm into the home, then the
+        // min/max straight into it. Homes are xmm2..xmm15, so the staged
+        // scratch below can never alias the destination. ORDER MATTERS: the
+        // false arm's source must be secured BEFORE the true arm's copy can
+        // clobber a shared home — when the destination inherits the FALSE
+        // arm's home (`x = a > b ? a : b` with x reusing b's register), the
+        // direct home spelling would read the register AFTER the true-arm
+        // copy overwrote it. Stage to %xmm1 in that case, exactly like the
+        // blend's step-2-before-step-3 discipline.
+        if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            let d_name = phys_reg_name(d);
+            let false_home_is_dest = match false_val {
+                Operand::Value(v) => self.fresh_home_of(v.0) == Some(d),
+                _ => false,
+            };
+            let false_src = if false_home_is_dest {
+                self.emit_fp_operand_to_xmm(false_val, ty, "xmm1");
+                "%xmm1".to_string()
+            } else {
+                match self.fp_src_mem_operand(false_val, ty) {
+                    Some(s) => s,
+                    None => {
+                        self.emit_fp_operand_to_xmm(false_val, ty, "xmm1");
+                        "%xmm1".to_string()
+                    }
+                }
+            };
+            self.emit_fp_operand_to_xmm(true_val, ty, &d_name);
+            self.emit_fp_select_minmax_instruction(minmax, &false_src, &d_name);
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Case B: no XMM home — dst arm into the FP accumulator scratch,
+        // min/max into it, store through the shared xmm0 dest path.
+        self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
+        match self.fp_src_mem_operand(false_val, ty) {
+            Some(src) => {
+                self.emit_fp_select_minmax_instruction(minmax, &src, "xmm0");
+            }
+            None => {
+                self.emit_fp_operand_to_xmm(false_val, ty, "xmm1");
+                self.emit_fp_select_minmax_instruction(minmax, "%xmm1", "xmm0");
+            }
+        }
+        self.store_xmm0_fp_dest(dest, ty);
+        true
+    }
+
+    /// S05 FP-SELECT: blend the FP arms of a Select whose condition is a
+    /// float Cmp that elided its boolean (see emit_float_cmp_impl). The mask
+    /// is re-derived as vcmpsd/vcmpss from the recorded operands, then
+    /// vblendvpd/vblendvps selects the arms — gcc's exact shape.
+    ///
+    /// Register contract: XMM homes are xmm2-xmm15, so xmm0/xmm1 are the
+    /// only scratch XMMs and no operand can alias them. Both arms are pure
+    /// reads with the compare-replay consumer-position liveness contract
+    /// (the operand links extended their intervals to this select).
+    ///
+    /// Blend order is TRUE-ARM-SECOND: vblendvpd %mask, %true, %false, %dst
+    /// (the VEX /is4 src2 — the AT&T middle operand — is selected when the
+    /// mask MSB is 1). Reversing it silently swaps the arms — the
+    /// `rint(-0.5) → -0.5` miscompile class.
+    ///
+    /// Returns true when the blend was emitted; false when the operands /
+    /// destination cannot be blended in registers (the caller then
+    /// re-materializes the boolean and uses the ordinary path).
+    fn try_emit_fp_select_blend(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> bool {
+        // The OQ predicates 13/14/17/18 exist solely in the 32-predicate VEX
+        // encoding, and `blendvpd` without VEX is SSE4.1 with an implicit
+        // %xmm0 mask, so legacy SSE takes the cmpsd + logic-op bit select.
+        if !self.isa.avx {
+            return self.try_emit_fp_select_sse_mask(dest, op, lhs, rhs, true_val, false_val, ty);
+        }
+        // vcmpsd predicate per the ucomisd-setcc semantics:
+        //   * Eq  → EQ_OQ (0):  ordered equal, NaN → false  (setnp&sete)
+        //   * Ne  → NEQ_UQ (4): unordered OR not-equal, NaN → true (setp|setne)
+        //   * Slt → LT_OQ (17), Sle → LE_OQ (18), Sgt → GT_OQ (14),
+        //     Sge → GE_OQ (13): ordered, NaN → false (seta/setae).
+        // The OQ (quiet) variants avoid signaling-NaN exceptions while
+        // preserving bit-exact predicate results. NOTE the RAW (lhs, rhs)
+        // order — vcmpsd encodes the predicate directly, unlike the
+        // swapped ucomisd+seta dance.
+        let imm: u8 = match op {
+            IrCmpOp::Eq => 0,
+            IrCmpOp::Ne => 4,
+            IrCmpOp::Slt | IrCmpOp::Ult => 17,
+            IrCmpOp::Sle | IrCmpOp::Ule => 18,
+            IrCmpOp::Sgt | IrCmpOp::Ugt => 14,
+            IrCmpOp::Sge | IrCmpOp::Uge => 13,
+        };
+        let is_f64 = ty == IrType::F64;
+        let cmp_insn = if is_f64 { "vcmpsd" } else { "vcmpss" };
+        let blend_insn = if is_f64 { "vblendvpd" } else { "vblendvps" };
+
+        // Case A: XMM-homed destination — blend straight into the home.
+        if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            let d_name = phys_reg_name(d);
+            if fp_select_debug() {
+                eprintln!("[FP-SELECT] blend into {}", d_name);
+            }
+            // 1. mask: the vcmpsd source position takes the RHS directly
+            //    (fresh XMM home / pool constant / stack slot — the same
+            //    classification as the register-direct compare), with the
+            //    LHS compared straight from its own home. Falls back to the
+            //    staged lhs→xmm0/rhs→xmm1 pair when the LHS has no fresh
+            //    home. The mask lands in %xmm0 either way (scratch, never
+            //    a home), and the compare still runs BEFORE the false-arm
+            //    copy can touch a shared home — order preserved.
+            let lhs_home = match lhs {
+                Operand::Value(v) => self
+                    .fresh_home_of(v.0)
+                    .filter(|r| is_xmm_reg(*r))
+                    .map(phys_reg_name),
+                _ => None,
+            };
+            match (lhs_home, self.fp_src_mem_operand(rhs, ty)) {
+                (Some(l_name), Some(r_src)) => {
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, {}, %{}, %xmm0",
+                        cmp_insn, imm, r_src, l_name
+                    ));
+                }
+                _ => {
+                    self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
+                    self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, %xmm1, %xmm0, %xmm0",
+                        cmp_insn, imm
+                    ));
+                }
+            }
+            // 2. true → xmm1 BEFORE false can clobber a shared home.
+            self.emit_fp_operand_to_xmm(true_val, ty, "xmm1");
+            // 3. false → dest home (no-op when the false arm already lives
+            //    there; the true-arm copy above stays safe either way).
+            self.emit_fp_operand_to_xmm(false_val, ty, d_name);
+            // 4. blend: mask ? true : false, into the dest home.
+            self.state.emit_fmt(format_args!(
+                "    {} %xmm0, %xmm1, %{}, %{}",
+                blend_insn, d_name, d_name
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+
+        // Case B: destination has no XMM home — blend into the xmm0 FP
+        // accumulator, then store_xmm0_fp_dest (XMM home is impossible here
+        // by construction; GPR home / slot / accumulator all handled).
+        // Requires the FALSE arm to be XMM-homed: only src1 (vvvv) can take
+        // a spare register in this budget — mask in xmm1, true in xmm0, so
+        // the false arm is read straight from its home register.
+        let false_home = match false_val {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r)),
+            _ => None,
+        };
+        let Some(f_reg) = false_home else {
+            return false;
+        };
+        let f_name = phys_reg_name(f_reg);
+        if fp_select_debug() {
+            eprintln!("[FP-SELECT] blend into xmm0 (false in {})", f_name);
+        }
+        // 1. mask → xmm1: register-direct when the LHS has a fresh home
+        //    (RHS from the memory-capable source slot), else the staged
+        //    lhs→xmm0 / rhs→xmm1 pair. Mask in %xmm1 either way.
+        let lhs_home = match lhs {
+            Operand::Value(v) => self
+                .fresh_home_of(v.0)
+                .filter(|r| is_xmm_reg(*r))
+                .map(phys_reg_name),
+            _ => None,
+        };
+        match (lhs_home, self.fp_src_mem_operand(rhs, ty)) {
+            (Some(l_name), Some(r_src)) => {
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, {}, %{}, %xmm1",
+                    cmp_insn, imm, r_src, l_name
+                ));
+            }
+            _ => {
+                self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
+                self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
+                self.state.emit_fmt(format_args!(
+                    "    {} ${}, %xmm1, %xmm0, %xmm1",
+                    cmp_insn, imm
+                ));
+            }
+        }
+        // 2. true → xmm0 (any operand kind; the false arm stays in its home).
+        self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
+        // 3. blend into the accumulator: mask ? xmm0 : %f.
+        self.state.emit_fmt(format_args!(
+            "    {} %xmm1, %xmm0, %{}, %xmm0",
+            blend_insn, f_name
+        ));
+        self.store_xmm0_fp_dest(dest, ty);
+        return true;
+    }
+
+    /// S05 FP-SELECT under legacy SSE (SSE1 for F32, SSE2 for F64): the
+    /// select is a bit select over a `cmpss`/`cmpsd` mask, never a GPR
+    /// `cmov`. The `cmov` fallback costs three XMM<->GPR crossings per
+    /// select; llvm-mca 23.1.4 on glibc's `floor` select chain measures
+    /// 40.0 -> 29.0 cycles/iteration (alderlake) and 28.0 -> 26.0 (znver4),
+    /// with fewer uops and no branch-misprediction exposure. LLVM's X86
+    /// `LowerSELECT` uses the same FSETCC + logic shape without SSE4.1.
+    ///
+    /// Predicates: legacy `cmpsd` has only imm 0-7, so `>`/`>=` swap the
+    /// operands into LT/LE. EQ (0) is false on unordered, NEQ (4) true,
+    /// LT (1)/LE (2) false: the same results as the VEX OQ predicates and
+    /// the ucomisd `seta`/`setae` fallback. LT/LE are the signaling forms,
+    /// which is what C Annex F requires of relational operators (GCC emits
+    /// `comisd` there); values are unaffected either way.
+    ///
+    /// Select: `F ^ ((T ^ F) & mask)` lands in the destination home without
+    /// a final move. A +0.0 arm needs one logic op (`andps` / `andnps`);
+    /// -0.0 is not all-zero bits and takes the generic select. Scalar lanes
+    /// only: upper lanes are don't-care, exactly as for the VEX blend.
+    /// Register contract as for `try_emit_fp_select_blend`: homes are
+    /// xmm2-xmm15, xmm0/xmm1 are scratch.
+    fn try_emit_fp_select_sse_mask(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> bool {
+        let (imm, swap): (u8, bool) = match op {
+            IrCmpOp::Eq => (0, false),
+            IrCmpOp::Ne => (4, false),
+            IrCmpOp::Slt | IrCmpOp::Ult => (1, false),
+            IrCmpOp::Sle | IrCmpOp::Ule => (2, false),
+            IrCmpOp::Sgt | IrCmpOp::Ugt => (1, true),
+            IrCmpOp::Sge | IrCmpOp::Uge => (2, true),
+        };
+        let (first, second) = if swap { (rhs, lhs) } else { (lhs, rhs) };
+        let (cmp, xor, and, andn, mov) = if ty == IrType::F64 {
+            ("cmpsd", "xorpd", "andpd", "andnpd", "movapd")
+        } else {
+            ("cmpss", "xorps", "andps", "andnps", "movaps")
+        };
+        let is_pos_zero = |op: &Operand| match op {
+            Operand::Const(IrConst::F64(c)) => c.to_bits() == 0,
+            Operand::Const(IrConst::F32(c)) => c.to_bits() == 0,
+            _ => false,
+        };
+
+        if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            let d_name = phys_reg_name(d);
+            // 1. mask -> %xmm0 (the compare runs before any arm staging can
+            //    overwrite a home it reads).
+            self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+            let src = match self.fp_src_mem_operand(second, ty) {
+                Some(s) => s,
+                None => {
+                    self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+                    "%xmm1".to_string()
+                }
+            };
+            self.state
+                .emit_fmt(format_args!("    {cmp} ${imm}, {src}, %xmm0"));
+            if is_pos_zero(false_val) {
+                // mask ? T : +0.0 == T & mask.
+                self.emit_fp_operand_to_xmm(true_val, ty, d_name);
+                self.state
+                    .emit_fmt(format_args!("    {and} %xmm0, %{d_name}"));
+            } else if is_pos_zero(true_val) {
+                // mask ? +0.0 : F == F & ~mask.
+                self.emit_fp_operand_to_xmm(false_val, ty, d_name);
+                self.state
+                    .emit_fmt(format_args!("    {andn} %{d_name}, %xmm0"));
+                self.state
+                    .emit_fmt(format_args!("    {mov} %xmm0, %{d_name}"));
+            } else if let Some(f_name) = match false_val {
+                Operand::Value(v) => self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r) && *r != d)
+                    .map(phys_reg_name),
+                _ => None,
+            } {
+                // F lives in another XMM register: build the select in the
+                // destination, dest = ((T ^ F) & mask) ^ F, with no scratch
+                // copy (T -> dest is a no-op when T already lives there).
+                self.emit_fp_operand_to_xmm(true_val, ty, d_name);
+                self.state
+                    .emit_fmt(format_args!("    {xor} %{f_name}, %{d_name}"));
+                self.state
+                    .emit_fmt(format_args!("    {and} %xmm0, %{d_name}"));
+                self.state
+                    .emit_fmt(format_args!("    {xor} %{f_name}, %{d_name}"));
+            } else {
+                // 2. T -> %xmm1 BEFORE F can overwrite a shared home.
+                self.emit_fp_operand_to_xmm(true_val, ty, "xmm1");
+                // 3. F -> dest home (no-op when it already lives there).
+                self.emit_fp_operand_to_xmm(false_val, ty, d_name);
+                // 4. dest = F ^ ((T ^ F) & mask).
+                self.state
+                    .emit_fmt(format_args!("    {xor} %{d_name}, %xmm1"));
+                self.state.emit_fmt(format_args!("    {and} %xmm0, %xmm1"));
+                self.state
+                    .emit_fmt(format_args!("    {xor} %xmm1, %{d_name}"));
+            }
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+
+        // No XMM home for the destination: select into the %xmm0
+        // accumulator. With only two scratch registers the FALSE arm must be
+        // XMM-homed (the same budget rule as the VEX blend's Case B).
+        let false_home = match false_val {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r)),
+            _ => None,
+        };
+        let Some(f_reg) = false_home else {
+            return false;
+        };
+        let f_name = phys_reg_name(f_reg);
+        // 1. mask -> %xmm1.
+        self.emit_fp_operand_to_xmm(first, ty, "xmm1");
+        let src = match self.fp_src_mem_operand(second, ty) {
+            Some(s) => s,
+            None => {
+                self.emit_fp_operand_to_xmm(second, ty, "xmm0");
+                "%xmm0".to_string()
+            }
+        };
+        self.state
+            .emit_fmt(format_args!("    {cmp} ${imm}, {src}, %xmm1"));
+        // 2. xmm0 = F ^ ((T ^ F) & mask).
+        self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
+        self.state
+            .emit_fmt(format_args!("    {xor} %{f_name}, %xmm0"));
+        self.state.emit_fmt(format_args!("    {and} %xmm1, %xmm0"));
+        self.state
+            .emit_fmt(format_args!("    {xor} %{f_name}, %xmm0"));
+        self.store_xmm0_fp_dest(dest, ty);
+        true
+    }
+
+    /// Is this select arm the address of an over-aligned (> 16) alloca?
+    fn select_arm_over_aligned(&self, op: &Operand) -> bool {
+        matches!(op, Operand::Value(v) if self.state.alloca_over_align(v.0).is_some())
+    }
+
+    /// Select whose arm is an over-aligned alloca (> 16 bytes: a 32-byte GNU
+    /// vector object whose address escapes, under the SSE ABI level).  Such
+    /// an arm materializes as `leaq; addq $align-1; andq $-align` -- the
+    /// `addq`/`andq` write the flags, so the flag-neutral staging contract of
+    /// the in-place select paths does not hold.  The condition's flags are
+    /// already live when `live_cc` is `Some` (fused / replayed compare or an
+    /// in-place test); otherwise the legacy test is emitted first.  Either
+    /// way the staging is bracketed with `pushfq`/`popfq` and the cmov uses
+    /// the same condition code.
+    ///
+    /// Cost: `popfq` is ~20 uops on Intel cores; this path is cold by
+    /// construction (`downgrade_nonescaping_vector_align` removes the
+    /// over-alignment of every vector temporary whose address does not
+    /// escape, so only an escaped 32-byte object selected under `-mno-avx`
+    /// reaches it).  Observed miscompile before this path existed:
+    /// `r = c ? a : b` over `float vector_size(32)` at `-mno-avx` selected
+    /// the wrong object for every `c` (the matrix's `tern_assign`).
+    fn emit_select_over_aligned_arms(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+        live_cc: Option<&'static str>,
+    ) {
+        let cc = match live_cc {
+            Some(cc) => cc,
+            None => {
+                self.emit_legacy_cond_test(cond);
+                "ne"
+            }
+        };
+        self.state.emit("    pushfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 8;
+        }
+        self.operand_to_rax(false_val);
+        self.operand_to_rcx(true_val);
+        self.state.emit("    popfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= 8;
+        }
+        self.emit_cmov_typed(cc, "rcx", "rax", ty);
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
+    pub(super) fn emit_select_impl(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) {
+        // legacy-compat path (debugging): the legacy emission order.
+        if v9_select() {
+            if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+                if !is_xmm_reg(d_reg) {
+                    let d_name = phys_reg_name(d_reg);
+                    self.emit_legacy_cond_test(cond);
+                    self.state.emit("    pushfq");
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += 8;
+                    }
+                    self.operand_to_callee_reg(false_val, d_reg);
+                    self.operand_to_rcx(true_val);
+                    self.state.emit("    popfq");
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size -= 8;
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+            self.emit_legacy_cond_test(cond);
+            self.state.emit("    pushfq");
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size += 8;
+            }
+            self.operand_to_rax(false_val);
+            self.operand_to_rcx(true_val);
+            self.state.emit("    popfq");
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size -= 8;
+            }
+            self.state.emit("    cmovneq %rcx, %rax");
+            self.state.reg_cache.invalidate_acc();
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Constant condition: statically select the operand. Both operands are
+        // pure SSA values (already computed by earlier instructions), so only
+        // the chosen one needs to be loaded — no test/cmov/branch at all.
+        if let Operand::Const(c) = cond {
+            let chosen = if c.is_zero() { false_val } else { true_val };
+            if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+                if !is_xmm_reg(d_reg) {
+                    self.operand_to_callee_reg(chosen, d_reg);
+                    self.state.reg_cache.invalidate_acc();
+                    // Definition-writes-home accounting (constant-cond
+                    // select: the chosen arm was staged into the dest home).
+                    self.note_inplace_compute(d_reg, dest.0);
+                    return;
+                }
+            }
+            self.operand_to_rax(chosen);
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // FP-SELECT blend (S05): the condition is a float Cmp whose single
+        // use is this select; the Cmp emitted no boolean (see
+        // emit_float_cmp_impl). Re-derive the vcmpsd/vcmpss mask and blend
+        // the FP arms. On failure (or non-blendable arms), re-materialize
+        // the boolean with emit_fp_cmp_boolean and fall through to the
+        // ordinary materialized-select path below.
+        //
+        // Arm acceptance: the blend is a pure BIT select. The frontend
+        // lowers FP selects as INTEGER selects over bitcast arms (the FP
+        // bits live in the same XMM homes), so the arms are accepted when
+        // they carry a clean full-lane bit pattern at the Cmp's width:
+        //   * cty F64 → arms typed F64 or I64
+        //   * cty F32 → arms typed F32 or I32
+        // (I32 values in XMM homes occupy only the low 32 bits — writing a
+        // GPR→XMM lane leaves the upper bits stale — so an F64-width blend
+        // over an I32 arm would mix stale lanes; the width must match.)
+        // The cmov condition the FP-SELECT fallback's `ucomis` left live.
+        let mut fp_flags_cc: Option<&'static str> = None;
+        if !fp_select_disabled() {
+            if let Operand::Value(cv) = cond {
+                if let Some((cop, clhs, crhs, cty)) = self.fp_select_cmps.get(&cv.0).cloned() {
+                    let arm_ok = |op: &Operand| -> bool {
+                        match op {
+                            Operand::Const(_) => true,
+                            Operand::Value(v) => match self.value_types.get(&v.0).copied() {
+                                Some(tt) => {
+                                    tt == cty
+                                        || (cty == IrType::F64 && tt == IrType::I64)
+                                        || (cty == IrType::F32 && tt == IrType::I32)
+                                }
+                                None => false,
+                            },
+                        }
+                    };
+                    if arm_ok(true_val) && arm_ok(false_val) {
+                        // The one-instruction min/max shape first: when the
+                        // arms ARE the compared operands, no mask and no
+                        // cmov are needed at all (`a > b ? a : b` → maxsd),
+                        // on SSE2 exactly as on AVX.
+                        if self.try_emit_fp_select_minmax(
+                            dest, cop, &clhs, &crhs, true_val, false_val, cty,
+                        ) {
+                            return;
+                        }
+                        if !self.try_emit_fp_select_blend(
+                            dest, cop, &clhs, &crhs, true_val, false_val, cty,
+                        ) {
+                            if fp_select_debug() {
+                                eprintln!(
+                                    "[FP-SELECT] cmp %{}: blend refused, materialize boolean",
+                                    cv.0
+                                );
+                            }
+                            fp_flags_cc = self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
+                        } else {
+                            return;
+                        }
+                    } else {
+                        if fp_select_debug() {
+                            eprintln!(
+                                "[FP-SELECT] cmp %{}: arm types not blendable, materialize",
+                                cv.0
+                            );
+                        }
+                        fp_flags_cc = self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
+                    }
+                }
+            }
+        }
+
+        // FLAG FUSION: the condition is the direct result of the immediately
+        // preceding Cmp whose flags are live — use the comparison's condition
+        // code directly for the cmov, no test needed.
+        let fused_op = self.take_pending_cmp(cond);
+        // FP-SELECT fallback flags: emit_fp_cmp_boolean (above) just ran the
+        // ucomisd and left its FP relational flags live as `a`/`ae`
+        // (unordered → false arm, C99 NaN), the SAME contract as the
+        // CondBranch fusion. An FP Cmp never fuses into a Select (prologue
+        // gate), so `pending_fp_cmp` is the CondBranch's alone.
+        // COMPARE-REPLAY: the condition is a Cmp result consumed only by this
+        // select but not adjacent to the Cmp (flags clobbered in between).
+        // Re-emit the comparison from the recorded operands right before the
+        // cmov; the flags are then fresh. The accumulator cache is invalidated
+        // first so re-materialized operands are always reloaded from their
+        // canonical locations.
+        let replay_op = self.take_replay_cmp(cond);
+        if let Some((_op, lhs, rhs, ty)) = &replay_op {
+            self.state.reg_cache.invalidate_acc();
+            self.emit_int_cmp_replay_insn(lhs, rhs, *ty);
+        }
+        // Test the condition in place (no pushfq). Only when the condition is
+        // not directly testable (rare) do we fall back to the legacy
+        // materialize + pushfq/popfq path. With live flags (fused integer or
+        // FP Cmp, or a replayed compare) the in-place path is MANDATORY: the
+        // condition's boolean was never materialized, so any load/test would
+        // read a stale home. `CCC_NO_INPLACE_SELECT` therefore only turns off
+        // the optional in-place test of a materialized condition.
+        let tested_in_place = if fused_op.is_some() || fp_flags_cc.is_some() || replay_op.is_some()
+        {
+            true
+        } else if no_inplace_select() {
+            false
+        } else {
+            self.test_select_cond_in_place(cond)
+        };
+        let cmov_cc = match (fused_op, fp_flags_cc, replay_op.as_ref()) {
+            (Some(op), _, _) => Self::cmp_cmov(op),
+            (None, Some(cc), _) => cc,
+            (None, None, Some((op, _, _, _))) => Self::cmp_cmov(*op),
+            (None, None, None) => "ne",
+        };
+
+        if self.select_arm_over_aligned(true_val) || self.select_arm_over_aligned(false_val) {
+            self.emit_select_over_aligned_arms(
+                dest,
+                cond,
+                true_val,
+                false_val,
+                ty,
+                tested_in_place.then_some(cmov_cc),
+            );
+            return;
+        }
+
+        // Register-direct: when dest has a register, operate directly on it.
+        if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name(d_reg);
+                if tested_in_place {
+                    // Load order (all alias-safe):
+                    //   1. true_val → %rcx   (clobbers rcx only; rcx is never
+                    //      register-allocated, and this only READS other regs)
+                    //   2. false_val → dest  (clobbers dest; cond was already
+                    //      tested, so flags are safe; if true_val lived in dest,
+                    //      rcx already holds a copy)
+                    //   3. cmovcc — reads flags (set by the in-place test or the
+                    //      fused Cmp; not modified by any of the above moves,
+                    //      which are flag-neutral) and rcx.
+                    // All materialization is flag-neutral (select_operand_to_reg
+                    // avoids `xorl` for zero constants, which would clobber the
+                    // flags between the test and the cmov).
+                    //
+                    // Direct-cmov: when the true value already lives in a
+                    // (non-XMM, non-dest) register, emit `cmovcc %src, %dest`
+                    // straight from it — skipping the dead `movq %src, %rcx`
+                    // staging copy (fill_window's prev[] loop had one per
+                    // element). The rcx staging is only needed when true_val
+                    // aliases dest or isn't register-resident.
+                    let true_src_reg = match true_val {
+                        Operand::Value(v) => self
+                            .reg_assignments
+                            .get(&v.0)
+                            .copied()
+                            .filter(|r| !is_xmm_reg(*r) && *r != d_reg),
+                        _ => None,
+                    };
+                    if let Some(src_reg) = true_src_reg {
+                        self.select_operand_to_reg(
+                            false_val,
+                            phys_reg_name(d_reg),
+                            phys_reg_name_32(d_reg),
+                        );
+                        self.emit_cmov_typed(cmov_cc, phys_reg_name(src_reg), d_name, ty);
+                    } else {
+                        self.select_operand_to_reg(true_val, "rcx", "ecx");
+                        self.select_operand_to_reg(
+                            false_val,
+                            phys_reg_name(d_reg),
+                            phys_reg_name_32(d_reg),
+                        );
+                        self.emit_cmov_typed(cmov_cc, "rcx", d_name, ty);
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    // Definition-writes-home accounting: the false_val
+                    // staging + cmov defined the select's dest into its home.
+                    self.note_inplace_compute(d_reg, dest.0);
+                    return;
+                }
+                // Legacy path: condition not testable in place.
+                self.emit_legacy_cond_test(cond);
+                self.state.emit("    pushfq");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size += 8;
+                }
+                self.operand_to_callee_reg(false_val, d_reg);
+                self.operand_to_rcx(true_val);
+                self.state.emit("    popfq");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size -= 8;
+                }
+                self.state
+                    .emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
+                self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting (legacy select arm).
+                self.note_inplace_compute(d_reg, dest.0);
+                return;
+            }
+        }
+
+        // Accumulator fallback.
+        if tested_in_place {
+            // false_val → %rax, true_val → %rcx: both loads only clobber
+            // rax/rcx and never modify the flags set by the in-place test or
+            // the fused Cmp (flag-neutral materialization, see
+            // select_operand_to_reg).
+            self.select_operand_to_reg(false_val, "rax", "eax");
+            self.select_operand_to_reg(true_val, "rcx", "ecx");
+            self.emit_cmov_typed(cmov_cc, "rcx", "rax", ty);
+            self.state.reg_cache.invalidate_acc();
+            self.store_rax_to(dest);
+            return;
+        }
+
+        // Legacy pushfq fallback (condition not testable in place).
+        self.emit_legacy_cond_test(cond);
+        self.state.emit("    pushfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 8;
+        }
+        self.operand_to_rax(false_val);
+        self.operand_to_rcx(true_val);
+        self.state.emit("    popfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= 8;
+        }
+        self.state.emit("    cmovneq %rcx, %rax");
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+}
+
+/// Pending-FP-compare pseudo-codes for a two-flag `==`/`!=`: only the
+/// CondBranch consumer accepts them (`emit_fp_eq_ne_pair_branch`); FP
+/// Selects never fuse (prologue gate), so no cmov ever sees one.
+const FP_EQ_PAIR: &str = "fp-eq-pair";
+const FP_NE_PAIR: &str = "fp-ne-pair";
+
+/// Both operands are the same SSA value: `ucomis r,r` then sets PF exactly
+/// when `r` is NaN (ZF is always set), so FP `Eq`/`Ne` reduce to `jnp`/`jp`.
+fn is_self_compare(lhs: &Operand, rhs: &Operand) -> bool {
+    matches!(lhs, Operand::Value(_)) && lhs == rhs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value,
+    };
+
+    fn blk(label: u32, instructions: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            source_spans: Vec::new(),
+            terminator: term,
+        }
+    }
+
+    fn cmp7(lhs: u32) -> Instruction {
+        Instruction::Cmp {
+            dest: Value(7),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I32,
+        }
+    }
+
+    fn cp(d: u32, s: u32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(d),
+            src: Operand::Value(Value(s)),
+        }
+    }
+
+    fn scan(body: Vec<Instruction>) -> CmpReplayScan {
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![
+            blk(0, body, {
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(7)),
+                    true_label: BlockId(0),
+                    false_label: BlockId(1),
+                }
+            }),
+            blk(1, Vec::new(), Terminator::Return(None)),
+        ];
+        f.next_value_id = 100;
+        let mut use_counts = FxHashMap::default();
+        use_counts.insert(7u32, 1u32);
+        compute_cmp_replay_scan(&f, &use_counts, &FxHashMap::default())
+    }
+
+    #[test]
+    fn replays_a_compare_whose_operands_survive_to_the_branch() {
+        assert!(scan(vec![cmp7(5), cp(42, 9)]).replay.contains_key(&7));
+    }
+
+    /// The compare-replay re-reads its operands at the consumer position. A
+    /// phi-elimination latch copy absorbed into the block redefines the operand
+    /// in between, so the replay would branch on the NEXT iteration's value.
+    /// `operand_links` keeps the allocator from reassigning the register; it
+    /// cannot stop an IR-level redefinition of the same value. This is the
+    /// ra09_selfop_xor miscompile at -O3.
+    #[test]
+    fn refuses_to_replay_when_an_operand_is_redefined_first() {
+        assert!(!scan(vec![cmp7(5), cp(5, 9)]).replay.contains_key(&7));
+    }
+
+    #[test]
+    fn refuses_to_replay_when_the_rhs_is_redefined_first() {
+        let body = vec![
+            Instruction::Cmp {
+                dest: Value(7),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(5)),
+                rhs: Operand::Value(Value(6)),
+                ty: IrType::I32,
+            },
+            cp(6, 9),
+        ];
+        assert!(!scan(body).replay.contains_key(&7));
+    }
+
+    /// A redefinition after the consumer is on the next iteration's path and
+    /// cannot affect this replay.
+    #[test]
+    fn replays_when_the_redefinition_is_the_compare_itself() {
+        assert!(scan(vec![cp(5, 9), cmp7(5)]).replay.contains_key(&7));
+    }
+
+    fn sel(d: u32) -> Instruction {
+        Instruction::Select {
+            dest: Value(d),
+            cond: Operand::Value(Value(7)),
+            true_val: Operand::Value(Value(20 + d)),
+            false_val: Operand::Value(Value(30 + d)),
+            ty: IrType::I32,
+        }
+    }
+
+    fn scan_n(body: Vec<Instruction>, n_uses: u32, term_branch_on_7: bool) -> CmpReplayScan {
+        let term = if term_branch_on_7 {
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(7)),
+                true_label: BlockId(0),
+                false_label: BlockId(1),
+            }
+        } else {
+            Terminator::Return(None)
+        };
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![
+            blk(0, body, term),
+            blk(1, Vec::new(), Terminator::Return(None)),
+        ];
+        f.next_value_id = 100;
+        let mut use_counts = FxHashMap::default();
+        use_counts.insert(7u32, n_uses);
+        compute_cmp_replay_scan(&f, &use_counts, &FxHashMap::default())
+    }
+
+    /// The min/max shape: two selects share one bounds compare; each
+    /// re-emits it (binary_search's lo/hi updates).
+    #[test]
+    fn admits_two_selects_sharing_one_compare() {
+        let s = scan_n(vec![cmp7(5), sel(10), sel(11)], 2, false);
+        assert!(s.replay.contains_key(&7));
+        assert_eq!(s.replay_multi.get(&7), Some(&2));
+    }
+
+    /// The loop-back shape: two selects plus the terminator branch share
+    /// the bool; the branch re-emits like any select (linux_find_bit).
+    #[test]
+    fn admits_selects_plus_terminator_branch() {
+        let s = scan_n(vec![cmp7(5), sel(10), sel(11)], 3, true);
+        assert!(s.replay.contains_key(&7));
+        assert_eq!(s.replay_multi.get(&7), Some(&3));
+    }
+
+    /// Partial coverage is unsound: the Copy consumer would read the
+    /// never-materialized boolean, so the whole record is refused.
+    #[test]
+    fn refuses_multi_when_a_use_is_not_a_select() {
+        let s = scan_n(vec![cmp7(5), sel(10), cp(9, 7)], 2, false);
+        assert!(!s.replay.contains_key(&7));
+    }
+
+    /// The redefinition guard spans to the LAST select: an operand
+    /// redefined between the two selects poisons the second re-emission.
+    #[test]
+    fn refuses_multi_when_an_operand_dies_between_selects() {
+        let s = scan_n(vec![cmp7(5), sel(10), cp(5, 9), sel(11)], 2, false);
+        assert!(!s.replay.contains_key(&7));
+    }
+
+    /// Multi-select replay is integer-only; float Cmps keep the
+    /// single-use fp_select path even with several selects.
+    #[test]
+    fn refuses_multi_for_float_compares() {
+        let fcmp = Instruction::Cmp {
+            dest: Value(7),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(5)),
+            rhs: Operand::Const(IrConst::F64(0.0)),
+            ty: IrType::F64,
+        };
+        let s = scan_n(vec![fcmp, sel(10), sel(11)], 2, false);
+        assert!(!s.replay.contains_key(&7));
+        assert!(!s.fp_select.contains_key(&7));
+    }
+
+    #[test]
+    fn select_operand_to_reg_preserves_negative_zero_and_uses_movl_for_32bit_consts() {
+        let mut cg = crate::backend::x86::codegen::emit::X86Codegen::new();
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F64(-0.0)), "rax", "eax");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F32(-0.0)), "rcx", "ecx");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F32(-1.0)), "rdx", "edx");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::I32(42)), "rsi", "esi");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F64(0.0)), "rdi", "edi");
+        let asm = cg.state.out.buf.as_str();
+        assert!(
+            asm.contains("movabsq $-9223372036854775808, %rax"),
+            "F64(-0.0) must preserve sign bit via movabsq, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $-2147483648, %ecx"),
+            "F32(-0.0) must preserve sign bit via movl, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $-1082130432, %edx"),
+            "F32(-1.0) must use 5-byte movl instead of movabsq, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $42, %esi"),
+            "positive I32(42) must use 5-byte movl, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $0, %edi"),
+            "F64(+0.0) must use movl $0, got:\n{asm}"
+        );
+    }
+}

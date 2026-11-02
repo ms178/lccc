@@ -1,0 +1,65 @@
+;;; vex_hint_defaults — dual-encoded VEX/EVEX mnemonics default to the
+;;; EVEX row in GAS 2.47 (AVX-VNNI ∩ AVX512-VNNI, AVX-IFMA ∩ AVX512-IFMA):
+;;; `vpdpbusd %ymm3,%ymm1,%ymm2` = 62 f2 75 28 50 d3 (byte-probed).
+vpdpbusd %ymm3, %ymm1, %ymm2
+vpdpbusd %xmm3, %xmm1, %xmm2
+vpdpbusd (%rax), %ymm1, %ymm2
+vpdpbusd 0x100(%rax), %ymm1, %ymm2
+vpdpbusd 0x100(%eax), %ymm1, %ymm2
+vpdpbusd %ymm3, %ymm1, %ymm2{%k7}
+vpdpbusd %ymm3, %ymm1, %ymm2{%k7}{z}
+vpdpwssd %ymm3, %ymm1, %ymm2
+vpdpwssd %xmm3, %xmm1, %xmm2
+vpdpwssd (%rax), %ymm1, %ymm2
+vpdpwssd %ymm3, %ymm1, %ymm2{%k1}
+vpmadd52luq %ymm3, %ymm1, %ymm2
+vpmadd52huq %ymm3, %ymm1, %ymm2
+vpmadd52luq %xmm3, %xmm1, %xmm2
+vpmadd52huq (%rax), %ymm1, %ymm2
+;;; vex_hint_forces_vex — {vex}/{vex2}/{vex3} force the VEX row
+;;; (`{vex} vpdpbusd %ymm3,%ymm1,%ymm2` = c4 e2 75 50 d3).
+{vex} vpdpbusd %ymm3, %ymm1, %ymm2
+{vex} vpdpbusd %xmm3, %xmm1, %xmm2
+{vex} vpdpbusd (%rax), %ymm1, %ymm2
+{vex} vpdpwssd %ymm3, %ymm1, %ymm2
+{vex2} vpdpbusd %ymm3, %ymm1, %ymm2
+{vex3} vpdpbusd %ymm3, %ymm1, %ymm2
+{vex} vpmadd52huq %ymm3, %ymm1, %ymm2
+{vex} vpmadd52luq %xmm3, %xmm1, %xmm2
+{vex} vpmadd52huq (%rax), %ymm1, %ymm2
+{vex3} vpmadd52huq %ymm3, %ymm1, %ymm2
+{vex} vpaddb %xmm1, %xmm2, %xmm3
+{vex} vpaddd %ymm1, %ymm2, %ymm3
+{vex} vaddps %ymm1, %ymm2, %ymm3
+;;; vex_hint_reject_zmm reject
+{vex} vpdpbusd %zmm3, %zmm1, %zmm2
+;;; vex_hint_reject_zmm_mask reject
+{vex} vpdpbusd %zmm3, %zmm1, %zmm2{%k7}
+;;; vex_hint_reject_mask reject
+{vex} vpdpbusd %ymm3, %ymm1, %ymm2{%k7}
+;;; vex_hint_reject_zmm_vmovdqu8 reject
+{vex} vmovdqu8 %zmm1, %zmm2
+;;; vex_hint_reject_evex_only reject
+{vex} vmovdqu8 %ymm1, %ymm2
+;;; vex_hint_reject_high_vec reject
+{vex} vpdpbusd %ymm20, %ymm1, %ymm2
+;;; vex_hint_reject_high_vec_dst reject
+{vex} vpdpbusd %ymm3, %ymm1, %ymm20
+;;; vex_hint_reject_egpr_mem reject
+{vex} vpdpbusd 8(%r20), %ymm1, %ymm2
+;;; vex_hint_reject_legacy reject
+{vex} movl %eax, %ebx
+;;; vex_hint_reject_legacy2 reject
+{vex} addl $1, %eax
+;;; vex_hint_reject_legacy_egpr reject
+{vex} movl 8(%r20), %eax
+;;; vex_hint_reject_ifma_zmm reject
+{vex} vpmadd52huq %zmm3, %zmm1, %zmm2
+;;; vex_hint_reject_bcst reject
+{vex} vpaddd 4(%rax){1to4}, %ymm1, %ymm2
+;;; vex_evex_hint_last_wins — encoding selectors are order-sensitive in
+;;; GAS 2.47: the LAST of {vex}/{evex} wins.
+{vex} {evex} vpdpbusd %ymm3, %ymm1, %ymm2
+{evex} {vex} vpdpbusd %ymm3, %ymm1, %ymm2
+{vex} {evex} vmovss %xmm15, %xmm6, %xmm2
+{evex} {vex} vmovq %xmm15, %xmm6

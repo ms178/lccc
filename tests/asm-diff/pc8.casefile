@@ -1,0 +1,74 @@
+;;; pc8_external
+.text
+jrcxz undef_pc8_a
+loop undef_pc8_b
+
+;;; pc8_external_declared
+.text
+.extern ext_pc8
+jrcxz ext_pc8
+loop ext_pc8
+
+;;; pc8_dot_self
+.text
+jrcxz .
+loop .
+call .
+ja .+0x10
+movq $(xtrn_dot-.), %rax
+
+;;; data_diff_extern_minus_local
+.data
+loc8: .quad 0
+.quad xtrn_q - loc8
+loc4: .long 0
+.long xtrn_l - loc4
+
+;;; quad_plain_and_cross_section
+.data
+.quad plainExt
+.text
+t1: nop
+.data
+.quad t1 - .
+
+;;; mov_diff_same_section_fold
+.text
+.Lfold_start: nop
+movq $(.Lfold_end - .Lfold_start), %rcx
+movq $(.Lfold_end - .Lfold_start), %r15
+nop
+.Lfold_end: nop
+
+;;; diff_local_minus_extern reject
+.text
+l1: nop
+movq $(l1-xtrnA), %rax
+
+;;; diff_extern_minus_extern reject
+.text
+movq $(xtrn1-xtrn2), %rax
+
+;;; diff_cross_section reject
+.text
+a1: nop
+.long a1 - b1
+.data
+b1: nop
+
+;;; pc8_out_of_range_forward reject
+.text
+jrcxz far_fwd
+.fill 300,1,0x90
+far_fwd: ret
+
+;;; pc8_out_of_range_backward reject
+.text
+far_bwd: nop
+.fill 300,1,0x90
+jrcxz far_bwd
+
+;;; diff_undefined_numeric_minuend reject
+.text
+.globl ext
+.long 9f - ext

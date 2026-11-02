@@ -1,0 +1,88 @@
+{
+  "source": "tests/regression/fixtures/late_const_gep/main.c",
+  "function": "main",
+  "arch": "x86",
+  "errors": [
+    {
+      "compiler": "icc",
+      "id": "cicc2021100",
+      "error": "GodboltError: remote compile failed: icc (cicc2021100)"
+    }
+  ],
+  "records": [
+    {
+      "key": "lccc",
+      "id": "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "elapsed_s": 0.032121001999257714,
+      "instructions": 30,
+      "loads": 1,
+      "stores": 4,
+      "spills": 3,
+      "stack_refs": 3,
+      "xmm_reg_moves": 0,
+      "branches": 6,
+      "vectors": 3,
+      "calls": 1,
+      "ratio_vs_best": 1.0
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "elapsed_s": 0.7389518929994665,
+      "instructions": 61,
+      "loads": 1,
+      "stores": 6,
+      "spills": 2,
+      "stack_refs": 2,
+      "xmm_reg_moves": 0,
+      "branches": 4,
+      "vectors": 37,
+      "calls": 1,
+      "ratio_vs_best": 2.033333333333333
+    },
+    {
+      "key": "clang",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "elapsed_s": 0.44624985700011166,
+      "instructions": 37,
+      "loads": 9,
+      "stores": 19,
+      "spills": 2,
+      "stack_refs": 2,
+      "xmm_reg_moves": 0,
+      "branches": 2,
+      "vectors": 28,
+      "calls": 1,
+      "ratio_vs_best": 1.2333333333333334
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O2 -march=x86-64-v3 -mtune=raptorlake",
+      "elapsed_s": 0.7054411139997683,
+      "instructions": 59,
+      "loads": 19,
+      "stores": 33,
+      "spills": 8,
+      "stack_refs": 8,
+      "xmm_reg_moves": 0,
+      "branches": 2,
+      "vectors": 46,
+      "calls": 1,
+      "ratio_vs_best": 1.9666666666666666
+    }
+  ]
+}

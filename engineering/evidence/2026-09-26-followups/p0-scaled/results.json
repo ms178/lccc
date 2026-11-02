@@ -1,0 +1,3090 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.3203026773737534,
+    "best": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.253714272809169,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.3186224418907198,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 2,
+    "worst": {
+      "benchmark": "linux_find_bit_scaled",
+      "ratio": 1.3868910819383378,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.3203026773737534,
+    "best": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.253714272809169
+    },
+    "geometric_mean_ratio": 1.3186224418907198,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 2,
+    "worst": {
+      "benchmark": "linux_find_bit_scaled",
+      "ratio": 1.3868910819383378
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "ccc": {
+          "binary_bytes": 6816,
+          "child_cpu_s": 0.077814,
+          "command": [
+            "/home/user/lccc/target/baseline-e5bc1911-lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-DPASSES=65536"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1617,
+          "wall_s": 0.078277266
+        },
+        "gcc": {
+          "binary_bytes": 16096,
+          "child_cpu_s": 0.06262799999999996,
+          "command": [
+            "/usr/bin/x86_64-linux-gnu-gcc-14",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-DPASSES=65536"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2012,
+          "wall_s": 0.06283475
+        },
+        "lccc": {
+          "binary_bytes": 6816,
+          "child_cpu_s": 0.07734300000000001,
+          "command": [
+            "/home/user/lccc/target/followup-vex-lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+            "-DPASSES=65536"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1617,
+          "wall_s": 0.077689571
+        }
+      },
+      "correctness": {
+        "ccc": {
+          "matches_baseline": true,
+          "output": "0",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "matches_baseline": true,
+          "output": "0",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "0",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Linux sparse find_next_andnot_bit / scaled",
+      "name": "linux_find_bit_scaled",
+      "ratios_from_lccc": {
+        "ccc": {
+          "cv": 0.036495301707030255,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.014416421901607523,
+          "max": 1.0695943895612543,
+          "mean": 0.9979801298694154,
+          "median": 0.9964446157944468,
+          "median_ci95_bootstrap": [
+            0.9820281938928392,
+            1.0250555807359563
+          ],
+          "min": 0.9372955140302415,
+          "n": 9,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.0049906305360248,
+              "round": 0
+            },
+            {
+              "ratio": 0.9842646368882338,
+              "round": 1
+            },
+            {
+              "ratio": 1.0695943895612543,
+              "round": 2
+            },
+            {
+              "ratio": 0.9756065490501906,
+              "round": 3
+            },
+            {
+              "ratio": 0.9964446157944468,
+              "round": 4
+            },
+            {
+              "ratio": 0.9372955140302415,
+              "round": 5
+            },
+            {
+              "ratio": 1.0250555807359563,
+              "round": 6
+            },
+            {
+              "ratio": 0.9820281938928392,
+              "round": 7
+            },
+            {
+              "ratio": 1.0065410583355514,
+              "round": 8
+            }
+          ],
+          "stdev": 0.03642158593720555
+        },
+        "gcc": {
+          "cv": 0.05361716162289995,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.07475639376450527,
+          "max": 1.4715711660239248,
+          "mean": 1.361414328511182,
+          "median": 1.3868910819383378,
+          "median_ci95_bootstrap": [
+            1.284601915052227,
+            1.41571221231883
+          ],
+          "min": 1.2573662344968106,
+          "n": 9,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.3056972664855397,
+              "round": 0
+            },
+            {
+              "ratio": 1.284601915052227,
+              "round": 1
+            },
+            {
+              "ratio": 1.4715711660239248,
+              "round": 2
+            },
+            {
+              "ratio": 1.3868910819383378,
+              "round": 3
+            },
+            {
+              "ratio": 1.2573662344968106,
+              "round": 4
+            },
+            {
+              "ratio": 1.3121346881738325,
+              "round": 5
+            },
+            {
+              "ratio": 1.41571221231883,
+              "round": 6
+            },
+            {
+              "ratio": 1.4052174379747784,
+              "round": 7
+            },
+            {
+              "ratio": 1.4135369541363572,
+              "round": 8
+            }
+          ],
+          "stdev": 0.07299517208751585
+        }
+      },
+      "ratios_to_gcc": {
+        "ccc": {
+          "cv": 0.04430828378251062,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.04046027655154738,
+          "max": 1.4309339046615177,
+          "mean": 1.364433645084875,
+          "median": 1.381107755447168,
+          "median_ci95_bootstrap": [
+            1.2992133725556516,
+            1.4215680319987154
+          ],
+          "min": 1.2618526053194998,
+          "n": 9,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.2992133725556516,
+              "round": 0
+            },
+            {
+              "ratio": 1.3051387471498657,
+              "round": 1
+            },
+            {
+              "ratio": 1.375821695014276,
+              "round": 2
+            },
+            {
+              "ratio": 1.4215680319987154,
+              "round": 3
+            },
+            {
+              "ratio": 1.2618526053194998,
+              "round": 4
+            },
+            {
+              "ratio": 1.3999156813754867,
+              "round": 5
+            },
+            {
+              "ratio": 1.381107755447168,
+              "round": 6
+            },
+            {
+              "ratio": 1.4309339046615177,
+              "round": 7
+            },
+            {
+              "ratio": 1.4043510122416933,
+              "round": 8
+            }
+          ],
+          "stdev": 0.06045571314882603
+        },
+        "lccc": {
+          "cv": 0.05361716162289995,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.07475639376450527,
+          "max": 1.4715711660239248,
+          "mean": 1.361414328511182,
+          "median": 1.3868910819383378,
+          "median_ci95_bootstrap": [
+            1.284601915052227,
+            1.41571221231883
+          ],
+          "min": 1.2573662344968106,
+          "n": 9,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.3056972664855397,
+              "round": 0
+            },
+            {
+              "ratio": 1.284601915052227,
+              "round": 1
+            },
+            {
+              "ratio": 1.4715711660239248,
+              "round": 2
+            },
+            {
+              "ratio": 1.3868910819383378,
+              "round": 3
+            },
+            {
+              "ratio": 1.2573662344968106,
+              "round": 4
+            },
+            {
+              "ratio": 1.3121346881738325,
+              "round": 5
+            },
+            {
+              "ratio": 1.41571221231883,
+              "round": 6
+            },
+            {
+              "ratio": 1.4052174379747784,
+              "round": 7
+            },
+            {
+              "ratio": 1.4135369541363572,
+              "round": 8
+            }
+          ],
+          "stdev": 0.07299517208751585
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "ccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.8754549999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.87627745
+            },
+            "gcc": {
+              "child_cpu_s": 0.6737060000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.674467696
+            },
+            "lccc": {
+              "child_cpu_s": 0.8800319999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.880650627
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "ccc",
+            "lccc"
+          ],
+          "round": 1,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.9068959999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.907619983
+            },
+            "gcc": {
+              "child_cpu_s": 0.6949640000000015,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.695420303
+            },
+            "lccc": {
+              "child_cpu_s": 0.892911999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.893338253
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "ccc",
+            "gcc"
+          ],
+          "round": 2,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.8692520000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.870036484
+            },
+            "gcc": {
+              "child_cpu_s": 0.6318169999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.632375901
+            },
+            "lccc": {
+              "child_cpu_s": 0.9298479999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.930586142
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "ccc"
+          ],
+          "round": 3,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.9081730000000015,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.908677171
+            },
+            "gcc": {
+              "child_cpu_s": 0.6387359999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.639207657
+            },
+            "lccc": {
+              "child_cpu_s": 0.8859049999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.886511399
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "gcc",
+            "lccc"
+          ],
+          "round": 4,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.8702550000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.87093991
+            },
+            "gcc": {
+              "child_cpu_s": 0.6893279999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.690207324
+            },
+            "lccc": {
+              "child_cpu_s": 0.8670869999999979,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.867843384
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "gcc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.9190299999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.919998021
+            },
+            "gcc": {
+              "child_cpu_s": 0.6566690000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.657181024
+            },
+            "lccc": {
+              "child_cpu_s": 0.8618039999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.862310018
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "ccc"
+          ],
+          "round": 6,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.8674280000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.867912671
+            },
+            "gcc": {
+              "child_cpu_s": 0.6277829999999973,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.628417781
+            },
+            "lccc": {
+              "child_cpu_s": 0.8890170000000026,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.889658727
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "lccc",
+            "gcc"
+          ],
+          "round": 7,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.8864700000000028,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.886965278
+            },
+            "gcc": {
+              "child_cpu_s": 0.6191069999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.619850627
+            },
+            "lccc": {
+              "child_cpu_s": 0.8703729999999972,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.87102491
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "ccc"
+          ],
+          "round": 8,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 0.870985000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.871370917
+            },
+            "gcc": {
+              "child_cpu_s": 0.620037,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.620479431
+            },
+            "lccc": {
+              "child_cpu_s": 0.8765530000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "0",
+              "wall_s": 0.877070605
+            }
+          }
+        }
+      ],
+      "runs": {
+        "ccc": [
+          {
+            "child_cpu_s": 0.8754549999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.87627745
+          },
+          {
+            "child_cpu_s": 0.9068959999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.907619983
+          },
+          {
+            "child_cpu_s": 0.8692520000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.870036484
+          },
+          {
+            "child_cpu_s": 0.9081730000000015,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.908677171
+          },
+          {
+            "child_cpu_s": 0.8702550000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.87093991
+          },
+          {
+            "child_cpu_s": 0.9190299999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.919998021
+          },
+          {
+            "child_cpu_s": 0.8674280000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.867912671
+          },
+          {
+            "child_cpu_s": 0.8864700000000028,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.886965278
+          },
+          {
+            "child_cpu_s": 0.870985000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.871370917
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.6737060000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.674467696
+          },
+          {
+            "child_cpu_s": 0.6949640000000015,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.695420303
+          },
+          {
+            "child_cpu_s": 0.6318169999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.632375901
+          },
+          {
+            "child_cpu_s": 0.6387359999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.639207657
+          },
+          {
+            "child_cpu_s": 0.6893279999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.690207324
+          },
+          {
+            "child_cpu_s": 0.6566690000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.657181024
+          },
+          {
+            "child_cpu_s": 0.6277829999999973,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.628417781
+          },
+          {
+            "child_cpu_s": 0.6191069999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.619850627
+          },
+          {
+            "child_cpu_s": 0.620037,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.620479431
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.8800319999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.880650627
+          },
+          {
+            "child_cpu_s": 0.892911999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.893338253
+          },
+          {
+            "child_cpu_s": 0.9298479999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.930586142
+          },
+          {
+            "child_cpu_s": 0.8859049999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.886511399
+          },
+          {
+            "child_cpu_s": 0.8670869999999979,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.867843384
+          },
+          {
+            "child_cpu_s": 0.8618039999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.862310018
+          },
+          {
+            "child_cpu_s": 0.8890170000000026,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.889658727
+          },
+          {
+            "child_cpu_s": 0.8703729999999972,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.87102491
+          },
+          {
+            "child_cpu_s": 0.8765530000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.877070605
+          }
+        ]
+      },
+      "runtime": {
+        "ccc": {
+          "child_cpu": {
+            "cv": 0.022677168629658528,
+            "mad": 0.00802699999999934,
+            "max": 0.9190299999999993,
+            "mean": 0.8859937777777784,
+            "median": 0.8754549999999997,
+            "median_ci95_bootstrap": [
+              0.8692520000000012,
+              0.9081730000000015
+            ],
+            "min": 0.8674280000000003,
+            "n": 9,
+            "outlier_count_mad": 1,
+            "stdev": 0.020091830303494887
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.87627745,
+            0.907619983,
+            0.870036484,
+            0.908677171,
+            0.87093991,
+            0.919998021,
+            0.867912671,
+            0.886965278,
+            0.871370917
+          ],
+          "wall": {
+            "cv": 0.02273974225154421,
+            "mad": 0.008364778999999989,
+            "max": 0.919998021,
+            "mean": 0.8866442094444444,
+            "median": 0.87627745,
+            "median_ci95_bootstrap": [
+              0.870036484,
+              0.908677171
+            ],
+            "min": 0.867912671,
+            "n": 9,
+            "outlier_count_mad": 1,
+            "stdev": 0.020162060791590847
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.04541890783509268,
+            "mad": 0.0186989999999998,
+            "max": 0.6949640000000015,
+            "mean": 0.6502385555555554,
+            "median": 0.6387359999999997,
+            "median_ci95_bootstrap": [
+              0.620037,
+              0.6893279999999997
+            ],
+            "min": 0.6191069999999996,
+            "n": 9,
+            "outlier_count_mad": 0,
+            "stdev": 0.029533125025601563
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.674467696,
+            0.695420303,
+            0.632375901,
+            0.639207657,
+            0.690207324,
+            0.657181024,
+            0.628417781,
+            0.619850627,
+            0.620479431
+          ],
+          "wall": {
+            "cv": 0.04543868652507575,
+            "mad": 0.018728226000000014,
+            "max": 0.695420303,
+            "mean": 0.6508453048888889,
+            "median": 0.639207657,
+            "median_ci95_bootstrap": [
+              0.620479431,
+              0.690207324
+            ],
+            "min": 0.619850627,
+            "n": 9,
+            "outlier_count_mad": 0,
+            "stdev": 0.029573555785163578
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.02279071352573071,
+            "mad": 0.009659000000002749,
+            "max": 0.9298479999999998,
+            "mean": 0.8837256666666663,
+            "median": 0.8800319999999999,
+            "median_ci95_bootstrap": [
+              0.8670869999999979,
+              0.892911999999999
+            ],
+            "min": 0.8618039999999993,
+            "n": 9,
+            "outlier_count_mad": 0,
+            "stdev": 0.02014073850433538
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.880650627,
+            0.893338253,
+            0.930586142,
+            0.886511399,
+            0.867843384,
+            0.862310018,
+            0.889658727,
+            0.87102491,
+            0.877070605
+          ],
+          "wall": {
+            "cv": 0.02280553762330122,
+            "mad": 0.009625716999999923,
+            "max": 0.930586142,
+            "mean": 0.8843326738888888,
+            "median": 0.880650627,
+            "median_ci95_bootstrap": [
+              0.867843384,
+              0.893338253
+            ],
+            "min": 0.862310018,
+            "n": 9,
+            "outlier_count_mad": 0,
+            "stdev": 0.02016768206588762
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/linux_find_bit.c",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "tags": [
+        "workload",
+        "linux",
+        "bitmap",
+        "bit"
+      ],
+      "warmups": {
+        "ccc": [
+          {
+            "child_cpu_s": 0.9068969999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.907333323
+          },
+          {
+            "child_cpu_s": 0.8792690000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.879672794
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.6314679999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.631817351
+          },
+          {
+            "child_cpu_s": 0.6227080000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.623201817
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.9314020000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.931826572
+          },
+          {
+            "child_cpu_s": 0.8672499999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/linux_find_bit_scaled/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "0",
+            "wall_s": 0.867799638
+          }
+        ]
+      },
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "ccc": {
+          "binary_bytes": 7584,
+          "child_cpu_s": 0.16915199999999686,
+          "command": [
+            "/home/user/lccc/target/baseline-e5bc1911-lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2434,
+          "wall_s": 0.172196145
+        },
+        "gcc": {
+          "binary_bytes": 16160,
+          "child_cpu_s": 0.06954700000000003,
+          "command": [
+            "/usr/bin/x86_64-linux-gnu-gcc-14",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2368,
+          "wall_s": 0.069829427
+        },
+        "lccc": {
+          "binary_bytes": 7584,
+          "child_cpu_s": 0.1730070000000019,
+          "command": [
+            "/home/user/lccc/target/followup-vex-lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-march=x86-64-v3",
+            "-mtune=raptorlake",
+            "-o",
+            "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 2434,
+          "wall_s": 0.173452968
+        }
+      },
+      "correctness": {
+        "ccc": {
+          "matches_baseline": true,
+          "output": "29f49acaab81f800",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "matches_baseline": true,
+          "output": "29f49acaab81f800",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "29f49acaab81f800",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "LZ4 repeat-rich input / byte match extension",
+      "name": "lz4_match_extend",
+      "ratios_from_lccc": {
+        "ccc": {
+          "cv": 0.04016522144617074,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.009569513610838132,
+          "max": 1.0791650581265781,
+          "mean": 0.9966690721405311,
+          "median": 0.9998687561323606,
+          "median_ci95_bootstrap": [
+            0.9517353847731171,
+            1.0094382697431987
+          ],
+          "min": 0.9366292787553112,
+          "n": 9,
+          "outlier_count_mad": 2,
+          "raw": [
+            {
+              "ratio": 1.0094382697431987,
+              "round": 0
+            },
+            {
+              "ratio": 0.9366292787553112,
+              "round": 1
+            },
+            {
+              "ratio": 0.9517353847731171,
+              "round": 2
+            },
+            {
+              "ratio": 1.0791650581265781,
+              "round": 3
+            },
+            {
+              "ratio": 0.9895073754588978,
+              "round": 4
+            },
+            {
+              "ratio": 0.9998687561323606,
+              "round": 5
+            },
+            {
+              "ratio": 0.993193035894798,
+              "round": 6
+            },
+            {
+              "ratio": 1.0071215004130991,
+              "round": 7
+            },
+            {
+              "ratio": 1.0033629899674197,
+              "round": 8
+            }
+          ],
+          "stdev": 0.04003143399107395
+        },
+        "gcc": {
+          "cv": 0.040751133617526455,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.026256929118215755,
+          "max": 1.3835985284545234,
+          "mean": 1.2731441347051977,
+          "median": 1.253714272809169,
+          "median_ci95_bootstrap": [
+            1.2359021064441296,
+            1.3164363725458597
+          ],
+          "min": 1.205170609620835,
+          "n": 9,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.2495642469037633,
+              "round": 0
+            },
+            {
+              "ratio": 1.3164363725458597,
+              "round": 1
+            },
+            {
+              "ratio": 1.2359021064441296,
+              "round": 2
+            },
+            {
+              "ratio": 1.3835985284545234,
+              "round": 3
+            },
+            {
+              "ratio": 1.253714272809169,
+              "round": 4
+            },
+            {
+              "ratio": 1.205170609620835,
+              "round": 5
+            },
+            {
+              "ratio": 1.252901352402783,
+              "round": 6
+            },
+            {
+              "ratio": 1.2810385212383324,
+              "round": 7
+            },
+            {
+              "ratio": 1.2799712019273848,
+              "round": 8
+            }
+          ],
+          "stdev": 0.051882066747741616
+        }
+      },
+      "ratios_to_gcc": {
+        "ccc": {
+          "cv": 0.04286409731629893,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.010491856636660302,
+          "max": 1.4055041865606368,
+          "mean": 1.2783944613050018,
+          "median": 1.2719801143286866,
+          "median_ci95_bootstrap": [
+            1.2378807940595047,
+            1.2985774472793765
+          ],
+          "min": 1.2053288016345387,
+          "n": 9,
+          "outlier_count_mad": 2,
+          "raw": [
+            {
+              "ratio": 1.2378807940595047,
+              "round": 0
+            },
+            {
+              "ratio": 1.4055041865606368,
+              "round": 1
+            },
+            {
+              "ratio": 1.2985774472793765,
+              "round": 2
+            },
+            {
+              "ratio": 1.2821009335276654,
+              "round": 3
+            },
+            {
+              "ratio": 1.2670085174733958,
+              "round": 4
+            },
+            {
+              "ratio": 1.2053288016345387,
+              "round": 5
+            },
+            {
+              "ratio": 1.2614882576920263,
+              "round": 6
+            },
+            {
+              "ratio": 1.2719801143286866,
+              "round": 7
+            },
+            {
+              "ratio": 1.2756810991891847,
+              "round": 8
+            }
+          ],
+          "stdev": 0.05479722459799514
+        },
+        "lccc": {
+          "cv": 0.040751133617526455,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.026256929118215755,
+          "max": 1.3835985284545234,
+          "mean": 1.2731441347051977,
+          "median": 1.253714272809169,
+          "median_ci95_bootstrap": [
+            1.2359021064441296,
+            1.3164363725458597
+          ],
+          "min": 1.205170609620835,
+          "n": 9,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.2495642469037633,
+              "round": 0
+            },
+            {
+              "ratio": 1.3164363725458597,
+              "round": 1
+            },
+            {
+              "ratio": 1.2359021064441296,
+              "round": 2
+            },
+            {
+              "ratio": 1.3835985284545234,
+              "round": 3
+            },
+            {
+              "ratio": 1.253714272809169,
+              "round": 4
+            },
+            {
+              "ratio": 1.205170609620835,
+              "round": 5
+            },
+            {
+              "ratio": 1.252901352402783,
+              "round": 6
+            },
+            {
+              "ratio": 1.2810385212383324,
+              "round": 7
+            },
+            {
+              "ratio": 1.2799712019273848,
+              "round": 8
+            }
+          ],
+          "stdev": 0.051882066747741616
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "ccc",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.3622319999999988,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.362737276
+            },
+            "gcc": {
+              "child_cpu_s": 1.1004470000000026,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.10086309
+            },
+            "lccc": {
+              "child_cpu_s": 1.3745949999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.375599158
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "lccc",
+            "gcc"
+          ],
+          "round": 1,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.5325369999999978,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.533237828
+            },
+            "gcc": {
+              "child_cpu_s": 1.0901720000000026,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.090881011
+            },
+            "lccc": {
+              "child_cpu_s": 1.435445999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.436075441
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "ccc"
+          ],
+          "round": 2,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.4670890000000014,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.468307945
+            },
+            "gcc": {
+              "child_cpu_s": 1.1300930000000022,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.130704948
+            },
+            "lccc": {
+              "child_cpu_s": 1.3966739999999973,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.397440627
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "ccc",
+            "gcc"
+          ],
+          "round": 3,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.406882000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.407510771
+            },
+            "gcc": {
+              "child_cpu_s": 1.097367999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.097815885
+            },
+            "lccc": {
+              "child_cpu_s": 1.518220999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.518936443
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "ccc"
+          ],
+          "round": 4,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.3722739999999973,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.372819731
+            },
+            "gcc": {
+              "child_cpu_s": 1.082892000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.08351263
+            },
+            "lccc": {
+              "child_cpu_s": 1.358025000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.358415249
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "ccc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.3781350000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.37879204
+            },
+            "gcc": {
+              "child_cpu_s": 1.143486000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.143913626
+            },
+            "lccc": {
+              "child_cpu_s": 1.3780749999999955,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.378611082
+            }
+          }
+        },
+        {
+          "order": [
+            "ccc",
+            "lccc",
+            "gcc"
+          ],
+          "round": 6,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.3776480000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.378208531
+            },
+            "gcc": {
+              "child_cpu_s": 1.091341,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.09252585
+            },
+            "lccc": {
+              "child_cpu_s": 1.368262999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.368827115
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "ccc"
+          ],
+          "round": 7,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.3839510000000104,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.384383968
+            },
+            "gcc": {
+              "child_cpu_s": 1.0876249999999956,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.088369191
+            },
+            "lccc": {
+              "child_cpu_s": 1.393697000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.394242859
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "ccc",
+            "lccc"
+          ],
+          "round": 8,
+          "runs": {
+            "ccc": {
+              "child_cpu_s": 1.3698339999999973,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.370290142
+            },
+            "gcc": {
+              "child_cpu_s": 1.0737159999999903,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.074163553
+            },
+            "lccc": {
+              "child_cpu_s": 1.3744159999999965,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800",
+              "wall_s": 1.374898414
+            }
+          }
+        }
+      ],
+      "runs": {
+        "ccc": [
+          {
+            "child_cpu_s": 1.3622319999999988,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.362737276
+          },
+          {
+            "child_cpu_s": 1.5325369999999978,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.533237828
+          },
+          {
+            "child_cpu_s": 1.4670890000000014,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.468307945
+          },
+          {
+            "child_cpu_s": 1.406882000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.407510771
+          },
+          {
+            "child_cpu_s": 1.3722739999999973,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.372819731
+          },
+          {
+            "child_cpu_s": 1.3781350000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.37879204
+          },
+          {
+            "child_cpu_s": 1.3776480000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.378208531
+          },
+          {
+            "child_cpu_s": 1.3839510000000104,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.384383968
+          },
+          {
+            "child_cpu_s": 1.3698339999999973,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.370290142
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 1.1004470000000026,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.10086309
+          },
+          {
+            "child_cpu_s": 1.0901720000000026,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.090881011
+          },
+          {
+            "child_cpu_s": 1.1300930000000022,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.130704948
+          },
+          {
+            "child_cpu_s": 1.097367999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.097815885
+          },
+          {
+            "child_cpu_s": 1.082892000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.08351263
+          },
+          {
+            "child_cpu_s": 1.143486000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.143913626
+          },
+          {
+            "child_cpu_s": 1.091341,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.09252585
+          },
+          {
+            "child_cpu_s": 1.0876249999999956,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.088369191
+          },
+          {
+            "child_cpu_s": 1.0737159999999903,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.074163553
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 1.3745949999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.375599158
+          },
+          {
+            "child_cpu_s": 1.435445999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.436075441
+          },
+          {
+            "child_cpu_s": 1.3966739999999973,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.397440627
+          },
+          {
+            "child_cpu_s": 1.518220999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.518936443
+          },
+          {
+            "child_cpu_s": 1.358025000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.358415249
+          },
+          {
+            "child_cpu_s": 1.3780749999999955,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.378611082
+          },
+          {
+            "child_cpu_s": 1.368262999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.368827115
+          },
+          {
+            "child_cpu_s": 1.393697000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.394242859
+          },
+          {
+            "child_cpu_s": 1.3744159999999965,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.374898414
+          }
+        ]
+      },
+      "runtime": {
+        "ccc": {
+          "child_cpu": {
+            "cv": 0.04069047694173102,
+            "mad": 0.008301000000003,
+            "max": 1.5325369999999978,
+            "mean": 1.405620222222223,
+            "median": 1.3781350000000003,
+            "median_ci95_bootstrap": [
+              1.3698339999999973,
+              1.4670890000000014
+            ],
+            "min": 1.3622319999999988,
+            "n": 9,
+            "outlier_count_mad": 2,
+            "stdev": 0.0571953572411642
+          },
+          "quality_warnings": [
+            "2 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            1.362737276,
+            1.533237828,
+            1.468307945,
+            1.407510771,
+            1.372819731,
+            1.37879204,
+            1.378208531,
+            1.384383968,
+            1.370290142
+          ],
+          "wall": {
+            "cv": 0.040773530650211914,
+            "mad": 0.008501898000000008,
+            "max": 1.533237828,
+            "mean": 1.4062542480000002,
+            "median": 1.37879204,
+            "median_ci95_bootstrap": [
+              1.370290142,
+              1.468307945
+            ],
+            "min": 1.362737276,
+            "n": 9,
+            "outlier_count_mad": 2,
+            "stdev": 0.05733795068281872
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.020614165984820954,
+            "mad": 0.008448999999998819,
+            "max": 1.143486000000003,
+            "mean": 1.0996822222222216,
+            "median": 1.091341,
+            "median_ci95_bootstrap": [
+              1.082892000000001,
+              1.1300930000000022
+            ],
+            "min": 1.0737159999999903,
+            "n": 9,
+            "outlier_count_mad": 1,
+            "stdev": 0.02266903185944564
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            1.10086309,
+            1.090881011,
+            1.130704948,
+            1.097815885,
+            1.08351263,
+            1.143913626,
+            1.09252585,
+            1.088369191,
+            1.074163553
+          ],
+          "wall": {
+            "cv": 0.020548407477738184,
+            "mad": 0.008337240000000135,
+            "max": 1.143913626,
+            "mean": 1.1003055315555554,
+            "median": 1.09252585,
+            "median_ci95_bootstrap": [
+              1.08351263,
+              1.130704948
+            ],
+            "min": 1.074163553,
+            "n": 9,
+            "outlier_count_mad": 1,
+            "stdev": 0.022609526412412862
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.03557169545131871,
+            "mad": 0.015622000000007574,
+            "max": 1.518220999999997,
+            "mean": 1.3997124444444435,
+            "median": 1.3780749999999955,
+            "median_ci95_bootstrap": [
+              1.368262999999999,
+              1.435445999999999
+            ],
+            "min": 1.358025000000005,
+            "n": 9,
+            "outlier_count_mad": 1,
+            "stdev": 0.049790144793198605
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            1.375599158,
+            1.436075441,
+            1.397440627,
+            1.518936443,
+            1.358415249,
+            1.378611082,
+            1.368827115,
+            1.394242859,
+            1.374898414
+          ],
+          "wall": {
+            "cv": 0.03558941642848105,
+            "mad": 0.01563177700000007,
+            "max": 1.518936443,
+            "mean": 1.4003384875555556,
+            "median": 1.378611082,
+            "median_ci95_bootstrap": [
+              1.368827115,
+              1.436075441
+            ],
+            "min": 1.358415249,
+            "n": 9,
+            "outlier_count_mad": 1,
+            "stdev": 0.04983722957444399
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "tags": [
+        "workload",
+        "lz4",
+        "compression",
+        "byte-compare"
+      ],
+      "warmups": {
+        "ccc": [
+          {
+            "child_cpu_s": 1.3959599999999988,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.396342966
+          },
+          {
+            "child_cpu_s": 1.479416999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/ccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.480072163
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 1.1019400000000026,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.10261287
+          },
+          {
+            "child_cpu_s": 1.1196160000000042,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.120020044
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 1.4601869999999977,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.460960546
+          },
+          {
+            "child_cpu_s": 1.448512000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/engineering/evidence/2026-09-26-followups/p0-scaled/artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800",
+            "wall_s": 1.449151872
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "d071563d5326f5e1d0a8e3f5aa035e0079843868da16abe9cd2ee16484e3f818",
+      "executable": "/home/user/lccc/target/followup-vex-lccc",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-mtune=raptorlake"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "3f6797b8aeb721e023da1f154763a54100ab732ffb9af7a1fe6a6fb59fc45ce4",
+      "executable": "/home/user/lccc/target/baseline-e5bc1911-lccc",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2",
+        "-march=x86-64-v3",
+        "-mtune=raptorlake"
+      ],
+      "key": "ccc",
+      "label": "CCC"
+    },
+    {
+      "binary_sha256": "a23ecab8ff08f09ad8c80602c2c5df7f49e09c25905cb8975902e101bf72635f",
+      "executable": "/usr/bin/x86_64-linux-gnu-gcc-14",
+      "flags": [
+        "-O2",
+        "-march=x86-64-v3",
+        "-mtune=raptorlake"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    }
+  ],
+  "metadata": {
+    "compiler_versions": {
+      "ccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "gcc": "x86_64-linux-gnu-gcc-14 (Debian 14.2.0-19) 14.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "e5bc19118c6ea5a54d5539d4a6cff52c97ab6baa",
+      "status": "M src/backend/x86/codegen/intrinsics.rs\n M tests/benchmark/programs/lz4_compress.c\n M tests/benchmark/run_benchmarks.py\n M tests/regression/check_strict_computed_recip_codegen.sh\n?? engineering/evidence/2026-09-26-followups/"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        2032608 kB\nMemFree:          468340 kB\nMemAvailable:    1757876 kB\nBuffers:            7936 kB\nCached:          1383236 kB\nSwapCached:        12188 kB\nActive:           663184 kB\nInactive:         788764 kB\nActive(anon):       6728 kB\nInactive(anon):    54716 kB\nActive(file):     656456 kB\nInactive(file):   734048 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       8388604 kB\nSwapFree:        8057300 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:                40 kB\nWriteback:             0 kB\nAnonPages:         51272 kB\nMapped:            27660 kB\nShmem:               664 kB\nKReclaimable:      61544 kB\nSlab:              81304 kB\nSReclaimable:      61544 kB\nSUnreclaim:        19760 kB\nKernelStack:        2192 kB\nPageTables:         3132 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     9404908 kB\nCommitted_AS:     724444 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        7344 kB\nVmallocChunk:          0 kB\nPercpu:              640 kB\nAnonHugePages:     10240 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     1011712 kB\nDirectMap1G:     3145728 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.41",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": true,
+      "reason": "perf is not installed"
+    },
+    "python": "3.13.14 (main, Jul 14 2026, 04:45:36) [GCC 14.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t331304\t\t-2",
+    "timestamp_utc": "2026-09-26T00:43:50.153735+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Fri Jul 17 14:31:34 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 9264672768,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 9264672768,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 910290944,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 9264672768,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [
+      "-march=x86-64-v3",
+      "-mtune=raptorlake"
+    ],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 9,
+    "seed": 260927,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 2
+  },
+  "unavailable_compilers": {}
+}

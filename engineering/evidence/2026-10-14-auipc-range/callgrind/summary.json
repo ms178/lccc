@@ -1,0 +1,312 @@
+{
+  "metric": "simulated whole-program Ir; not physical runtime",
+  "rounds": 3,
+  "kernels": 6,
+  "paired_runs": 18,
+  "arithmetic_mean": 1.0,
+  "geomean": 1.0,
+  "best": 1.0,
+  "worst": 1.0,
+  "wins": 0,
+  "regressions": 0,
+  "ties": 18,
+  "rows": [
+    {
+      "round": "round-1",
+      "name": "expat_xml_scan",
+      "ratio": 1.0,
+      "ir_mine": 1666759,
+      "ir_ref": 1666759,
+      "elf_identical": true
+    },
+    {
+      "round": "round-1",
+      "name": "glibc_memcmp",
+      "ratio": 1.0,
+      "ir_mine": 722898,
+      "ir_ref": 722898,
+      "elf_identical": true
+    },
+    {
+      "round": "round-1",
+      "name": "gzip_crc32",
+      "ratio": 1.0,
+      "ir_mine": 801011,
+      "ir_ref": 801011,
+      "elf_identical": true
+    },
+    {
+      "round": "round-1",
+      "name": "linux_find_bit",
+      "ratio": 1.0,
+      "ir_mine": 5957800,
+      "ir_ref": 5957800,
+      "elf_identical": true
+    },
+    {
+      "round": "round-1",
+      "name": "sqlite_varint",
+      "ratio": 1.0,
+      "ir_mine": 833138,
+      "ir_ref": 833138,
+      "elf_identical": true
+    },
+    {
+      "round": "round-1",
+      "name": "zlib_ng_adler32",
+      "ratio": 1.0,
+      "ir_mine": 463876,
+      "ir_ref": 463876,
+      "elf_identical": true
+    },
+    {
+      "round": "round-2",
+      "name": "expat_xml_scan",
+      "ratio": 1.0,
+      "ir_mine": 1666759,
+      "ir_ref": 1666759,
+      "elf_identical": true
+    },
+    {
+      "round": "round-2",
+      "name": "glibc_memcmp",
+      "ratio": 1.0,
+      "ir_mine": 722898,
+      "ir_ref": 722898,
+      "elf_identical": true
+    },
+    {
+      "round": "round-2",
+      "name": "gzip_crc32",
+      "ratio": 1.0,
+      "ir_mine": 801011,
+      "ir_ref": 801011,
+      "elf_identical": true
+    },
+    {
+      "round": "round-2",
+      "name": "linux_find_bit",
+      "ratio": 1.0,
+      "ir_mine": 5957800,
+      "ir_ref": 5957800,
+      "elf_identical": true
+    },
+    {
+      "round": "round-2",
+      "name": "sqlite_varint",
+      "ratio": 1.0,
+      "ir_mine": 833138,
+      "ir_ref": 833138,
+      "elf_identical": true
+    },
+    {
+      "round": "round-2",
+      "name": "zlib_ng_adler32",
+      "ratio": 1.0,
+      "ir_mine": 463876,
+      "ir_ref": 463876,
+      "elf_identical": true
+    },
+    {
+      "round": "round-3",
+      "name": "expat_xml_scan",
+      "ratio": 1.0,
+      "ir_mine": 1666759,
+      "ir_ref": 1666759,
+      "elf_identical": true
+    },
+    {
+      "round": "round-3",
+      "name": "glibc_memcmp",
+      "ratio": 1.0,
+      "ir_mine": 722898,
+      "ir_ref": 722898,
+      "elf_identical": true
+    },
+    {
+      "round": "round-3",
+      "name": "gzip_crc32",
+      "ratio": 1.0,
+      "ir_mine": 801011,
+      "ir_ref": 801011,
+      "elf_identical": true
+    },
+    {
+      "round": "round-3",
+      "name": "linux_find_bit",
+      "ratio": 1.0,
+      "ir_mine": 5957800,
+      "ir_ref": 5957800,
+      "elf_identical": true
+    },
+    {
+      "round": "round-3",
+      "name": "sqlite_varint",
+      "ratio": 1.0,
+      "ir_mine": 833138,
+      "ir_ref": 833138,
+      "elf_identical": true
+    },
+    {
+      "round": "round-3",
+      "name": "zlib_ng_adler32",
+      "ratio": 1.0,
+      "ir_mine": 463876,
+      "ir_ref": 463876,
+      "elf_identical": true
+    }
+  ],
+  "memcheck": [
+    {
+      "name": "expat_xml_scan",
+      "arm": "aa",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/expat_xml_scan/aa/expat_xml_scan"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "expat_xml_scan",
+      "arm": "bb",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/expat_xml_scan/bb/expat_xml_scan"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "glibc_memcmp",
+      "arm": "aa",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/glibc_memcmp/aa/glibc_memcmp"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "glibc_memcmp",
+      "arm": "bb",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/glibc_memcmp/bb/glibc_memcmp"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "gzip_crc32",
+      "arm": "aa",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/gzip_crc32/aa/gzip_crc32"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "gzip_crc32",
+      "arm": "bb",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/gzip_crc32/bb/gzip_crc32"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "linux_find_bit",
+      "arm": "aa",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/linux_find_bit/aa/linux_find_bit"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "linux_find_bit",
+      "arm": "bb",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/linux_find_bit/bb/linux_find_bit"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "sqlite_varint",
+      "arm": "aa",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/sqlite_varint/aa/sqlite_varint"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "sqlite_varint",
+      "arm": "bb",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/sqlite_varint/bb/sqlite_varint"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "arm": "aa",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/zlib_ng_adler32/aa/zlib_ng_adler32"
+      ],
+      "exit": 0
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "arm": "bb",
+      "command": [
+        "valgrind",
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--error-exitcode=97",
+        "/home/user/.cache/current-callgrind/round-1/zlib_ng_adler32/bb/zlib_ng_adler32"
+      ],
+      "exit": 0
+    }
+  ],
+  "compiler_binary_sha256": {
+    "before": "5500eaa7c48aae817c4d25d6fc6784bc1fcabda705d4acdc50445745cc246717",
+    "after": "df0618676d830a275d9e5134e14bf2b18848a4171095cec36a08fede15c19b71"
+  },
+  "baseline_source_commit": "8a90170d778f434c725007d98efd2fb979643b9f",
+  "candidate_source_commit": "cb7ca9ba13ca89edf33b9a34e4ba0b934f8e13e8",
+  "note": "Independent fastbuild/-O1/-j2 builds, debug=0/incremental=0. Compiler source delta is confined to two RISC-V linker files. ASLR/startup/library effects remain possible; equal-length run paths and pinned cache descriptions verified. Valgrind emitted host-cache discovery warnings; raw headers confirm requested simulated geometry."
+}

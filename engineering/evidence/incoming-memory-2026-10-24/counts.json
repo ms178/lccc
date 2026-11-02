@@ -1,0 +1,51 @@
+{
+  "source": "tests/regression/vector_ext/matrix.c",
+  "source_sha256": "2733ea791526adb2b985d4c874ee975010155a1bf75a0e4c97d0073cac6903c2",
+  "flags": [
+    "-O2",
+    "-mavx2",
+    "-mfma"
+  ],
+  "clang_extra_flags": [
+    "-ffp-contract=fast"
+  ],
+  "common_functions": 377,
+  "totals": {
+    "before": 2582,
+    "after": 2537,
+    "gcc": 2441,
+    "clang": 2133
+  },
+  "changed": {
+    "cf_wrap_phi": {
+      "before": 32,
+      "after": 10,
+      "gcc": 6,
+      "clang": 12
+    },
+    "nine": {
+      "before": 20,
+      "after": 12,
+      "gcc": 9,
+      "clang": 15
+    },
+    "nine4": {
+      "before": 17,
+      "after": 11,
+      "gcc": 9,
+      "clang": 9
+    },
+    "s4i_add": {
+      "before": 25,
+      "after": 16,
+      "gcc": 11,
+      "clang": 9
+    }
+  },
+  "assembly_sha256": {
+    "before": "1f53f00a0c04f02bb7cefaf8f59998d67d365519f9b10ad42bfdbdb6659b59d1",
+    "after": "c04c38df5199dd22f441166a86cf7025e04d2e67b5c34a0823f578d0da6f2356",
+    "gcc": "0987b6a875543df5ef24edd76b0e82f6d3877cf6e82d38386a5589a70bb44bee",
+    "clang": "a90cc6e168c735f8655729f8c9f033cc51f421744a4545d63b0c51fc659835d3"
+  }
+}

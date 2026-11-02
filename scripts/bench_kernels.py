@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Runtime A/B benchmark of lccc against system GCC/Clang on real hot loops.
+
+Instruction counts from the Compiler Explorer oracle say which compiler emits
+*fewer* instructions, not which emits *faster* code -- a vectorised loop with
+more instructions usually wins, and a shorter loop that spills does not. This
+harness measures wall-clock time of the same kernel compiled by each compiler
+and reports the ratio, so a codegen claim can be backed by a number.
+
+Method, chosen because this VM exposes no PMU:
+
+  * each kernel is a separate translation unit compiled by each compiler, then
+    linked against a shared driver compiled ONCE by a fixed reference compiler,
+    so only the kernel's codegen differs between arms;
+  * the driver runs the kernel `--inner` times per timed sample and reports the
+    best of `--reps` samples. Minimum, not mean: it is the sample least
+    perturbed by scheduler noise, and the distribution is one-sided;
+  * the kernel result is accumulated into a volatile sink and printed, so no
+    arm can delete the work, and mismatched output between arms is reported as
+    a CORRECTNESS failure rather than a speed win;
+  * arms are interleaved round-robin across repetitions rather than run in
+    blocks, so slow thermal or noisy-neighbour drift hits every arm equally.
+
+Usage:
+    scripts/bench_kernels.py                          # all kernels, default arms
+    scripts/bench_kernels.py --kernels adler32,memchr
+    scripts/bench_kernels.py --reps 9 --inner 2000
+    scripts/bench_kernels.py --lccc-alt-env CCC_NO_FOO=1 --kernels foo
+    scripts/bench_kernels.py --baseline before.json --save after.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import re
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+BENCH_DIR = REPO / "tests" / "bench"
+
+
+def which(*names: str) -> str | None:
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def timed_function_hash(obj: Path) -> str:
+    """Fingerprint of the TIMED function's machine code, and nothing else.
+
+    Hashing the whole object is too coarse: `bench_setup` is compiled into the
+    same translation unit but runs once, outside the timed region, so a change
+    there must not be attributed to a runtime delta. Disassemble `bench_run`
+    alone and strip the address column, which moves whenever anything ahead of
+    it changes size, and the relocation-dependent RIP displacements.
+
+    Falls back to hashing the whole object if objdump is unavailable. Both
+    hashes are diagnostics only: neither can auto-waive a runtime regression.
+    """
+    try:
+        r = subprocess.run(
+            ["objdump", "-d", "--disassemble=bench_run", str(obj)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode == 0 and "bench_run" in r.stdout:
+            body = []
+            for line in r.stdout.splitlines():
+                if "\t" not in line:
+                    continue
+                parts = line.split("\t")
+                # parts[0] = "  30:", parts[1] = raw bytes, parts[2] = mnemonic
+                text = parts[-1].strip()
+                # Drop RIP-relative displacements and branch targets: both are
+                # pure position, not code.
+                text = re.sub(r"0x[0-9a-f]+\(%rip\)", "RIP", text)
+                text = re.sub(r"^(j\w+|call\w*)\s+[0-9a-f]+", r"\1 T", text)
+                text = re.sub(r"#.*$", "", text).strip()
+                body.append(text)
+            if body:
+                return hashlib.sha256("\n".join(body).encode()).hexdigest()[:16]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return hashlib.sha256(obj.read_bytes()).hexdigest()[:16]
+
+
+def parse_env_assignments(raw: str) -> dict[str, str]:
+    """Parse comma-separated ``NAME=VALUE`` assignments for an A/B compiler arm.
+
+    This intentionally accepts only explicit assignments: inheriting the
+    process environment is still useful (toolchain selection, PATH), but an
+    alternate arm must make every changed knob visible in both the command
+    line and saved result metadata.
+    """
+    result: dict[str, str] = {}
+    for assignment in raw.split(","):
+        assignment = assignment.strip()
+        if not assignment or "=" not in assignment:
+            raise ValueError(f"expected NAME=VALUE, got {assignment!r}")
+        name, value = assignment.split("=", 1)
+        name = name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError(f"invalid environment variable name {name!r}")
+        result[name] = value
+    if not result:
+        raise ValueError("alternate-arm environment is empty")
+    return result
+
+
+def build_arm(arm: str, cc: str, env_extra: dict[str, str], cflags: list[str],
+              kernel: Path, driver_obj: Path, out: Path, workdir: Path,
+              receipts: list[dict] | None = None) -> tuple[bool, str, str]:
+    """Compile + link one arm and retain every subprocess receipt."""
+    if receipts is None:
+        receipts = []
+    # Two arms may deliberately invoke the exact same compiler under different
+    # knobs.  Key the object on the ARM, not the compiler basename, so one arm
+    # can never overwrite the other before its link/hash step.
+    kobj = workdir / f"{kernel.stem}.{arm}.o"
+    env = dict(os.environ)
+    env.update(env_extra)
+    compile_cmd = [cc, "-c", str(kernel), "-o", str(kobj), *cflags]
+    try:
+        r = subprocess.run(compile_cmd, capture_output=True, text=True, env=env)
+    except (OSError, subprocess.SubprocessError) as exc:
+        receipts.append({"arm": arm, "phase": "compile", "command": compile_cmd,
+                         "env_overrides": env_extra, "returncode": None,
+                         "stdout": "", "stderr": "", "error": str(exc)})
+        return False, f"kernel compile invocation failed: {exc}", ""
+    receipts.append({"arm": arm, "phase": "compile", "command": compile_cmd,
+                     "env_overrides": env_extra, "returncode": r.returncode,
+                     "stdout": r.stdout, "stderr": r.stderr})
+    if r.returncode != 0:
+        return False, f"kernel compile failed: {r.stderr.strip()[:300]}", ""
+    # Diagnostic fingerprint of the normalized timed function, NOT a proof
+    # of equal linked layout, callee implementations, relocations or data.
+    digest = timed_function_hash(kobj)
+    # Link with the reference compiler so the linker is identical across arms.
+    # Kernel objects are compiled without -fPIC on purpose (benchmark fidelity:
+    # absolute addressing is part of the measured codegen), so a PIE-default
+    # host driver (Debian/Ubuntu gcc) rejects them with R_X86_64_32S errors.
+    # _reference_no_pie() probes once whether the driver accepts -no-pie and
+    # only then requests a non-PIE link; a driver without the flag keeps the
+    # historical command line unchanged.
+    link_cmd = [REFERENCE_CC, *_reference_no_pie(),
+                str(kobj), str(driver_obj), "-o", str(out), "-lm"]
+    try:
+        r = subprocess.run(link_cmd, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        receipts.append({"arm": arm, "phase": "link", "command": link_cmd,
+                         "env_overrides": {}, "returncode": None,
+                         "stdout": "", "stderr": "", "error": str(exc)})
+        return False, f"link invocation failed: {exc}", ""
+    receipts.append({"arm": arm, "phase": "link", "command": link_cmd,
+                     "env_overrides": {}, "returncode": r.returncode,
+                     "stdout": r.stdout, "stderr": r.stderr})
+    if r.returncode != 0:
+        return False, f"link failed: {r.stderr.strip()[:300]}", ""
+    return True, "", digest
+
+
+def choose_taskset(cpu_option: str) -> tuple[list[str], str]:
+    """Return a taskset prefix for benchmark children, or an explicit reason.
+
+    Pinning is best-effort because containers can restrict affinity.  Never
+    silently claim that a sample is pinned: the report records the chosen CPU
+    or the reason it was unavailable.
+    """
+    if cpu_option.lower() in ("none", "off", "no"):
+        return [], "disabled"
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return [], "sched_getaffinity unavailable"
+    if not allowed:
+        return [], "empty affinity set"
+    if cpu_option.lower() == "auto":
+        cpu = allowed[0]
+    else:
+        try:
+            cpu = int(cpu_option)
+        except ValueError:
+            return [], f"invalid CPU {cpu_option!r}"
+        if cpu not in allowed:
+            return [], f"CPU {cpu} outside allowed set {allowed}"
+    taskset = shutil.which("taskset")
+    if not taskset:
+        return [], "taskset unavailable"
+    probe = subprocess.run([taskset, "-c", str(cpu), "/bin/true"],
+                           capture_output=True, text=True, timeout=10)
+    if probe.returncode:
+        why = probe.stderr.strip().splitlines()
+        return [], why[0] if why else "taskset probe failed"
+    return [taskset, "-c", str(cpu)], f"CPU {cpu} via taskset"
+
+
+def time_once(binary: Path, inner: int, taskset_prefix: list[str]) -> dict:
+    """Record even bad samples: none may silently disappear from a verdict."""
+    try:
+        r = subprocess.run([*taskset_prefix, str(binary), str(inner)],
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"rc": None, "error": str(exc), "stdout_sha256": None,
+                "seconds": None, "checksum": None}
+    parts = r.stdout.split()
+    sample = {"rc": r.returncode,
+              "stdout_sha256": hashlib.sha256(r.stdout.encode()).hexdigest(),
+              "seconds": None, "checksum": None}
+    if r.returncode != 0 or len(parts) != 2:
+        sample["error"] = f"exit {r.returncode}; expected exactly two output fields"
+        return sample
+    try:
+        sample["seconds"] = float(parts[0])
+    except ValueError:
+        sample["error"] = "invalid time"
+        return sample
+    if not math.isfinite(sample["seconds"]) or sample["seconds"] <= 0:
+        sample["error"] = "nonpositive/nonfinite time"
+        return sample
+    sample["checksum"] = parts[1]
+    return sample
+
+
+def checked_samples(records: list[dict], arms: list[str], rounds: int) -> tuple[dict, str | None]:
+    """Validate every arm/round (including warmups) before computing any ratio."""
+    if rounds <= 0 or len(records) != len(arms) * rounds:
+        return {}, "missing/extra benchmark samples"
+    checksums = set()
+    samples = {arm: [] for arm in arms}
+    for record in records:
+        arm = record['arm']
+        if arm not in samples or record['round'] not in range(rounds):
+            return {}, "unknown arm/round"
+        if record.get('rc') != 0 or record.get('error') or record.get('seconds') is None or record.get('checksum') is None:
+            return {}, f"{arm} round {record['round']}: run/parse failure {record.get('error', '')}"
+        if not math.isfinite(record['seconds']) or record['seconds'] <= 0:
+            return {}, "invalid sample time"
+        samples[arm].append(record)
+        checksums.add(record['checksum'])
+    if any(len(samples[arm]) != rounds or
+           {r['round'] for r in samples[arm]} != set(range(rounds)) for arm in arms):
+        return {}, "duplicate/missing arm/round"
+    if len(checksums) != 1:
+        return {}, "CORRECTNESS: samples disagree on checksum"
+    return {arm: min(r['seconds'] for r in rows) for arm, rows in samples.items()}, None
+
+
+REFERENCE_CC = "cc"
+_NO_PIE: list | None = None
+
+
+def _reference_no_pie() -> list:
+    """Probe once whether REFERENCE_CC accepts -no-pie; cache the answer."""
+    global _NO_PIE
+    if _NO_PIE is None:
+        probe = None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                src = Path(td) / "probe.c"
+                src.write_text("int main(void){return 0;}\n")
+                probe = subprocess.run(
+                    [REFERENCE_CC, "-no-pie", str(src), "-o", str(Path(td) / "probe")],
+                    capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            probe = None
+        _NO_PIE = ["-no-pie"] if probe is not None and probe.returncode == 0 else []
+    return _NO_PIE
+
+
+def main() -> int:
+    global REFERENCE_CC
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--lccc", default=str(REPO / "target/fastbuild/lccc"))
+    ap.add_argument("--lccc-alt-env", default="", metavar="NAME=VALUE[,NAME=VALUE]",
+                    help="compile an interleaved lccc-alt arm with these environment overrides")
+    ap.add_argument("--gcc", default=which("gcc", "cc"))
+    ap.add_argument("--clang", default=which("clang"))
+    ap.add_argument("--reference-cc", default=which("gcc", "cc"),
+                    help="compiler used for the driver and for linking every arm")
+    ap.add_argument("--flags", default="-O3",
+                    help="optimisation flags given to every arm")
+    ap.add_argument("--kernels", default="", help="comma-separated kernel names")
+    ap.add_argument("--reps", type=int, default=7, help="timed samples per arm")
+    ap.add_argument("--cpu", default="auto",
+                    help="pin timed children to this allowed CPU, auto (default), or none")
+    ap.add_argument("--inner", type=int, default=0,
+                    help="iterations per sample (0 = per-kernel default)")
+    ap.add_argument("--save", metavar="JSON")
+    ap.add_argument("--baseline", metavar="JSON")
+    ap.add_argument("--tolerance", type=float, default=3.0,
+                    help="percent slowdown vs baseline that counts as a regression")
+    args = ap.parse_args()
+
+    if not args.reference_cc:
+        print("error: no reference C compiler found", file=sys.stderr)
+        return 2
+    REFERENCE_CC = args.reference_cc
+
+    driver = BENCH_DIR / "driver.c"
+    if not driver.exists():
+        print(f"error: missing {driver}", file=sys.stderr)
+        return 2
+
+    kernels = sorted(p for p in BENCH_DIR.glob("k_*.c"))
+    if args.kernels:
+        want = {k.strip() for k in args.kernels.split(",") if k.strip()}
+        kernels = [k for k in kernels if k.stem[2:] in want or k.stem in want]
+    if not kernels:
+        print("error: no kernels selected", file=sys.stderr)
+        return 2
+
+    arms: list[tuple[str, str, dict[str, str]]] = []
+    alt_env: dict[str, str] = {}
+    if args.lccc_alt_env:
+        try:
+            alt_env = parse_env_assignments(args.lccc_alt_env)
+        except ValueError as exc:
+            ap.error(f"--lccc-alt-env: {exc}")
+    if args.lccc and Path(args.lccc).exists():
+        arms.append(("lccc", args.lccc, {}))
+        if alt_env:
+            arms.append(("lccc-alt", args.lccc, alt_env))
+    elif alt_env:
+        ap.error("--lccc-alt-env requires an existing --lccc compiler")
+    if args.gcc:
+        arms.append(("gcc", args.gcc, {}))
+    if args.clang:
+        arms.append(("clang", args.clang, {}))
+    if len(arms) < 2:
+        print("error: need at least two compilers to compare", file=sys.stderr)
+        return 2
+
+    taskset_prefix, pinning = choose_taskset(args.cpu)
+    if not taskset_prefix and args.cpu.lower() not in ("none", "off", "no"):
+        print(f"warning: timed children are not pinned ({pinning})", file=sys.stderr)
+
+    cflags = args.flags.split()
+    results: dict[str, dict[str, float]] = {}
+    hashes: dict[str, dict[str, str]] = {}
+    failures: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="lccc-bench-") as td:
+        work = Path(td)
+        driver_obj = work / "driver.o"
+        driver_cmd = [REFERENCE_CC, "-O2", "-c", str(driver), "-o", str(driver_obj)]
+        try:
+            r = subprocess.run(driver_cmd, capture_output=True, text=True)
+            driver_receipt = {"phase": "driver-compile", "command": driver_cmd,
+                              "returncode": r.returncode, "stdout": r.stdout,
+                              "stderr": r.stderr}
+        except (OSError, subprocess.SubprocessError) as exc:
+            driver_receipt = {"phase": "driver-compile", "command": driver_cmd,
+                              "returncode": None, "stdout": "", "stderr": "",
+                              "error": str(exc)}
+            results["_harness"] = {"_invalid": "driver build invocation failed",
+                                   "_builds": [driver_receipt]}
+            save_results(args.save, results)
+            print(f"error: driver build invocation failed: {exc}", file=sys.stderr)
+            return 2
+        if r.returncode != 0:
+            results["_harness"] = {"_invalid": "driver build failed",
+                                   "_builds": [driver_receipt]}
+            save_results(args.save, results)
+            print(f"error: driver build failed:\n{r.stderr}", file=sys.stderr)
+            return 2
+
+        for kernel in kernels:
+            name = kernel.stem[2:]
+            inner = args.inner or default_inner(name)
+            binaries: dict[str, Path] = {}
+            build_records: list[dict] = []
+            for arm, cc, env_extra in arms:
+                out = work / f"{name}.{arm}"
+                ok, err, digest = build_arm(
+                    arm, cc, env_extra, cflags, kernel, driver_obj, out, work,
+                    receipts=build_records,
+                )
+                if not ok:
+                    failures.append(f"{name}/{arm}: {err}")
+                    continue
+                binaries[arm] = out
+                hashes.setdefault(name, {})[arm] = digest
+            if len(binaries) != len(arms):
+                # An omitted compiler is not a complete multi-arm sample, but
+                # its failed invocations remain first-class structured evidence.
+                results[name] = {
+                    "_invalid": "one or more compiler arms failed to build",
+                    "_builds": build_records,
+                }
+                continue
+
+            # Balance both first/second position and (for 3+ arms) relative
+            # neighbours.  Merely running A then B inside every repetition is
+            # not an A/B experiment: warm-cache, thermal and scheduler drift
+            # would all be permanently assigned to one side.
+            records: list[dict] = []
+            base_order = list(binaries.items())
+            for round_index in range(args.reps):
+                rotate = (round_index // 2) % len(base_order)
+                order = base_order[rotate:] + base_order[:rotate]
+                if round_index % 2:
+                    order.reverse()
+                for position, (arm, binary) in enumerate(order):
+                    records.append(dict(time_once(binary, inner, taskset_prefix),
+                                        round=round_index, arm=arm, order=position))
+
+            result, error = checked_samples(records, list(binaries), args.reps)
+            if error:
+                failures.append(f"{name}: {error}")
+                # Preserve failures without presenting a partial performance
+                # result. The legacy baseline loader ignores metadata keys.
+                results[name] = {"_samples": records, "_builds": build_records,
+                                 "_invalid": error}
+                continue
+            results[name] = {**result, "_samples": records, "_builds": build_records}
+            # Preserve _hash_lccc for existing baseline files, while making
+            # the alternate arm independently auditable as well.
+            for arm, digest in hashes.get(name, {}).items():
+                results[name][f"_hash_{arm}"] = digest
+
+    # ── report ──────────────────────────────────────────────────────────────
+    arm_names = [a for a, _, _ in arms]
+    compare_arms = [a for a in arm_names if a != "lccc"]
+    print()
+    print(f"runtime benchmark  flags={args.flags!r}  reps={args.reps} (best-of)")
+    print(f"pinning: {pinning}")
+    if alt_env:
+        print("lccc-alt environment: " + ", ".join(f"{k}={v}" for k, v in sorted(alt_env.items())))
+    print()
+    header = f"{'KERNEL':<18}" + "".join(f"{a + ' (ms)':>14}" for a in arm_names)
+    if "lccc" in arm_names:
+        header += "".join(f"{'vs ' + other:>10}" for other in compare_arms)
+    print(header)
+    print("-" * len(header))
+    for name in sorted(results):
+        row = results[name]
+        line = f"{name:<18}"
+        for a in arm_names:
+            line += f"{row.get(a, float('nan')) * 1e3:>14.3f}" if a in row else f"{'-':>14}"
+        if "lccc" in row:
+            for other in compare_arms:
+                if other in row and row[other] > 0:
+                    ratio = row[other] / row["lccc"]
+                    line += f"{ratio:>9.2f}x"
+                else:
+                    line += f"{'-':>10}"
+        print(line)
+
+    if results and "lccc" in arm_names:
+        print()
+        for other in compare_arms:
+            ratios = [r[other] / r["lccc"] for r in results.values()
+                      if other in r and "lccc" in r and r["lccc"] > 0]
+            if ratios:
+                print(f"  geomean vs {other}: {statistics.geometric_mean(ratios):.3f}x "
+                      f"(>1 means lccc is faster)")
+
+    for f in failures:
+        print(f"  FAIL {f}")
+
+    if args.save:
+        save_results(args.save, results)
+        print(f"\n  saved -> {args.save}")
+
+    if args.baseline:
+        base = json.loads(Path(args.baseline).read_text())
+        regressed = 0
+        print()
+        for name, row in sorted(results.items()):
+            if "lccc" not in row or name not in base or "lccc" not in base[name]:
+                continue
+            was, now = base[name]["lccc"], row["lccc"]
+            delta = (now - was) / was * 100.0
+            if abs(delta) <= args.tolerance:
+                continue
+
+            # The normalized function hash is diagnostic only. Same text can
+            # call a different callee, load different data, or move to another
+            # alignment. Never auto-waive a timing regression from this hash.
+            old_hash = base[name].get("_hash_lccc", "")
+            new_hash = row.get("_hash_lccc", "")
+            same_codegen = bool(old_hash) and old_hash == new_hash
+            diagnostic = f" (normalized function hash equal: {new_hash}; investigate layout/callees/data)" if same_codegen else ""
+            if delta > 0:
+                print(f"  REGRESSED {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
+                      f"({delta:+.1f}%){diagnostic}")
+                regressed += 1
+            else:
+                print(f"  IMPROVED  {name}: {was*1e3:.3f} -> {now*1e3:.3f} ms "
+                      f"({delta:+.1f}%){diagnostic}")
+
+        if regressed:
+            print(f"\n  FAIL: {regressed} kernel(s) regressed beyond "
+                  f"{args.tolerance}%")
+            return 1
+        print("\n  OK: no runtime regressions against baseline")
+
+    return 1 if failures else 0
+
+
+def save_results(path: str | None, results: dict) -> None:
+    """Persist receipts on every exit path that accepted ``--save``."""
+    if not path:
+        return
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
+
+
+def default_inner(name: str) -> int:
+    """Per-kernel iteration counts, sized so each sample runs ~20-80 ms."""
+    return {
+        "adler32": 3000,
+        "matchlen": 20000,
+        "namechars": 3000,
+        "classify": 3000,
+        "varint": 20000,
+        "memchr": 3000,
+        "hashmix": 20000,
+    }.get(name, 3000)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

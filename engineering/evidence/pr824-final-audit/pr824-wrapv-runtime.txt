@@ -1,0 +1,124 @@
+IVSR: ivsr_narrow_wrap -O0
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+IVSR: ivsr_signedness_domain -O0
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+IVSR: ivsr_signed_wrap_impldef -O0
+ivsr_signed_wrap_impldef: OK
+ivsr_signed_wrap_impldef: SKIP (needs a 64-bit address space)
+ivsr_signed_wrap_impldef: OK
+IVSR: ivsr_unsigned_sparse_wrap -O0
+ivsr_unsigned_sparse_wrap: OK
+ivsr_unsigned_sparse_wrap: SKIP (needs a 64-bit address space)
+ivsr_unsigned_sparse_wrap: OK
+IVSR: ivsr_address_add -O0
+ivsr_address_add: OK
+ivsr_address_add: OK
+ivsr_address_add: OK
+IVSR: ivsr_scale_ring_wrap -O0
+ivsr_scale_ring_wrap: OK
+ivsr_scale_ring_wrap: SKIP (needs a 64-bit address space)
+ivsr_scale_ring_wrap: OK
+IVSR: ivsr_affine_add_wrap -O0
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+IVSR: ivsr_narrow_wrap -O1
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+IVSR: ivsr_signedness_domain -O1
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+IVSR: ivsr_signed_wrap_impldef -O1
+ivsr_signed_wrap_impldef: OK
+ivsr_signed_wrap_impldef: SKIP (needs a 64-bit address space)
+ivsr_signed_wrap_impldef: OK
+IVSR: ivsr_unsigned_sparse_wrap -O1
+ivsr_unsigned_sparse_wrap: OK
+ivsr_unsigned_sparse_wrap: SKIP (needs a 64-bit address space)
+ivsr_unsigned_sparse_wrap: OK
+IVSR: ivsr_address_add -O1
+ivsr_address_add: OK
+ivsr_address_add: OK
+ivsr_address_add: OK
+IVSR: ivsr_scale_ring_wrap -O1
+ivsr_scale_ring_wrap: OK
+ivsr_scale_ring_wrap: SKIP (needs a 64-bit address space)
+ivsr_scale_ring_wrap: OK
+IVSR: ivsr_affine_add_wrap -O1
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+IVSR: ivsr_narrow_wrap -O2
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+IVSR: ivsr_signedness_domain -O2
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+IVSR: ivsr_signed_wrap_impldef -O2
+ivsr_signed_wrap_impldef: OK
+ivsr_signed_wrap_impldef: SKIP (needs a 64-bit address space)
+ivsr_signed_wrap_impldef: OK
+IVSR: ivsr_unsigned_sparse_wrap -O2
+ivsr_unsigned_sparse_wrap: OK
+ivsr_unsigned_sparse_wrap: SKIP (needs a 64-bit address space)
+ivsr_unsigned_sparse_wrap: OK
+IVSR: ivsr_address_add -O2
+ivsr_address_add: OK
+ivsr_address_add: OK
+ivsr_address_add: OK
+IVSR: ivsr_scale_ring_wrap -O2
+ivsr_scale_ring_wrap: OK
+ivsr_scale_ring_wrap: SKIP (needs a 64-bit address space)
+ivsr_scale_ring_wrap: OK
+IVSR: ivsr_affine_add_wrap -O2
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+IVSR: ivsr_narrow_wrap -O3
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+ivsr_narrow_wrap: OK
+IVSR: ivsr_signedness_domain -O3
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+ivsr_signedness_domain: OK
+IVSR: ivsr_signed_wrap_impldef -O3
+ivsr_signed_wrap_impldef: OK
+ivsr_signed_wrap_impldef: SKIP (needs a 64-bit address space)
+ivsr_signed_wrap_impldef: OK
+IVSR: ivsr_unsigned_sparse_wrap -O3
+ivsr_unsigned_sparse_wrap: OK
+ivsr_unsigned_sparse_wrap: SKIP (needs a 64-bit address space)
+ivsr_unsigned_sparse_wrap: OK
+IVSR: ivsr_address_add -O3
+ivsr_address_add: OK
+ivsr_address_add: OK
+ivsr_address_add: OK
+IVSR: ivsr_scale_ring_wrap -O3
+ivsr_scale_ring_wrap: OK
+ivsr_scale_ring_wrap: SKIP (needs a 64-bit address space)
+ivsr_scale_ring_wrap: OK
+IVSR: ivsr_affine_add_wrap -O3
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+ivsr_affine_add_wrap: OK
+wrapv: -O0 native PASS (4 domains)
+wrapv: -O0 i686 PASS (4 domains)
+wrapv: -O1 native PASS (4 domains)
+wrapv: -O1 i686 PASS (4 domains)
+wrapv: -O2 native PASS (4 domains)
+wrapv: -O2 i686 PASS (4 domains)
+wrapv: -O3 native PASS (4 domains)
+wrapv: -O3 i686 PASS (4 domains)
+wrapv: -Os native PASS (4 domains)
+wrapv: -Os i686 PASS (4 domains)
+wrapv: -Oz native PASS (4 domains)
+wrapv: -Oz i686 PASS (4 domains)

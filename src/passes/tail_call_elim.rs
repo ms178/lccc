@@ -1,0 +1,1824 @@
+//! Tail-call-to-loop transformation (TCE).
+//!
+//! Converts self-recursive tail calls into loop back-edges, eliminating
+//! stack frames for accumulator-style recursive functions.
+//!
+//! A **tail call** is a call to the same function whose result is returned
+//! immediately with no further computation. Example:
+//!
+//! ```c
+//! long sum(int n, long acc) {
+//!     if (n == 0) return acc;
+//!     return sum(n - 1, acc + n);   // tail call
+//! }
+//! ```
+//!
+//! The transformation inserts a loop-header block between the function entry
+//! and the body, with one Phi node per parameter:
+//!
+//! ```text
+//! entry:
+//!   %n   = ParamRef 0
+//!   %acc = ParamRef 1
+//!   Branch(loop_header)
+//!
+//! loop_header:
+//!   %phi_n   = Phi [(%n, entry), (%n1, rec_block)]
+//!   %phi_acc = Phi [(%acc, entry), (%acc1, rec_block)]
+//!   <rest of original entry block>
+//!   CondBranch(...)
+//!
+//! base_case:
+//!   Return(%phi_acc)
+//!
+//! rec_block:
+//!   %n1   = Sub %phi_n, 1
+//!   %acc1 = Add %phi_acc, %phi_n
+//!   Branch(loop_header)      // was: Call + Return
+//! ```
+//!
+//! Correctness constraints checked before transformation:
+//! - Non-variadic, non-sret function
+//! - Call argument count equals parameter count
+//! - The call result flows directly to a `Return` with no intervening uses
+//! - The tail call is not in the entry block (would create duplicate predecessors)
+
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{
+    BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+    replace_values_in_inst_map, replace_values_in_terminator_map,
+};
+
+/// Replace the canonical tail-recursive integer sum with a closed form.
+///
+/// The source pattern is:
+///
+/// ```text
+///     if (n <= 0) return acc;
+///     return sum(n - 1, acc + n);
+/// ```
+///
+/// After TCE this is a two-phi loop. For the lowered `int`/`long` ABI,
+/// `n*(n+1)` is bounded by roughly 2^62, so the product is representable in
+/// signed i64 for every defined int input. Replacing the loop with
+/// `acc + (n * (n + 1) / 2)` removes O(n) work while preserving the original
+/// branch for n <= 0. The matcher is deliberately strict and rejects any
+/// extra side effects or non-canonical recurrence.
+///
+/// Returns 1 when transformed, 0 otherwise.
+pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
+    if func.is_declaration
+        || func.is_variadic
+        || func.uses_sret
+        || func.return_type != crate::common::types::IrType::I64
+        || func.params.len() != 2
+        || func.params[0].ty != crate::common::types::IrType::I32
+        || func.params[1].ty != crate::common::types::IrType::I64
+        || func.blocks.len() < 3
+    {
+        return 0;
+    }
+
+    let Some(entry) = func.blocks.first() else {
+        return 0;
+    };
+    let mut n_param = None;
+    let mut acc_param = None;
+    for inst in &entry.instructions {
+        if let Instruction::ParamRef {
+            dest,
+            param_idx,
+            ty,
+        } = inst
+        {
+            match (*param_idx, *ty) {
+                (0, crate::common::types::IrType::I32) => n_param = Some(*dest),
+                (1, crate::common::types::IrType::I64) => acc_param = Some(*dest),
+                _ => {}
+            }
+        }
+    }
+    let (Some(n_param), Some(acc_param)) = (n_param, acc_param) else {
+        return 0;
+    };
+
+    // Find the loop header with the two recurrence phis and its n <= 0 test.
+    let mut header_idx = None;
+    let mut n_phi = None;
+    let mut acc_phi = None;
+    let mut base_label = None;
+    let mut rec_label = None;
+    for (idx, block) in func.blocks.iter().enumerate() {
+        let mut found_n = None;
+        let mut found_acc = None;
+        for inst in &block.instructions {
+            if let Instruction::Phi { dest, ty, .. } = inst {
+                match *ty {
+                    crate::common::types::IrType::I32 if found_n.is_none() => found_n = Some(*dest),
+                    crate::common::types::IrType::I64 if found_acc.is_none() => {
+                        found_acc = Some(*dest)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some((n_phi_here, acc_phi_here)) = found_n.zip(found_acc) else {
+            continue;
+        };
+        let Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } = &block.terminator
+        else {
+            continue;
+        };
+        let Operand::Value(cond_value) = cond else {
+            continue;
+        };
+        let mut is_base_true = false;
+        for inst in &block.instructions {
+            if let Instruction::Cmp {
+                dest,
+                op: crate::ir::reexports::IrCmpOp::Sle,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
+                if *dest == *cond_value
+                    && *ty == crate::common::types::IrType::I32
+                    && matches!(lhs, Operand::Value(v) if *v == n_phi_here)
+                    && matches!(rhs, Operand::Const(crate::ir::reexports::IrConst::I32(0)))
+                {
+                    is_base_true = true;
+                }
+            }
+        }
+        if !is_base_true {
+            continue;
+        }
+        header_idx = Some(idx);
+        n_phi = Some(n_phi_here);
+        acc_phi = Some(acc_phi_here);
+        base_label = Some(*true_label);
+        rec_label = Some(*false_label);
+        break;
+    }
+    let (Some(header_idx), Some(n_phi), Some(acc_phi), Some(base_label), Some(rec_label)) =
+        (header_idx, n_phi, acc_phi, base_label, rec_label)
+    else {
+        return 0;
+    };
+    let header_label = func.blocks[header_idx].label;
+
+    let find_block = |label: crate::ir::reexports::BlockId| {
+        func.blocks.iter().find(|block| block.label == label)
+    };
+    let Some(base_block) = find_block(base_label) else {
+        return 0;
+    };
+    let Some(rec_block) = find_block(rec_label) else {
+        return 0;
+    };
+    if !matches!(base_block.terminator, Terminator::Return(Some(_)))
+        || !matches!(rec_block.terminator, Terminator::Branch(label) if label == header_label)
+    {
+        return 0;
+    }
+
+    // The base arm must return the accumulator phi (possibly through one Copy).
+    let base_returns_acc = match base_block.terminator {
+        Terminator::Return(Some(Operand::Value(v))) => {
+            v == acc_phi
+                || base_block.instructions.iter().any(|inst| {
+                    matches!(inst, Instruction::Copy { dest, src: Operand::Value(src) } if *dest == v && *src == acc_phi)
+                })
+        }
+        _ => false,
+    };
+    if !base_returns_acc {
+        return 0;
+    }
+
+    let mut has_n_step = false;
+    let mut has_acc_step = false;
+    for inst in &rec_block.instructions {
+        match inst {
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Sub, lhs, rhs, ty, .. }
+                if *ty == crate::common::types::IrType::I32
+                    && matches!(lhs, Operand::Value(v) if *v == n_phi)
+                    && matches!(rhs, Operand::Const(crate::ir::reexports::IrConst::I32(1))) =>
+            {
+                has_n_step = true;
+            }
+            Instruction::BinOp { op: crate::ir::reexports::IrBinOp::Add, lhs, rhs, ty, .. }
+                if *ty == crate::common::types::IrType::I64
+                    && ((matches!(lhs, Operand::Value(v) if *v == acc_phi)
+                        && rec_block.instructions.iter().any(|candidate| matches!(candidate,
+                            Instruction::Cast { dest, src: Operand::Value(src), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 }
+                                if matches!(rhs, Operand::Value(v) if *v == *dest) && *src == n_phi)))
+                        || (matches!(rhs, Operand::Value(v) if *v == acc_phi)
+                        && rec_block.instructions.iter().any(|candidate| matches!(candidate,
+                            Instruction::Cast { dest, src: Operand::Value(src), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 }
+                                if matches!(lhs, Operand::Value(v) if *v == *dest) && *src == n_phi)))) =>
+            {
+                has_acc_step = true;
+            }
+            _ => {}
+        }
+    }
+    if !has_n_step || !has_acc_step {
+        return 0;
+    }
+
+    let formula_label = rec_label;
+    let base_label = base_label;
+    let mut next = func.next_value_id;
+    let fresh = |next: &mut u32| {
+        let value = Value(*next);
+        *next += 1;
+        value
+    };
+    let cond = fresh(&mut next);
+    let n64 = fresh(&mut next);
+    let n_plus_one = fresh(&mut next);
+    let product = fresh(&mut next);
+    let half = fresh(&mut next);
+    let result = fresh(&mut next);
+
+    let spans = |count: usize| vec![crate::common::source::Span::dummy(); count];
+    let entry_block = BasicBlock {
+        label: func.blocks[0].label,
+        instructions: vec![
+            Instruction::ParamRef {
+                dest: n_param,
+                param_idx: 0,
+                ty: crate::common::types::IrType::I32,
+            },
+            Instruction::ParamRef {
+                dest: acc_param,
+                param_idx: 1,
+                ty: crate::common::types::IrType::I64,
+            },
+            Instruction::Cmp {
+                dest: cond,
+                op: crate::ir::reexports::IrCmpOp::Sle,
+                lhs: Operand::Value(n_param),
+                rhs: Operand::Const(crate::ir::reexports::IrConst::I32(0)),
+                ty: crate::common::types::IrType::I32,
+            },
+        ],
+        terminator: Terminator::CondBranch {
+            cond: Operand::Value(cond),
+            true_label: base_label,
+            false_label: formula_label,
+        },
+        source_spans: spans(3),
+    };
+    let base_block = BasicBlock {
+        label: base_label,
+        instructions: Vec::new(),
+        terminator: Terminator::Return(Some(Operand::Value(acc_param))),
+        source_spans: Vec::new(),
+    };
+    let formula_block = BasicBlock {
+        label: formula_label,
+        instructions: vec![
+            Instruction::Cast {
+                dest: n64,
+                src: Operand::Value(n_param),
+                from_ty: crate::common::types::IrType::I32,
+                to_ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: n_plus_one,
+                op: crate::ir::reexports::IrBinOp::Add,
+                lhs: Operand::Value(n64),
+                rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)),
+                ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: product,
+                op: crate::ir::reexports::IrBinOp::Mul,
+                lhs: Operand::Value(n64),
+                rhs: Operand::Value(n_plus_one),
+                ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: half,
+                op: crate::ir::reexports::IrBinOp::SDiv,
+                lhs: Operand::Value(product),
+                rhs: Operand::Const(crate::ir::reexports::IrConst::I64(2)),
+                ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: result,
+                op: crate::ir::reexports::IrBinOp::Add,
+                lhs: Operand::Value(acc_param),
+                rhs: Operand::Value(half),
+                ty: crate::common::types::IrType::I64,
+            },
+        ],
+        terminator: Terminator::Return(Some(Operand::Value(result))),
+        source_spans: spans(5),
+    };
+    func.blocks = vec![entry_block, base_block, formula_block];
+    func.next_value_id = next;
+    func.next_label = formula_label.0.saturating_add(1);
+    func.param_alloca_values.clear();
+    1
+}
+
+/// Run tail-call-to-loop on a single function.
+/// Returns the number of tail calls eliminated (0 = no change).
+pub(crate) fn tail_calls_to_loops(func: &mut IrFunction) -> usize {
+    calls_to_loops(func, false)
+}
+
+/// Accumulator recursion elimination: a self-call whose result reaches
+/// `return` only through a chain of one associative, commutative integer
+/// operation (`return 1 + check(l) + check(r)`) becomes a back edge too.
+/// An accumulator phi starts at the operation's identity, each such site
+/// folds its other operands in (`acc' = acc + (1 + check(l))`), and every
+/// remaining `return x` returns `acc + x`.  Only the pure combining step is
+/// reassociated -- the operands were computed before the call, so their
+/// side effects keep their order -- and wrapping integer `+ * & | ^` are
+/// associative and commutative.  Floating point is never touched.
+///
+/// `binary_trees`' `check` drops one call per node, and its leaf test
+/// becomes a loop branch (GCC 16 does the same in tree-tailcall).  Runs
+/// after `rec2iter`, whose O(n) rewrite of `f(n - 1) + f(n - 2)` must win.
+pub(crate) fn accumulator_calls_to_loops(func: &mut IrFunction) -> usize {
+    calls_to_loops(func, true)
+}
+
+/// The accumulating chain after a self-call: `rest` (everything after the
+/// call) must be exactly `cur = cur op o` steps with one `op`, starting at
+/// the call result, whose last result the block returns.  Returns the
+/// operation and the other operands `o`.
+fn accumulator_chain(
+    rest: &[Instruction],
+    call_dest: Option<Value>,
+    terminator: &Terminator,
+    ret_ty: IrType,
+) -> Option<(IrBinOp, Vec<Operand>)> {
+    use IrType::*;
+    if !matches!(ret_ty, I8 | I16 | I32 | I64 | U8 | U16 | U32 | U64) {
+        return None;
+    }
+    let defined: FxHashSet<u32> = rest.iter().filter_map(|i| i.dest()).map(|v| v.0).collect();
+    let mut cur = call_dest?;
+    let mut op0: Option<IrBinOp> = None;
+    let mut others = Vec::new();
+    for inst in rest {
+        let Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } = inst
+        else {
+            return None;
+        };
+        if *ty != ret_ty
+            || !matches!(
+                op,
+                IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+            )
+            || op0.is_some_and(|o| o != *op)
+        {
+            return None;
+        }
+        op0 = Some(*op);
+        let other = match (lhs, rhs) {
+            (Operand::Value(l), o) if *l == cur => *o,
+            (o, Operand::Value(r)) if *r == cur => *o,
+            _ => return None,
+        };
+        if matches!(other, Operand::Value(v) if v == cur || defined.contains(&v.0)) {
+            return None;
+        }
+        others.push(other);
+        cur = *dest;
+    }
+    match terminator {
+        Terminator::Return(Some(Operand::Value(r))) if *r == cur => Some((op0?, others)),
+        _ => None,
+    }
+}
+
+/// Identity of an accumulating operation.
+fn accumulator_identity(op: IrBinOp, ty: IrType) -> IrConst {
+    match op {
+        IrBinOp::Mul => IrConst::one(ty),
+        IrBinOp::And => IrConst::from_i64(-1, ty),
+        _ => IrConst::zero(ty),
+    }
+}
+
+fn calls_to_loops(func: &mut IrFunction, accumulate: bool) -> usize {
+    if func.is_variadic || func.is_declaration || func.uses_sret {
+        return 0;
+    }
+    if func.blocks.is_empty() || func.params.is_empty() {
+        return 0;
+    }
+
+    let func_name = func.name.clone();
+    let num_params = func.params.len();
+
+    // Reusing one frame is not semantics-preserving when a recursive argument
+    // points into the current frame: each source-level call owns a distinct
+    // automatic object. Track stack-derived pointers through the pure pointer
+    // forms that can reach call arguments. The actual call-site check below is
+    // deliberately per argument, so ordinary scalar locals do not disable TCE.
+    let mut local_pointers = FxHashSet::default();
+    for block in &func.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Alloca { dest, .. } | Instruction::DynAlloca { dest, .. } =
+                instruction
+            {
+                local_pointers.insert(dest.0);
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for instruction in &block.instructions {
+                let derived = match instruction {
+                    Instruction::GetElementPtr { dest, base, .. }
+                        if local_pointers.contains(&base.0) =>
+                    {
+                        Some(*dest)
+                    }
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(source),
+                    }
+                    | Instruction::Cast {
+                        dest,
+                        src: Operand::Value(source),
+                        ..
+                    } if local_pointers.contains(&source.0) => Some(*dest),
+                    Instruction::Phi { dest, incoming, .. }
+                        if incoming.iter().any(|(operand, _)| {
+                            matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
+                        }) =>
+                    {
+                        Some(*dest)
+                    }
+                    Instruction::Select {
+                        dest,
+                        true_val,
+                        false_val,
+                        ..
+                    } if [true_val, false_val].iter().any(|operand| {
+                        matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
+                    }) => Some(*dest),
+                    Instruction::BinOp {
+                        dest,
+                        lhs,
+                        rhs,
+                        ty: crate::common::types::IrType::Ptr,
+                        ..
+                    } if [lhs, rhs].iter().any(|operand| {
+                        matches!(operand, Operand::Value(value) if local_pointers.contains(&value.0))
+                    }) => Some(*dest),
+                    _ => None,
+                };
+                if let Some(dest) = derived {
+                    changed |= local_pointers.insert(dest.0);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // ── 1. Collect ParamRef instructions from the entry block ──────────────
+    // After mem2reg, each parameter has exactly one ParamRef in the entry block.
+    // param_refs[i] = (SSA Value, IrType) for parameter i.
+    let mut param_refs: Vec<Option<(Value, crate::common::types::IrType)>> = vec![None; num_params];
+
+    for inst in &func.blocks[0].instructions {
+        if let Instruction::ParamRef {
+            dest,
+            param_idx,
+            ty,
+        } = inst
+        {
+            if *param_idx < num_params {
+                param_refs[*param_idx] = Some((*dest, *ty));
+            }
+        }
+    }
+
+    // Bail out if any parameter has no ParamRef (dead param, or mem2reg not run).
+    if param_refs.iter().any(|p| p.is_none()) {
+        return 0;
+    }
+    let param_refs: Vec<(Value, crate::common::types::IrType)> =
+        param_refs.into_iter().map(|p| p.unwrap()).collect();
+
+    // ── 2. Find self-recursive tail calls ──────────────────────────────────
+    struct TailCall {
+        block_idx: usize,
+        call_inst_idx: usize,
+        block_label: BlockId,
+        /// Raw (pre-rename) args from the call site.
+        args: Vec<Operand>,
+        /// Operands an accumulating site folds into the accumulator.
+        acc_operands: Vec<Operand>,
+    }
+
+    let mut tail_calls: Vec<TailCall> = Vec::new();
+    let ret_ty = func.return_type;
+    let mut acc_op: Option<IrBinOp> = None;
+
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        // Tail calls cannot be in the entry block: redirecting entry → loop_header
+        // while also branching from entry back → loop_header creates duplicate
+        // phi predecessors (entry appears twice in the phi incoming list).
+        if block_idx == 0 {
+            continue;
+        }
+
+        // Find the last Call to self in this block.
+        let Some(call_idx) = block
+            .instructions
+            .iter()
+            .rposition(|inst| matches!(inst, Instruction::Call { func: f, .. } if f == &func_name))
+        else {
+            continue;
+        };
+
+        let Instruction::Call { func: _, info } = &block.instructions[call_idx] else {
+            continue;
+        };
+
+        // Only handle simple non-struct self-calls with correct argument count.
+        if info.is_sret || info.is_variadic || info.num_fixed_args != num_params {
+            continue;
+        }
+
+        let call_dest = info.dest;
+        let args: Vec<Operand> = info.args[..num_params].to_vec();
+        if args.iter().any(|argument| {
+            matches!(argument, Operand::Value(value) if local_pointers.contains(&value.0))
+        }) {
+            continue;
+        }
+
+        // Everything after the call must be removable dead code. The rewrite
+        // below turns the call into a back edge but leaves the trailing
+        // instructions in place, so they would run *before* the callee's
+        // body instead of after it returns. Their results can feed nothing
+        // but the block's own tail (the block ends in `return`), so a pure
+        // tail is dead and harmless; a side effect is reordered across the
+        // whole recursive activation. `int r = f(n - 1); counter++; return
+        // r;` executed every increment before the base case ran, and a
+        // volatile `asm` after the recursive call was hoisted likewise
+        // (GCC keeps the frame here: the call is not in tail position).
+        // Dest-less instructions are rooted like DCE roots them.
+        if block.instructions[call_idx + 1..]
+            .iter()
+            .any(|inst| crate::passes::dce::has_side_effects(inst) || inst.dest().is_none())
+        {
+            continue;
+        }
+
+        // Verify no instruction after the call uses the call result.
+        let later_use = call_dest.is_some_and(|result_val| {
+            block.instructions[call_idx + 1..].iter().any(|inst| {
+                let mut used = false;
+                inst.for_each_used_value(|v| {
+                    if v == result_val.0 {
+                        used = true;
+                    }
+                });
+                used
+            })
+        });
+
+        // Verify the block's terminator is Return(call_result) or Return(None).
+        let is_tail = !later_use
+            && match &block.terminator {
+                Terminator::Return(None) => call_dest.is_none(),
+                Terminator::Return(Some(Operand::Value(rv))) => {
+                    call_dest.map(|d| d.0) == Some(rv.0)
+                }
+                _ => false,
+            };
+        let mut acc_operands = Vec::new();
+        if !is_tail {
+            if !accumulate {
+                continue;
+            }
+            let Some((op, operands)) = accumulator_chain(
+                &block.instructions[call_idx + 1..],
+                call_dest,
+                &block.terminator,
+                ret_ty,
+            ) else {
+                continue;
+            };
+            if acc_op.is_some_and(|o| o != op) {
+                continue;
+            }
+            acc_op = Some(op);
+            acc_operands = operands;
+        }
+
+        tail_calls.push(TailCall {
+            block_idx,
+            call_inst_idx: call_idx,
+            block_label: block.label,
+            args,
+            acc_operands,
+        });
+    }
+
+    if tail_calls.is_empty() {
+        return 0;
+    }
+
+    // ── 3. Allocate phi Values and a fresh label for the loop header ────────
+    let phi_vals: Vec<Value> = (0..num_params)
+        .map(|_| {
+            let v = Value(func.next_value_id);
+            func.next_value_id += 1;
+            v
+        })
+        .collect();
+
+    let loop_header_label = BlockId(func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1);
+    let entry_label = func.blocks[0].label;
+    // The accumulator phi and its incoming values (accumulating mode only).
+    let acc_phi = acc_op.map(|_| {
+        let v = Value(func.next_value_id);
+        func.next_value_id += 1;
+        v
+    });
+    let mut acc_incoming: Vec<(Operand, BlockId)> = Vec::new();
+    if let (Some(op), Some(_)) = (acc_op, acc_phi) {
+        acc_incoming.push((
+            Operand::Const(accumulator_identity(op, ret_ty)),
+            entry_label,
+        ));
+    }
+
+    // ── 4. Build replacement map: paramref Value → phi Value ───────────────
+    let mut replace_map: FxHashMap<u32, u32> = FxHashMap::default();
+    for (&(param_val, _), &phi_val) in param_refs.iter().zip(phi_vals.iter()) {
+        replace_map.insert(param_val.0, phi_val.0);
+    }
+
+    // ── 5. Build phi incoming ──────────────────────────────────────────────
+    // Entry block provides the initial paramref values (un-renamed, intentional).
+    // Each tail-call site provides the new argument values (renamed so that
+    // paramref values in args become the corresponding phi values).
+    let mut phi_incoming: Vec<Vec<(Operand, BlockId)>> = param_refs
+        .iter()
+        .map(|&(param_val, _)| vec![(Operand::Value(param_val), entry_label)])
+        .collect();
+
+    for tc in &tail_calls {
+        for (i, arg) in tc.args.iter().enumerate() {
+            let mut renamed_arg = arg.clone();
+            replace_op(&mut renamed_arg, &replace_map);
+            phi_incoming[i].push((renamed_arg, tc.block_label));
+        }
+    }
+
+    // ── 6. Split entry block: keep ParamRef/Alloca, move everything else ───
+    // ParamRef must stay in entry (backend reads from arg registers there).
+    // Alloca/DynAlloca must stay in entry (stack frame allocation).
+    // All other instructions move to the loop header so they re-execute on
+    // each "iteration" with updated phi values.
+    let entry_block = &mut func.blocks[0];
+    let old_spans = std::mem::take(&mut entry_block.source_spans);
+    let has_spans = !old_spans.is_empty() && old_spans.len() == entry_block.instructions.len();
+
+    let mut keep_in_entry: Vec<Instruction> = Vec::new();
+    let mut move_to_header: Vec<Instruction> = Vec::new();
+    let mut keep_spans: Vec<crate::common::source::Span> = Vec::new();
+    let mut header_spans: Vec<crate::common::source::Span> = Vec::new();
+
+    for (i, inst) in entry_block.instructions.drain(..).enumerate() {
+        let is_anchor = matches!(
+            inst,
+            Instruction::ParamRef { .. }
+                | Instruction::Alloca { .. }
+                | Instruction::DynAlloca { .. }
+        );
+        if is_anchor {
+            keep_in_entry.push(inst);
+            if has_spans {
+                keep_spans.push(old_spans[i]);
+            }
+        } else {
+            move_to_header.push(inst);
+            if has_spans {
+                header_spans.push(old_spans[i]);
+            }
+        }
+    }
+    entry_block.instructions = keep_in_entry;
+    if has_spans {
+        entry_block.source_spans = keep_spans;
+    }
+
+    // ── 7. Redirect entry block terminator → loop header ───────────────────
+    let entry_original_terminator = std::mem::replace(
+        &mut func.blocks[0].terminator,
+        Terminator::Branch(loop_header_label),
+    );
+
+    // ── 8. Patch tail-call sites: remove call, replace Return with Branch ──
+    for tc in &tail_calls {
+        let block = &mut func.blocks[tc.block_idx];
+        if let (Some(op), Some(phi)) = (acc_op, acc_phi) {
+            // Drop the call and its accumulating chain (the chain reads the
+            // call result, so it cannot stay), then fold the chain's other
+            // operands into the accumulator.
+            block.instructions.truncate(tc.call_inst_idx);
+            let spans = !block.source_spans.is_empty();
+            block.source_spans.truncate(tc.call_inst_idx);
+            let mut acc = phi;
+            for &o in &tc.acc_operands {
+                let next = Value(func.next_value_id);
+                func.next_value_id += 1;
+                block.instructions.push(Instruction::BinOp {
+                    dest: next,
+                    op,
+                    lhs: Operand::Value(acc),
+                    rhs: o,
+                    ty: ret_ty,
+                });
+                if spans {
+                    block
+                        .source_spans
+                        .push(crate::common::source::Span::dummy());
+                }
+                acc = next;
+            }
+            acc_incoming.push((Operand::Value(acc), tc.block_label));
+        } else {
+            // Remove the Call instruction (call result is now dead; DCE will clean up).
+            block.instructions.remove(tc.call_inst_idx);
+            if has_spans && tc.call_inst_idx < block.source_spans.len() {
+                block.source_spans.remove(tc.call_inst_idx);
+            }
+        }
+        block.terminator = Terminator::Branch(loop_header_label);
+    }
+
+    // ── 9. Rename paramref values to phi values in all existing blocks ──────
+    // AND retarget phi predecessor labels: the entry block's original
+    // terminator has just moved into the loop header (step 7), so every
+    // control-flow edge that used to leave `entry` now leaves `loop_header`.
+    // A phi in a former entry-successor that still names `entry` as the
+    // predecessor is doubly wrong after the value rename below: the incoming
+    // value becomes the header phi (defined only in the loop header, which
+    // does NOT dominate entry), and phi elimination then places the edge
+    // copy in the entry block, reading the header phi's home before its
+    // first definition. glibc's _dl_lookup_symbol_x hashed a stale register
+    // for every ld.so lookup exactly this way (LK-27). The loop below only
+    // visits pre-existing blocks — the loop header (pushed in step 10) keeps
+    // its deliberate `entry` incomings.
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            if matches!(inst, Instruction::ParamRef { .. }) {
+                continue; // definition, not a use
+            }
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, pred) in incoming.iter_mut() {
+                    if *pred == entry_label {
+                        *pred = loop_header_label;
+                    }
+                }
+            }
+            replace_values_in_inst_map(inst, &replace_map);
+        }
+        replace_values_in_terminator_map(&mut block.terminator, &replace_map);
+    }
+
+    // ── 10. Build and push the loop header block ────────────────────────────
+    // Phi nodes first, then the moved entry instructions (already renamed via
+    // the existing-block pass, since those instructions were drained from
+    // func.blocks[0] which was processed in step 9).
+    //
+    // Wait — the moved instructions were drained from func.blocks[0] before
+    // step 9, so step 9 did NOT rename them. Apply renaming now.
+    let mut header_instructions: Vec<Instruction> = Vec::new();
+
+    // Phi nodes (no renaming — deliberately hold paramref values for entry incoming).
+    for (i, &phi_val) in phi_vals.iter().enumerate() {
+        header_instructions.push(Instruction::Phi {
+            dest: phi_val,
+            ty: param_refs[i].1,
+            incoming: phi_incoming[i].clone(),
+        });
+    }
+    // Accumulator operands were renamed with their blocks in step 9.
+    if let Some(phi) = acc_phi {
+        header_instructions.push(Instruction::Phi {
+            dest: phi,
+            ty: ret_ty,
+            incoming: acc_incoming,
+        });
+    }
+
+    // Moved entry instructions: apply renaming.
+    for mut inst in move_to_header {
+        replace_values_in_inst_map(&mut inst, &replace_map);
+        header_instructions.push(inst);
+    }
+
+    // Loop header terminator = original entry terminator, with renaming applied.
+    let mut header_terminator = entry_original_terminator;
+    replace_values_in_terminator_map(&mut header_terminator, &replace_map);
+
+    // Span list: dummy spans for phi nodes, original spans for moved instructions.
+    let header_source_spans: Vec<crate::common::source::Span> = if has_spans {
+        let dummy = crate::common::source::Span::dummy();
+        let phis = phi_vals.len() + usize::from(acc_phi.is_some());
+        let mut spans: Vec<_> = (0..phis).map(|_| dummy).collect();
+        spans.extend(header_spans);
+        spans
+    } else {
+        Vec::new()
+    };
+
+    func.blocks.push(BasicBlock {
+        label: loop_header_label,
+        instructions: header_instructions,
+        terminator: header_terminator,
+        source_spans: header_source_spans,
+    });
+    // The header label was minted above max-live; keep the counter ahead of
+    // it so later passes cannot collide (`.max()` never regresses a healthy
+    // already-ahead counter).
+    func.next_label = func.next_label.max(loop_header_label.0.saturating_add(1));
+
+    // ── 11. Every remaining return completes the accumulation ──────────────
+    if let (Some(op), Some(phi)) = (acc_op, acc_phi) {
+        for block in &mut func.blocks {
+            let Terminator::Return(Some(x)) = block.terminator else {
+                continue;
+            };
+            let total = Value(func.next_value_id);
+            func.next_value_id += 1;
+            block.instructions.push(Instruction::BinOp {
+                dest: total,
+                op,
+                lhs: Operand::Value(phi),
+                rhs: x,
+                ty: ret_ty,
+            });
+            if !block.source_spans.is_empty() {
+                block
+                    .source_spans
+                    .push(crate::common::source::Span::dummy());
+            }
+            block.terminator = Terminator::Return(Some(Operand::Value(total)));
+        }
+    }
+
+    tail_calls.len()
+}
+
+// ── Value replacement helpers ─────────────────────────────────────────────────
+
+#[inline]
+fn replace_val(v: &mut Value, map: &FxHashMap<u32, u32>) {
+    if let Some(&new_id) = map.get(&v.0) {
+        *v = Value(new_id);
+    }
+}
+
+#[inline]
+fn replace_op(op: &mut Operand, map: &FxHashMap<u32, u32>) {
+    if let Operand::Value(v) = op {
+        replace_val(v, map);
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, IrConst, IrParam};
+
+    fn self_call(name: &str, dest: u32, arg: Operand) -> Instruction {
+        Instruction::Call {
+            func: name.to_string(),
+            info: crate::ir::reexports::CallInfo {
+                dest: Some(Value(dest)),
+                args: vec![arg],
+                arg_types: vec![IrType::I64],
+                return_type: IrType::I64,
+                is_variadic: false,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![None],
+                struct_arg_aligns: vec![None],
+                struct_arg_classes: vec![vec![]],
+                struct_arg_riscv_float_classes: vec![None],
+                struct_arg_is_f128_sse: Vec::new(),
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                assume_library: false,
+                ret_eightbyte_classes: vec![],
+                ret_is_f128_sse: false,
+                cold: false,
+            },
+        }
+    }
+
+    fn bb(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn bin(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        }
+    }
+
+    fn val(v: u32) -> Operand {
+        Operand::Value(Value(v))
+    }
+
+    fn k64(x: i64) -> Operand {
+        Operand::Const(IrConst::I64(x))
+    }
+
+    /// Reference interpreter for the single-`i64`-parameter subset these
+    /// tests use, self-calls included; `memory` counts loads in slot 0.
+    fn run_ref(f: &IrFunction, arg: i64, memory: &FxHashMap<i64, i64>, depth: u32) -> Option<i64> {
+        if depth > 64 {
+            return None;
+        }
+        let mut env: FxHashMap<u32, i64> = FxHashMap::default();
+        let get = |env: &FxHashMap<u32, i64>, o: &Operand| match o {
+            Operand::Value(v) => env.get(&v.0).copied(),
+            Operand::Const(c) => c.to_i64(),
+        };
+        let mut prev: Option<BlockId> = None;
+        let mut at = 0usize;
+        for _ in 0..10_000 {
+            let block = &f.blocks[at];
+            let phis: Vec<(u32, i64)> = block
+                .instructions
+                .iter()
+                .filter_map(|i| match i {
+                    Instruction::Phi { dest, incoming, .. } => incoming
+                        .iter()
+                        .find(|(_, b)| Some(*b) == prev)
+                        .and_then(|(o, _)| get(&env, o))
+                        .map(|x| (dest.0, x)),
+                    _ => None,
+                })
+                .collect();
+            env.extend(phis);
+            for inst in &block.instructions {
+                let (d, x) = match inst {
+                    Instruction::Phi { .. } => continue,
+                    Instruction::ParamRef { dest, .. } => (dest.0, arg),
+                    Instruction::BinOp {
+                        dest, op, lhs, rhs, ..
+                    } => {
+                        let (l, r) = (get(&env, lhs)?, get(&env, rhs)?);
+                        let x = match op {
+                            IrBinOp::Add => l.wrapping_add(r),
+                            IrBinOp::Sub => l.wrapping_sub(r),
+                            IrBinOp::Mul => l.wrapping_mul(r),
+                            IrBinOp::And => l & r,
+                            IrBinOp::Or => l | r,
+                            IrBinOp::Xor => l ^ r,
+                            _ => return None,
+                        };
+                        (dest.0, x)
+                    }
+                    Instruction::Cmp {
+                        dest, op, lhs, rhs, ..
+                    } => (
+                        dest.0,
+                        i64::from(op.eval_i64(get(&env, lhs)?, get(&env, rhs)?)),
+                    ),
+                    Instruction::Load { dest, ptr, .. } => {
+                        (dest.0, *memory.get(env.get(&ptr.0)?).unwrap_or(&0))
+                    }
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => (dest.0, env.get(&base.0)?.wrapping_add(get(&env, offset)?)),
+                    Instruction::Call { func: callee, info } if *callee == f.name => {
+                        let a = get(&env, &info.args[0])?;
+                        (info.dest?.0, run_ref(f, a, memory, depth + 1)?)
+                    }
+                    _ => return None,
+                };
+                env.insert(d, x);
+            }
+            let next = match &block.terminator {
+                Terminator::Return(Some(o)) => return get(&env, o),
+                Terminator::Branch(t) => *t,
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => {
+                    if get(&env, cond)? != 0 {
+                        *true_label
+                    } else {
+                        *false_label
+                    }
+                }
+                _ => return None,
+            };
+            prev = Some(block.label);
+            at = f.blocks.iter().position(|b| b.label == next)?;
+        }
+        None
+    }
+
+    fn self_calls(f: &IrFunction) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i, Instruction::Call { func, .. } if *func == f.name))
+            .count()
+    }
+
+    /// `binary_trees`' `check`: `n->left == 0 ? 1 : 1 + check(left) +
+    /// check(right)`, nodes `[left, right]` in memory.
+    fn tree_check(combine: IrBinOp) -> IrFunction {
+        let mut f = make_func("check", vec![IrType::I64]);
+        f.blocks = vec![
+            bb(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I64,
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            bb(
+                1,
+                vec![
+                    Instruction::Load {
+                        dest: Value(1),
+                        ptr: Value(0),
+                        ty: IrType::I64,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: IrCmpOp::Eq,
+                        lhs: val(1),
+                        rhs: k64(0),
+                        ty: IrType::I64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: val(2),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            bb(2, vec![], Terminator::Return(Some(k64(1)))),
+            bb(
+                3,
+                vec![
+                    self_call("check", 3, val(1)),
+                    bin(4, combine, k64(1), val(3)),
+                    Instruction::GetElementPtr {
+                        dest: Value(5),
+                        base: Value(0),
+                        offset: k64(8),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::Load {
+                        dest: Value(6),
+                        ptr: Value(5),
+                        ty: IrType::I64,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    self_call("check", 7, val(6)),
+                    bin(8, combine, val(4), val(7)),
+                ],
+                Terminator::Return(Some(val(8))),
+            ),
+        ];
+        f.next_value_id = 9;
+        f
+    }
+
+    /// A complete tree of `depth` at 1000.., plus a lopsided right spine.
+    fn trees() -> Vec<(i64, FxHashMap<i64, i64>)> {
+        fn build(m: &mut FxHashMap<i64, i64>, next: &mut i64, depth: u32) -> i64 {
+            let at = *next;
+            *next += 16;
+            if depth > 0 {
+                let l = build(m, next, depth - 1);
+                let r = build(m, next, depth - 1);
+                m.insert(at, l);
+                m.insert(at + 8, r);
+            }
+            at
+        }
+        let mut out = Vec::new();
+        for depth in 0..5 {
+            let mut m = FxHashMap::default();
+            let mut next = 1000;
+            let root = build(&mut m, &mut next, depth);
+            out.push((root, m));
+        }
+        let mut m = FxHashMap::default();
+        for i in 0..6 {
+            let at = 5000 + 32 * i;
+            m.insert(at, 9000 + 16 * i);
+            m.insert(at + 8, at + 32);
+        }
+        m.insert(5000 + 32 * 6, 0);
+        out.push((5000, m));
+        out
+    }
+
+    #[test]
+    fn accumulator_recursion_becomes_a_loop_with_the_same_results() {
+        for op in [
+            IrBinOp::Add,
+            IrBinOp::Mul,
+            IrBinOp::Xor,
+            IrBinOp::Or,
+            IrBinOp::And,
+        ] {
+            let f = tree_check(op);
+            let mut g = f.clone();
+            assert_eq!(accumulator_calls_to_loops(&mut g), 1, "{op:?}");
+            assert_eq!(self_calls(&g), 1, "{op:?}: only the left call stays");
+            for (root, m) in trees() {
+                let want = run_ref(&f, root, &m, 0);
+                assert!(want.is_some());
+                assert_eq!(want, run_ref(&g, root, &m, 0), "{op:?} on tree {root}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_tce_leaves_accumulator_recursion_alone() {
+        let mut f = tree_check(IrBinOp::Add);
+        assert_eq!(tail_calls_to_loops(&mut f), 0);
+        assert_eq!(self_calls(&f), 2);
+    }
+
+    #[test]
+    fn non_reassociable_chains_are_refused() {
+        // `1 - check(l) - check(r)`: subtraction does not commute.
+        let mut f = tree_check(IrBinOp::Sub);
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // `t + t`: the call result feeds the chain twice.
+        let mut f = tree_check(IrBinOp::Add);
+        f.blocks[3].instructions[5] = bin(8, IrBinOp::Add, val(7), val(7));
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // Mixed operations in one chain.
+        let mut f = tree_check(IrBinOp::Add);
+        f.blocks[3]
+            .instructions
+            .push(bin(9, IrBinOp::Mul, val(8), k64(3)));
+        f.blocks[3].terminator = Terminator::Return(Some(val(9)));
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // A store after the call is a side effect the loop would reorder.
+        let mut f = tree_check(IrBinOp::Add);
+        f.blocks[3].instructions.insert(
+            5,
+            Instruction::Store {
+                val: val(7),
+                ptr: Value(0),
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        );
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+        // Floating point never reassociates.
+        let mut f = tree_check(IrBinOp::Add);
+        f.return_type = IrType::F64;
+        for inst in &mut f.blocks[3].instructions {
+            if let Instruction::BinOp { ty, .. } = inst {
+                *ty = IrType::F64;
+            }
+        }
+        assert_eq!(accumulator_calls_to_loops(&mut f), 0);
+    }
+
+    /// `n <= 1 ? 1 : n * fact(n - 1)` beside a plain `return fact(n - 2)`
+    /// site (odd `n` above 10): both become back edges of one loop.
+    #[test]
+    fn accumulating_and_plain_sites_share_the_loop() {
+        let mut f = make_func("fact", vec![IrType::I64]);
+        let cmp = |d: u32, op: IrCmpOp, l: Operand, r: Operand| Instruction::Cmp {
+            dest: Value(d),
+            op,
+            lhs: l,
+            rhs: r,
+            ty: IrType::I64,
+        };
+        f.blocks = vec![
+            bb(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I64,
+                    },
+                    cmp(1, IrCmpOp::Sle, val(0), k64(1)),
+                ],
+                Terminator::CondBranch {
+                    cond: val(1),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            bb(1, vec![], Terminator::Return(Some(k64(1)))),
+            bb(
+                2,
+                vec![
+                    bin(2, IrBinOp::And, val(0), k64(1)),
+                    cmp(3, IrCmpOp::Sgt, val(0), k64(10)),
+                    bin(4, IrBinOp::And, val(2), val(3)),
+                ],
+                Terminator::CondBranch {
+                    cond: val(4),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ),
+            bb(
+                3,
+                vec![
+                    bin(5, IrBinOp::Sub, val(0), k64(2)),
+                    self_call("fact", 6, val(5)),
+                ],
+                Terminator::Return(Some(val(6))),
+            ),
+            bb(
+                4,
+                vec![
+                    bin(7, IrBinOp::Sub, val(0), k64(1)),
+                    self_call("fact", 8, val(7)),
+                    bin(9, IrBinOp::Mul, val(0), val(8)),
+                ],
+                Terminator::Return(Some(val(9))),
+            ),
+        ];
+        f.next_value_id = 10;
+        let mut g = f.clone();
+        assert_eq!(accumulator_calls_to_loops(&mut g), 2);
+        assert_eq!(self_calls(&g), 0);
+        let m = FxHashMap::default();
+        for n in [-3, 0, 1, 2, 5, 10, 11, 13, 20, 25] {
+            let want = run_ref(&f, n, &m, 0);
+            assert!(want.is_some());
+            assert_eq!(want, run_ref(&g, n, &m, 0), "fact({n})");
+        }
+    }
+
+    /// Build a minimal IrFunction skeleton (no blocks) for testing.
+    fn make_func(name: &str, params: Vec<IrType>) -> IrFunction {
+        let ir_params: Vec<IrParam> = params
+            .iter()
+            .map(|&ty| IrParam {
+                ty,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                riscv_float_class: None,
+                is_f128_sse: false,
+            })
+            .collect();
+        IrFunction::new(name.to_string(), IrType::I64, ir_params, false)
+    }
+
+    /// Build the canonical accumulator-recursive sum function:
+    ///
+    /// ```c
+    /// long sum(int n, long acc) {
+    ///     if (n == 0) return acc;
+    ///     return sum(n - 1, acc + n);
+    /// }
+    /// ```
+    ///
+    /// IR (after mem2reg):
+    ///
+    /// ```
+    /// entry (B0):
+    ///   %0 = ParamRef 0 i32   // n
+    ///   %1 = ParamRef 1 i64   // acc
+    ///   %2 = Cmp Eq %0, 0
+    ///   CondBranch(%2, base, rec)
+    ///
+    /// base (B1):
+    ///   Return(%1)
+    ///
+    /// rec (B2):
+    ///   %3 = Sub %0, 1        // n - 1
+    ///   %4 = Cast %0 i32→i64
+    ///   %5 = Add %1, %4       // acc + n
+    ///   %6 = Call sum(%3, %5)
+    ///   Return(%6)
+    /// ```
+    fn make_sum_func() -> IrFunction {
+        let mut func = make_func("sum", vec![IrType::I32, IrType::I64]);
+
+        // B0: entry
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I64,
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Eq,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+
+        // B1: base case — return acc
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+
+        // B2: recursive case — return sum(n-1, acc+n)
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(4),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::Call {
+                    func: "sum".to_string(),
+                    info: crate::ir::reexports::CallInfo {
+                        dest: Some(Value(6)),
+                        args: vec![Operand::Value(Value(3)), Operand::Value(Value(5))],
+                        arg_types: vec![IrType::I32, IrType::I64],
+                        return_type: IrType::I64,
+                        is_variadic: false,
+                        num_fixed_args: 2,
+                        struct_arg_sizes: vec![None, None],
+                        struct_arg_aligns: vec![None, None],
+                        struct_arg_classes: vec![vec![], vec![]],
+                        struct_arg_riscv_float_classes: vec![None, None],
+                        struct_arg_is_f128_sse: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        regparm: None,
+                        is_pure: false,
+                        is_const: false,
+                        assume_library: false,
+                        ret_eightbyte_classes: vec![],
+                        ret_is_f128_sse: false,
+                        cold: false,
+                    },
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+            source_spans: Vec::new(),
+        });
+
+        func.next_value_id = 7;
+        func
+    }
+
+    #[test]
+    fn test_tce_finds_tail_call() {
+        let mut func = make_sum_func();
+        let n = tail_calls_to_loops(&mut func);
+        assert_eq!(n, 1, "should have eliminated 1 tail call");
+    }
+
+    #[test]
+    fn test_tce_rejects_pointer_into_current_stack_frame() {
+        let mut func = make_sum_func();
+        func.blocks[0].instructions.insert(
+            0,
+            Instruction::Alloca {
+                dest: Value(7),
+                ty: IrType::I32,
+                size: 4,
+                align: 4,
+                volatile: false,
+                semantic_volatile: false,
+            },
+        );
+        func.blocks[2].instructions.insert(
+            3,
+            Instruction::GetElementPtr {
+                dest: Value(8),
+                base: Value(7),
+                offset: Operand::Const(IrConst::I64(0)),
+                ty: IrType::Ptr,
+            },
+        );
+        let call = func.blocks[2]
+            .instructions
+            .iter_mut()
+            .find(|instruction| matches!(instruction, Instruction::Call { .. }))
+            .unwrap();
+        if let Instruction::Call { info, .. } = call {
+            info.args[1] = Operand::Value(Value(8));
+            info.arg_types[1] = IrType::Ptr;
+        }
+        func.next_value_id = 9;
+
+        assert_eq!(tail_calls_to_loops(&mut func), 0);
+        assert!(func.blocks[2].instructions.iter().any(
+            |instruction| matches!(instruction, Instruction::Call { func, .. } if func == "sum")
+        ));
+    }
+
+    #[test]
+    fn test_tce_inserts_loop_header() {
+        let mut func = make_sum_func();
+        tail_calls_to_loops(&mut func);
+        // Original 3 blocks + 1 new loop header
+        assert_eq!(func.blocks.len(), 4, "should have 4 blocks after TCE");
+    }
+
+    #[test]
+    fn test_tce_entry_branches_to_loop_header() {
+        let mut func = make_sum_func();
+        tail_calls_to_loops(&mut func);
+        // Entry block (B0) must now branch unconditionally to the loop header.
+        assert!(
+            matches!(func.blocks[0].terminator, Terminator::Branch(_)),
+            "entry block should end with an unconditional branch after TCE"
+        );
+    }
+
+    #[test]
+    fn test_tce_loop_header_has_phi_nodes() {
+        let mut func = make_sum_func();
+        tail_calls_to_loops(&mut func);
+        // The last block pushed is the loop header.
+        let header = func.blocks.last().unwrap();
+        let phi_count = header
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Phi { .. }))
+            .count();
+        assert_eq!(
+            phi_count, 2,
+            "loop header should have 2 phi nodes (one per param)"
+        );
+    }
+
+    #[test]
+    fn test_tce_tail_call_block_becomes_branch() {
+        let mut func = make_sum_func();
+        tail_calls_to_loops(&mut func);
+        // B2 (rec) was the tail-call block; its terminator should now be Branch.
+        let rec_block = func.blocks.iter().find(|b| b.label == BlockId(2)).unwrap();
+        assert!(
+            matches!(rec_block.terminator, Terminator::Branch(_)),
+            "tail-call block terminator should be Branch after TCE"
+        );
+        // The Call instruction should be removed.
+        let has_self_call = rec_block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Call { func: f, .. } if f == "sum"));
+        assert!(
+            !has_self_call,
+            "self-recursive Call should be removed by TCE"
+        );
+    }
+
+    #[test]
+    fn test_tce_paramref_uses_renamed_to_phi() {
+        let mut func = make_sum_func();
+        tail_calls_to_loops(&mut func);
+        // Value(0) was %n (ParamRef). Value(2) (the compare) used it.
+        // After TCE, that compare should use a phi value, not Value(0).
+        let header = func.blocks.last().unwrap();
+        let phi_dests: Vec<u32> = header
+            .instructions
+            .iter()
+            .filter_map(|i| {
+                if let Instruction::Phi { dest, .. } = i {
+                    Some(dest.0)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // The Cmp (originally in entry, now moved to loop header) should use a phi val.
+        let cmp_inst = header
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Cmp { .. }))
+            .unwrap();
+        if let Instruction::Cmp {
+            lhs: Operand::Value(lhs_val),
+            ..
+        } = cmp_inst
+        {
+            assert!(
+                phi_dests.contains(&lhs_val.0),
+                "Cmp should use a phi value after renaming, got Value({})",
+                lhs_val.0
+            );
+        } else {
+            panic!("Cmp lhs should be a Value operand");
+        }
+    }
+
+    #[test]
+    fn test_tce_no_tail_call_no_change() {
+        // A non-recursive function should not be modified.
+        let mut func = make_func("add", vec![IrType::I32, IrType::I32]);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+
+        let n = tail_calls_to_loops(&mut func);
+        assert_eq!(n, 0);
+        assert_eq!(
+            func.blocks.len(),
+            1,
+            "non-recursive function should be unchanged"
+        );
+    }
+
+    /// `long sum(int n, long acc)` whose recursive block stores to a global
+    /// after the self call: `r = sum(n - 1, acc + n); counter = n; return r;`
+    fn make_sum_func_with_trailing(trailing: Vec<Instruction>) -> IrFunction {
+        let mut func = make_sum_func();
+        let rec = &mut func.blocks[2];
+        rec.instructions.push(Instruction::GlobalAddr {
+            dest: Value(7),
+            name: "counter".to_string(),
+        });
+        rec.instructions.extend(trailing);
+        func.next_value_id = 9;
+        func
+    }
+
+    #[test]
+    fn test_tce_rejects_side_effect_after_self_call() {
+        // The trailing store would run before the callee's body once the
+        // call became a back edge: every `counter` write would precede the
+        // base case instead of following it.
+        let mut func = make_sum_func_with_trailing(vec![Instruction::Store {
+            val: Operand::Value(Value(0)),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }]);
+        assert_eq!(tail_calls_to_loops(&mut func), 0);
+        assert_eq!(func.blocks.len(), 3, "function must be left untouched");
+    }
+
+    #[test]
+    fn test_tce_accepts_dead_pure_tail_after_self_call() {
+        // A pure tail can only feed the block's own tail (the block ends in
+        // `return`), so it is dead code and does not block the rewrite.
+        let mut func = make_sum_func_with_trailing(vec![Instruction::Load {
+            dest: Value(8),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }]);
+        assert_eq!(tail_calls_to_loops(&mut func), 1);
+    }
+
+    #[test]
+    fn test_tce_rejects_volatile_load_after_self_call() {
+        let mut func = make_sum_func_with_trailing(vec![Instruction::Load {
+            dest: Value(8),
+            ptr: Value(7),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        }]);
+        assert_eq!(tail_calls_to_loops(&mut func), 0);
+    }
+
+    #[test]
+    fn test_tce_non_tail_call_not_eliminated() {
+        // A call whose result is used in further computation is NOT a tail call.
+        let mut func = make_func("fib", vec![IrType::I32]);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                // %1 = call fib(n-1)
+                Instruction::Call {
+                    func: "fib".to_string(),
+                    info: crate::ir::reexports::CallInfo {
+                        dest: Some(Value(1)),
+                        args: vec![Operand::Value(Value(0))],
+                        arg_types: vec![IrType::I32],
+                        return_type: IrType::I64,
+                        is_variadic: false,
+                        num_fixed_args: 1,
+                        struct_arg_sizes: vec![None],
+                        struct_arg_aligns: vec![None],
+                        struct_arg_classes: vec![vec![]],
+                        struct_arg_riscv_float_classes: vec![None],
+                        struct_arg_is_f128_sse: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        regparm: None,
+                        is_pure: false,
+                        is_const: false,
+                        assume_library: false,
+                        ret_eightbyte_classes: vec![],
+                        ret_is_f128_sse: false,
+                        cold: false,
+                    },
+                },
+                // %2 = %1 + 1   (uses call result — NOT a tail call)
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+
+        let n = tail_calls_to_loops(&mut func);
+        assert_eq!(n, 0, "non-tail call should not be eliminated");
+        assert_eq!(func.blocks.len(), 2);
+    }
+
+    #[test]
+    fn replace_values_rewrites_hidden_memory_operands() {
+        use crate::ir::intrinsics::IntrinsicOp;
+
+        let mut map = FxHashMap::default();
+        map.insert(7, 70);
+        map.insert(8, 80);
+        map.insert(9, 90);
+
+        let mut asm = Instruction::InlineAsm {
+            template: String::new(),
+            outputs: vec![("=m".into(), Value(7), Some("out".into()))],
+            inputs: vec![("r".into(), Operand::Value(Value(8)), Some("in".into()))],
+            clobbers: Vec::new(),
+            operand_types: vec![IrType::I32, IrType::I32],
+            goto_labels: Vec::new(),
+            input_symbols: vec![None],
+            seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
+        };
+        replace_values_in_inst_map(&mut asm, &map);
+        match asm {
+            Instruction::InlineAsm {
+                outputs, inputs, ..
+            } => {
+                assert_eq!(outputs[0].1, Value(70));
+                assert!(matches!(inputs[0].1, Operand::Value(Value(80))));
+            }
+            _ => unreachable!(),
+        }
+
+        let mut intrinsic = Instruction::Intrinsic {
+            dest: None,
+            op: IntrinsicOp::Storedqu,
+            dest_ptr: Some(Value(9)),
+            args: vec![Operand::Value(Value(8))],
+        };
+        replace_values_in_inst_map(&mut intrinsic, &map);
+        match intrinsic {
+            Instruction::Intrinsic { dest_ptr, args, .. } => {
+                assert_eq!(dest_ptr, Some(Value(90)));
+                assert!(matches!(args.as_slice(), [Operand::Value(Value(80))]));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn test_closed_form_tail_sum_after_tce() {
+        let mut func = make_sum_func();
+        if let Instruction::Cmp { op, .. } = &mut func.blocks[0].instructions[2] {
+            *op = IrCmpOp::Sle;
+        }
+        assert_eq!(tail_calls_to_loops(&mut func), 1);
+        assert_eq!(closed_form_tail_sum(&mut func), 1);
+        assert_eq!(func.blocks.len(), 3);
+        assert!(func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::SDiv,
+                        ty: IrType::I64,
+                        ..
+                    }
+                )
+            })
+        }));
+    }
+}

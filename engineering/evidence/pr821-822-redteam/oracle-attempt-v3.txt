@@ -1,0 +1,27 @@
+godbolt: cicc2021100: requested compiler options not honored: icc: command line warning #10148: option '-march=x86-64-v3' not supported
+godbolt: cicc2021100: requested compiler options not honored: icc: command line warning #10148: option '-march=x86-64-v3' not supported
+ERROR       icc: GodboltError: remote compile failed: icc (cicc2021100)
+ERROR       icc: GodboltError: remote compile failed: icc (cicc2021100)
+godbolt: cicc2021100: requested compiler options not honored: icc: command line warning #10148: option '-march=x86-64-v3' not supported
+ERROR       icc: GodboltError: remote compile failed: icc (cicc2021100)
+
+tests/benchmark/programs/zlib_ng_adler32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+gcc              156     19       3       2      10    1.06x  x86-64 gcc 16.2
+clang            148     17       9       0       7    1.01x  x86-64 clang 23.1.0
+icx              147     22       6       3       7    1.00x  x86-64 icx (latest)
+
+tests/benchmark/programs/gzip_crc32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+gcc               50      5       2       0       8    1.00x  x86-64 gcc 16.2
+clang             82      9       9       0       5    1.64x  x86-64 clang 23.1.0
+icx              100     20       6       3       5    2.00x  x86-64 icx (latest)
+
+tests/benchmark/programs/expat_xml_scan.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+gcc              172     15       6       4      50    1.00x  x86-64 gcc 16.2
+clang            222     15      10       0      59    1.29x  x86-64 clang 23.1.0
+icx              327     21      29       3     107    1.90x  x86-64 icx (latest)

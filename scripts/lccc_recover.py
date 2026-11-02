@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Restore the compact snapshot without toolchain installation or compilation.
+
+Exact history uses lccc-session.bundle plus BASE (fetched, locally available,
+or reconstructed OFFLINE from the verified source/archive/cumulative patch
+and recorded raw BASE commit). If that chain is unavailable, a verified source
+fallback explicitly reports exact_history=false, never inventing commit IDs.
+Existing worktrees are untouched; --preserve-worktree installs .git only.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import inspect
+import json
+import os
+from pathlib import Path,PurePosixPath
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+
+SHA=re.compile(r'^[0-9a-f]{40}$');DIGEST=re.compile(r'^[0-9a-f]{64}$')
+UPSTREAM='https://github.com/ms178/lccc.git'
+
+
+# Checkpoint retention outgrew the old 16-name ceiling. Keep the independent
+# byte limits unchanged: increasing the bounded metadata count must not allow
+# a larger member or a larger decompressed archive. The producer uses this
+# same predicate before publishing a new bundle inventory.
+BUNDLE_ARCHIVE_MAX_MEMBERS = 64
+BUNDLE_ARCHIVE_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+BUNDLE_ARCHIVE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+
+
+def bundle_archive_within_budget(count, member_bytes, total_bytes):
+    return (0 < count <= BUNDLE_ARCHIVE_MAX_MEMBERS
+            and 0 <= member_bytes <= BUNDLE_ARCHIVE_MAX_MEMBER_BYTES
+            and 0 <= total_bytes <= BUNDLE_ARCHIVE_MAX_TOTAL_BYTES)
+
+
+def git(repo,*args,input=None):
+    p=subprocess.run(['git','-C',str(repo),*args],input=input,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
+    if p.returncode:raise ValueError('git '+args[0]+': '+p.stderr.decode('utf-8',errors='replace')[-2000:])
+    return p.stdout.decode().strip()
+
+
+def sha(path):
+    h=hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for block in iter(lambda:f.read(1048576),b''):h.update(block)
+    return h.hexdigest()
+
+
+def require(ok,msg):
+    if not ok:raise ValueError(msg)
+
+
+def extractall_takes_filter():
+    """True when tarfile's extractall accepts PEP 706's filter= keyword.
+
+    filter= landed in 3.12 and 3.11.4, but docs/getting-started.md declares
+    Python 3.9+ as the floor, so it cannot be passed unconditionally.  Probe
+    the signature instead of catching TypeError around the call: a bare
+    `except TypeError` also swallows one raised from INSIDE extraction and
+    then silently continues unfiltered, which is a worse outcome than the
+    crash it was hiding.  Verified True on 3.12.3/3.12.15/3.13.14 and False
+    for a simulated legacy signature.
+    """
+    try:
+        return 'filter' in inspect.signature(tarfile.TarFile.extractall).parameters
+    except (TypeError,ValueError):
+        return False
+
+
+def chmod_ignores_a_none_mode():
+    """True when TarFile.chmod tolerates the filter's mode=None.
+
+    PEP 706 landed the filter in 3.12 and 3.11.4 and *with it* an early return
+    for `tarinfo.mode is None` in `TarFile.chmod`.  A 3.11.3-or-older
+    interpreter therefore crashes with `TypeError: 'NoneType' object cannot be
+    interpreted as an integer` on every DIRECTORY member whose mode the filter
+    cleared — measured on Debian 12's 3.11.2 with this module's own unit tests
+    (20 errors, all `tarfile.py: self.chmod(tarinfo, dirpath)`), i.e. on
+    exactly the interpreters the documented 3.9+ floor covers and which cannot
+    use the filter branch at all.
+
+    Probed by calling the unbound method rather than by version number: a
+    distro backport can move either half of PEP 706 independently, and
+    `chmod` never reads `self` on ANY version, so `None` is a safe receiver.
+    """
+    member=tarfile.TarInfo('probe');member.type=tarfile.DIRTYPE;member.mode=None
+    try:
+        tarfile.TarFile.chmod(None,member,os.devnull)
+    except TypeError:
+        return False
+    return True
+
+
+def read_json(path):
+    def pairs(values):
+        r={}
+        for k,v in values:
+            require(k not in r,'duplicate recovery metadata key');r[k]=v
+        return r
+    def bad(value):raise ValueError('nonfinite recovery JSON: '+value)
+    return json.loads(Path(path).read_text(),object_pairs_hook=pairs,parse_constant=bad)
+
+
+def name(value):
+    require(isinstance(value,str) and value and '/' not in value and '\\' not in value and value not in {'.','..'} and '\0' not in value,'unsafe artifact basename')
+    return value
+
+
+def digest(value,pattern):require(isinstance(value,str) and pattern.fullmatch(value) is not None,'invalid recovery identity')
+
+
+def recipe_metadata(path):
+    r=read_json(path);require(r['format']=='lccc-source-archive-v2','unknown source archive recipe')
+    for f in ('head','tree','base'):digest(r[f],SHA)
+    for f in ('archive_sha256','patch_sha256'):digest(r[f],DIGEST)
+    name(r['archive']);name(r['patch']);require(r['prefix']=='lccc/','unknown source archive prefix')
+    require(isinstance(r['branch'],str) and not r['branch'].startswith('-'),'unsafe branch')
+    raw=base64.b64decode(r['base_commit_base64'],validate=True)
+    require(len(raw)<=65536 and hashlib.sha1(b'commit '+str(len(raw)).encode()+b'\0'+raw).hexdigest()==r['base'],'BASE commit identity mismatch')
+    return r
+
+
+def bundle_metadata(path):
+    r=read_json(path);require(r['format']=='lccc-session-bundle-v1','unknown session bundle format')
+    for f in ('head','tree','base'):digest(r[f],SHA)
+    digest(r['bundle_sha256'],DIGEST);name(r['bundle'])
+    if 'bundle_archive' in r or 'bundle_archive_sha256' in r:
+        name(r.get('bundle_archive'));digest(r.get('bundle_archive_sha256'),DIGEST)
+    require(isinstance(r['branch'],str) and not r['branch'].startswith('-'),'unsafe branch')
+    return r
+
+
+def neutralize_archive_attrs(member):
+    """Strip the archive-supplied ownership/permission an unfiltered extractall applies.
+
+    The member loop in extract() validates NAMES and TYPES.  It cannot cover
+    metadata, because on the 3.9+ floor `filter='data'` does not exist and a
+    bare extractall still calls chown/chmod with the archive's own values:
+    running as root, an archive can chown the extracted tree to any uid/gid,
+    and any mode can be planted on a file.  tarfile's `data` filter closes
+    both (Lib/tarfile.py `_get_filtered_attrs`, `for_data=True`), so this is
+    that filter's metadata half, implemented against the documented behaviour
+    rather than approximated:
+
+      * uid/gid/uname/gname -> None.  TarFile.chown maps None to -1, and
+        chown(path, -1, -1) leaves ownership untouched.
+      * mode &= 0o755, which clears setuid/setgid/sticky AND the group/other
+        write bits; for a regular file the executable bits are then dropped
+        unless the owner has one, and 0o600 is forced on; directories and
+        symlinks get None, and TarFile.chmod returns at once for None, so
+        their mode stays whatever the OS created under the umask.
+
+    Special files never reach this: the caller rejects every type but
+    regular/dir/symlink, which is where the filter raises SpecialFileError.
+    tests/corpus/test_recovery_contracts.py asserts this agrees with the real
+    tarfile.data_filter member-for-member on interpreters that have one, so
+    the equivalence is machine-checked rather than asserted in a comment.
+    """
+    member.uid=None;member.gid=None;member.uname=None;member.gname=None
+    mode=member.mode
+    if mode is None:return member
+    mode&=0o755
+    if member.isfile() or member.islnk():
+        if not mode&0o100:mode&=~0o111
+        mode|=0o600
+    elif member.isdir() or member.issym():mode=None
+    member.mode=mode
+    return member
+
+
+def extract(archive,stage,r):
+    require(Path(archive).is_file() and not Path(archive).is_symlink() and sha(archive)==r['archive_sha256'],'source archive hash mismatch/missing')
+    # The recipe authenticates the exact compressed bytes. Permit lossless xz
+    # transcodes as well as the publisher's gzip default; member checks below
+    # apply identically to every supported tar compression.
+    with tarfile.open(archive,'r:*') as t:
+        members=t.getmembers();require(len(members)<=20000 and sum(m.size for m in members)<=512*1024*1024,'source archive extraction budget exceeded')
+        seen=set()
+        for member in members:
+            p=PurePosixPath(member.name)
+            require(not p.is_absolute() and '..' not in p.parts and p.parts and p.parts[0]=='lccc','escaping archive member')
+            require('.git' not in p.parts and '\\' not in member.name and '\0' not in member.name,'unsafe archive member')
+            require(member.name not in seen,'duplicate archive member');seen.add(member.name)
+            require(member.isfile() or member.isdir() or member.issym(),'unsupported archive entry')
+            # Everything above validates the member NAME and never the symlink
+            # TARGET, so on its own this loop accepts `lccc/evil ->
+            # ../../../../etc/passwd`: verified -- the loop returns no verdict
+            # for that member and only tarfile's data filter refuses it
+            # (LinkOutsideDestinationError), while an unfiltered extractall
+            # happily creates the escaping link.  The guarantee therefore cannot
+            # rest on `filter='data'`, which is 3.12+/3.11.4+ against the
+            # Python 3.9+ floor docs/getting-started.md declares.  Reject the
+            # escaping target and the special mode bits here instead, so an old
+            # interpreter loses redundancy rather than protection.  Stricter
+            # than the data filter (which permits a `..` that resolves back
+            # inside), which costs nothing: the snapshot archive this restores
+            # carries 5620 members, zero links and zero special-bit modes.
+            if member.issym():
+                link=PurePosixPath(member.linkname)
+                require(not link.is_absolute() and '..' not in link.parts,'escaping archive link target')
+            require(not member.mode & 0o7000,'setuid/setgid/sticky archive member')
+        # PEP 706 data filter where the interpreter provides it; on the floor
+        # versions the filter is applied by hand instead -- the loop above
+        # covers names/types/links, this covers the metadata half, and together
+        # they are the same guarantee rather than a narrower one.
+        if extractall_takes_filter():
+            t.extractall(stage,filter='data')
+        else:
+            guarded=chmod_ignores_a_none_mode()
+            umask=os.umask(0);os.umask(umask)
+            for member in members:
+                neutralize_archive_attrs(member)
+                if member.isdir() and member.mode is None and not guarded:
+                    # The neutralizer mirrors the data filter, which expresses
+                    # "ignore this member's mode" as mode=None.  An interpreter
+                    # whose chmod predates PEP 706's None guard passes that
+                    # straight to os.chmod() and dies on every directory, so
+                    # give the directory the mode the guard-era interpreter
+                    # ends up with after its own unfiltered `_extract_member`:
+                    # os.mkdir's default (`0o777 & ~umask`) — the filter never
+                    # puts a directory back to the archive's mode, and the
+                    # group/other-write clamp this helper exists for is
+                    # unaffected because the umask can only CLEAR bits.
+                    member.mode=0o777&~umask
+            t.extractall(stage)
+    repo=stage/'lccc';require(repo.is_dir(),'source root missing');return repo
+
+
+def init(repo,branch):
+    repo.mkdir(parents=True,exist_ok=True);git(repo,'init','-q');git(repo,'check-ref-format','refs/heads/'+branch)
+    git(repo,'symbolic-ref','HEAD','refs/heads/'+branch)
+    git(repo,'config','user.name','LCCC source recovery');git(repo,'config','user.email','recovery@lccc.local')
+
+
+def source_tree(repo,r):
+    git(repo,'add','-f','-A');tree=git(repo,'write-tree');require(tree==r['tree'],'source archive does not reproduce the recorded Git tree')
+
+
+def offline_base(stage,artifacts,r,*,patch=None):
+    repo=extract(artifacts/r['archive'],stage,r);init(repo,r['branch']);source_tree(repo,r)
+    patch=Path(patch) if patch is not None else artifacts.parent/r['patch']
+    require(patch.is_file() and not patch.is_symlink() and sha(patch)==r['patch_sha256'],'cumulative patch identity mismatch/missing')
+    git(repo,'apply','--reverse','--check',str(patch.resolve()))
+    git(repo,'apply','--reverse',str(patch.resolve()));git(repo,'add','-f','-A')
+    raw=base64.b64decode(r['base_commit_base64'],validate=True);base_tree=raw.splitlines()[0].decode().split(' ')
+    require(len(base_tree)==2 and base_tree[0]=='tree' and git(repo,'write-tree')==base_tree[1],'reverse patch did not reconstruct BASE tree')
+    value=git(repo,'hash-object','-t','commit','-w','--stdin',input=raw);require(value==r['base'],'reconstructed BASE commit mismatch')
+    # Missing BASE parents are deliberate, like a depth=1 upstream fetch. No
+    # commit identity is rewritten; fsck knows this authenticated shallow edge.
+    (repo/'.git/shallow').write_text(r['base']+'\n')
+    git(repo,'update-ref','refs/heads/'+r['branch'],r['base'])
+    return repo
+
+
+def ensure_base_ancestry(repo,upstream,base):
+    """Deepen BASE so a session range that merged upstream can verify.
+
+    A bundle whose range merges upstream lists the OLD fork point as a second
+    prerequisite beside BASE, which a `--depth=1` BASE cannot satisfy -- the
+    bundle restores perfectly from BASE *and its ancestry*, which is what an
+    upstream clone has.  Deepen instead of declaring a good bundle broken.
+    """
+    if git(repo,'rev-parse','--is-shallow-repository')=='true':
+        git(repo,'fetch','-q','--unshallow','--no-tags',upstream,base)
+    else:
+        git(repo,'fetch','-q','--no-tags',upstream,base)
+
+
+def resolve_bundle(stage,artifacts,b):
+    """Materialize only the authenticated bundle in private temporary storage.
+
+    A corrupt standalone bundle never silently falls back to another copy.
+    The optional solid archive saves duplicate pack payloads across checkpoints;
+    no archive paths, links, owners or permissions are applied to the filesystem.
+    """
+    bundle=artifacts/b['bundle']
+    if bundle.exists() or bundle.is_symlink():
+        require(bundle.is_file() and not bundle.is_symlink() and sha(bundle)==b['bundle_sha256'],
+                'session bundle identity mismatch')
+        return bundle
+    require('bundle_archive' in b,'session bundle missing')
+    archive=artifacts/b['bundle_archive']
+    require(archive.is_file() and not archive.is_symlink() and sha(archive)==b['bundle_archive_sha256'],
+            'bundle archive identity mismatch/missing')
+    destination=stage/'session.bundle'
+    try:
+        with tarfile.open(archive,'r:*') as tar:
+            names=set();total=0;selected=None
+            for member in tar:
+                name(member.name)
+                require(member.isfile() and member.name not in names,'unsafe/duplicate bundle archive member')
+                names.add(member.name);total+=member.size
+                require(bundle_archive_within_budget(len(names), member.size, total),
+                        'bundle archive budget exceeded')
+                if member.name==b['bundle']:selected=member
+            require(selected is not None,'named bundle absent from archive')
+            with tar.extractfile(selected) as source,destination.open('xb') as output:
+                shutil.copyfileobj(source,output,1024*1024)
+    except tarfile.TarError as exc:
+        raise ValueError('invalid bundle archive') from exc
+    require(sha(destination)==b['bundle_sha256'],'archived bundle identity mismatch')
+    return destination
+
+
+def exact_restore(stage,artifacts,b,recipe,upstream,offline,patch):
+    bundle=resolve_bundle(stage,artifacts,b)
+    require(recipe is None or (recipe['head'],recipe['tree'],recipe['base'],recipe['branch'])==(b['head'],b['tree'],b['base'],b['branch']),'bundle/source generations differ; use latest verified source fallback')
+    method='upstream-base';repo=stage/'lccc';network_error=None
+    if not offline:
+        init(repo,b['branch'])
+        try:git(repo,'fetch','-q','--depth=1','--no-tags',upstream,b['base'])
+        except (OSError,ValueError,subprocess.SubprocessError) as exc:network_error=str(exc);shutil.rmtree(repo)
+    if offline or network_error:
+        require(recipe is not None,'offline exact history requires the source/patch/BASE recipe')
+        repo=offline_base(stage,artifacts,recipe,patch=patch);method='offline-reconstructed-base'
+    try:
+        git(repo,'bundle','verify',str(bundle.resolve()))
+    except (OSError,ValueError,subprocess.SubprocessError):
+        # Reported as exact-history failure only when BASE's ancestry cannot
+        # help either: offline reconstruction has BASE alone by construction.
+        require(method=='upstream-base' and not offline,
+                'session bundle needs BASE ancestry; the offline recipe has BASE alone')
+        ensure_base_ancestry(repo,upstream,b['base'])
+        git(repo,'bundle','verify',str(bundle.resolve()))
+    git(repo,'fetch','-q',str(bundle.resolve()),'refs/heads/'+b['branch'])
+    git(repo,'checkout','-q','-B',b['branch'],'FETCH_HEAD')
+    require(git(repo,'rev-parse','HEAD')==b['head'] and git(repo,'rev-parse','HEAD^{tree}')==b['tree'],'session history restore mismatch')
+    git(repo,'fsck','--full','--no-reflogs')
+    return repo,dict(mode=method,exact_history=True,head=b['head'],tree=b['tree'],branch=b['branch'],base=b['base'],upstream_fetch_error=network_error)
+
+
+def recover(repo,artifacts,*,upstream=UPSTREAM,offline=False,preserve_worktree=False,patch=None,allow_source_fallback=True):
+    repo=Path(repo).absolute();artifacts=Path(artifacts).absolute()
+    require(not repo.is_symlink(),'destination repository must not be a symlink')
+    require(not (repo/'.git').exists(),'Git metadata already exists; recovery never overwrites it')
+    require(not repo.exists() or repo.is_dir(),'destination is not a directory')
+    require(not repo.exists() or not any(repo.iterdir()) or preserve_worktree,'nonempty worktree requires --preserve-worktree')
+    repo.parent.mkdir(parents=True,exist_ok=True)
+    recipe=recipe_metadata(artifacts/'SOURCE_ARCHIVE.json') if (artifacts/'SOURCE_ARCHIVE.json').is_file() else None
+    b=bundle_metadata(artifacts/'SESSION_BUNDLE.json') if (artifacts/'SESSION_BUNDLE.json').is_file() else None
+    with tempfile.TemporaryDirectory(prefix='.lccc-recover-',dir=repo.parent) as td:
+        stage=Path(td);error=None
+        try:
+            if b is not None:restored,result=exact_restore(stage,artifacts,b,recipe,upstream,offline,patch)
+            elif (artifacts/'lccc.bundle').is_file():
+                legacy=stage/'lccc';git(stage,'clone','-q',str((artifacts/'lccc.bundle').resolve()),str(legacy))
+                restored=legacy;result=dict(mode='legacy-full-bundle',exact_history=True,head=git(legacy,'rev-parse','HEAD'),tree=git(legacy,'rev-parse','HEAD^{tree}'),branch=git(legacy,'branch','--show-current'))
+            else:raise ValueError('no session/legacy bundle available')
+        except (OSError,ValueError,subprocess.SubprocessError) as exc:
+            error=str(exc)
+            require(allow_source_fallback and recipe is not None,error+'; verified source fallback unavailable/disallowed')
+            shutil.rmtree(stage/'lccc',ignore_errors=True)
+            restored=extract(artifacts/recipe['archive'],stage,recipe);init(restored,recipe['branch']);source_tree(restored,recipe)
+            git(restored,'commit','-qm','Offline source snapshot recovery (not original history)')
+            result=dict(mode='verified-source-fallback',exact_history=False,original_head=recipe['head'],head=git(restored,'rev-parse','HEAD'),
+                        tree=recipe['tree'],branch=recipe['branch'],history_restore_error=error,
+                        warning='source is complete; original commits/BASE ancestry unavailable: restore exact bundle before rebasing/snapshotting')
+        git(restored,'remote','add','origin',upstream) if not git(restored,'remote') else git(restored,'remote','set-url','origin',upstream)
+        if preserve_worktree and repo.exists():
+            os.replace(restored/'.git',repo/'.git');result['worktree_preserved']=True
+        else:
+            os.replace(restored,repo);result['worktree_preserved']=False
+        require(git(repo,'rev-parse','HEAD')==result['head'],'published Git metadata identity mismatch')
+        return result
+
+
+def main(argv=None):
+    ap=argparse.ArgumentParser(description=__doc__.splitlines()[0]);ap.add_argument('--repo',type=Path,required=True)
+    ap.add_argument('--artifacts',type=Path,default=Path('/home/user/artifacts'));ap.add_argument('--upstream',default=UPSTREAM)
+    ap.add_argument('--offline',action='store_true');ap.add_argument('--preserve-worktree',action='store_true');ap.add_argument('--patch',type=Path)
+    ap.add_argument('--require-exact-history',action='store_true');args=ap.parse_args(argv)
+    try:r=recover(args.repo,args.artifacts,upstream=args.upstream,offline=args.offline,preserve_worktree=args.preserve_worktree,patch=args.patch,allow_source_fallback=not args.require_exact_history)
+    except (OSError,ValueError,KeyError,subprocess.SubprocessError,tarfile.TarError) as exc:
+        print('recovery FAILED; destination/user worktree preserved: '+str(exc),file=__import__('sys').stderr);return 1
+    print(json.dumps(r,sort_keys=True,allow_nan=False));return 0
+
+
+if __name__=='__main__':raise SystemExit(main())

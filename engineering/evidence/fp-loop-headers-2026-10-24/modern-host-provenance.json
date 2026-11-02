@@ -1,0 +1,110 @@
+{
+  "scope": "Reproduce the already executed SSE2 benchmark ELFs with the matched GCC16 host-driver compiler pair",
+  "host_driver": "gcc (GCC) 16.2.0",
+  "gnu_target_linker": "GNU ld (GNU Binutils) 2.47.20260726",
+  "rust_host_linker": "LLD 22.1.6 (/checkout/src/llvm-project/llvm 08c84e69a84d95936296dfcab0e38b34100725d5) (compatible with GNU linkers)",
+  "compiler_sha256": {
+    "lccc": "6ad2a3302d0fbbb19d9ceff573eab5ff1607ffb9e8175821364e3bc9176d8c08",
+    "baseline": "0ca1f0bb4baec617fbd248b994ff088fb8105dd48dafba4c6c789879de9f7261"
+  },
+  "cases": [
+    {
+      "name": "matmul",
+      "arm": "lccc",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-I/home/user/.cache/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64",
+        "-DN=1024",
+        "-o",
+        "/home/user/artifacts/audit/relinked-matmul-lccc",
+        "/home/user/lccc/tests/benchmark/programs/matmul.c"
+      ],
+      "elf_sha256": "b9deab695ea999da306b951061d434a186a06359f2834cefb80552c3a169ce89",
+      "identical_to_executed_sample": true
+    },
+    {
+      "name": "spectral_norm",
+      "arm": "lccc",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-I/home/user/.cache/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64",
+        "-DN=3072",
+        "-o",
+        "/home/user/artifacts/audit/relinked-spectral_norm-lccc",
+        "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+        "-lm"
+      ],
+      "elf_sha256": "460a2696938963fd30be38fdb750b30ce14a0fe156d416d6b18cdcbc987a15ad",
+      "identical_to_executed_sample": true
+    },
+    {
+      "name": "gzip_longest_match",
+      "arm": "lccc",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-I/home/user/.cache/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64",
+        "-DPASSES=131072",
+        "-o",
+        "/home/user/artifacts/audit/relinked-gzip_longest_match-lccc",
+        "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+      ],
+      "elf_sha256": "aa7614b7770e62288f015fb8b846bd658f6fe8107ab9fe9906d6d878e423394f",
+      "identical_to_executed_sample": true
+    },
+    {
+      "name": "matmul",
+      "arm": "baseline",
+      "command": [
+        "/home/user/artifacts/audit/lccc-baseline-modern",
+        "-I/home/user/.cache/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64",
+        "-DN=1024",
+        "-o",
+        "/home/user/artifacts/audit/relinked-matmul-baseline",
+        "/home/user/lccc/tests/benchmark/programs/matmul.c"
+      ],
+      "elf_sha256": "b9deab695ea999da306b951061d434a186a06359f2834cefb80552c3a169ce89",
+      "identical_to_executed_sample": true
+    },
+    {
+      "name": "spectral_norm",
+      "arm": "baseline",
+      "command": [
+        "/home/user/artifacts/audit/lccc-baseline-modern",
+        "-I/home/user/.cache/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64",
+        "-DN=3072",
+        "-o",
+        "/home/user/artifacts/audit/relinked-spectral_norm-baseline",
+        "/home/user/lccc/tests/benchmark/programs/spectral_norm.c",
+        "-lm"
+      ],
+      "elf_sha256": "460a2696938963fd30be38fdb750b30ce14a0fe156d416d6b18cdcbc987a15ad",
+      "identical_to_executed_sample": true
+    },
+    {
+      "name": "gzip_longest_match",
+      "arm": "baseline",
+      "command": [
+        "/home/user/artifacts/audit/lccc-baseline-modern",
+        "-I/home/user/.cache/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-march=x86-64",
+        "-DPASSES=131072",
+        "-o",
+        "/home/user/artifacts/audit/relinked-gzip_longest_match-baseline",
+        "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+      ],
+      "elf_sha256": "aa7614b7770e62288f015fb8b846bd658f6fe8107ab9fe9906d6d878e423394f",
+      "identical_to_executed_sample": true
+    }
+  ]
+}

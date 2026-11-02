@@ -1,0 +1,15 @@
+
+tests/benchmark/programs/zlib_ng_adler32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              244     35      10      11      23    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/expat_siphash24.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc              756    128      77     128      56    1.00x  x86-64 icc 2021.10.0
+
+tests/benchmark/programs/gzip_crc32.c :: <all functions>
+compiler       insns  loads  stores   stack  branch   best-x  name
+--------------------------------------------------------------------------------------------
+icc               60      7       6       3       6    1.00x  x86-64 icc 2021.10.0

@@ -1,0 +1,18 @@
+{
+  "fp32_product_map": {
+    "before": "c732fdd47d1fcb88e6798b97c9616417f2e133c78805018ec2dfb9c859b333a4",
+    "lccc": "c732fdd47d1fcb88e6798b97c9616417f2e133c78805018ec2dfb9c859b333a4"
+  },
+  "fp64_product_map": {
+    "before": "f1de5294f47f53e07e1dcdaa89816d06bd4e5fa5a15ebca19e27aebd8b0bd962",
+    "lccc": "f1de5294f47f53e07e1dcdaa89816d06bd4e5fa5a15ebca19e27aebd8b0bd962"
+  },
+  "i32_product_map": {
+    "before": "8b3f6d6691e8c37bb09de4216c4d629b414c97efea4bf0e16695ebfaaa5523fd",
+    "lccc": "8b3f6d6691e8c37bb09de4216c4d629b414c97efea4bf0e16695ebfaaa5523fd"
+  },
+  "nbody": {
+    "before": "3d9bf1a8808b763314985245becb8837e7625e106ee765cc31337cfe5cbd965f",
+    "lccc": "3d9bf1a8808b763314985245becb8837e7625e106ee765cc31337cfe5cbd965f"
+  }
+}

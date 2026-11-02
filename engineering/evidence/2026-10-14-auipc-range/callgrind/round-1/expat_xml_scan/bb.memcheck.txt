@@ -1,0 +1,15 @@
+0
+==26844== Memcheck, a memory error detector
+==26844== Copyright (C) 2002-2024, and GNU GPL'd, by Julian Seward et al.
+==26844== Using Valgrind-3.24.0 and LibVEX; rerun with -h for copyright info
+==26844== Command: /home/user/.cache/current-callgrind/round-1/expat_xml_scan/bb/expat_xml_scan
+==26844== 
+==26844== 
+==26844== HEAP SUMMARY:
+==26844==     in use at exit: 0 bytes in 0 blocks
+==26844==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated
+==26844== 
+==26844== All heap blocks were freed -- no leaks are possible
+==26844== 
+==26844== For lists of detected and suppressed errors, rerun with: -s
+==26844== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)

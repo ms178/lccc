@@ -1,0 +1,66 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 20s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 58 tests
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_branch_inside_the_bracket_blocks_it ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_call_inside_the_bracket_blocks_it ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_dead_vector_copy_is_deleted_and_a_live_one_is_not ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_cancelling_copy_pair_is_deleted ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_non_preserving_earlier_copy_into_the_result_register_blocks_the_rewrite ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_scalar_rounding_bracket_collapses_to_one_instruction ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_source_read_inside_the_bracket_blocks_coalescing ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_narrow_copy_into_a_private_temporary_widens ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_two_argument_fp_bracket_collapses_to_the_oracle_form ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_vex_producer_whose_result_is_only_copied_writes_the_target_directly ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_temporary_live_outside_the_bracket_blocks_coalescing ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_wide_interior_access_blocks_a_narrow_bracket ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::a_wide_read_of_the_source_after_the_bracket_blocks_it ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::an_fma_bracket_whose_result_is_a_multiplicand_becomes_one_213_form ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::all_four_fma_families_rotate_the_same_way ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::an_fma_bracket_whose_result_is_the_other_multiplicand_takes_213 ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::an_fma_bracket_whose_result_is_the_addend_keeps_231_and_moves_the_destination ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::brackets_do_not_rename_implicit_vector_inputs ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::builtin_fma_reaches_the_single_instruction_the_oracles_emit ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::coalescing_refuses_implicit_state_observers ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::copy_forms_carry_their_upper_bit_semantics ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::an_opaque_directive_blocks_but_cfi_does_not ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::explicit_only_vector_operations_still_admit_propagation ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_132_bracket_from_the_mul_add_shape_collapses_to_one_instruction ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::copysign_reaches_the_three_instructions_clang_emits ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_copy_out_only_re_homes_the_result_when_the_accumulator_is_dead ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_bracket_with_a_memory_multiplicand_keeps_it_at_operand_zero ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_accepts_a_copy_in_wider_than_the_element ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_does_not_reach_across_a_barrier ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_refuses_a_copy_out_wider_than_the_element ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reaches_a_single_fused_instruction ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_refuses_a_result_register_that_is_not_an_operand ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_refuses_a_temporary_that_is_not_private ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_refuses_a_temporary_that_is_also_an_operand ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_refuses_packed_and_masked_forms ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_reassociation_refuses_to_see_through_a_copy_in_narrower_than_the_element ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_run_follows_a_chain_of_copies_to_the_true_origin ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_result_register_upper_bits_are_protected ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_run_refuses_when_any_deleted_destination_is_still_read ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_run_stops_at_a_copy_that_does_not_feed_the_fma ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::masked_move_source_must_not_replace_the_masked_result ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::fma_squared_norm_shape_with_a_swap_run_collapses_to_gcc_text ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::masked_moves_do_not_establish_unconditional_copy_facts ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::masked_moves_cannot_close_or_open_a_copy_bracket ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::mention_widths_follow_the_mnemonic_not_the_spelling ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::propagate_stops_before_a_destination_write ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::propagation_does_not_cross_implicit_vector_outputs ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::propagation_refuses_implicit_vector_clobbers ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::reads_are_rewritten_and_the_destination_is_not ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::propagation_does_not_cross_a_width_it_cannot_prove ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::rename_is_exact_on_digit_boundaries ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::retargeting_refuses_implicit_wide_observers ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::the_result_retarget_refuses_every_case_it_must ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::vzeroupper_inside_the_bracket_blocks_it ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::the_pass_leaves_integer_and_mixed_code_alone ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::widening_refuses_implicit_earlier_definitions ... ok
+test backend::x86::codegen::peephole::types::classify_directive_tests::vector_copy_shares_the_law_instead_of_keeping_its_own ... ok
+test backend::x86::codegen::peephole::passes::vector_copy::tests::ymm_brackets_coalesce_too ... ok
+
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 4672 filtered out; finished in 0.02s
+

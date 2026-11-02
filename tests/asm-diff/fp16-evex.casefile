@@ -1,0 +1,811 @@
+# AVX512-FP16 (EVEX maps 5/6) + compare-to-EFLAGS + conversion decorator
+# matrix + {1toN} count law. Generated from the audit-response oracle
+# battery (every accept AND reject re-validated against GAS 2.47.20260726
+# at generation time; asmdiff re-checks both assemblers per run).
+;;; fp16_arith_ph
+.text
+vaddpd (%rdx){1to8}, %zmm1, %zmm2
+vaddph (%rdx){1to16}, %ymm1, %ymm2
+vaddph (%rdx){1to32}, %zmm1, %zmm2
+vaddph (%rdx){1to8}, %xmm1, %xmm2
+vaddps (%rdx){1to16}, %zmm1, %zmm2
+vaddss %xmm1, %xmm2, %xmm3
+vaddss %xmm1, %xmm2, %xmm3{%k7}{z}
+vaddss -256(%rdx), %xmm5, %xmm6
+vminmaxbf16 $1, %zmm1, %zmm2, %zmm3
+vminmaxpd $2, %zmm1, %zmm2, %zmm3
+vminmaxph $3, %zmm1, %zmm2, %zmm3
+vminmaxps $1, %zmm1, %zmm2, %zmm3
+vminmaxps $1, %zmm1, %zmm2, %zmm3{%k7}{z}
+vminmaxps $1, (%rax){1to16}, %zmm1, %zmm2
+vminmaxps $1, (%rdx){1to16}, %zmm1, %zmm2
+;;; fp16_bcst_counts
+.text
+valignd $1, (%rdx){1to16}, %zmm1, %zmm2
+valignq $1, (%rdx){1to8}, %zmm1, %zmm2
+vfixupimmps $1, (%rdx){1to16}, %zmm1, %zmm2
+vpabsq (%rdx){1to8}, %zmm2
+vpaddd (%rdx){1to16}, %zmm1, %zmm2
+vpcmpd $1, (%rdx){1to16}, %zmm1, %k2
+vpconflictd (%rdx){1to16}, %zmm2
+vpermi2d (%rdx){1to16}, %zmm1, %zmm2
+vpermilpd (%rdx){1to8}, %zmm1, %zmm2
+vpermilps (%rdx){1to16}, %zmm1, %zmm2
+vpermpd $123, (%rax){1to8}, %zmm6
+vpermq $123, (%rax){1to4}, %ymm6{%k7}
+vpmadd52luq (%rdx){1to8}, %zmm1, %zmm2
+vpshldd $1, (%rdx){1to16}, %zmm1, %zmm2
+vpternlogd $-1, %zmm1, %zmm2, %zmm3
+vpternlogd $1, (%rdx){1to16}, %zmm1, %zmm2
+vrangeps $1, (%rdx){1to16}, %zmm1, %zmm2
+vshufi64x2 $1, (%rdx){1to8}, %zmm1, %zmm2
+vshufpd $1, (%rdx){1to2}, %xmm29, %xmm30
+vshufps $1, (%rdx){1to4}, %xmm1, %xmm2
+vunpckhpd (%rdx){1to8}, %zmm1, %zmm2
+vunpcklpd (%rdx){1to2}, %xmm1, %xmm2
+vunpcklps (%rdx){1to4}, %xmm1, %xmm2
+;;; fp16_comis
+.text
+vcomisd %xmm16, %xmm1
+vcomisd (%rax), %xmm2
+vcomisd -128(%rdx), %xmm20
+vcomisd 128(%rdx), %xmm20
+vcomisd 64(%rdx), %xmm20
+vcomisd {sae}, %xmm1, %xmm2
+vcomish %xmm1, %xmm2
+vcomish %xmm1, %xmm20
+vcomish %xmm1, %xmm31
+vcomish %xmm16, %xmm1
+vcomish (%rax), %xmm2
+vcomish -128(%rdx), %xmm2
+vcomish -129(%rdx), %xmm2
+vcomish 127(%rdx), %xmm2
+vcomish 128(%rdx), %xmm2
+vcomish 511(%rdx), %xmm2
+vcomish 512(%rdx), %xmm2
+vcomish {sae}, %xmm1, %xmm2
+vcomiss %xmm1, %xmm2
+vcomiss %xmm1, %xmm20
+vcomiss %xmm16, %xmm1
+vcomiss (%rax), %xmm2
+vcomiss -128(%rdx), %xmm20
+vcomiss 127(%rdx), %xmm20
+vcomiss 64(%rdx), %xmm20
+vcomiss {sae}, %xmm1, %xmm2
+vcomiss {sae}, %xmm16, %xmm1
+vucomisd {sae}, %xmm1, %xmm2
+vucomish %xmm1, %xmm2
+vucomish (%rax), %xmm2
+vucomish 64(%rdx), %xmm2
+vucomish {sae}, %xmm1, %xmm2
+vucomiss %xmm20, %xmm5
+vucomiss {sae}, %xmm1, %xmm2
+;;; fp16_convert
+.text
+vcvtdq2pd %ymm1, %zmm2
+vcvtdq2ph {rn-sae}, %zmm1, %ymm2
+vcvtdq2ps {rn-sae}, %zmm1, %zmm2
+vcvtpd2dq {rn-sae}, %zmm1, %ymm2
+vcvtpd2ph %ymm1, %xmm2
+vcvtpd2ph %zmm1, %xmm2
+vcvtpd2ph {rn-sae}, %zmm1, %xmm2
+vcvtpd2ps {rn-sae}, %zmm1, %ymm2
+vcvtpd2qq {rn-sae}, %zmm1, %zmm2
+vcvtpd2uqq {rn-sae}, %zmm1, %zmm2
+vcvtph2dq %xmm1, %xmm2
+vcvtph2dq %xmm1, %ymm2
+vcvtph2dq %ymm1, %zmm2
+vcvtph2dq (%rax){1to16}, %zmm2
+vcvtph2dq (%rax){1to8}, %ymm2
+vcvtph2dq {rn-sae}, %ymm1, %zmm2
+vcvtph2pd %xmm1, %xmm2
+vcvtph2pd %xmm1, %ymm2
+vcvtph2pd %xmm1, %zmm2
+vcvtph2pd (%rax), %xmm2
+vcvtph2pd (%rax), %ymm2
+vcvtph2pd (%rax){1to2}, %xmm2
+vcvtph2pd (%rax){1to4}, %ymm2
+vcvtph2pd (%rax){1to8}, %zmm2
+vcvtph2pd 32(%rdx), %xmm2
+vcvtph2pd 64(%rdx), %zmm2
+vcvtph2pd 8(%rdx), %ymm2
+vcvtph2pd {sae}, %xmm1, %zmm2
+vcvtph2psx %xmm1, %xmm2
+vcvtph2psx %xmm1, %ymm2
+vcvtph2psx %ymm1, %zmm2
+vcvtph2psx (%rax), %xmm2
+vcvtph2psx (%rax){1to16}, %zmm2
+vcvtph2psx (%rax){1to4}, %xmm2
+vcvtph2psx (%rax){1to8}, %ymm2
+vcvtph2psx 16(%rdx), %ymm2
+vcvtph2psx 32(%rdx), %zmm2
+vcvtph2psx {sae}, %ymm1, %zmm2
+vcvtph2qq %xmm1, %xmm2
+vcvtph2qq %xmm1, %ymm2
+vcvtph2qq %xmm1, %zmm2
+vcvtph2qq (%rax){1to2}, %xmm2
+vcvtph2qq (%rax){1to8}, %zmm2
+vcvtph2qq {rn-sae}, %xmm1, %zmm2
+vcvtph2udq {rn-sae}, %ymm1, %zmm2
+vcvtph2uqq %xmm1, %ymm2
+vcvtph2uqq %xmm1, %zmm2
+vcvtph2uqq {rn-sae}, %xmm1, %zmm2
+vcvtph2uw {rn-sae}, %zmm1, %zmm2
+vcvtph2w {rn-sae}, %zmm1, %zmm2
+vcvtps2dq {rn-sae}, %zmm1, %zmm2
+vcvtps2pd %xmm1, %xmm2
+vcvtps2pd %xmm1, %ymm2
+vcvtps2pd %ymm1, %zmm2
+vcvtps2pd {sae}, %ymm1, %zmm2
+vcvtps2phx {rn-sae}, %zmm1, %ymm2
+vcvtps2qq {rn-sae}, %ymm1, %zmm2
+vcvtps2udq {rn-sae}, %zmm1, %zmm2
+vcvtps2uqq {rn-sae}, %ymm1, %zmm2
+vcvtqq2pd {rn-sae}, %zmm1, %zmm2
+vcvtqq2ph %ymm1, %xmm2
+vcvtqq2ph %zmm1, %xmm2
+vcvtqq2ph {rn-sae}, %zmm1, %xmm2
+vcvtqq2ps {rn-sae}, %zmm1, %ymm2
+vcvtsd2ss {rn-sae}, %xmm1, %xmm2, %xmm3
+vcvtss2sd {sae}, %xmm1, %xmm2, %xmm3
+vcvttpd2dq {sae}, %zmm1, %ymm2
+vcvttpd2qq {sae}, %zmm1, %zmm2
+vcvttpd2uqq {sae}, %zmm1, %zmm2
+vcvttph2dq %xmm1, %xmm2
+vcvttph2dq %xmm1, %ymm2
+vcvttph2dq %ymm1, %zmm2
+vcvttph2dq (%rax), %zmm2
+vcvttph2dq (%rax){1to16}, %zmm2
+vcvttph2dq {sae}, %ymm1, %zmm2
+vcvttph2qq %xmm1, %xmm2
+vcvttph2qq %xmm1, %ymm2
+vcvttph2qq %xmm1, %zmm2
+vcvttph2qq (%rax){1to8}, %zmm2
+vcvttph2qq {sae}, %xmm1, %zmm2
+vcvttph2udq %xmm1, %ymm2
+vcvttph2udq %ymm1, %zmm2
+vcvttph2udq {sae}, %ymm1, %zmm2
+vcvttph2uqq %xmm1, %zmm2
+vcvttph2uqq {sae}, %xmm1, %zmm2
+vcvttph2uw %zmm1, %zmm2
+vcvttph2uw (%rax){1to32}, %zmm2
+vcvttph2uw {sae}, %zmm1, %zmm2
+vcvttph2w %xmm1, %xmm2
+vcvttph2w %ymm1, %ymm2
+vcvttph2w %zmm1, %zmm2
+vcvttph2w (%rax){1to32}, %zmm2
+vcvttph2w {sae}, %zmm1, %zmm2
+vcvttps2dq {sae}, %zmm1, %zmm2
+vcvttps2qq {sae}, %ymm1, %zmm2
+vcvttps2udq {sae}, %zmm1, %zmm2
+vcvttps2uqq {sae}, %ymm1, %zmm2
+vcvtudq2pd %ymm1, %zmm2
+vcvtudq2ph {rn-sae}, %zmm1, %ymm2
+vcvtudq2ps {rn-sae}, %zmm1, %zmm2
+vcvtuqq2pd {rn-sae}, %zmm1, %zmm2
+vcvtuqq2ph {rn-sae}, %zmm1, %xmm2
+vcvtuqq2ps {rn-sae}, %zmm1, %ymm2
+vcvtuw2ph {rn-sae}, %zmm1, %zmm2
+vcvtw2ph {rn-sae}, %zmm1, %zmm2
+;;; fp16_imm2
+.text
+vgetmantpd $1, (%rdx){1to8}, %zmm2
+vgetmantph $0x2, %xmm1, %xmm2
+vgetmantph $0x2, %ymm1, %ymm2
+vgetmantph $0x2, %zmm1, %zmm2
+vgetmantph $0x2, %zmm1, %zmm2{%k7}
+vgetmantph $0x2, (%rax), %zmm2
+vgetmantph $0x2, (%rax){1to32}, %zmm2
+vgetmantph $0x2, {sae}, %zmm1, %zmm2
+vgetmantph $1, (%rdx){1to32}, %zmm2
+vgetmantps $0x2, %zmm1, %zmm2
+vgetmantps $0x2, {sae}, %zmm1, %zmm2
+vgetmantps $1, (%rdx){1to16}, %zmm2
+vreduceph $1, %zmm1, %zmm2
+vreduceph $1, {sae}, %zmm1, %zmm2
+vreduceps $1, {sae}, %zmm1, %zmm2
+vrndscaleph $0x12, %zmm1, %zmm2
+vrndscaleph $0x12, {sae}, %zmm1, %zmm2
+vrndscaleph $1, (%rdx){1to32}, %zmm2
+vrndscaleps $0x12, {sae}, %zmm1, %zmm2
+;;; fp16_misc
+.text
+vcmppd $1, (%rdx){1to8}, %zmm1, %k2
+vexp2pd (%rax){1to8}, %zmm2
+vexp2ps %zmm1, %zmm2
+vexp2ps (%rax){1to16}, %zmm2
+vexp2ps {sae}, %zmm1, %zmm2
+vfmadd132ph (%rdx){1to32}, %zmm1, %zmm2
+vfmadd132sd {rn-sae}, %xmm1, %xmm2, %xmm3
+vfmadd132ss %xmm1, %xmm2, %xmm3{%k7}
+vfmadd231ss %xmm1, %xmm2, %xmm3{%k2}{z}
+vfmsub132sd -512(%rdx), %xmm5, %xmm6
+vfnmsub213sd %xmm16, %xmm1, %xmm2
+vrcp28pd (%rax){1to8}, %zmm2
+vrcp28ps (%rax){1to16}, %zmm2
+vrsqrt28pd (%rax){1to8}, %zmm2
+vrsqrt28ps (%rax){1to16}, %zmm2
+{evex}vcomish %xmm1, %xmm2
+{evex}vcomiss %xmm1, %xmm2
+{evex}vucomisd %xmm1, %xmm2
+;;; fp16_movsh
+.text
+vmovsh %xmm1, %xmm2, %xmm3
+vmovsh %xmm1, %xmm2, %xmm3{%k7}
+vmovsh %xmm1, %xmm2, %xmm3{%k7}{z}
+vmovsh %xmm16, %xmm20, %xmm3
+vmovsh %xmm5, %xmm6, %xmm7{%k2}{z}
+vmovsh %xmm5, (%rax)
+vmovsh %xmm5, (%rax){%k7}
+vmovsh %xmm5, -256(%rdx)
+vmovsh (%rax), %xmm20
+vmovsh (%rax), %xmm5
+vmovsh (%rax), %xmm5{%k7}
+vmovsh -256(%rdx), %xmm5
+;;; fp16_movssd
+.text
+vmovsd -1024(%rdx), %xmm5
+vmovss %xmm4, %xmm5, %xmm6
+vmovss (%rax), %xmm5{%k7}
+vmovss -256(%rdx), %xmm5
+;;; fp16_scalar_sh
+.text
+vaddsh %xmm1, %xmm2, %xmm3
+vaddsh %xmm1, %xmm2, %xmm3{%k7}
+vaddsh %xmm1, %xmm2, %xmm3{%k7}{z}
+vaddsh %xmm16, %xmm20, %xmm3
+vaddsh (%rdx), %xmm5, %xmm6
+vaddsh -256(%rdx), %xmm5, %xmm6
+vaddsh {rn-sae}, %xmm1, %xmm2, %xmm3
+vfcmulcsh {rz-sae}, %xmm1, %xmm2, %xmm3
+vfmaddcsh {rn-sae}, %xmm1, %xmm2, %xmm3
+vfmulcsh {ru-sae}, %xmm1, %xmm2, %xmm3
+vgetexpsh {sae}, %xmm1, %xmm2, %xmm3
+vmaxsh {sae}, %xmm1, %xmm2, %xmm3
+vminsh {sae}, %xmm1, %xmm2, %xmm3
+vrcpsh -256(%rdx), %xmm5, %xmm6
+vscalefsh {rd-sae}, %xmm1, %xmm2, %xmm3
+;;; fp16_sqrt
+.text
+vsqrtph %xmm1, %xmm2
+vsqrtph %ymm1, %ymm2
+vsqrtph %zmm1, %zmm2
+vsqrtph %zmm1, %zmm2{%k7}
+vsqrtph %zmm16, %zmm20
+vsqrtph (%rax), %zmm2
+vsqrtph (%rax){1to16}, %ymm2
+vsqrtph (%rax){1to32}, %zmm2
+vsqrtph {rd-sae}, %zmm1, %zmm2
+vsqrtph {rn-sae}, %zmm1, %zmm2
+vsqrtph {ru-sae}, %zmm1, %zmm2
+vsqrtph {rz-sae}, %zmm1, %zmm2
+vsqrtps %zmm1, %zmm2
+vsqrtps {rn-sae}, %zmm1, %zmm2
+vsqrtsd %xmm16, %xmm1, %xmm2
+vsqrtsd {rz-sae}, %xmm1, %xmm2, %xmm3
+vsqrtsh %xmm1, %xmm2, %xmm3
+vsqrtsh {rn-sae}, %xmm1, %xmm2, %xmm3
+vsqrtsh {rz-sae}, %xmm1, %xmm2, %xmm3
+vsqrtss %xmm1, %xmm2, %xmm3
+vsqrtss %xmm16, %xmm1, %xmm2
+vsqrtss -512(%rdx), %xmm5, %xmm6
+vsqrtss {rn-sae}, %xmm1, %xmm2, %xmm3
+;;; fp16_rej_000_vaddsd reject
+.text
+vaddsd %ymm1, %ymm2, %xmm3
+;;; fp16_rej_001_vaddsh reject
+.text
+vaddsh %xmm1, %xmm2, %ymm3
+;;; fp16_rej_002_vaddsh reject
+.text
+vaddsh %xmm1, %ymm2, %xmm3
+;;; fp16_rej_003_vaddsh reject
+.text
+vaddsh %ymm1, %xmm2, %xmm3
+;;; fp16_rej_004_vaddsh reject
+.text
+vaddsh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_005_vaddsh reject
+.text
+vaddsh %zmm1, %zmm2, %zmm3
+;;; fp16_rej_006_vaddsh reject
+.text
+vaddsh (%rdx){1to2}, %xmm1, %xmm2
+;;; fp16_rej_007_vaddsh reject
+.text
+vaddsh (%rdx){1to2}, %xmm5, %xmm6
+;;; fp16_rej_008_vaddsh reject
+.text
+vaddsh {rz-sae}, %ymm1, %ymm2, %ymm3
+;;; fp16_rej_009_vaddsh reject
+.text
+vaddsh {sae}, %xmm1, %xmm2, %xmm3
+;;; fp16_rej_010_vaddss reject
+.text
+vaddss %ymm1, %ymm2, %ymm3
+;;; fp16_rej_011_vaddss reject
+.text
+vaddss %zmm1, %zmm2, %zmm3
+;;; fp16_rej_012_vcomish reject
+.text
+vcomish %xmm1, %xmm2, %xmm3
+;;; fp16_rej_013_vcomish reject
+.text
+vcomish %xmm1, %xmm2{%k1}
+;;; fp16_rej_014_vcomish reject
+.text
+vcomish %xmm1, %xmm2{%k1}{z}
+;;; fp16_rej_015_vcomish reject
+.text
+vcomish %xmm1, %ymm2
+;;; fp16_rej_016_vcomish reject
+.text
+vcomish %ymm1, %xmm2
+;;; fp16_rej_017_vcomish reject
+.text
+vcomish %zmm1, %zmm2
+;;; fp16_rej_018_vcomish reject
+.text
+vcomish (%rax), %ymm2
+;;; fp16_rej_019_vcomish reject
+.text
+vcomish (%rdx){1to2}, %xmm2
+;;; fp16_rej_020_vcomish reject
+.text
+vcomish (%rdx){1to4}, %xmm2
+;;; fp16_rej_021_vcomish reject
+.text
+vcomish {rz-sae}, %xmm1, %xmm2
+;;; fp16_rej_022_vcomish reject
+.text
+vcomish {sae}, (%rax), %xmm2
+;;; fp16_rej_023_vcomiss reject
+.text
+vcomiss %xmm1, %xmm2{%k1}
+;;; fp16_rej_024_vcomiss reject
+.text
+vcomiss %ymm1, %ymm2
+;;; fp16_rej_025_vcvtdq2pd reject
+.text
+vcvtdq2pd {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_026_vcvtdq2pd reject
+.text
+vcvtdq2pd {rz-sae}, %ymm1, %zmm2
+;;; fp16_rej_027_vcvtdq2pd reject
+.text
+vcvtdq2pd {sae}, %ymm1, %zmm2
+;;; fp16_rej_028_vcvtdq2ph reject
+.text
+vcvtdq2ph (%rax){1to16}, %zmm2
+;;; fp16_rej_029_vcvtdq2ph reject
+.text
+vcvtdq2ph (%rax){1to8}, %ymm2
+;;; fp16_rej_030_vcvtdq2ph reject
+.text
+vcvtdq2ph {sae}, %zmm1, %ymm2
+;;; fp16_rej_031_vcvtdq2ps reject
+.text
+vcvtdq2ps {rn-sae}, %ymm1, %ymm2
+;;; fp16_rej_032_vcvtdq2ps reject
+.text
+vcvtdq2ps {sae}, %zmm1, %zmm2
+;;; fp16_rej_033_vcvtneps2bf16 reject
+.text
+vcvtneps2bf16 (%rax){1to16}, %zmm2
+;;; fp16_rej_034_vcvtneps2bf16 reject
+.text
+vcvtneps2bf16 (%rax){1to8}, %ymm2
+;;; fp16_rej_035_vcvtneps2bf16 reject
+.text
+vcvtneps2bf16 {rn-sae}, %zmm1, %ymm2
+;;; fp16_rej_036_vcvtneps2bf16 reject
+.text
+vcvtneps2bf16 {sae}, %zmm1, %ymm2
+;;; fp16_rej_037_vcvtpd2dq reject
+.text
+vcvtpd2dq {sae}, %zmm1, %ymm2
+;;; fp16_rej_038_vcvtpd2ph reject
+.text
+vcvtpd2ph {sae}, %zmm1, %xmm2
+;;; fp16_rej_039_vcvtpd2ps reject
+.text
+vcvtpd2ps {sae}, %zmm1, %ymm2
+;;; fp16_rej_040_vcvtpd2qq reject
+.text
+vcvtpd2qq {sae}, %zmm1, %zmm2
+;;; fp16_rej_041_vcvtpd2uqq reject
+.text
+vcvtpd2uqq {sae}, %zmm1, %zmm2
+;;; fp16_rej_042_vcvtph2dq reject
+.text
+vcvtph2dq {sae}, %ymm1, %zmm2
+;;; fp16_rej_043_vcvtph2pd reject
+.text
+vcvtph2pd %ymm1, %xmm2
+;;; fp16_rej_044_vcvtph2pd reject
+.text
+vcvtph2pd %ymm1, %zmm2
+;;; fp16_rej_045_vcvtph2pd reject
+.text
+vcvtph2pd (%rax){1to4}, %xmm2
+;;; fp16_rej_046_vcvtph2pd reject
+.text
+vcvtph2pd (%rax){1to8}, %xmm2
+;;; fp16_rej_047_vcvtph2pd reject
+.text
+vcvtph2pd {rn-sae}, %xmm1, %zmm2
+;;; fp16_rej_048_vcvtph2pd reject
+.text
+vcvtph2pd {rz-sae}, %xmm1, %xmm2
+;;; fp16_rej_049_vcvtph2pd reject
+.text
+vcvtph2pd {rz-sae}, %ymm1, %zmm2
+;;; fp16_rej_050_vcvtph2pd reject
+.text
+vcvtph2pd {sae}, %xmm1, %xmm2
+;;; fp16_rej_051_vcvtph2pd reject
+.text
+vcvtph2pd {sae}, %ymm1, %zmm2
+;;; fp16_rej_052_vcvtph2psx reject
+.text
+vcvtph2psx %ymm1, %ymm2
+;;; fp16_rej_053_vcvtph2psx reject
+.text
+vcvtph2psx %zmm1, %zmm2
+;;; fp16_rej_054_vcvtph2psx reject
+.text
+vcvtph2psx (%rax){1to2}, %xmm2
+;;; fp16_rej_055_vcvtph2psx reject
+.text
+vcvtph2psx {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_056_vcvtph2psx reject
+.text
+vcvtph2psx {rz-sae}, %ymm1, %zmm2
+;;; fp16_rej_057_vcvtph2psx reject
+.text
+vcvtph2psx {sae}, %xmm1, %xmm2
+;;; fp16_rej_058_vcvtph2psx reject
+.text
+vcvtph2psx {sae}, %xmm1, %ymm2
+;;; fp16_rej_059_vcvtph2qq reject
+.text
+vcvtph2qq {sae}, %xmm1, %zmm2
+;;; fp16_rej_060_vcvtph2udq reject
+.text
+vcvtph2udq {sae}, %ymm1, %zmm2
+;;; fp16_rej_061_vcvtph2uqq reject
+.text
+vcvtph2uqq {sae}, %xmm1, %zmm2
+;;; fp16_rej_062_vcvtph2uw reject
+.text
+vcvtph2uw {sae}, %zmm1, %zmm2
+;;; fp16_rej_063_vcvtph2w reject
+.text
+vcvtph2w {sae}, %zmm1, %zmm2
+;;; fp16_rej_064_vcvtps2dq reject
+.text
+vcvtps2dq {sae}, %zmm1, %zmm2
+;;; fp16_rej_065_vcvtps2pd reject
+.text
+vcvtps2pd {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_066_vcvtps2pd reject
+.text
+vcvtps2pd {rz-sae}, %ymm1, %zmm2
+;;; fp16_rej_067_vcvtps2pd reject
+.text
+vcvtps2pd {sae}, %xmm1, %xmm2
+;;; fp16_rej_068_vcvtps2pd reject
+.text
+vcvtps2pd {sae}, %xmm1, %ymm2
+;;; fp16_rej_069_vcvtps2phx reject
+.text
+vcvtps2phx {sae}, %zmm1, %ymm2
+;;; fp16_rej_070_vcvtps2qq reject
+.text
+vcvtps2qq {rn-sae}, %xmm1, %xmm2
+;;; fp16_rej_071_vcvtps2qq reject
+.text
+vcvtps2qq {rn-sae}, %xmm1, %ymm2
+;;; fp16_rej_072_vcvtps2qq reject
+.text
+vcvtps2qq {sae}, %ymm1, %zmm2
+;;; fp16_rej_073_vcvtps2udq reject
+.text
+vcvtps2udq {sae}, %zmm1, %zmm2
+;;; fp16_rej_074_vcvtps2uqq reject
+.text
+vcvtps2uqq {sae}, %ymm1, %zmm2
+;;; fp16_rej_075_vcvtqq2pd reject
+.text
+vcvtqq2pd {rn-sae}, %ymm1, %ymm2
+;;; fp16_rej_076_vcvtqq2pd reject
+.text
+vcvtqq2pd {sae}, %zmm1, %zmm2
+;;; fp16_rej_077_vcvtqq2ph reject
+.text
+vcvtqq2ph {sae}, %zmm1, %xmm2
+;;; fp16_rej_078_vcvtqq2ps reject
+.text
+vcvtqq2ps {rn-sae}, %ymm1, %xmm2
+;;; fp16_rej_079_vcvtqq2ps reject
+.text
+vcvtqq2ps {sae}, %zmm1, %ymm2
+;;; fp16_rej_080_vcvtss2sd reject
+.text
+vcvtss2sd {rn-sae}, %xmm1, %xmm2, %xmm3
+;;; fp16_rej_081_vcvttpd2dq reject
+.text
+vcvttpd2dq {rn-sae}, %zmm1, %ymm2
+;;; fp16_rej_082_vcvttpd2qq reject
+.text
+vcvttpd2qq {rn-sae}, %zmm1, %zmm2
+;;; fp16_rej_083_vcvttpd2uqq reject
+.text
+vcvttpd2uqq {rn-sae}, %zmm1, %zmm2
+;;; fp16_rej_084_vcvttph2dq reject
+.text
+vcvttph2dq %ymm1, %ymm2
+;;; fp16_rej_085_vcvttph2dq reject
+.text
+vcvttph2dq {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_086_vcvttph2qq reject
+.text
+vcvttph2qq {rn-sae}, %xmm1, %zmm2
+;;; fp16_rej_087_vcvttph2udq reject
+.text
+vcvttph2udq {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_088_vcvttph2uqq reject
+.text
+vcvttph2uqq {rn-sae}, %xmm1, %zmm2
+;;; fp16_rej_089_vcvttph2uw reject
+.text
+vcvttph2uw {rn-sae}, %zmm1, %zmm2
+;;; fp16_rej_090_vcvttph2w reject
+.text
+vcvttph2w {rn-sae}, %zmm1, %zmm2
+;;; fp16_rej_091_vcvttps2dq reject
+.text
+vcvttps2dq {rn-sae}, %zmm1, %zmm2
+;;; fp16_rej_092_vcvttps2qq reject
+.text
+vcvttps2qq {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_093_vcvttps2qq reject
+.text
+vcvttps2qq {rz-sae}, %ymm1, %zmm2
+;;; fp16_rej_094_vcvttps2qq reject
+.text
+vcvttps2qq {sae}, %xmm1, %xmm2
+;;; fp16_rej_095_vcvttps2udq reject
+.text
+vcvttps2udq {rn-sae}, %zmm1, %zmm2
+;;; fp16_rej_096_vcvttps2uqq reject
+.text
+vcvttps2uqq {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_097_vcvtudq2pd reject
+.text
+vcvtudq2pd {rn-sae}, %ymm1, %zmm2
+;;; fp16_rej_098_vcvtudq2pd reject
+.text
+vcvtudq2pd {rz-sae}, %ymm1, %zmm2
+;;; fp16_rej_099_vcvtudq2pd reject
+.text
+vcvtudq2pd {sae}, %ymm1, %zmm2
+;;; fp16_rej_100_vcvtudq2ph reject
+.text
+vcvtudq2ph {sae}, %zmm1, %ymm2
+;;; fp16_rej_101_vcvtudq2ps reject
+.text
+vcvtudq2ps {sae}, %zmm1, %zmm2
+;;; fp16_rej_102_vcvtuqq2pd reject
+.text
+vcvtuqq2pd {sae}, %zmm1, %zmm2
+;;; fp16_rej_103_vcvtuqq2ph reject
+.text
+vcvtuqq2ph {sae}, %zmm1, %xmm2
+;;; fp16_rej_104_vcvtuqq2ps reject
+.text
+vcvtuqq2ps {sae}, %zmm1, %ymm2
+;;; fp16_rej_105_vcvtuw2ph reject
+.text
+vcvtuw2ph {sae}, %zmm1, %zmm2
+;;; fp16_rej_106_vcvtw2ph reject
+.text
+vcvtw2ph {sae}, %zmm1, %zmm2
+;;; fp16_rej_107_vdivsh reject
+.text
+vdivsh %zmm1, %zmm2, %zmm3
+;;; fp16_rej_108_vexp2ps reject
+.text
+vexp2ps %xmm1, %xmm2
+;;; fp16_rej_109_vfcmaddcsh reject
+.text
+vfcmaddcsh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_110_vfcmulcsh reject
+.text
+vfcmulcsh %ymm1, %xmm2, %xmm3
+;;; fp16_rej_111_vfmadd132ph reject
+.text
+vfmadd132ph (%rdx){1to16}, %zmm1, %zmm2
+;;; fp16_rej_112_vfmadd132sd reject
+.text
+vfmadd132sd {sae}, %xmm1, %xmm2, %xmm3
+;;; fp16_rej_113_vfmadd132sh reject
+.text
+vfmadd132sh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_114_vfmadd132sh reject
+.text
+vfmadd132sh %zmm1, %zmm2, %zmm3
+;;; fp16_rej_115_vfmadd132ss reject
+.text
+vfmadd132ss %ymm1, %xmm2, %xmm3{%k7}
+;;; fp16_rej_116_vfmadd132ss reject
+.text
+vfmadd132ss %ymm1, %ymm2, %ymm3
+;;; fp16_rej_117_vfmadd213sh reject
+.text
+vfmadd213sh %zmm1, %zmm2, %zmm3
+;;; fp16_rej_118_vfmadd231sd reject
+.text
+vfmadd231sd %zmm1, %ymm2, %xmm3
+;;; fp16_rej_119_vfmaddcsh reject
+.text
+vfmaddcsh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_120_vfmsub231sh reject
+.text
+vfmsub231sh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_121_vfmsub231ss reject
+.text
+vfmsub231ss (%rdx){1to4}, %xmm5, %xmm6
+;;; fp16_rej_122_vfmulcsh reject
+.text
+vfmulcsh %zmm1, %xmm2, %xmm3
+;;; fp16_rej_123_vfnmadd132sh reject
+.text
+vfnmadd132sh %ymm1, %xmm2, %xmm3
+;;; fp16_rej_124_vfnmsub213sh reject
+.text
+vfnmsub213sh %xmm1, %ymm2, %xmm3
+;;; fp16_rej_125_vgetexpsh reject
+.text
+vgetexpsh %xmm1, %xmm2, %ymm3
+;;; fp16_rej_126_vgetexpsh reject
+.text
+vgetexpsh %ymm1, %ymm2, %xmm3
+;;; fp16_rej_127_vgetmantph reject
+.text
+vgetmantph $0x2, {rz-sae}, %zmm1, %zmm2
+;;; fp16_rej_128_vgetmantph reject
+.text
+vgetmantph $0x2, {sae}, %ymm1, %ymm2
+;;; fp16_rej_129_vgetmantps reject
+.text
+vgetmantps $0x2, {sae}, %ymm1, %ymm2
+;;; fp16_rej_130_vmaxsh reject
+.text
+vmaxsh %ymm1, %xmm2, %xmm3
+;;; fp16_rej_131_vminmaxps reject
+.text
+vminmaxps $-1, %zmm1, %zmm2, %zmm3
+;;; fp16_rej_132_vminsh reject
+.text
+vminsh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_133_vmovsd reject
+.text
+vmovsd %ymm4, %ymm5, %ymm6
+;;; fp16_rej_134_vmovsd reject
+.text
+vmovsd %ymm5, (%rax)
+;;; fp16_rej_135_vmovsh reject
+.text
+vmovsh %xmm6, %xmm7{%k7}
+;;; fp16_rej_136_vmovsh reject
+.text
+vmovsh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_137_vmovsh reject
+.text
+vmovsh %ymm5, (%rax)
+;;; fp16_rej_138_vmovsh reject
+.text
+vmovsh (%rax), %ymm5
+;;; fp16_rej_139_vmovsh reject
+.text
+vmovsh (%rdx){1to2}, %xmm5
+;;; fp16_rej_140_vmovss reject
+.text
+vmovss %xmm6, %xmm7{%k7}
+;;; fp16_rej_141_vmovss reject
+.text
+vmovss %ymm4, %ymm5, %ymm6
+;;; fp16_rej_142_vmovss reject
+.text
+vmovss %ymm5, (%rax)
+;;; fp16_rej_143_vmovss reject
+.text
+vmovss (%rax), %ymm5
+;;; fp16_rej_144_vmulsh reject
+.text
+vmulsh %ymm1, %ymm2, %ymm3
+;;; fp16_rej_145_vmulss reject
+.text
+vmulss %zmm1, %xmm2, %xmm3
+;;; fp16_rej_146_vpaddd reject
+.text
+vpaddd (%rdx){1to4}, %zmm1, %zmm2
+;;; fp16_rej_147_vpaddd reject
+.text
+vpaddd (%rdx){1to8}, %zmm1, %zmm2
+;;; fp16_rej_148_vpermt2ps reject
+.text
+vpermt2ps $1, (%rdx){1to16}, %zmm1, %zmm2
+;;; fp16_rej_149_vrcpsh reject
+.text
+vrcpsh %ymm1, %ymm2, %xmm3
+;;; fp16_rej_150_vreduceph reject
+.text
+vreduceph $1, (%rdx){1to16}, %zmm2
+;;; fp16_rej_151_vreduceph reject
+.text
+vreduceph $1, {sae}, %ymm1, %ymm2
+;;; fp16_rej_152_vrndscaleph reject
+.text
+vrndscaleph $0x12, {sae}, %xmm1, %xmm2
+;;; fp16_rej_153_vrndscaleph reject
+.text
+vrndscaleph $0x12, {sae}, %ymm1, %ymm2
+;;; fp16_rej_154_vroundss reject
+.text
+vroundss {sae}, $1, %xmm1, %xmm2, %xmm3
+;;; fp16_rej_155_vrsqrtsh reject
+.text
+vrsqrtsh %xmm1, %ymm2, %xmm3
+;;; fp16_rej_156_vscalefsh reject
+.text
+vscalefsh %xmm1, %xmm2, %ymm3
+;;; fp16_rej_157_vscalefsh reject
+.text
+vscalefsh %ymm1, %ymm2, %xmm3
+;;; fp16_rej_158_vscalefss reject
+.text
+vscalefss %ymm1, %xmm2, %xmm3
+;;; fp16_rej_159_vshuff32x4 reject
+.text
+vshuff32x4 $1, (%rdx){1to4}, %zmm1, %zmm2
+;;; fp16_rej_160_vsqrtph reject
+.text
+vsqrtph {rn-sae}, %ymm1, %ymm2
+;;; fp16_rej_161_vsqrtph reject
+.text
+vsqrtph {sae}, %xmm1, %xmm2
+;;; fp16_rej_162_vsqrtph reject
+.text
+vsqrtph {sae}, %ymm1, %ymm2
+;;; fp16_rej_163_vsqrtph reject
+.text
+vsqrtph {sae}, %zmm1, %zmm2
+;;; fp16_rej_164_vsqrtps reject
+.text
+vsqrtps {sae}, %zmm1, %zmm2
+;;; fp16_rej_165_vsqrtsh reject
+.text
+vsqrtsh %xmm1, %xmm2, %ymm3
+;;; fp16_rej_166_vsqrtsh reject
+.text
+vsqrtsh %xmm1, %ymm2, %xmm3
+;;; fp16_rej_167_vsqrtsh reject
+.text
+vsqrtsh {sae}, %xmm1, %xmm2, %xmm3
+;;; fp16_rej_168_vsqrtss reject
+.text
+vsqrtss %ymm1, %ymm2, %ymm3
+;;; fp16_rej_169_vsubsh reject
+.text
+vsubsh %zmm1, %zmm2, %zmm3
+;;; fp16_rej_170_vucomish reject
+.text
+vucomish %xmm1, %xmm2{%k1}
+;;; fp16_rej_171_vucomish reject
+.text
+vucomish %ymm1, %ymm2
+;;; fp16_rej_172_vucomiss reject
+.text
+vucomiss %xmm1, %xmm2{%k1}

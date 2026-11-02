@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""LCCC regression corpus runner.
+
+Compiles every ``tests/regression/*.c`` with LCCC (and, unless a test opts
+out, with GCC as the differential oracle), runs the resulting binaries, and
+reports per-file status.  This is the missing-in-repo runner that prior
+sessions invoked as "382/382 lccc regressions" — checked in so every future
+session (and CI) runs the identical protocol.
+
+Conventions (per test ``NAME.c``):
+
+* ``NAME.flags`` — single line of compile flags; defaults to ``-O2``.
+  A sidecar without an explicit ``-O`` level is prepended with ``-O2``
+  (additive, matching run_regression_suite.sh); naming any ``-O`` level
+  keeps full control.
+  The placeholder ``@PROFDIR@`` marks a PGO test: it is replaced by a
+  per-test profile directory and the test is run as the documented
+  generate → train → use roundtrip (the use build must behave
+  identically to the training build).
+* ``NAME.env`` — shell-style comments plus ``KEY=VAL`` assignments
+  exported for *both* compile and run phases (kill-switches such as
+  ``CCC_*`` live here).
+* ``LCCC_NO_COMPARE=1`` in the env marks the test lccc-only: the GCC
+  reference is not a valid oracle (defective linker behaviour, feature
+  gaps, ABI-peculiar tests).  The lccc self-check still must pass.
+* A test passes when its binary exits 0.  Compared tests additionally
+  require byte-identical stdout between the LCCC and GCC binaries.  An
+  oracle binary that exits non-zero has failed the test's own assertions:
+  that is a reference divergence, reported as ``FAIL`` so a broken or
+  stale oracle can never be silently ignored.
+* ``LCCC_ORACLE_SELFCHECK=skip`` in the env declares, per test, that the
+  reference toolchain genuinely predates the semantics the fixture pins
+  (GCC < 14 classifies a vector type as -1 where GCC 14+ and lccc agree on
+  19).  Only a test that states that reason in its own ``.env`` sidecar
+  downgrades a failed oracle self-check to ``SKIP-COMPARE``; the waiver is
+  therefore visible in review and countable, instead of being inferred
+  from an exit code for every fixture.
+* A successfully linked ``-m32`` test is reported as ``SKIP-RUN`` when the
+  host image has no i386 ELF interpreter; this is not a compiler failure.
+  The same applies when the host's own GCC cannot build the ``-m32`` test
+  at all (missing multilib headers, or no 32-bit startup files/libgcc).
+
+Usage::
+
+    python3 tests/regression/run_regression.py            # full corpus
+    python3 tests/regression/run_regression.py --filter adler
+    python3 tests/regression/run_regression.py -v -j 1
+    python3 tests/regression/run_regression.py --json results/regression.json
+
+No third-party packages.  Exit status is the number of failures (0 = clean).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parents[1]
+DEFAULT_LCCC = REPO_ROOT / "target" / "fastbuild" / "lccc"
+DEFAULT_FLAGS = "-O2"
+# Per compile+run phase; PGO tests get 3 phases.  The 90 s default is the
+# GitHub-runner budget.  A slower but legitimate host can exceed it on the
+# heaviest vectorizer rows without any code defect: on one 4 GiB sandbox
+# (2026-10-01, bisection recorded) `vectorize_int_reduction_homes.c -O2`
+# compiles in 112 s on PRISTINE upstream main (and byte-identically, 148 s
+# wall under suite contention, on the audited tree -- same 47528-byte
+# object), so the timeout there is a host-speed artifact, not a regression
+# signal.  LCCC_REGRESSION_TIMEOUT_S overrides the budget for exactly that
+# case; the compile still has to SUCCEED, only the wall-clock budget moves.
+
+
+def _timeout_s() -> int:
+    """The per-phase wall-clock budget, from LCCC_REGRESSION_TIMEOUT_S.
+
+    Fail CLOSED with the offending value in the message: an empty or
+    non-numeric setting is a CI misconfiguration (the `export VAR=` with
+    nothing after it, or a stray unit suffix), and the alternative --
+    ValueError traceback at import time -- costs a debugging round to even
+    find which knob broke. A budget below 1 s is the same class: it can
+    only ever produce TimeoutExpired on every row.
+    """
+    raw = os.environ.get("LCCC_REGRESSION_TIMEOUT_S", "90")
+    try:
+        budget = int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"LCCC_REGRESSION_TIMEOUT_S must be an integer number of "
+            f"seconds, got {raw!r}") from None
+    if budget < 1:
+        raise SystemExit(
+            f"LCCC_REGRESSION_TIMEOUT_S must be >= 1 second, got {budget}")
+    return budget
+
+
+TIMEOUT_S = _timeout_s()
+
+BOLD = "\033[1m"
+RED = "\033[31m"
+GRN = "\033[32m"
+YLW = "\033[33m"
+DIM = "\033[2m"
+RST = "\033[0m"
+
+
+def color(code: str, text: str) -> str:
+    return f"{code}{text}{RST}" if sys.stdout.isatty() else text
+
+
+@dataclass
+class TestCase:
+    name: str
+    source: Path
+    flags: str
+    env: dict[str, str]
+    no_compare: bool
+    oracle_selfcheck_skip: bool = False
+
+
+@dataclass
+class Result:
+    name: str
+    status: str  # pass | fail | skip-compare | skip-run
+    detail: str = ""
+    lccc_time: float = 0.0
+    gcc_time: float = 0.0
+    phases: list[str] = field(default_factory=list)
+
+
+def split_flags_for_gcc(flags: str, src: str) -> list[str]:
+    """Order ``flags`` and ``src`` the way GNU ld resolves archives.
+
+    ``-lm`` (and any ``-l``/``-Wl,`` linker input) must FOLLOW the object
+    that references it: ``gcc -lm foo.c`` drops libm before ``foo.o`` needs
+    it and fails with "undefined reference to sin".  lccc's driver defers
+    libraries itself, which is why every ``-lm`` test used to be silently
+    reported as SKIP-COMPARE instead of being checked against GCC.
+    """
+    words = flags.split()
+    libs = [w for w in words if w.startswith(("-l", "-Wl,"))]
+    rest = [w for w in words if not w.startswith(("-l", "-Wl,"))]
+    # GCC's -m32 reference executables are linked non-PIE to match lccc's
+    # non-PIE -m32 output (like-for-like). This is a matching choice: the
+    # default-PIE -m32 reference also runs correctly with GNU ld 2.47.
+    if "-m32" in rest and "-no-pie" not in rest:
+        rest.append("-no-pie")
+    return [*rest, src, *libs]
+
+
+def unavailable_i386_interpreter(binary: Path, flags: str) -> bool:
+    """Whether a successful -m32 link cannot run only due to the host image."""
+    if "-m32" not in flags.split():
+        return False
+    loaders = (
+        Path("/lib/ld-linux.so.2"),
+        Path("/lib32/ld-linux.so.2"),
+        Path("/usr/lib32/ld-linux.so.2"),
+    )
+    if any(path.is_file() and os.access(path, os.X_OK) for path in loaders):
+        return False
+    if shutil.which("readelf") is None:
+        return False
+    probe = subprocess.run(
+        ["readelf", "-l", str(binary)], capture_output=True, text=True
+    )
+    return probe.returncode == 0 and "Requesting program interpreter" in probe.stdout
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        env[key.strip()] = value.strip()
+    return env
+
+
+def corpus_contract_hint(stderr: str) -> str:
+    """Explain the corpus's single-TU contract when a fixture breaks it.
+
+    Discovery is `tests/regression/*.c` — non-recursive, one compiler
+    invocation per file, no extra sources.  A fixture that references symbols
+    defined in a sibling file therefore fails at link time here even though its
+    own gate script links it correctly, which reads as a compiler bug and is
+    not one.  Naming the fix in the failure message costs one function and
+    saves the next author a debugging session; a bare `undefined reference`
+    does not say "you put a support file where the corpus will pick it up".
+    """
+    if "undefined reference" not in stderr and "undefined symbol" not in stderr:
+        return ""
+    return (
+        "\n  note: this looks like the corpus's single-TU contract, not a "
+        "codegen bug.\n"
+        "  Every tests/regression/*.c is compiled standalone (see discover()); "
+        "a\n"
+        "  fixture whose symbols live in a sibling file must keep its support "
+        "files in\n"
+        "  a subdirectory and add a root-level wrapper TU that #includes them "
+        "— see\n"
+        "  minmax_reduction.c / minmax_refused.c."
+    )
+
+
+def discover(base_dirs: list[Path]) -> list[TestCase]:
+    tests: list[TestCase] = []
+    for directory in base_dirs:
+        for source in sorted(directory.glob("*.c")):
+            name = source.stem
+            flags_file = source.with_suffix(".flags")
+            flags = flags_file.read_text().strip() if flags_file.exists() else DEFAULT_FLAGS
+            if not flags:
+                flags = DEFAULT_FLAGS
+            elif not re.search(r"(^|\s)-O\S", flags):
+                # A sidecar without an explicit -O level ADDS to the -O2
+                # default instead of replacing it. Replacement silently
+                # downgraded 69 tests (the whole simd/vectorize family among
+                # them) to -O0 in this runner while run_regression_suite.sh
+                # compiled the same sources at -O2: the two mirrors must test
+                # the same optimization level. A sidecar that names any -O
+                # level keeps full control, exactly like the suite, where the
+                # later level in `-O2 <flags>` wins.
+                flags = f"{DEFAULT_FLAGS} {flags}"
+            env = parse_env(source.with_suffix(".env"))
+            oracle_skip = env.get("LCCC_ORACLE_SELFCHECK", "").strip()
+            if oracle_skip and oracle_skip != "skip":
+                raise SystemExit(
+                    f"{source.with_suffix('.env')}: LCCC_ORACLE_SELFCHECK "
+                    f"must be 'skip' when present, got {oracle_skip!r}")
+            tests.append(
+                TestCase(name=name, source=source, flags=flags, env=env,
+                         no_compare=env.get("LCCC_NO_COMPARE") == "1",
+                         oracle_selfcheck_skip=oracle_skip == "skip")
+            )
+    return tests
+
+
+def run_checked(cmd: list[str], *, env: dict[str, str], cwd: Path,
+                timeout: int = TIMEOUT_S) -> tuple[int, str, str]:
+    """Run `cmd`; return (exit_code, stdout, stderr). Killed on timeout."""
+    full_env = dict(os.environ)
+    full_env.update(env)
+    try:
+        proc = subprocess.run(cmd, env=full_env, cwd=cwd, timeout=timeout,
+                              capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        import os as _os
+        path = cmd[0] if cmd else "<empty>"
+        try:
+            st = _os.stat(path)
+            state = f"exists mode={oct(st.st_mode)}"
+        except OSError:
+            state = "MISSING"
+        return -127, "", f"ENOENT exec {path} ({state}); cwd={cwd}; cmd={cmd}"
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        return -9, out, f"TIMEOUT after {timeout}s"
+
+
+def _compile_fail_detail(src: str, stderr: str) -> str:
+    """Explain a compile failure, not just report it.
+
+    The corpus is `tests/regression/*.c`, globbed non-recursively and each
+    file compiled as a self-contained program. The failure mode that actually
+    happens is a multi-file *driver* landing in that directory: its kernels
+    live in a sibling file, so it links standalone only by accident, and the
+    raw error is a wall of `undefined reference to ...` naming symbols the
+    reader has never heard of, with no hint about the real cause. Naming the
+    cause turns a triage into a one-line fix and costs nothing otherwise.
+    """
+    detail = f"lccc compile failed:\n{stderr[-2000:]}"
+    if "undefined reference" not in stderr and "undefined symbols" not in stderr:
+        return detail
+    name = Path(src).name
+    return (
+        f"{detail}\n\n"
+        f"{src} has unresolved externs, so it is not a self-contained program.\n"
+        f"Every tests/regression/*.c is globbed non-recursively by this runner\n"
+        f"and compiled standalone, so a file here must define everything it\n"
+        f"calls. If {name} is the driver for a multi-file test, move it into a\n"
+        f"subdirectory (e.g. tests/regression/<name>/) -- subdirectories are\n"
+        f"outside the glob by construction, which is the point."
+    )
+
+
+def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
+    """True when the host's GCC cannot build this test in 32-bit mode.
+
+    lccc is not blamed for a missing multilib, and the claim is not taken on
+    the wording of lccc's own diagnostics: the oracle compiler is asked to
+    do the same work, and only an identical host-side gap downgrades the
+    result.  Two gaps are recognised, because a host may have the headers
+    but no 32-bit startup files or libgcc:
+
+    * the translation unit does not preprocess in ``-m32`` mode (missing
+      ``bits/`` headers);
+    * a trivial ``-m32`` program does not link (missing ``Scrt1.o``/crti,
+      or a ``libgcc.a`` for the wrong target — the host's GCC fails the
+      same way for every ``-m32`` test, so none of them can be validated).
+
+    A ``-m32`` test that the host's GCC builds but lccc does not stays a
+    hard failure.
+    """
+    if "-m32" not in flags.split():
+        return False
+    try:
+        probe = subprocess.run([gcc, "-m32", "-fsyntax-only", src],
+                               capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if probe.returncode == 0:
+        return not _host_links_i386(gcc)
+    err = probe.stderr
+    # Only a missing multilib header counts. Anything else — a real
+    # preprocessor or parse error — must stay visible as a failure.
+    #
+    # Both spellings matter: glibc's 32-bit layer is reached through `bits/`
+    # (`bits/libc-header-start.h`), while the kernel UAPI tests reach for
+    # `asm/` (`asm/types.h`, `asm/posix_types.h`), which a host without
+    # linux-libc-dev:i386 never provides.  A host that fails on `asm/` fails
+    # every `-m32` test that includes a kernel header for exactly the same
+    # reason, so the same downgrade applies.
+    return "No such file or directory" in err and (
+        "bits/" in err or "asm/" in err
+    )
+
+
+_I386_LINK_OK: dict[str, bool] = {}
+
+
+def _host_links_i386(gcc: str) -> bool:
+    """True when `gcc -m32` can link a trivial program on this host.
+
+    Cached: the answer is a property of the image, and the probe runs for
+    every failing ``-m32`` test otherwise.  A host without 32-bit startup
+    files or a 32-bit ``libgcc.a`` cannot validate *any* linked ``-m32``
+    test, so those results are environment gaps, not compiler defects.
+    """
+    cached = _I386_LINK_OK.get(gcc)
+    if cached is not None:
+        return cached
+    try:
+        probe = subprocess.run(
+            [gcc, "-m32", "-x", "c", "-o", os.devnull, "-"],
+            input="int main(void) { return 0; }\n",
+            capture_output=True, text=True, timeout=60)
+        ok = probe.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    _I386_LINK_OK[gcc] = ok
+    return ok
+
+
+def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
+                compile_only: bool = False) -> Result:
+    """Compile (and, unless `compile_only`, run and differentially compare).
+
+    `--compile-only` exists because the corpus gate GitHub CI runs is a SLOW
+    gate locally, so a source file that cannot even link used to reach
+    upstream on a green local run. Linking is the cheap half: no execution,
+    no GCC reference build, no stdout comparison -- and it is exactly the
+    half that catches a non-self-contained file.
+    """
+    start = time.monotonic()
+    phases: list[str] = []
+    env = dict(test.env)
+
+    out = workdir / test.name
+    src = str(test.source)
+
+    def lccc_cmd(flags: str) -> list[str]:
+        return [str(lccc), "-I", gcc_include, *flags.split(), src, "-o", str(out)]
+
+    def gcc_cmd(flags: str) -> list[str]:
+        return [gcc, *split_flags_for_gcc(flags, src), "-o", str(out)]
+
+    if "@PROFDIR@" in test.flags:
+        # PGO roundtrip: generate -> train -> use. The use build must be
+        # behaviorally identical to the training build.
+        profdir = workdir / "profile"
+        profdir.mkdir(exist_ok=True)
+        gen_flags = test.flags.replace("@PROFDIR@", str(profdir))
+        use_flags = f"-fprofile-use={profdir}"
+        rc, so, se = run_checked(lccc_cmd(gen_flags), env=env, cwd=workdir)
+        if rc != 0:
+            return Result(test.name, "fail",
+                          f"lccc PGO-generate compile failed:\n{se[-2000:]}",
+                          time.monotonic() - start, 0.0, phases + ["gen:fail"])
+        phases.append("gen:ok")
+        if compile_only:
+            # `--compile-only` promises "compile+link, do not run it", and the
+            # generate build has already linked -- which is the whole point of
+            # this gate: it is what catches a source file that is not
+            # self-contained.
+            #
+            # Stop HERE, not at the corpus's own early return further down.
+            # Everything after this point on the PGO path EXECUTES the program:
+            # the training run, and then the -fprofile-use rebuild. Reaching
+            # them under a flag documented as "do not run it" both breaks the
+            # contract and makes the fast link gate slow for no benefit.
+            return Result(test.name, "pass", "",
+                          time.monotonic() - start, 0.0, phases + ["link:ok"])
+        rc, so, se = run_checked([str(out)], env=env, cwd=workdir)
+        if rc != 0:
+            return Result(test.name, "fail",
+                          f"training run failed (rc={rc}):\n{so}{se[-1500:]}",
+                          time.monotonic() - start, 0.0, phases + ["train:fail"])
+        phases.append("train:ok")
+        rc, so, se = run_checked(lccc_cmd(use_flags), env=env, cwd=workdir)
+        if rc != 0:
+            return Result(test.name, "fail",
+                          f"lccc PGO-use compile failed:\n{se[-2000:]}",
+                          time.monotonic() - start, 0.0, phases + ["use:fail"])
+        phases.append("use:ok")
+        rc, so, se = run_checked([str(out)], env=env, cwd=workdir)
+        if rc != 0:
+            return Result(test.name, "fail",
+                          f"PGO-use run failed (rc={rc}):\n{so}{se[-1500:]}",
+                          time.monotonic() - start, 0.0, phases)
+        phases.append("run:ok")
+        return Result(test.name, "pass", "", time.monotonic() - start, 0.0, phases)
+
+    # Plain single-phase test.
+    rc, so, se = run_checked(lccc_cmd(test.flags), env=env, cwd=workdir)
+    if rc != 0:
+        if host_lacks_i386_headers(gcc, src, test.flags):
+            return Result(
+                test.name,
+                "skip-run",
+                "host image cannot build 32-bit programs; the host's own GCC "
+                "fails the same -m32 test identically",
+                time.monotonic() - start,
+                0.0,
+                phases + ["compile:host-skip"],
+            )
+        return Result(test.name, "fail",
+                      _compile_fail_detail(src, se),
+                      time.monotonic() - start, 0.0, phases + ["compile:fail"])
+    phases.append("compile:ok")
+    if compile_only:
+        return Result(test.name, "pass", "",
+                      time.monotonic() - start, 0.0, phases + ["link:ok"])
+    if not out.exists():
+        return Result(test.name, "fail",
+                      f"internal: compile rc=0 but no binary at {out}; cwd={workdir}; stderr={se[-1500:]}",
+                      time.monotonic() - start, 0.0, phases + ["run:missing"])
+    if unavailable_i386_interpreter(out, test.flags):
+        return Result(
+            test.name,
+            "skip-run",
+            "compiled successfully; host image has no i386 ELF interpreter",
+            time.monotonic() - start,
+            0.0,
+            phases + ["run:host-skip"],
+        )
+    rc, so, se = run_checked([str(out)], env=env, cwd=workdir)
+    lccc_elapsed = time.monotonic() - start
+    if rc != 0:
+        # A freestanding -m32 binary dies with SIGSYS on hosts whose
+        # seccomp policy blocks the legacy i386 `int $0x80` syscall path.
+        # That is an environment limitation, not a compiler defect (the
+        # i686 codegen and the static link are still validated up to the
+        # run phase); report it as a skip so capable hosts keep running
+        # the test while sandboxed CI does not count it as a regression.
+        if rc == -31 and "-m32" in test.flags.split():
+            return Result(
+                test.name,
+                "skip-run",
+                "static i386 binary killed by SIGSYS: host seccomp blocks "
+                "the legacy int $0x80 syscall path",
+                lccc_elapsed,
+                0.0,
+                phases + ["run:seccomp-skip"],
+            )
+        return Result(test.name, "fail",
+                      f"run failed (rc={rc}):\n{so}{se[-1500:]}",
+                      lccc_elapsed, 0.0, phases + ["run:fail"])
+    phases.append("run:ok")
+
+    if test.no_compare:
+        return Result(test.name, "pass", "", lccc_elapsed, 0.0, phases)
+
+    gcc_start = time.monotonic()
+    gcc_out = workdir / (test.name + ".gcc")
+    rc, so_g, se_g = run_checked([gcc, *split_flags_for_gcc(test.flags, src), "-o", str(gcc_out)],
+                                 env=env, cwd=workdir)
+    if rc != 0:
+        # Not a valid oracle for this test — count as pass without compare.
+        return Result(test.name, "skip-compare",
+                      f"gcc cannot compile ({se_g.strip().splitlines()[-1] if se_g.strip() else rc})",
+                      lccc_elapsed, time.monotonic() - gcc_start, phases)
+    rc, so_g, se_g = run_checked([str(gcc_out)], env=env, cwd=workdir)
+    gcc_elapsed = time.monotonic() - gcc_start
+    if rc != 0:
+        # The reference binary failed the test's own assertions.  By default
+        # that is a reference divergence and must stay loud: an oracle that
+        # silently stopped matching would turn the comparison off for every
+        # row it touches.  Only a fixture that declares the version gap in
+        # its own sidecar may treat the oracle as invalid, so each waiver is
+        # documented, reviewable and countable.
+        if not test.oracle_selfcheck_skip:
+            return Result(test.name, "fail",
+                          f"oracle self-check failed (gcc rc={rc}) while the "
+                          f"lccc binary passed the same assertions; declare "
+                          f"LCCC_ORACLE_SELFCHECK=skip in "
+                          f"{test.source.with_suffix('.env').name} with the "
+                          f"toolchain gap, or fix the divergence",
+                          lccc_elapsed, gcc_elapsed, phases + ["compare:fail"])
+        return Result(test.name, "skip-compare",
+                      f"declared oracle self-check gap (gcc rc={rc}); the "
+                      f"reference toolchain predates the asserted semantics",
+                      lccc_elapsed, gcc_elapsed, phases + ["compare:oracle-skip"])
+    if so_g != so:
+        return Result(test.name, "fail",
+                      f"output differs from gcc:\nlccc:{so[:600]!r}\ngcc:{so_g[:600]!r}",
+                      lccc_elapsed, gcc_elapsed, phases + ["compare:fail"])
+    phases.append("compare:ok")
+    return Result(test.name, "pass", "", lccc_elapsed, gcc_elapsed, phases)
+
+
+gcc_include = ""
+
+
+def main(argv: list[str] | None = None) -> int:
+    global gcc_include
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--filter", default="", help="substring match on test name")
+    parser.add_argument("--lccc", type=Path, default=DEFAULT_LCCC,
+                        help=f"lccc binary (default {DEFAULT_LCCC})")
+    parser.add_argument("--gcc", default=os.environ.get("GCC_BIN", "gcc"))
+    parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--json", type=Path, help="write machine-readable results")
+    parser.add_argument("--compile-only", action="store_true",
+                        help="compile+link every corpus file but do not run it "
+                             "or build the GCC reference; catches a source file "
+                             "that is not self-contained, in seconds")
+    parser.add_argument(
+        "--extra-dir", type=Path, action="append", default=[],
+        help="additional source directories to sweep (default: the benchmark programs)",
+    )
+    args = parser.parse_args(argv)
+
+    # Compilation workers use a private temporary cwd. Normalize tool paths
+    # before dispatching them; otherwise a perfectly valid invocation such as
+    # `--lccc target/fastbuild/lccc` becomes ENOENT in every worker while the
+    # error misleadingly resembles 100% compiler regressions.
+    args.lccc = args.lccc.expanduser().resolve()
+    if os.sep in args.gcc or args.gcc.startswith("."):
+        args.gcc = str(Path(args.gcc).expanduser().resolve())
+    else:
+        args.gcc = shutil.which(args.gcc) or args.gcc
+
+    if not args.lccc.exists():
+        print(f"error: lccc binary not found: {args.lccc}", file=sys.stderr)
+        return 2
+
+    try:
+        gcc_include = subprocess.check_output(
+            [args.gcc, "-print-file-name=include"], text=True).strip()
+    except (subprocess.CalledProcessError, OSError):
+        gcc_include = "/usr/include"
+
+    # Resolve early: compiles run with cwd=tempdir, so every source path
+    # must be absolute (HERE already is; user-supplied dirs may not be).
+    base_dirs = [HERE] + [d.resolve() for d in args.extra_dir]
+    if not args.extra_dir:
+        bench = REPO_ROOT / "tests" / "benchmark" / "programs"
+        if bench.is_dir():
+            base_dirs.append(bench.resolve())
+
+    tests = [t for t in discover(base_dirs) if args.filter in t.name]
+    if not tests:
+        print("no tests matched")
+        return 2
+
+    print(f"lccc: {args.lccc}")
+    print(f"corpus: {len(tests)} tests, jobs={args.jobs}, timeout={TIMEOUT_S}s each\n")
+
+    failures: list[Result] = []
+    skips: list[Result] = []
+    passed = 0
+    t0 = time.monotonic()
+
+    def report(res: Result) -> None:
+        mark = {
+            "pass": color(GRN, "PASS"),
+            "fail": color(RED, "FAIL"),
+            "skip-compare": color(YLW, "SKIP-COMPARE"),
+            "skip-run": color(YLW, "SKIP-RUN"),
+        }[res.status]
+        tag = " ".join(res.phases)
+        line = f"{mark} {res.name}  ({tag})  {res.lccc_time:5.1f}s"
+        if res.status == "pass" and args.verbose:
+            print(line)
+        elif res.status != "pass":
+            print(line)
+            if res.detail:
+                for d in res.detail.splitlines():
+                    print(f"      {d}")
+
+    with tempfile.TemporaryDirectory(prefix="lccc-reg-") as tmp:
+        workroot = Path(tmp)
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = {}
+            for test in tests:
+                workdir = workroot / test.name
+                workdir.mkdir(parents=True, exist_ok=True)
+                futures[pool.submit(compile_one, args.lccc, args.gcc, test,
+                                    workdir, args.compile_only)] = test
+            for fut in as_completed(futures):
+                res = fut.result()
+                report(res)
+                if res.status == "pass":
+                    passed += 1
+                elif res.status == "fail":
+                    failures.append(res)
+                else:
+                    skips.append(res)
+
+    elapsed = time.monotonic() - t0
+    skipped_compare = sum(result.status == "skip-compare" for result in skips)
+    skipped_run = sum(result.status == "skip-run" for result in skips)
+    print()
+    print(f"== {passed} passed, {len(failures)} failed, "
+          f"{skipped_compare} skipped-compare, {skipped_run} skipped-run, "
+          f"{len(tests)} total, {elapsed:.0f}s")
+
+    if args.json:
+        payload: dict[str, Any] = {
+            "passed": passed,
+            "failed": len(failures),
+            "skipped_compare": skipped_compare,
+            "skipped_run": skipped_run,
+            "total": len(tests),
+            "elapsed_s": round(elapsed, 1),
+            "lccc": str(args.lccc),
+            "failures": [{"name": r.name, "detail": r.detail, "phases": r.phases}
+                         for r in failures],
+        }
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(payload, indent=2))
+        print(f"json: {args.json}")
+
+    if failures:
+        print(f"\nfailures: {', '.join(sorted(r.name for r in failures))}")
+    return len(failures)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

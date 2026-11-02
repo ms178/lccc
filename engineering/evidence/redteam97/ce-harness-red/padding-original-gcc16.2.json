@@ -1,0 +1,538 @@
+{
+  "inputFilename": "example.c",
+  "code": 0,
+  "okToCache": true,
+  "timedOut": false,
+  "stdout": [],
+  "stderr": [],
+  "truncated": false,
+  "execTime": 49,
+  "processExecutionResultTime": 0.00452599860727787,
+  "instructionSet": "amd64",
+  "compilationOptions": [
+    "-g",
+    "-o",
+    "/app/output.s",
+    "-fno-verbose-asm",
+    "-S",
+    "-fdiagnostics-color=always",
+    "-O2",
+    "-Werror",
+    "-no-pie",
+    "/app/example.c"
+  ],
+  "downloads": [],
+  "tools": [],
+  "asmSize": 7886,
+  "asm": [
+    {
+      "text": "  .text",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".p2align 4",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".globl padding_witness",
+      "source": null,
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 8,
+            "endCol": 23
+          }
+        }
+      ]
+    },
+    {
+      "text": ".type padding_witness,@function",
+      "source": null,
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 7,
+            "endCol": 22
+          }
+        }
+      ]
+    },
+    {
+      "text": "padding_witness:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".cfi_startproc",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  testl %edi, %edi",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  je .LBB2",
+      "source": null,
+      "labels": [
+        {
+          "name": ".LBB2",
+          "range": {
+            "startCol": 6,
+            "endCol": 11
+          }
+        }
+      ]
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .p2align 4,0xf8",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  setc %al",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  jmp .LBB3",
+      "source": null,
+      "labels": [
+        {
+          "name": ".LBB3",
+          "range": {
+            "startCol": 7,
+            "endCol": 12
+          }
+        }
+      ]
+    },
+    {
+      "text": ".LBB2:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .p2align 4,0xf9",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  setc %al",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  jmp .LBB3",
+      "source": null,
+      "labels": [
+        {
+          "name": ".LBB3",
+          "range": {
+            "startCol": 7,
+            "endCol": 12
+          }
+        }
+      ]
+    },
+    {
+      "text": ".LBB3:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".cfi_endproc",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".size padding_witness, .-padding_witness",
+      "source": null,
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 7,
+            "endCol": 22
+          }
+        },
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 26,
+            "endCol": 41
+          }
+        }
+      ]
+    },
+    {
+      "text": ".section .note.GNU-stack,\"\",@progbits",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .section .rodata.str1.1,\"aMS\",@progbits,1",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".LC0:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  .string \"16.2.0\"",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "main:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  pushq %rbx",
+      "source": {
+        "file": null,
+        "line": 4,
+        "column": 16
+      },
+      "labels": []
+    },
+    {
+      "text": "  movl $.LC0, %edi",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": [
+        {
+          "name": ".LC0",
+          "range": {
+            "startCol": 9,
+            "endCol": 13
+          }
+        }
+      ]
+    },
+    {
+      "text": ".LBB2:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movl $-3, %ebx",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 14
+      },
+      "labels": []
+    },
+    {
+      "text": "  call puts",
+      "source": {
+        "file": null,
+        "line": 5,
+        "column": 2
+      },
+      "labels": []
+    },
+    {
+      "text": ".LBB3:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": ".L4:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  movl %ebx, %edi",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  call padding_witness",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": [
+        {
+          "name": "padding_witness",
+          "range": {
+            "startCol": 8,
+            "endCol": 23
+          }
+        }
+      ]
+    },
+    {
+      "text": "  movl %eax, %edx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 13
+      },
+      "labels": []
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 46
+      },
+      "labels": []
+    },
+    {
+      "text": "  testl %ebx, %ebx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 46
+      },
+      "labels": []
+    },
+    {
+      "text": "  sete %al",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 46
+      },
+      "labels": []
+    },
+    {
+      "text": "  cmpl %eax, %edx",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 12
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .L8",
+      "source": {
+        "file": null,
+        "line": 11,
+        "column": 12
+      },
+      "labels": [
+        {
+          "name": ".L8",
+          "range": {
+            "startCol": 7,
+            "endCol": 10
+          }
+        }
+      ]
+    },
+    {
+      "text": "  addl $1, %ebx",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 38
+      },
+      "labels": []
+    },
+    {
+      "text": "  cmpl $4, %ebx",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 32
+      },
+      "labels": []
+    },
+    {
+      "text": "  jne .L4",
+      "source": {
+        "file": null,
+        "line": 10,
+        "column": 32
+      },
+      "labels": [
+        {
+          "name": ".L4",
+          "range": {
+            "startCol": 7,
+            "endCol": 10
+          }
+        }
+      ]
+    },
+    {
+      "text": "  xorl %eax, %eax",
+      "source": {
+        "file": null,
+        "line": 14,
+        "column": 12
+      },
+      "labels": []
+    },
+    {
+      "text": "  popq %rbx",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": ".L8:",
+      "source": null,
+      "labels": []
+    },
+    {
+      "text": "  leal 13(%rbx), %eax",
+      "source": {
+        "file": null,
+        "line": 12,
+        "column": 23
+      },
+      "labels": []
+    },
+    {
+      "text": "  popq %rbx",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    },
+    {
+      "text": "  ret",
+      "source": {
+        "file": null,
+        "line": 15,
+        "column": 1
+      },
+      "labels": []
+    }
+  ],
+  "optOutput": [],
+  "labelDefinitions": {
+    "padding_witness": 5,
+    ".LBB2": 30,
+    ".LBB3": 33,
+    ".LC0": 25,
+    "main": 27,
+    ".L4": 34,
+    ".L8": 49
+  },
+  "parsingTime": 5,
+  "filteredCount": 467,
+  "popularArguments": {},
+  "execResult": {
+    "code": -1,
+    "didExecute": false,
+    "buildResult": {
+      "inputFilename": "example.c",
+      "code": 1,
+      "okToCache": true,
+      "timedOut": false,
+      "stdout": [],
+      "stderr": [
+        {
+          "text": "/tmp/ccEEuVrW.s: Assembler messages:"
+        },
+        {
+          "text": "/tmp/ccEEuVrW.s:51: Error: symbol `.LBB2' is already defined"
+        },
+        {
+          "text": "/tmp/ccEEuVrW.s:59: Error: symbol `.LBB3' is already defined"
+        },
+        {
+          "text": "/tmp/ccEEuVrW.s:468: Error: invalid operands (.text.startup and .text sections) for `-'"
+        },
+        {
+          "text": "/tmp/ccEEuVrW.s:471: Error: invalid operands (.text.startup and .text sections) for `-'"
+        },
+        {
+          "text": "/tmp/ccEEuVrW.s:473: Error: invalid operands (.text.startup and .text sections) for `-'"
+        },
+        {
+          "text": "/tmp/ccEEuVrW.s:474: Error: invalid operands (.text.startup and .text sections) for `-'"
+        }
+      ],
+      "truncated": false,
+      "execTime": 43,
+      "processExecutionResultTime": 0.03481400012969971,
+      "instructionSet": "amd64",
+      "downloads": [],
+      "executableFilename": "/nosym/tmp/compiler-explorer-compilerCJWdNu/output.s",
+      "compilationOptions": [
+        "-g",
+        "-o",
+        "/app/output.s",
+        "-fno-verbose-asm",
+        "-fdiagnostics-color=always",
+        "-O2",
+        "-Werror",
+        "-no-pie",
+        "/app/example.c",
+        "-L./lib",
+        "-Wl,-rpath,./lib"
+      ]
+    },
+    "stderr": [
+      {
+        "text": "Build failed"
+      }
+    ],
+    "stdout": [],
+    "timedOut": false
+  },
+  "queueTime": 5,
+  "lcccOracleOptions": {
+    "requested": "-O2 -Werror -no-pie",
+    "effective": "-O2 -Werror -no-pie"
+  }
+}

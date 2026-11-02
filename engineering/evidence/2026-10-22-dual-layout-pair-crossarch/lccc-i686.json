@@ -1,0 +1,256 @@
+{
+  "arm_order": "seeded per-iteration shuffle",
+  "arms": [
+    "serial",
+    "auto",
+    "forced"
+  ],
+  "compiler": "target/fastbuild/lccc-i686",
+  "iters": 15,
+  "seed": 20261022,
+  "sources": {
+    "chain_wide.c": {
+      "arms": {
+        "auto": {
+          "median_s": 0.3284422930000801,
+          "pairs": [
+            {
+              "chain_bytes": 1807,
+              "mode": "parallel",
+              "orig_bytes": 1851
+            },
+            {
+              "chain_bytes": 1807,
+              "mode": "parallel",
+              "orig_bytes": 1851
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            }
+          ],
+          "pairs_split": 10,
+          "ratio_ci95": [
+            0.8957661055123511,
+            0.9566548461630074
+          ],
+          "ratio_median": 0.9409204884171422,
+          "ratios": [
+            0.7934914994654956,
+            0.8739285579193926,
+            0.802902593109827,
+            0.8957661055123511,
+            0.9445823638729781,
+            0.9398869992392308,
+            0.9201950994887156,
+            0.9073686421161691,
+            1.1037742508965347,
+            1.1513558552992824,
+            1.1848128703328407,
+            0.9566548461630074,
+            0.9507603046828659,
+            0.9755204093588294,
+            0.9409204884171422
+          ]
+        },
+        "forced": {
+          "median_s": 0.32700865400011025,
+          "pairs": [
+            {
+              "chain_bytes": 1807,
+              "mode": "parallel",
+              "orig_bytes": 1851
+            },
+            {
+              "chain_bytes": 1807,
+              "mode": "parallel",
+              "orig_bytes": 1851
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "parallel",
+              "orig_bytes": 1887
+            }
+          ],
+          "pairs_split": 10,
+          "ratio_ci95": [
+            0.8979907445248136,
+            0.9505303146769783
+          ],
+          "ratio_median": 0.930098049214102,
+          "ratios": [
+            1.0349423178300665,
+            0.8756033822042661,
+            0.8979907445248136,
+            0.9090164768933691,
+            0.930098049214102,
+            0.9260418841072038,
+            0.808328029226901,
+            0.9333736489354234,
+            1.043147139053943,
+            1.0580302612118933,
+            1.1922810111380502,
+            0.8970413186038434,
+            0.9505303146769783,
+            0.8712323712845189,
+            0.9315134566841515
+          ]
+        },
+        "serial": {
+          "median_s": 0.3490412539999852,
+          "pairs": [
+            {
+              "chain_bytes": 1807,
+              "mode": "serial",
+              "orig_bytes": 1851
+            },
+            {
+              "chain_bytes": 1807,
+              "mode": "serial",
+              "orig_bytes": 1851
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            },
+            {
+              "chain_bytes": 1842,
+              "mode": "serial",
+              "orig_bytes": 1887
+            }
+          ],
+          "pairs_split": 0,
+          "ratio_ci95": [
+            1.0,
+            1.0
+          ],
+          "ratio_median": 1.0,
+          "ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "assembly_identical": true,
+      "assembly_sha256": [
+        "517b3404315082ee942220d43e833f704b7216c96dc89f55fd9307f2c569c24d"
+      ]
+    }
+  },
+  "warmups": 3
+}

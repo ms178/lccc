@@ -1,0 +1,333 @@
+#include <stdio.h>
+/* MachInst window reload of sub-word vregs must define the FULL register.
+ *
+ * Reduced from Linux 6.18 lib/vsprintf.c number() (the %d/%u emission
+ * chain).  The sign `char` was reloaded into a window register with a
+ * partial `movb slot, %r11b` while the rest of the pipeline (home move
+ * `movq %r11, %rdi`, 8-byte store-back, 64-bit `if (sign)` test) read the
+ * vreg as a full 64-bit register image.  The stale upper bits --
+ * `(unsigned)(field_width - 1)` = 0xFFFFFF00 for the default width 0 --
+ * made the sign test pass with sign byte 0x00, so every plain %d printed
+ * a phantom NUL byte before its digits (boot logs read "SMBIOS \0 2.\0 8").
+ *
+ * Trigger: -O2 -funsigned-char (the kernel's char signedness) plus the
+ * register pressure of the full number() shape.  Fixed by extending
+ * arriving sub-word reloads to movzx/movsx forms (see
+ * machinst_alloc::arriving_reload).
+ *
+ * FAIL (old): emitted digits preceded by 0x00, length +1.
+ */
+#include <stdint.h>
+typedef _Bool bool;
+typedef uint64_t u64; typedef uint32_t u32; typedef uint16_t u16; typedef uint8_t u8;
+#define noinline_for_stack __attribute__((noinline))
+#define __packed __attribute__((packed))
+#define __aligned(x) __attribute__((aligned(x)))
+#define static_assert(x) _Static_assert(x, "sa")
+const char hex_asc_upper[] = "0123456789ABCDEF";
+static noinline_for_stack char *put_dec(char *buf, unsigned long long n)
+{
+    if (n < 10) { *buf++ = '0' + (int)n; return buf; }
+    *buf++ = '0' + (int)(n % 10); n /= 10;
+    *buf++ = '0' + (int)(n % 10); n /= 10;
+    while (n) { *buf++ = '0' + (int)(n % 10); n /= 10; }
+    return buf;
+}
+
+#define SIGN	1		/* unsigned/signed */
+#define LEFT	2		/* left justified */
+#define PLUS	4		/* show plus */
+#define SPACE	8		/* space if plus */
+#define ZEROPAD	16		/* pad with zero, must be 16 == '0' - ' ' */
+#define SMALL	32		/* use lowercase in hex (must be 32 == 0x20) */
+#define SPECIAL	64		/* prefix hex with "0x", octal with "0" */
+struct printf_spec {
+	unsigned char	flags;		/* flags to number() */
+	unsigned char	base;		/* number base, 8, 10 or 16 only */
+	short		precision;	/* # of digits/chars */
+	int		field_width;	/* width of output field */
+} __packed;
+static_assert(sizeof(struct printf_spec) == 8);
+
+#define FIELD_WIDTH_MAX ((1 << 23) - 1)
+#define PRECISION_MAX ((1 << 15) - 1)
+
+static noinline_for_stack
+char *number(char *buf, char *end, unsigned long long num,
+	     struct printf_spec spec)
+{
+	/* put_dec requires 2-byte alignment of the buffer. */
+	char tmp[3 * sizeof(num)] __aligned(2);
+	char sign;
+	char locase;
+	int need_pfx = ((spec.flags & SPECIAL) && spec.base != 10);
+	int i;
+	bool is_zero = num == 0LL;
+	int field_width = spec.field_width;
+	int precision = spec.precision;
+
+	/* locase = 0 or 0x20. ORing digits or letters with 'locase'
+	 * produces same digits or (maybe lowercased) letters */
+	locase = (spec.flags & SMALL);
+	if (spec.flags & LEFT)
+		spec.flags &= ~ZEROPAD;
+	sign = 0;
+	if (spec.flags & SIGN) {
+		if ((signed long long)num < 0) {
+			sign = '-';
+			num = -(signed long long)num;
+			field_width--;
+		} else if (spec.flags & PLUS) {
+			sign = '+';
+			field_width--;
+		} else if (spec.flags & SPACE) {
+			sign = ' ';
+			field_width--;
+		}
+	}
+	if (need_pfx) {
+		if (spec.base == 16)
+			field_width -= 2;
+		else if (!is_zero)
+			field_width--;
+	}
+
+	/* generate full string in tmp[], in reverse order */
+	i = 0;
+	if (num < spec.base)
+		tmp[i++] = hex_asc_upper[num] | locase;
+	else if (spec.base != 10) { /* 8 or 16 */
+		int mask = spec.base - 1;
+		int shift = 3;
+
+		if (spec.base == 16)
+			shift = 4;
+		do {
+			tmp[i++] = (hex_asc_upper[((unsigned char)num) & mask] | locase);
+			num >>= shift;
+		} while (num);
+	} else { /* base 10 */
+		i = put_dec(tmp, num) - tmp;
+	}
+
+	/* printing 100 using %2d gives "100", not "00" */
+	if (i > precision)
+		precision = i;
+	/* leading space padding */
+	field_width -= precision;
+	if (!(spec.flags & (ZEROPAD | LEFT))) {
+		while (--field_width >= 0) {
+			if (buf < end)
+				*buf = ' ';
+			++buf;
+		}
+	}
+	/* sign */
+	if (sign) {
+		if (buf < end)
+			*buf = sign;
+		++buf;
+	}
+	/* "0x" / "0" prefix */
+	if (need_pfx) {
+		if (spec.base == 16 || !is_zero) {
+			if (buf < end)
+				*buf = '0';
+			++buf;
+		}
+		if (spec.base == 16) {
+			if (buf < end)
+				*buf = ('X' | locase);
+			++buf;
+		}
+	}
+	/* zero or space padding */
+	if (!(spec.flags & LEFT)) {
+		char c = ' ' + (spec.flags & ZEROPAD);
+
+		while (--field_width >= 0) {
+			if (buf < end)
+				*buf = c;
+			++buf;
+		}
+	}
+	/* hmm even more zero padding? */
+	while (i <= --precision) {
+		if (buf < end)
+			*buf = '0';
+		++buf;
+	}
+	/* actual digits of result */
+	while (--i >= 0) {
+		if (buf < end)
+			*buf = tmp[i];
+		++buf;
+	}
+	/* trailing space padding */
+	while (--field_width >= 0) {
+		if (buf < end)
+			*buf = ' ';
+		++buf;
+	}
+
+	return buf;
+}
+
+static noinline_for_stack
+char *number_unaligned(char *buf, char *end, unsigned long long num,
+	     struct printf_spec spec)
+{
+	/* put_dec requires 2-byte alignment of the buffer. */
+	char tmp[3 * sizeof(num)];
+	char sign;
+	char locase;
+	int need_pfx = ((spec.flags & SPECIAL) && spec.base != 10);
+	int i;
+	bool is_zero = num == 0LL;
+	int field_width = spec.field_width;
+	int precision = spec.precision;
+
+	/* locase = 0 or 0x20. ORing digits or letters with 'locase'
+	 * produces same digits or (maybe lowercased) letters */
+	locase = (spec.flags & SMALL);
+	if (spec.flags & LEFT)
+		spec.flags &= ~ZEROPAD;
+	sign = 0;
+	if (spec.flags & SIGN) {
+		if ((signed long long)num < 0) {
+			sign = '-';
+			num = -(signed long long)num;
+			field_width--;
+		} else if (spec.flags & PLUS) {
+			sign = '+';
+			field_width--;
+		} else if (spec.flags & SPACE) {
+			sign = ' ';
+			field_width--;
+		}
+	}
+	if (need_pfx) {
+		if (spec.base == 16)
+			field_width -= 2;
+		else if (!is_zero)
+			field_width--;
+	}
+
+	/* generate full string in tmp[], in reverse order */
+	i = 0;
+	if (num < spec.base)
+		tmp[i++] = hex_asc_upper[num] | locase;
+	else if (spec.base != 10) { /* 8 or 16 */
+		int mask = spec.base - 1;
+		int shift = 3;
+
+		if (spec.base == 16)
+			shift = 4;
+		do {
+			tmp[i++] = (hex_asc_upper[((unsigned char)num) & mask] | locase);
+			num >>= shift;
+		} while (num);
+	} else { /* base 10 */
+		i = put_dec(tmp, num) - tmp;
+	}
+
+	/* printing 100 using %2d gives "100", not "00" */
+	if (i > precision)
+		precision = i;
+	/* leading space padding */
+	field_width -= precision;
+	if (!(spec.flags & (ZEROPAD | LEFT))) {
+		while (--field_width >= 0) {
+			if (buf < end)
+				*buf = ' ';
+			++buf;
+		}
+	}
+	/* sign */
+	if (sign) {
+		if (buf < end)
+			*buf = sign;
+		++buf;
+	}
+	/* "0x" / "0" prefix */
+	if (need_pfx) {
+		if (spec.base == 16 || !is_zero) {
+			if (buf < end)
+				*buf = '0';
+			++buf;
+		}
+		if (spec.base == 16) {
+			if (buf < end)
+				*buf = ('X' | locase);
+			++buf;
+		}
+	}
+	/* zero or space padding */
+	if (!(spec.flags & LEFT)) {
+		char c = ' ' + (spec.flags & ZEROPAD);
+
+		while (--field_width >= 0) {
+			if (buf < end)
+				*buf = c;
+			++buf;
+		}
+	}
+	/* hmm even more zero padding? */
+	while (i <= --precision) {
+		if (buf < end)
+			*buf = '0';
+		++buf;
+	}
+	/* actual digits of result */
+	while (--i >= 0) {
+		if (buf < end)
+			*buf = tmp[i];
+		++buf;
+	}
+	/* trailing space padding */
+	while (--field_width >= 0) {
+		if (buf < end)
+			*buf = ' ';
+		++buf;
+	}
+
+	return buf;
+}
+
+static int check(unsigned long long num, const char *want, int unaligned)
+{
+    char buf[32];
+    unsigned i;
+    for (i = 0; i < sizeof(buf); i++) buf[i] = 'X';
+    struct printf_spec spec = {
+        .flags = SIGN, .base = 10, .precision = -1, .field_width = 0};
+    if (unaligned) number_unaligned(buf, buf + sizeof(buf) - 1, num, spec);
+    else number(buf, buf + sizeof(buf) - 1, num, spec);
+    for (i = 0; want[i]; i++)
+        if (buf[i] != want[i]) {
+            printf("FAIL num=%llu: got %02x at byte %u (want %02x)\n",
+                   num, (unsigned char)buf[i], i, (unsigned char)want[i]);
+            return 1;
+        }
+    if (buf[i] != 'X') {
+        printf("FAIL num=%llu: extra byte %02x after %u digits\n",
+               num, (unsigned char)buf[i], i);
+        return 1;
+    }
+    return 0;
+}
+
+int main(void)
+{
+    int bad = 0;
+    for (int variant = 0; variant < 2; ++variant) {
+    bad |= check(2, "2", variant);            /* single digit: fast path          */
+    bad |= check(97, "97", variant);          /* two digits: put_dec              */
+    bad |= check(0, "0", variant);            /* zero                             */
+    bad |= check(40, "40", variant);          /* the kobject irq shape            */
+    bad |= check(123456789, "123456789", variant);
+    bad |= check(18446744073709551615ULL, "-1", variant); /* SIGN: s64 view */
+    }
+    if (!bad) puts("PASS");
+    return bad;
+}

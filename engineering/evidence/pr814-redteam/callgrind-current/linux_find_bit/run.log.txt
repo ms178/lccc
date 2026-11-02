@@ -1,0 +1,5 @@
+| benchmark | Ir ref | Ir mine | Ir m/r | I1miss m/r | D1miss r+w m/r | LLmiss r+w m/r | Bcm m/r | Bim m/r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| linux_find_bit | 5077233 | 5957942 | 1.17346 | 1358/1360 | 137235/137209 | 6995/7013 | 11854/11895 | 232/239 |
+geomean simulated Ir mine/ref = 1.1734623957576893 (not measured speedup)
+manifest -> /home/user/artifacts/pr814-callgrind-current/linux_find_bit/manifest.json

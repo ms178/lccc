@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# ============================================================================
+# host_tools_userdeb.sh — install kernel-build host tools without root.
+#
+# Restricted sandboxes (no root, no passwordless sudo) cannot run
+# `apt-get install`. This script downloads the required host-tool packages
+# via `apt-get download` (which needs no privileges) and extracts them with
+# `dpkg -x` into a user prefix (default /home/z/userdeps). Binaries run from
+# $PREFIX/usr/bin with $PREFIX/usr/lib/x86_64-linux-gnu on
+# LD_LIBRARY_PATH; that prefix is exported by the session env.sh.
+#
+# Tools covered (kernel tree prepare + boot build + full build + QEMU test):
+#   flex bison bc cpio zstd dwarves(pahole) libelf-dev libssl-dev
+#   qemu-system-x86 (+ its runtime shared-library closure, --qemu)
+#
+# Idempotent: already-extracted debs are skipped (stamp per deb in
+# $PREFIX/.extracted). Re-running after a harness wipe rebuilds the prefix.
+#
+# Usage:
+#   host_tools_userdeb.sh [--qemu] [pkg ...]
+#     --qemu   additionally extract qemu-system-x86 and dependencies
+# Environment:
+#   LCCC_USERDEPS  prefix (default /home/z/userdeps)
+# ============================================================================
+set -uo pipefail
+
+PREFIX=${LCCC_USERDEPS:-/home/z/userdeps}
+CACHEDIR=$PREFIX/debs
+STAMPDIR=$PREFIX/.extracted
+WITH_QEMU=0
+PKGS=()
+
+while (($#)); do
+  case $1 in
+    --qemu) WITH_QEMU=1 ;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    *) PKGS+=("$1") ;;
+  esac
+  shift
+done
+
+# Default tool set.  busybox-static is accepted as a fallback provider for
+# coreutils-style tools if present in the cache dir.
+if ((${#PKGS[@]} == 0)); then
+  PKGS=(flex bison bc cpio zstd dwarves libelf-dev libssl-dev)
+fi
+if ((WITH_QEMU)); then
+  PKGS+=(qemu-system-x86)
+fi
+
+mkdir -p "$CACHEDIR" "$STAMPDIR"
+
+# Recursively resolve a package's dependency closure (excluding virtual
+# noise), keeping only real package names that apt can download.
+resolve_closure() { # resolve_closure <pkg> ...
+  local p dep
+  local -A seen=() declared=()
+  local queue=("$@")
+  for p in "$@"; do declared[$p]=1; done
+  while ((${#queue[@]})); do
+    p=${queue[0]}; queue=("${queue[@]:1}")
+    seen[$p]=1
+    # shellcheck disable=SC2207
+    local deps
+    deps=$(apt-cache depends --recurse --no-recommends --no-suggests \
+             --no-conflicts --no-breaks --no-replaces --no-enhances \
+             "$p" 2>/dev/null \
+           | awk '/^[^ ]/ {print $1}' | sort -u)
+    for dep in $deps; do
+      [[ -n $dep && -z ${declared[$dep]:-} ]] || continue
+      declared[$dep]=1
+      queue+=("$dep")
+    done
+  done
+  printf '%s\n' "${!seen[@]}" | sort -u
+}
+
+download() { # download <pkg>
+  local pkg=$1
+  if ls "$CACHEDIR/${pkg}"_*.deb >/dev/null 2>&1; then
+    return 0
+  fi
+  (cd "$CACHEDIR" && apt-get download --quiet --quiet "$pkg") \
+    || echo "  (download failed: $pkg — likely virtual or not needed)" >&2
+}
+
+extract_all() {
+  local deb base
+  for deb in "$CACHEDIR"/*.deb; do
+    [[ -f $deb ]] || continue
+    base=$(basename "$deb" .deb)
+    if [[ -f "$STAMPDIR/$base" ]]; then continue; fi
+    if dpkg -x "$deb" "$PREFIX" 2>/dev/null; then
+      touch "$STAMPDIR/$base"
+    else
+      echo "  (extract failed: $base)" >&2
+    fi
+  done
+}
+
+echo "host_tools_userdeb: resolving closure of ${#PKGS[@]} packages (this can take a minute)"
+mapfile -t ALL < <(resolve_closure "${PKGS[@]}")
+echo "host_tools_userdeb: ${#ALL[@]} packages in closure"
+
+n_ok=0
+for p in "${PKGS[@]}"; do
+  echo "  download: $p"
+  download "$p" && n_ok=$((n_ok+1))
+done
+# Dependencies of the *requested* tools only; a failed download of an
+# unrelated closure member is tolerated (virtual packages etc.).
+for p in "${ALL[@]}"; do
+  [[ -n ${PKGS[*]/*$p*/} ]] && download "$p" >/dev/null 2>&1 || true
+done
+
+echo "host_tools_userdeb: extracting debs into $PREFIX"
+extract_all
+
+cat <<EOF
+host_tools_userdeb: done. Activate with:
+  export PATH="$PREFIX/usr/bin:$PREFIX/usr/sbin:\$PATH"
+  export LD_LIBRARY_PATH="$PREFIX/usr/lib/x86_64-linux-gnu\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+  export PKG_CONFIG_PATH="$PREFIX/usr/lib/x86_64-linux-gnu/pkgconfig\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}"
+EOF

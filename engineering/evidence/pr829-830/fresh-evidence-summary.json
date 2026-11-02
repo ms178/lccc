@@ -1,0 +1,127 @@
+{
+  "date": "2026-10-15",
+  "compiler_sha256": "ca7a022e9ca63539429ab35373807ec1be940b62955e929278dd64c0be585e3f",
+  "compiler_source_unchanged_since": "790e220c975ca2daede85462d8d04cd1e8e14bb3",
+  "native": {
+    "current": {
+      "current": {
+        "pass": 94,
+        "fail": 0
+      }
+    },
+    "vendors": {
+      "gcc16": {
+        "pass": 89,
+        "fail": 5
+      },
+      "clang23": {
+        "pass": 94,
+        "fail": 0
+      }
+    },
+    "pr829": {
+      "pr829": {
+        "pass": 90,
+        "fail": 4
+      }
+    }
+  },
+  "callgrind_vs_pr829": {
+    "cases": 45,
+    "ir_ties": 45,
+    "failures": []
+  },
+  "worst15_vs_gcc16": {
+    "metric": "bounded whole-program simulated Ir, NOT timing or the supplied EPYC workload",
+    "ratios": {
+      "sieve": 1.0539981593646675,
+      "binary_trees": 1.0790760384215534,
+      "spectral_norm": 1.9603045843709308,
+      "mandelbrot": 1.088441201045115,
+      "strlen_bench": 1.15912965591062,
+      "switch_dispatch": 1.081057777465657,
+      "byte_load_reassembly": 4.286985428525296,
+      "zlib_ng_adler32_combine": 1.0219859014030108,
+      "expat_xml_scan": 1.1501925322024737,
+      "expat_siphash24": 0.9901472538105643,
+      "sqlite_varint": 1.1037608283658922,
+      "linux_find_bit": 1.1734138454065015,
+      "linux_find_bit_scaled": 1.1823987426797227,
+      "sha256_transform": 0.9486070249003763,
+      "lz4_match_extend": 1.2457292171049155
+    },
+    "geometric": 1.2471286275411166,
+    "arithmetic": 1.368348546065153
+  },
+  "byte_i686_vs_pr829": {
+    "conditional_mispredicts": [
+      23232,
+      23234
+    ],
+    "d1_misses": [
+      1223,
+      1223
+    ],
+    "i1_misses": [
+      1209,
+      1209
+    ],
+    "indirect_mispredicts": [
+      114,
+      114
+    ],
+    "ir_mine": 82469158,
+    "ir_ratio": 0.7988940682289624,
+    "ir_ref": 103229153,
+    "ll_misses": [
+      2285,
+      2285
+    ]
+  },
+  "compiler_work_3_round_medians": {
+    "spectral_norm.c": 0.9989703831403429,
+    "tls_seg_access.c": 1.0011159013153252,
+    "sieve.c": 0.9982051734020027,
+    "byte_load_reassembly.c": 0.9970365636470238
+  },
+  "memcheck": {
+    "wrapping_arms": 24,
+    "readonly_arms": 8,
+    "packed_recip_arms": 9
+  },
+  "riscv_loader": {
+    "passed": 13,
+    "failed": 0,
+    "skipped": 0
+  },
+  "linker_tls_smoke": {
+    "passed": 18,
+    "scope": "three compiler objects x two ABIs x BFD2.47/lld23.1.3/mold2.42.1; not full linker qualification"
+  },
+  "s32_fast": {
+    "tree": "67cbc2343d5fedf7db39547a29e2201e5b837dcd",
+    "passed": 257,
+    "failed": 0,
+    "skipped": 6,
+    "rust_passed": 4746,
+    "rust_failed": 0,
+    "rust_ignored": 8,
+    "fmt": "pass",
+    "msrv_1_97": "pass",
+    "strict_clippy": "pass"
+  },
+  "remote_fp": {
+    "initial_icx": "rejects FENV_ACCESS while its default precise mode is disabled",
+    "common_explicit_fno_fast_math": {
+      "gcc16.2": "executed, rounding witness mismatch",
+      "clang23.1": "executed, expected digest",
+      "icx_latest_actual_2024": "executed, expected digest"
+    }
+  },
+  "raw_archives": {
+    "fresh-vendor-raw.tar.json": "4b43d00dd830116a7d853272997e9686fdffa801129b76f692af076939cd7e60",
+    "fresh-compiler-work-raw.tar.json": "fe9bf9d5c62ad8866b5a6005cb3b096ac3b78f957b3a7d017020b59e9bfaa8af",
+    "fresh-pr829-comparison-raw.tar.json": "1cef00670ae78ff95f33a0d40697424a175bd4b4a463f454b03cf1dc530b161e"
+  },
+  "status": "Final acceptance requires matching final-tree FAST and external FINAL-ACCEPTANCE receipt; S32 gate is historical after later script/document changes."
+}

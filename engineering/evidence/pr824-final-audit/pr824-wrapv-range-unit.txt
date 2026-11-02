@@ -1,0 +1,68 @@
+   Compiling lccc v0.1.0 (/home/user/.cache/lccc)
+    Finished `fastbuild` profile [optimized] target(s) in 3m 19s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-2790982c43eeadfa)
+
+running 60 tests
+test passes::iv_widen::tests::cast_from_ty_must_match_the_operand_def ... ok
+test passes::iv_widen::tests::cast_wider_than_the_wide_domain_declines ... ok
+test passes::iv_widen::tests::chained_latch_is_canonicalised_and_then_widened ... ok
+test passes::iv_widen::tests::constant_minus_member_range_keeps_operand_order ... ok
+test passes::iv_widen::tests::guard_that_does_not_dominate_latch_declines_proof ... ok
+test passes::iv_widen::tests::normalize_step_const_agrees_with_itself ... ok
+test passes::iv_widen::tests::nested_alias_chain_removal_leaves_no_dangling_use ... ok
+test passes::iv_widen::tests::same_width_cast_of_member_keeps_a_consistent_from_ty ... ok
+test passes::iv_widen::tests::strided_counted_loop_with_a_constant_bound_is_widened ... ok
+test passes::iv_widen::tests::strided_counted_loop_with_a_runtime_bound_stays_narrow ... ok
+test passes::iv_widen::tests::strided_counted_loop_with_no_room_for_the_stride_stays_narrow ... ok
+test passes::iv_widen::tests::test_and_const_widens ... ok
+test passes::iv_widen::tests::test_body_entry_not_closed_declines ... ok
+test passes::iv_widen::tests::test_closure_and_mask ... ok
+test passes::iv_widen::tests::test_closure_offset_add ... ok
+test passes::iv_widen::tests::test_cross_sign_zext_chain_widens ... ok
+test passes::iv_widen::tests::test_decrementing_iv ... ok
+test passes::iv_widen::tests::test_escape_block_mixed_wide_narrow_uses ... ok
+test passes::iv_widen::tests::test_escape_trunc_return ... ok
+test passes::iv_widen::tests::test_exit_cmp_bound_defined_after_loop_stays_narrow ... ok
+test passes::iv_widen::tests::test_exit_cmp_bound_in_preheader_is_widened ... ok
+test passes::iv_widen::tests::test_exit_on_true_polarity ... ok
+test passes::iv_widen::tests::test_exit_merge_phi_bails ... ok
+test passes::iv_widen::tests::test_exposed_const_seed_folds_and_widens ... ok
+test passes::iv_widen::tests::test_exposed_decrement_lower_bound_widens ... ok
+test passes::iv_widen::tests::test_exposed_runtime_seed_fold_overflows_and_declines ... ok
+test passes::iv_widen::tests::test_i8_iv ... ok
+test passes::iv_widen::tests::test_gep_offset_on_exposed_member_declines ... ok
+test passes::iv_widen::tests::test_invariant_step_hoisted ... ok
+test passes::iv_widen::tests::test_latch_add_step_phi_order ... ok
+test passes::iv_widen::tests::test_latch_on_inner_cycle_declines ... ok
+test passes::iv_widen::tests::test_member_member_binop ... ok
+test passes::iv_widen::tests::test_multi_cmp_same_block ... ok
+test passes::iv_widen::tests::test_narrow_shift_closure ... ok
+test passes::iv_widen::tests::test_nested_inner_loop_guarded_outer_widens ... ok
+test passes::iv_widen::tests::test_no_addressing_bails ... ok
+test passes::iv_widen::tests::test_non_member_operand_bails ... ok
+test passes::iv_widen::tests::test_p_edge_resolves_block_labels_not_indices ... ok
+test passes::iv_widen::tests::test_post_increment_gep ... ok
+test passes::iv_widen::tests::test_rotated_escape_exit_cast_declines ... ok
+test passes::iv_widen::tests::test_runtime_bound_cross_cast_accum ... ok
+test passes::iv_widen::tests::test_select_cond_narrow_bails ... ok
+test passes::iv_widen::tests::test_select_data_operand ... ok
+test passes::iv_widen::tests::test_self_loop_rotated ... ok
+test passes::iv_widen::tests::test_shift_bad_count_bails ... ok
+test passes::iv_widen::tests::test_shift_foreign_sign_bails ... ok
+test passes::iv_widen::tests::test_signed_iv_unsigned_pred_widen ... ok
+test passes::iv_widen::tests::test_unsigned_const_widen ... ok
+test passes::iv_widen::tests::test_twin_with_other_uses_is_not_canonicalised ... ok
+test passes::iv_widen::tests::test_unsigned_counted_loop ... ok
+test passes::iv_widen::tests::test_unsigned_no_bound_bails ... ok
+test passes::iv_widen::tests::test_unsigned_shl_wrap_bails ... ok
+test passes::iv_widen::tests::test_unsigned_signed_pred_bound_declines ... ok
+test passes::iv_widen::tests::test_variant_step_bails ... ok
+test passes::iv_widen::tests::test_widen_basic_cast_gep ... ok
+test passes::iv_widen::tests::test_widen_scaled_int_chain ... ok
+test passes::iv_widen::tests::unit_step_with_a_runtime_bound_still_widens ... ok
+test passes::iv_widen::tests::unsigned_wrap_step_is_declined_not_widened ... ok
+test passes::iv_widen::tests::widened_signed_step_emits_the_proved_delta ... ok
+test passes::iv_widen::tests::wrapping_signed_widening_requires_a_range_for_the_whole_closure ... ok
+
+test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 4673 filtered out; finished in 0.00s
+

@@ -1,0 +1,211 @@
+{
+  "schema": "lccc-audit-rebase-validation-v1",
+  "base": "1e83776f41529e2d754380d1d934ff901e25a097",
+  "compiler_sha256": "a2c4e6aecfc1a6857bae644497039cfacf8779da465acc4c8a826e0d55dcd56a",
+  "rust_source_diff_from_base": "",
+  "build": {
+    "profile": "fastbuild",
+    "opt_level": 1,
+    "jobs": 2,
+    "debug": 0,
+    "incremental": 0,
+    "rustflags": "-C link-arg=-fuse-ld=mold -D warnings -C link-arg=-Wl,--no-keep-memory"
+  },
+  "kernel_correctness": [
+    {
+      "filter": "gzip_crc32",
+      "pass_count": 4,
+      "fail": 0,
+      "skip": 0,
+      "command": [
+        "bash",
+        "scripts/check_benchmark_outputs.sh",
+        "gzip_crc32"
+      ]
+    },
+    {
+      "filter": "zlib_ng_adler32",
+      "pass_count": 8,
+      "fail": 0,
+      "skip": 0,
+      "command": [
+        "bash",
+        "scripts/check_benchmark_outputs.sh",
+        "zlib_ng_adler32"
+      ]
+    },
+    {
+      "filter": "expat_siphash24",
+      "pass_count": 4,
+      "fail": 0,
+      "skip": 0,
+      "command": [
+        "bash",
+        "scripts/check_benchmark_outputs.sh",
+        "expat_siphash24"
+      ]
+    },
+    {
+      "filter": "sqlite_varint",
+      "pass_count": 4,
+      "fail": 0,
+      "skip": 0,
+      "command": [
+        "bash",
+        "scripts/check_benchmark_outputs.sh",
+        "sqlite_varint"
+      ]
+    },
+    {
+      "filter": "linux_find_bit",
+      "pass_count": 4,
+      "fail": 0,
+      "skip": 0,
+      "command": [
+        "bash",
+        "scripts/check_benchmark_outputs.sh",
+        "linux_find_bit"
+      ]
+    },
+    {
+      "filter": "glibc_memcmp",
+      "pass_count": 4,
+      "fail": 0,
+      "skip": 0,
+      "command": [
+        "bash",
+        "scripts/check_benchmark_outputs.sh",
+        "glibc_memcmp"
+      ]
+    }
+  ],
+  "gzip": {
+    "archive": {
+      "url": "https://ftp.gnu.org/pub/gnu/gzip/gzip-1.14.tar.xz",
+      "path": "/home/user/.cache/lccc-workloads/gzip-1.14.tar.xz",
+      "sha256": "01a7b881bd220bfdf615f97b8718f80bdfd3f6add385b993dcf6efd14e8c0ac6",
+      "archpkgbuilds_selector": "packages/gzip/PKGBUILD pkgver=1.14",
+      "signature_verified": false
+    },
+    "builds": {
+      "lccc": {
+        "key": "lccc",
+        "cc": "/opt/lccc-audit-cache/lccc/target/fastbuild/lccc",
+        "compiler_version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+        "flags": "-O3 -march=x86-64-v3 -I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "environment": {},
+        "binary": "/opt/lccc-audit-cache/gzip-rebased/gzip-lccc",
+        "binary_sha256": "2319b3bf4c0752ddc810b534069ae82d76e4cc86e1588c82f2d982f6b3a6fdb3",
+        "binary_bytes": 106416,
+        "check": {
+          "total": 30,
+          "pass": 30,
+          "skip": 0,
+          "xfail": 0,
+          "fail": 0,
+          "xpass": 0,
+          "error": 0
+        }
+      },
+      "gcc": {
+        "key": "gcc",
+        "cc": "/usr/bin/gcc",
+        "compiler_version": "gcc (Debian 14.2.0-19) 14.2.0",
+        "flags": "-O3 -march=x86-64-v3",
+        "environment": {},
+        "binary": "/opt/lccc-audit-cache/gzip-rebased/gzip-gcc",
+        "binary_sha256": "33167e4a6d8649e309f819f524a1b8fc70b56a9532f4bb29583a6d47886fb3bf",
+        "binary_bytes": 133616,
+        "check": {
+          "total": 30,
+          "pass": 30,
+          "skip": 0,
+          "xfail": 0,
+          "fail": 0,
+          "xpass": 0,
+          "error": 0
+        }
+      }
+    },
+    "correctness_streams": {
+      "compress-source-l1": {
+        "sha256": "a2cb4ba927a98843b83f3927ba4ad9acea3e61a17b69a28e8e4873bba17c00d6",
+        "compiler_sha256": {
+          "lccc": "a2cb4ba927a98843b83f3927ba4ad9acea3e61a17b69a28e8e4873bba17c00d6",
+          "gcc": "a2cb4ba927a98843b83f3927ba4ad9acea3e61a17b69a28e8e4873bba17c00d6"
+        }
+      },
+      "compress-source-l6": {
+        "sha256": "d99459810fa38eba7421c60ed395a9046bf9d21674251320930ed82771ed00d6",
+        "compiler_sha256": {
+          "lccc": "d99459810fa38eba7421c60ed395a9046bf9d21674251320930ed82771ed00d6",
+          "gcc": "d99459810fa38eba7421c60ed395a9046bf9d21674251320930ed82771ed00d6"
+        }
+      },
+      "compress-source-l9": {
+        "sha256": "5cca217cf2fe180ca89e2441fa8552d7f5ace3ebeb5646349c02270bc5cdd7b0",
+        "compiler_sha256": {
+          "lccc": "5cca217cf2fe180ca89e2441fa8552d7f5ace3ebeb5646349c02270bc5cdd7b0",
+          "gcc": "5cca217cf2fe180ca89e2441fa8552d7f5ace3ebeb5646349c02270bc5cdd7b0"
+        }
+      },
+      "compress-mixed-l1": {
+        "sha256": "e0326130becab6f9ec61b3ddc36618aa65efa1a0f9bfc256b2d33ee617d32304",
+        "compiler_sha256": {
+          "lccc": "e0326130becab6f9ec61b3ddc36618aa65efa1a0f9bfc256b2d33ee617d32304",
+          "gcc": "e0326130becab6f9ec61b3ddc36618aa65efa1a0f9bfc256b2d33ee617d32304"
+        }
+      },
+      "compress-mixed-l6": {
+        "sha256": "44fdff37ff95d76f9b8f9547233520165db7339ecf08b94faa0fd3d41843d864",
+        "compiler_sha256": {
+          "lccc": "44fdff37ff95d76f9b8f9547233520165db7339ecf08b94faa0fd3d41843d864",
+          "gcc": "44fdff37ff95d76f9b8f9547233520165db7339ecf08b94faa0fd3d41843d864"
+        }
+      },
+      "compress-mixed-l9": {
+        "sha256": "dd337ad538c0987df638e53e8be66361861e1d7b5839946739065617014472e8",
+        "compiler_sha256": {
+          "lccc": "dd337ad538c0987df638e53e8be66361861e1d7b5839946739065617014472e8",
+          "gcc": "dd337ad538c0987df638e53e8be66361861e1d7b5839946739065617014472e8"
+        }
+      }
+    },
+    "timings": "excluded: one round, no warmup, concurrent audit workload"
+  },
+  "expat": {
+    "ctest": [
+      {
+        "compiler": "gcc",
+        "checks": 4932,
+        "failed": 0,
+        "ctest_cases": 1
+      },
+      {
+        "compiler": "lccc",
+        "checks": 4932,
+        "failed": 0,
+        "ctest_cases": 1
+      }
+    ],
+    "harness_rc": 1,
+    "reason": "junit_check.ReportError: unrecognised status='run'"
+  },
+  "zlib": {
+    "harness_rc": 1,
+    "ctest_rc": 8,
+    "ctest_pass": 68,
+    "ctest_total": 69,
+    "failed_case": "maketrees",
+    "roundtrip_rc": 0
+  },
+  "contracts": {
+    "observations": 30,
+    "violations": 13
+  },
+  "script_syntax": {
+    "files": 564,
+    "failed": 0
+  },
+  "performance_claim": null
+}

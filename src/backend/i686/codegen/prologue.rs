@@ -1,0 +1,2029 @@
+//! I686Codegen: prologue/epilogue and stack frame operations.
+
+use super::emit::{
+    I686_CALLEE_SAVED, I686_CALLEE_SAVED_WITH_EBP, I686_CALLER_SAVED, I686Codegen,
+    I686FastcallSlot, i686_clobber_to_phys, i686_constraint_to_phys, phys_reg_name,
+};
+use crate::backend::call_abi::{ParamClass, classify_params};
+use crate::backend::generation::{
+    calculate_stack_space_common, filter_available_regs, find_param_alloca, is_i128_type,
+    run_regalloc_and_merge_clobbers,
+};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::StackSlot;
+use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
+use crate::emit;
+use crate::ir::reexports::{Instruction, IntrinsicOp, IrFunction, Value};
+
+fn has_overaligned_call_args(func: &IrFunction) -> bool {
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| match inst {
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                info.struct_arg_aligns.iter().any(|a| a.unwrap_or(0) > 16)
+            }
+            _ => false,
+        })
+    })
+}
+
+impl I686Codegen {
+    /// Does this function need the PIC GOT base in %ebx?
+    ///
+    /// Exactly the constructs that expand to a `@GOT`/`@GOTOFF` reference:
+    ///   * `GlobalAddr`  -> `movl sym@GOT(%ebx)` / `leal sym@GOTOFF(%ebx)`
+    ///   * `LabelAddr`   -> `leal L@GOTOFF(%ebx)`   (computed goto, `&&label`)
+    ///   * TLS addresses whose model reads the GOT: initial-exec
+    ///     (`sym@GOTNTPOFF(%ebx)`) and the dynamic descriptor
+    ///     (`sym@TLSDESC(%ebx)`). Local-exec (`%gs:0 + sym@NTPOFF`) is a
+    ///     link-time constant, so a PIE function whose only PIC construct
+    ///     is a local-exec access needs no thunk (GCC: none either).
+    ///   * a `Switch` lowered to a jump table -> `leal jt@GOTOFF(%ebx)`
+    ///   * inline asm, which may name any symbol in text we do not parse
+    ///
+    /// Deliberately an ALLOWLIST with a conservative default: anything not
+    /// recognised here keeps the GOT. Getting this wrong in the permissive
+    /// direction produces a wild %ebx dereference, so the failure mode must be
+    /// "one wasted register", never "wrong address".
+    fn function_needs_got(&self, func: &IrFunction) -> bool {
+        use crate::ir::reexports::{Instruction, Terminator};
+        if !self.state.pic_mode {
+            // Explicit GNU2 dynamic TLS still addresses its descriptor through
+            // the GOT. Unlike ordinary non-PIC globals, it therefore needs a
+            // valid %ebx base even in an ET_EXEC compilation.
+            return func.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    let Instruction::GlobalAddr { name, .. } = inst else {
+                        return false;
+                    };
+                    self.state.tls_symbols.contains(name)
+                        && matches!(
+                            self.state.tls_model(name),
+                            crate::ir::reexports::TlsModel::LocalDynamic
+                                | crate::ir::reexports::TlsModel::GlobalDynamic
+                        )
+                })
+            });
+        }
+        for block in &func.blocks {
+            // A Switch may be lowered to a GOTOFF-relative jump table. The
+            // decision happens later in emit_switch_jump_table, so assume the
+            // table form whenever a Switch is present.
+            if matches!(block.terminator, Terminator::Switch { .. }) {
+                return true;
+            }
+            if matches!(block.terminator, Terminator::IndirectBranch { .. }) {
+                return true;
+            }
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GlobalAddr { name, .. }
+                        if self.state.tls_symbols.contains(name)
+                            && self.state.tls_model(name)
+                                == crate::common::tls::TlsModel::LocalExec => {}
+                    Instruction::GlobalAddr { .. }
+                    | Instruction::LabelAddr { .. }
+                    | Instruction::InlineAsm { .. }
+                    | Instruction::InitTrampoline { .. } => return true,
+                    // A `call sym@PLT` is the i386 PSABI's OTHER consumer of
+                    // %ebx: the lazy-binding PLT stub is
+                    //     jmp *name@GOT(%ebx); push $reloc; jmp .plt0
+                    // and .plt0 itself does `push 4(%ebx); jmp *8(%ebx)`.
+                    // Without the GOT base at the call site the very first
+                    // call through the stub jumps through garbage. This is
+                    // why GCC sets up the thunk even in functions whose only
+                    // PIC-relevant construct is an external call (verified:
+                    // gcc -m32 -fPIC on `return helper(x)+1;` emits
+                    // get_pc_thunk.bx + call helper@PLT).
+                    Instruction::Call { func: callee, .. }
+                        if self.state.needs_plt(callee) || self.state.needs_got_call(callee) =>
+                    {
+                        return true;
+                    }
+                    // 64-bit div/mod lowers to __{u}divdi3/__{u}moddi3 calls
+                    // behind the backend's back (emit_i128_divmod). Those are
+                    // PLT calls under the same rule when the weak stubs end
+                    // up resolved externally, so keep the GOT alive for them.
+                    Instruction::BinOp { op, ty, .. }
+                        if matches!(
+                            op,
+                            crate::ir::reexports::IrBinOp::SDiv
+                                | crate::ir::reexports::IrBinOp::UDiv
+                                | crate::ir::reexports::IrBinOp::SRem
+                                | crate::ir::reexports::IrBinOp::URem
+                        ) && matches!(ty, IrType::I64 | IrType::U64) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// Resolve incoming parameter homes once, before conflict analysis and allocation.
+    fn prepare_parameter_layout(&mut self, func: &IrFunction) {
+        // Fastcall layout: the single source of truth shared by parameter
+        // capture, ParamRef and the return instruction. Computed here (not
+        // in emit_store_params) because the conflict analysis below needs
+        // it after register allocation.
+        self.fastcall_slots.clear();
+        self.conflict_param_slots.clear();
+        self.param_direct_homes.clear();
+        if self.is_fastcall {
+            let param_tys: Vec<IrType> = func.params.iter().map(|p| p.ty).collect();
+            let struct_sizes: Vec<Option<usize>> =
+                func.params.iter().map(|p| p.struct_size).collect();
+            let struct_aligns: Vec<Option<usize>> =
+                func.params.iter().map(|p| p.struct_align).collect();
+            let struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = func
+                .params
+                .iter()
+                .map(|p| p.struct_eightbyte_classes.clone())
+                .collect();
+            let force_stack: Vec<bool> = func
+                .params
+                .iter()
+                .map(|param| {
+                    (param.ty == IrType::U16 && param.is_f128_sse)
+                        || (param.struct_eightbyte_classes.len() == 1
+                            && param.struct_eightbyte_classes[0]
+                                == crate::common::types::EightbyteClass::NoClass)
+                })
+                .collect();
+            let (slots, stack_bytes) = self.fastcall_layout_with_abi(
+                &param_tys,
+                &struct_sizes,
+                &force_stack,
+                func.is_variadic,
+                &struct_aligns,
+                &struct_classes,
+            );
+            self.fastcall_slots = slots;
+            self.fastcall_stack_cleanup = stack_bytes;
+        } else {
+            self.fastcall_stack_cleanup = 0;
+        }
+    }
+
+    // ---- calculate_stack_space ----
+
+    pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        self.is_variadic = func.is_variadic;
+        self.is_fastcall = func.is_fastcall;
+        self.current_return_type = func.return_type;
+        self.current_return_half_xmm = func.return_type == IrType::U16 && func.ret_is_f128_sse;
+        self.current_return_i686_xmm = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes
+                == [
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::SseUp,
+                ];
+        self.current_return_i686_ext_vector_gp3 = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes.len() == 3
+            && func
+                .ret_eightbyte_classes
+                .iter()
+                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
+        // Effective regparm for this function: a function-level
+        // `__attribute__((regparm(N)))` overrides the global -mregparm
+        // flag; fastcall wins over both (GCC passes ECX/EDX and the two
+        // attributes together are rejected at parse time). The
+        // classification itself ignores regparm for variadic functions
+        // (GCC function_arg_32: all-stack).
+        self.regparm = if func.is_fastcall {
+            0
+        } else {
+            func.regparm.unwrap_or(self.base_regparm).min(3)
+        };
+
+        self.prepare_parameter_layout(func);
+
+        // Same-block div/rem pair fusion table (one divl serves a
+        // URem+UDiv couple with identical operands). Constant-RHS pairs
+        // fuse as well: the head runs ONE magic-number sequence producing
+        // q in %eax and r in %edx (emit_divrem_const_in_eax_edx), or the
+        // staged `divl` at -Os: the same clobber set the RA model charges
+        // any constant-divisor division with, so the model stays exact.
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs_with_config(
+            func,
+            crate::backend::regalloc::DivRemTarget::I686,
+            &self.state.ra_config,
+        );
+        self.divrem_tail_dests = pairs.tail_dests;
+        self.divrem_head_partners = pairs.head_partners;
+        self.divrem_broken_tails.clear();
+
+        // Zero-extending wide casts (u8/u16/u32/ptr -> i64/u64): their high
+        // half is provably zero — the 64-bit ALU fast paths use this to drop
+        // the alo*bhi cross product and to carry with an immediate 0.
+        self.zext_wide_values.clear();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let crate::ir::reexports::Instruction::Cast {
+                    dest,
+                    src: crate::ir::reexports::Operand::Value(_),
+                    from_ty,
+                    to_ty,
+                } = inst
+                {
+                    let zext = matches!(
+                        (from_ty, to_ty),
+                        (
+                            crate::common::types::IrType::U8
+                                | crate::common::types::IrType::U16
+                                | crate::common::types::IrType::U32
+                                | crate::common::types::IrType::Ptr,
+                            crate::common::types::IrType::I64 | crate::common::types::IrType::U64
+                        )
+                    );
+                    if zext {
+                        self.zext_wide_values.insert(dest.0);
+                    }
+                }
+            }
+        }
+
+        self.narrow_images = super::comparison::compute_narrow_images(func);
+
+        // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
+        // since ESP changes by runtime-computed amounts.
+        if self.state.has_dyn_alloca {
+            self.omit_frame_pointer = false;
+        }
+        if self.state.stack_clash_protection {
+            let total_allocas = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter_map(|inst| match inst {
+                    crate::ir::reexports::Instruction::Alloca { size, .. } => Some(*size),
+                    _ => None,
+                })
+                .fold(0usize, |acc, s| acc.saturating_add(s));
+            if total_allocas > 12_288 {
+                self.omit_frame_pointer = false;
+            }
+        }
+
+        // Runtime ESP realignment requires EBP-relative local/param
+        // addressing for the duration of the call.
+        if has_overaligned_call_args(func) {
+            self.omit_frame_pointer = false;
+        }
+
+        // __builtin_frame_address(0) and __builtin_setjmp read %ebp directly;
+        // under -fomit-frame-pointer the register would hold a stale
+        // caller-owned value.  Mirror the has_frame_address veto the x86-64
+        // pipeline applies in backend/generation.rs.
+        // gcc.c-torture execute/frame-address.c caught this: at -O1/-O2 the
+        // noipa helper containing the intrinsic lost its frame pointer while
+        // its caller (holding a dynamic alloca) kept one, so the stack-address
+        // containment check failed and the test aborted.
+        if func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    crate::ir::reexports::Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::FrameAddress
+                            | crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                        ..
+                    }
+                )
+            })
+        }) {
+            self.omit_frame_pointer = false;
+        }
+
+        // Compute named parameter stack bytes for va_start (variadic functions).
+        {
+            let config = self.call_abi_config();
+            let classification = crate::backend::call_abi::classify_params_full(func, &config);
+            self.incoming_stack_arg_bytes = classification.total_stack_bytes as i64;
+            if func.is_variadic {
+                self.va_named_stack_bytes = classification.total_stack_bytes;
+            }
+        }
+
+        // Run register allocator before stack space computation.
+        // Use the _with_generic variant to conservatively mark all callee-saved
+        // registers as clobbered when generic register constraints (r, q, g) are
+        // present. On i686, the scratch allocator may pick esi/edi/ebx for generic
+        // constraints, which would clobber values the register allocator placed there.
+        let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
+
+        // When omitting the frame pointer, EBP is available as a callee-saved
+        // register, so use the extended set that includes EBP.
+        let callee_saved_set = if self.omit_frame_pointer {
+            I686_CALLEE_SAVED_WITH_EBP
+        } else {
+            I686_CALLEE_SAVED
+        };
+
+        // Precision variant: the blanket "generic constraint clobbers every
+        // callee-saved register" rule is skipped when a per-block demand scan
+        // proves the scratch allocator can satisfy the block from %ecx/%edx
+        // (the head of its fixed pool). arch/x86/boot is full of one-operand
+        // "=rm"/"r" segment reads that were paying 3 push/pop pairs plus
+        // total register-allocator starvation for a guarantee they never
+        // needed. Falls back to the conservative marking when any block's
+        // demand exceeds the caller-saved prefix.
+        crate::backend::stack_layout::collect_inline_asm_callee_saved_i686(
+            func,
+            &mut asm_clobbered_regs,
+            i686_constraint_to_phys,
+            i686_clobber_to_phys,
+            callee_saved_set,
+        );
+        // In PIC mode, %ebx (PhysReg(0)) is reserved as the GOT base pointer --
+        // but ONLY for functions that actually reference the GOT.
+        //
+        // Unconditionally reserving it cost every leaf function 12 bytes it
+        // could not use: `push %ebx` + `call __x86.get_pc_thunk.bx` +
+        // `addl $_GLOBAL_OFFSET_TABLE_,%ebx` + `pop %ebx`, plus the loss of a
+        // register that then forced spills elsewhere. On the 32 KiB-limited
+        // kernel setup binary that is pure waste, because the overwhelming
+        // majority of those functions never form a global address at all.
+        // GCC makes the same call: it materializes the GOT base lazily.
+        let needs_got = self.function_needs_got(func);
+        self.pic_got_live = needs_got;
+        if needs_got && !asm_clobbered_regs.contains(&PhysReg(0)) {
+            asm_clobbered_regs.push(PhysReg(0));
+        }
+        let mut available_regs = filter_available_regs(callee_saved_set, &asm_clobbered_regs);
+        // __builtin_longjmp abandons the epilogue restores (`jmp` replaces
+        // the `ret` path), so any value homed in a callee-saved register
+        // permanently corrupts the setjmp caller's register (x86-64 twin:
+        // torture execute/pr84521.c, where the buf parameter spilled to %rbx
+        // clobbered main's live value). GNU non-local goto is the same
+        // class (the x86-64 backend already excludes both). Keep such
+        // functions out of the callee-saved pool; caller-saved homes and
+        // slots remain valid.
+        let has_longjmp = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Intrinsic {
+                        op: IntrinsicOp::BuiltinLongjmp,
+                        ..
+                    }
+                )
+            })
+        });
+        let has_nonlocal_goto = func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::NonlocalGoto { .. }))
+        });
+        if has_longjmp || has_nonlocal_goto {
+            available_regs.clear();
+        }
+
+        let mut caller_saved_regs = I686_CALLER_SAVED.to_vec();
+        if self.state.disable_regalloc {
+            available_regs.clear();
+            caller_saved_regs.clear();
+        }
+
+        // GlobalAddr values whose EVERY use is a foldable Load/Store pointer
+        // never materialize (non-PIC absolute fold in generate_load/store);
+        // keep them out of the allocator so a dead address cannot occupy a
+        // register the live loaded value needs. Mirrors the fold conditions:
+        // non-PIC, non-TLS, non-wide type, default address space.
+        let mut never_materialized = if !self.state.pic_mode {
+            let gmap = crate::backend::generation::build_global_addr_map_for(
+                func,
+                &self.state.tls_symbols,
+            );
+            let mut set =
+                crate::backend::generation::build_foldable_global_addr_set_for(func, &gmap);
+            // Loads folded into `cmp{b,w,l} $imm,(mem)` and fused
+            // compare-and-branch booleans emit no code and write no value, so
+            // they must not grab a caller-saved register that the live loop
+            // pointer needs (strlen/strchr/strstr used to park the dead byte
+            // or boolean in %edx, forcing the pointer into a push/pop-paying
+            // callee-saved home).
+            set.extend(crate::backend::generation::build_folded_value_set(
+                func,
+                &self.state.tls_symbols,
+                &self.state.absolute_symbols,
+            ));
+            // Also deny stack slots: these values produce no code at all.
+            self.state.never_materialized_values = set.clone();
+            Some(set)
+        } else {
+            None
+        };
+        // Omitted TLS roots (PIC too: the IE offset comes via %ebx) are never
+        // written either; a register home would only cost a callee-save push.
+        if !self.state.omitted_tls_roots.is_empty() {
+            let roots: Vec<u32> = self.state.omitted_tls_roots.keys().copied().collect();
+            self.state
+                .never_materialized_values
+                .extend(roots.iter().copied());
+            never_materialized
+                .get_or_insert_with(Default::default)
+                .extend(roots);
+        }
+
+        // Return-consumed accumulator flow: a value whose SOLE use is the
+        // Return terminator and whose producer preserves the accumulator
+        // (compute_immediately_consumed enforces both, plus producer/terminator
+        // adjacency) is consumed by emit_return_default via operand_to_eax —
+        // a cache hit, zero instructions.  Give it NO home: the producer
+        // leaves the result in %eax (store_eax_to emits nothing without a
+        // home and keeps the cache entry), and the ret reads it there.
+        // strlen's `p - s` tail stops paying `movl %edi,%eax` + a register
+        // home.  Kept out of the PIC-only set above because it applies
+        // regardless of PIC mode; state.never_materialized_values (the
+        // emitter's fold set) is deliberately NOT extended — these values DO
+        // emit their producer.
+        {
+            let mut ret_operands: crate::common::fx_hash::FxHashSet<u32> =
+                crate::common::fx_hash::FxHashSet::default();
+            for block in &func.blocks {
+                if let crate::ir::reexports::Terminator::Return(Some(op)) = &block.terminator {
+                    if let crate::ir::reexports::Operand::Value(v) = op {
+                        ret_operands.insert(v.0);
+                    }
+                }
+            }
+            // On i686 EVERY immediately-consumed value is read through the
+            // accumulator (operand_to_eax checks the acc cache first): Store
+            // val, Cast/UnaryOp/Copy src, BinOp/Cmp lhs, and fused-consume
+            // terminators all stage via %eax.  Giving them a register home
+            // only adds a `movl %R,%eax` relay (and a callee-save push for
+            // the home).  Deny them registers as well as slots; the
+            // direct-dest binop path then declines (no home) and the
+            // accumulator path takes over, which is the shape the consumer
+            // expects.  compute_immediately_consumed already proves the
+            // consumer is adjacent (no cache-invalidation window) and the
+            // producer accumulator-preserving.
+            //
+            // EXCEPTION — CondBranch conditions: the truthy test of a
+            // register-resident condition emits `testl %R,%R` IN PLACE, but
+            // a home-less condition pays `movl %src,%eax; testl %eax,%eax`
+            // (the no-op-coalesced producer sets no acc-cache entry).  Keep
+            // their homes (check_load_widen_cast_no_relay regression).
+            let mut cond_values: crate::common::fx_hash::FxHashSet<u32> =
+                crate::common::fx_hash::FxHashSet::default();
+            for block in &func.blocks {
+                if let crate::ir::reexports::Terminator::CondBranch { cond, .. } = &block.terminator
+                {
+                    if let crate::ir::reexports::Operand::Value(v) = cond {
+                        cond_values.insert(v.0);
+                    }
+                }
+            }
+            let _ = &ret_operands; // (ret_operands kept for the PIC-free path)
+            // Kill switch for the whole policy (see RaConfig::no_i686_accum_nohome).
+            let skip: crate::common::fx_hash::FxHashSet<u32> =
+                if self.state.ra_config.no_i686_accum_nohome {
+                    Default::default()
+                } else {
+                    crate::backend::regalloc::analyze_accumulator_assignments_with_config(
+                    func,
+                    crate::backend::regalloc::AccumulatorPolicy {
+                        operand_order:
+                            crate::backend::regalloc::AccumulatorOperandOrder::AccumulatorCentric,
+                        return_consumes_accumulator: true,
+                    },
+                    &self.state.ra_config,
+                )
+                .into_iter()
+                .map(|a| a.value_id)
+                .collect()
+                };
+            let extra: Vec<u32> = skip
+                .iter()
+                .copied()
+                .filter(|v| !cond_values.contains(v))
+                .collect();
+            if !extra.is_empty() {
+                match never_materialized.as_mut() {
+                    Some(set) => set.extend(extra),
+                    None => {
+                        never_materialized = Some(extra.into_iter().collect());
+                    }
+                }
+            }
+        }
+
+        let (
+            reg_assigned,
+            cached_liveness,
+            _caller_save_spans,
+            accumulator_assignments,
+            _ra_eligible,
+        ) = crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
+            func,
+            available_regs,
+            caller_saved_regs,
+            &asm_clobbered_regs,
+            &mut self.reg_assignments,
+            &mut self.used_callee_saved,
+            false,
+            never_materialized,
+            Vec::new(),
+            Vec::new(),
+            // i686 emits SIB indexed addressing directly at the Load/Store
+            // (session 27) AND folds constant-offset GEPs with register
+            // bases (const_offset_fold_reg_base_ok): BOTH forms consume
+            // address registers RA-invisibly at the access position.
+            // collect_folded_gep_links_all extends the base intervals of
+            // const-offset folds plus base AND index intervals of indexed
+            // folds to their consumers, so the address registers survive
+            // intervening calls and accumulator staging.
+            crate::backend::generation::collect_folded_gep_links_all(func, false),
+            // Register-base constant-offset folds (%ebx/%esi/%edi/%ebp homes;
+            // const_offset_fold_reg_base_ok): defer their address producers.
+            [0u8, 1, 2, 3]
+                .into_iter()
+                .map(crate::backend::regalloc::PhysReg)
+                .filter(|&r| super::emit::i686_const_fold_base_reg(r))
+                .collect(),
+            &self.state.ra_config,
+            // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
+            &mut crate::common::fx_hash::FxHashMap::default(),
+        );
+
+        // %ebx must be saved/restored only when it really holds the GOT base.
+        if needs_got && !self.used_callee_saved.contains(&PhysReg(0)) {
+            self.used_callee_saved.insert(0, PhysReg(0));
+        }
+
+        // Large by-value call arguments use REP MOVSB. Preserve ESI/EDI
+        // from function entry, not just around the copy: CFI must describe
+        // the caller's original values even while REP temporarily owns them.
+        let has_large_arg_copy = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| match inst {
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info
+                    .struct_arg_sizes
+                    .iter()
+                    .flatten()
+                    .any(|&size| size >= crate::backend::call_abi::LARGE_ARG_COPY_THRESHOLD),
+                _ => false,
+            })
+        });
+        if has_large_arg_copy {
+            for reg in [PhysReg(1), PhysReg(2)] {
+                if !self.used_callee_saved.contains(&reg) {
+                    self.used_callee_saved.push(reg);
+                }
+            }
+            self.used_callee_saved.sort_by_key(|reg| reg.0);
+        }
+
+        // Incoming register parameters whose destinations share one
+        // physical register get 4-byte conflict slots (allocated below)
+        // instead of an entry-time register capture.
+        let conflict_params = self.compute_conflict_params(func);
+
+        let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+
+        // The bias ensures that slots requiring >= 16-byte alignment land on
+        // 16-byte boundaries at runtime. The correct value depends on the
+        // stack overhead between the 16-byte-aligned call-site ESP and the
+        // reference point for slot addressing:
+        //
+        //   With frame pointer:   return addr (4) + saved ebp (4) = 8
+        //     Address of slot -X = EBP - X = (16n - 8) - X, aligned when X ≡ 8 mod 16
+        //
+        //   Without frame pointer: return addr (4) only
+        //     Address of slot = 16n - 4 - space, aligned when space ≡ 12 mod 16
+        let omit_fp = self.omit_frame_pointer;
+        let alignment_bias: i64 = if omit_fp { 12 } else { 8 };
+
+        self.state.ra_accumulator_values =
+            accumulator_assignments.iter().map(|a| a.value_id).collect();
+        let space = calculate_stack_space_common(
+            &mut self.state,
+            func,
+            callee_saved_bytes,
+            |space, alloc_size, align| {
+                let effective_align = if align > 0 { align.max(4) } else { 4 };
+                let alloc = (alloc_size + 3) & !3;
+                let required = space + alloc;
+                let new_space = if effective_align >= 16 {
+                    let bias = alignment_bias;
+                    let a = effective_align;
+                    let rem = ((required % a) + a) % a;
+                    let needed = if rem <= bias {
+                        bias - rem
+                    } else {
+                        a - rem + bias
+                    };
+                    required + needed
+                } else {
+                    ((required + effective_align - 1) / effective_align) * effective_align
+                };
+                (-new_space, new_space)
+            },
+            &reg_assigned,
+            callee_saved_set,
+            cached_liveness,
+        );
+        // Mul-acc chain plans resolve AFTER the RA and slot assignment:
+        // fusibility depends on the final register homes and stack slots
+        // (see compute_i686_mulacc_chains / resolve_mulacc_plans).
+        self.resolve_mulacc_plans(func);
+
+        // Conflict slots: appended past the packed slot region, so they
+        // cannot collide with any allocator-assigned slot. The extra space
+        // becomes part of the frame.
+        for (k, &param_idx) in conflict_params.iter().enumerate() {
+            let offset = -(space + 4 + (k as i64) * 4);
+            self.conflict_param_slots
+                .insert(param_idx, StackSlot(offset));
+        }
+        let mut space = space + conflict_params.len() as i64 * 4;
+        self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
+            func.uses_sret,
+            &func.ret_eightbyte_classes,
+        )
+        .unwrap_or(0);
+        if self.vector_ret_buffer_bytes > 0 {
+            space += self.vector_ret_buffer_bytes as i64;
+            self.vector_ret_buffer_offset = -space;
+        }
+        space
+    }
+
+    // ---- aligned_frame_size ----
+
+    /// Incoming register parameters (fastcall %ecx/%edx slots, or regparm
+    /// %eax/%edx/%ecx classes) whose ParamRef destinations share one
+    /// physical register. Their IR live ranges are disjoint, so RA may
+    /// legally reuse the register — but every capture happens at function
+    /// entry, so capturing both into the shared register would clobber the
+    /// first. These parameters are captured into 4-byte conflict slots
+    /// instead (see `conflict_param_slots`).
+    fn compute_conflict_params(&self, func: &IrFunction) -> Vec<usize> {
+        let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::ParamRef {
+                    dest, param_idx, ..
+                } = inst
+                {
+                    if *param_idx < paramref_dests.len() {
+                        paramref_dests[*param_idx] = Some(*dest);
+                    }
+                }
+            }
+        }
+
+        let mut candidates: Vec<usize> = Vec::new();
+        if self.is_fastcall {
+            for (i, slot) in self.fastcall_slots.iter().enumerate() {
+                if matches!(slot, I686FastcallSlot::Reg(_)) {
+                    candidates.push(i);
+                }
+            }
+        } else if self.regparm > 0 {
+            let config = self.call_abi_config();
+            let classes = classify_params(func, &config);
+            for (i, class) in classes.iter().enumerate() {
+                if matches!(class, ParamClass::IntReg { .. }) {
+                    candidates.push(i);
+                }
+            }
+        }
+
+        let mut by_reg: crate::common::fx_hash::FxHashMap<u8, Vec<usize>> =
+            crate::common::fx_hash::FxHashMap::default();
+        for i in candidates {
+            if let Some(dest) = paramref_dests[i] {
+                if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+                    by_reg.entry(phys.0).or_default().push(i);
+                }
+            }
+        }
+        let mut conflicts: Vec<usize> = Vec::new();
+        for (_, params) in by_reg {
+            if params.len() > 1 {
+                conflicts.extend(params);
+            }
+        }
+        conflicts.sort_unstable();
+        conflicts
+    }
+
+    pub(super) fn aligned_frame_size_impl(&self, raw_space: i64) -> i64 {
+        let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+        let raw_locals = raw_space - callee_saved_bytes;
+        // With frame pointer: overhead = callee_saved + 8 (saved ebp + return addr)
+        // Without frame pointer: overhead = callee_saved + 4 (return addr only)
+        let fixed_overhead = if self.omit_frame_pointer {
+            callee_saved_bytes + 4
+        } else {
+            callee_saved_bytes + 8
+        };
+        let needed = raw_locals + fixed_overhead;
+        let b = self.stack_boundary.max(4);
+        let aligned = (needed + (b - 1)) & !(b - 1);
+        aligned - fixed_overhead
+    }
+
+    // ---- emit_prologue ----
+
+    pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
+        // Single source of truth for materialisation widths (and for the
+        // narrow-index extension in the SIB emitters) -- the same
+        // `compute_value_type_map` the x86-64 backend seeds in its prologue.
+        // Seeded here, before any instruction of the function is emitted.
+        self.value_types = crate::backend::common::compute_value_type_map(func);
+        // Private codegen metadata consumed (and removed) by the i686 assembly
+        // peephole.  Without the return type it must conservatively keep EDX
+        // live at every ret for the i64 ABI, which preserves hundreds of dead
+        // `mov ..., %edx` relays in ordinary 32-bit-returning functions.
+        if matches!(func.return_type, IrType::I64 | IrType::U64) || is_i128_type(func.return_type) {
+            self.state.emit("# lccc-i686-return-uses-edx");
+        }
+        if self.current_return_i686_ext_vector_gp3 {
+            self.state.emit("# lccc-i686-return-uses-ecx");
+        }
+        // Unwind info for this frame is derived from the final instruction
+        // stream after the peephole (backend::cfi_synth), so it stays exact
+        // when the peephole drops a callee-saved push or reshapes the frame.
+        if !self.omit_frame_pointer {
+            self.state.emit("    pushl %ebp");
+            self.state.emit("    movl %esp, %ebp");
+        }
+
+        for &reg in self.used_callee_saved.iter() {
+            let name = phys_reg_name(reg);
+            emit!(self.state, "    pushl %{}", name);
+        }
+
+        if self.pic_got_live {
+            debug_assert!(
+                self.used_callee_saved.contains(&PhysReg(0)),
+                "GOT-using function requires ebx in used_callee_saved"
+            );
+            self.state.emit("    call __x86.get_pc_thunk.bx");
+            self.state.emit("    addl $_GLOBAL_OFFSET_TABLE_, %ebx");
+            self.needs_pc_thunk_bx = true;
+        }
+
+        if frame_size > 0 {
+            let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+            emit_stack_alloc_i686(
+                &mut self.state,
+                frame_size,
+                self.omit_frame_pointer,
+                callee_saved_bytes,
+            );
+        }
+
+        // Post-prologue %esp baseline (ebp-relative), valid in both frame
+        // pointer modes: %esp at esp_adjust==0 equals %ebp minus this value.
+        // DoBuiltinApply uses it to restore %esp after its untracked staging.
+        self.esp_baseline_offset = self.used_callee_saved.len() as i64 * 4 + frame_size;
+
+        if self.omit_frame_pointer {
+            let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+            self.frame_base_offset = callee_saved_bytes + frame_size;
+            self.esp_adjust = 0;
+        }
+    }
+
+    // ---- emit_epilogue ----
+
+    pub(super) fn emit_epilogue_impl(&mut self, _frame_size: i64) {
+        if self.omit_frame_pointer {
+            let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+            let total = self.frame_base_offset - callee_saved_bytes;
+            if total > 0 {
+                emit!(self.state, "    addl ${}, %esp", total);
+            }
+        } else {
+            let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+            if callee_saved_bytes > 0 {
+                emit!(self.state, "    leal -{}(%ebp), %esp", callee_saved_bytes);
+            } else {
+                self.state.emit("    movl %ebp, %esp");
+            }
+        }
+
+        for &reg in self.used_callee_saved.iter().rev() {
+            let name = phys_reg_name(reg);
+            emit!(self.state, "    popl %{}", name);
+        }
+
+        if !self.omit_frame_pointer {
+            self.state.emit("    popl %ebp");
+        }
+    }
+
+    // ---- Over-aligned parameter alloca support ----
+
+    /// Store 4-byte words into a parameter alloca slot, honoring over-aligned
+    /// (>16) parameter allocas: the slot is oversized by (align-1) and the
+    /// EFFECTIVE address is align_up(slot, align) — every alloca-address user
+    /// (emit_alloca_addr_to, memcpy paths, ParamRef loads) resolves that same
+    /// aligned address, so a capture written to the raw slot would desync
+    /// from every later read by the alignment pad (mirrors the struct-capture
+    /// arm's handling and the x86-64 prologue's _Alignas fix).
+    ///
+    /// Returns true when the stores were emitted through the effective
+    /// address; false means the slot is not over-aligned and the caller must
+    /// emit the normal raw-slot stores (keeps the common path identical).
+    ///
+    /// %ecx holds the aligned base for the stores. While register parameters
+    /// could still be live (regparm/fastcall), %ecx is saved/restored around
+    /// the copy and a %ecx source is read from its pushed copy; capture sites
+    /// run in parameter order, so staging sources through %eax cannot
+    /// clobber an uncaptured incoming register (%eax is param 0's regparm
+    /// source — captured before any later parameter's copy — and is never a
+    /// fastcall source). `esp_adjust` stays in sync so esp-relative refs
+    /// below the push stay exact.
+    pub(super) fn emit_over_aligned_param_stores<'a>(
+        &mut self,
+        dest_id: u32,
+        slot: StackSlot,
+        words: impl IntoIterator<Item = (&'a str, i64)>,
+    ) -> bool {
+        if self.state.alloca_over_align(dest_id).is_none() {
+            return false;
+        }
+        let ecx_free = self.regparm == 0 && !self.is_fastcall;
+        if !ecx_free {
+            self.state.emit("    pushl %ecx");
+            self.esp_adjust += 4;
+        }
+        self.emit_alloca_addr_to("ecx", dest_id, slot);
+        for (src, off) in words {
+            match src {
+                "%eax" => {}
+                "%ecx" if !ecx_free => {
+                    // The incoming source was saved below the base
+                    // computation; reload it from the pushed copy.
+                    self.state.emit("    movl 0(%esp), %eax");
+                }
+                _ => emit!(self.state, "    movl {}, %eax", src),
+            }
+            emit!(self.state, "    movl %eax, {}(%ecx)", off);
+        }
+        if !ecx_free {
+            self.state.emit("    popl %ecx");
+            self.esp_adjust -= 4;
+        }
+        true
+    }
+
+    /// Load `ty` from a (possibly over-aligned) parameter alloca slot into
+    /// %eax. Over-aligned slots load through the effective address (%ecx,
+    /// which is free scratch at any ParamRef in the body: the prologue has
+    /// long captured the incoming registers); plain slots keep the exact
+    /// previous raw-slot-ref load.
+    pub(super) fn emit_param_slot_load(&mut self, dest_id: u32, slot: StackSlot, ty: IrType) {
+        let load_instr = self.mov_load_for_type(ty);
+        if self.state.alloca_over_align(dest_id).is_some() {
+            self.emit_alloca_addr_to("ecx", dest_id, slot);
+            emit!(self.state, "    {} 0(%ecx), %eax", load_instr);
+        } else {
+            let src_ref = self.slot_ref(slot);
+            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+        }
+    }
+
+    /// Copy 4-byte words from a (possibly over-aligned) parameter alloca
+    /// slot to a destination slot. Over-aligned sources read through the
+    /// effective address (%ecx); plain slots keep the exact previous
+    /// raw-slot-ref loads.
+    pub(super) fn emit_param_slot_word_copies(
+        &mut self,
+        dest_id: u32,
+        src_slot: StackSlot,
+        dst_slot: StackSlot,
+        offs: &[i64],
+    ) {
+        if self.state.alloca_over_align(dest_id).is_some() {
+            self.emit_alloca_addr_to("ecx", dest_id, src_slot);
+            for &j in offs {
+                emit!(self.state, "    movl {}(%ecx), %eax", j);
+                let dst_ref = self.slot_ref_offset(dst_slot, j);
+                emit!(self.state, "    movl %eax, {}", dst_ref);
+            }
+        } else {
+            for &j in offs {
+                let src_ref = self.slot_ref_offset(src_slot, j);
+                let dst_ref = self.slot_ref_offset(dst_slot, j);
+                emit!(self.state, "    movl {}, %eax", src_ref);
+                emit!(self.state, "    movl %eax, {}", dst_ref);
+            }
+        }
+    }
+
+    // ---- emit_store_params ----
+
+    /// Eligibility check for redirecting a stack-scalar parameter's frame slot
+    /// onto the caller's argument slot (`param_direct_homes`).
+    ///
+    /// Sound only when the slot can never be accessed beyond its low 4 bytes:
+    /// the caller's argument area is exactly one 4-byte slot per argument, and
+    /// a wider write (`movq`, two-word i64 store, vector save) through a
+    /// coalesced web would clobber the *adjacent argument's* home. The scan is
+    /// therefore closed over every value sharing the slot:
+    ///
+    /// * every typed instruction dest (`result_type`) sharing the slot must be
+    ///   at most 4 bytes wide — a wide value's spill/reload stores all 8 bytes;
+    /// * `Alloca` dests are checked by their DATA size (their `result_type` is
+    ///   `Ptr`): a promoted array/struct home wider than 4 bytes is rejected;
+    /// * the backend's pre-scanned width sets (`wide_values`, `i128_values`,
+    ///   `vector_values`, `vector128_values`) reject Copy-only webs whose width
+    ///   is not locally derivable;
+    /// * over-aligned allocas keep the staging copy (their effective address
+    ///   differs from the raw slot base);
+    /// * sub-int types (I8/U8/I16/U16) are fine: every read re-extends from
+    ///   the slot and every store writes within the low bytes of the 4-byte
+    ///   argument slot.
+    ///
+    /// Returns the home's *extent* -- the frame bytes whose operands must be
+    /// redirected along with it (`slot_base_disp`): the `Alloca`'s data size
+    /// when the web holds one (its constant-offset aliases address bytes
+    /// inside it), otherwise 1, the exact slot only (a sub-4-byte spill
+    /// slot does not own its neighbours, and without an `Alloca` there is no
+    /// interior address to redirect).
+    ///
+    /// Kill switch: `CCC_NO_PARAM_DIRECT_HOME=1` restores the homing copy
+    /// verbatim (bisection escape hatch, mirrors the other `CCC_NO_*` gates).
+    fn stack_param_direct_home_eligible(
+        &self,
+        func: &IrFunction,
+        dest_id: u32,
+        slot: StackSlot,
+        ty: IrType,
+    ) -> Option<i64> {
+        if std::env::var_os("CCC_NO_PARAM_DIRECT_HOME").is_some() {
+            return None;
+        }
+        if self.state.alloca_over_align(dest_id).is_some() {
+            return None;
+        }
+        if ty.size() > 4 {
+            return None;
+        }
+        let mut extent = 1i64;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Some(dest) = inst.dest() else { continue };
+                if self.state.get_slot(dest.0).map(|s| s.0) != Some(slot.0) {
+                    continue;
+                }
+                if self.state.wide_values.contains(&dest.0)
+                    || self.state.i128_values.contains(&dest.0)
+                    || self.state.vector_values.contains(&dest.0)
+                    || self.state.vector128_values.contains(&dest.0)
+                {
+                    return None;
+                }
+                if let Instruction::Alloca { size, .. } = inst {
+                    if *size > 4 {
+                        return None;
+                    }
+                    extent = extent.max(*size as i64);
+                    continue;
+                }
+                if let Some(res_ty) = inst.result_type() {
+                    if res_ty.size() > 4 {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(extent)
+    }
+
+    pub(super) fn emit_store_params_impl(&mut self, func: &IrFunction) {
+        let config = self.call_abi_config();
+        let param_classes = classify_params(func, &config);
+        self.state.param_classes = param_classes.clone();
+        self.state.num_params = func.params.len();
+        self.state.func_is_variadic = func.is_variadic;
+
+        self.state.param_alloca_slots = (0..func.params.len())
+            .map(|i| {
+                find_param_alloca(func, i).and_then(|(dest, ty)| {
+                    self.state.get_slot(dest.0).map(|slot| (slot, ty, dest.0))
+                })
+            })
+            .collect();
+
+        // The fastcall layout (self.fastcall_slots /
+        // self.fastcall_stack_cleanup) was computed in
+        // calculate_stack_space_impl, before register allocation.
+
+        // Build a map of param_idx -> ParamRef dest Value for fast lookup.
+        // Used to handle the case where param alloca was eliminated by mem2reg
+        // but the register allocator assigned a callee-saved register.
+        let mut paramref_dests: Vec<Option<Value>> = vec![None; func.params.len()];
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::ParamRef {
+                    dest, param_idx, ..
+                } = inst
+                {
+                    if *param_idx < paramref_dests.len() {
+                        paramref_dests[*param_idx] = Some(*dest);
+                    }
+                }
+            }
+        }
+
+        // NOTE: ParamRef dest values never share an over-aligned (>16)
+        // parameter alloca's slot — resolve_copy_aliases refuses the share
+        // (the padded slot's effective address differs from its raw base,
+        // so a plain value sharing it would desync from every aligned
+        // access). The dest keeps its own plain slot; ParamRef copies
+        // from the alloca through the aligned address.
+
+        let stack_base: i64 = 8;
+
+        // ── regparm callee-side capture ─────────────────────────────────────
+        // Register parameters (%eax/%edx/%ecx) are caller-saved: the ONLY safe
+        // place to capture them is the prologue, before any body instruction
+        // can clobber them. Three cases per register param:
+        //   1. Param alloca has a slot  -> handled by the per-class arms in
+        //      the main loop below (store reg -> alloca slot).
+        //   2. Alloca gone (mem2reg) but the ParamRef dest is register-
+        //      allocated -> move the ABI register to the assigned register
+        //      NOW and mark param_pre_stored.
+        //   3. Alloca gone but the ParamRef dest has a spill slot -> store
+        //      the ABI register to that slot NOW and mark param_pre_stored.
+        // Params are processed in DESCENDING ABI-register order (ecx, edx,
+        // eax): %ecx/%edx are themselves allocatable (caller-saved phase), so
+        // a pre-store target could be a later param's still-unread source.
+        // Saving higher-numbered sources first makes that impossible.
+        if self.regparm > 0 && !self.is_fastcall {
+            let regparm_srcs = ["%eax", "%edx", "%ecx"];
+            // Phase 1: memory-target captures. Stores never clobber another
+            // param's source register, so they are safe in any order. This
+            // MUST cover register params with live allocas too: the main
+            // loop's stack-param copies stage through %eax (and wide copies
+            // through %edx), which would destroy unsaved register args.
+            let mut reg_moves: Vec<(
+                usize,
+                &'static str,
+                crate::backend::regalloc::PhysReg,
+                IrType,
+            )> = Vec::new(); // (param_idx, src, dst, ty)
+            for (i, class) in param_classes.iter().enumerate() {
+                let alloca_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0).map(|s| (dest, s)));
+                match *class {
+                    ParamClass::IntReg { reg_idx } => {
+                        let src_full = regparm_srcs[reg_idx];
+                        if let Some((dest, slot)) = alloca_slot {
+                            // Typed capture into the alloca slot. Sub-int
+                            // types are extended in-register first (the
+                            // extension clobbers only this param's own
+                            // source register, which is dead afterwards).
+                            let ty = func.params[i].ty;
+                            let regparm_regs_byte = ["%al", "%dl", "%cl"];
+                            let regparm_regs_word = ["%ax", "%dx", "%cx"];
+                            match ty {
+                                IrType::I8 => {
+                                    emit!(
+                                        self.state,
+                                        "    movsbl {}, {}",
+                                        regparm_regs_byte[reg_idx],
+                                        src_full
+                                    );
+                                }
+                                IrType::U8 => {
+                                    emit!(
+                                        self.state,
+                                        "    movzbl {}, {}",
+                                        regparm_regs_byte[reg_idx],
+                                        src_full
+                                    );
+                                }
+                                IrType::I16 => {
+                                    emit!(
+                                        self.state,
+                                        "    movswl {}, {}",
+                                        regparm_regs_word[reg_idx],
+                                        src_full
+                                    );
+                                }
+                                IrType::U16 => {
+                                    emit!(
+                                        self.state,
+                                        "    movzwl {}, {}",
+                                        regparm_regs_word[reg_idx],
+                                        src_full
+                                    );
+                                }
+                                _ => {}
+                            }
+                            let words = [(src_full, 0i64)];
+                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
+                                let slot_ref = self.slot_ref(slot);
+                                emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                            }
+                        } else if let Some(dest) = paramref_dests[i] {
+                            if let Some(&phys) = self.reg_assignments.get(&dest.0) {
+                                if let Some(&conflict_slot) = self.conflict_param_slots.get(&i) {
+                                    // Shared register home with another
+                                    // parameter: capture into the conflict
+                                    // slot (the ParamRef reloads from there);
+                                    // capturing into the register would
+                                    // clobber the other param's value.
+                                    let cr = self.slot_ref(conflict_slot);
+                                    emit!(self.state, "    movl {}, {}", src_full, cr);
+                                } else {
+                                    reg_moves.push((i, src_full, phys, func.params[i].ty));
+                                }
+                            } else if let Some(slot) = self.state.get_slot(dest.0) {
+                                // Normalize sub-int types into the spill
+                                // slot: one extension here is never more
+                                // expensive than extending at every later
+                                // use, and the slot then carries a full
+                                // 32-bit value.
+                                let slot_ref = self.slot_ref(slot);
+                                let ty = func.params[i].ty;
+                                match ty {
+                                    IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
+                                        self.emit_incoming_reg_move(src_full, "eax", ty);
+                                        emit!(self.state, "    movl %eax, {}", slot_ref);
+                                    }
+                                    _ => {
+                                        emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                                    }
+                                }
+                                self.state.param_pre_stored.insert(i);
+                            }
+                            // Neither register nor slot: value is dead.
+                        }
+                    }
+                    ParamClass::I64RegPair { base_reg_idx } => {
+                        // Wide values always live in 8-byte slots on i686.
+                        if let Some((dest, slot)) = alloca_slot {
+                            let words = [
+                                (regparm_srcs[base_reg_idx], 0i64),
+                                (regparm_srcs[base_reg_idx + 1], 4i64),
+                            ];
+                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
+                                let sr0 = self.slot_ref(slot);
+                                let sr4 = self.slot_ref_offset(slot, 4);
+                                emit!(
+                                    self.state,
+                                    "    movl {}, {}",
+                                    regparm_srcs[base_reg_idx],
+                                    sr0
+                                );
+                                emit!(
+                                    self.state,
+                                    "    movl {}, {}",
+                                    regparm_srcs[base_reg_idx + 1],
+                                    sr4
+                                );
+                            }
+                        } else if let Some(slot) =
+                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
+                        {
+                            let sr0 = self.slot_ref(slot);
+                            let sr4 = self.slot_ref_offset(slot, 4);
+                            emit!(
+                                self.state,
+                                "    movl {}, {}",
+                                regparm_srcs[base_reg_idx],
+                                sr0
+                            );
+                            emit!(
+                                self.state,
+                                "    movl {}, {}",
+                                regparm_srcs[base_reg_idx + 1],
+                                sr4
+                            );
+                            self.state.param_pre_stored.insert(i);
+                        }
+                    }
+                    ParamClass::StructByValReg { base_reg_idx, size } => {
+                        let nwords = size.div_ceil(4);
+                        if let Some((dest, slot)) = alloca_slot {
+                            let words: Vec<(&str, i64)> = (0..nwords)
+                                .map(|k| (regparm_srcs[base_reg_idx + k], (k * 4) as i64))
+                                .collect();
+                            if !self.emit_over_aligned_param_stores(dest.0, slot, words) {
+                                for k in 0..nwords {
+                                    let sr = self.slot_ref_offset(slot, (k * 4) as i64);
+                                    emit!(
+                                        self.state,
+                                        "    movl {}, {}",
+                                        regparm_srcs[base_reg_idx + k],
+                                        sr
+                                    );
+                                }
+                            }
+                        } else if let Some(slot) =
+                            paramref_dests[i].and_then(|d| self.state.get_slot(d.0))
+                        {
+                            for k in 0..nwords {
+                                let sr = self.slot_ref_offset(slot, (k * 4) as i64);
+                                emit!(
+                                    self.state,
+                                    "    movl {}, {}",
+                                    regparm_srcs[base_reg_idx + k],
+                                    sr
+                                );
+                            }
+                            self.state.param_pre_stored.insert(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Phase 2: register-target captures form a parallel move: a
+            // target (%eax/%ecx/%edx are all allocatable on i686) can be
+            // another move's still-unread source. The shared resolver
+            // (emit.rs) emits moves only while a move exists whose target
+            // is not a pending source, breaks 2-cycles with xchg and
+            // rotates longer cycles (which require %eax participation)
+            // through a scratch stack slot. The previous hardcoded
+            // `xchgl %ecx, %edx` fallback miscompiled every %eax cycle.
+            self.resolve_incoming_reg_moves(&mut reg_moves);
+        }
+
+        // ── fastcall register capture ──────────────────────────────────────
+        // Fastcall register arguments (%ecx/%edx) are captured in parameter
+        // order before the main copy loop runs. All stack copies stage
+        // through %eax only (the over-aligned aggregate path saves/restores
+        // %ecx), so the sources stay intact — but register-target captures
+        // are collected and resolved as one parallel move AFTER the loop, so
+        // a swap between two register params cannot corrupt a source.
+        let mut fc_reg_moves: Vec<(
+            usize,
+            &'static str,
+            crate::backend::regalloc::PhysReg,
+            IrType,
+        )> = Vec::new();
+        if self.is_fastcall {
+            for i in 0..func.params.len() {
+                let I686FastcallSlot::Reg(reg_idx) = self.fastcall_slots[i] else {
+                    continue;
+                };
+                let src_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
+                let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
+                let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
+                let ty = func.params[i].ty;
+                let has_alloca_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
+                    .is_some();
+                if has_alloca_slot {
+                    // Handled by the alloca capture in the main loop below
+                    // (which normalizes sub-int types into the slot).
+                    continue;
+                }
+                let Some(paramref_dest) = paramref_dests[i] else {
+                    continue;
+                };
+                if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
+                    if let Some(&conflict_slot) = self.conflict_param_slots.get(&i) {
+                        // Shared register home: capture into the conflict
+                        // slot; the ParamRef reloads from there.
+                        let cr = self.slot_ref(conflict_slot);
+                        emit!(self.state, "    movl {}, {}", src_full, cr);
+                    } else {
+                        fc_reg_moves.push((i, src_full, phys_reg, ty));
+                    }
+                } else if let Some(slot) = self.state.get_slot(paramref_dest.0) {
+                    let slot_ref = self.slot_ref(slot);
+                    match ty {
+                        IrType::I8 => {
+                            emit!(self.state, "    movsbl {}, %eax", src_byte);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        IrType::U8 => {
+                            emit!(self.state, "    movzbl {}, %eax", src_byte);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        IrType::I16 => {
+                            emit!(self.state, "    movswl {}, %eax", src_word);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        IrType::U16 => {
+                            emit!(self.state, "    movzwl {}, %eax", src_word);
+                            emit!(self.state, "    movl %eax, {}", slot_ref);
+                        }
+                        _ => {
+                            emit!(self.state, "    movl {}, {}", src_full, slot_ref);
+                        }
+                    }
+                    self.state.param_pre_stored.insert(i);
+                }
+            }
+        }
+
+        for (i, _param) in func.params.iter().enumerate() {
+            let class = param_classes[i];
+            // GNU empty aggregates consume no argument bytes or registers.
+            // Their addressable local object may still have an alloca, but
+            // there is nothing to capture into it. In particular do not fall
+            // through to the stack-copy arm (or shift the following argument).
+            if matches!(class, ParamClass::ZeroSizeSkip) {
+                continue;
+            }
+
+            // An i386 vector piece arrives in %xmm{reg_idx} (shared mapping:
+            // CoreArgClass::StructXmmReg -> ParamClass::F128SseReg). Nothing
+            // in the prologue uses an XMM register, so the store can sit in
+            // parameter order; the parameter object is its 16-byte alloca.
+            if let ParamClass::VectorReturnBuffer { .. } = class {
+                if let Some(slot) =
+                    find_param_alloca(func, i).and_then(|(dest, _)| self.state.get_slot(dest.0))
+                {
+                    let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
+                    let destination = self.slot_ref(slot);
+                    emit!(self.state, "    leal {}, %eax", source);
+                    emit!(self.state, "    movl %eax, {}", destination);
+                }
+                continue;
+            }
+            if let ParamClass::F128SseReg { reg_idx, size } = class {
+                if let Some((destination, _)) = find_param_alloca(func, i) {
+                    let Some(slot) = self.state.get_slot(destination.0) else {
+                        continue;
+                    };
+                    let dst = if self.state.alloca_over_align(destination.0).is_some() {
+                        self.emit_alloca_addr_to("eax", destination.0, slot);
+                        "(%eax)".to_string()
+                    } else {
+                        self.slot_ref(slot)
+                    };
+                    let (instruction, register) = match size {
+                        16 => ("movups", format!("xmm{reg_idx}")),
+                        32 => ("vmovups", format!("ymm{reg_idx}")),
+                        64 => ("vmovups", format!("zmm{reg_idx}")),
+                        _ => unreachable!("invalid native vector parameter width"),
+                    };
+                    emit!(self.state, "    {} %{}, {}", instruction, register, dst);
+                    if size > 16 {
+                        self.state.dirty_upper_ymm = true;
+                    }
+                }
+                continue;
+            }
+
+            // mem2reg commonly removes the frontend's parameter alloca.  A
+            // regparm value still arrives in EAX/EDX/ECX and must be captured
+            // at function entry, before ordinary code can clobber those
+            // caller-saved registers.  i686's global allocator assigns only
+            // callee-saved EBX/ESI/EDI/(EBP), so these moves cannot form an
+            // incoming-register cycle; spilled destinations are equally safe.
+            if let ParamClass::IntReg { reg_idx } = class {
+                // The phase-1/2 capture pass above already saved this param
+                // (param_pre_stored). Re-capturing HERE is a miscompile, not
+                // just redundancy: this loop runs interleaved with the
+                // stack-param copies, which stage through %eax — a second
+                // `movl %eax, %dest` after param 0's copy writes the copied
+                // STACK value over the already-captured register argument
+                // (observed: d_i(double, int) read b as garbage at -O1+).
+                if self.state.param_pre_stored.contains(&i) {
+                    continue;
+                }
+                // Conflict-slot capture: the value sits in a frame slot,
+                // not the destination — nothing to re-capture here.
+                if self.conflict_param_slots.contains_key(&i) {
+                    continue;
+                }
+                let has_alloca_slot = find_param_alloca(func, i)
+                    .and_then(|(dest, _)| self.state.get_slot(dest.0))
+                    .is_some();
+                if !has_alloca_slot {
+                    if let Some(paramref_dest) = paramref_dests[i] {
+                        let full = ["%eax", "%edx", "%ecx"][reg_idx];
+                        let byte = ["%al", "%dl", "%cl"][reg_idx];
+                        let word = ["%ax", "%dx", "%cx"][reg_idx];
+                        let ty = func.params[i].ty;
+                        if let Some(&phys_reg) = self.reg_assignments.get(&paramref_dest.0) {
+                            let dest_reg = phys_reg_name(phys_reg);
+                            match ty {
+                                IrType::I8 => {
+                                    emit!(self.state, "    movsbl {}, %{}", byte, dest_reg)
+                                }
+                                IrType::U8 => {
+                                    emit!(self.state, "    movzbl {}, %{}", byte, dest_reg)
+                                }
+                                IrType::I16 => {
+                                    emit!(self.state, "    movswl {}, %{}", word, dest_reg)
+                                }
+                                IrType::U16 => {
+                                    emit!(self.state, "    movzwl {}, %{}", word, dest_reg)
+                                }
+                                _ => emit!(self.state, "    movl {}, %{}", full, dest_reg),
+                            }
+                            self.state.param_pre_stored.insert(i);
+                        } else if let Some(slot) = self.state.get_slot(paramref_dest.0) {
+                            let slot_ref = self.slot_ref(slot);
+                            match ty {
+                                IrType::I8 => emit!(self.state, "    movsbl {}, {}", byte, full),
+                                IrType::U8 => emit!(self.state, "    movzbl {}, {}", byte, full),
+                                IrType::I16 => emit!(self.state, "    movswl {}, {}", word, full),
+                                IrType::U16 => emit!(self.state, "    movzwl {}, {}", word, full),
+                                _ => {}
+                            }
+                            emit!(self.state, "    movl {}, {}", full, slot_ref);
+                            self.state.param_pre_stored.insert(i);
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let (slot, ty, dest_id) = if let Some((dest, ty)) = find_param_alloca(func, i) {
+                if let Some(slot) = self.state.get_slot(dest.0) {
+                    (slot, ty, dest.0)
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            // Fastcall register parameters whose alloca survived: capture
+            // %ecx/%edx into the alloca slot (normalizing sub-int types).
+            // The fc_reg_moves pass above skipped them precisely so this
+            // arm (which knows the slot) handles the capture.
+            if self.is_fastcall {
+                if let I686FastcallSlot::Reg(reg_idx) = self.fastcall_slots[i] {
+                    let src_reg_full: &'static str = ["%ecx", "%edx"][reg_idx as usize];
+                    let src_byte: &'static str = ["%cl", "%dl"][reg_idx as usize];
+                    let src_word: &'static str = ["%cx", "%dx"][reg_idx as usize];
+                    // For sub-int types, sign/zero-extend to full 32-bit before
+                    // storing to the 4-byte SSA slot (avoids partial-write issues).
+                    match ty {
+                        IrType::I8 => {
+                            emit!(self.state, "    movsbl {}, {}", src_byte, src_reg_full);
+                        }
+                        IrType::U8 => {
+                            emit!(self.state, "    movzbl {}, {}", src_byte, src_reg_full);
+                        }
+                        IrType::I16 => {
+                            emit!(self.state, "    movswl {}, {}", src_word, src_reg_full);
+                        }
+                        IrType::U16 => {
+                            emit!(self.state, "    movzwl {}, {}", src_word, src_reg_full);
+                        }
+                        _ => {}
+                    }
+                    let words = [(src_reg_full, 0i64)];
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, words) {
+                        let slot_ref = self.slot_ref(slot);
+                        emit!(self.state, "    movl {}, {}", src_reg_full, slot_ref);
+                    }
+                    continue;
+                }
+            }
+
+            // Register-class parameters (IntReg with a surviving alloca,
+            // I64RegPair, StructByValReg) were captured into their alloca
+            // slots by the regparm phases above, before any stack copy
+            // could clobber the incoming registers. The main loop copies
+            // stack-class parameters only.
+            if matches!(
+                class,
+                ParamClass::IntReg { .. }
+                    | ParamClass::I64RegPair { .. }
+                    | ParamClass::StructByValReg { .. }
+            ) {
+                continue;
+            }
+
+            // Stack-parameter source offset. For fastcall functions the
+            // layout gives each stack parameter its exact offset in the
+            // compacted argument area (GCC rule: register args removed
+            // wherever they occur, floats skipped without removal, so a
+            // blanket `reg_count * 4` subtraction is NOT generally valid).
+            let src_offset = if self.is_fastcall {
+                match self.fastcall_slots[i] {
+                    I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
+                    // Classified `F128SseReg` by the same rule and stored
+                    // from its register by the arm above.
+                    I686FastcallSlot::Reg(_) | I686FastcallSlot::Vector { .. } => {
+                        unreachable!("handled above")
+                    }
+                }
+            } else {
+                match class {
+                    ParamClass::StackScalar { offset }
+                    | ParamClass::StructStack { offset, .. }
+                    | ParamClass::LargeStructStack { offset, .. }
+                    | ParamClass::F128AlwaysStack { offset }
+                    | ParamClass::I128Stack { offset }
+                    | ParamClass::F128Stack { offset }
+                    | ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset,
+                    _ => {
+                        // Register classes: captured by the regparm phases.
+                        unreachable!("register parameter without capture: {:?}", class)
+                    }
+                }
+            };
+
+            match class {
+                ParamClass::StackScalar { offset: _ } => {
+                    // D64: BID bit container — integer pair copy, no x87.
+                    if ty == IrType::F64
+                        || ty == IrType::I64
+                        || ty == IrType::U64
+                        || ty == IrType::D64
+                    {
+                        let src_ref = self.param_ref(src_offset);
+                        let src_ref_hi = self.param_ref(src_offset + 4);
+                        let words = [(&*src_ref, 0i64), (&*src_ref_hi, 4i64)];
+                        if !self.emit_over_aligned_param_stores(dest_id, slot, words) {
+                            let dst_ref = self.slot_ref(slot);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                            let dst_ref_hi = self.slot_ref_offset(slot, 4);
+                            emit!(self.state, "    movl {}, %eax", src_ref_hi);
+                            emit!(self.state, "    movl %eax, {}", dst_ref_hi);
+                        }
+                    } else if let Some(extent) =
+                        self.stack_param_direct_home_eligible(func, dest_id, slot, ty)
+                    {
+                        // Direct homing (GCC model): the callee owns the
+                        // incoming argument slot, so the ParamRef dest lives
+                        // THERE — no `movl 220(%esp),%eax; movl %eax,
+                        // 188(%esp)` copy pair. `slot_ref`/`slot_ref_offset`
+                        // translate this slot through `param_ref(src_offset)`
+                        // from here on, so every load, store, spill and
+                        // coalesced alias reads/writes the authoritative
+                        // location. Two instructions and four frame bytes
+                        // saved per eligible stack argument (measured on the
+                        // Linux x86 boot corpus: the setup image's .text
+                        // shrinks proportionally to the homing-pair census).
+                        self.param_direct_homes.insert(slot.0, (src_offset, extent));
+                    } else {
+                        let load_instr = self.mov_load_for_type(ty);
+                        let src_ref = self.param_ref(src_offset);
+                        if self.state.alloca_over_align(dest_id).is_some() {
+                            // Load + sign/zero-extend into %eax first (the
+                            // helper stages memory sources with a plain
+                            // movl), then store through the aligned base.
+                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                            let words = [("%eax", 0i64)];
+                            self.emit_over_aligned_param_stores(dest_id, slot, words);
+                        } else {
+                            let dst_ref = self.slot_ref(slot);
+                            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+                            // Always store full 32-bit value to SSA slot. The load
+                            // instruction above already sign/zero-extended sub-int
+                            // types into the full eax register. Using movb/movw here
+                            // would leave garbage in the upper bytes of the 4-byte
+                            // slot, which gets read back later by movl.
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
+                    }
+                }
+                ParamClass::StructStack { offset: _, size }
+                | ParamClass::LargeStructStack { offset: _, size } => {
+                    // Over-aligned (>16) parameter allocas: the slot is
+                    // oversized by (align-1) and the EFFECTIVE address is
+                    // align_up(slot, align) — every alloca-address user
+                    // (emit_alloca_addr_to, memcpy paths) resolves that same
+                    // aligned address, so the incoming-parameter copy must
+                    // target it too. Writing the raw slot desyncs the two by
+                    // the alignment pad (mirrors the x86-64 prologue's
+                    // _Alignas(32) fix; i686 repro: over_aligned_struct_arg).
+                    //
+                    // %ecx holds the aligned destination for the whole copy.
+                    // It is caller-saved and, in a plain cdecl prologue (no
+                    // regparm, no fastcall), provably dead here: register
+                    // parameters are captured through the same loop's
+                    // earlier arms and the function body has not started.
+                    // With regparm/fastcall, %ecx may still carry an
+                    // uncaptured register argument (the capture arms run in
+                    // parameter order), so it is saved/restored around the
+                    // copy — esp_adjust is kept in sync so that esp-relative
+                    // slot/param references below the push stay exact.
+                    let over_align = self.state.alloca_over_align(dest_id);
+                    let ecx_free = self.regparm == 0 && !self.is_fastcall;
+                    if over_align.is_some() {
+                        if ecx_free {
+                            self.emit_alloca_addr_to("ecx", dest_id, slot);
+                        } else {
+                            self.state.emit("    pushl %ecx");
+                            self.esp_adjust += 4;
+                            self.emit_alloca_addr_to("ecx", dest_id, slot);
+                        }
+                        let mut copied = 0usize;
+                        while copied + 4 <= size {
+                            let src_ref = self.param_ref(src_offset + copied as i64);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}(%ecx)", copied);
+                            copied += 4;
+                        }
+                        while copied < size {
+                            let src_ref = self.param_ref(src_offset + copied as i64);
+                            emit!(self.state, "    movb {}, %al", src_ref);
+                            emit!(self.state, "    movb %al, {}(%ecx)", copied);
+                            copied += 1;
+                        }
+                        if !ecx_free {
+                            self.state.emit("    popl %ecx");
+                            self.esp_adjust -= 4;
+                        }
+                    } else {
+                        let mut copied = 0usize;
+                        while copied + 4 <= size {
+                            let src_ref = self.param_ref(src_offset + copied as i64);
+                            let dst_ref = self.slot_ref_offset(slot, copied as i64);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                            copied += 4;
+                        }
+                        while copied < size {
+                            let src_ref = self.param_ref(src_offset + copied as i64);
+                            let dst_ref = self.slot_ref_offset(slot, copied as i64);
+                            emit!(self.state, "    movb {}, %al", src_ref);
+                            emit!(self.state, "    movb %al, {}", dst_ref);
+                            copied += 1;
+                        }
+                    }
+                }
+                ParamClass::F128AlwaysStack { offset: _ } => {
+                    // Bit-exact 12-byte copy of the incoming argument (the
+                    // caller's 10 payload bytes + 2 pad). An x87 round trip
+                    // would re-canonicalize exceptional encodings and
+                    // rewrite the padding; the slot keeps the native 80-bit
+                    // representation, so f128_direct_slots still applies.
+                    let words: Vec<(String, i64)> = (0..12)
+                        .step_by(4)
+                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
+                        .collect();
+                    let refs: Vec<(&str, i64)> =
+                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
+                        for (src_ref, j) in words {
+                            let dst_ref = self.slot_ref_offset(slot, j);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
+                    }
+                    self.state.f128_direct_slots.insert(dest_id);
+                }
+                ParamClass::I128Stack { offset: _ } => {
+                    let words: Vec<(String, i64)> = (0..16)
+                        .step_by(4)
+                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
+                        .collect();
+                    let refs: Vec<(&str, i64)> =
+                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
+                        for (src_ref, j) in words {
+                            let dst_ref = self.slot_ref_offset(slot, j);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
+                    }
+                }
+                ParamClass::F128Stack { offset: _ } => {
+                    // Bit-exact 12-byte copy (see F128AlwaysStack above).
+                    let words: Vec<(String, i64)> = (0..12)
+                        .step_by(4)
+                        .map(|j| (self.param_ref(src_offset + j as i64), j as i64))
+                        .collect();
+                    let refs: Vec<(&str, i64)> =
+                        words.iter().map(|(s, o)| (s.as_str(), *o)).collect();
+                    if !self.emit_over_aligned_param_stores(dest_id, slot, refs) {
+                        for (src_ref, j) in words {
+                            let dst_ref = self.slot_ref_offset(slot, j);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                        }
+                    }
+                    self.state.f128_direct_slots.insert(dest_id);
+                }
+                ParamClass::IntReg { .. }
+                | ParamClass::I64RegPair { .. }
+                | ParamClass::StructByValReg { .. } => {
+                    // Captured by the regparm phase-1 pass above (which runs
+                    // BEFORE any stack-param copy can clobber %eax/%edx/%ecx).
+                }
+                _ => {
+                    // Remaining register classes (FloatReg, SSE structs, etc.)
+                    // don't apply to i686's ABI classification.
+                }
+            }
+        }
+
+        // Fastcall register-target captures: resolved LAST, after every
+        // stack copy and every alloca-slot capture has read its source
+        // register (stack copies stage through %eax only; the over-aligned
+        // path preserves %ecx). Resolving earlier would let a cycle's
+        // scratch moves overwrite %ecx/%edx before an alloca-slot capture
+        // further down the parameter list read them.
+        self.resolve_incoming_reg_moves(&mut fc_reg_moves);
+    }
+
+    // ---- emit_param_ref ----
+
+    pub(super) fn emit_param_ref_impl(&mut self, dest: &Value, param_idx: usize, ty: IrType) {
+        use crate::backend::call_abi::ParamClass;
+
+        // Over-aligned-param homing elision: this dest's only use was the
+        // elided homing store. The prologue capture is the single
+        // authoritative home of the alloca; the dest itself is dead. Emit
+        // nothing (its slot, if any, is never read).
+        if self.state.dead_param_ref_dests.contains(&dest.0) {
+            return;
+        }
+
+        // If this param was pre-stored in the prologue (fastcall register param
+        // with eliminated alloca), the value is already in the correct physical
+        // register or stack slot. No code generation needed.
+        if self.state.param_pre_stored.contains(&param_idx) {
+            return;
+        }
+
+        // Shared register home: the prologue captured this param into a
+        // conflict slot instead of the destination register (a second
+        // capture would have clobbered another param's value). Reload.
+        if let Some(&conflict_slot) = self.conflict_param_slots.get(&param_idx) {
+            let load_instr = self.mov_load_for_type(ty);
+            let src_ref = self.slot_ref(conflict_slot);
+            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+            self.store_eax_to(dest);
+            return;
+        }
+
+        if param_idx < self.state.param_alloca_slots.len() {
+            if let Some((alloca_slot, _alloca_ty, alloca_id)) =
+                self.state.param_alloca_slots[param_idx]
+            {
+                if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                    if dest_slot.0 == alloca_slot.0 {
+                        // The param value is already in the alloca slot (stored by
+                        // emit_store_params). If dest also has a register assignment,
+                        // we must initialize the register from the slot — otherwise
+                        // the register contains garbage from the caller, and any
+                        // subsequent read via operand_to_eax will use the register
+                        // (uninitialized) instead of the slot.
+                        if let Some(phys) = self.dest_reg(dest) {
+                            let reg = phys_reg_name(phys);
+                            self.emit_param_slot_load(alloca_id, alloca_slot, ty);
+                            emit!(self.state, "    movl %eax, %{}", reg);
+                            self.state.reg_cache.invalidate_acc();
+                        }
+                        // The shared slot holds the native F128 encoding
+                        // (emit_store_params captured it bit-exactly), so a
+                        // later identity cast may use the direct copy path.
+                        if ty == IrType::F128 {
+                            self.state.f128_direct_slots.insert(dest.0);
+                        }
+                        return;
+                    }
+                }
+                if self.state.get_slot(dest.0).is_none() {
+                    // Dest is register-allocated (or dead) with no spill slot.
+                    // The param value lives in the alloca slot — emit_store_params
+                    // put it there regardless of whether it arrived in a register
+                    // (regparm) or on the stack. Load it from there; falling
+                    // through to the stack-offset fallback is wrong for register
+                    // params (they have no stack home).
+                    if let Some(phys) = self.dest_reg(dest) {
+                        let reg = phys_reg_name(phys);
+                        self.emit_param_slot_load(alloca_id, alloca_slot, ty);
+                        emit!(self.state, "    movl %eax, %{}", reg);
+                        self.state.reg_cache.invalidate_acc();
+                    }
+                    return;
+                }
+                if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                    if is_i128_type(ty) {
+                        self.emit_param_slot_word_copies(
+                            alloca_id,
+                            alloca_slot,
+                            dest_slot,
+                            &[0, 4, 8, 12],
+                        );
+                    } else if ty == IrType::F128 {
+                        // Bit-exact 12-byte copy (see the F128 capture
+                        // arms above); the destination keeps the native
+                        // 80-bit representation.
+                        self.emit_param_slot_word_copies(
+                            alloca_id,
+                            alloca_slot,
+                            dest_slot,
+                            &[0, 4, 8],
+                        );
+                        self.state.f128_direct_slots.insert(dest.0);
+                    } else if ty == IrType::F64
+                        || ty == IrType::I64
+                        || ty == IrType::U64
+                        || ty == IrType::D64
+                    {
+                        self.emit_param_slot_word_copies(
+                            alloca_id,
+                            alloca_slot,
+                            dest_slot,
+                            &[0, 4],
+                        );
+                    } else {
+                        self.emit_param_slot_load(alloca_id, alloca_slot, ty);
+                        self.store_eax_to(dest);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Fastcall register parameter: captured in the prologue into its
+        // home (param_pre_stored, or its alloca slot). It has no stack
+        // location to read.
+        if self.is_fastcall {
+            if let I686FastcallSlot::Reg(_) | I686FastcallSlot::Vector { .. } =
+                self.fastcall_slots[param_idx]
+            {
+                if let Some(Some((slot, _slot_ty, alloca_id))) =
+                    self.state.param_alloca_slots.get(param_idx)
+                {
+                    self.emit_param_slot_load(*alloca_id, *slot, ty);
+                    self.store_eax_to(dest);
+                }
+                return;
+            }
+        }
+
+        let stack_base: i64 = 8;
+        let param_offset = if self.is_fastcall {
+            // Exact compacted offset from the authoritative layout.
+            match self.fastcall_slots[param_idx] {
+                I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
+                I686FastcallSlot::Reg(_) | I686FastcallSlot::Vector { .. } => {
+                    unreachable!("handled above")
+                }
+            }
+        } else if param_idx < self.state.param_classes.len() {
+            match self.state.param_classes[param_idx] {
+                ParamClass::StackScalar { offset }
+                | ParamClass::StructStack { offset, .. }
+                | ParamClass::LargeStructStack { offset, .. }
+                | ParamClass::F128AlwaysStack { offset }
+                | ParamClass::I128Stack { offset }
+                | ParamClass::F128Stack { offset }
+                | ParamClass::LargeStructByRefStack { offset, .. } => stack_base + offset,
+                ParamClass::IntReg { .. }
+                | ParamClass::I64RegPair { .. }
+                | ParamClass::StructByValReg { .. } => {
+                    // Register param whose alloca was eliminated: the value was
+                    // captured in the prologue (param_pre_stored) or is dead.
+                    // There IS no stack home to read; falling through to a
+                    // stack load would read the caller's frame garbage.
+                    debug_assert!(
+                        false,
+                        "emit_param_ref: register param {} not pre-stored",
+                        param_idx
+                    );
+                    return;
+                }
+                ParamClass::VectorReturnBuffer { .. } => {
+                    let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
+                    emit!(self.state, "    leal {}, %eax", source);
+                    self.store_eax_to(dest);
+                    return;
+                }
+                _ => stack_base + (param_idx as i64) * 4,
+            }
+        } else {
+            stack_base + (param_idx as i64) * 4
+        };
+
+        if is_i128_type(ty) {
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                for i in (0..16).step_by(4) {
+                    let src_ref = self.param_ref(param_offset + i as i64);
+                    let dst_ref = self.slot_ref_offset(slot, i as i64);
+                    emit!(self.state, "    movl {}, %eax", src_ref);
+                    emit!(self.state, "    movl %eax, {}", dst_ref);
+                }
+            }
+        } else if ty == IrType::F128 {
+            if let Some(dest_slot) = self.state.get_slot(dest.0) {
+                // Bit-exact 12-byte copy; destination keeps the native
+                // 80-bit representation.
+                for j in (0..12).step_by(4) {
+                    let src_ref = self.param_ref(param_offset + j as i64);
+                    let dst_ref = self.slot_ref_offset(dest_slot, j as i64);
+                    emit!(self.state, "    movl {}, %eax", src_ref);
+                    emit!(self.state, "    movl %eax, {}", dst_ref);
+                }
+                self.state.f128_direct_slots.insert(dest.0);
+            }
+        } else if super::emit::is_pair_scalar(ty) {
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                let src_ref = self.param_ref(param_offset);
+                let dst_ref = self.slot_ref(slot);
+                emit!(self.state, "    movl {}, %eax", src_ref);
+                emit!(self.state, "    movl %eax, {}", dst_ref);
+                let src_ref_hi = self.param_ref(param_offset + 4);
+                let dst_ref_hi = self.slot_ref_offset(slot, 4);
+                emit!(self.state, "    movl {}, %eax", src_ref_hi);
+                emit!(self.state, "    movl %eax, {}", dst_ref_hi);
+            }
+        } else {
+            let load_instr = self.mov_load_for_type(ty);
+            let src_ref = self.param_ref(param_offset);
+            emit!(self.state, "    {} {}, %eax", load_instr, src_ref);
+            self.store_eax_to(dest);
+        }
+    }
+
+    // ---- emit_epilogue_and_ret ----
+
+    pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        self.state.flush_epilogue_loc();
+        // Same discipline as x86-64 (and GCC on i386): a function that wrote
+        // YMM/ZMM upper state cleans it before returning, or the caller's
+        // legacy-SSE code pays the AVX-SSE transition / false-dependency cost.
+        if self.state.dirty_upper_ymm {
+            self.state.emit("    vzeroupper");
+        }
+        self.emit_epilogue(frame_size);
+        if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
+            // i386 SysV sret: callee pops the hidden pointer.
+            // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
+            // function_value semantics) — nothing is on the stack to pop.
+            self.state.emit("    ret $4");
+        } else if self.is_fastcall && !self.is_variadic && self.fastcall_stack_cleanup > 0 {
+            // Variadic fastcall callees receive everything on the stack and
+            // pop nothing (plain `ret`); the caller owns the cleanup.
+            emit!(self.state, "    ret ${}", self.fastcall_stack_cleanup);
+        } else {
+            self.state.emit("    ret");
+        }
+    }
+
+    // ---- store/load instr for type ----
+
+    pub(super) fn store_instr_for_type_impl(&self, ty: IrType) -> &'static str {
+        self.mov_store_for_type(ty)
+    }
+
+    pub(super) fn load_instr_for_type_impl(&self, ty: IrType) -> &'static str {
+        self.mov_load_for_type(ty)
+    }
+}
+
+fn emit_stack_alloc_i686(
+    state: &mut crate::backend::state::CodegenState,
+    mut size: i64,
+    omit_fp: bool,
+    callee_saved_bytes: i64,
+) {
+    if size <= 0 {
+        return;
+    }
+    // i686 needs no register-form fallback: `subl imm32, %esp` takes the full
+    // 32-bit immediate (the x86-64 sign-extension trap that forces
+    // `emit_stack_adjust_x86` does not exist here -- a 32-bit operand size
+    // means the immediate is the whole value), and a frame larger than the
+    // address space cannot be built in the first place. A size above `u32::MAX`
+    // is a front-end defect, not something to encode: the assertion catches it
+    // in a debug build, and the assembler rejects the literal otherwise rather
+    // than letting a wrapped constant move `%esp` the wrong way.
+    debug_assert!(
+        size <= i64::from(u32::MAX),
+        "i686 frame {size} does not fit the 32-bit immediate"
+    );
+    const PAGE_SIZE: i64 = 4096;
+    if !state.stack_clash_protection || size <= PAGE_SIZE {
+        state.emit_fmt(format_args!("    subl ${}, %esp", size));
+        return;
+    }
+    if omit_fp || size <= 4 * PAGE_SIZE {
+        while size > PAGE_SIZE {
+            state.emit_fmt(format_args!("    subl ${}, %esp", PAGE_SIZE));
+            state.emit("    orl $0, (%esp)");
+            size -= PAGE_SIZE;
+        }
+        if size > 0 {
+            state.emit_fmt(format_args!("    subl ${}, %esp", size));
+            state.emit("    orl $0, (%esp)");
+        }
+    } else {
+        // Frame pointer is active (`%ebp` established). Probe the first page by
+        // saving `%eax` into it so `regparm`/`fastcall` incoming `%eax` is
+        // preserved without touching unallocated memory below `%esp`.
+        let saved_eax_ebp_off = -(callee_saved_bytes + PAGE_SIZE);
+        state.emit_fmt(format_args!("    subl ${}, %esp", PAGE_SIZE));
+        state.emit("    movl %eax, (%esp)");
+        let rem_total = size - PAGE_SIZE;
+        let probe_label = state.fresh_label("stack_probe");
+        state.emit_fmt(format_args!("    movl ${}, %eax", rem_total));
+        state.emit_fmt(format_args!("{}:", probe_label));
+        state.emit_fmt(format_args!("    subl ${}, %esp", PAGE_SIZE));
+        state.emit("    orl $0, (%esp)");
+        state.emit_fmt(format_args!("    subl ${}, %eax", PAGE_SIZE));
+        state.emit_fmt(format_args!("    cmpl ${}, %eax", PAGE_SIZE));
+        state.emit_fmt(format_args!("    ja {}", probe_label));
+        state.emit("    subl %eax, %esp");
+        state.emit("    orl $0, (%esp)");
+        state.emit_fmt(format_args!("    movl {}(%ebp), %eax", saved_eax_ebp_off));
+    }
+}

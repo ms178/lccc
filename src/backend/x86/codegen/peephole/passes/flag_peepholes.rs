@@ -1,0 +1,6256 @@
+//! Flags-aware x86-64 peepholes.
+//!
+//! Transforms that need an explicit model of the EFLAGS lifetime, which
+//! the other peephole passes deliberately avoid touching:
+//!
+//! 1. [`fold_copy_add_into_lea`] — `movl %A,%D; addl $imm,%D` → `leal imm(%A),%D`,
+//!    and `movl %A,%D; addl %R,%D` → `leal (%A,%R),%D`.
+//!    One instruction less, and — crucially — `lea` does not write flags, which
+//!    is what makes transform 2 applicable to the loop bodies the backend emits.
+//!    [`fold_lea_add_into_lea`] — `leal d(%B,%I,s),%D; addl $k,%D` →
+//!    `leal d+k(%B,%I,s),%D` (the add folded into the LEA displacement).
+//! 2. [`fold_setcc_test_cmov`] — the backend materialises a comparison as a
+//!    0/1 byte, widens it, tests it, and feeds the test to a `cmov`. When no
+//!    instruction between the `setCC` and the `cmov` writes flags, the `cmov`
+//!    can consume the ORIGINAL comparison directly: the `setCC`, the `movzbl`
+//!    and the `test` all disappear (three instructions).
+//! 3. [`fold_conditional_increment`] — count zero/nonzero using carry, after
+//!    proving the temporary and every changed flag dead.
+//!    [`fold_setcc_increment`] — the same identity for the materialised
+//!    boolean (`cmp $0; setne; movzbl; add` → `cmp $1; sbb $-1`).
+//! 4. [`fold_copy_and_mask_into_movz`] — `movl %A,%D; andl $255,%D` →
+//!    `movzbl %Al,%D` (likewise `$65535` → `movzwl`).
+//!
+//! # The flags model
+//!
+//! `flags_effect` classifies a line as WRITES / READS / NEUTRAL, and anything
+//! unrecognised is treated as *both* a reader and a writer. Transform 1 needs
+//! "the flags this `add` writes are dead" (definite kills cover every flag
+//! before any reader; a partial writer is not a complete kill); transforms 1 and 2 both bail out at control flow, because a
+//! conditional branch elsewhere may consume flags that were set before a label.
+
+use super::super::types::*;
+use super::helpers::{
+    get_dest_reg, has_implicit_reg_usage, is_read_modify_write, src_mentions_family, writes_family,
+    writes_family_full,
+};
+use super::liveness::FileLiveness;
+use super::relay_and_lea::{
+    dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
+    provably_dead, rbp_is_gpr_in_function, split_two_operands,
+};
+
+/// What a line does to EFLAGS.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum FlagsEffect {
+    /// Neither reads nor writes the flags (moves, `lea`, most SSE data moves).
+    Neutral,
+    /// Writes flags without consuming the previous value (`cmp`, `add`, ...).
+    Writes,
+    /// Reads the flags (`jcc`, `setcc`, `cmovcc`, `adc`, `sbb`, `pushfq`, ...).
+    /// Anything unrecognised is reported as `Reads` so both queries below stay
+    /// conservative: a reader blocks "flags are dead" AND blocks "flags still
+    /// hold the original comparison".
+    Reads,
+}
+
+/// Bits for the arithmetic flags a rewrite can be observed through.
+pub(super) const F_ZF: u8 = 1 << 0;
+pub(super) const F_CF: u8 = 1 << 1;
+pub(super) const F_SF: u8 = 1 << 2;
+pub(super) const F_OF: u8 = 1 << 3;
+pub(super) const F_PF: u8 = 1 << 4;
+pub(super) const F_AF: u8 = 1 << 5;
+/// Every arithmetic flag.  The default for anything not listed below: a mask
+/// narrower than the truth is a miscompile, a mask wider than the truth only
+/// costs a missed fold.
+pub(super) const F_ALL: u8 = F_ZF | F_CF | F_SF | F_OF | F_PF | F_AF;
+
+/// Arithmetic flags definitely replaced or made architecturally undefined.
+/// Neither case preserves a defined dependency on the incoming flag value.
+/// A possible write is not a kill: INC preserves CF, SAHF preserves OF,
+/// and a variable/zero-count shift can preserve every flag. Unknown writers
+/// therefore kill nothing. Partial writers never retire surviving flags.
+pub(super) fn flags_written_mask(t: &str) -> u8 {
+    let base = t.strip_prefix('v').unwrap_or(t);
+    let mnem = base.split_whitespace().next().unwrap_or(base);
+    let stem = if matches!(mnem, "sub" | "mul" | "imul" | "call") {
+        mnem
+    } else {
+        mnem.strip_suffix(['b', 'w', 'l', 'q']).unwrap_or(mnem)
+    };
+    match mnem {
+        "stc" | "clc" | "cmc" => F_CF,
+        "sahf" => F_SF | F_ZF | F_AF | F_PF | F_CF,
+        "comiss" | "comisd" | "ucomiss" | "ucomisd" | "ptest" => F_ALL,
+        _ => match stem {
+            "add" | "sub" | "cmp" | "test" | "and" | "or" | "xor" | "neg" | "xadd" | "cmpxchg"
+            | "popcnt" | "popf" | "call" => F_ALL,
+            "inc" | "dec" => F_ALL & !F_CF,
+            "mul" | "imul" | "div" | "idiv" | "bsf" | "bsr" | "lzcnt" | "tzcnt" | "andn"
+            | "blsi" | "blsmsk" | "blsr" | "bzhi" | "bextr" => F_ALL,
+            // BT family leaves ZF unchanged; the other non-CF flags are undefined.
+            "bt" | "bts" | "btr" | "btc" => F_ALL & !F_ZF,
+            _ => 0,
+        },
+    }
+}
+
+/// Mnemonic prefixes that never touch EFLAGS.
+const FLAG_NEUTRAL_PREFIXES: &[&str] = &[
+    "movl ",
+    "movq ",
+    "movb ",
+    "movw ",
+    "movabsq ",
+    "movabs ",
+    "movzbl ",
+    "movzbq ",
+    "movzwl ",
+    "movzwq ",
+    "movsbl ",
+    "movsbq ",
+    "movswl ",
+    "movswq ",
+    "movslq ",
+    "leal ",
+    "leaq ",
+    "movss ",
+    "movsd ",
+    "movaps ",
+    "movapd ",
+    "movups ",
+    "movupd ",
+    "movdqa ",
+    "movdqu ",
+    "movd ",
+    "movq2dq ",
+    "vmovss ",
+    "vmovsd ",
+    "vmovaps ",
+    "vmovapd ",
+    "vmovups ",
+    "vmovupd ",
+    "vmovdqa ",
+    "vmovdqu ",
+    "cvtsi2sd ",
+    "cvtsi2ss ",
+    "cvttsd2si ",
+    "cvttss2si ",
+    "cvtss2sd ",
+    "cvtsd2ss ",
+    "bswap ",
+    "bswapl ",
+    "bswapq ",
+    "xchg ",
+    "nop",
+    "prefetch",
+];
+
+/// Mnemonic prefixes that read the flags.
+const FLAG_READER_PREFIXES: &[&str] = &[
+    "set", "cmov", "adc", "sbb", "rcl", "rcr", "pushf", "lahf", "into", "cmc", "salc",
+];
+
+/// Classify a trimmed instruction's effect on EFLAGS.
+pub(super) fn flags_effect(t: &str) -> FlagsEffect {
+    // Conditional jumps read; `jmp` is control flow but flag-neutral.
+    if t.starts_with('j') {
+        return if t.starts_with("jmp") {
+            FlagsEffect::Neutral
+        } else {
+            FlagsEffect::Reads
+        };
+    }
+    if FLAG_READER_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        return FlagsEffect::Reads;
+    }
+    if FLAG_NEUTRAL_PREFIXES.iter().any(|p| t.starts_with(p)) {
+        return FlagsEffect::Neutral;
+    }
+    // Bare mnemonics (no operand) that are flag-neutral.
+    if matches!(
+        t,
+        "ret"
+            | "leave"
+            | "cltq"
+            | "cqto"
+            | "cwtl"
+            | "cdqe"
+            | "nop"
+            | "endbr64"
+            | "cltd"
+            | "cwtd"
+            | "cdq"
+            | "cwd"
+            | "cbw"
+            | "cwde"
+            | "cbtw"
+    ) {
+        return FlagsEffect::Neutral;
+    }
+    // Plain stack push/pop do not touch EFLAGS.  pushf is a flag READER
+    // (handled above), popf a flag WRITER (handled below).  The mnemonic may
+    // carry an operand-size suffix (`popq %rbp` — the spelling every AT&T
+    // epilogue emits), which the old `starts_with("pop ")` test missed: the
+    // suffixed forms fell through to the "unknown" catch-all, were treated
+    // as flag READERS, and `flags_dead_after` then refused every
+    // flag-discarding fold across a callee-save restore.  The stem must END
+    // at the mnemonic — `popcnt` shares no stem letters with this check
+    // ('t' is not a width suffix), and `pushfq`/`popfq` reduce to
+    // `pushf`/`popf`, which are classified above/below as reader/writer.
+    let mnem_end = t.find(|c: char| !c.is_ascii_lowercase()).unwrap_or(t.len());
+    let mnem = &t[..mnem_end];
+    let stem = mnem
+        .strip_suffix('q')
+        .or_else(|| mnem.strip_suffix('l'))
+        .or_else(|| mnem.strip_suffix('w'))
+        .unwrap_or(mnem);
+    if matches!(stem, "pop" | "push") {
+        return FlagsEffect::Neutral;
+    }
+    // A call clobbers flags (they are not preserved across the SysV boundary),
+    // which for our purposes is exactly a write.
+    if t.starts_with("call") {
+        return FlagsEffect::Writes;
+    }
+    // BMI2 VEX shifts (`shlx/shrx/sarx`) and the other flag-neutral BMI2
+    // ops (rorx/pdep/pext/mulx) leave EFLAGS untouched per the SDM; they
+    // must be classified before the prefix table below, which would
+    // otherwise match them as "shl"/"shr"/"sar" writers and let a later
+    // scan treat an earlier `cmp`'s flags as dead.
+    // The BMI1 VEX siblings (andn/bextr/bzhi/blsi/blsmsk/blsr) are NOT
+    // neutral — the SDM documents flag writes for all of them (andn:
+    // SF/ZF/PF set, OF/CF cleared; blsi/blsr/blsmsk: ZF/CF/SF/OF;
+    // bextr/bzhi: ZF/CF), proven on hardware 2026-09-24 (`cmp; andn; je`
+    // takes the branch iff andn wrote ZF — it does).  They are classified
+    // as writers in the WRITERS table below: in `cmp; andn; je` the branch
+    // reads ANDN's flags, so the cmp's flags are dead, not live — the old
+    // comment had the dataflow exactly backwards.
+    if t.starts_with("shlx")
+        || t.starts_with("shrx")
+        || t.starts_with("sarx")
+        || t.starts_with("rorx")
+        || t.starts_with("pdep")
+        || t.starts_with("pext")
+        || t.starts_with("mulx")
+    {
+        return FlagsEffect::Neutral;
+    }
+
+    // Everything below classifies on the mnemonic with a leading VEX `v`
+    // stripped, so `vaddps` gets exactly the classification of `addps`.
+    let base = t.strip_prefix('v').unwrap_or(t);
+
+    // Instructions with a fixed flag-writing effect that the generic tables
+    // below would misroute: sahf/stc/clc write flags without reading them;
+    // shld/shrd/bts/btr/btc/ptest write CF (and friends); popf REPLACES the
+    // flags from the stack (a producer, not a consumer); the SSE/AVX compare
+    // family (u)comis{s,d} writes ZF/CF/PF.
+    let mnem = base
+        .split(|c: char| c == ' ' || c == '\t')
+        .next()
+        .unwrap_or(base);
+    if matches!(
+        mnem,
+        "sahf"
+            | "stc"
+            | "clc"
+            | "cld"
+            | "std"
+            | "shld"
+            | "shldl"
+            | "shldq"
+            | "shrd"
+            | "shrdl"
+            | "shrdq"
+            | "bts"
+            | "btsl"
+            | "btsq"
+            | "btsw"
+            | "btr"
+            | "btrl"
+            | "btrq"
+            | "btrw"
+            | "btc"
+            | "btcl"
+            | "btcq"
+            | "btcw"
+            | "ptest"
+            | "popf"
+            | "popfl"
+            | "popfq"
+            | "popfw"
+            | "comiss"
+            | "comisd"
+            | "ucomiss"
+            | "ucomisd"
+    ) {
+        return FlagsEffect::Writes;
+    }
+
+    // SSE/AVX data instructions never touch EFLAGS.  The generic ALU stems
+    // below would otherwise match their scalar/vector spellings as flag
+    // writers (`addsd` -> "add"), which is factually wrong and — far worse —
+    // lets `flags_dead_after` delete a live producer between a `cmp` and a
+    // later `jcc` (`cmp; addsd; je` miscompiled before this list existed).
+    if fp_data_op(base) {
+        return FlagsEffect::Neutral;
+    }
+
+    // Generic flag-writing ALU stems, matched with an exact size suffix
+    // (l/q/w/b), a blank, or end-of-mnemonic — never `sd`/`ss`/`ps`/`pd`
+    // (those are FP forms, handled above) and never sibling mnemonics
+    // (`shld`, `cmpxchg` are classified by their own rules; the BMI1
+    // `andn`/`bextr`/`bzhi`/`blsi`/`blsmsk`/`blsr` stems below are exact
+    // writers — the SSE `andnps`/`andnpd` do NOT match: `ps`/`pd` are not
+    // integer suffixes, and the FP table above claims them first anyway).
+    const WRITERS: &[&str] = &[
+        "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
+        "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
+        "tzcnt", "cmpxchg", "xadd", "andn", "bextr", "bzhi", "blsi", "blsmsk", "blsr",
+    ];
+    if WRITERS.iter().any(|p| suffix_exact_writer(base, p)) {
+        return FlagsEffect::Writes;
+    }
+    // Unknown: assume the worst (both).
+    FlagsEffect::Reads
+}
+
+/// `stem` is a flag-writing mnemonic when it is followed by nothing, a blank
+/// (operands follow), or an integer size suffix (l/q/w/b).  A suffix that
+/// starts a different mnemonic (`addsd`, `andn`, `shld`, `btc`) is not one.
+#[inline]
+fn suffix_exact_writer(base: &str, stem: &str) -> bool {
+    let Some(rest) = base.strip_prefix(stem) else {
+        return false;
+    };
+    rest.is_empty() || matches!(rest.as_bytes()[0], b' ' | b'l' | b'q' | b'w' | b'b')
+}
+
+/// SSE/AVX data mnemonics (and their VEX `v`-prefixed spellings via the
+/// caller's base) that never read or write EFLAGS.
+#[inline]
+fn fp_data_op(base: &str) -> bool {
+    const FP_NEUTRAL: &[&str] = &[
+        // scalar/vector FP arithmetic, compares, rounding, sqrt, rcps
+        "addsd",
+        "addss",
+        "addps",
+        "addpd",
+        "addsubps",
+        "addsubpd",
+        "subsd",
+        "subss",
+        "subps",
+        "subpd",
+        "mulsd",
+        "mulss",
+        "mulps",
+        "mulpd",
+        "divsd",
+        "divss",
+        "divps",
+        "divpd",
+        "minss",
+        "minsd",
+        "minps",
+        "minpd",
+        "maxss",
+        "maxsd",
+        "maxps",
+        "maxpd",
+        "cmpps",
+        "cmppd",
+        "blendvps",
+        "blendvpd",
+        "sqrtss",
+        "sqrtsd",
+        "sqrtps",
+        "sqrtpd",
+        "roundss",
+        "roundsd",
+        "roundps",
+        "roundpd",
+        "rcpss",
+        "rcpps",
+        "rsqrtss",
+        "rsqrtps",
+        "shufps",
+        "shufpd",
+        "andps",
+        "andpd",
+        "andnps",
+        "andnpd",
+        "orps",
+        "orpd",
+        "xorps",
+        "xorpd",
+        "unpcklps",
+        "unpckhps",
+        "unpcklpd",
+        "unpckhpd",
+        "cvt",
+        "cvtt",
+        "hadd",
+        "hsub",
+        // integer SIMD data ops
+        "pshufb",
+        "pshufd",
+        "pshufhw",
+        "pshuflw",
+        "palignr",
+        "padd",
+        "psub",
+        "pmul",
+        "pmadd",
+        "pavg",
+        "psll",
+        "psrl",
+        "psra",
+        "pand",
+        "pandn",
+        "por",
+        "pxor",
+        "pcmpeq",
+        "pcmpgt",
+        "pmins",
+        "pminu",
+        "pmaxs",
+        "pmaxu",
+        "psadbw",
+        "pmuludq",
+        "mpsadbw",
+        "phadd",
+        "phsub",
+        "psign",
+        "pabs",
+        "pmaddubsw",
+        "pack",
+        "punpck",
+        "pinsr",
+        "pextr",
+        "extract",
+        "insert",
+        "insertps",
+        "extractps",
+        "blend",
+        "pblend",
+        "perm",
+        "maskmov",
+        // data movement / mask extraction / broadcasts / gathers / FMA / AES
+        "movdqa",
+        "movdqu",
+        "movaps",
+        "movups",
+        "movapd",
+        "movupd",
+        "movdq",
+        "movhlps",
+        "movlhps",
+        "movnti",
+        "movntq",
+        "movntdqa",
+        "lddqu",
+        "movshdup",
+        "movsldup",
+        "movddup",
+        "movmskps",
+        "movmskpd",
+        "pmovmskb",
+        "broadcast",
+        "pbroadcast",
+        "gather",
+        "pgather",
+        "fmadd",
+        "fmsub",
+        "fnmadd",
+        "fnmsub",
+        "aes",
+        "pclmul",
+        "zero",
+        "ldmxcsr",
+        "stmxcsr",
+        // moves and LEAs (covers v-prefixed data moves too: vmovq, vmovd)
+        "mov",
+        "lea",
+        "xchg",
+        "not",
+    ];
+    FP_NEUTRAL.iter().any(|p| base.starts_with(p))
+}
+
+/// True when the flags written at `from - 1` are dead: scanning forward inside
+/// the block, a flags WRITER is reached before any flags READER.  The single
+/// oracle every flag-discarding transform must consult — a one-instruction
+/// peek lets an intervening flag-NEUTRAL instruction (`mov`, `lea`, `andn`,
+/// `blsi`, ...) hide a later `jcc`/`setcc`/`adc` that still reads the value
+/// (the `addq $imm` → `leaq` rewrite in local_patterns miscompiled exactly
+/// this shape).
+/// A whole-line comment (`#` first, GAS x86 syntax): it emits no bytes, so it
+/// can neither read nor write EFLAGS.  `classify_line` keeps such lines whole
+/// (the `# LCCC_*` markers are read from their text), so they reach the
+/// mnemonic classifier, which would charge them as unknown flag readers.  The
+/// inline-asm quarantine markers stay opaque.
+pub(super) fn is_byteless_comment(t: &str) -> bool {
+    t.starts_with('#') && t != "#APP" && t != "#NO_APP"
+}
+
+pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
+    let mut n = from;
+    let mut live = F_ALL;
+    while n < store.len() {
+        if infos[n].is_nop() {
+            n += 1;
+            continue;
+        }
+        // `.cfi_*`, `.loc`, `.size` and fill-less alignment emit no flag-touching
+        // instruction (their padding is `nop`), so they are a position.  A DATA
+        // directive is not: `.byte 0xf5` is `cmc`.  It is deliberately left to
+        // the classifier below, which answers `Reads` for text it cannot
+        // identify and therefore reports the flags live (see `steps_over_line`).
+        if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n)))
+            || is_byteless_comment(infos[n].trimmed(store.get(n)))
+        {
+            n += 1;
+            continue;
+        }
+        // A label is a join point, not a transfer. Other predecessors can enter
+        // it, but flags written before it reach only the fall-through path,
+        // which runs straight through the label. Any branch out of the scanned
+        // region is a `Reads` before the label is reached. Treating the label
+        // as a barrier kept a dead `shlq` alive in ring_fifo, whose `cmpl` sits
+        // one label past the shift. This check precedes the classifier, which
+        // answers `Reads` for unrecognised text such as a label line.
+        if infos[n].kind == LineKind::Label {
+            n += 1;
+            continue;
+        }
+        // Returning ends the flags' lifetime: the SysV ABI does not preserve
+        // EFLAGS across a call boundary.
+        if infos[n].kind == LineKind::Ret {
+            return true;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        match flags_effect(t) {
+            FlagsEffect::Reads => return false,
+            FlagsEffect::Writes => {
+                live &= !flags_written_mask(t);
+                if live == 0 {
+                    return true;
+                }
+            }
+            FlagsEffect::Neutral => {}
+        }
+        // push/pop are barriers for the register scans but leave flags alone.
+        if matches!(infos[n].kind, LineKind::Push { .. } | LineKind::Pop { .. }) {
+            n += 1;
+            continue;
+        }
+        // Any other control flow: a successor block may read the flags.
+        if infos[n].is_barrier() {
+            return false;
+        }
+        n += 1;
+    }
+    false
+}
+
+/// Index of the next line after `i` that is neither a NOP nor a
+/// debug-attribution directive (`.loc`/`.file`), or `None`.
+///
+/// Attribution lines are free of the window's step budget, exactly as
+/// `next_memfold_instruction` in `memory_fold.rs` treats them (its proof
+/// budgets carry the same invariant): if they counted, whether a pair fits
+/// the window would depend on whether `-g` was passed, and the same source
+/// would emit different `.text` with and without debug information
+/// (check_debug_code_parity.py).  Without `-g` no attribution lines exist
+/// in a function, so this changes nothing for plain builds.
+fn next_real(store: &LineStore, infos: &[LineInfo], i: usize, len: usize) -> Option<usize> {
+    let k = next_non_debug(store, infos, i + 1, len);
+    (k < len).then_some(k)
+}
+
+/// Parse `$<int>` (decimal, optionally negative) into its value.
+fn imm_value(text: &str) -> Option<i64> {
+    text.strip_prefix('$')?.parse::<i64>().ok()
+}
+
+/// The arithmetic operand must name the copy's destination register at the
+/// arithmetic's own width (`movq %r9, %rax` + `addl $1, %eax`).
+fn names_family_at_width(text: &str, fam: RegId, wide: bool) -> bool {
+    text == REG_NAMES[if wide { 0 } else { 1 }][fam as usize]
+}
+
+// ── 1. copy + add-immediate → lea ────────────────────────────────────────────
+
+/// `movl %A, %D` + `addl $imm, %D` → `leal imm(%A), %D` (same for `q`, and for
+/// `sub` with the displacement negated), and the register-addend form
+/// `movl %A, %D` + `addl %R, %D` → `leal (%A,%R), %D` (`add` only: `lea` has
+/// no subtracted index).
+///
+/// Saves one instruction and — the reason this pass exists — removes a flags
+/// write from between a comparison and its consumer, which is what lets
+/// [`fold_setcc_test_cmov`] fire on the counter-increment idiom.
+///
+/// Soundness: `lea` computes the same value (`imm` fits in the 32-bit signed
+/// displacement), `A != D` so no operand is destroyed, and the flags the `add`
+/// used to write must be provably dead.
+pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    /// `%rbp` may serve as a value register here only in a function that never
+    /// establishes a frame pointer, and proving that scans the whole function.
+    /// Both arms below ask the same question at the same line, and a function
+    /// can hold many candidates, so the answer is memoised on the function's
+    /// start line (candidates are visited in order, so one entry covers the
+    /// repeats). `function_range` is memoised with it, being part of the same
+    /// scan.
+    fn rbp_is_gpr_at(
+        store: &LineStore,
+        infos: &[LineInfo],
+        at: usize,
+        memo: &mut Option<(usize, bool)>,
+    ) -> bool {
+        let Some((fs, fe)) = function_range(store, infos, at) else {
+            return false;
+        };
+        if let Some((cached, v)) = *memo
+            && cached == fs
+        {
+            return v;
+        }
+        let v = rbp_is_gpr_in_function(store, infos, fs, fe);
+        *memo = Some((fs, v));
+        v
+    }
+    let len = store.len();
+    let mut rbp_memo: Option<(usize, bool)> = None;
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let mov = infos[i].trimmed(store.get(i));
+        let (wide, rest) = if let Some(r) = mov.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((src_text, dst_text)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let (Some(src_fam), Some(dst_fam)) =
+            (plain_gp_operand(src_text), plain_gp_operand(dst_text))
+        else {
+            i += 1;
+            continue;
+        };
+        // A self-copy is not this pattern, and %rsp is never a destination.
+        if src_fam == dst_fam || dst_fam == REG_RSP {
+            i += 1;
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let add = infos[j].trimmed(store.get(j));
+        let (add_wide, neg, arest) = if let Some(r) = add.strip_prefix("addq ") {
+            (true, false, r)
+        } else if let Some(r) = add.strip_prefix("addl ") {
+            (false, false, r)
+        } else if let Some(r) = add.strip_prefix("subq ") {
+            (true, true, r)
+        } else if let Some(r) = add.strip_prefix("subl ") {
+            (false, true, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // The copy may be WIDER than the arithmetic (`movq %r9, %rax` +
+        // `addl $1, %eax` = zero-extended 32-bit add), never narrower: a
+        // `movl` copy zero-extends, so a following `addq` would read bits the
+        // 64-bit LEA source still has.
+        if !wide && add_wide {
+            i += 1;
+            continue;
+        }
+        let Some((imm_text, add_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        if !names_family_at_width(add_dst, dst_fam, add_wide) {
+            i += 1;
+            continue;
+        }
+        let Some(mut imm) = imm_value(imm_text) else {
+            // Register addend: `movl %A, %D; addl %R, %D` -> `leal (%A, %R), %D`.
+            // R must be named at the add's width (a `%r8b` addend is not a
+            // 32-bit add) and must not be D (after the copy D holds A; that
+            // aliasing case is left alone) or %rsp (not encodable as index).
+            // %rbp as the destination participates only when
+            // `rbp_is_gpr_in_function` proves the function never establishes
+            // a frame pointer — the same policy the relay retarget uses; in
+            // a frame-pointer build an rbp write is the frame, not a value.
+            let Some(r_fam) = plain_gp_operand(imm_text) else {
+                i += 1;
+                continue;
+            };
+            // `movq %rsp, %rbp` is the frame setup, whatever follows it.
+            if neg
+                || (dst_fam == REG_RBP && src_fam == REG_RSP)
+                || r_fam == dst_fam
+                || r_fam == REG_RSP
+                || !names_family_at_width(imm_text, r_fam, add_wide)
+                || (dst_fam == REG_RBP && !rbp_is_gpr_at(store, infos, i, &mut rbp_memo))
+                || !flags_dead_after(store, infos, j + 1)
+            {
+                i += 1;
+                continue;
+            }
+            let mnemonic = if add_wide { "leaq" } else { "leal" };
+            let dst_name = REG_NAMES[if add_wide { 0 } else { 1 }][dst_fam as usize];
+            let new_line = format!(
+                "    {} ({}, {}), {}",
+                mnemonic, REG_NAMES[0][src_fam as usize], REG_NAMES[0][r_fam as usize], dst_name
+            );
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[j], j, new_line);
+            changed = true;
+            i = j + 1;
+            continue;
+        };
+        // `%rbp` as destination participates only when the copy is not from
+        // `%rsp` and `rbp_is_gpr_in_function` proves the function never
+        // establishes a frame pointer — matching the register-addend arm above.
+        if dst_fam == REG_RBP
+            && (src_fam == REG_RSP || !rbp_is_gpr_at(store, infos, i, &mut rbp_memo))
+        {
+            i += 1;
+            continue;
+        }
+        if neg {
+            imm = imm.saturating_neg();
+        }
+        if imm < i32::MIN as i64 || imm > i32::MAX as i64 {
+            i += 1;
+            continue;
+        }
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        // The LEA is emitted at the ARITHMETIC width; its base register is
+        // always named 64-bit so the address computation stays in 64-bit mode
+        // (`leal 1(%r9), %eax` — 32-bit result, 64-bit base).
+        let mnemonic = if add_wide { "leaq" } else { "leal" };
+        let base = REG_NAMES[0][src_fam as usize];
+        let dst_name = if add_wide {
+            REG_NAMES[0][dst_fam as usize]
+        } else {
+            REG_NAMES[1][dst_fam as usize]
+        };
+        let new_line = format!("    {} {}({}), {}", mnemonic, imm, base, dst_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── 1a. lea + add-immediate → lea ───────────────────────────────────────────
+
+/// `lea{l,q} d(%B,%I,s), %D` + `{add,sub}{l,q} $k, %D` →
+/// `lea d±k(%B,%I,s), %D` — the add folded into the displacement. The
+/// multiply-by-constant plans emit `leal (%r,%r,2), %r` and the IR's
+/// following `+ 1` becomes `addl $1, %r`; GCC emits the single
+/// `leal 1(%rax,%rax,2), %eax`.
+///
+/// Soundness (all checked):
+/// * *Value.* `D = d + B + I*s`, then `D += k` is `d + k + B + I*s` in
+///   wrapping arithmetic. The result takes the ADD's width: a `leaq` + `addl`
+///   pair is the low 32 bits of `(B + I*s + d) + k`, which `leal` computes
+///   exactly (low bits never depend on high bits). A `leal` + `addq` pair adds
+///   `k` to the ZERO-EXTENDED 32-bit sum — not a LEA — and refuses.
+/// * *Displacement.* Only numeric displacements (no `sym(%rip)`, no
+///   relocation operator); `d + k` must fit the signed 32-bit field.
+/// * *Operands.* The LEA reads `B`/`I` before writing `D`, and the merged
+///   LEA reads them at the same point, so `B == D` or `I == D` is fine.
+///   `%rsp`/`%rbp` destinations are left alone (frame idioms), as in
+///   [`fold_copy_add_into_lea`].
+/// * *Flags.* `lea` writes none, so the ADD's flags must be provably dead.
+/// * *Adjacency.* Only NOPs between the two lines; neither may be pinned.
+pub(super) fn fold_lea_add_into_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let lea = infos[i].trimmed(store.get(i));
+        let (lea_wide, lrest) = if let Some(r) = lea.strip_prefix("leaq ") {
+            (true, r)
+        } else if let Some(r) = lea.strip_prefix("leal ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((mem, lea_dst)) = split_two_operands(lrest) else {
+            i += 1;
+            continue;
+        };
+        let Some(dst_fam) = plain_gp_operand(lea_dst) else {
+            i += 1;
+            continue;
+        };
+        if dst_fam == REG_RSP
+            || dst_fam == REG_RBP
+            || !names_family_at_width(lea_dst, dst_fam, lea_wide)
+        {
+            i += 1;
+            continue;
+        }
+        let Some(open) = mem.find('(') else {
+            i += 1;
+            continue;
+        };
+        let (disp_text, addr) = mem.split_at(open);
+        if addr.contains("%rip") || !addr.ends_with(')') {
+            i += 1;
+            continue;
+        }
+        let Some(disp) = super::local_patterns::parse_lea_disp(disp_text) else {
+            i += 1;
+            continue;
+        };
+        let Some(j) = next_real(store, infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let add = infos[j].trimmed(store.get(j));
+        let (add_wide, neg, arest) = if let Some(r) = add.strip_prefix("addq ") {
+            (true, false, r)
+        } else if let Some(r) = add.strip_prefix("addl ") {
+            (false, false, r)
+        } else if let Some(r) = add.strip_prefix("subq ") {
+            (true, true, r)
+        } else if let Some(r) = add.strip_prefix("subl ") {
+            (false, true, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // `leal` zero-extends; a following 64-bit add is not a LEA of the
+        // original operands.
+        if !lea_wide && add_wide {
+            i += 1;
+            continue;
+        }
+        let Some((imm_text, add_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        if !names_family_at_width(add_dst, dst_fam, add_wide) {
+            i += 1;
+            continue;
+        }
+        let Some(k) = imm_value(imm_text) else {
+            i += 1;
+            continue;
+        };
+        let Some(new_disp) = (if neg {
+            disp.checked_sub(k)
+        } else {
+            disp.checked_add(k)
+        }) else {
+            i += 1;
+            continue;
+        };
+        if new_disp < i32::MIN as i64 || new_disp > i32::MAX as i64 {
+            i += 1;
+            continue;
+        }
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        let (mnemonic, dst_name) = if add_wide {
+            ("leaq", REG_NAMES[0][dst_fam as usize])
+        } else {
+            ("leal", REG_NAMES[1][dst_fam as usize])
+        };
+        let disp_out = if new_disp == 0 {
+            String::new()
+        } else {
+            new_disp.to_string()
+        };
+        let new_line = format!("    {} {}{}, {}", mnemonic, disp_out, addr, dst_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── 1b. in-place add-immediate + copy → lea (the mirrored order) ─────────────
+
+/// `addq $imm, %S` + `movq %S, %D` → `leaq imm(%S), %D` (same for `l`, and
+/// for `sub` with the displacement negated).
+///
+/// The mirror of [`fold_copy_add_into_lea`] for the order the loop backend
+/// actually emits: the in-place ALU computes the induction step in the phi's
+/// home and then repairs the result into the temp's home — every indexed
+/// load pair in a loop-carried scan pays `addq $1, %r10; movq %r10, %r9`
+/// (linux_find_bit's bitmap scan measured 9 insns/word vs GCC's 7).
+///
+/// Soundness: the LEA computes the same value in `%D` and — the one semantic
+/// difference — PRESERVES `%S` where the add destroyed it, so the transform
+/// additionally requires `%S` to be dead after the copy. Flags the add wrote
+/// must be dead after the pair, as in the copy-first mirror.
+pub(super) fn fold_inplace_add_copy_into_lea(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let add = infos[i].trimmed(store.get(i));
+        let (add_wide, neg, arest) = if let Some(r) = add.strip_prefix("addq ") {
+            (true, false, r)
+        } else if let Some(r) = add.strip_prefix("addl ") {
+            (false, false, r)
+        } else if let Some(r) = add.strip_prefix("subq ") {
+            (true, true, r)
+        } else if let Some(r) = add.strip_prefix("subl ") {
+            (false, true, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // Only the IMMEDIATE form folds (the register form would need a
+        // two-source LEA; `leaq (%S,%R), %D` — a different pattern).
+        let Some((imm_text, add_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        let Some(src_fam) = plain_gp_operand(add_dst) else {
+            i += 1;
+            continue;
+        };
+        if src_fam == REG_RSP || src_fam == REG_RBP {
+            i += 1;
+            continue;
+        }
+        let Some(mut imm) = imm_value(imm_text) else {
+            i += 1;
+            continue;
+        };
+        if neg {
+            imm = imm.saturating_neg();
+        }
+        if imm < i32::MIN as i64 || imm > i32::MAX as i64 {
+            i += 1;
+            continue;
+        }
+        // The consumer: an adjacent full-width copy of %S to a different
+        // register. The copy may be WIDER than the arithmetic (movq after
+        // addl), never narrower (a movl copy would truncate the 64-bit
+        // result the LEA must produce).
+        let Some(j) = next_real(store, infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let mov = infos[j].trimmed(store.get(j));
+        let (copy_wide, mrest) = if let Some(r) = mov.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        if !copy_wide && add_wide {
+            i += 1;
+            continue;
+        }
+        let Some((m_src, m_dst)) = split_two_operands(mrest) else {
+            i += 1;
+            continue;
+        };
+        let (Some(m_src_fam), Some(dst_fam)) = (plain_gp_operand(m_src), plain_gp_operand(m_dst))
+        else {
+            i += 1;
+            continue;
+        };
+        if m_src_fam != src_fam || dst_fam == src_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
+            i += 1;
+            continue;
+        }
+        // The copy must read the arithmetic's destination at its exact
+        // width spelling (width mismatch = different value semantics).
+        if !names_family_at_width(add_dst, src_fam, add_wide)
+            || !names_family_at_width(m_src, src_fam, copy_wide)
+            || !names_family_at_width(m_dst, dst_fam, copy_wide)
+        {
+            i += 1;
+            continue;
+        }
+        // %S's incremented value must be dead after the copy: the LEA
+        // preserves %S's ORIGINAL value, the add did not.
+        if !provably_dead(store, infos, j, src_fam, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        // Flags the add wrote must be dead after the pair.
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        let mnemonic = if add_wide { "leaq" } else { "leal" };
+        let base = REG_NAMES[0][src_fam as usize];
+        let dst_name = if add_wide {
+            REG_NAMES[0][dst_fam as usize]
+        } else {
+            REG_NAMES[1][dst_fam as usize]
+        };
+        let new_line = format!("    {} {}({}), {}", mnemonic, imm, base, dst_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── 4. copy + left shift → scaled lea ────────────────────────────────────────
+
+/// `movq %A, %D; shlq $N, %D` → `leaq 0(,%A,2^N), %D` for N in 1..=3 (and the
+/// 32-bit forms). One instruction less and no flags write.
+///
+/// `fuse_copy_and_operation` in `local_patterns.rs` documents this rewrite in
+/// its header comment but only ever implemented copy+lea and copy+add; the
+/// insertion-sort address computation (`movq %rax, %r12; shlq $2, %r12`) is
+/// the shape it misses.
+///
+/// Width rule as in [`fold_copy_add_into_lea`]: the copy may be wider than the
+/// shift (the shift then truncates and the LEA zero-extends identically), but
+/// never narrower.
+pub(super) fn fold_copy_shift_into_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let mov = infos[i].trimmed(store.get(i));
+        let (wide, rest) = if let Some(r) = mov.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((src_text, dst_text)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let (Some(src_fam), Some(dst_fam)) =
+            (plain_gp_operand(src_text), plain_gp_operand(dst_text))
+        else {
+            i += 1;
+            continue;
+        };
+        if src_fam == dst_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
+            i += 1;
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let shift = infos[j].trimmed(store.get(j));
+        let (shift_wide, srest) = if let Some(r) = shift.strip_prefix("shlq ") {
+            (true, r)
+        } else if let Some(r) = shift.strip_prefix("shll ") {
+            (false, r)
+        } else if let Some(r) = shift.strip_prefix("salq ") {
+            (true, r)
+        } else if let Some(r) = shift.strip_prefix("sall ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        if !wide && shift_wide {
+            i += 1;
+            continue;
+        }
+        let Some((imm_text, shift_dst)) = split_two_operands(srest) else {
+            i += 1;
+            continue;
+        };
+        if !names_family_at_width(shift_dst, dst_fam, shift_wide) {
+            i += 1;
+            continue;
+        }
+        let scale = match imm_value(imm_text) {
+            Some(1) => 2,
+            Some(2) => 4,
+            Some(3) => 8,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        let mnemonic = if shift_wide { "leaq" } else { "leal" };
+        let index = REG_NAMES[0][src_fam as usize];
+        let dst_name = if shift_wide {
+            REG_NAMES[0][dst_fam as usize]
+        } else {
+            REG_NAMES[1][dst_fam as usize]
+        };
+        let new_line = format!("    {} 0(,{},{}), {}", mnemonic, index, scale, dst_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── 2. setcc / movzbl / test / cmov → cmov on the original comparison ────────
+
+/// Negate a condition-code suffix (`e` ↔ `ne`, `l` ↔ `ge`, ...).
+fn negate_cc(cc: &str) -> Option<&'static str> {
+    Some(match cc {
+        "e" | "z" => "ne",
+        "ne" | "nz" => "e",
+        "l" | "nge" => "ge",
+        "ge" | "nl" => "l",
+        "le" | "ng" => "g",
+        "g" | "nle" => "le",
+        "b" | "c" | "nae" => "ae",
+        "ae" | "nb" | "nc" => "b",
+        "be" | "na" => "a",
+        "a" | "nbe" => "be",
+        "s" => "ns",
+        "ns" => "s",
+        "p" | "pe" => "np",
+        "np" | "po" => "p",
+        "o" => "no",
+        "no" => "o",
+        _ => return None,
+    })
+}
+
+/// Canonical condition-code names accepted on `setCC`/`cmovCC`.
+fn canonical_cc(cc: &str) -> Option<&'static str> {
+    Some(match cc {
+        "e" | "z" => "e",
+        "ne" | "nz" => "ne",
+        "l" | "nge" => "l",
+        "ge" | "nl" => "ge",
+        "le" | "ng" => "le",
+        "g" | "nle" => "g",
+        "b" | "c" | "nae" => "b",
+        "ae" | "nb" | "nc" => "ae",
+        "be" | "na" => "be",
+        "a" | "nbe" => "a",
+        "s" => "s",
+        "ns" => "ns",
+        "p" | "pe" => "p",
+        "np" | "po" => "np",
+        "o" => "o",
+        "no" => "no",
+        _ => return None,
+    })
+}
+
+/// Operands of a widening copy of an 8-bit register: `movzbl %bl, %ebx`,
+/// `movsbq %bl, %r11`, `movsbl %al, %eax`, ... .  Returns `(src, dst)`.
+fn widen_copy_operands(t: &str) -> Option<(&str, &str)> {
+    // Only the byte-source extensions: `movzwl`/`movswl` read 16 bits, which
+    // the `setcc` did not define (see the call site).
+    for pfx in ["movzbl ", "movzbq ", "movsbl ", "movsbq "] {
+        if let Some(args) = t.strip_prefix(pfx) {
+            if let Some((s, d)) = split_two_operands(args) {
+                return Some((s, d));
+            }
+        }
+    }
+    None
+}
+
+/// Which `live` idiom families does line `info`/`t` retire?  `Some(mask)` when
+/// every live family the line references is PURELY and FULLY redefined by it
+/// (a >=32-bit destination write that reads neither explicitly -- source or
+/// address operand -- nor implicitly, and is not read-modify-write), so the
+/// old boolean copy is unobservable afterwards; `Some(0)` when the line does
+/// not touch them at all; `None` (abort the fold) when it reads one, writes
+/// one partially, or would retire `keep` (the register the pending `test`
+/// still has to read).  Acceptance-grade: built only from the shared
+/// dest-only and full-write predicates the liveness analysis uses.
+fn retiring_families(info: &LineInfo, t: &str, live: u16, keep: RegId) -> Option<u16> {
+    let touched = info.reg_refs & live;
+    if touched == 0 {
+        return Some(0);
+    }
+    let fam = get_dest_reg(info);
+    if fam == REG_NONE || fam > REG_GP_MAX || fam == keep || touched != 1u16 << fam {
+        return None;
+    }
+    let pure = writes_family_full(info, t, fam)
+        && !is_read_modify_write(t)
+        && !src_mentions_family(t, fam)
+        && implicit_read_refs(t.as_bytes()) & touched == 0;
+    pure.then_some(touched)
+}
+
+/// Split `cmovneq %r8, %rbx` into (`"ne"`, `"q"`, `"%r8"`, `"%rbx"`).
+fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
+    let rest = t.strip_prefix("cmov")?;
+    let sp = rest.find(' ')?;
+    let (tag, ops) = rest.split_at(sp);
+    let (cc_part, width) = match tag.chars().last()? {
+        w @ ('q' | 'l' | 'w') if tag.len() >= 2 => (&tag[..tag.len() - 1], w),
+        _ => return None,
+    };
+    let cc = canonical_cc(cc_part)?;
+    let (src, dst) = split_two_operands(ops)?;
+    Some((cc, width, src, dst))
+}
+
+/// The backend lowers `x = cond ? a : b` and `count += (p[i] == 0)` as
+///
+/// ```text
+///     cmpb  $0, %r11b        <- the real comparison
+///     sete  %r10b
+///     movzbl %r10b, %r10d
+///     leal  1(%rbx), %r8d    <- flag-neutral after fold_copy_add_into_lea
+///     testq %r10, %r10
+///     cmovneq %r8, %rbx
+/// ```
+///
+/// The boolean round-trip is pure overhead when nothing between the `setCC` and
+/// the `cmov` writes flags: the `cmov` can test the original comparison.
+/// Three instructions disappear (`setCC`, `movzbl`, `test`).
+///
+/// Conditions checked here:
+/// * the `setCC` destination byte register, the widened register and the `test`
+///   operands are all the same family, and that family is provably dead after
+///   the `cmov` (so deleting its definition is invisible);
+/// * NOTHING between the `setCC` and the `cmov` writes or reads the flags
+///   (readers would observe the comparison we are about to consume, writers
+///   would destroy it), and there is no control-flow boundary;
+/// * the `test` is a self-test of the boolean or of a WIDENING COPY of it.
+///   The IR's `Cast(bool -> i32)` lowers to a sign-extending copy into a fresh
+///   register (`movsbq %bl, %r11`), and the `test` then names that register
+///   instead of the boolean -- measured on the ASCII case-fold kernel, where
+///   insisting on the boolean's own register left `setbe; movzbl; movsbq;
+///   test; cmovne` (9 instructions per byte) in place.  Both copies are
+///   accepted; sign/zero extension of a 0/1 value is 0 iff the boolean is 0.
+///   After that normalization, full 32/64-bit register copies are accepted
+///   too. Before it, only the exact low-byte test is valid;
+/// * the `cmov` condition is `ne` (boolean true) or `e` (boolean false), which
+///   maps to the original condition or its negation.
+pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        // `setCC %reg8`
+        let Some(rest) = t.strip_prefix("set") else {
+            i += 1;
+            continue;
+        };
+        let Some(sp) = rest.find(' ') else {
+            i += 1;
+            continue;
+        };
+        let (cc_txt, breg) = rest.split_at(sp);
+        let (Some(cc), breg) = (canonical_cc(cc_txt), breg.trim()) else {
+            i += 1;
+            continue;
+        };
+        let bool_fam = register_family_fast(breg);
+        // Only a low byte carries this proof. Extending AH into EAX would
+        // overwrite AH itself, invalidating a subsequent read of that byte.
+        if bool_fam == REG_NONE
+            || bool_fam > REG_GP_MAX
+            || bool_fam == REG_RSP
+            || breg != REG_NAMES[3][bool_fam as usize]
+        {
+            i += 1;
+            continue;
+        }
+        let bool_mask = 1u16 << bool_fam;
+
+        // Walk forward: optional movzbl of the boolean, then flag-neutral
+        // instructions, then `test %C,%C`, then `cmovCC`.
+        let mut owned = vec![i];
+        let mut k = i;
+        let mut test_idx = None;
+        let mut cmov_idx = None;
+        // The register family the `test` and the `cmov` are matched against:
+        // the boolean's own family, or the destination of a widening copy of
+        // it (`movsbq %bl, %r11` -- the shape the IR's `Cast(bool -> i32)`
+        // produces, which the "same family only" rule used to bail on).
+        let mut tested_fam = bool_fam;
+        // EVERY family a widening copy defines, not just the last one.
+        //
+        // The idiom this pass matches is `setCC %al; movzbl %al, %rN; test
+        // %rN, %rN; cmovCC`, and the pass deletes all of those lines.  A source
+        // can widen the same boolean twice (`movzbl %al, %r8d; movzbl %al,
+        // %r9d`) -- and then `tested_fam` names only `%r9`, so every guard
+        // tested the last destination while the deletion also took `%r8`'s
+        // definition.  A surviving `cmovne %r8d, %ebx` would read a value
+        // nobody defines any more.  Tracking the whole set makes the
+        // intervening-line scan, the cmov-operand check and the deadness proof
+        // all cover every definition the rewrite removes, and the fold still
+        // fires whenever all of them really are dead -- so this costs reach
+        // only for shapes that were never sound.
+        let mut widened_mask: u16 = 0;
+        // Families of the idiom that a later line REDEFINED (pure full-width
+        // write, no read) after their last idiom use.  The old boolean copy
+        // is unobservable from there on, so deleting its definition is
+        // invisible; the family leaves `bool_mask`/`widened_mask` and every
+        // later proof (cmov operands, deadness, the rewritten line) reasons
+        // about the NEW value.  Refusing these lines made the fold depend on
+        // register choice: `movl %r14d, %r11d; leal 32(%r9), %r14d; testl
+        // %r11d, %r11d; cmovnel` (the allocator reusing the dead setcc
+        // register) kept setbe+movzbl+test in the ASCII case-fold loop.
+        let mut retired_mask: u16 = 0;
+        while let Some(n) = next_real(store, infos, k, len) {
+            k = n;
+            if infos[n].pinned || infos[n].is_barrier() {
+                break;
+            }
+            let tn = infos[n].trimmed(store.get(n));
+            // A widening copy of the boolean is part of the idiom, whether it
+            // lands back in the same family (`movzbl %bl, %ebx`) or in a fresh
+            // register (`movsbq %bl, %r11`).  The copy's source must be the
+            // boolean, or the exact low byte of an already normalized 0/1
+            // copy. This includes chains through a different register family;
+            // reading a high byte would instead read zero, not the boolean.
+            // The destination becomes the register the `test` names.
+            if test_idx.is_none() {
+                if let Some((src, dst)) = widen_copy_operands(&tn) {
+                    let sfam = register_family_fast(src);
+                    let dfam = register_family_fast(dst);
+                    // The copy must read the EXACT register the `setcc` wrote
+                    // (`%bl`, not merely its family): `setcc` defines the low
+                    // byte only, so a 16-bit read of the same family
+                    // (`movswl %bx, %eax`) would sign-extend whatever the high
+                    // byte happens to hold -- garbage the `setcc` never wrote
+                    // -- and the fused `cmov` would then follow the wrong
+                    // condition.  Family equality is what makes the accepted
+                    // 8-bit reads sound; text equality is what makes the wider
+                    // ones impossible.
+                    // Either arm reads a LIVE carrier: a family retired by a
+                    // later redefinition no longer holds the boolean.
+                    if sfam <= REG_GP_MAX
+                        && ((sfam == bool_fam && src == breg && retired_mask & bool_mask == 0)
+                            || (widened_mask & !retired_mask & (1u16 << sfam) != 0
+                                && src == REG_NAMES[3][sfam as usize]))
+                        && dfam != REG_NONE
+                        && dfam <= REG_GP_MAX
+                        && dfam != REG_RSP
+                    {
+                        tested_fam = dfam;
+                        widened_mask |= 1u16 << dfam;
+                        retired_mask &= !(1u16 << dfam);
+                        owned.push(n);
+                        continue;
+                    }
+                }
+            }
+            // Once an extension has defined ALL bits as 0/1, ordinary
+            // full-register copies preserve the condition too. Do not infer
+            // this from setcc alone: its untouched upper bits may be nonzero.
+            // Keep every deleted destination in widened_mask for the later
+            // operand/deadness proofs, not just the final test register.
+            if test_idx.is_none() {
+                let copy = tn
+                    .strip_prefix("movl ")
+                    .map(|args| (args, 1))
+                    .or_else(|| tn.strip_prefix("movq ").map(|args| (args, 0)));
+                if let Some((args, size)) = copy {
+                    if let Some((src, dst)) = split_two_operands(args) {
+                        if let (Some(sfam), Some(dfam)) =
+                            (plain_gp_operand(src), plain_gp_operand(dst))
+                        {
+                            if sfam <= REG_GP_MAX
+                                && dfam <= REG_GP_MAX
+                                && dfam != REG_RSP
+                                && src == REG_NAMES[size][sfam as usize]
+                                && dst == REG_NAMES[size][dfam as usize]
+                                && widened_mask & !retired_mask & (1u16 << sfam) != 0
+                            {
+                                tested_fam = dfam;
+                                widened_mask |= 1u16 << dfam;
+                                retired_mask &= !(1u16 << dfam);
+                                owned.push(n);
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if test_idx.is_none() {
+                if let Some(args) = tn
+                    .strip_prefix("testq ")
+                    .or_else(|| tn.strip_prefix("testl "))
+                    .or_else(|| tn.strip_prefix("testb "))
+                {
+                    if let Some((a, b)) = split_two_operands(args) {
+                        let size = if tn.starts_with("testq ") {
+                            0
+                        } else if tn.starts_with("testl ") {
+                            1
+                        } else {
+                            3
+                        };
+                        let normalized = widened_mask & (1u16 << tested_fam) != 0;
+                        if a == b
+                            && a == REG_NAMES[size][tested_fam as usize]
+                            && (normalized || (size == 3 && a == breg))
+                        {
+                            owned.push(n);
+                            test_idx = Some(n);
+                            continue;
+                        }
+                    }
+                }
+            }
+            if test_idx.is_some() {
+                if parse_cmov(tn).is_some() {
+                    cmov_idx = Some(n);
+                    break;
+                }
+                // Flag-neutral staging between the `test` and the `cmov` is
+                // part of the same idiom: the select lowering stages the
+                // false value into the destination (`movq %r9, %rbp`) and the
+                // allocator is free to place it after the test.  Such lines
+                // stay in the output; they only have to avoid the flags and
+                // the registers we are about to delete.
+                if flags_effect(tn) != FlagsEffect::Neutral {
+                    break;
+                }
+                // The test consumed the boolean: any idiom family may retire.
+                let Some(r) = retiring_families(
+                    &infos[n],
+                    &tn,
+                    (bool_mask | widened_mask) & !retired_mask,
+                    REG_NONE,
+                ) else {
+                    break;
+                };
+                retired_mask |= r;
+                continue;
+            }
+            // Any other line: it must not touch the flags, and may touch the
+            // boolean (or a widened copy) only by retiring it -- except the
+            // family the pending `test` still has to read.
+            if flags_effect(tn) != FlagsEffect::Neutral {
+                break;
+            }
+            let Some(r) = retiring_families(
+                &infos[n],
+                &tn,
+                (bool_mask | widened_mask) & !retired_mask,
+                tested_fam,
+            ) else {
+                break;
+            };
+            retired_mask |= r;
+        }
+        let bool_retired = retired_mask & bool_mask != 0;
+        let widened_mask = widened_mask & !retired_mask;
+        let bool_mask = bool_mask & !retired_mask;
+
+        let (Some(test_i), Some(cmov_i)) = (test_idx, cmov_idx) else {
+            i += 1;
+            continue;
+        };
+        let cmov_line = infos[cmov_i].trimmed(store.get(cmov_i)).to_string();
+        let Some((cmov_cc, width, src, dst)) = parse_cmov(&cmov_line) else {
+            i += 1;
+            continue;
+        };
+        // `test C,C` + `cmovne` = "boolean is true" = original condition;
+        // `cmove` = its negation. Any other condition is not a boolean test.
+        let new_cc = match cmov_cc {
+            "ne" => cc,
+            "e" => match negate_cc(cc) {
+                Some(n) => n,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // The cmov must not read the boolean or ANY of its widened copies (it
+        // would lose a definition we are deleting).
+        if infos[cmov_i].reg_refs & (bool_mask | widened_mask) != 0 {
+            i += 1;
+            continue;
+        }
+        // The deleted `test` also DEFINED the flags every later reader saw.
+        // After the rewrite those readers would observe the original
+        // comparison instead — with `sete`/`setne` in the idiom that is the
+        // inverted condition, so a following `jne` would branch the wrong way.
+        // Require the flags to be dead after the cmov.
+        if !flags_dead_after(store, infos, cmov_i + 1) {
+            i += 1;
+            continue;
+        }
+        // The boolean register must be dead after the cmov: either the block
+        // rewrites it before any read, or the whole function only mentions it
+        // in the lines we are about to delete.
+        owned.push(cmov_i);
+        // Both registers die with the idiom: the boolean itself, and the
+        // widened copy the `test`/`cmov` were reading.  A widened copy that is
+        // live elsewhere keeps its definition (the transform is not
+        // applicable), and the boolean likewise.
+        let carriers = IdiomCarriers {
+            setcc_i: i,
+            cmov_i,
+            bool_fam,
+            bool_mask,
+            widened_mask,
+            bool_retired,
+        };
+        if !carriers.all_dead_after_cmov(store, infos, &lv, &owned) {
+            i += 1;
+            continue;
+        }
+        let new_line = format!("    cmov{}{} {}, {}", new_cc, width, src, dst);
+        // A retired boolean family names the redefining line's value.
+        if !bool_retired && line_refs_family(&new_line, bool_fam) {
+            i += 1;
+            continue;
+        }
+        for &d in &owned {
+            if d != cmov_i {
+                mark_nop(&mut infos[d]);
+            }
+        }
+        replace_line(store, &mut infos[cmov_i], cmov_i, new_line);
+        lv.refresh_at(store, infos, cmov_i);
+        changed = true;
+        i = test_i.max(cmov_i) + 1;
+    }
+    changed
+}
+
+/// The registers that carry `fold_setcc_test_cmov`'s boolean: the setcc
+/// family itself and every widened copy (masks already exclude families a
+/// later line retired).
+#[derive(Clone, Copy)]
+struct IdiomCarriers {
+    setcc_i: usize,
+    cmov_i: usize,
+    bool_fam: RegId,
+    bool_mask: u16,
+    widened_mask: u16,
+    bool_retired: bool,
+}
+
+impl IdiomCarriers {
+    /// Whether every carrier dies with the idiom, so deleting its
+    /// definitions is unobservable.  `owned` holds every line the rewrite
+    /// deletes plus the cmov.
+    fn all_dead_after_cmov(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        lv: &FileLiveness,
+        owned: &[usize],
+    ) -> bool {
+        let Self {
+            setcc_i: i,
+            cmov_i,
+            bool_fam,
+            bool_mask,
+            widened_mask,
+            bool_retired,
+        } = *self;
+        let bool_dead = bool_retired
+            || matches!(lv.live_after(cmov_i, bool_fam), Some(false))
+            || dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
+            || family_private_to(store, infos, i, bool_fam, owned);
+        // Every widened copy the rewrite deletes needs its own deadness proof:
+        // one live copy is enough to make the deletion observable.
+        let mut widened_dead = true;
+        for fam in 0..=REG_GP_MAX {
+            if widened_mask & (1u16 << fam) == 0 || fam == bool_fam {
+                continue;
+            }
+            let dead = matches!(lv.live_after(cmov_i, fam), Some(false))
+                || dead_in_block_after(store, infos, cmov_i + 1, fam)
+                || family_private_to(store, infos, i, fam, owned);
+            if !dead {
+                widened_dead = false;
+                break;
+            }
+        }
+        // Across a backedge, partial setcc writes can make this sequence's
+        // OWN deleted byte reads look live. Ask about the rewritten program
+        // before refusing: every carrier reference in this straight-line span
+        // is owned above; intervening surviving lines and the cmov mention none.
+        // Neutralize both reads AND writes, so an external reader still vetoes.
+        let carriers = bool_mask | widened_mask;
+        (bool_dead && widened_dead)
+            || matches!(
+                lv.live_after_dropping_region(store, infos, cmov_i, i, cmov_i, carriers),
+                Some(live) if live & carriers == 0
+            )
+    }
+}
+
+// ── 3. copy + mask → zero-extending move ─────────────────────────────────────
+
+/// `movl %A,%D; andl $255,%D` → `movzbl %Al,%D` (and `$65535` → `movzwl`).
+///
+/// One instruction less and no flags write. Valid for the `q` forms as well:
+/// `movzbl` zeroes bits 8..63 of the destination, exactly like `andq $255`
+/// applied to a 64-bit copy.
+pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let mov = infos[i].trimmed(store.get(i));
+        let (wide, rest) = if let Some(r) = mov.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((src_text, dst_text)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let (Some(src_fam), Some(dst_fam)) =
+            (plain_gp_operand(src_text), plain_gp_operand(dst_text))
+        else {
+            i += 1;
+            continue;
+        };
+        if src_fam == dst_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
+            i += 1;
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let and = infos[j].trimmed(store.get(j));
+        let (and_wide, arest) = if let Some(r) = and.strip_prefix("andq ") {
+            (true, r)
+        } else if let Some(r) = and.strip_prefix("andl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        if !wide && and_wide {
+            i += 1;
+            continue;
+        }
+        let Some((imm_text, and_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        if !names_family_at_width(and_dst, dst_fam, and_wide) {
+            i += 1;
+            continue;
+        }
+        // 8-bit source names for %rsp/%rbp/%rsi/%rdi need a REX prefix; the
+        // table already spells them (%spl/%bpl/%sil/%dil) and the assembler
+        // emits REX, but %ah-class aliasing makes the byte form of families
+        // 4/5 pointless here — they are rejected above for the destination and
+        // are legal as a source.
+        let (mnemonic, sub_name) = match imm_value(imm_text) {
+            Some(255) => ("movzbl", REG_NAMES[3][src_fam as usize]),
+            Some(65535) => ("movzwl", REG_NAMES[2][src_fam as usize]),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        // The destination of movzbl/movzwl is always the 32-bit name.
+        let dst32 = REG_NAMES[1][dst_fam as usize];
+        let new_line = format!("    {} {}, {}", mnemonic, sub_name, dst32);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── 4b. copy + mask + flag consumer → test ─────────────────────────────────
+
+/// Longest run of real lines [`copy_mask_partner`] crosses between the copy
+/// and its mask.
+const COPY_MASK_WINDOW: usize = 12;
+
+/// The first real line after the copy `i` (`mov %A, %D`) that names `%D`, when
+/// every line between them leaves the pair alone: no line names `%D` (any
+/// width, implicit operands included), writes `%A`, has implicit register
+/// effects, or is a barrier, label, pinned line or inline asm.  Testing `%A`
+/// at the partner's position then sees exactly the value the copy took, and
+/// deleting the copy is unobservable because nothing in the window reads
+/// `%D`.  The adjacent pair is the zero-length window.
+///
+/// hot_web_loop keeps `h = helper(i)` for both `a += h` and `(h & 255) == 0`:
+/// `movq %rax, %r10` sits right after the call, the mask ten lines later.
+fn copy_mask_partner(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    len: usize,
+    src_fam: RegId,
+    dst_fam: RegId,
+) -> Option<usize> {
+    let mut k = i;
+    for _ in 0..=COPY_MASK_WINDOW {
+        k = next_real(store, infos, k, len)?;
+        let t = infos[k].trimmed(store.get(k));
+        if infos[k].pinned || infos[k].is_barrier() || infos[k].kind == LineKind::InlineAsm {
+            return None;
+        }
+        if line_refs_family(t, dst_fam) {
+            return Some(k);
+        }
+        if implicit_reg_refs(t.as_bytes()) & (1u16 << dst_fam) != 0
+            || super::helpers::has_implicit_reg_usage(t)
+            || writes_family(&infos[k], t, src_fam)
+        {
+            return None;
+        }
+    }
+    None
+}
+
+/// `movl %A,%D; andl $imm,%D; j{e,ne}/setcc/cmov…` with `%D` dead afterwards
+/// → `testl $imm,%A` (`testb $imm,%Ab` when the mask fits a byte and every
+/// consumer is ZF-only).
+///
+/// The backend lowers `if (!(x & 1))` as a copy, a destructive `and` and a
+/// branch; the copy exists only because `and` clobbers its operand. `test`
+/// computes the same result without writing it, and sets *exactly* the same
+/// flags as `and` (ZF/SF/PF from the result, CF/OF cleared), so at equal width
+/// the rewrite is flag-transparent for every consumer, including `js`/`jp`.
+/// The byte form narrows SF/PF to bit 7, hence the ZF-only requirement.
+///
+/// GCC/Clang/ICX emit `testb $1, %dil` for the `ffs1` kernel where we emitted
+/// `movl %ebx,%esi; andl $1,%esi; jne` (2 instructions + a copy per
+/// iteration of the shift loop).
+///
+/// Soundness: `%D` must be dead after the `and` (whole-function dataflow via
+/// [`FileLiveness`]); `%A` is only read; the lines between the `mov` and the
+/// `and` neither name `%D` nor write `%A` ([`copy_mask_partner`]), so `%A`
+/// still holds the copied value at the `and`. Families 4/5 (`%rsp`/`%rbp`)
+/// never take the byte form.
+pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    // Most files contain no eligible copy/AND pair. Keep the exact
+    // analysis and refresh contract, but pay for it only at a real query.
+    let mut liveness = None;
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let mov = infos[i].trimmed(store.get(i));
+        let (wide, rest) = if let Some(r) = mov.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((src_text, dst_text)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let (Some(src_fam), Some(dst_fam)) =
+            (plain_gp_operand(src_text), plain_gp_operand(dst_text))
+        else {
+            i += 1;
+            continue;
+        };
+        if src_fam == dst_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
+            i += 1;
+            continue;
+        }
+        let Some(j) = copy_mask_partner(store, infos, i, len, src_fam, dst_fam) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let and = infos[j].trimmed(store.get(j));
+        let (and_wide, arest) = if let Some(r) = and.strip_prefix("andq ") {
+            (true, r)
+        } else if let Some(r) = and.strip_prefix("andl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // The copy must be at least as wide as the mask: a 32-bit copy zero-
+        // extends, so a 64-bit `and` afterwards reads zeros we would not
+        // reproduce by testing the original 64-bit source.
+        if !wide && and_wide {
+            i += 1;
+            continue;
+        }
+        let Some((imm_text, and_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        if !names_family_at_width(and_dst, dst_fam, and_wide) {
+            i += 1;
+            continue;
+        }
+        let Some(imm) = imm_value(imm_text) else {
+            let Some(mask_fam) = plain_gp_operand(imm_text) else {
+                i += 1;
+                continue;
+            };
+            // `%rsp` is encodable in either `test` position and the fold
+            // rewrites only flags, so a stack-pointer operand needs no
+            // exclusion: the destination arm already refuses `%rsp`/`%rbp`, so
+            // no stack adjustment can disappear. Excluding it (as this did)
+            // lost every `mov %rsp, %S; and %M, %S` / `and %rsp, %S` fold.
+            if mask_fam == dst_fam || !names_family_at_width(imm_text, mask_fam, and_wide) {
+                i += 1;
+                continue;
+            }
+            let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+            if !matches!(lv.live_after(j, dst_fam), Some(false)) {
+                i += 1;
+                continue;
+            }
+            let Some(k) = next_real(store, infos, j, len) else {
+                i += 1;
+                continue;
+            };
+            if !matches!(infos[k].kind, LineKind::CondJmp)
+                || flags_effect(infos[k].trimmed(store.get(k))) != FlagsEffect::Reads
+            {
+                i += 1;
+                continue;
+            };
+            let new_line = if and_wide {
+                format!(
+                    "    testq {}, {}",
+                    REG_NAMES[0][mask_fam as usize], REG_NAMES[0][src_fam as usize]
+                )
+            } else {
+                format!(
+                    "    testl {}, {}",
+                    REG_NAMES[1][mask_fam as usize], REG_NAMES[1][src_fam as usize]
+                )
+            };
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[j], j, new_line);
+            lv.refresh_at(store, infos, j);
+            changed = true;
+            i = j + 1;
+            continue;
+        };
+        if !names_family_at_width(and_dst, dst_fam, and_wide) {
+            i += 1;
+            continue;
+        }
+        // The masked value itself must be dead: only the flags survive.
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        if !matches!(lv.live_after(j, dst_fam), Some(false)) {
+            i += 1;
+            continue;
+        }
+        // Someone must actually consume the flags in this block, otherwise the
+        // pair is dead-code territory, not ours.
+        let Some(k) = next_real(store, infos, j, len) else {
+            i += 1;
+            continue;
+        };
+        if flags_effect(infos[k].trimmed(store.get(k))) != FlagsEffect::Reads {
+            i += 1;
+            continue;
+        }
+        // The byte form is flag-exact unless the mask carries bit 7, which is
+        // the only bit whose test result lands in SF at byte width but not at
+        // dword width (see `flags_reach_an_sf_consumer`). Without bit 7 there is
+        // nothing to prove and no consumer walk to pay for; with it, an SF
+        // consumer anywhere in the flags' reach -- including one on the taken
+        // edge of a conditional jump, or a `pushf` that captures SF as data --
+        // refuses the narrow form and keeps the wide one.
+        let byte_form = (0..=255).contains(&imm)
+            && src_fam != REG_RSP
+            && src_fam != REG_RBP
+            && (imm & 0x80 == 0 || !flags_reach_an_sf_consumer(store, infos, j + 1));
+        // An all-ones mask at the test width tests the register against
+        // itself: `x & 0xff == x & x` at byte width, so ZF/SF/PF agree and
+        // CF/OF are cleared either way; the register form drops the imm8
+        // (GCC/Clang emit `testb %dl, %dl` for `(h & 255) == 0`).
+        let (name_b, name_l, name_q) = (
+            REG_NAMES[3][src_fam as usize],
+            REG_NAMES[1][src_fam as usize],
+            REG_NAMES[0][src_fam as usize],
+        );
+        let new_line = if byte_form && imm == 0xff {
+            format!("    testb {name_b}, {name_b}")
+        } else if byte_form {
+            format!("    testb ${imm}, {name_b}")
+        } else if !and_wide && imm == 0xffff_ffff {
+            format!("    testl {name_l}, {name_l}")
+        } else if and_wide && imm == -1 {
+            // `x & -1 == x` at qword width: the register form is flag-identical
+            // and is what GCC/Clang emit (`testq %rax, %rax`).
+            format!("    testq {name_q}, {name_q}")
+        } else if and_wide {
+            format!("    testq ${imm}, {name_q}")
+        } else {
+            format!("    testl ${imm}, {name_l}")
+        };
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        // `%A` now lives up to the `test`; keep the oracle exact for later hits.
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── 5. redundant self-test after a logical or arithmetic op ──────────────────
+
+/// How a flag producer's EFLAGS compare with a `test` of its own result.
+///
+/// The distinction is the whole legality argument of the fold below, so it is
+/// named rather than spelled as a pair of booleans at the use site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TestFlagAgreement {
+    /// Defined condition-code flags agree for `and`/`or`/`xor`.
+    /// AF is undefined for both the logical producer and TEST.
+    Exact,
+    /// ZF alone (`sub`, `add`, `inc`, `dec`, `neg`): the arithmetic forms take
+    /// CF from the carry/borrow and OF from the overflow, where `test` clears
+    /// both, and they define AF from the borrow where `test` leaves it. SF and
+    /// PF agree at equal widths only, which the width rule below covers.
+    ZeroOnly,
+}
+
+/// Classify a producer line for [`eliminate_redundant_self_test`]: its operand
+/// width, and how closely its flags match a `test` of its own result. `None`
+/// for anything that is not a producer this fold may use — including a byte
+/// form (`addb`, `negb`), which writes only the low byte.
+///
+/// The list is deliberately exhaustive over the forms whose flag semantics are
+/// flag-for-flag known; an unrecognised producer falls back to "no fold", the
+/// same default-deny the rest of this module uses.
+fn test_flag_agreement(text: &str) -> Option<(bool, TestFlagAgreement)> {
+    const LOGICAL: &[(&str, bool)] = &[
+        ("andq ", true),
+        ("orq ", true),
+        ("xorq ", true),
+        ("andl ", false),
+        ("orl ", false),
+        ("xorl ", false),
+    ];
+    const ARITHMETIC: &[(&str, bool)] = &[
+        ("addq ", true),
+        ("subq ", true),
+        ("incq ", true),
+        ("decq ", true),
+        ("negq ", true),
+        ("addl ", false),
+        ("subl ", false),
+        ("incl ", false),
+        ("decl ", false),
+        ("negl ", false),
+    ];
+    if let Some((_, wide)) = LOGICAL.iter().find(|(p, _)| text.starts_with(p)) {
+        return Some((*wide, TestFlagAgreement::Exact));
+    }
+    ARITHMETIC
+        .iter()
+        .find(|(p, _)| text.starts_with(p))
+        .map(|(_, wide)| (*wide, TestFlagAgreement::ZeroOnly))
+}
+
+/// `andl $1, %esi; testq %rsi, %rsi; je` → `andl $1, %esi; je`.
+///
+/// `and`/`or`/`xor` set ZF/SF/PF from the result and clear CF/OF — exactly the
+/// flag state a `test` of that result produces, so the test is pure overhead.
+/// The i686 backend already does this (`check_redundant_test_elimination.sh`);
+/// x86-64 kept the pair because the codegen emits a 64-bit `testq` over a
+/// 32-bit logical result.
+///
+/// Width rule: a 32-bit logical op zero-extends, so ZF is identical for the
+/// 64-bit test, but SF is not (bit 31 vs bit 63). When the widths differ the
+/// fold is therefore only applied if every consumer of the flags tests ZF.
+///
+/// Arithmetic producer: `subl $1, %esi; testl %esi, %esi; je` is the same one
+/// instruction of pure overhead — the decrement already set ZF — and it is the
+/// shape every downward counter loop compiles to (`while (--n)`,
+/// `for (; n--;)`, `while (n -= step)`), so it is worth the stricter proof. The
+/// producer agrees with the test on ZF/SF/PF only, so the fold is taken
+/// exclusively when [`flag_consumers_are_zf_only`] proves that every consumer
+/// of the flags reads ZF; see [`TestFlagAgreement::ZeroOnly`].
+
+/// True when `t` is a register-only immediate/unary induction bump (`add{l,q} $imm, %reg`,
+/// `sub{l,q} $imm, %reg`, `inc{l,q} %reg`, `dec{l,q} %reg`) on a non-`%rsp` GP register.
+fn is_pure_reg_bump(t: &str, info: &LineInfo) -> bool {
+    if info.pinned
+        || info.volatile_access
+        || !matches!(info.kind, LineKind::Other { .. })
+        || t.contains('(')
+    {
+        return false;
+    }
+    let dst = get_dest_reg(info);
+    if dst == REG_NONE || dst > REG_GP_MAX || dst == REG_RSP {
+        return false;
+    }
+    if let Some(rest) = t
+        .strip_prefix("addq $")
+        .or_else(|| t.strip_prefix("addl $"))
+        .or_else(|| t.strip_prefix("subq $"))
+        .or_else(|| t.strip_prefix("subl $"))
+    {
+        if let Some((_, reg)) = split_two_operands(rest) {
+            return plain_gp_operand(reg.trim()) == Some(dst);
+        }
+        return false;
+    }
+    if let Some(rest) = t
+        .strip_prefix("incq ")
+        .or_else(|| t.strip_prefix("incl "))
+        .or_else(|| t.strip_prefix("decq "))
+        .or_else(|| t.strip_prefix("decl "))
+    {
+        return plain_gp_operand(rest.trim()) == Some(dst);
+    }
+    false
+}
+
+/// Replace a self-test of an arithmetic result with the equivalent sign-only
+/// condition when the result itself came from that arithmetic operation.
+///
+/// `sub %esi, %edi; test %edi, %edi; cmovge %edi, %eax` tests whether the
+/// *wrapped result* is non-negative. `test` clears OF, so `ge` here is exactly
+/// `ns`; the arithmetic producer has the same SF as the test at the same
+/// width. Rewriting to `sub; cmovns` removes the redundant test without
+/// relying on signed-overflow assumptions (including under `-fwrapv`). The
+/// mirrored `l` -> `s` case is the negative-result predicate.  A
+/// flag-for-flag exact producer (`and`/`or`/`xor`) also admits the
+/// strict `g` and `le` predicates unchanged, because its CF/OF already equal
+/// TEST's zero.  A merely ZF/SF/PF-agreeing arithmetic producer refuses them:
+/// e.g. `g` after TEST is `!ZF && !SF`, which cannot be expressed by arithmetic
+/// flags when OF is nonzero.
+///
+/// For an arithmetic producer the consumer walk after the `cmov` must prove
+/// that no reachable consumer selects CF/OF/AF before a complete writer or
+/// return; a later `sete`/`js`/`jp` is harmless because those flags survive.
+/// Whole-flag readers (`pushf`, `lahf`, inline asm) always veto.  This is
+/// deliberately narrower than the general self-test fold.
+pub(super) fn fold_arithmetic_test_sign_cmov(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut test_idx = 0;
+    while test_idx < len {
+        if infos[test_idx].is_nop() || infos[test_idx].pinned {
+            test_idx += 1;
+            continue;
+        }
+        let test = infos[test_idx].trimmed(store.get(test_idx));
+        let (test_width, args) = if let Some(args) = test.strip_prefix("testq ") {
+            ('q', args)
+        } else if let Some(args) = test.strip_prefix("testl ") {
+            ('l', args)
+        } else {
+            test_idx += 1;
+            continue;
+        };
+        let Some((lhs, rhs)) = split_two_operands(args) else {
+            test_idx += 1;
+            continue;
+        };
+        if lhs != rhs {
+            test_idx += 1;
+            continue;
+        }
+        let Some(fam) = plain_gp_operand(lhs) else {
+            test_idx += 1;
+            continue;
+        };
+        if fam > REG_GP_MAX || fam == REG_RSP {
+            test_idx += 1;
+            continue;
+        }
+        let mask = 1u16 << fam;
+
+        // Find the nearest flag writer. It must define the tested register,
+        // and arithmetic/test widths must match so SF denotes the same bit.
+        let mut producer = None;
+        let mut p = test_idx;
+        while p > 0 {
+            p -= 1;
+            if infos[p].is_nop() || infos[p].kind == LineKind::Empty {
+                continue;
+            }
+            if infos[p].pinned
+                || infos[p].is_barrier()
+                || matches!(infos[p].kind, LineKind::Label | LineKind::Directive)
+            {
+                break;
+            }
+            let pt = infos[p].trimmed(store.get(p));
+            match flags_effect(pt) {
+                FlagsEffect::Writes => {
+                    let Some((wide, agreement)) = test_flag_agreement(pt) else {
+                        break;
+                    };
+                    if wide == (test_width == 'q') && get_dest_reg(&infos[p]) == fam {
+                        producer = Some((p, agreement));
+                    }
+                    break;
+                }
+                FlagsEffect::Reads => break,
+                FlagsEffect::Neutral => {
+                    if infos[p].reg_refs & mask != 0 || has_implicit_reg_usage(pt) {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some((_producer, agreement)) = producer else {
+            test_idx += 1;
+            continue;
+        };
+
+        // The first reader must be a sign-only conditional move. Neutral
+        // staging may read the tested value but must not redefine it. Any
+        // other flag consumer/writer or control-flow boundary fails closed.
+        let mut cmov_idx = None;
+        let mut n = test_idx + 1;
+        while n < len {
+            if infos[n].is_nop() || infos[n].kind == LineKind::Empty {
+                n += 1;
+                continue;
+            }
+            if infos[n].pinned
+                || infos[n].is_barrier()
+                || matches!(infos[n].kind, LineKind::Label | LineKind::Directive)
+            {
+                break;
+            }
+            let nt = infos[n].trimmed(store.get(n));
+            match flags_effect(nt) {
+                FlagsEffect::Neutral => {
+                    if get_dest_reg(&infos[n]) == fam || has_implicit_reg_usage(nt) {
+                        break;
+                    }
+                }
+                FlagsEffect::Writes => break,
+                FlagsEffect::Reads => {
+                    let Some((cc, width, src, dst)) = parse_cmov(nt) else {
+                        break;
+                    };
+                    if width != test_width {
+                        break;
+                    }
+                    let canonical = match cc {
+                        "nl" => "ge",
+                        "nge" => "l",
+                        "nle" => "g",
+                        "ng" => "le",
+                        other => other,
+                    };
+                    let replacement = match (agreement, canonical) {
+                        (_, "ge") => "ns",
+                        (_, "l") => "s",
+                        (TestFlagAgreement::Exact, "g") => "g",
+                        (TestFlagAgreement::Exact, "le") => "le",
+                        _ => break,
+                    };
+                    // An arithmetic producer and TEST agree on ZF/SF/PF only:
+                    // deleting TEST exposes the producer's CF/OF/AF.  A later
+                    // consumer reading only ZF, SF or PF is still exact; any
+                    // reader of CF/OF/AF (including whole-flag captures and an
+                    // unresolvable branch edge) vetoes the fold.  A logical or
+                    // AND/OR/XOR producer is flag-for-flag exact, so later consumers
+                    // need no further licence.
+                    if agreement == TestFlagAgreement::ZeroOnly
+                        && !flag_consumers_are_zf_sf_pf_only(store, infos, n + 1)
+                    {
+                        break;
+                    }
+                    let new_line = format!("    cmov{replacement}{width} {src}, {}", dst.trim());
+                    replace_line(store, &mut infos[n], n, new_line);
+                    mark_nop(&mut infos[test_idx]);
+                    cmov_idx = Some(n);
+                    changed = true;
+                }
+            }
+            if cmov_idx.is_some() {
+                break;
+            }
+            n += 1;
+        }
+        if let Some(cmov_idx) = cmov_idx {
+            test_idx = cmov_idx + 1;
+        } else {
+            test_idx += 1;
+        }
+    }
+    changed
+}
+
+#[expect(clippy::needless_range_loop)]
+pub(super) fn eliminate_redundant_self_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned {
+            j += 1;
+            continue;
+        }
+        let t = infos[j].trimmed(store.get(j));
+        let (test_wide, args) = if let Some(a) = t.strip_prefix("testq ") {
+            (true, a)
+        } else if let Some(a) = t.strip_prefix("testl ") {
+            (false, a)
+        } else {
+            j += 1;
+            continue;
+        };
+        let Some((a, b)) = split_two_operands(args) else {
+            j += 1;
+            continue;
+        };
+        if a != b {
+            j += 1;
+            continue;
+        }
+        let fam = register_family_fast(a);
+        if fam == REG_NONE || fam > REG_GP_MAX || fam == REG_RSP {
+            j += 1;
+            continue;
+        }
+        let mask = 1u16 << fam;
+
+        // Walk back to the producer through flag-neutral instructions (or at
+        // most one disjoint register-only induction bump immediately before the test).
+        let mut k = j;
+        let mut producer: Option<(usize, String)> = None;
+        let mut swap_bump: Option<usize> = None;
+        while k > 0 {
+            k -= 1;
+            if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
+                continue;
+            }
+            if infos[k].pinned || infos[k].is_barrier() {
+                break;
+            }
+            let tk = infos[k].trimmed(store.get(k));
+            if infos[k].reg_refs & mask != 0 {
+                producer = Some((k, tk.to_string()));
+                break;
+            }
+            if flags_effect(tk) != FlagsEffect::Neutral {
+                if swap_bump.is_none() && is_pure_reg_bump(tk, &infos[k]) {
+                    swap_bump = Some(k);
+                    continue;
+                }
+                break; // another instruction owns the flags
+            }
+        }
+        let Some((pidx, ptext)) = producer else {
+            j += 1;
+            continue;
+        };
+        let Some((prod_wide, agreement)) = test_flag_agreement(&ptext) else {
+            j += 1;
+            continue;
+        };
+        if get_dest_reg(&infos[pidx]) != fam {
+            j += 1;
+            continue;
+        };
+        // The producer must WRITE the whole tested value: a 32-bit op under a
+        // 64-bit test is fine (zero extension), the reverse is not.
+        if prod_wide && !test_wide {
+            j += 1;
+            continue;
+        }
+        // Anything between the producer and the test must leave both the flags
+        // and the register alone (except an optional single disjoint bump `m`
+        // with no directives or other non-NOP instructions in `pidx + 1..j`).
+        if let Some(m) = swap_bump {
+            if !ptext.contains('(')
+                || infos[pidx].volatile_access
+                || (infos[m].reg_refs & infos[pidx].reg_refs) != 0
+                || (pidx + 1..j).any(|n| n != m && !infos[n].is_nop())
+            {
+                j += 1;
+                continue;
+            }
+        } else {
+            let mut clean = true;
+            for n in pidx + 1..j {
+                if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
+                    continue;
+                }
+                let tn = infos[n].trimmed(store.get(n));
+                if flags_effect(tn) != FlagsEffect::Neutral || infos[n].reg_refs & mask != 0 {
+                    clean = false;
+                    break;
+                }
+            }
+            if !clean {
+                j += 1;
+                continue;
+            }
+        }
+        // What separates the two producer classes is which flags the test may
+        // be replaced in: `and`/`or`/`xor` clear CF and OF exactly as the test
+        // does, while an arithmetic producer takes both from the operation, so
+        // it needs the flags to be read as ZF alone -- the same proof a width
+        // change needs, because a 32-bit producer zero-extends (ZF survives
+        // into the wide test) while SF does not (bit 31 vs bit 63).
+        //
+        // `flag_consumers_are_zf_only` is the whole proof, including the
+        // whole-EFLAGS readers: `lahf`, `pushf`, inline asm and unknown
+        // mnemonics have no condition code, so the walk charges them with
+        // `saw_non_zf` before either caller looks. That matters here because
+        // they are exactly the readers that can observe AF, which an
+        // arithmetic producer defines from the borrow and the test does not
+        // touch at all. The walk follows the TAKEN edge of every conditional
+        // jump, so a consumer in a block the fall-through never reaches still
+        // counts, and it reports `proved = false` rather than guessing when a
+        // target cannot be resolved.
+        if agreement == TestFlagAgreement::ZeroOnly || prod_wide != test_wide {
+            if !flag_consumers_are_zf_only(store, infos, j + 1) {
+                j += 1;
+                continue;
+            }
+            if prod_wide != test_wide {
+                // Losing SF is a whole-function property, not a property of
+                // this straight-line run: verify the convention that flags do
+                // not cross a block boundary before relying on the consumer
+                // walk's reachability.
+                let Some((fstart, fend)) = function_range(store, infos, j) else {
+                    j += 1;
+                    continue;
+                };
+                if !flags_are_block_local(store, infos, fstart, fend) {
+                    j += 1;
+                    continue;
+                }
+            }
+        }
+        if let Some(m) = swap_bump {
+            let m_line = store.get(m).to_string();
+            let p_line = store.get(pidx).to_string();
+            replace_line(store, &mut infos[pidx], pidx, m_line);
+            replace_line(store, &mut infos[m], m, p_line);
+        }
+        mark_nop(&mut infos[j]);
+        changed = true;
+        j += 1;
+    }
+    changed
+}
+
+/// Verify the whole function keeps EFLAGS inside a basic block: every
+/// flag-reading instruction is preceded, in its own block, by a flag writer.
+///
+/// The peephole flag transforms reason about a single block; if some block
+/// consumed flags produced by a PREDECESSOR, a rewrite could change what that
+/// consumer sees. LCCC's codegen (like GCC's and LLVM's) never keeps flags live
+/// across a join, and this check turns that convention into a verified
+/// precondition instead of an assumption.
+#[expect(clippy::needless_range_loop)]
+fn flags_are_block_local(
+    store: &LineStore,
+    infos: &[LineInfo],
+    fstart: usize,
+    fend: usize,
+) -> bool {
+    let mut written = 0;
+    for n in fstart..fend {
+        if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
+            continue;
+        }
+        if infos[n].kind == LineKind::Label {
+            written = 0;
+            continue;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        match flags_effect(t) {
+            FlagsEffect::Reads => {
+                if written != F_ALL {
+                    return false;
+                }
+            }
+            FlagsEffect::Writes => written |= flags_written_mask(t),
+            FlagsEffect::Neutral => {}
+        }
+        if matches!(infos[n].kind, LineKind::Call) {
+            written = F_ALL; // a call leaves the flags undefined
+        }
+    }
+    true
+}
+
+/// Condition-code predicates that read SF: `s`/`ns` test it directly, and the
+/// signed relations test it in combination with OF (`l`/`nl`/`le`/`nle` are
+/// SF != OF, `g`/`ng`/`ge`/`nge` are SF == OF). The unsigned relations
+/// (`b`/`ae`/`a`/`be`), the CF predicates, `o`/`no` and `p`/`np` do not.
+const SF_CCS: &[&str] = &["s", "ns", "l", "nl", "le", "nle", "g", "ng", "ge", "nge"];
+
+/// Condition codes that select on ZF and CF alone, with every other flag
+/// masked out: `e/z/ne/nz` (ZF), `b/c/nae` (CF), `nb/nc/ae` (!CF) and
+/// `be/na` (CF|ZF), `a/nbe` (!CF|!ZF).  The SF/OF group (`s`, `l`, `le`, `g`,
+/// `ge` and their `n` forms) is deliberately absent, as is every
+/// whole-word/unknown reader.  A rewrite that changes SF, PF, OF or AF -- such
+/// as narrowing a `cmp` to its operands' common width -- may only proceed
+/// while [`flag_consumers_are_zf_cf_only`] holds.
+const ZF_CF_ONLY_CCS: &[&str] = &[
+    "e", "z", "ne", "nz", "b", "c", "nae", "nb", "nc", "ae", "be", "na", "a", "nbe",
+];
+
+/// Condition codes that select only on ZF, SF or PF.  Deleting a TEST after an
+/// arithmetic result preserves precisely those three flags, so a downstream
+/// consumer in this set cannot observe the divergence in CF/OF/AF.  The
+/// `jcxz` family reads no arithmetic flags at all and is included for
+/// completeness; the backend does not currently emit it.
+const ZF_SF_PF_ONLY_CCS: &[&str] = &[
+    "e", "z", "ne", "nz", "s", "ns", "p", "pe", "np", "po", "cxz", "ecxz", "rcxz",
+];
+
+/// Flag readers that provably do NOT read SF, so a rewrite whose only flag
+/// divergence is SF cannot be observed through them: the CF-carry group
+/// (`adc`/`sbb` and the two rotates that take CF as carry-in, `cmc`, `salc`,
+/// the ADX twins `adcx` -- covered by the `adc` prefix -- and `adox`, which is
+/// listed on its own because no other entry prefixes it) and `into` (OF). Each
+/// was checked on silicon
+/// with the f10 flag sweep rather than read off a mnemonic table. Everything
+/// else `flags_effect` reports as a reader and this list does not name --
+/// `pushf*` and `lahf` (whole-flag forms that capture SF), `syscall`/`sysenter`
+/// (RFLAGS goes to R11), `int*` (RFLAGS goes on the handler stack), and any
+/// mnemonic the tables do not recognise -- counts as reading SF. Default-deny:
+/// an unknown reader is never assumed benign.
+const NON_SF_FLAG_READERS: &[&str] = &["adc", "adox", "sbb", "rcl", "rcr", "cmc", "salc", "into"];
+
+/// True when a flag reader also overwrites the flags, so the flags being
+/// tracked die at that line: `adc`/`sbb`/`rcl`/`rcr`/`cmc` write the arithmetic
+/// flags back, `syscall`/`sysenter` mask RFLAGS after saving it to R11, and
+/// `int*` hands RFLAGS to a handler that may rewrite it. `lahf`, `pushf*`,
+/// `salc` and `into` only read, so the walk continues past them. An
+/// unrecognised reader also ends the path: it has already been counted as an SF
+/// reader, so nothing downstream of that guess could license anything anyway.
+fn reader_also_writes_flags(t: &str) -> bool {
+    if !(t.starts_with("adc")
+        || t.starts_with("sbb")
+        || t.starts_with("rcl")
+        || t.starts_with("rcr")
+        || t.starts_with("cmc")
+        || t.starts_with("syscall")
+        || t.starts_with("sysenter")
+        || t.starts_with("int"))
+    {
+        return false;
+    }
+    // `into` reads OF and traps; it does not write flags. (`int3`, `int $n` do
+    // hand RFLAGS to a handler, which is the stronger reason to stop.)
+    !t.starts_with("into")
+}
+
+/// What a flag-consumer walk established about the flags live at its start.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ConsumerFacts {
+    /// At least one consumer was reached.
+    pub(super) saw_consumer: bool,
+    /// A consumer that reads something other than ZF was reached.
+    pub(super) saw_non_zf: bool,
+    /// A consumer that reads a flag outside {ZF, SF, PF} was reached.  This is
+    /// the exact hazard set of deleting a TEST that followed an arithmetic
+    /// producer: the producer agrees on ZF/SF/PF and diverges only on CF/OF/AF.
+    pub(super) saw_outside_zf_sf_pf: bool,
+    /// A consumer that reads a flag outside {ZF, CF} was reached.  Weaker than
+    /// [`Self::saw_non_zf`]: a `jb`/`jbe` reads CF (and ZF) but nothing else,
+    /// so a rewrite that provably preserves ZF and CF alone may keep it.  A
+    /// consumer with no condition code is always charged here, because a
+    /// whole-word or unknown reader can select neither condition exclusively
+    /// and can observe AF, which no width-narrowing `cmp` preserves.
+    pub(super) saw_outside_zf_cf: bool,
+    /// A consumer that reads SF -- or the whole EFLAGS word, which contains it
+    /// -- was reached.
+    pub(super) saw_sf_reader: bool,
+    /// A consumer with no condition code -- `lahf`, `pushf`, inline asm, any
+    /// unknown mnemonic -- was reached.  This is exactly the class that can
+    /// observe **AF**, which no `jcc`/`setcc`/`cmovcc` predicate can select
+    /// and which the `NON_SF_FLAG_READERS` whitelist (`adc`/`sbb`/`adox`/...)
+    /// provably does not read.  `test`-vs-`cmp` rewrites diverge on AF (a
+    /// `cmp` defines it, `test` leaves it), so folds that are not
+    /// flag-for-flag identical must veto on this fact.
+    pub(super) saw_whole_reader: bool,
+    /// False when the walk had to give up: an indirect branch, a target it
+    /// could not resolve, or a branch leaving the function. The flags may then
+    /// reach consumers nobody looked at, so the facts are a lower bound and
+    /// must not license a flag-divergent rewrite on their own.
+    pub(super) proved: bool,
+}
+
+/// Forward reachability over the flag flow that starts at `from`.
+///
+/// A linear text walk is not enough, and this is not a theoretical objection.
+/// Flags travel along the TAKEN edge of every conditional jump as well as down
+/// the fall-through, so a consumer can sit in a block the text walk never
+/// enters, and stopping at the first flag writer is unsound for exactly that
+/// reason: in `andl $128,%esi; je .L1; addl $1,%edi; .L1: js .L2` the `addl`
+/// kills the flags on the fall-through path only, while the taken edge still
+/// delivers them to the `js` that reads SF. So this walk follows direct branch
+/// targets in addition to fall-through, ends each path at the first line that
+/// writes the flags it is tracking (a writer, a call, a `ret`), and reports
+/// what it could not resolve in `proved` instead of guessing.
+///
+/// Merging paths are handled by the visited set: a line is expanded once, and
+/// every fact found there is shared by all paths that reach it. That
+/// over-approximates which flags a consumer sees -- at a join it may attribute
+/// another predecessor's flags to this walk -- and over-approximation here only
+/// ever reports MORE consumers, which fails closed.
+/// `preserved` is the set of flags the rewrite under test PROVES it leaves
+/// unchanged.  A writer that clobbers none of the other flags cannot expose
+/// the rewrite, so the walk steps over it instead of stopping -- which is what
+/// keeps `stc` from hiding the `jo` behind it -- and, symmetrically, it is why
+/// a PARTIAL writer never ends the walk: `clc` redefines CF and nothing else,
+/// so a `setne` (ZF) or `setl` (SF/OF) behind it still reads the flags the
+/// rewrite may have changed.  Ending the walk there would be unsound, which is
+/// precisely what a caller passing `preserved = 0` ("the whole flag word is in
+/// question") must not get: with every flag in question, only a writer that
+/// redefines ALL SIX flags -- `cmp`, `test`, `add`, `popfq`, ... -- ends a
+/// path; a call and a `ret` end it too (the flags are dead across the ABI
+/// boundary and past the return), and an unresolvable target sets `proved` to
+/// false instead of guessing.
+pub(super) fn walk_flag_consumers(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+    preserved: u8,
+) -> ConsumerFacts {
+    walk_flag_consumers_seeded(store, infos, from, &[from], preserved)
+}
+
+/// [`walk_flag_consumers`] with an explicit entry set.
+///
+/// A conditional jump has TWO successors, and flags travel along both; a
+/// caller that is asking about the flags *after* a branch must therefore seed
+/// the walk with the fall-through and the resolved target, not with the jump
+/// itself (a `jcc` is itself a consumer, so starting there would report the
+/// branch under test as its own hazard).  `anchor` locates the enclosing
+/// function for the label table and bounds, and is where the facts are
+/// reported from; `seeds` may be empty (no path to explore: nothing can
+/// observe the flags).
+pub(super) fn walk_flag_consumers_seeded(
+    store: &LineStore,
+    infos: &[LineInfo],
+    anchor: usize,
+    seeds: &[usize],
+    preserved: u8,
+) -> ConsumerFacts {
+    let mut facts = ConsumerFacts {
+        saw_consumer: false,
+        saw_non_zf: false,
+        saw_outside_zf_sf_pf: false,
+        saw_outside_zf_cf: false,
+        saw_sf_reader: false,
+        saw_whole_reader: false,
+        proved: true,
+    };
+    // Label table for the enclosing function, so a branch target can be turned
+    // into a line index. A target outside the function is a tail branch: the
+    // flags leave with it and nothing here can account for them.
+    let Some((fs, fe)) = function_range(store, infos, anchor) else {
+        facts.proved = false;
+        return facts;
+    };
+    let mut labels: Vec<(&str, usize)> = Vec::new();
+    for n in fs..fe {
+        if infos[n].kind == LineKind::Label {
+            let t = infos[n].trimmed(store.get(n));
+            if let Some(name) = t.strip_suffix(':').map(str::trim) {
+                labels.push((name, n));
+            }
+        }
+    }
+    let resolve = |t: &str, facts: &mut ConsumerFacts| -> Option<usize> {
+        let Some(target) = super::helpers::extract_jump_target(t) else {
+            facts.proved = false;
+            return None;
+        };
+        match labels.iter().find(|(name, _)| *name == target) {
+            Some((_, idx)) => Some(*idx),
+            None => {
+                facts.proved = false;
+                None
+            }
+        }
+    };
+
+    // A codegen-marked sibling call (`# LCCC_TAIL_CALL`, conditional or not)
+    // to a symbol outside this function is a CALL: EFLAGS are no argument
+    // (SysV leaves them undefined at entry), so that edge ends the path like
+    // `call` does instead of making the walk unprovable.  A label of this
+    // function stays an ordinary edge, marker or not.
+    let sibling_or_resolve = |n: usize, t: &str, facts: &mut ConsumerFacts| -> Option<usize> {
+        let local = super::helpers::extract_jump_target(t)
+            .and_then(|target| labels.iter().find(|(name, _)| *name == target));
+        if local.is_none() && super::liveness::tail_call_marked(store, infos, n) {
+            return None;
+        }
+        resolve(t, facts)
+    };
+    let mut seen = vec![false; fe - fs];
+    let mut work: Vec<usize> = seeds.to_vec();
+    while let Some(head) = work.pop() {
+        let mut n = head;
+        while n < fe {
+            if seen[n - fs] {
+                break; // this suffix was already expanded, facts included
+            }
+            seen[n - fs] = true;
+            if infos[n].is_nop() {
+                n += 1;
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if infos[n].kind == LineKind::Directive {
+                // A benign directive is a position, not an effect.  A DATA
+                // directive is an instruction the text does not spell out, so
+                // it is charged like inline asm: a reader of every flag, and
+                // a reason the walk cannot be proved.  (No lccc-emitted
+                // function body contains a data directive -- measured over the
+                // whole benchmark corpus -- so this costs nothing on real
+                // output and closes the one place the walker trusted
+                // unrecognized text.)
+                if super::helpers::directive_emits_data(t) {
+                    facts.saw_consumer = true;
+                    facts.saw_non_zf = true;
+                    facts.saw_outside_zf_sf_pf = true;
+                    facts.saw_outside_zf_cf = true;
+                    facts.saw_sf_reader = true;
+                    facts.saw_whole_reader = true;
+                    facts.proved = false;
+                    break;
+                }
+                n += 1;
+                continue;
+            }
+            // A blank line has no mnemonic, so `flags_effect` falls through to
+            // its fail-closed default and charges it with reading every flag --
+            // which made any walk that reached the end of a function (the
+            // padding after the last `ret`) report a whole-word reader and veto
+            // every flag-divergent rewrite.  Emitting nothing, a blank line
+            // cannot observe EFLAGS, so skipping it is strictly more precise
+            // and cannot license anything the writer before it did not already
+            // license.  The same holds for a whole-line comment
+            // ([`is_byteless_comment`]): the codegen's call and tail-call
+            // markers sit between a branch and a sibling `jmp`, and charging
+            // them as unknown readers vetoed every flag fold before a tail
+            // call.  `#APP`/`#NO_APP` stay opaque.
+            if t.is_empty() || is_byteless_comment(t) {
+                n += 1;
+                continue;
+            }
+            match infos[n].kind {
+                // A label is a position, not an effect: fall through it.
+                LineKind::Label => {
+                    n += 1;
+                    continue;
+                }
+                // Inline asm can read or write any flag through raw encodings
+                // the textual predicates cannot see (`.byte $0x83, $0xd0, $0x00`
+                // is an `adc`), so it is charged with every reader fact AND
+                // makes the walk unproved: neither the flags before it nor the
+                // flags after it can be reasoned about from the text.
+                LineKind::InlineAsm => {
+                    facts.saw_consumer = true;
+                    facts.saw_non_zf = true;
+                    facts.saw_outside_zf_sf_pf = true;
+                    facts.saw_outside_zf_cf = true;
+                    facts.saw_sf_reader = true;
+                    facts.saw_whole_reader = true;
+                    facts.proved = false;
+                    break;
+                }
+                // `ret` ends the flags' lifetime and a call leaves EFLAGS
+                // undefined, so this path stops either way.
+                LineKind::Ret | LineKind::Call => break,
+                // Targets live in jump-table data or a register: unknowable
+                // here, and saying so is what keeps the walk honest.
+                LineKind::JmpIndirect => {
+                    facts.proved = false;
+                    break;
+                }
+                // An unconditional jump has no fall-through; the flags go to
+                // the target only.
+                LineKind::Jmp => {
+                    if let Some(idx) = sibling_or_resolve(n, t, &mut facts) {
+                        work.push(idx);
+                    }
+                    break;
+                }
+                // A real register push/pop is a stack adjustment and leaves
+                // EFLAGS alone. `pushf*` shares `LineKind::Push` (with
+                // `REG_NONE`) purely for %rsp tracking, yet it READS every
+                // flag, and `popf*` replaces them: the kind alone says nothing
+                // about EFLAGS, so only the register forms are skipped and the
+                // flag forms fall through to `flags_effect`, which reports
+                // pushf as a reader and popf as a writer.
+                LineKind::Push { reg } | LineKind::Pop { reg } if reg != REG_NONE => {
+                    n += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            match flags_effect(t) {
+                // The flags die here on this path -- UNLESS this writer only
+                // clobbers flags the rewrite already proves it preserves.  A
+                // CF-only writer cannot reveal a ZF/CF-preserving rewrite, and
+                // stopping there would hide every consumer behind it.
+                FlagsEffect::Writes => {
+                    let changed = F_ALL & !preserved;
+                    // Every flag in question redefined -> the walk is over on
+                    // this path.  Anything less (a partial writer, an
+                    // unknown-effect line that kills no proven flags)
+                    // keeps the walk going: the surviving
+                    // flags still hold the values under test.
+                    if changed == 0 || flags_written_mask(t) & changed == changed {
+                        break;
+                    }
+                    n += 1;
+                    continue;
+                }
+                FlagsEffect::Neutral => {
+                    n += 1;
+                    continue;
+                }
+                FlagsEffect::Reads => {
+                    facts.saw_consumer = true;
+                    // Condition-code consumers (`jcc`, `setcc`, `cmovcc`) name
+                    // exactly which flags they read; everything else is a
+                    // whole-flag or unknown reader and is charged with SF
+                    // unless `NON_SF_FLAG_READERS` vouches for it.
+                    let cc = condition_code_of(t);
+                    match cc {
+                        Some(cc) => {
+                            if !matches!(cc, "e" | "z" | "ne" | "nz") {
+                                facts.saw_non_zf = true;
+                            }
+                            if !ZF_CF_ONLY_CCS.contains(&cc) {
+                                facts.saw_outside_zf_cf = true;
+                            }
+                            if !ZF_SF_PF_ONLY_CCS.contains(&cc) {
+                                facts.saw_outside_zf_sf_pf = true;
+                            }
+                            if SF_CCS.contains(&cc) {
+                                facts.saw_sf_reader = true;
+                            }
+                        }
+                        None => {
+                            facts.saw_non_zf = true;
+                            facts.saw_outside_zf_sf_pf = true;
+                            facts.saw_outside_zf_cf = true;
+                            if !NON_SF_FLAG_READERS.iter().any(|p| t.starts_with(p)) {
+                                facts.saw_sf_reader = true;
+                                facts.saw_whole_reader = true;
+                            }
+                        }
+                    }
+                    // A conditional jump is a consumer AND an edge: the same
+                    // flags are live at its target.
+                    if infos[n].kind == LineKind::CondJmp
+                        || (t.starts_with('j') && !t.starts_with("jmp"))
+                    {
+                        if let Some(idx) = sibling_or_resolve(n, t, &mut facts) {
+                            work.push(idx);
+                        }
+                    }
+                    if reader_also_writes_flags(t) {
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+        }
+    }
+    facts
+}
+
+/// The flags **after a conditional jump**: does any consumer reachable from
+/// either successor observe them before a writer redefines them?
+///
+/// This is the question a compare/branch fusion must answer before it deletes
+/// the `test` that used to set those flags, and it is why the walk is seeded
+/// with BOTH successors: the taken edge carries the flags to the target block,
+/// where no linear text scan after the jump can ever look.  `preserved = 0`
+/// because the deleted `test` and the surviving producer comparison disagree
+/// about every one of the six arithmetic flags (`test %r,%r` clears OF/CF/AF
+/// and sets SF/ZF/PF from the value; a `cmp` sets all six from the
+/// subtraction), so no flag is safe to ignore.
+///
+/// Returns `None` when the jump's target cannot be resolved from the text
+/// (external symbol, computed target, no label in this function): the caller
+/// must treat that as a hazard rather than a proof.
+pub(super) fn flags_reach_consumer_after_branch(
+    store: &LineStore,
+    infos: &[LineInfo],
+    jcc_idx: usize,
+) -> Option<ConsumerFacts> {
+    let text = infos[jcc_idx].trimmed(store.get(jcc_idx));
+    let target = super::helpers::extract_jump_target(text)?;
+    let (fs, fe) = function_range(store, infos, jcc_idx)?;
+    let mut target_idx = None;
+    for n in fs..fe {
+        if infos[n].kind != LineKind::Label {
+            continue;
+        }
+        if let Some(name) = infos[n]
+            .trimmed(store.get(n))
+            .strip_suffix(':')
+            .map(str::trim)
+        {
+            if name == target {
+                target_idx = Some(n);
+                break;
+            }
+        }
+    }
+    let target_idx = target_idx?;
+    Some(walk_flag_consumers_seeded(
+        store,
+        infos,
+        jcc_idx,
+        &[jcc_idx + 1, target_idx],
+        0,
+    ))
+}
+
+/// The condition code of a `jcc`/`setcc`/`cmovcc` line, with any size suffix
+/// stripped (`cmovlq` -> `l`), or `None` for a reader that is not a
+/// condition-code form. Condition-code names collide with size suffixes, so
+/// `setl` must not be stripped to `set` and lose its predicate.
+fn condition_code_of(t: &str) -> Option<&str> {
+    if let Some(rest) = t.strip_prefix("set") {
+        return Some(rest.split_whitespace().next().unwrap_or(""));
+    }
+    if let Some(rest) = t.strip_prefix("cmov") {
+        let tag = rest.split_whitespace().next().unwrap_or("");
+        return Some(
+            tag.strip_suffix(|c| c == 'q' || c == 'l' || c == 'w')
+                .unwrap_or(tag),
+        );
+    }
+    if t.starts_with('j') && !t.starts_with("jmp") {
+        return Some(&t[1..t.find(' ').unwrap_or(t.len())]);
+    }
+    None
+}
+
+/// True when every consumer of the current flags only tests ZF (`e`/`ne`) and
+/// at least one consumer exists. False also covers "could not prove", which is
+/// the point: an incomplete walk must not license anything.
+pub(super) fn flag_consumers_are_zf_only(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, 0);
+    f.proved && f.saw_consumer && !f.saw_non_zf
+}
+
+/// True when every consumer of the current flags selects only on ZF and CF
+/// (see [`ZF_CF_ONLY_CCS`]) and at least one consumer exists.  False also
+/// covers "could not prove", for the same reason [`flag_consumers_are_zf_only`]
+/// fails closed: an incomplete walk must not license a flag-divergent rewrite.
+pub(super) fn flag_consumers_are_zf_sf_pf_only(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, F_ZF | F_SF | F_PF);
+    f.proved && !f.saw_outside_zf_sf_pf && !f.saw_whole_reader
+}
+
+pub(super) fn flag_consumers_are_zf_cf_only(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, 0);
+    f.proved && f.saw_consumer && !f.saw_outside_zf_cf
+}
+
+/// [`flag_consumers_are_zf_cf_only`] for a rewrite that PROVES it preserves
+/// ZF and CF, so a writer touching only those two cannot expose it.
+///
+/// This is strictly more precise, never less: the only difference is that a
+/// CF-only writer (`stc`, `clc`, `cmc`) or an OF-preserving one (`sahf`) no
+/// longer terminates the walk, so consumers standing behind it are examined
+/// instead of skipped.  In `cmp; jb; ...; stc; jo` the old code stopped at
+/// `stc` and never saw the `jo`; here the `jo` is reached and vetoes the
+/// rewrite, which is the correct answer because the rewrite does change OF.
+pub(super) fn flag_consumers_are_zf_cf_only_preserving_zf_cf(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, F_ZF | F_CF);
+    f.proved && f.saw_consumer && !f.saw_outside_zf_cf
+}
+
+/// True when some consumer of the current flags reads SF, or when the walk
+/// could not prove that none does.
+///
+/// This is the guard a rewrite needs when SF is the ONLY flag it can change --
+/// which is narrower than "every consumer is ZF-only" and therefore keeps folds
+/// that a ZF-only test refuses: a `jc`, an `jo`, an `adc` or a `jp` downstream
+/// cannot observe an SF-only divergence. Both rewrites that use it diverge in
+/// SF alone, and both divergences are provable rather than empirical:
+///
+/// * `testb $imm, %Xb` for `andl $imm, %X` (mask <= 255): ZF, PF, CF and OF are
+///   identical, and SF is bit 7 of `imm & X` against bit 31 of a result that
+///   cannot exceed 255 -- so it differs only when the mask has bit 7;
+/// * `cmpb $0, mem` for a zero-extended load plus `test`: ZF, PF, CF and OF are
+///   identical, and SF is bit 7 of the byte against bit 63 of the extended
+///   register, which is 0.
+pub(super) fn flags_reach_an_sf_consumer(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, 0);
+    !f.proved || f.saw_sf_reader
+}
+
+/// True when some consumer of the current flags reads the WHOLE EFLAGS word
+/// (or is opaque enough that it might): `lahf`, `pushf`, inline-asm blocks,
+/// unknown mnemonics.  This is the reader class that can observe **AF**;
+/// condition-code consumers cannot select AF and the
+/// [`NON_SF_FLAG_READERS`] whitelist (`adc`/`sbb`/`adox`/`rcl`/`rcr`/`cmc`/
+/// `salc`/`into`) reads CF/OF only.  Fails closed exactly like
+/// [`flags_reach_an_sf_consumer`]: an incomplete walk must not license an
+/// AF-divergent rewrite.
+///
+/// Used by `test`→`cmp` zero-compare folds: `cmp $0, mem` DEFINES AF (a
+/// subtraction from zero never borrows, so AF=0) while `test` leaves it
+/// carrying the previous writer's value -- the only flag the rewrite can
+/// change when SF/ZF/PF/CF/OF are provably identical.
+pub(super) fn flags_reach_a_whole_flags_reader(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+) -> bool {
+    let f = walk_flag_consumers(store, infos, from, 0);
+    !f.proved || f.saw_whole_reader
+}
+
+/// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
+fn mentions_exact_name(line: &str, name: &str) -> bool {
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    let mut pos = 0;
+    while pos + nb.len() <= bytes.len() {
+        if &bytes[pos..pos + nb.len()] == nb {
+            let after = pos + nb.len();
+            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
+                return true;
+            }
+        }
+        pos += 1;
+    }
+    false
+}
+
+// ── 6. narrow a sign extension nobody reads at 64 bits ───────────────────────
+
+/// `movslq %edx, %r8` → `movl %edx, %r8d` when the 64-bit half of the result is
+/// never read. The narrower form is the same length but feeds the copy folds
+/// (`producer_retarget`, `eliminate_move_relays`), which cannot touch a
+/// sign-extending producer because it changes the value's width class.
+pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i)).to_string();
+        let Some(rest) = t.strip_prefix("movslq ") else {
+            i += 1;
+            continue;
+        };
+        let Some((src, dst)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let Some(dst_fam) = plain_gp_operand(dst) else {
+            i += 1;
+            continue;
+        };
+        if dst != REG_NAMES[0][dst_fam as usize] || !src.starts_with('%') {
+            i += 1;
+            continue;
+        }
+        let name64 = REG_NAMES[0][dst_fam as usize];
+        let mask = 1u16 << dst_fam;
+        let mut ok = false;
+        // Last line the scan examined: everything between it and `j` is
+        // stepped over (deleted lines, hidden `-g` rows, comments), so its
+        // live-out is the live-in of `j`.  `j - 1` would ask about a hidden
+        // row, which has no liveness, and `-g` alone would keep the movslq.
+        let mut last = i;
+        let mut j = i + 1;
+        while j < len {
+            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
+                j += 1;
+                continue;
+            }
+            if infos[j].is_barrier() || infos[j].pinned {
+                // Safe to stop here only if the register is dead from now on.
+                ok = matches!(lv.live_after(last, dst_fam), Some(false));
+                break;
+            }
+            let tj = infos[j].trimmed(store.get(j));
+            if infos[j].reg_refs & mask != 0 {
+                if mentions_exact_name(tj, name64) {
+                    break; // a 64-bit read observes the sign extension
+                }
+                // An implicit READ of the family observes the extension just
+                // as much as a named 64-bit operand does: `cqto` consumes
+                // all 64 bits of %rax, `idivq` reads %rax:%rdx. The
+                // `reg_refs` union is what routes these lines here at all.
+                if implicit_read_refs(tj.as_bytes()) & mask != 0 {
+                    break;
+                }
+                // "Fully redefined" must mean a FULL-WIDTH write of the
+                // family: a `cqto` is classified with %rax as its primary
+                // destination, but %rax is its implicit input — the only
+                // family it writes is %rdx — so it can never retire a %rax
+                // identity here.  And a PARTIAL write (`movb $1, %al`,
+                // `lahf`, `setcc`) leaves the upper bits of the old value
+                // live, so a later 64-bit read would still observe them:
+                // the any-width `writes_family` must not end the search.
+                // `writes_family_full` proves the whole architectural
+                // family rewritten (32-bit writes zero-extend).  cmov is
+                // additionally excluded: its write is conditional.
+                if writes_family_full(&infos[j], tj, dst_fam) && !tj.starts_with("cmov") {
+                    ok = true; // fully redefined before any wide read
+                    break;
+                }
+            }
+            last = j;
+            j += 1;
+        }
+        if ok {
+            let new_line = format!("    movl {}, {}", src, REG_NAMES[1][dst_fam as usize]);
+            replace_line(store, &mut infos[i], i, new_line);
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
+// ── 7. redundant compare feeding a chain of cmovs ──────────────────────────
+
+/// `cmp A,B …(flag-preserving)… cmp A,B` → drop the **second** `cmp`.
+///
+/// # Why the second one is dead
+///
+/// `CMOVcc` READS EFLAGS but does not WRITE it. That is the whole reason this
+/// transform exists: a comparison computed for one conditional move is still
+/// intact for the next one, because nothing in between has disturbed it.
+///
+/// The backend emits one `cmp` per `cmov`. When if-conversion turns a chain of
+/// branches that share a condition into a chain of `cmov`s, every `cmov` after
+/// the first gets its own re-computation of a comparison the flags already
+/// hold. SQLite's varint decoder is the canonical case: the two tail arms test
+/// the same byte, and the emitted loop carried
+///
+/// ```text
+///     cmpb $-128, %r10b
+///     movl %r11d, %edx
+///     cmovbl %r12d, %edx
+///     cmpb $-128, %r10b        <-- recomputes flags nobody changed
+///     movl $3, %ecx
+///     movl $4, %ebx
+///     cmovbl %ecx, %ebx
+/// ```
+///
+/// which is one dead instruction on the slowest arm of the loop, in the one
+/// shape the kernel spends most of its time in.
+///
+/// # What makes it sound
+///
+/// The two instructions must be *textually* identical — same mnemonic, same
+/// width suffix, same operand text — so they compute identical flags, and
+/// every line between them must be one of:
+///
+///   * a no-op, a directive, or a label-free run of flag-`Neutral` code;
+///   * a flag reader that does not also write (`cmov`, `setcc`) — reading the
+///     flags cannot change them, and `adc`/`sbb`/`rcl`/`rcr`, which do, are
+///     excluded by [`reader_also_writes_flags`];
+///   * and, crucially, none of them may WRITE a register named by either
+///     operand.
+///
+/// That last clause is not decoration. Deleting the operand-write guards was
+/// tried, and it miscompiles two corpus tests — `bb_slp_i64_to_i32_select`
+/// (`gt_big[2]: got 6 want 100000`) and `array_string_init_matrix_O0`. Note
+/// that a hand-written C fixture does *not* reproduce this: the register
+/// allocator normally gives the two compares different registers, so the
+/// texts differ and the fold declines anyway. The hazard only opens where
+/// allocation reuses one register across the redefinition, and the corpus is
+/// where those shapes live.
+///
+/// Control flow, calls and inline asm are barriers, so a label or a branch
+/// target between the two ends the search. That also means the fold can never
+/// reach across a basic block, where the flags' liveness this reasoning
+/// depends on would have to be re-established.
+///
+/// # Memory operands are refused outright
+///
+/// If either operand names memory, two textually identical compares are *not*
+/// necessarily equal: a store between them can change what the load reads,
+/// and nothing in the `LineInfo` model lets us prove it did not. Rather than
+/// guess, the fold declines. The real-world case this targets is a compare
+/// against a register or an immediate, so nothing is lost, and a wrong fold
+/// here would be a miscompile rather than a missed optimisation.
+///
+/// # Measured limit of the block-local restriction
+///
+/// The obvious extension is to fold, across an edge, a compare that repeats the
+/// one a branch has just consumed. A three-way test (`if (a < b) … else if
+/// (a > b) … else`) lowers to one `Cmp` per arm on identical operands, and the
+/// later arms' compares sit at the top of the block the earlier branch jumps
+/// to, so one `cmpl` provably answers both:
+///
+/// ```text
+/// .LBB2:
+///     cmpl %esi, %r9d
+///     jge  .LBB5          ; the fallthrough arm is guarded by `jmp`
+///     …
+///     jmp  .LBB7          ; so .LBB5 has exactly one predecessor
+/// .LBB5:
+///     cmpl %esi, %r9d     ; the flags the branch above just consumed
+///     jle  .LBB8
+/// ```
+///
+/// This is foldable: when the label has exactly one predecessor (one jump names
+/// it *and* the line above cannot fall through into it), the label name appears
+/// in no `.long` jump-table entry, the compare is the first real instruction
+/// after the label, and the walk back to the surviving compare crosses nothing
+/// that writes the flags, either operand, or memory. Such a pass was written
+/// and measured, and is deliberately **not** kept. Over the 2121 programs of
+/// the regression and benchmark suites that compile cleanly at `-O2` it fired
+/// on exactly one — `linux_rbtree.c` — removing 2 of 379 625 instructions
+/// (0.0005 %), with 1.008 on that program and a geomean of 0.9980 across all 49
+/// benchmarks, i.e. inside the noise band, and 300/300 `phi_cfg` differential
+/// cases passing. A ~200-line pass plus a new skip knob is not worth 0.0005 %.
+/// Do not re-implement it without a workload that exercises the shape; if one
+/// appears, the guards above are the correct ones.
+pub(super) fn fold_redundant_flags_compare(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned {
+            j += 1;
+            continue;
+        }
+        let t = infos[j].trimmed(store.get(j));
+
+        // Accept only `cmp`/`test` with an explicit width suffix; the bare
+        // forms are assembler defaults and are not what the backend emits.
+        let Some(args) = strip_width_suffix(t, "cmp").or_else(|| strip_width_suffix(t, "test"))
+        else {
+            j += 1;
+            continue;
+        };
+        let Some((a, b)) = split_two_operands(args) else {
+            j += 1;
+            continue;
+        };
+        // Refuse memory operands: see the module note above.
+        if a.contains('(') || b.contains('(') || a.contains('[') || b.contains('[') {
+            j += 1;
+            continue;
+        }
+        // Aliasing operands (`test %rax,%rax`) collapse to one family, and the
+        // single write check below then covers both, so no extra case is needed.
+        let fam_a = register_family_fast(a);
+        let fam_b = register_family_fast(b);
+
+        // Walk forward over flag-preserving lines looking for the same compare.
+        let mut k = j + 1;
+        while k < len {
+            if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
+                k += 1;
+                continue;
+            }
+            if infos[k].pinned || infos[k].is_barrier() {
+                break;
+            }
+            let tk = infos[k].trimmed(store.get(k));
+            // Identity is tested FIRST, before the flag classification below.
+            // A `cmp` is itself a flag writer, so classifying first would break
+            // out of the walk on the very line this pass exists to delete.
+            if tk == t {
+                mark_nop(&mut infos[k]);
+                changed = true;
+                break;
+            }
+            match flags_effect(tk) {
+                // Someone recomputed the flags: the compare we walked from no
+                // longer describes them.
+                FlagsEffect::Writes => break,
+                // Reads the flags *and* writes them (adc/sbb/rcl/rcr/int).
+                FlagsEffect::Reads if reader_also_writes_flags(tk) => break,
+                // `flags_effect` answers "might this line touch flags?" and
+                // deliberately answers `Reads` -- "assume the worst" -- for
+                // every mnemonic it does not recognise. That is the correct
+                // fail-CLOSED answer for its other callers, but this fold needs
+                // the opposite polarity: it is about to DELETE a compare, so it
+                // needs *proof* that the line left EFLAGS alone. Treating the
+                // unknown-`Reads` catch-all as "preserves flags" inverted the
+                // conservative default into a fail-OPEN one, and every flag
+                // writer missing from the tables (adox, daa, kortest*, the x87
+                // fcomi family, pcmpistri) silently re-based the
+                // flags the following cmov reads. See `preserves_eflags`.
+                FlagsEffect::Reads | FlagsEffect::Neutral => {
+                    if !preserves_eflags(tk) {
+                        break;
+                    }
+                }
+            }
+            // A redefinition of either operand register makes the second
+            // compare see a different value, even though the text matches.
+            //
+            // `reg_refs` is the classifier's complete register bitmask for the
+            // whole line (every operand, not just the destination), so it also
+            // covers instructions whose single-destination model does not fit:
+            // `xchgq %rcx, %rax` writes BOTH operands, and `mulxq %rsi, %rcx,
+            // %rdx` writes two of its three. `writes_family` alone only sees
+            // the parsed destination and let both folds delete a compare that
+            // was reading a register the line had just clobbered. The mask
+            // conflates reads with writes, which is the conservative direction
+            // for a compare we are about to delete.
+            let refs = infos[k].reg_refs;
+            if fam_a != REG_NONE
+                && (writes_family(&infos[k], tk, fam_a) || refs & (1u16 << fam_a) != 0)
+            {
+                break;
+            }
+            if fam_b != REG_NONE
+                && fam_b != fam_a
+                && (writes_family(&infos[k], tk, fam_b) || refs & (1u16 << fam_b) != 0)
+            {
+                break;
+            }
+            k += 1;
+        }
+        j += 1;
+    }
+    changed
+}
+
+/// Proof that `t` leaves EFLAGS unmodified — the question
+/// `fold_redundant_flags_compare` actually needs.
+///
+/// `flags_effect` answers a deliberately different question ("might this line
+/// touch flags?") and returns `FlagsEffect::Reads` as its catch-all, which is
+/// fail-CLOSED for the transforms that consult it. A fold that *deletes* a
+/// compare needs the converse: a positive proof that nothing between the two
+/// compares rewrote the flags the later `cmov`/`jcc` will read. Answering that
+/// with `Reads` would invert the conservative default into a fail-OPEN one, so
+/// the polarity is fixed here, once, rather than at each call site.
+///
+/// The allowlist is the set of instructions the SDM documents as reading
+/// EFLAGS without writing it, plus the families `flags_effect` has already
+/// proven neutral. Everything else — including every mnemonic `flags_effect`
+/// does not know — is treated as a writer and blocks the fold. That direction
+/// is the safe one: a missed fold costs one instruction, a wrong one is a
+/// miscompile.
+#[inline]
+pub(super) fn preserves_eflags(t: &str) -> bool {
+    // Documented pure readers of the condition codes.
+    if t.starts_with("cmov")
+        || t.starts_with("set")
+        || t.starts_with("lahf")
+        || t.starts_with("pushf")
+        || t.starts_with("salc")
+    {
+        return true;
+    }
+    // `Neutral` is `flags_effect`'s *positive* verdict, reached only through
+    // explicit tables (register push/pop, the BMI2 VEX shifts, `fp_data_op`).
+    // `Reads` is its unknown-mnemonic catch-all and proves nothing.
+    matches!(flags_effect(t), FlagsEffect::Neutral)
+}
+
+/// `"cmpq 1, %rax"` → `Some("1, %rax")`; `"cmpl $0, 8(%rbx)"` → `Some("$0, 8(%rbx)")`.
+/// Returns `None` unless the mnemonic is exactly `base` plus one of the four
+/// width suffixes, so `cmpps`/`cmpxchg` can never be mistaken for `cmp`.
+fn strip_width_suffix<'a>(t: &'a str, base: &str) -> Option<&'a str> {
+    let rest = t.strip_prefix(base)?;
+    let rest = rest.strip_prefix(['b', 'w', 'l', 'q'])?;
+    if !rest.starts_with(' ') {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::peephole_optimize;
+    use super::{ConsumerFacts, FlagsEffect, flags_effect, walk_flag_consumers};
+    use crate::backend::x86::codegen::peephole::types::{LineInfo, LineStore, classify_line};
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    #[test]
+    fn partial_flag_writers_do_not_kill_surviving_flags() {
+        for writer in [
+            "incq %rdx",
+            "decq %rdx",
+            "stc",
+            "clc",
+            "cld",
+            "std",
+            "sahf",
+            "shlq %cl, %rdx",
+            "shrq $0, %rdx",
+            "shlq $64, %rdx",
+            "rolq $0, %rdx",
+            "shldq %cl, %rax, %rdx",
+            "btl $1, %edx",
+            "lock adcq $0, (%rdi)",
+        ] {
+            let text = format!("    {writer}\n    pushfq\n    popq %rax\n    ret\n");
+            let store = LineStore::new(text);
+            let infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(!super::flags_dead_after(&store, &infos, 0), "{writer}");
+        }
+    }
+
+    #[test]
+    fn complete_flag_writes_and_return_end_lifetime() {
+        for tail in [
+            "addq $1, %rdx\n    pushfq",
+            "cmpq $0, %rdx\n    pushfq",
+            "incq %rdx\n    clc\n    pushfq",
+            "shlq %cl, %rdx\n    ret",
+        ] {
+            let text = format!("    {tail}\n");
+            let store = LineStore::new(text);
+            let infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(super::flags_dead_after(&store, &infos, 0), "{tail}");
+        }
+    }
+
+    #[test]
+    fn partial_writers_do_not_hide_cfg_flag_consumers() {
+        for writer in ["incq %rdx", "shlq %cl, %rdx", "cld"] {
+            let text = format!(
+                "foo:\n.cfi_startproc\n    cmpq $0, %rax\n    {writer}\n    setb %al\n    ret\n.cfi_endproc\n"
+            );
+            let facts = facts_from(&text, "cmpq");
+            assert!(facts.proved && facts.saw_non_zf, "{writer}");
+            let local = format!(
+                "foo:\n.cfi_startproc\n    {writer}\n    setb %al\n    ret\n.cfi_endproc\n"
+            );
+            let (store, infos) = build(&local);
+            assert!(
+                !super::flags_are_block_local(&store, &infos, 0, store.len()),
+                "{writer}"
+            );
+        }
+    }
+
+    /// Register push/pop (any operand-size suffix) never touch EFLAGS per the
+    /// SDM; only PUSHF/POPF do. `popq`/`pushq` — the spelling every AT&T
+    /// epilogue emits — used to fall through the size-suffix-less `pop `
+    /// check into the "unknown" catch-all and were treated as flag READERS,
+    /// so `flags_dead_after` refused every flag-discarding fold whose
+    /// producer sat before a callee-save restore.
+    #[test]
+    fn register_push_pop_width_suffixed_is_flag_neutral() {
+        for t in [
+            "popq %rbp",
+            "popl %eax",
+            "popw %bx",
+            "pop %rax",
+            "pushq %rbp",
+            "pushq $16",
+            "push %rax",
+        ] {
+            assert_eq!(
+                flags_effect(t),
+                FlagsEffect::Neutral,
+                "{t} must be flag-neutral"
+            );
+        }
+        // The flag stack ops keep their classifications ...
+        assert_eq!(flags_effect("pushfq"), FlagsEffect::Reads);
+        assert_eq!(flags_effect("popfq"), FlagsEffect::Writes);
+        // ... and `popcnt` is not a stack pop.
+        assert_eq!(flags_effect("popcntq %rax, %rax"), FlagsEffect::Writes);
+    }
+
+    /// End-to-end: a flag-dropping fold must now reach across a callee-save
+    /// `popq` restore. `addq $1, %rax` staged through a copy folds to a lea
+    /// even though the only flag event after it is the epilogue's pops.
+    #[test]
+    fn flag_discard_reaches_across_callee_save_pop() {
+        // The sum is returned in %rax (observable), so only the staging copy
+        // and the add may fold — the pipeline must not delete the value.
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rsi, %rbx\n",
+            "    addq $16, %rbx\n",
+            "    movq %rbx, %rax\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("leaq 16(%rsi), %rax"),
+            "staged add must fold to a lea across the popq:\n{out}"
+        );
+        assert!(
+            !out.contains("addq $16"),
+            "the flag-writing add must be gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn self_test_after_and_is_removed() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    andl $1, %esi\n",
+            "    testq %rsi, %rsi\n",
+            "    je .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $1, %esi"), "{out}");
+        assert!(!out.contains("testq %rsi, %rsi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_and_is_kept_for_a_sign_consumer() {
+        // SF of a 32-bit `andl` is bit 31; `testq` reports bit 63. A signed
+        // consumer must keep the wide test.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    andl $255, %esi\n",
+            "    testq %rsi, %rsi\n",
+            "    js .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testq %rsi, %rsi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_add_is_kept() {
+        // The consumer is `jb`, a carry test: `addl` takes CF from the carry
+        // while `testl` clears it, so the pair is not redundant. The ZF-only
+        // twin of this shape IS folded -- see the counter tests below.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    jb .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    /// Run the self-test pass over a one-function snippet whose body branches
+    /// forward to the appended `.LBB4`.
+    fn self_test_case(body: &str) -> String {
+        run(&format!(
+            "foo:\n.cfi_startproc\n{body}.LBB4:\n    ret\n.cfi_endproc\n"
+        ))
+    }
+
+    #[test]
+    fn self_test_after_counter_sub_is_removed_for_zf_consumer() {
+        // `while (--chain != 0)`: the decrement already set ZF.
+        let out = self_test_case(concat!(
+            "    subl $1, %ebp\n",
+            "    testl %ebp, %ebp\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("subl $1, %ebp"), "{out}");
+        assert!(!out.contains("testl %ebp, %ebp"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_add_dec_neg_is_removed_for_zf_consumer() {
+        for (prod, tst) in [
+            ("addl %edx, %esi", "testl %esi, %esi"),
+            ("decl %esi", "testl %esi, %esi"),
+            ("negl %esi", "testl %esi, %esi"),
+            ("subq $8, %rsi", "testq %rsi, %rsi"),
+            // 32-bit producer zero-extends: ZF of the wide test is identical.
+            ("subl $1, %esi", "testq %rsi, %rsi"),
+        ] {
+            let out = self_test_case(&format!("    {prod}\n    {tst}\n    jne .LBB4\n    ret\n"));
+            assert!(!out.contains(tst), "`{tst}` after `{prod}` must go:\n{out}");
+        }
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_for_carry_overflow_or_sign_consumers() {
+        // `sub` sets CF/OF from the subtraction, and SF (at equal widths) is
+        // the register's sign bit, which agrees with the test -- but the proof
+        // this fold carries is "ZF alone", so every non-ZF predicate refuses.
+        for jcc in [
+            "jb", "ja", "jl", "jg", "jle", "jge", "js", "jo", "jbe", "jp",
+        ] {
+            let out = self_test_case(&format!(
+                "    subl $1, %esi\n    testl %esi, %esi\n    {jcc} .LBB4\n    ret\n"
+            ));
+            assert!(out.contains("testl %esi, %esi"), "{jcc}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_when_a_later_edge_reads_carry() {
+        // The taken edge of the first branch delivers the flags to `jb`.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    subl $1, %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    jb .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_wide_sub_is_kept_under_a_narrow_test() {
+        // `subq` can leave a non-zero upper half that `testl` ignores, so the
+        // wide subtraction never licenses dropping the narrow test.
+        let out = self_test_case(concat!(
+            "    subq $1, %rsi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_for_a_whole_flags_reader() {
+        let out = self_test_case(concat!(
+            "    subl $1, %esi\n",
+            "    testl %esi, %esi\n",
+            "    lahf\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_when_the_register_is_touched_between() {
+        let out = self_test_case(concat!(
+            "    subl $1, %esi\n",
+            "    leal 1(%esi), %esi\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_sub_is_kept_when_a_branch_enters_at_the_test() {
+        // A label between the producer and the test is a barrier, so the fold
+        // never claims a straight-line window it does not have: the `jmp`
+        // delivers flags that the decrement did not produce, and the test is
+        // the only thing defining ZF for them.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    jmp .LBB5\n",
+            "    subl $1, %esi\n",
+            ".LBB5:\n",
+            "    testl %esi, %esi\n",
+            "    je .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn dead_sign_extension_is_narrowed() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %edx, %r8\n",
+            "    movl %r8d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movslq"), "{out}");
+    }
+
+    #[test]
+    fn live_sign_extension_is_kept() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %edx, %r8\n",
+            "    movq %r8, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movslq %edx, %r8"), "{out}");
+    }
+
+    #[test]
+    fn copy_plus_add_becomes_lea() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %r8d\n",
+            "    addl $1, %r8d\n",
+            "    testq %r10, %r10\n",
+            "    cmovneq %r8, %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal 1(%rbx), %r8d"), "{out}");
+        assert!(!out.contains("addl $1, %r8d"), "{out}");
+    }
+
+    /// The rotation loop of check_phi_acyclic_order.sh: a copy into an
+    /// allocatable %rbp plus a register add, with the flags dead (the next
+    /// flags reader is preceded by a writer).
+    #[test]
+    fn copy_plus_register_add_becomes_two_source_lea() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r12, %rbp\n",
+            "    addl %edi, %ebp\n",
+            "    movq %rbx, %r8\n",
+            "    addq %rsi, %r8\n",
+            "    cmpq %rbp, %r8\n",
+            "    jl .L1\n",
+            ".L1:\n",
+            "    movq %rsi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal (%r12, %rdi), %ebp"), "{out}");
+        assert!(out.contains("leaq (%rbx, %rsi), %r8"), "{out}");
+        assert!(!out.contains("movq %r12, %rbp"), "{out}");
+        assert!(!out.contains("addl %edi, %ebp"), "{out}");
+    }
+
+    /// Every case the register form must refuse: flags read by the next
+    /// instruction, a `sub` (no negated index), a narrower copy than the add,
+    /// an addend that is the destination or %rsp, a byte-register addend, and
+    /// the frame setup `movq %rsp, %rbp`.
+    #[test]
+    fn copy_plus_register_add_refusals() {
+        for (pair, why) in [
+            (
+                "    movl %ebx, %r8d\n    addl %ecx, %r8d\n    jc .L1\n",
+                "carry read",
+            ),
+            ("    movl %ebx, %r8d\n    subl %ecx, %r8d\n", "sub"),
+            (
+                "    movl %ebx, %r8d\n    addq %rcx, %r8\n",
+                "narrow copy, wide add",
+            ),
+            (
+                "    movl %ebx, %r8d\n    addl %r8d, %r8d\n",
+                "addend is the destination",
+            ),
+            ("    movq %rbx, %r8\n    addq %rsp, %r8\n", "rsp index"),
+            ("    movl %ebx, %r8d\n    addb %cl, %r8b\n", "byte add"),
+            ("    movq %rsp, %rbp\n    addq %rcx, %rbp\n", "frame setup"),
+        ] {
+            let asm = format!(
+                "foo:\n.cfi_startproc\n{pair}    testq %r8, %r8\n    jne .L1\n.L1:\n    ret\n.cfi_endproc\n"
+            );
+            let out = run(&asm);
+            assert!(!out.contains("lea"), "{why}: {out}");
+        }
+    }
+
+    /// The immediate form still folds a copy of %rsp (address of a stack
+    /// slot) -- the register form's frame-setup refusal must not leak.
+    #[test]
+    fn copy_of_rsp_plus_immediate_still_becomes_lea() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rsp, %rax\n",
+            "    addq $8, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 8(%rsp), %rax"), "{out}");
+    }
+
+    #[test]
+    fn copy_plus_add_keeps_flags_when_read() {
+        // The hazard pinned here is the flag-free `leal`: with `je` reading
+        // the flags, copy+add must never become `leal 1(%ebx), %r8d`. Two
+        // spellings satisfy that — the pair kept verbatim, or the copy
+        // coalesced into a retargeted `addl` (which computes IDENTICAL flags
+        // from the same value, so `je` still observes them). Pin the
+        // invariant, not the spelling.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %r8d\n",
+            "    addl $1, %r8d\n",
+            "    je .LBB9\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("leal"), "{out}");
+        assert!(
+            out.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("addl $1, ") && (l.ends_with("%r8d") || l.ends_with("%ebx"))
+            }),
+            "{out}"
+        );
+        assert!(out.contains("je .LBB9"), "{out}");
+    }
+
+    #[test]
+    fn wide_copy_with_narrow_add_becomes_a_32bit_lea() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    addl $1, %eax\n",
+            "    movq %rax, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal 1(%r9), %eax"), "{out}");
+    }
+
+    #[test]
+    fn narrow_copy_with_wide_add_is_rejected() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %r9d, %eax\n",
+            "    addq $1, %rax\n",
+            "    movq %rax, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("addq $1, %rax"), "{out}");
+    }
+
+    #[test]
+    fn copy_plus_shift_becomes_scaled_lea() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rax, %r12\n",
+            "    shlq $2, %r12\n",
+            "    movq %r12, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 0(,%rax,4), %r12"), "{out}");
+        assert!(!out.contains("shlq $2"), "{out}");
+    }
+
+    #[test]
+    fn copy_plus_shift_is_kept_when_flags_are_read() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rax, %r12\n",
+            "    shlq $2, %r12\n",
+            "    jne .LBB4\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("shlq $2, %r12"), "{out}");
+    }
+
+    fn fuse_boolean_only(body: &str) -> (bool, String) {
+        let asm = format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n");
+        let (mut store, mut infos) = build(&asm);
+        let changed = super::fold_setcc_test_cmov(&mut store, &mut infos);
+        (changed, store.build_result(|i| infos[i].is_nop()))
+    }
+
+    #[test]
+    fn normalized_boolean_copy_chains_feed_the_original_flags() {
+        for copy in ["movl %r10d, %r11d", "movq %r10, %r11"] {
+            for (cmov, expected) in [("cmovnel", "cmovbel"), ("cmovel", "cmoval")] {
+                let (changed, out) = fuse_boolean_only(&format!(
+                    "    cmpb $25, %dil\n    setbe %r9b\n    movzbl %r9b, %r10d\n    {copy}\n    movl %r11d, %ecx\n    leal 32(%rsi), %edx\n    testl %ecx, %ecx\n    movl %esi, %eax\n    {cmov} %edx, %eax\n    ret\n"
+                ));
+                assert!(changed, "{out}");
+                assert!(out.contains(expected), "{out}");
+                assert!(!out.contains("setbe") && !out.contains("testl"), "{out}");
+                assert!(!out.contains("movzbl") && !out.contains(copy), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_boolean_byte_extensions_feed_original_flags() {
+        for first in ["movzbl %r9b, %r10d", "movsbq %r9b, %r10"] {
+            for second in ["movsbl %r10b, %r11d", "movzbq %r10b, %r11"] {
+                let (changed, out) = fuse_boolean_only(&format!(
+                    "    cmpb $25, %dil\n    setbe %r9b\n    {first}\n    {second}\n    movsbq %r11b, %rcx\n    testq %rcx, %rcx\n    cmovnel %edx, %eax\n    ret\n"
+                ));
+                assert!(changed && out.contains("cmovbel"), "{out}");
+                assert!(!out.contains("setbe") && !out.contains("movsbq"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_fusion_removes_only_self_supported_loop_liveness() {
+        for escape in ["", "    movb %r15b, (%rdi)\n"] {
+            let (changed, out) = fuse_boolean_only(&format!(
+                "    pushq %r15\n.Lloop:\n    cmpb $25, %dil\n    setbe %r15b\n    movzbl %r15b, %r15d\n    leal 32(%rdx), %ecx\n    testl %r15d, %r15d\n    movl %edx, %eax\n    cmovnel %ecx, %eax\n    addl $1, %esi\n    cmpl $16, %esi\n    jb .Lloop\n{escape}    popq %r15\n    ret\n"
+            ));
+            assert_eq!(changed, escape.is_empty(), "{out}");
+            assert_eq!(out.contains("setbe"), !escape.is_empty(), "{out}");
+            if changed {
+                assert!(out.contains("cmovbel"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_byte_extension_chains_preserve_intermediates() {
+        for (middle, tail) in [
+            ("", "    movl %r10d, (%rdi)\n    ret\n"),
+            ("    movb $2, %r10b\n", "    ret\n"),
+            ("    addl $1, %esi\n", "    ret\n"),
+            ("", "    jne .Lother\n    ret\n.Lother:\n    ret\n"),
+        ] {
+            let (changed, out) = fuse_boolean_only(&format!(
+                "    cmpb $25, %dil\n    setbe %r9b\n    movzbl %r9b, %r10d\n{middle}    movsbq %r10b, %rcx\n    testq %rcx, %rcx\n    cmovnel %edx, %eax\n{tail}"
+            ));
+            assert!(!changed, "must preserve live definitions and flags: {out}");
+        }
+        let (changed, out) = fuse_boolean_only(
+            "    cmpb $25, %dil\n    setbe %al\n    movzbl %al, %ecx\n    movsbq %ch, %rdx\n    testq %rdx, %rdx\n    cmovnel %esi, %eax\n    ret\n",
+        );
+        assert!(!changed, "high byte is not the boolean: {out}");
+    }
+
+    #[test]
+    fn boolean_fusion_rejects_unknown_bits_and_high_bytes() {
+        for body in [
+            "    setbe %r9b\n    movl %r9d, %ecx\n    testl %ecx, %ecx\n",
+            "    setbe %r9b\n    testq %r9, %r9\n",
+            "    setbe %r9b\n    movw %r9w, %cx\n    testl %ecx, %ecx\n",
+            "    setbe %ah\n    movzbl %ah, %eax\n    movzbl %ah, %ecx\n    testl %ecx, %ecx\n",
+            "    setbe %al\n    movzbl %al, %ecx\n    testb %ch, %ch\n",
+        ] {
+            let (changed, _) = fuse_boolean_only(&format!(
+                "    cmpb $25, %dil\n{body}    cmovnel %edx, %esi\n    movl %esi, %eax\n    ret\n"
+            ));
+            assert!(!changed, "must refuse unknown or different bits: {body}");
+        }
+    }
+
+    #[test]
+    fn boolean_copy_fusion_preserves_all_live_destinations_and_flags() {
+        for (middle, cmov, tail) in [
+            (
+                "",
+                "cmovnel %edx, %eax",
+                "    movl %r10d, (%rdi)\n    ret\n",
+            ),
+            ("", "cmovnel %r10d, %eax", "    ret\n"),
+            ("    addl $1, %esi\n", "cmovnel %edx, %eax", "    ret\n"),
+            ("    movb $2, %r10b\n", "cmovnel %edx, %eax", "    ret\n"),
+            (
+                "",
+                "cmovnel %edx, %eax",
+                "    jne .Lother\n    ret\n.Lother:\n    ret\n",
+            ),
+            (".Lentry:\n", "cmovnel %edx, %eax", "    ret\n"),
+        ] {
+            let (changed, _) = fuse_boolean_only(&format!(
+                "    cmpb $25, %dil\n    setbe %r9b\n    movzbl %r9b, %r10d\n    movl %r10d, %ecx\n{middle}    testl %ecx, %ecx\n    {cmov}\n{tail}"
+            ));
+            assert!(!changed, "must preserve {middle} / {cmov} / {tail}");
+        }
+    }
+
+    #[test]
+    fn boolean_roundtrip_collapses_into_the_cmov() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB2:\n",
+            "    movzbl (%rsi,%r12), %r11d\n",
+            "    cmpb $0, %r11b\n",
+            "    sete %r10b\n",
+            "    movzbl %r10b, %r10d\n",
+            "    movl %ebx, %r8d\n",
+            "    addl $1, %r8d\n",
+            "    testq %r10, %r10\n",
+            "    cmovneq %r8, %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmoveq %r8, %rbx"), "{out}");
+        assert!(!out.contains("sete"), "{out}");
+        assert!(!out.contains("testq %r10"), "{out}");
+        assert!(out.contains("leal 1(%rbx), %r8d"), "{out}");
+    }
+
+    #[test]
+    fn boolean_roundtrip_is_kept_when_a_later_branch_reads_the_test() {
+        // The `jne` consumes the flags the `test` produced ("boolean is set").
+        // Collapsing the idiom would leave it reading the `cmpl` instead,
+        // which is the inverted condition.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    cmpl %edx, %ecx\n",
+            "    sete %r10b\n",
+            "    movzbl %r10b, %r10d\n",
+            "    testq %r10, %r10\n",
+            "    cmovneq %r8, %rbx\n",
+            "    jne .LBB9\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testq %r10, %r10"), "{out}");
+        assert!(out.contains("sete %r10b"), "{out}");
+    }
+
+    #[test]
+    fn boolean_roundtrip_is_kept_when_a_flags_writer_intervenes() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    cmpb $0, %r11b\n",
+            "    sete %r10b\n",
+            "    movzbl %r10b, %r10d\n",
+            "    addl $1, %r8d\n",
+            "    testq %r10, %r10\n",
+            "    cmovneq %r8, %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("sete %r10b"), "{out}");
+        assert!(out.contains("testq %r10, %r10"), "{out}");
+    }
+
+    #[test]
+    fn boolean_roundtrip_is_kept_when_the_boolean_is_used_again() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    cmpb $0, %r11b\n",
+            "    sete %r10b\n",
+            "    movzbl %r10b, %r10d\n",
+            "    testq %r10, %r10\n",
+            "    cmovneq %r8, %rbx\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("sete %r10b"), "{out}");
+    }
+
+    #[test]
+    fn cmove_inverts_the_condition() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    cmpl %edx, %ecx\n",
+            "    setg %r10b\n",
+            "    movzbl %r10b, %r10d\n",
+            "    testq %r10, %r10\n",
+            "    cmoveq %r8, %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("cmovleq %r8, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_becomes_movzbl() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %eax, %r9d\n",
+            "    andl $255, %r9d\n",
+            "    movl (%rcx,%r9,4), %r10d\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl %al, %r9d"), "{out}");
+        assert!(!out.contains("andl $255"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_is_kept_when_flags_are_read() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %eax, %r9d\n",
+            "    andl $255, %r9d\n",
+            "    jne .LBB4\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $255, %r9d"), "{out}");
+    }
+    /// hot_web_loop: `h` is copied right after the call and masked ten lines
+    /// later; the copy's only reader is the mask, so both go and the branch
+    /// tests the call result directly (GCC: `testb %dl, %dl`).
+    #[test]
+    fn distant_copy_and_mask_becomes_register_testb() {
+        let body = concat!(
+            "    call helper\n",
+            "    movq %rax, %r10\n",
+            "    addq %rax, %r12\n",
+            "    leaq 0(,%r14,8), %r11\n",
+            "    xorq %r11, %r14\n",
+            "    andq $255, %r10\n",
+            "    je .LBB5\n",
+            "    movq %r12, %rax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movq %r14, %rax\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(format!(".cfi_startproc\n{body}.cfi_endproc\n"));
+        assert!(out.contains("testb %al, %al"), "{out}");
+        assert!(!out.contains("%r10"), "{out}");
+    }
+
+    /// Every window veto keeps the copy and the `and`.  The pass runs alone:
+    /// in the full pipeline a relay may first retire the copy's other reader
+    /// (`movq %r10, %r9` -> `movq %rax, %r9`), after which folding is right.
+    #[test]
+    fn distant_copy_and_mask_window_vetoes() {
+        let peephole_optimize = |asm: String| {
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(!super::fold_copy_and_mask_into_test(&mut store, &mut infos));
+            (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i).trim().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (mid, why) in [
+            ("    addq $1, %rax\n", "source rewritten"),
+            ("    movq %r10, %r9\n", "copy read in the window"),
+            ("    movb $1, %r10b\n", "copy partially written"),
+            ("    cqto\n", "implicit register effects"),
+            ("    call g\n", "barrier"),
+            (".Lmid:\n", "label"),
+        ] {
+            let asm = format!(
+                ".cfi_startproc\n    movq %rax, %r10\n{mid}    andq $255, %r10\n    je .LBB5\n    movq %r9, %rax\n    ret\n.LBB5:\n    ret\n.cfi_endproc\n"
+            );
+            let out = peephole_optimize(asm);
+            assert!(
+                out.contains("andq $255, %r10") || out.contains("andl $255, %r10d"),
+                "{why}: {out}"
+            );
+        }
+    }
+
+    /// Debug attribution must not consume the window's step budget.  With
+    /// `-g` every instruction carries a `.loc` line, so if attribution
+    /// counted, the same source would fold the pair in the plain build but
+    /// not in the `-g` build and the two `.text` sections would differ
+    /// (check_debug_code_parity.py).  This case sits one attribution line
+    /// past the 12-real-line budget: the old budgeting (attribution counted)
+    /// rejected the fold, the transparent walk accepts it, and the plain
+    /// build (no attribution lines at all) is bit-identical before and after.
+    #[test]
+    fn debug_attribution_does_not_break_copy_mask_window() {
+        let mid = "    addq %r12, %r13\n".repeat(12) + ".loc 1 42 0\n";
+        let asm = format!(
+            ".cfi_startproc\n    movq %rax, %r10\n{mid}    andq $255, %r10\n    je .LBB5\n    movq %r12, %rax\n    ret\n.LBB5:\n    ret\n.cfi_endproc\n"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(super::fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("testb %al, %al"), "{out}");
+        assert!(!out.contains("movq %rax, %r10"), "{out}");
+        assert!(!out.contains("andq $255, %r10"), "{out}");
+    }
+
+    /// The all-ones dword mask tests the register against itself.
+    #[test]
+    fn all_ones_dword_mask_becomes_register_testl() {
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $4294967295, %esi\n",
+            "    js .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl %ebx, %ebx"), "{out}");
+    }
+
+    /// The qword all-ones mask tests the register against itself (GCC shape
+    /// `testq %rax, %rax`), not `testq $-1, %rax`.
+    #[test]
+    fn all_ones_qword_mask_becomes_register_testq() {
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movq %rax, %r10\n",
+            "    andq $-1, %r10\n",
+            "    js .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testq %rax, %rax"), "{out}");
+        assert!(!out.contains("$-1"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_branch_becomes_testb() {
+        // ffs1 kernel shape: `while (!(x & 1))`, mask temp dead after the branch.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            ".LBB4:\n",
+            "    movl %ebx, %esi\n",
+            "    andl $1, %esi\n",
+            "    jne .LBB5\n",
+            "    shrl $1, %ebx\n",
+            "    addl $1, %edi\n",
+            "    movl %ebx, %edx\n",
+            "    andl $1, %edx\n",
+            "    je .LBB4\n",
+            ".LBB5:\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $1, %bl"), "{out}");
+        assert!(!out.contains("andl $1, %esi"), "{out}");
+        assert!(!out.contains("andl $1, %edx"), "{out}");
+        assert!(!out.contains("movl %ebx, %esi"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_and_when_masked_value_is_live() {
+        // The masked value feeds a later add: the `and` must stay.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $1, %esi\n",
+            "    jne .LBB5\n",
+            "    addl %esi, %edi\n",
+            ".LBB5:\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("andl $1, %esi"), "{out}");
+        assert!(!out.contains("testb"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_sign_consumer_uses_full_width_test() {
+        // `js` reads SF of the 32-bit result: the byte form would be wrong,
+        // the dword `test` is flag-identical to the `and`.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $-2147483648, %esi\n",
+            "    js .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $-2147483648, %ebx"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_refuses_byte_form_when_pushf_captures_sf_as_data() {
+        // `pushfq` reads EVERY flag (RFLAGS goes to the stack) and is
+        // classified `LineKind::Push { reg: REG_NONE }` for %rsp tracking. A
+        // consumer scan that skips Push/Pop lines STRUCTURALLY -- before
+        // consulting `flags_effect`, which classifies `pushf` as a reader --
+        // never sees this all-flags consumer. It finds only the ZF-only `je`,
+        // stops at the `xorl`, concludes "ZF-only" and licenses the byte form.
+        // But SF of `testb $128, %bl` is bit 7 of the mask result while SF of
+        // `andl $128, %esi` is bit 31 = 0, and here the pushed word is popped
+        // into %r12 and RETURNED as data: the divergence escapes through a
+        // register, where no flag reader in the block can reveal it. Note the
+        // function IS flag-block-local, so the block-locality guard cannot
+        // catch this shape -- only classifying pushf as the reader it is.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    pushfq\n",
+            "    popq %r12\n",
+            "    je .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    shrb $7, %r12b\n",
+            "    movzbl %r12b, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $128, %ebx"), "{out}");
+        assert!(!out.contains("testb $128"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_refuses_byte_form_when_a_consumer_lives_past_the_scan_window() {
+        // The linear scan stops at the first flag WRITER, but flags also flow
+        // along the CONDITIONAL edge: `je .LBB5` carries the `and`'s flags
+        // into .LBB5, where `js` reads SF. The scan returns at the `addl` in
+        // the fall-through block having seen only the ZF-only `je`, so it
+        // licenses the byte form whose SF is bit 7 of the mask result instead
+        // of bit 31. No amount of care at labels fixes this -- the consumer is
+        // never visited. The invariant that makes a linear scan sound is
+        // flag-block-locality (every reader preceded by a writer inside its
+        // own block), which `flags_are_block_local` verifies and which is
+        // FALSE here: `js` follows `.LBB5` with no writer between.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    je .LBB5\n",
+            "    addl $1, %edi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    js .LBB6\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB6:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $128, %ebx"), "{out}");
+        assert!(!out.contains("testb $128"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_for_a_sign_consumer_when_the_mask_has_no_bit7() {
+        // SF is the byte form's ONLY possible divergence, and it exists only
+        // when the mask has bit 7: `testb $15, %bl` puts bit 7 of the masked
+        // result in SF, which is 0 for every mask below 0x80 -- exactly what
+        // `andl $15, %esi` leaves in bit 31. So a sign consumer is not a reason
+        // to give up the narrow encoding here, and no consumer walk is needed to
+        // prove it. The older ZF-only guard refused this fold.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $15, %esi\n",
+            "    js .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $15, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_for_a_carry_consumer() {
+        // A CF-only consumer cannot observe an SF-only divergence, and both
+        // forms clear CF. Narrowing the guard from "ZF-only" to "no SF reader"
+        // is what keeps this fold, at a mask that does carry bit 7.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    jc .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $128, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_when_the_taken_edge_reads_no_flags() {
+        // Positive control for the indirect-jump pin below: identical shape, but
+        // the taken edge lands in a block that reads no flags, so the walk
+        // proves SF is unconsumed and the narrow form stands.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    je .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $128, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_byte_form_when_the_taken_edge_is_an_unconditional_jump() {
+        // Following edges must not turn into refusing everything: an
+        // unconditional jump's target is resolved exactly like a conditional
+        // one, and this one leads to a block that reads no flags. Measured
+        // alongside this pin: a target the walk cannot resolve (an indirect
+        // `jmpq *%rax`, a jump to an external symbol or to a label outside the
+        // function) never reaches the byte-form decision at all, because the
+        // liveness oracle the fold also requires already reports the masked
+        // register as not provably dead there. `proved=false` is defence in
+        // depth at this call site, and is pinned directly on the walk below.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    je .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    jmp .LBB6\n",
+            ".LBB6:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $128, %bl"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_refuses_byte_form_for_lahf_which_reads_sf() {
+        // LAHF loads SF:ZF:0:AF:0:PF:1:CF into AH -- a whole-flag reader, and
+        // one of the few that reads SF without being a condition-code form. It
+        // is not in `NON_SF_FLAG_READERS`, so the walk charges it with SF.
+        // (Its twin SAHF is a flag WRITER, not a reader, and notably does not
+        // restore OF -- the reason it belongs in no reader table at all.)
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $128, %esi\n",
+            "    lahf\n",
+            "    movzbl %ah, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $128, %ebx"), "{out}");
+        assert!(!out.contains("testb $128"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_narrow_copy_wide_mask_is_left_alone() {
+        // movl zero-extends; a 64-bit and afterwards tests bits the original
+        // %rbx may have set — no fold.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andq $255, %rsi\n",
+            "    jne .LBB5\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("andq $255, %rsi"), "{out}");
+    }
+
+    #[test]
+    fn bmi1_vex_ops_are_flag_writers_not_flag_neutral() {
+        // BMI1 is VEX-encoded but WRITES EFLAGS (SDM: andn sets SF/ZF/PF
+        // and clears OF/CF; blsi/blsr/blsmsk write ZF/CF/SF/OF; bextr/bzhi
+        // write ZF/CF — proven on hardware 2026-09-24: `cmp; andn; je`
+        // takes the branch iff andn wrote ZF, and it does).  In
+        // `cmp; andn; je` the branch reads ANDN's flags, so the cmp's flags
+        // are dead, not live — Neutral here hid that and pinned the missed
+        // optimization as a contract.
+        let tag = |e: FlagsEffect| match e {
+            FlagsEffect::Neutral => "neutral",
+            FlagsEffect::Writes => "writes",
+            FlagsEffect::Reads => "reads",
+        };
+        for m in [
+            "andnq %rdx, %rax, %rax",
+            "andnl %edx, %eax, %eax",
+            "blsiq %rcx, %rax",
+            "blsmskq %rcx, %rax",
+            "blsrq %rcx, %rax",
+            "bextrq %rcx, %rax, %rdx",
+            "bzhiq %rcx, %rax, %rdx",
+        ] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Writes),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+        // The SSE lookalikes stay neutral (claimed by the FP table above,
+        // and unreachable through the integer-suffix WRITERS stems anyway).
+        for m in ["andnps %xmm1, %xmm2", "andnpd %xmm1, %xmm2"] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Neutral),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+    }
+
+    #[test]
+    fn sse_arith_is_flag_neutral_not_a_flag_writer() {
+        // `addsd` and its FP siblings write only their XMM destination;
+        // classifying them as flag writers lets `flags_dead_after` retire a
+        // live `cmp` between them and a later branch.
+        let tag = |e: FlagsEffect| match e {
+            FlagsEffect::Neutral => "neutral",
+            FlagsEffect::Writes => "writes",
+            FlagsEffect::Reads => "reads",
+        };
+        for m in [
+            "addsd %xmm1, %xmm2",
+            "addss %xmm1, %xmm2",
+            "addps %xmm1, %xmm2",
+            "addpd %xmm1, %xmm2",
+            "subsd %xmm1, %xmm2",
+            "mulsd %xmm1, %xmm2",
+            "divsd %xmm1, %xmm2",
+            "xorps %xmm1, %xmm2",
+            "andps %xmm1, %xmm2",
+            "orps %xmm1, %xmm2",
+            "minss %xmm1, %xmm2",
+            "maxpd %xmm1, %xmm2",
+            "sqrtss %xmm1, %xmm2",
+            "shufps $27, %xmm1, %xmm2",
+            "paddq %xmm1, %xmm2",
+            "psubw %xmm1, %xmm2",
+            "pmulld %xmm1, %xmm2",
+            "pand %xmm1, %xmm2",
+            "por %xmm1, %xmm2",
+            "pxor %xmm1, %xmm2",
+            "pshufb %xmm1, %xmm2",
+            "pcmpeqd %xmm1, %xmm2",
+            "cvtsi2sd %eax, %xmm1",
+            "roundss $1, %xmm1, %xmm2",
+            "vaesenc %xmm1, %xmm2, %xmm3",
+            "vpand %xmm1, %xmm2, %xmm3",
+            "vaddps %ymm1, %ymm2, %ymm3",
+            "vmulsd %xmm1, %xmm2, %xmm3",
+            "vdivpd %ymm1, %ymm2, %ymm3",
+            "vfmadd231ps %ymm1, %ymm2, %ymm3",
+            "vpclmulqdq $0, %xmm1, %xmm2, %xmm3",
+            "vpxor %ymm1, %ymm2, %ymm3",
+            "vminpd %ymm1, %ymm2, %ymm3",
+            "cmpps $1, %xmm1, %xmm2",
+            "vcmppd $2, %ymm1, %ymm2, %ymm3",
+            "vblendvps %ymm1, %ymm2, %ymm3, %ymm4",
+            "vperm2f128 $1, %ymm1, %ymm2, %ymm3",
+            "vzeroupper",
+            "vzeroall",
+            "movdqa %xmm1, %xmm2",
+            "vmovups %ymm1, (%rdi)",
+        ] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Neutral),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+    }
+
+    #[test]
+    fn exact_flag_writers_are_writers() {
+        let tag = |e: FlagsEffect| match e {
+            FlagsEffect::Neutral => "neutral",
+            FlagsEffect::Writes => "writes",
+            FlagsEffect::Reads => "reads",
+        };
+        for m in [
+            "sahf",
+            "stc",
+            "clc",
+            "cld",
+            "std",
+            "popfq",
+            "shldl %cl, %eax, %ebx",
+            "shrdq %cl, %rax, %rbx",
+            "btsq %rax, %rbx",
+            "btrq %rax, %rbx",
+            "btcq %rax, %rbx",
+            "ptest %xmm1, %xmm2",
+            "vptest %ymm1, %ymm2",
+            "ucomiss %xmm1, %xmm2",
+            "comisd %xmm1, %xmm2",
+            "vucomisd %xmm1, %xmm2",
+        ] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Writes),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+    }
+
+    #[test]
+    fn add_folds_to_lea_across_a_bmi1_op_the_branch_reads() {
+        // End-to-end: `copy + add` folds to a scaled LEA only when the add's
+        // flags are dead (`flags_dead_after`).  The `andn` WRITES flags
+        // (hardware-proven), so the `jne` reads ANDN's flags and the add's
+        // flags are dead: the fold fires and control flow is unchanged.
+        // (This test used to pin the backwards reading — that the jne reads
+        // the ADD's flags "through" the andn — as a contract.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    addq $5, %rax\n",
+            "    andnq %rdx, %rbx, %rbx\n",
+            "    jne .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("leaq 5(%r9), %rax"),
+            "the add's flags are dead across the flag-writing andn: {out}"
+        );
+        assert!(out.contains("andnq %rdx, %rbx, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn add_survives_across_sse_arith_the_branch_reads() {
+        // The `movq+addq` -> `leaq` fold discards the add's flags; a
+        // flag-NEUTRAL `addsd` in between must not hide the `je` that still
+        // reads them.  (Before the FP classification this folded and the
+        // branch read garbage flags.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    addq $5, %rax\n",
+            "    addsd %xmm1, %xmm2\n",
+            "    je .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("addq $5, %rax"),
+            "the add's flags feed the je through a flag-neutral addsd: {out}"
+        );
+        assert!(out.contains("addsd %xmm1, %xmm2"), "{out}");
+    }
+
+    #[test]
+    fn add_folds_across_a_true_flag_writer() {
+        // The positive control: `popcntq` writes the flags the `je` reads,
+        // so the add's flags are dead and the fold is legal.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    addq $5, %rax\n",
+            "    popcntq %rbx, %rbx\n",
+            "    je .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("leaq 5(%r9), %rax"),
+            "the add must fold across a real flag writer: {out}"
+        );
+        assert!(!out.contains("addq $5, %rax"), "{out}");
+    }
+
+    #[test]
+    fn move_survives_a_partial_redefinition_of_its_destination() {
+        // `eliminate_dead_reg_moves` must not delete the move across a
+        // PARTIAL write of its destination family: `movb $1, %al` leaves the
+        // upper bits of %rax as the move wrote them, and the final copy
+        // ships them out.  (The any-width `writes_family` acceptance made
+        // this `movq %r9, %rax` disappear — %rbx received garbage.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    movb $1, %al\n",
+            "    movq %rax, %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movq %r9, %rax"),
+            "the move's value survives the byte write: {out}"
+        );
+        assert!(out.contains("movb $1, %al"), "{out}");
+    }
+
+    #[test]
+    fn sign_extension_survives_a_partial_redefinition() {
+        // `movslq` narrows to `movl` only when the 64-bit value is fully
+        // redefined before any wide read.  `movb $1, %al` rewrites just the
+        // low byte; the `ret` still observes the sign extension's upper
+        // bits, so the narrow would corrupt the return value.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %eax, %rax\n",
+            "    movb $1, %al\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movslq %eax, %rax"),
+            "sign extension must survive a partial redefinition: {out}"
+        );
+        assert!(!out.contains("movl %eax, %eax"), "{out}");
+    }
+
+    #[test]
+    fn sign_extension_survives_a_lahf_partial_write() {
+        // Same hazard through an IMPLICIT partial write: `lahf` sets only AH.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %eax, %rax\n",
+            "    lahf\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movslq %eax, %rax"),
+            "sign extension must survive lahf: {out}"
+        );
+    }
+
+    #[test]
+    fn sign_extension_narrows_across_a_full_redefinition() {
+        // The positive control: a 32-bit write zero-extends and fully
+        // redefines the family, so the extension may be narrowed away
+        // entirely (`movl $1, %eax` alone is the full %rax value).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %eax, %rax\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            !out.contains("movslq"),
+            "full redefinition must retire the extension: {out}"
+        );
+        assert!(out.contains("movl $1, %eax"), "{out}");
+    }
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    /// Walk the flags produced by the line containing `marker`.
+    fn facts_from(asm: &str, marker: &str) -> ConsumerFacts {
+        let (store, infos) = build(asm);
+        let at = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).contains(marker))
+            .expect("marker line not found");
+        walk_flag_consumers(&store, &infos, at + 1, 0)
+    }
+
+    #[test]
+    fn walk_follows_the_taken_edge_of_a_conditional_jump() {
+        // The whole reason the walk is not a linear scan: the fall-through path
+        // kills the flags at the `xorl`, and the SF reader only exists on the
+        // edge the `je` takes.
+        let f = facts_from(
+            concat!(
+                ".cfi_startproc\n",
+                "    andl $128, %esi\n",
+                "    je .LBB5\n",
+                "    xorl %eax, %eax\n",
+                "    ret\n",
+                ".LBB5:\n",
+                "    js .LBB6\n",
+                ".LBB6:\n",
+                "    ret\n",
+                ".cfi_endproc\n",
+            ),
+            "andl $128",
+        );
+        assert!(f.proved && f.saw_consumer && f.saw_sf_reader && f.saw_non_zf);
+    }
+
+    #[test]
+    fn walk_reports_unproved_when_it_cannot_resolve_a_target() {
+        // An indirect jump's targets are data; so is a jump to a symbol that is
+        // not a label of this function. Both must say "I do not know" rather
+        // than report a clean bill of health.
+        for tail in [
+            "    jmpq *%rax\n",
+            "    jmp ext_symbol\n",
+            "    jmp .LBB9\n",
+        ] {
+            let asm = format!(
+                ".cfi_startproc\n    andl $128, %esi\n    je .LBB5\n.LBB5:\n{tail}.cfi_endproc\n"
+            );
+            let f = facts_from(&asm, "andl $128");
+            assert!(!f.proved, "target {tail:?} was reported as proved");
+        }
+    }
+
+    #[test]
+    fn walk_charges_whole_flag_readers_with_sf_but_not_carry_readers() {
+        // `pushf*` and `lahf` capture SF; `adcx`/`adox`/`adc`/`sbb`/`into` read
+        // CF or OF only (silicon-verified), so they must not block an SF-only
+        // rewrite -- and the ones that write flags back also end the path.
+        let sf = |m: &str| {
+            let asm =
+                format!(".cfi_startproc\n    andl $128, %esi\n    {m}\n    ret\n.cfi_endproc\n");
+            facts_from(&asm, "andl $128")
+        };
+        for reader in ["pushfq", "pushf", "lahf", "syscall", "int3"] {
+            let f = sf(reader);
+            assert!(f.saw_sf_reader, "{reader} should be charged with SF");
+        }
+        for reader in [
+            "adcxq %rdx, %rbx",
+            "adoxq %rdx, %rbx",
+            "adcq %rdx, %rbx",
+            "sbbq %rdx, %rbx",
+            "into",
+        ] {
+            let f = sf(reader);
+            assert!(!f.saw_sf_reader, "{reader} does not read SF");
+            assert!(f.saw_non_zf, "{reader} is still a non-ZF consumer");
+        }
+    }
+
+    #[test]
+    fn walk_stops_each_path_at_a_writer_a_call_and_a_ret() {
+        let facts = |body: &str| {
+            let asm = format!(".cfi_startproc\n    andl $128, %esi\n{body}.cfi_endproc\n");
+            facts_from(&asm, "andl $128")
+        };
+        // A writer kills the flags: the `js` behind it reads the writer's flags.
+        let f = facts("    addl $1, %edi\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(f.proved && !f.saw_consumer && !f.saw_sf_reader);
+        // A call leaves EFLAGS undefined, so nothing behind it is a consumer.
+        let f = facts("    call ext\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(f.proved && !f.saw_consumer);
+        // `ret` ends the flags' lifetime at the ABI boundary.
+        let f = facts("    ret\n");
+        assert!(f.proved && !f.saw_consumer);
+        // A real register push/pop is flag-neutral and must NOT stop the walk,
+        // while `popf*` replaces the flags and must.
+        let f = facts("    pushq %rax\n    popq %rax\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(
+            f.proved && f.saw_sf_reader,
+            "register push/pop must be transparent"
+        );
+        let f = facts("    popfq\n    js .LBB5\n.LBB5:\n    ret\n");
+        assert!(f.proved && !f.saw_sf_reader, "popf replaces the flags");
+    }
+
+    // ==================== fold_redundant_flags_compare ====================
+    //
+    // This fold DELETES a compare, so every test here is a "must NOT fold"
+    // unless the comment says otherwise. The input always carries exactly two
+    // identical compares; a correct peephole keeps BOTH (2), and 1 means the
+    // second was wrongly deleted. `reg_refs` and copy-propagation rewrite
+    // register names freely, so the tests count `cmpb $-128,` rather than
+    // matching a specific register.
+
+    fn two_cmp_case(mid: &str) -> String {
+        format!(
+            "main:\n    .cfi_startproc\n    cmpb $-128, %rcx\n    {mid}\n    \
+             cmpb $-128, %rcx\n    cmovb %rsi, %rcx\n    .cfi_endproc\n    ret\n"
+        )
+    }
+    fn n_cmp(out: &str) -> usize {
+        out.matches("cmpb $-128,").count()
+    }
+
+    /// A flag-preserving, non-clobbering line between two identical compares:
+    /// the exact redundancy this pass exists to remove. If this ever stops
+    /// folding, the pass has become a pessimisation and every other test below
+    /// is vacuous.
+    #[test]
+    fn flags_compare_folds_the_redundant_compare() {
+        let out = run(&two_cmp_case("movq %rsi, %rdx"));
+        assert_eq!(
+            n_cmp(&out),
+            1,
+            "movq preserves flags and writes neither operand"
+        );
+        // ...and the negative control still holds the fold off.  The tail
+        // stores %edi so the intervening `addl` cannot be retired as a dead
+        // write (`eliminate_dead_flag_writes`): what blocks the fold must be
+        // the flag write, not the removal of the line.
+        let kept = run(concat!(
+            "main:\n    .cfi_startproc\n    cmpb $-128, %rcx\n",
+            "    addl %esi, %edi\n",
+            "    cmpb $-128, %rcx\n",
+            "    cmovb %rsi, %rcx\n",
+            "    movl %edi, (%rdx)\n",
+            "    .cfi_endproc\n    ret\n",
+        ));
+        assert_eq!(
+            n_cmp(&kept),
+            2,
+            "addl writes flags: both compares must survive"
+        );
+    }
+
+    /// `flags_effect` answers "might this touch flags?" and returns `Reads` for
+    /// anything unrecognised. Every real flag writer that lands in that
+    /// catch-all must still block a fold that deletes a compare. Each of these
+    /// reproduced a wrong fold before `preserves_eflags` existed.
+    #[test]
+    fn flags_compare_refuses_across_unmodelled_flag_writers() {
+        // `adox` writes OF; its `adcx` sibling is caught only because it
+        // happens to share the "adc" prefix, so both are pinned here.
+        for mid in [
+            "adoxq %rsi, %r8",            // OF
+            "adcxq %rsi, %r8",            // CF
+            "daa",                        // AF/CF
+            "kortestw %ax, %bx",          // ZF/CF
+            "fcomip %st(1)",              // ZF/PF/CF
+            "fcomip %st(1)",              // ZF/PF/CF
+            "pcmpistri $0, (%rax), %rdx", // ZF/CF/SF/OF + EAX
+        ] {
+            let out = run(&two_cmp_case(mid));
+            assert_eq!(
+                n_cmp(&out),
+                2,
+                "`{mid}` writes EFLAGS: 2nd compare must survive"
+            );
+        }
+    }
+
+    /// `xchgq %rcx, %rax` writes BOTH operands and `mulxq %rsi, %rcx, %rdx`
+    /// writes two of its three, so neither fits a single-destination model.
+    /// `writes_family` saw only the parsed destination and let the fold delete
+    /// a compare whose operand the line had just clobbered.
+    #[test]
+    fn flags_compare_refuses_across_multi_destination_writes() {
+        for mid in ["xchgq %rcx, %rax", "mulxq %rsi, %rcx, %rdx"] {
+            let out = run(&two_cmp_case(mid));
+            assert_eq!(
+                n_cmp(&out),
+                2,
+                "`{mid}` writes %rcx: 2nd compare must survive"
+            );
+        }
+    }
+
+    /// Pins the SSE/AVX and MXCSR classes of the shared `flags_effect` oracle.
+    ///
+    /// These were re-derived from the SDM prose and got it wrong, so they are
+    /// pinned to what the hardware actually does. A pushfq/popq probe around
+    /// each instruction (x86-64, 2026-09-30) gives:
+    ///
+    ///     cmpps    unchanged      cmppd    unchanged
+    ///     movaps   unchanged      stmxcsr  unchanged
+    ///     comiss   WRITES EFLAGS
+    ///
+    /// The packed SSE compares write the per-element mask to the DESTINATION
+    /// and leave EFLAGS alone; only the *scalar* COMISS/UCOMISS family sets
+    /// ZF/PF/CF. LDMXCSR likewise does not write EFLAGS for any value tested,
+    /// including ones with SIMD exception status bits set. The pre-existing
+    /// `sse_arith_is_flag_neutral_not_a_flag_writer` test was already right and
+    /// caught the wrong reclassification; this one exists so the boundary is
+    /// stated in both directions rather than only on the side that was wrong.
+    #[test]
+    fn sse_compare_and_mxcsr_classes_match_hardware() {
+        // Measured flag-neutral on this x86-64 host.
+        for t in [
+            "cmpps $0, %xmm0, %xmm1",
+            "cmppd $0, %xmm0, %xmm1",
+            "ldmxcsr (%rax)",
+            "stmxcsr (%rax)",
+            "movaps %xmm0, %xmm1",
+        ] {
+            assert_eq!(
+                flags_effect(t),
+                FlagsEffect::Neutral,
+                "{t} leaves EFLAGS alone"
+            );
+        }
+        // Measured to set ZF/PF/CF.
+        for t in [
+            "comiss %xmm0, %xmm1",
+            "comisd %xmm0, %xmm1",
+            "ucomiss %xmm0, %xmm1",
+            "ucomisd %xmm0, %xmm1",
+            "vcomiss %xmm0, %xmm1",
+            "vucomisd %xmm0, %xmm1",
+        ] {
+            assert_eq!(flags_effect(t), FlagsEffect::Writes, "{t} sets ZF/PF/CF");
+        }
+        // The scalar/packed CMPSS/CMPSD spellings are unmodelled, so they land
+        // on the unknown catch-all. `Reads` is fail-closed -- it can only make
+        // a transform refuse a fold it could have made -- so leaving them there
+        // is correct-by-default rather than a gap worth closing on a guess.
+        for t in ["cmpss $0, %xmm0, %xmm1", "cmpsd $0, %xmm0, %xmm1"] {
+            assert_eq!(flags_effect(t), FlagsEffect::Reads, "{t} is unmodelled");
+        }
+    }
+}
+
+#[cfg(test)]
+mod widened_copy_tracking_tests {
+    //! `setCC; movzbl %al, %rN; test %rN, %rN; cmovCC` deletes every widening
+    //! copy it walks over, so it must prove every one of them dead.  The scan
+    //! used to remember only the LAST destination while deleting all of them,
+    //! which let a `cmov` read the earlier copy's (now deleted) definition.
+    use super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    #[test]
+    fn refuses_when_the_cmov_reads_an_earlier_widened_copy() {
+        let out = run(&f(
+            "    cmpq $0, %rdi\n    setne %al\n    movzbl %al, %r8d\n    movzbl %al, %r9d\n    testl %r9d, %r9d\n    cmovne %r8d, %ebx\n    movl %ebx, %eax\n    ret",
+        ));
+        assert!(
+            out.contains("setne %al"),
+            "boolean deleted while %%r8 was still read: {out}"
+        );
+        assert!(
+            out.contains("movzbl %al, %r8d"),
+            "%%r8 definition deleted: {out}"
+        );
+        // No fusion: the `test` (and therefore the whole idiom) survives, and
+        // the `cmov` still reads the definition it had.  The input's own
+        // `cmovne` is a SURVIVOR here -- the bug would have been deleting the
+        // `%r8d` definition under it, not removing it.
+        assert!(out.contains("testl %r9d, %r9d"), "fusion fired: {out}");
+        assert!(
+            out.contains("cmovne %r8d, %ebx"),
+            "the select changed shape: {out}"
+        );
+    }
+
+    // The allocator may recycle the dead setcc register before the test.
+    const RECYCLED: &str = "    cmpb $25, %r11b\n    setbe %r14b\n    movzbl %r14b, %r14d\n    movl %r14d, %r11d\n    LINE\n    testl %r11d, %r11d\n    movl %r9d, %r15d\n    cmovnel %r14d, %r15d\n    movl %r15d, %eax\n    ret";
+
+    #[test]
+    fn fuses_past_a_pure_redefinition_of_the_dead_boolean_register() {
+        let out = run(&f(&RECYCLED.replace("LINE", "leal 32(%r9), %r14d")));
+        assert!(
+            !out.contains("setbe"),
+            "fold refused a recycled register: {out}"
+        );
+        assert!(out.contains("cmovbel %r14d, "), "{out}");
+        assert!(out.contains("leal 32(%r9), %r14d"), "{out}");
+    }
+
+    #[test]
+    fn refuses_when_the_redefinition_reads_the_boolean() {
+        let out = run(&f(&RECYCLED.replace("LINE", "leal 32(%r14), %r14d")));
+        assert!(
+            out.contains("setbe %r14b"),
+            "boolean read after deletion: {out}"
+        );
+    }
+
+    #[test]
+    fn refuses_when_the_tested_copy_is_redefined_before_the_test() {
+        let asm = "    cmpb $25, %r11b\n    setbe %r14b\n    movzbl %r14b, %r11d\n    movl $5, %r11d\n    testl %r11d, %r11d\n    movl %r9d, %r15d\n    cmovnel %r10d, %r15d\n    movl %r15d, %eax\n    ret";
+        let out = run(&f(asm));
+        assert!(
+            out.contains("testl %r11d, %r11d"),
+            "tested a stale copy: {out}"
+        );
+        assert!(!out.contains("cmovbe"), "{out}");
+    }
+
+    #[test]
+    fn still_fuses_the_single_widening_shape() {
+        // Control for the test above: one widening copy, used by the `test`,
+        // dead afterwards -- the fold must still fire.
+        let out = run(&f(
+            "    cmpq $0, %rdi\n    setne %al\n    movzbl %al, %r8d\n    testl %r8d, %r8d\n    jne .Lx\n    movl $1, %eax\n    ret\n.Lx:\n    xorl %eax, %eax\n    ret",
+        ));
+        assert!(!out.contains("setne"), "fold did not fire: {out}");
+        assert!(out.contains("ne .Lx") || out.contains("e .Lx"), "{out}");
+    }
+}
+
+/// Fold `lea 1(acc), tmp; cmp $0, x; cmovne tmp, acc` to
+/// `cmp $1, x; sbb $-1, acc` (CMOVE uses ADC $0 instead).
+/// For any x bit pattern, unsigned x < 1 iff x == 0. Thus CF selects
+/// exactly the original increment, including modular overflow. Memory is
+/// read once at the original width/address; no access is moved across another
+/// memory operation. The temporary must die, and every changed flag must die.
+/// Both 32-bit forms zero-extend the accumulator even on a false condition.
+pub(super) fn fold_conditional_increment(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let mut liveness = None;
+    for i in 0..store.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i, store.len()) else {
+            continue;
+        };
+        let Some(k) = next_real(store, infos, j, store.len()) else {
+            continue;
+        };
+        if infos[j].pinned || infos[k].pinned {
+            continue;
+        }
+        let first = infos[i].trimmed(store.get(i));
+        let second = infos[j].trimmed(store.get(j));
+        let (lea, cmp, cmp_idx) = if first.starts_with("lea") {
+            (first, second, j)
+        } else {
+            (second, first, i)
+        };
+        let Some((cc, width @ ('l' | 'q'), src, dst)) = parse_cmov(infos[k].trimmed(store.get(k)))
+        else {
+            continue;
+        };
+        if !matches!(cc, "e" | "ne") {
+            continue;
+        }
+        let lea_args = match width {
+            'l' => lea.strip_prefix("leal "),
+            _ => lea.strip_prefix("leaq "),
+        };
+        let Some((address, tmp)) = lea_args.and_then(split_two_operands) else {
+            continue;
+        };
+        let Some(base) = address.strip_prefix("1(").and_then(|s| s.strip_suffix(')')) else {
+            continue;
+        };
+        let (Some(acc_fam), Some(tmp_fam)) = (plain_gp_operand(base), plain_gp_operand(tmp)) else {
+            continue;
+        };
+        if acc_fam == tmp_fam
+            || matches!(acc_fam, 4 | 5)
+            || matches!(tmp_fam, 4 | 5)
+            || !names_family_at_width(tmp, tmp_fam, width == 'q')
+            || !names_family_at_width(dst, acc_fam, width == 'q')
+            || src != tmp
+            || !(names_family_at_width(base, acc_fam, true)
+                || (width == 'l' && names_family_at_width(base, acc_fam, false)))
+        {
+            continue;
+        }
+        let Some((cmp_mnem, args)) = cmp.split_once(' ') else {
+            continue;
+        };
+        if !matches!(cmp_mnem, "cmpb" | "cmpw" | "cmpl" | "cmpq") {
+            continue;
+        }
+        let Some(("$0", operand)) = split_two_operands(args) else {
+            continue;
+        };
+        // The removed LEA must not supply the compared value or its address.
+        if infos[cmp_idx].reg_refs & (1u16 << tmp_fam) != 0
+            || !flags_dead_after(store, infos, k + 1)
+        {
+            continue;
+        }
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        if !super::relay_and_lea::provably_dead_lv(lv, store, infos, k, tmp_fam, &[i, j, k]) {
+            continue;
+        }
+        let compare = format!("    {cmp_mnem} $1, {operand}");
+        let update = if cc == "ne" {
+            format!("    sbb{width} $-1, {dst}")
+        } else {
+            format!("    adc{width} $0, {dst}")
+        };
+        let lea_idx = if cmp_idx == i { j } else { i };
+        mark_nop(&mut infos[lea_idx]);
+        replace_line(store, &mut infos[cmp_idx], cmp_idx, compare);
+        replace_line(store, &mut infos[k], k, update);
+        lv.refresh_at(store, infos, k);
+        changed = true;
+    }
+    changed
+}
+
+/// Fold the materialised-boolean form of a zero/nonzero count,
+/// `cmp $0, x; setne b; movzbl b, r; add r, acc` (or `test x, x` for a
+/// register `x`), to `cmp $1, x; sbb $-1, acc` (`sete` uses `adc $0`).
+///
+/// The select form is [`fold_conditional_increment`]; this is the shape a
+/// scalar `c += (x != 0)` lowers to directly (the byte-count remainder
+/// loops, every non-vectorised predicate count).  Same identity: for any x,
+/// unsigned `x < 1` iff `x == 0`, so `sbb $-1` adds `1 - CF = [x != 0]` and
+/// `adc $0` adds `CF = [x == 0]`, including modular wrap.  `x` is read once
+/// at the original width and address.  The boolean register and its
+/// widened copy must die at the add, and every flag the add wrote must be
+/// dead (`sbb`/`adc` produce the same value but different CF/OF).  The
+/// 32-bit forms zero-extend the accumulator exactly like `addl`.
+pub(super) fn fold_setcc_increment(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let mut liveness = None;
+    for i in 0..store.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i, store.len()) else {
+            continue;
+        };
+        let Some(k) = next_real(store, infos, j, store.len()) else {
+            continue;
+        };
+        let Some(l) = next_real(store, infos, k, store.len()) else {
+            continue;
+        };
+        if infos[j].pinned || infos[k].pinned || infos[l].pinned {
+            continue;
+        }
+        // The compare: `cmpW $0, x`, or `testW %r, %r` (a register x).
+        let Some((cmp_mnem, cmp_args)) = infos[i].trimmed(store.get(i)).split_once(' ') else {
+            continue;
+        };
+        let Some(cmp_width) = cmp_mnem
+            .strip_prefix("cmp")
+            .or_else(|| cmp_mnem.strip_prefix("test"))
+            .filter(|w| matches!(*w, "b" | "w" | "l" | "q"))
+        else {
+            continue;
+        };
+        let Some((lhs, operand)) = split_two_operands(cmp_args) else {
+            continue;
+        };
+        let compared_is_zero_test = if cmp_mnem.starts_with("cmp") {
+            lhs == "$0"
+        } else {
+            lhs == operand && plain_gp_operand(operand).is_some()
+        };
+        if !compared_is_zero_test {
+            continue;
+        }
+        // `setne b` / `sete b` on a plain low-byte register.
+        let Some((set_mnem, b)) = infos[j].trimmed(store.get(j)).split_once(' ') else {
+            continue;
+        };
+        let cc_ne = match set_mnem {
+            "setne" => true,
+            "sete" => false,
+            _ => continue,
+        };
+        let b = b.trim();
+        let Some(b_fam) = plain_gp_operand(b) else {
+            continue;
+        };
+        if b != REG_NAMES[3][b_fam as usize] {
+            continue;
+        }
+        // `movzbl b, r32` / `movzbq b, r64`.
+        let Some((zx_mnem, zx_args)) = infos[k].trimmed(store.get(k)).split_once(' ') else {
+            continue;
+        };
+        let Some((zx_src, zx_dst)) = split_two_operands(zx_args) else {
+            continue;
+        };
+        let zx_wide = match zx_mnem {
+            "movzbl" => false,
+            "movzbq" => true,
+            _ => continue,
+        };
+        let Some(r_fam) = plain_gp_operand(zx_dst) else {
+            continue;
+        };
+        if zx_src != b || !names_family_at_width(zx_dst, r_fam, zx_wide) {
+            continue;
+        }
+        // `addW r, acc` at the accumulator's width (the copy is zero-extended
+        // to 64 bits either way).
+        let Some((add_mnem, add_args)) = infos[l].trimmed(store.get(l)).split_once(' ') else {
+            continue;
+        };
+        let add_wide = match add_mnem {
+            "addl" => false,
+            "addq" => true,
+            _ => continue,
+        };
+        let Some((addend, acc)) = split_two_operands(add_args) else {
+            continue;
+        };
+        let Some(acc_fam) = plain_gp_operand(acc) else {
+            continue;
+        };
+        if !names_family_at_width(addend, r_fam, add_wide)
+            || !names_family_at_width(acc, acc_fam, add_wide)
+            || acc_fam == r_fam
+            || acc_fam == b_fam
+            || matches!(acc_fam, 4 | 5)
+            || !flags_dead_after(store, infos, l + 1)
+        {
+            continue;
+        }
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        let owned = [i, j, k, l];
+        let cheap_dead = super::relay_and_lea::provably_dead_lv(lv, store, infos, l, r_fam, &owned)
+            && (b_fam == r_fam
+                || super::relay_and_lea::provably_dead_lv(lv, store, infos, l, b_fam, &owned));
+        // In a loop the dataflow models `setcc b` as also reading b's family
+        // (bits 8..63 survive a byte write), so the sequence's OWN deleted
+        // reads keep the boolean live around the back edge whenever the
+        // family is used elsewhere in the function and the uniqueness proof
+        // cannot apply. Ask about the rewritten program instead, as
+        // `fold_conditional_increment` does: neutralise the carrier families
+        // on `j..=l`, every line of which loses its mention of them
+        // (`setcc` and the extension disappear, the add becomes an
+        // immediate `sbb`/`adc`; `acc` is neither family). The compare at
+        // `i` survives with its operand -- which may BE the boolean family
+        // (`testb %r10b, %r10b`) -- so it stays outside the region and a
+        // loop-carried read through it still vetoes.
+        let carriers = (1u16 << r_fam) | (1u16 << b_fam);
+        if !cheap_dead
+            && !matches!(
+                lv.live_after_dropping_region(store, infos, l, j, l, carriers),
+                Some(live) if live & carriers == 0
+            )
+        {
+            continue;
+        }
+        let width = if add_wide { 'q' } else { 'l' };
+        let compare = format!("    cmp{cmp_width} $1, {operand}");
+        let update = if cc_ne {
+            format!("    sbb{width} $-1, {acc}")
+        } else {
+            format!("    adc{width} $0, {acc}")
+        };
+        replace_line(store, &mut infos[i], i, compare);
+        mark_nop(&mut infos[j]);
+        mark_nop(&mut infos[k]);
+        replace_line(store, &mut infos[l], l, update);
+        lv.refresh_at(store, infos, l);
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod setcc_increment_tests {
+    use super::*;
+
+    fn fold(body: &str) -> (bool, String) {
+        let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_setcc_increment(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, out)
+    }
+
+    #[test]
+    fn folds_every_width_predicate_and_compare_form() {
+        for (aw, acc, addend) in [('l', "%eax", "%r10d"), ('q', "%rax", "%r10")] {
+            for cmp in [
+                "cmpb $0, (%rsi,%r9)",
+                "cmpw $0, (%rdi)",
+                "cmpl $0, 4(%rdi)",
+                "cmpq $0, %rdx",
+                "testb %cl, %cl",
+                "testl %ecx, %ecx",
+            ] {
+                for (cc, upd) in [
+                    ("setne", format!("sbb{aw} $-1, {acc}")),
+                    ("sete", format!("adc{aw} $0, {acc}")),
+                ] {
+                    for zx in ["movzbl %r10b, %r10d", "movzbq %r10b, %r10"] {
+                        let body = format!(
+                            "    {cmp}\n    {cc} %r10b\n    {zx}\n    add{aw} {addend}, {acc}\n    ret"
+                        );
+                        let (changed, out) = fold(&body);
+                        assert!(changed, "{body}\n=> {out}");
+                        assert!(out.contains(&upd), "{out}");
+                        assert!(!out.contains("set"), "{out}");
+                        assert!(!out.contains("movzb"), "{out}");
+                        let operand = cmp.split_once(", ").unwrap().1;
+                        let w = &cmp[cmp.find(' ').unwrap() - 1..cmp.find(' ').unwrap()];
+                        assert!(out.contains(&format!("cmp{w} $1, {operand}")), "{out}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_boolean_and_copy_registers_must_both_die() {
+        let valid = "    cmpb $0, (%rdi)\n    setne %cl\n    movzbl %cl, %r10d\n    addq %r10, %rax\n    ret";
+        assert!(fold(valid).0, "{valid}");
+        let live_b = valid.replace("    ret", "    movzbl %cl, %edx\n    ret");
+        assert!(!fold(&live_b).0, "{live_b}");
+        let live_r = valid.replace("    ret", "    movq %r10, %rdx\n    ret");
+        assert!(!fold(&live_r).0, "{live_r}");
+    }
+
+    /// The `sieve` counting loop: `%rsi` is used before the loop, so the
+    /// whole-function uniqueness proof cannot apply, and the dataflow sees the
+    /// boolean live around the back edge only through `setne %sil`'s own
+    /// partial-write read. The rewritten program reads `%rsi` nowhere after
+    /// the add, so the fold must fire.
+    const LOOP: &str = "    movl $1, %esi\n    movq %rsi, (%rdi)\n    xorl %eax, %eax\n    movl $0, %r10d\n.L1:\n    cmpb $0, (%r8,%r10)\n    setne %sil\n    movzbl %sil, %esi\n    addq %rsi, %rax\n    addq $1, %r10\n    cmpq $100, %r10\n    jl .L1\n    ret";
+
+    #[test]
+    fn folds_in_a_loop_whose_boolean_family_is_used_elsewhere() {
+        let (changed, out) = fold(LOOP);
+        assert!(changed, "{out}");
+        assert!(
+            out.contains("    cmpb $1, (%r8,%r10)\n    sbbq $-1, %rax\n"),
+            "{out}"
+        );
+        assert!(!out.contains("setne") && !out.contains("movzbl"), "{out}");
+    }
+
+    #[test]
+    fn refuses_when_the_boolean_is_observed_after_the_rewritten_sequence() {
+        // Each variant adds one genuine reader of the pre-fold boolean value
+        // that the rewrite would leave reading a stale register.
+        let compare_reads_it = LOOP.replace("    cmpb $0, (%r8,%r10)\n", "    testb %sil, %sil\n");
+        let header_reads_it = LOOP.replace(".L1:\n", ".L1:\n    movq %rsi, 16(%rdi)\n");
+        let exit_reads_it = LOOP.replace("    jl .L1\n", "    jl .L1\n    movq %rsi, 8(%rdi)\n");
+        let copy_read_after = LOOP
+            .replace(
+                "    movzbl %sil, %esi\n    addq %rsi, %rax\n",
+                "    movzbl %sil, %r11d\n    addq %r11, %rax\n",
+            )
+            .replace("    jl .L1\n", "    jl .L1\n    movq %r11, 8(%rdi)\n");
+        for body in [
+            compare_reads_it,
+            header_reads_it,
+            exit_reads_it,
+            copy_read_after,
+        ] {
+            let (changed, out) = fold(&body);
+            assert!(
+                !changed,
+                "folded although the boolean is still read:\n{body}\n=> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_live_flags_aliases_and_unmodelled_shapes() {
+        let valid = "    cmpb $0, (%rsi)\n    setne %r10b\n    movzbl %r10b, %r10d\n    addq %r10, %rax\n    ret";
+        assert!(fold(valid).0);
+        for body in [
+            // The add's flags are read.
+            valid.replace("    ret", "    jo .Lx\n    ret\n.Lx:\n    ret"),
+            valid.replace("    ret", "    adcq $0, %rdx\n    ret"),
+            // Not a zero test / wrong predicate / non-boolean producer.
+            valid.replace("$0", "$1"),
+            valid.replace("setne", "setg"),
+            valid.replace("cmpb $0, (%rsi)", "testb %cl, %dl"),
+            // The accumulator aliases the boolean, or is a frame register.
+            valid.replace("%rax", "%r10"),
+            valid.replace("%rax", "%rsp"),
+            // Width mismatches between the copy and the add.
+            valid.replace("addq %r10, %rax", "addl %r10, %eax"),
+            valid.replace("addq %r10, %rax", "addq %r11, %rax"),
+            valid.replace("movzbl %r10b, %r10d", "movzbw %r10b, %r10w"),
+            valid.replace("movzbl %r10b, %r10d", "movzbl %r11b, %r10d"),
+            // A high-byte boolean, a label inside the window.
+            valid.replace("%r10b", "%ah"),
+            valid.replace("    setne", ".Ljoin:\n    setne"),
+        ] {
+            assert!(!fold(&body).0, "{body}");
+        }
+    }
+
+    #[test]
+    fn copy_live_around_the_backedge_is_not_dead() {
+        let (changed, _) = fold(
+            ".Lloop:\n    movl %r10d, (%rdi)\n    cmpb $0, (%rsi)\n    setne %r10b\n    movzbl %r10b, %r10d\n    addq %r10, %rax\n    decq %rcx\n    jne .Lloop\n    ret",
+        );
+        assert!(!changed);
+    }
+
+    #[test]
+    fn carry_identity_matches_the_boolean_add_for_every_byte_and_wrap() {
+        for x in 0u16..=255 {
+            for acc in [0u64, 1, 0x7FFF_FFFF, 0xFFFF_FFFF, u64::MAX - 1, u64::MAX] {
+                let cf = u64::from(x < 1);
+                let ne = acc.wrapping_add(u64::from(x != 0));
+                let eq = acc.wrapping_add(u64::from(x == 0));
+                assert_eq!(acc.wrapping_sub(u64::MAX).wrapping_sub(cf), ne);
+                assert_eq!(acc.wrapping_add(cf), eq);
+                let a32 = acc as u32;
+                assert_eq!(
+                    a32.wrapping_sub(u32::MAX).wrapping_sub(cf as u32),
+                    a32.wrapping_add(u32::from(x != 0))
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod conditional_increment_tests {
+    use super::*;
+
+    fn fold(body: &str) -> (bool, String) {
+        let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_conditional_increment(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, out)
+    }
+
+    #[test]
+    fn count_eq_ne_at_both_accumulator_widths_and_all_compare_widths() {
+        for (width, acc, tmp) in [('l', "%eax", "%r9d"), ('q', "%rax", "%r9")] {
+            for cmp_width in ['b', 'w', 'l', 'q'] {
+                for (cc, expected) in [("ne", "sbb"), ("e", "adc")] {
+                    for lea_first in [false, true] {
+                        let lea = format!("    lea{width} 1(%rax), {tmp}\n");
+                        let cmp = format!("    cmp{cmp_width} $0, (%rdi)\n");
+                        let body = if lea_first {
+                            format!("{lea}{cmp}")
+                        } else {
+                            format!("{cmp}{lea}")
+                        };
+                        let (changed, out) =
+                            fold(&format!("{body}    cmov{cc}{width} {tmp}, {acc}\n    ret"));
+                        assert!(changed, "{out}");
+                        assert!(out.contains(&format!("{expected}{width}")), "{out}");
+                        assert!(out.contains(&format!("cmp{cmp_width} $1")), "{out}");
+                        assert!(!out.contains("lea"), "{out}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_live_temporary_flags_aliases_and_unmodelled_shapes() {
+        let valid = "    leal 1(%rax), %r9d\n    cmpb $0, (%rdi)\n    cmovnel %r9d, %eax\n    ret";
+        for body in [
+            valid.replace("    ret", "    movl %r9d, %eax\n    ret"),
+            valid.replace("    ret", "    incq %rdx\n    adcl $0, %eax\n    ret"),
+            valid.replace("    ret", "    shlq %cl, %rdx\n    sete %al\n    ret"),
+            valid.replace("    ret", "    lahf\n    ret"),
+            valid.replace("(%rdi)", "(%r9)"),
+            valid.replace("cmpb $0, (%rdi)", "cmpl $0, %r9d"),
+            valid.replace("1(%rax)", "2(%rax)"),
+            valid.replace("1(%rax)", "1(%r9)"),
+            valid.replace("$0", "$2"),
+            valid.replace("cmovnel", "cmovgel"),
+            valid.replace("leal", "leaq"),
+            valid.replace("    cmpb", ".Ljoin:\n    cmpb"),
+            valid.replace("%r9d", "%esp"),
+            valid.replace("%eax", "%ax"),
+        ] {
+            assert!(!fold(&body).0, "{body}");
+        }
+    }
+
+    #[test]
+    fn temporary_live_across_backedge_is_not_dead() {
+        let (changed, _) = fold(
+            ".Lloop:\n    movl %r9d, (%rdi)\n    leal 1(%rax), %r9d\n    cmpb $0, (%rsi)\n    cmovnel %r9d, %eax\n    cmpl $9, %eax\n    jne .Lloop\n    ret",
+        );
+        assert!(!changed);
+    }
+
+    #[test]
+    fn conditional_increment_identity_is_exact_in_each_narrow_ring() {
+        for x in 0u16..=255 {
+            for acc in 0u16..=255 {
+                let carry = u8::from(x < 1);
+                let a = acc as u8;
+                assert_eq!(
+                    a.wrapping_add(u8::from(x != 0)),
+                    a.wrapping_sub(255).wrapping_sub(carry)
+                );
+                assert_eq!(a.wrapping_add(u8::from(x == 0)), a.wrapping_add(carry));
+            }
+        }
+    }
+
+    #[test]
+    fn fold_copy_add_into_lea_allows_rbp_when_omit_frame_pointer() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    movq %rbp, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_add_into_lea(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("leaq 8(%r14), %rbp"), "{out}");
+
+        let (mut store_fp, mut infos_fp) = build(concat!(
+            "bar:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!fold_copy_add_into_lea(&mut store_fp, &mut infos_fp));
+    }
+
+    #[test]
+    fn fold_copy_and_mask_into_test_supports_register_mask_when_dest_dies() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r10, %r8\n",
+            "    andq %rcx, %r8\n",
+            "    je .LBB2\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("testq %rcx, %r10"), "{out}");
+        assert!(!out.contains("andq %rcx, %r8"), "{out}");
+    }
+
+    /// `%rsp` is encodable in either `test` position, and the fold can only
+    /// touch flags (the destination arm refuses `%rsp`/`%rbp`), so a stack
+    /// pointer operand must not block it. Excluding it lost real folds.
+    #[test]
+    fn fold_copy_and_mask_into_test_accepts_rsp_operands() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        // %rsp as the copied source: `testq %rcx, %rsp`.
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rsp, %r8\n",
+            "    andq %rcx, %r8\n",
+            "    je .LBB2\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("testq %rcx, %rsp"), "{out}");
+        assert!(!out.contains("andq %rcx, %r8"), "{out}");
+
+        // %rsp as the mask: `testq %rsp, %rax`.
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rax, %r8\n",
+            "    andq %rsp, %r8\n",
+            "    je .LBB2\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("testq %rsp, %rax"), "{out}");
+    }
+
+    /// The memoised frame-pointer test must answer per function. A file with a
+    /// frame-pointer function followed by a leaf (and the reverse) must fold
+    /// only the leaf's `%rbp` candidate both times.
+    #[test]
+    fn rbp_destination_memo_does_not_leak_across_functions() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let leaf = concat!(
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    movq %rbp, %rax\n",
+            "    ret\n",
+        );
+        let framed = concat!(
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+        );
+        for (first, second) in [(leaf, framed), (framed, leaf)] {
+            let asm = format!(
+                "a:\n.cfi_startproc\n{first}.cfi_endproc\nb:\n.cfi_startproc\n{second}.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build(&asm);
+            assert!(fold_copy_add_into_lea(&mut store, &mut infos));
+            let out = store.build_result(|i| infos[i].is_nop());
+            // Exactly one of the two functions folds -- the leaf -- whichever
+            // order they appear in, and the framed one keeps its `addq`.
+            assert_eq!(out.matches("leaq 8(%r14), %rbp").count(), 1, "{out}");
+            assert!(out.contains("addq $8, %rbp"), "{out}");
+        }
+    }
+
+    #[test]
+    fn lea_folds_handle_i64_min_negation_without_overflow() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:
+",
+            ".cfi_startproc
+",
+            "    movq %rdi, %rax
+",
+            "    subq $-9223372036854775808, %rax
+",
+            "    cmpq %rsi, %rax
+",
+            "    ret
+",
+            ".cfi_endproc
+",
+        ));
+        assert!(!fold_copy_add_into_lea(&mut store, &mut infos));
+        assert!(!fold_inplace_add_copy_into_lea(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn inplace_add_copy_into_lea_rejects_mismatched_subregister_widths() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    addl $4, %di\n",
+            "    movl %edi, %eax\n",
+            "    cmpq %rsi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!fold_inplace_add_copy_into_lea(&mut store, &mut infos));
+        let (mut store2, mut infos2) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    addl $4, %edi\n",
+            "    movl %edi, %ax\n",
+            "    cmpq %rsi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!fold_inplace_add_copy_into_lea(&mut store2, &mut infos2));
+    }
+}
+
+#[cfg(test)]
+mod lea_add_tests {
+    //! `fold_lea_add_into_lea`: the add folds into the LEA displacement only
+    //! when the value, width, displacement range and flags clauses hold.
+    use super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    #[test]
+    fn lea_add_folds_into_displacement() {
+        let out = run(&f(
+            "    leal (%rdi, %rdi, 2), %eax\n    addl $1, %eax\n    ret",
+        ));
+        assert!(out.contains("leal 1(%rdi, %rdi, 2), %eax"), "{out}");
+        assert!(!out.contains("addl"), "{out}");
+    }
+
+    #[test]
+    fn lea_sub_folds_with_negated_displacement() {
+        let out = run(&f(
+            "    leaq 8(%rdi, %rsi, 4), %rax\n    subq $3, %rax\n    ret",
+        ));
+        assert!(out.contains("leaq 5(%rdi, %rsi, 4), %rax"), "{out}");
+        assert!(!out.contains("subq"), "{out}");
+    }
+
+    #[test]
+    fn lea_add_cancelling_to_zero_drops_the_displacement() {
+        let out = run(&f(
+            "    leaq 4(%rdi, %rsi, 2), %rax\n    subq $4, %rax\n    ret",
+        ));
+        assert!(out.contains("leaq (%rdi, %rsi, 2), %rax"), "{out}");
+    }
+
+    /// `leaq` + `addl` is the low 32 bits of the 64-bit sum plus k: `leal`.
+    #[test]
+    fn leaq_then_addl_becomes_leal() {
+        let out = run(&f(
+            "    leaq 3(%rdi, %rsi, 4), %rax\n    addl $5, %eax\n    ret",
+        ));
+        assert!(out.contains("leal 8(%rdi, %rsi, 4), %eax"), "{out}");
+    }
+
+    /// `leal` zero-extends; `addq` then adds to the zero-extended value,
+    /// which no LEA of the original operands computes.
+    #[test]
+    fn leal_then_addq_refuses() {
+        let out = run(&f(
+            "    leal 4(%rdi, %rsi, 2), %eax\n    addq $1, %rax\n    ret",
+        ));
+        assert!(out.contains("addq $1, %rax"), "{out}");
+    }
+
+    /// The add's flags are read: `lea` would not produce them.
+    #[test]
+    fn lea_add_refuses_when_flags_are_live() {
+        let out = run(&f(
+            "    leal (%rdi, %rdi, 2), %eax\n    addl $1, %eax\n    sete %cl\n    movzbl %cl, %edx\n    addl %edx, %eax\n    ret",
+        ));
+        assert!(out.contains("addl $1, %eax"), "{out}");
+    }
+
+    /// The merged displacement must fit the signed 32-bit field.
+    #[test]
+    fn lea_add_refuses_displacement_overflow() {
+        let out = run(&f(
+            "    leaq 2147483647(%rdi), %rax\n    addq $1, %rax\n    ret",
+        ));
+        assert!(!out.contains("2147483648("), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_test_sign_cmov_tests {
+    use super::super::peephole_optimize;
+
+    fn run(body: &str) -> String {
+        peephole_optimize(format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n"))
+    }
+
+    #[test]
+    fn nonnegative_result_uses_sign_flag_without_test() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %ecx\n    movl %ecx, %eax\n    cmovgel %edi, %eax\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovnsl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn negative_result_uses_sign_flag_without_test() {
+        let out = run(
+            "    subq %rsi, %rdi\n    testq %rdi, %rdi\n    movq $0, %rax\n    cmovlq %rdi, %rax\n    ret",
+        );
+        assert!(!out.contains("testq %rdi, %rdi"), "{out}");
+        assert!(out.contains("cmovsq %rdi, %rax"), "{out}");
+    }
+
+    #[test]
+    fn sign_test_fold_allows_read_only_staging_of_the_result() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %ecx\n    movq %rdi, %rsi\n    cmovll %ecx, %edi\n    movl %edi, %eax\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovnsl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn strict_positive_predicate_keeps_test_and_cmov() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgl %edi, %eax\n    ret",
+        );
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovgl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn mismatched_test_width_keeps_test() {
+        let out = run(
+            "    subl %esi, %edi\n    testq %rdi, %rdi\n    movl $0, %eax\n    cmovgeq %edi, %eax\n    ret",
+        );
+        assert!(out.contains("testq %rdi, %rdi"), "{out}");
+        assert!(out.contains("cmovgeq %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn later_flag_reader_vetoes_fold() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    pushfq\n    popq %rdx\n    ret",
+        );
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovgel %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn exact_logical_producer_admits_strict_positive_cmov() {
+        let out = run(
+            "    andl $7, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgl %edi, %eax\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovgl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn exact_logical_producer_admits_strict_nonpositive_cmov() {
+        let out = run(
+            "    orl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovlel %edi, %eax\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovlel %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn exact_logical_producer_keeps_a_later_of_reader_safe() {
+        let out = run(
+            "    andl $7, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    setl %cl\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovnsl %edi, %eax"), "{out}");
+        assert!(out.contains("setl %cl"), "{out}");
+    }
+
+    #[test]
+    fn arithmetic_producer_allows_a_later_zf_reader() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    sete %cl\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovnsl %edi, %eax"), "{out}");
+        assert!(out.contains("sete %cl"), "{out}");
+    }
+
+    #[test]
+    fn arithmetic_producer_refuses_a_later_of_reader() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    setl %cl\n    ret",
+        );
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovgel %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn arithmetic_producer_refuses_a_later_carry_reader() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    adcl $0, %edx\n    ret",
+        );
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+    }
+
+    #[test]
+    fn condition_synonyms_are_canonicalised() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovnll %edi, %eax\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovnsl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn a_label_between_test_and_cmov_is_a_barrier() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n.Ljoin:\n    movl $0, %eax\n    cmovgel %edi, %eax\n    ret",
+        );
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+    }
+
+    #[test]
+    fn a_flag_neutral_redefinition_between_producer_and_test_is_refused() {
+        // An intervening ALU writer is itself a valid producer; the dangerous
+        // redefinition is one that changes the value WITHOUT setting flags, so
+        // the nearest writer no longer describes the tested result.
+        let out = run(
+            "    subl %esi, %edi\n    movl %ecx, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    ret",
+        );
+        // Copy propagation may retarget the surviving test/cmov to the source
+        // register; the contract is that the pair itself survives.
+        assert!(out.contains("testl"), "{out}");
+        assert!(out.contains("cmovge"), "{out}");
+    }
+
+    #[test]
+    fn andn_with_undefined_parity_is_not_a_test_equivalent() {
+        assert_eq!(super::test_flag_agreement("andnl %esi, %edi, %edi"), None);
+    }
+
+    #[test]
+    fn dedicated_skip_group_disables_only_this_fold() {
+        use super::super::test_skips::skip_passes;
+        let body = "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    ret";
+        let skipped = {
+            let _guard = skip_passes(&["sign_test_cmov"]);
+            run(body)
+        };
+        assert!(skipped.contains("testl %edi, %edi"), "{skipped}");
+        // The general self-test group is deliberately NOT the switch for this
+        // pass: it also owns a different fold, so it must not hide this one.
+        let unrelated_skip = {
+            let _guard = skip_passes(&["self_test"]);
+            run(body)
+        };
+        assert!(
+            !unrelated_skip.contains("testl %edi, %edi"),
+            "{unrelated_skip}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod copy_mask_lazy_liveness_tests {
+    use super::super::liveness::LIVENESS_BUILDS;
+    use super::*;
+
+    #[test]
+    fn no_liveness_build_without_an_eligible_copy_mask_pair() {
+        for body in [
+            "movq %rdi, %r8\naddq $1, %r8\nret\n",
+            "movq %rdi, %r8\nandq $1, %r9\nret\n",
+            "movl %edi, %r8d\nandq $1, %r8\nret\n",
+        ] {
+            let mut store = LineStore::new(format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n"));
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            let before = LIVENESS_BUILDS.with(std::cell::Cell::get);
+            assert!(!fold_copy_and_mask_into_test(&mut store, &mut infos));
+            assert_eq!(LIVENESS_BUILDS.with(std::cell::Cell::get) - before, 0);
+        }
+    }
+
+    #[test]
+    fn immediate_and_register_candidates_share_one_refreshed_analysis() {
+        let mut store = LineStore::new(
+            concat!(
+                "f:\n.cfi_startproc\n",
+                "movq %rdi, %r8\nandq $1, %r8\nje .Lnext\n",
+                "movq %rsi, %r9\nandq %rcx, %r9\nje .Lnext\n",
+                ".Lnext:\nxorl %eax, %eax\nret\n.cfi_endproc\n",
+            )
+            .into(),
+        );
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let before = LIVENESS_BUILDS.with(std::cell::Cell::get);
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        assert_eq!(LIVENESS_BUILDS.with(std::cell::Cell::get) - before, 1);
+        let output = store.build_result(|i| infos[i].is_nop());
+        assert!(output.contains("testb $1, %dil"), "{output}");
+        assert!(output.contains("testq %rcx, %rsi"), "{output}");
+    }
+}
+
+#[cfg(test)]
+mod walker_comment_and_sibling_tests {
+    use super::*;
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    fn line(store: &LineStore, text: &str) -> usize {
+        (0..store.len())
+            .find(|&i| store.get(i).trim() == text)
+            .unwrap()
+    }
+
+    #[test]
+    fn comments_are_transparent_but_app_markers_are_not() {
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n    # a human note\n",
+            "    # LCCC_CALL_ARGS 0\n    je .LBB2\n    ret\n.LBB2:\n    ret\n.cfi_endproc\n"
+        ));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.proved && f.saw_consumer && !f.saw_non_zf && !f.saw_whole_reader);
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n#APP\n#NO_APP\n",
+            "    je .LBB2\n    ret\n.LBB2:\n    ret\n.cfi_endproc\n"
+        ));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.saw_whole_reader, "#APP must stay opaque");
+        // flags_dead_after: a comment before the overwriting compare.
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    addl $1, %eax\n    # note\n    cmpl $3, %eax\n",
+            "    je .LBB2\n    ret\n.LBB2:\n    ret\n.cfi_endproc\n"
+        ));
+        assert!(flags_dead_after(
+            &store,
+            &infos,
+            line(&store, "addl $1, %eax") + 1
+        ));
+    }
+
+    #[test]
+    fn marked_sibling_calls_end_the_path_unmarked_ones_are_unknown() {
+        let marked = concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n    je .LBB2\n    jmp fast@PLT\n",
+            "    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 0\n.LBB2:\n    jmp slow@PLT\n",
+            "    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 0\n.cfi_endproc\n"
+        );
+        let (store, infos) = build(marked);
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.proved && f.saw_consumer && !f.saw_non_zf, "{f:?}");
+        // A conditional sibling call: consumer, and its taken edge ends.
+        let (store, infos) = build(concat!(
+            "f:\n.cfi_startproc\n    testl %edi, %edi\n    jne slow@PLT\n",
+            "    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 0\n    ret\n.cfi_endproc\n"
+        ));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(f.proved && f.saw_consumer, "{f:?}");
+        let (store, infos) = build(&marked.replace("    # LCCC_TAIL_CALL\n", ""));
+        let f = walk_flag_consumers(&store, &infos, line(&store, "testl %edi, %edi") + 1, 0);
+        assert!(!f.proved, "an unmarked foreign jmp may be anything");
+    }
+}

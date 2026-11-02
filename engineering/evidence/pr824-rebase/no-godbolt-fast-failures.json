@@ -1,0 +1,365 @@
+{
+  "memory-value-contracts": [
+    "FAIL: check_memory_value_contracts needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  memory-value-contracts  (0s)"
+  ],
+  "ivsr-integer-domains": [
+    "FAIL (host, not lccc): gcc -m32 cannot build and run a trivial program here; install gcc-multilib and libc6-dev-i386 (the runner step in .github/workflows/ci.yml does exactly this).  This gate asserts its i386 legs by design rather than skipping them, so nothing is measured silently.",
+    "/usr/bin/ld: cannot find Scrt1.o: No such file or directory",
+    "/usr/bin/ld: cannot find crti.o: No such file or directory",
+    "FAIL  ivsr-integer-domains  (0s)"
+  ],
+  "static-local-init": [
+    "FAIL: check_static_local_init: GCC=gcc-16 is not an executable; the oracle is GCC 16 (this gate requires GCC 16 exactly)",
+    "FAIL  static-local-init  (0s)"
+  ],
+  "designator-init": [
+    "FAIL: check_designator_init: GCC=gcc-16 is not an executable; the oracle is GCC 16 (this gate requires GCC 16 exactly)",
+    "FAIL  designator-init  (0s)"
+  ],
+  "file-scope-init": [
+    "FAIL: check_file_scope_init: GCC=gcc-16 is not an executable; the oracle is GCC 16 (this gate requires GCC 16 exactly)",
+    "FAIL  file-scope-init  (0s)"
+  ],
+  "typedef-volatile-codegen": [
+    "FAIL: check_typedef_volatile_codegen: GCC=gcc-16 is not an executable; the oracle is GCC 16 (this gate requires GCC 16 exactly)",
+    "FAIL  typedef-volatile-codegen  (0s)"
+  ],
+  "seg-init-brace-elision": [
+    "FAIL: check_seg_init_brace_elision: GCC=gcc-16 is not an executable; the oracle is GCC 16 (this gate requires GCC 16 exactly)",
+    "FAIL  seg-init-brace-elision  (0s)"
+  ],
+  "volatile-member-codegen": [
+    "FAIL: check_volatile_member_codegen: GCC=gcc-16 is not an executable; the oracle is GCC 16 (this gate requires GCC 16 exactly)",
+    "FAIL  volatile-member-codegen  (0s)"
+  ],
+  "const-volatile-objects": [
+    "FAIL: check_const_volatile_objects: GCC=gcc-16 is not an executable; the oracle is GCC 16 (this gate requires GCC 16 exactly)",
+    "FAIL  const-volatile-objects  (0s)"
+  ],
+  "ivsr-vecaddr-struct-walk": [
+    "FAIL: host, not lccc: gcc -m32 cannot build and run a trivial program; install gcc-multilib and libc6-dev-i386",
+    "/usr/bin/ld: cannot find Scrt1.o: No such file or directory",
+    "/usr/bin/ld: cannot find crti.o: No such file or directory",
+    "FAIL: GCC i386 pair-walk oracle did not compile",
+    "In file included from /tmp/tmp.PdJkuRUWhW/pairwalk.c:1:",
+    "/usr/include/stdio.h:27:10: fatal error: bits/libc-header-start.h: No such file or directory",
+    "   27 | #include <bits/libc-header-start.h>",
+    "      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~",
+    "FAIL: pairwalk -O0 i386 did not compile",
+    "/usr/include/stdio.h:27:10: error: bits/libc-header-start.h: No such file or directory",
+    "/usr/include/stdio.h:38:10: error: bits/types.h: No such file or directory",
+    "/usr/include/stdio.h:39:10: error: bits/types/__fpos_t.h: No such file or directory",
+    "/usr/include/stdio.h:40:10: error: bits/types/__fpos64_t.h: No such file or directory",
+    "FAIL: pairwalk -O1 i386 did not compile",
+    "/usr/include/stdio.h:27:10: error: bits/libc-header-start.h: No such file or directory",
+    "/usr/include/stdio.h:38:10: error: bits/types.h: No such file or directory",
+    "/usr/include/stdio.h:39:10: error: bits/types/__fpos_t.h: No such file or directory",
+    "/usr/include/stdio.h:40:10: error: bits/types/__fpos64_t.h: No such file or directory"
+  ],
+  "ivwiden-exposed-latch": [
+    "FAIL (host, not lccc): gcc -m32 cannot build and run a trivial program here; install gcc-multilib and libc6-dev-i386 (the runner step in .github/workflows/ci.yml does exactly this).  This gate asserts its i386 legs by design rather than skipping them, so nothing is measured silently.",
+    "/usr/bin/ld: cannot find Scrt1.o: No such file or directory",
+    "/usr/bin/ld: cannot find crti.o: No such file or directory",
+    "FAIL  ivwiden-exposed-latch  (0s)"
+  ],
+  "fp-extract-homes": [
+    "FAIL (host, not lccc): gcc -m32 cannot build and run a trivial program here; install gcc-multilib and libc6-dev-i386 (the runner step in .github/workflows/ci.yml does exactly this).  This gate asserts its i386 legs by design rather than skipping them, so nothing is measured silently.",
+    "/usr/bin/ld: cannot find Scrt1.o: No such file or directory",
+    "/usr/bin/ld: cannot find crti.o: No such file or directory",
+    "FAIL  fp-extract-homes  (1s)"
+  ],
+  "empty-aggregate-abi": [
+    "PASS -m64 -O0 lccc-caller",
+    "PASS -m64 -O0 lccc-callee",
+    "PASS -m64 -O1 lccc-caller",
+    "PASS -m64 -O1 lccc-callee",
+    "PASS -m64 -O2 lccc-caller",
+    "PASS -m64 -O2 lccc-callee",
+    "PASS -m64 -O3 lccc-caller",
+    "PASS -m64 -O3 lccc-callee",
+    "PASS -m64 -Os lccc-caller",
+    "PASS -m64 -Os lccc-callee",
+    "FAIL (host, not lccc): gcc cannot build a -m32 program here -- install gcc-multilib and libc6-dev-i386.  10 configuration(s) passed before this leg; the rest were never measured.",
+    "/usr/bin/ld: cannot find Scrt1.o: No such file or directory",
+    "/usr/bin/ld: cannot find crti.o: No such file or directory",
+    "FAIL  empty-aggregate-abi  (1s)"
+  ],
+  "reassoc-latency": [
+    "PASS: v3 round recurrence 5.00 cycles (<= 5)",
+    "PASS: v3 negative control: pass disabled gives 8.00 (> 5)",
+    "PASS: v3 SHA-256 known answer + checksum 054db5f638d89d8b",
+    "PASS: x86-64 round recurrence 5.00 cycles (<= 5)",
+    "PASS: x86-64 negative control: pass disabled gives 8.00 (> 5)",
+    "PASS: x86-64 SHA-256 known answer + checksum 054db5f638d89d8b",
+    "PASS: differential v3: 55725831 3037458527064772522 2627931474 254739679 784259532",
+    "PASS: differential -march=x86-64: 55725831 3037458527064772522 2627931474 254739679 784259532",
+    "PASS: differential -O3: 55725831 3037458527064772522 2627931474 254739679 784259532",
+    "PASS: reassoc_lat rewrites trees in the differential program",
+    "PASS: rot() recurrence 2.00 cycles (<= 2); pass disabled 5.00",
+    "/usr/include/stdio.h:27:10: error: bits/libc-header-start.h: No such file or directory",
+    "/usr/include/stdio.h:38:10: error: bits/types.h: No such file or directory",
+    "/usr/include/stdio.h:39:10: error: bits/types/__fpos_t.h: No such file or directory",
+    "/usr/include/stdio.h:40:10: error: bits/types/__fpos64_t.h: No such file or directory",
+    "/usr/include/stdio.h:41:10: error: bits/types/__FILE.h: No such file or directory",
+    "/usr/include/stdio.h:42:10: error: bits/types/FILE.h: No such file or directory",
+    "/usr/include/stdio.h:43:10: error: bits/types/struct_FILE.h: No such file or directory"
+  ],
+  "loop-store-motion": [
+    "FAIL: check_loop_store_motion needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  loop-store-motion  (0s)"
+  ],
+  "seg-const-offset-fold": [
+    "FAIL: check_seg_const_offset_fold needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  seg-const-offset-fold  (0s)"
+  ],
+  "seg-gs-runtime": [
+    "FAIL: check_seg_gs_runtime needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  seg-gs-runtime  (0s)"
+  ],
+  "seg-copy-size-sweep": [
+    "FAIL: check_seg_copy_sweep needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  seg-copy-size-sweep  (0s)"
+  ],
+  "seg-declarator-space": [
+    "FAIL: check_seg_declarator_space needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  seg-declarator-space  (0s)"
+  ],
+  "seg-typedef-codegen": [
+    "FAIL: check_seg_typedef_codegen needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  seg-typedef-codegen  (0s)"
+  ],
+  "seg-conv-diagnostics": [
+    "FAIL: check_seg_conv_diagnostics needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  seg-conv-diagnostics  (0s)"
+  ],
+  "seg-conversion-parity": [
+    "FAIL: check_seg_conversion_parity needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  seg-conversion-parity  (0s)"
+  ],
+  "regression-corpus-link": [
+    "lccc: /home/user/lccc/target/fastbuild/lccc",
+    "corpus: 936 tests, jobs=2, timeout=90s each",
+    "",
+    "SKIP-RUN aggregate_init_edge_O1  (compile:host-skip)    0.0s",
+    "      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically",
+    "SKIP-RUN i686_access_width_disambiguation  (compile:host-skip)    0.0s",
+    "      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically",
+    "SKIP-RUN i686_access_width_disambiguation_O2  (compile:host-skip)    0.0s",
+    "      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically",
+    "SKIP-RUN i686_aggregate_init_canonical  (compile:host-skip)    0.0s",
+    "      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically",
+    "SKIP-RUN i686_aggregate_init_edge  (compile:host-skip)    0.0s",
+    "      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically",
+    "SKIP-RUN i686_array_string_init_matrix  (compile:host-skip)    0.0s",
+    "      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically",
+    "SKIP-RUN i686_composite_array_type_linkage  (compile:host-skip)    0.0s",
+    "      host image has no 32-bit libc headers; the host's own GCC fails the same -m32 translation unit identically",
+    "SKIP-RUN i686_const_stack_args  (compile:host-skip)    0.0s"
+  ],
+  "record-tag-identity": [
+    "check_record_tag_identity: FAIL: no usable oracle among gcc-16 gcc",
+    "  an oracle must accept both -std=c17 and -std=c23 (GCC >= 14);",
+    "  without one the c23 rows are meaningless and the c17 rows",
+    "  compare a rejection of the FLAG against a rejection of the",
+    "  PROGRAM.  Install gcc-16 or point GCC= at a suitable compiler.",
+    "FAIL  record-tag-identity  (0s)"
+  ],
+  "select-from-compare": [
+    "FAIL: check_select_from_compare needs GCC 16 as the verdict oracle; found: gcc=GCC 12.",
+    "      Install gcc-16 (apt install gcc-16), or set GCC=<path to gcc-16>.",
+    "FAIL  select-from-compare  (0s)"
+  ],
+  "redundant-test-elimination": [
+    "ccc: error: cannot find -lgcc",
+    "FAIL  redundant-test-elimination  (0s)"
+  ],
+  "i686-integer-isa-parity": [
+    "ccc: error: cannot find -lgcc",
+    "FAIL  i686-integer-isa-parity  (0s)"
+  ],
+  "map-i64-two-lane": [
+    "/usr/include/stdint.h:26:10: error: bits/libc-header-start.h: No such file or directory",
+    "/usr/include/stdint.h:27:10: error: bits/types.h: No such file or directory",
+    "/usr/include/stdint.h:28:10: error: bits/wchar.h: No such file or directory",
+    "/usr/include/stdint.h:29:10: error: bits/wordsize.h: No such file or directory",
+    "/usr/include/stdint.h:34:10: error: bits/stdint-intn.h: No such file or directory",
+    "/usr/include/stdint.h:37:10: error: bits/stdint-uintn.h: No such file or directory",
+    "/usr/include/stdio.h:27:10: error: bits/libc-header-start.h: No such file or directory",
+    "/usr/include/stdio.h:38:10: error: bits/types.h: No such file or directory",
+    "/usr/include/stdio.h:39:10: error: bits/types/__fpos_t.h: No such file or directory",
+    "/usr/include/stdio.h:40:10: error: bits/types/__fpos64_t.h: No such file or directory",
+    "/usr/include/stdio.h:41:10: error: bits/types/__FILE.h: No such file or directory",
+    "/usr/include/stdio.h:42:10: error: bits/types/FILE.h: No such file or directory",
+    "/usr/include/stdio.h:43:10: error: bits/types/struct_FILE.h: No such file or directory",
+    "/usr/include/stdio.h:133:10: error: bits/stdio_lim.h: No such file or directory",
+    "/usr/include/stdio.h:430:10: error: bits/floatn.h: No such file or directory",
+    "/usr/include/string.h:26:10: error: bits/libc-header-start.h: No such file or directory",
+    "ccc: error: 16 preprocessor error(s) in tests/regression/map_i64_two_lane.c",
+    "FAIL  map-i64-two-lane  (4s)"
+  ],
+  "asm-goto-phi-edge": [
+    "PASS -m64 -O0 fd6c281bebb77835",
+    "PASS -m64 -O2 fd6c281bebb77835",
+    "/usr/include/stdint.h:26:10: error: bits/libc-header-start.h: No such file or directory",
+    "/usr/include/stdint.h:27:10: error: bits/types.h: No such file or directory",
+    "/usr/include/stdint.h:28:10: error: bits/wchar.h: No such file or directory",
+    "/usr/include/stdint.h:29:10: error: bits/wordsize.h: No such file or directory",
+    "/usr/include/stdint.h:34:10: error: bits/stdint-intn.h: No such file or directory",
+    "/usr/include/stdint.h:37:10: error: bits/stdint-uintn.h: No such file or directory",
+    "/usr/include/stdio.h:27:10: error: bits/libc-header-start.h: No such file or directory",
+    "/usr/include/stdio.h:38:10: error: bits/types.h: No such file or directory",
+    "/usr/include/stdio.h:39:10: error: bits/types/__fpos_t.h: No such file or directory",
+    "/usr/include/stdio.h:40:10: error: bits/types/__fpos64_t.h: No such file or directory",
+    "/usr/include/stdio.h:41:10: error: bits/types/__FILE.h: No such file or directory",
+    "/usr/include/stdio.h:42:10: error: bits/types/FILE.h: No such file or directory",
+    "/usr/include/stdio.h:43:10: error: bits/types/struct_FILE.h: No such file or directory",
+    "/usr/include/stdio.h:133:10: error: bits/stdio_lim.h: No such file or directory",
+    "/usr/include/stdio.h:430:10: error: bits/floatn.h: No such file or directory",
+    "ccc: error: 15 preprocessor error(s) in /home/user/lccc/tests/regression/asm_goto_phi_edge.c"
+  ],
+  "i686-label-ref-safety": [
+    ".......",
+    "----------------------------------------------------------------------",
+    "Ran 7 tests in 0.000s",
+    "",
+    "OK",
+    "ccc: error: cannot find -lgcc",
+    "FAIL  i686-label-ref-safety  (0s)"
+  ],
+  "asm-diff-oracle-gas-2.47": [
+    "fetch: trying https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to ftp.gnu.org:443 ",
+    "fetch: trying https://mirrors.kernel.org/gnu/binutils/binutils-2.47.tar.xz",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to mirrors.kernel.org:443 ",
+    "fetch: trying https://mirror.csclub.uwaterloo.ca/gnu/binutils/binutils-2.47.tar.xz",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to mirror.csclub.uwaterloo.ca:443 ",
+    "FATAL: no mirror reachable for binutils-2.47",
+    "FAIL  asm-diff-oracle-gas-2.47  (0s)"
+  ],
+  "a64-gas-provision": [
+    "fetch: trying https://ftp.gnu.org/gnu/binutils/binutils-2.47.tar.xz",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to ftp.gnu.org:443 ",
+    "fetch: trying https://mirrors.kernel.org/gnu/binutils/binutils-2.47.tar.xz",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to mirrors.kernel.org:443 ",
+    "fetch: trying https://mirror.csclub.uwaterloo.ca/gnu/binutils/binutils-2.47.tar.xz",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to mirror.csclub.uwaterloo.ca:443 ",
+    "FATAL: no mirror reachable for binutils-2.47",
+    "FAIL  a64-gas-provision  (0s)"
+  ],
+  "arm-a64-xml-provision": [
+    "arm-a64-xml: fetching https://developer.arm.com/-/cdn-downloads/permalink/Exploration-Tools-A64-ISA/ISA_A64/ISA_A64_xml_A_profile-2026-09_md.tar.gz",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to developer.arm.com:443 ",
+    "FAIL  arm-a64-xml-provision  (0s)"
+  ],
+  "encdiff-semantic-validation": [
+    "...................................................F...FF.verdict histogram drifted from the recorded baseline:",
+    "     BEATS                 2    2",
+    "     DECLINED-DATA16       0    0",
+    "     DECLINED-FP           0    0",
+    "     DECLINED-WRONG        0    0",
+    "     DISAGREE              0    0",
+    "     LONGER                0    0",
+    "     NO-ORACLE             0    0",
+    "     ORACLE-INVALID        0    0",
+    "     REJECTS-VALID         0    0",
+    "     UNVERIFIED-BEATS      0    0",
+    "     UNVERIFIED-BYTES      0    0",
+    "     WRONG-BYTES           0    0",
+    "     both-reject           0    0",
+    "     ok                    0    0",
+    "     ok-best               0    0",
+    "  -> rows-sha256       recorded 3a87fc379e26d1329c3cf1add9712f814811315b7d08216359e1b15a7b3c12ef",
+    "     rows-sha256       actual   9cdf5f2c1cffcbc5ff26550b13933b960823d80919554c55bac22e04329159b1"
+  ],
+  "asmdiff-semantic-validation": [
+    "........E................",
+    "======================================================================",
+    "ERROR: setUpClass (__main__.RealToolchainTests)",
+    "----------------------------------------------------------------------",
+    "Traceback (most recent call last):",
+    "  File \"/home/user/lccc/scripts/test_asmdiff.py\", line 527, in setUpClass",
+    "    raise AssertionError(problem)",
+    "AssertionError: ASMDIFF_TEST_AS='/home/user/.cache/gas-2.47-x86_64-linux-gnu/bin/as' is not an executable file \u2014 an explicit channel is never completed from PATH; fix the path (or unset the channels for a bare PATH run).",
+    "",
+    "----------------------------------------------------------------------",
+    "Ran 24 tests in 0.007s",
+    "",
+    "FAILED (errors=1)",
+    "FAIL  asmdiff-semantic-validation  (0s)"
+  ],
+  "x86-asm-diff": [
+    "error: assembler oracle '/home/user/.cache/gas-2.47-x86_64-linux-gnu/bin/as' not found",
+    "FAIL  x86-asm-diff  (1s)"
+  ],
+  "i686-asm-diff": [
+    "error: assembler oracle '/home/user/.cache/gas-2.47-x86_64-linux-gnu/bin/as' not found",
+    "FAIL  i686-asm-diff  (0s)"
+  ],
+  "encdiff-corpus": [
+    "Traceback (most recent call last):",
+    "  File \"/home/user/lccc/scripts/encdiff.py\", line 1791, in <module>",
+    "    sys.exit(main())",
+    "             ^^^^^^",
+    "  File \"/home/user/lccc/scripts/encdiff.py\", line 1649, in main",
+    "    locals_gas = [encode_local(args.gas, i, tmp, args.objcopy,",
+    "                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/home/user/lccc/scripts/encdiff.py\", line 1649, in <listcomp>",
+    "    locals_gas = [encode_local(args.gas, i, tmp, args.objcopy,",
+    "                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/home/user/lccc/scripts/encdiff.py\", line 142, in encode_local",
+    "    r = _run(cmd)",
+    "        ^^^^^^^^^",
+    "  File \"/home/user/lccc/scripts/encdiff.py\", line 117, in _run",
+    "    return subprocess.run(cmd, capture_output=True, text=True, timeout=120, **kw)",
+    "           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
+    "  File \"/usr/lib/python3.11/subprocess.py\", line 548, in run",
+    "    with Popen(*popenargs, **kwargs) as process:"
+  ],
+  "kernel-relocs-tool": [
+    "fetching arch/x86/tools/relocs sources at v6.12",
+    "curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to git.kernel.org:443 ",
+    "FAIL  kernel-relocs-tool  (0s)"
+  ],
+  "linker-suite": [
+    "error: --strict: 5 skipped and 0 warned test(s)",
+    "",
+    "[FAIL] i386_dso_pointer_equality",
+    "    no -m32 toolchain: In file included from lib.c:2:",
+    "/usr/include/stdio.h:27:10: fatal error: bits/libc-header-start.h: No such file or directory",
+    "   27 | #include <bits/lib",
+    "[FAIL] i386_dso_emit_semantics",
+    "    no -m32 toolchain: /usr/bin/ld: cannot find crti.o: No such file or directory",
+    "/usr/bin/ld: skipping incompatible /usr/lib/gcc/x86_64-linux-gnu/12/libgcc.a when searching",
+    "[FAIL] gotpcrel_edges",
+    "    fixture does not assemble",
+    "[SKIP] ie_to_le_forms",
+    "    assembler without APX/MOVRS: ief.s: Assembler messages:",
+    "ief.s:17: Error: bad register name `%r17'",
+    "ief.s:18: Error: bad register name `%r20'",
+    "ief.s:19: Error: bad register name `%r21'",
+    "ief.s:20: Error: no such instruction: `{nf} addq ly@gottpoff(%rip),%r18'",
+    "ief.s:21: Error: no such instruction: `{nf} addq ly@gottpoff(%rip),%r18,%r"
+  ],
+  "aarch64-arm-doccheck": [
+    "doccheck: XML directory not found: /home/user/.cache/arm-isa-a64-2026-09/ISA_A64_xml_A_profile-2026-09_md (run scripts/ensure_arm_a64_xml.sh to provision the pinned 2026-09 package)",
+    "FAIL  aarch64-arm-doccheck  (0s)",
+    "SKIP  aarch64-family-sweeps (pinned aarch64 binutils or target/fastbuild/lccc not available)",
+    "SKIP  aarch64-legality-probe (pinned aarch64 binutils or",
+    "      target/fastbuild/lccc not available)",
+    "SKIP  directive-legality (pinned gas-2.47 pair not available)"
+  ],
+  "msrv-check": [
+    "/home/user/.cargo/bin/cargo: line 9: /home/user/.local/toolchains/1.97.0/bin/cargo: No such file or directory",
+    "FAIL  msrv-check  (0s)"
+  ]
+}

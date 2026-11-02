@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "source": "tests/benchmark/programs/spectral_norm.c",
+  "source_sha256": "42dd0681461b0ded04392066dee13ffcd7c8f841be3955a4db14c4c7c955b27b",
+  "function": "main",
+  "remote_flags": "-O2 -march=x86-64-v3",
+  "local_flags": "-O2",
+  "oracles": [
+    {
+      "key": "lccc",
+      "id": "target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O2",
+      "instructions": 58
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2 -march=x86-64-v3",
+      "instructions": 72
+    },
+    {
+      "key": "clang",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2 -march=x86-64-v3",
+      "instructions": 365
+    },
+    {
+      "key": "icc",
+      "id": "cicc2021100",
+      "name": "x86-64 icc 2021.10.0",
+      "semver": "2021.10.0",
+      "compilerType": "",
+      "flags": "-O2 -march=x86-64-v3",
+      "instructions": 274
+    },
+    {
+      "key": "icx",
+      "id": "cicxlatest",
+      "name": "x86-64 icx (latest)",
+      "semver": "(latest)",
+      "compilerType": "clang-intel",
+      "flags": "-O2 -march=x86-64-v3",
+      "instructions": 253
+    }
+  ]
+}

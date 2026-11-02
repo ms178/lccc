@@ -1,0 +1,32 @@
+{
+  "compiler_sha256": "ba07916b0b144c01ff923e833ff5fdec5e5e2c3c9b59b218714e0db46e3ad084",
+  "small_sanitizer": {
+    "command": "gcc -O1 -g -fsanitize=address,undefined tests/regression/fixtures/late_const_gep/{main,check}.c -o small-san; ASAN_OPTIONS=detect_leaks=0 ./small-san",
+    "exit": 0,
+    "stdout": "144 0 1\n",
+    "stderr": ""
+  },
+  "small_target_controls": {
+    "compiler_flags": [
+      "-O2 -m32",
+      "-O2 -march=x86-64",
+      "-O2 -march=x86-64-v3 -mtune=raptorlake"
+    ],
+    "oracle_linker": "gcc -O2 with matching target flags and separate check.c",
+    "exits": [
+      0,
+      0,
+      0
+    ],
+    "stdout_each": "144 0 1\n"
+  },
+  "memcheck": {
+    "command": "valgrind --tool=memcheck --error-exitcode=99 --track-origins=yes EXECUTABLE",
+    "small_exit": 0,
+    "full_exit": 0,
+    "errors_each": 0,
+    "full_stdout_sha256": "022736ff3362ef3591d1f8fc3b7fede5927c0d25ab0813d7ef8cd95efd6ea242"
+  },
+  "bounded_kernel_matrix": "28 pass / 0 fail / 0 skip; seven kernels including Adler combine, O0/O1/O2/O3",
+  "scope": "targeted checks, not final CI certification"
+}

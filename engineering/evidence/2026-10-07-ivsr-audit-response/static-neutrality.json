@@ -1,0 +1,60 @@
+{
+  "date": "2026-10-07",
+  "round": "audit-response (W1-W9 on the review of PR #774)",
+  "base_upstream": "9d85b134 (merge of PR #774; delivered tree e4eba4ef09f5f365145ae36ef86a871838f4d299 landed as bb492648)",
+  "arms": {
+    "pre": "/tmp/lccc-main-774 (fastbuild from unmodified 9d85b134)",
+    "post": "/tmp/lccc-audit2 (fastbuild from the same tree plus this round's diff)"
+  },
+  "metric": "assembly bytes, compared after normalising -fprofile-generate PID noise; instruction and stack-reference totals recorded as a second, coarser check",
+  "corpora": [
+    {
+      "name": "tests/benchmark/programs + tests/oracle/programs",
+      "matrix": "{-O1,-O2,-O3} x {x86-64, -m32 -msse2}",
+      "comparisons": 402,
+      "skipped": 0,
+      "changed": 0,
+      "insns_pre": 98002,
+      "insns_post": 98002,
+      "stack_pre": 25745,
+      "stack_post": 25745
+    },
+    {
+      "name": "tests/regression (each file with its own .flags)",
+      "matrix": "per-file flags, 27 of them -m32",
+      "comparisons": 844,
+      "skipped": 1,
+      "changed": 0,
+      "insns_pre": 232712,
+      "insns_post": 232712,
+      "stack_pre": 39696,
+      "stack_post": 39696
+    },
+    {
+      "name": "tests/bench (12 k_*.c performance kernels) + tests/benchmark/kernel_corpus (24) + tests/benchmark/patterns (3)",
+      "matrix": "{-O1,-O2,-O3} x {x86-64, -m32 -msse2}",
+      "comparisons": 234,
+      "skipped": 0,
+      "changed": 0,
+      "insns_pre": 35844,
+      "insns_post": 35844,
+      "stack_pre": 6978,
+      "stack_post": 6978
+    }
+  ],
+  "total": {
+    "comparisons": 1480,
+    "changed": 0,
+    "skipped": 1
+  },
+  "interpretation": [
+    "Every corpus total is byte-identical to the previous round's record, so this round changed no generated code anywhere it was measured.",
+    "That is the expected result, not a lucky one: the two behaviour changes are (a) `bounded` now follows the init for a descending IV with a loop-invariant limit, and (b) `bounded` is false for an empty descending body. Both are reachable only through the descending arm of `unsigned_iv_bound`, which the 16-program probe in descending-spelling-probe.txt shows no C spelling reaches.",
+    "No Callgrind re-run was performed, and that is an inference rather than an omission: identical assembly bytes imply identical Ir, so the merged round's measurements stand."
+  ],
+  "host": "2-core Xeon VM, Debian 13, GCC 14.2, binutils 2.44, Valgrind 3.24.0, 8 GiB swap. NOT the i7-14700KF target; no PMU; no cycle, uop or speedup claim is made anywhere in this round.",
+  "not_measured": [
+    "wall-clock deltas (the VM's layout-noise floor is ~15%)",
+    "ILP32 pointer-Add arming (excluded on measurement, unchanged this round)"
+  ]
+}

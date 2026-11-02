@@ -1,0 +1,288 @@
+;;; segments
+.text
+mov %fs:8(%rax), %rbx
+movl $1, %fs:(%rdi)
+mov %fs:0, %rax
+mov %fs:16, %rax
+movw $1, %fs:(%rdi)
+mov %fs:8(%r13,%r12,4), %rax
+mov %gs:8(%rax), %rbx
+movl $1, %gs:(%rdi)
+mov %gs:0, %rax
+mov %gs:16, %rax
+movw $1, %gs:(%rdi)
+mov %gs:8(%r13,%r12,4), %rax
+mov %cs:8(%rax), %rbx
+movl $1, %cs:(%rdi)
+mov %cs:0, %rax
+mov %cs:16, %rax
+movw $1, %cs:(%rdi)
+mov %cs:8(%r13,%r12,4), %rax
+mov %ss:8(%rax), %rbx
+movl $1, %ss:(%rdi)
+mov %ss:0, %rax
+mov %ss:16, %rax
+movw $1, %ss:(%rdi)
+mov %ss:8(%r13,%r12,4), %rax
+mov %ds:8(%rax), %rbx
+movl $1, %ds:(%rdi)
+mov %ds:0, %rax
+mov %ds:16, %rax
+movw $1, %ds:(%rdi)
+mov %ds:8(%r13,%r12,4), %rax
+mov %es:8(%rax), %rbx
+movl $1, %es:(%rdi)
+mov %es:0, %rax
+mov %es:16, %rax
+movw $1, %es:(%rdi)
+mov %es:8(%r13,%r12,4), %rax
+;;; lock
+.text
+lock addb %al, (%rdi)
+lock addb $1, (%rdi)
+lock addw %ax, (%rdi)
+lock addw $1, (%rdi)
+lock addl %eax, (%rdi)
+lock addl $1, (%rdi)
+lock addq %rax, (%rdi)
+lock addq $1, (%rdi)
+lock orb %al, (%rdi)
+lock orb $1, (%rdi)
+lock orw %ax, (%rdi)
+lock orw $1, (%rdi)
+lock orl %eax, (%rdi)
+lock orl $1, (%rdi)
+lock orq %rax, (%rdi)
+lock orq $1, (%rdi)
+lock adcb %al, (%rdi)
+lock adcb $1, (%rdi)
+lock adcw %ax, (%rdi)
+lock adcw $1, (%rdi)
+lock adcl %eax, (%rdi)
+lock adcl $1, (%rdi)
+lock adcq %rax, (%rdi)
+lock adcq $1, (%rdi)
+lock sbbb %al, (%rdi)
+lock sbbb $1, (%rdi)
+lock sbbw %ax, (%rdi)
+lock sbbw $1, (%rdi)
+lock sbbl %eax, (%rdi)
+lock sbbl $1, (%rdi)
+lock sbbq %rax, (%rdi)
+lock sbbq $1, (%rdi)
+lock andb %al, (%rdi)
+lock andb $1, (%rdi)
+lock andw %ax, (%rdi)
+lock andw $1, (%rdi)
+lock andl %eax, (%rdi)
+lock andl $1, (%rdi)
+lock andq %rax, (%rdi)
+lock andq $1, (%rdi)
+lock subb %al, (%rdi)
+lock subb $1, (%rdi)
+lock subw %ax, (%rdi)
+lock subw $1, (%rdi)
+lock subl %eax, (%rdi)
+lock subl $1, (%rdi)
+lock subq %rax, (%rdi)
+lock subq $1, (%rdi)
+lock xorb %al, (%rdi)
+lock xorb $1, (%rdi)
+lock xorw %ax, (%rdi)
+lock xorw $1, (%rdi)
+lock xorl %eax, (%rdi)
+lock xorl $1, (%rdi)
+lock xorq %rax, (%rdi)
+lock xorq $1, (%rdi)
+lock xaddb %al, (%rsi)
+lock cmpxchgb %al, (%rsi)
+lock incb (%rsi)
+lock decb (%rsi)
+lock negb (%rsi)
+lock notb (%rsi)
+xchg %al, (%rsi)
+lock xaddw %ax, (%rsi)
+lock cmpxchgw %ax, (%rsi)
+lock incw (%rsi)
+lock decw (%rsi)
+lock negw (%rsi)
+lock notw (%rsi)
+xchg %ax, (%rsi)
+lock xaddl %eax, (%rsi)
+lock cmpxchgl %eax, (%rsi)
+lock incl (%rsi)
+lock decl (%rsi)
+lock negl (%rsi)
+lock notl (%rsi)
+xchg %eax, (%rsi)
+lock xaddq %rax, (%rsi)
+lock cmpxchgq %rax, (%rsi)
+lock incq (%rsi)
+lock decq (%rsi)
+lock negq (%rsi)
+lock notq (%rsi)
+xchg %rax, (%rsi)
+lock cmpxchg16b (%rdi)
+lock cmpxchg8b (%rdi)
+;;; string
+.text
+rep movsb
+rep movsw
+rep movsl
+rep movsq
+rep stosb
+rep stosw
+rep stosl
+rep stosq
+rep lodsb
+rep lodsw
+rep lodsl
+rep lodsq
+rep scasb
+rep scasw
+rep scasl
+rep scasq
+rep cmpsb
+rep cmpsw
+repe movsb
+repe movsw
+repe movsl
+repe movsq
+repe stosb
+repe stosw
+repe stosl
+repe stosq
+repe lodsb
+repe lodsw
+repe lodsl
+repe lodsq
+repe scasb
+repe scasw
+repe scasl
+repe scasq
+repe cmpsb
+repe cmpsw
+repne movsb
+repne movsw
+repne movsl
+repne movsq
+repne stosb
+repne stosw
+repne stosl
+repne stosq
+repne lodsb
+repne lodsw
+repne lodsl
+repne lodsq
+repne scasb
+repne scasw
+repne scasl
+repne scasq
+repne cmpsb
+repne cmpsw
+;;; string_explicit_operands
+.text
+# The explicit-operand string forms (slot law, 2.47-probed): the ES-slot
+# is picked by operand position and must be %es-or-none, the ESI side
+# keeps any non-%ds override, accumulator spellings exist for STOS/LODS
+# only in the canonical order with the size-matched register, and the
+# INS/OUTS port is (%dx) or %dx.
+movsb (%rsi),%es:(%rdi)
+movsb %fs:(%rsi),%es:(%rdi)
+cmpsb (%rsi),%es:(%rdi)
+cmpsb %es:(%rdi),(%rsi)
+movsw (%rsi),%es:(%rdi)
+movsq (%rsi),(%rdi)
+stosb %al,(%rdi)
+stosb %al,%es:(%rdi)
+stosq %rax,(%rdi)
+lodsb (%rsi)
+lodsq (%rsi),%rax
+lodsw %fs:(%rsi),%ax
+scasb (%rdi)
+insb (%dx),%es:(%rdi)
+insb %dx,(%rdi)
+outsb (%rsi),%dx
+outsb %es:(%rsi),%dx
+movsb (%rsi,%rax),%es:(%rdi)
+;;; string_explicit_rejects reject
+.text
+movsb (%rsi),%fs:(%rdi)
+movsb %es:(%rdi),%fs:(%rsi)
+movsb %gs:(%rsi),%fs:(%rcx)
+stosb %cl,%es:(%rdi)
+stosb %rax,(%rdi)
+stosb (%rdi),%al
+lodsb %al,(%rsi)
+lodsb %rax,(%rsi)
+scasb %eax,(%rdi)
+insb (%eax),%es:(%rdi)
+insb (%edx),%es:(%rdi)
+insb (%dx)
+outsb (%rsi)
+outsb %dx,(%rsi)
+outsb (%rsi),%eax
+;;; seg_ss
+.text
+mov %ss:8(%rax), %rbx
+mov %ss:0, %rax
+mov %ss:8(%r13,%r12,4), %rax
+movl $1, %ss:(%rdi)
+movw $1, %ss:(%rdi)
+mov %ds:8(%rax), %rbx
+mov %es:8(%rax), %rbx
+mov %cs:8(%rax), %rbx
+;;; hle
+.text
+lock adcb $1,(%rax)
+lock xacquire adcb $1,(%rax)
+xacquire lock adcb $1,(%rax)
+lock xrelease adcb $1,(%rax)
+xrelease lock adcb $1,(%rax)
+lock xacquire addw $1,(%rax)
+lock xacquire addl %eax,(%rbx)
+lock xrelease orq $7,(%rcx)
+xrelease movb %al,(%rbx)
+xrelease movq %rax,(%rbx)
+xacquire xchg %eax,(%rbx)
+xrelease xchg %rax,(%rbx)
+xacquire lock xchg %eax,(%rbx)
+xrelease lock xchg %eax,(%rbx)
+lock xadd %eax,(%rbx)
+lock btsq $1,(%rax)
+lock incq (%rax)
+lock cmpxchg %eax,(%rbx)
+lock xacquire btsl $3,(%rdx)
+lock xrelease incl (%rsi)
+gs rep movsb
+gs addw $1,(%rax)
+;;; hle_missing_lock_acquire reject
+.text
+xacquire adcb $1,(%rax)
+;;; hle_missing_lock_release reject
+.text
+xrelease adcb $1,(%rax)
+;;; hle_mov_after_acquire reject
+.text
+xacquire movb %al,(%rbx)
+;;; hle_mov_load_after_release reject
+.text
+xrelease movb (%rbx),%al
+;;; hle_bad_insn_after_acquire reject
+.text
+xacquire nop
+;;; hle_bad_insn_after_release reject
+.text
+xrelease nop
+;;; hle_lock_nonlockable reject
+.text
+lock nop
+;;; hle_lock_regonly reject
+.text
+lock addl %eax,%ebx
+;;; hle_dup_lock reject
+.text
+lock lock adcb $1,(%rax)
+;;; hle_dup_rep reject
+.text
+rep repe movsb

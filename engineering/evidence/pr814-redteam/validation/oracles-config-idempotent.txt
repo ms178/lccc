@@ -1,0 +1,6 @@
+ld    : GNU ld (GNU Binutils) 2.47.20260726 (restored from /home/user/artifacts/oracles)
+mold  : mold 2.42.1 (compatible with GNU ld) (restored from /home/user/artifacts/oracles)
+lld   : Debian LLD 23.1.4 (compatible with GNU linkers)
+wild  : skipped (WITH_WILD=0)
+
+Oracles under /home/user/artifacts/oracles (wipe-safe); wrappers in /home/user/artifacts/bin; banners in /home/user/artifacts/oracles/ORACLES.lock.

@@ -1,0 +1,491 @@
+//! Section merging and common symbol allocation for ELF64 linkers.
+//!
+//! Groups input sections by mapped name, computes output offsets with proper
+//! alignment, sorts output sections by permission profile, and allocates
+//! SHN_COMMON symbols into `.bss`.
+
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
+use super::section_map::map_section_name;
+use super::symbols::{GlobalSymbolOps, InputSection, OutputSection};
+use super::types::Elf64Object;
+use crate::backend::elf::{
+    SHF_ALLOC, SHF_EXCLUDE, SHF_EXECINSTR, SHF_MERGE, SHF_STRINGS, SHF_TLS, SHF_WRITE, SHN_COMMON,
+    SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
+};
+
+/// Merge input sections from all objects into output sections.
+///
+/// Groups input sections by mapped name (e.g., `.text.foo` -> `.text`),
+/// computes output offsets with proper alignment, and sorts output sections
+/// by permission profile: RO -> Exec -> RW(progbits) -> RW(nobits).
+pub fn merge_sections_elf64(
+    objects: &[Elf64Object],
+    output_sections: &mut Vec<OutputSection>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
+) {
+    let no_dead = FxHashSet::default();
+    merge_sections_elf64_gc(objects, output_sections, section_map, &no_dead);
+}
+
+/// Merge input sections into output sections, optionally skipping dead sections.
+///
+/// When `dead_sections` is non-empty (from --gc-sections), sections in the set
+/// are excluded from the output, effectively garbage-collecting unreferenced code.
+pub fn merge_sections_elf64_gc(
+    objects: &[Elf64Object],
+    output_sections: &mut Vec<OutputSection>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
+    dead_sections: &FxHashSet<(usize, usize)>,
+) {
+    let mut output_map: FxHashMap<String, usize> = FxHashMap::default();
+
+    for obj_idx in 0..objects.len() {
+        for sec_idx in 0..objects[obj_idx].sections.len() {
+            let sec = &objects[obj_idx].sections[sec_idx];
+            if sec.flags & SHF_ALLOC == 0 {
+                continue;
+            }
+            if matches!(
+                sec.sh_type,
+                SHT_NULL | SHT_STRTAB | SHT_SYMTAB | SHT_RELA | SHT_REL | SHT_GROUP
+            ) {
+                continue;
+            }
+            if sec.flags & SHF_EXCLUDE != 0 {
+                continue;
+            }
+            if !dead_sections.is_empty() && dead_sections.contains(&(obj_idx, sec_idx)) {
+                continue;
+            }
+
+            let output_name = map_section_name(&sec.name).to_string();
+            let alignment = sec.addralign.max(1);
+
+            let out_idx = if let Some(&idx) = output_map.get(&output_name) {
+                if alignment > output_sections[idx].alignment {
+                    output_sections[idx].alignment = alignment;
+                }
+                idx
+            } else {
+                let idx = output_sections.len();
+                output_map.insert(output_name.clone(), idx);
+                output_sections.push(OutputSection {
+                    name: output_name,
+                    sh_type: sec.sh_type,
+                    flags: sec.flags,
+                    alignment,
+                    inputs: Vec::new(),
+                    data: Vec::new(),
+                    addr: 0,
+                    file_offset: 0,
+                    mem_size: 0,
+                });
+                idx
+            };
+
+            if sec.sh_type == SHT_PROGBITS {
+                output_sections[out_idx].sh_type = SHT_PROGBITS;
+            }
+            output_sections[out_idx].flags |=
+                sec.flags & (SHF_WRITE | SHF_EXECINSTR | SHF_ALLOC | SHF_TLS);
+            output_sections[out_idx].inputs.push(InputSection {
+                object_idx: obj_idx,
+                section_idx: sec_idx,
+                output_offset: 0,
+                size: sec.size,
+            });
+        }
+    }
+
+    // Sort .init_array/.fini_array inputs by their numeric priority suffix
+    // (GNU SORT_BY_INIT_PRIORITY semantics): `.init_array.NNNNN` runs in
+    // ascending N order, and unsuffixed `.init_array` entries run last.
+    // Without this, __attribute__((constructor(P))) ordering is broken.
+    // The same rule applies to `.ctors.N`/`.dtors.N` (whose names encode
+    // 65535-P, but ascending name order is still correct within the group).
+    for out_sec in output_sections.iter_mut() {
+        if out_sec.name != ".init_array"
+            && out_sec.name != ".fini_array"
+            && out_sec.name != ".ctors"
+            && out_sec.name != ".dtors"
+            && out_sec.name != ".preinit_array"
+        {
+            continue;
+        }
+        let prio_key = |input: &InputSection| -> (u64, usize, usize) {
+            let name = &objects[input.object_idx].sections[input.section_idx].name;
+            let prio = name
+                .rsplit('.')
+                .next()
+                .and_then(|suf| suf.parse::<u64>().ok())
+                // Unsuffixed sections sort AFTER all prioritized ones.
+                .unwrap_or(u64::MAX);
+            (prio, input.object_idx, input.section_idx)
+        };
+        out_sec.inputs.sort_by_key(prio_key);
+    }
+
+    for out_sec in output_sections.iter_mut() {
+        let mut off: u64 = 0;
+        for input in &mut out_sec.inputs {
+            let a = objects[input.object_idx].sections[input.section_idx]
+                .addralign
+                .max(1);
+            off = (off + a - 1) & !(a - 1);
+            input.output_offset = off;
+            off += input.size;
+        }
+        out_sec.mem_size = off;
+    }
+
+    for (out_idx, out_sec) in output_sections.iter().enumerate() {
+        for input in &out_sec.inputs {
+            section_map.insert(
+                (input.object_idx, input.section_idx),
+                (out_idx, input.output_offset),
+            );
+        }
+    }
+
+    // Sort: RO -> Exec -> RW(progbits) -> RW(nobits)
+    let len = output_sections.len();
+    let mut opts: Vec<Option<OutputSection>> = output_sections.drain(..).map(Some).collect();
+    let mut sort_indices: Vec<usize> = (0..len).collect();
+    sort_indices.sort_by_key(|&i| {
+        let sec = opts[i].as_ref().unwrap();
+        let is_exec = sec.flags & SHF_EXECINSTR != 0;
+        let is_write = sec.flags & SHF_WRITE != 0;
+        let is_nobits = sec.sh_type == SHT_NOBITS;
+        // Executable sections are ordered so PGO hot/cold partitioning is
+        // honored: `.text` → `.text.hot` → `.text.unlikely` → other exec.
+        // Hot functions stay in a contiguous region and cold functions are
+        // pushed to the tail of the executable segment.
+        let exec_rank = if is_exec {
+            match sec.name.as_str() {
+                ".text" => 0u32,
+                ".text.hot" => 1,
+                ".text.unlikely" => 2,
+                _ => 3,
+            }
+        } else {
+            0
+        };
+        if is_exec {
+            (1u32, exec_rank, is_nobits as u32)
+        } else if !is_write {
+            (0, 0u32, is_nobits as u32)
+        } else {
+            (2, 0u32, is_nobits as u32)
+        }
+    });
+
+    let mut index_remap: FxHashMap<usize, usize> = FxHashMap::default();
+    for (new_idx, &old_idx) in sort_indices.iter().enumerate() {
+        index_remap.insert(old_idx, new_idx);
+    }
+    for &old_idx in &sort_indices {
+        output_sections.push(opts[old_idx].take().unwrap());
+    }
+
+    let old_map: Vec<_> = section_map.drain().collect();
+    for ((obj_idx, sec_idx), (old_out_idx, off)) in old_map {
+        if let Some(&new_out_idx) = index_remap.get(&old_out_idx) {
+            section_map.insert((obj_idx, sec_idx), (new_out_idx, off));
+        }
+    }
+}
+
+/// Preserve non-allocated debug sections for x86-64 ELF links.
+///
+/// Ordinary section merging intentionally handles only the load image. Debug
+/// sections are different: they have file offsets but no virtual address or
+/// PT_LOAD membership, and they must retain their exact names so DWARF
+/// cross-section relocations remain meaningful. Call this after the
+/// allocatable sections have been sorted, so appended debug outputs do not
+/// participate in load-segment layout or section ordering.
+pub fn merge_debug_sections_elf64<'a>(
+    objects: impl IntoIterator<Item = &'a Elf64Object>,
+    output_sections: &mut Vec<OutputSection>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
+    dead_sections: &FxHashSet<(usize, usize)>,
+) -> Result<(), String> {
+    merge_nonalloc_sections_elf64(
+        objects,
+        output_sections,
+        section_map,
+        dead_sections,
+        is_debug_section_name,
+    )
+}
+
+/// `merge_debug_sections_elf64` for the non-allocated `SHT_PROGBITS`
+/// sections whose names `keep` accepts (e.g. the debug sections plus
+/// `.comment`), merged by exact name in input order.
+pub fn merge_nonalloc_sections_elf64<'a>(
+    objects: impl IntoIterator<Item = &'a Elf64Object>,
+    output_sections: &mut Vec<OutputSection>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
+    dead_sections: &FxHashSet<(usize, usize)>,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let mut output_map: FxHashMap<String, usize> = FxHashMap::default();
+    for (obj_idx, object) in objects.into_iter().enumerate() {
+        for (section_idx, section) in object.sections.iter().enumerate() {
+            if section.flags & SHF_ALLOC != 0
+                || section.flags & SHF_EXCLUDE != 0
+                || section.sh_type != SHT_PROGBITS
+                || !keep(&section.name)
+                || dead_sections.contains(&(obj_idx, section_idx))
+            {
+                continue;
+            }
+
+            let alignment = section.addralign.max(1);
+            let output_idx = if let Some(&idx) = output_map.get(&section.name) {
+                idx
+            } else {
+                let idx = output_sections.len();
+                output_map.insert(section.name.clone(), idx);
+                output_sections.push(OutputSection {
+                    name: section.name.clone(),
+                    sh_type: section.sh_type,
+                    flags: section.flags,
+                    alignment,
+                    inputs: Vec::new(),
+                    data: Vec::new(),
+                    addr: 0,
+                    file_offset: 0,
+                    mem_size: 0,
+                });
+                idx
+            };
+            let output = &mut output_sections[output_idx];
+            output.alignment = output.alignment.max(alignment);
+            let aligned = output
+                .mem_size
+                .checked_add(alignment - 1)
+                .map(|n| n & !(alignment - 1))
+                .ok_or_else(|| format!("debug section '{}' size overflow", section.name))?;
+            let end = aligned
+                .checked_add(section.size)
+                .ok_or_else(|| format!("debug section '{}' size overflow", section.name))?;
+            output.inputs.push(InputSection {
+                object_idx: obj_idx,
+                section_idx,
+                output_offset: aligned,
+                size: section.size,
+            });
+            output.mem_size = end;
+            section_map.insert((obj_idx, section_idx), (output_idx, aligned));
+        }
+    }
+    Ok(())
+}
+
+/// Give each non-empty non-allocated output section a file offset starting
+/// at `file_end`, in output order, and address 0: debug sections follow the
+/// last segment and are never loaded. Returns the new end of the file data.
+pub fn place_debug_sections(output_sections: &mut [OutputSection], mut file_end: u64) -> u64 {
+    for sec in output_sections
+        .iter_mut()
+        .filter(|s| s.flags & SHF_ALLOC == 0 && s.mem_size > 0)
+    {
+        file_end = file_end.next_multiple_of(sec.alignment.max(1));
+        sec.addr = 0;
+        sec.file_offset = file_end;
+        file_end += sec.mem_size;
+    }
+    file_end
+}
+
+/// Whether a non-allocated input section carries debug information that a
+/// final link keeps (and `--strip-debug` drops).
+pub fn is_debug_section_name(name: &str) -> bool {
+    name.starts_with(".debug_")
+        || name.starts_with(".zdebug_")
+        || name == ".gdb_index"
+        || name.starts_with(".gnu_debug")
+}
+
+/// Allocate SHN_COMMON symbols into the .bss output section.
+pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
+    globals: &mut FxHashMap<String, G>,
+    output_sections: &mut Vec<OutputSection>,
+    sort_common: bool,
+) {
+    let mut common_syms: Vec<(String, u64, u64)> = globals
+        .iter()
+        .filter(|(_, sym)| sym.section_idx() == SHN_COMMON && sym.is_defined())
+        .map(|(name, sym)| (name.clone(), sym.value().max(1), sym.size()))
+        .collect();
+    if common_syms.is_empty() {
+        return;
+    }
+    // `--sort-common`: largest first, so big alignments pack without holes
+    // (bfd orders by size too).  bfd's order within one size is hash noise;
+    // lccc uses the name instead, so the layout is fully deterministic.
+    if sort_common {
+        common_syms.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    }
+
+    let bss_idx = output_sections
+        .iter()
+        .position(|s| s.name == ".bss")
+        .unwrap_or_else(|| {
+            let idx = output_sections.len();
+            output_sections.push(OutputSection {
+                name: ".bss".to_string(),
+                sh_type: SHT_NOBITS,
+                flags: SHF_ALLOC | SHF_WRITE,
+                alignment: 1,
+                inputs: Vec::new(),
+                data: Vec::new(),
+                addr: 0,
+                file_offset: 0,
+                mem_size: 0,
+            });
+            idx
+        });
+
+    let mut bss_off = output_sections[bss_idx].mem_size;
+    for (name, alignment, size) in &common_syms {
+        let a = (*alignment).max(1);
+        bss_off = (bss_off + a - 1) & !(a - 1);
+        if let Some(sym) = globals.get_mut(name) {
+            sym.set_common_bss(bss_off);
+        }
+        if *alignment > output_sections[bss_idx].alignment {
+            output_sections[bss_idx].alignment = *alignment;
+        }
+        bss_off += size;
+    }
+    output_sections[bss_idx].mem_size = bss_off;
+}
+
+/// Merge `.comment` input sections (compiler version strings) into one blob,
+/// exactly as GNU ld does.
+///
+/// Every toolchain object carries a `.comment` section (e.g. `\0GCC: (Debian
+/// 14.2.0-19) 14.2.0\0`) flagged `SHF_MERGE|SHF_STRINGS`, so bfd runs it
+/// through `merge.c` like any other string section: each distinct string
+/// once, in first-seen order, with suffixes tail-merged into longer strings
+/// (`strmerge_gnu`). lld and mold additionally append their own identity
+/// string; bfd does not, and lccc follows bfd, so the output is a pure
+/// function of the inputs. Inputs that are not mergeable (no `SHF_MERGE`,
+/// relocations, ...) are copied as they are, aligned, in input order.
+pub fn merge_comment_sections(objects: &[Elf64Object]) -> Vec<u8> {
+    use super::strmerge_gnu::{MergeInput, Placement, merge};
+    let sections: Vec<(&Elf64Object, usize)> = objects
+        .iter()
+        .flat_map(|obj| {
+            obj.sections
+                .iter()
+                .enumerate()
+                .filter(|(si, sec)| {
+                    sec.name == ".comment"
+                        && sec.sh_type == SHT_PROGBITS
+                        && sec.flags & SHF_ALLOC == 0
+                        && obj.section_data.get(*si).is_some()
+                })
+                .map(move |(si, _)| (obj, si))
+        })
+        .collect();
+    let inputs: Vec<MergeInput> = sections
+        .iter()
+        .map(|&(obj, si)| {
+            let sec = &obj.sections[si];
+            MergeInput {
+                data: obj.section_data[si].as_slice(),
+                merge: sec.flags & SHF_MERGE != 0,
+                strings: sec.flags & SHF_STRINGS != 0,
+                entsize: sec.entsize,
+                addralign: sec.addralign.max(1),
+                has_relocs: obj.relocations.get(si).is_some_and(|r| !r.is_empty()),
+            }
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (input, placement) in inputs.iter().zip(merge(&inputs)) {
+        let bytes = match &placement {
+            Placement::Raw => input.data,
+            Placement::Merged {
+                pool: Some(pool), ..
+            } => pool.as_slice(),
+            Placement::Merged { pool: None, .. } => continue,
+        };
+        let align = usize::try_from(input.addralign).unwrap_or(1).max(1);
+        out.resize(out.len().next_multiple_of(align), 0);
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::linker_common::{Elf64Section, SectionData};
+
+    use super::*;
+
+    fn obj_with_comment(data: &[u8]) -> Elf64Object {
+        Elf64Object {
+            sections: vec![Elf64Section {
+                name_idx: 0,
+                name: ".comment".to_string(),
+                sh_type: SHT_PROGBITS,
+                flags: 0x30, // SHF_MERGE | SHF_STRINGS
+                addr: 0,
+                offset: 0,
+                size: data.len() as u64,
+                link: 0,
+                info: 0,
+                addralign: 1,
+                entsize: 1,
+            }],
+            symbols: vec![],
+            section_data: vec![SectionData::owned(data.to_vec())],
+            relocations: vec![Vec::new()],
+            source_name: "<test>".to_string(),
+            e_flags: 0,
+        }
+    }
+
+    #[test]
+    fn dedupes_identical_strings_in_first_seen_order() {
+        let a = obj_with_comment(b"toolchain-A\0toolchain-A\0");
+        let b = obj_with_comment(b"toolchain-B\0toolchain-A\0");
+        assert_eq!(
+            merge_comment_sections(&[a, b]),
+            b"toolchain-A\0toolchain-B\0"
+        );
+    }
+
+    #[test]
+    fn drops_empty_fragments_and_repairs_missing_nul() {
+        let a = obj_with_comment(b"\0toolchain-A\0\0");
+        let b = obj_with_comment(b"toolchain-B");
+        assert_eq!(
+            merge_comment_sections(&[a, b]),
+            b"toolchain-A\0toolchain-B\0"
+        );
+    }
+
+    #[test]
+    fn tail_merges_suffixes_like_gnu_ld() {
+        // `merge.c` shares a string that is a suffix of another one.
+        let a = obj_with_comment(b"\0GCC: (GNU) 16.2.0\0");
+        let b = obj_with_comment(b"16.2.0\0clang 23\0");
+        assert_eq!(
+            merge_comment_sections(&[a, b]),
+            b"GCC: (GNU) 16.2.0\0clang 23\0"
+        );
+    }
+
+    #[test]
+    fn ignores_non_comment_sections_and_empty_input() {
+        let mut o = obj_with_comment(b"");
+        o.sections[0].name = ".text".to_string();
+        assert!(merge_comment_sections(&[o]).is_empty());
+        assert!(merge_comment_sections(&[]).is_empty());
+    }
+}

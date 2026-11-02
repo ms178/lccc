@@ -1,0 +1,103 @@
+name: CachyMod 6.18.58 LCCC kernel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-61858-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-prerequisites:
+    # A GitHub-only transport for network-restricted development sandboxes.
+    # Unreferenced, content-addressed Git blobs never change a branch or tag;
+    # the notice records their IDs and a SHA256 manifest authenticates parts.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download Debian bookworm host tools (not kernel objects)
+        run: |
+          mkdir -p "$RUNNER_TEMP/kernel-host-debs"
+          docker run --rm -v "$RUNNER_TEMP/kernel-host-debs:/out" debian:bookworm bash -euc '
+            apt-get update -qq
+            apt-get -y --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 busybox-static file
+            cp /var/cache/apt/archives/*.deb /out/
+          '
+          cd "$RUNNER_TEMP/kernel-host-debs"
+          sha256sum ./*.deb > SHA256SUMS
+          tar -cJf "$RUNNER_TEMP/kernel-host-debs.tar.xz" ./*.deb SHA256SUMS
+          split -b 8M -d "$RUNNER_TEMP/kernel-host-debs.tar.xz" "$RUNNER_TEMP/kernel-host-part-"
+      - name: Publish content-addressed transport identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha256sum "$RUNNER_TEMP/kernel-host-debs.tar.xz"
+          for part in "$RUNNER_TEMP"/kernel-host-part-*; do
+            base64 -w0 "$part" > "$RUNNER_TEMP/blob.base64"
+            id=$(gh api "repos/$GITHUB_REPOSITORY/git/blobs" -X POST -f encoding=base64 -F content=@"$RUNNER_TEMP/blob.base64" --jq .sha)
+            echo "::notice title=Kernel host prerequisite blob::$(basename "$part") $id $(sha256sum "$part" | cut -d' ' -f1)"
+          done
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      KVER: 6.18.58
+      LCCC_KERNEL_SOURCE_MODE: git
+      LCCC_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Enable 4 GiB swap
+        env:
+          LCCC_CI_SWAP_SIZE: 4G
+        run: bash scripts/ci_enable_swap.sh
+      - name: Provision host tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 busybox-static file
+          bash scripts/ci_provision_toolchain.sh --multilib
+          echo "HOSTCC=$(command -v gcc-16)" >> "$GITHUB_ENV"
+      - name: Build LCCC and lccc-ld (fastbuild)
+        run: bash scripts/build_lccc_fast.sh
+      - name: Apply package patches and prepare with LCCC
+        run: bash scripts/prepare_kernel_tree.sh
+      - name: Select x86-64 defconfig using LCCC
+        run: |
+          set -euo pipefail
+          K=$(bash scripts/kernel_version.sh --default-dir)
+          make -C "$K" ARCH=x86_64 CC="$GITHUB_WORKSPACE/target/fastbuild/lccc" LD="$GITHUB_WORKSPACE/target/fastbuild/lccc-ld" AS="$GITHUB_WORKSPACE/target/fastbuild/lccc" HOSTCC="$HOSTCC" defconfig prepare
+      - name: Boot code first, including 32 KiB gate
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/kernel-boot" bash scripts/build_kernel_boot.sh 2>&1 | tee "$RUNNER_TEMP/kernel-boot.log"
+      - name: Full defconfig bzImage with LCCC and lccc-ld
+        run: |
+          set -euo pipefail
+          bash scripts/build_kernel_full.sh bzImage 2>&1 | tee "$RUNNER_TEMP/kernel-full.log"
+      - name: Boot the full defconfig image in QEMU
+        run: |
+          K=$(bash scripts/kernel_version.sh --default-dir)
+          BOOT_LOG="$RUNNER_TEMP/kernel-qemu.log" bash scripts/qemu_defconfig_smoke.sh "$K/arch/x86/boot/bzImage"
+      - name: Retain logs, configuration and provenance
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-61858-${{ github.sha }}
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/kernel-*.log
+            ${{ runner.temp }}/kernel-*.qemu-err
+            ${{ runner.temp }}/kernel-boot/setup.elf
+            ~/.cache/lccc/kernel-work/linux-6.18.58/.config
+            ~/.cache/lccc/kernel-work/linux-6.18.58/.lccc-prepared
+            ~/.cache/lccc/kernel-work/linux-6.18.58/.lccc-full-build-config
+          if-no-files-found: warn

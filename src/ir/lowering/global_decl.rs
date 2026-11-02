@@ -1,0 +1,1221 @@
+//! Global declaration lowering and shared declaration analysis.
+//!
+//! - `lower_global_decl`: processes top-level declarations (typedefs, global variables,
+//!   extern declarations) into IR globals with proper initializers, alignment, and linkage.
+//! - `analyze_declaration`: shared analysis for both local and global variable declarations,
+//!   computing type properties, array/pointer info, struct layout, etc.
+//! - `fixup_unsized_array`: resolves unsized array declarations from initializer size.
+
+use super::definitions::{DeclAnalysis, GlobalInfo};
+use super::lower::Lowerer;
+use crate::common::type_builder::TypeConvertContext;
+use crate::common::types::{CType, IrType};
+use crate::frontend::parser::ast::{
+    Declaration, DerivedDeclarator, Expr, InitDeclarator, Initializer, TypeSpecifier,
+};
+use crate::ir::lowering::const_object_images::{ConstObjectImage, const_object_bytes};
+use crate::ir::reexports::{GlobalInit, IrGlobal, TlsModel};
+
+/// What a `tls_model` attribute is attached to (`record_tls_model_attr`).
+#[derive(Clone, Copy)]
+pub(super) enum TlsAttrSubject {
+    /// A `_Thread_local`/`__thread` object: the attribute applies.
+    ThreadLocal,
+    /// An object without thread storage duration.
+    Variable,
+    /// A function declaration.
+    Function,
+}
+
+impl TlsAttrSubject {
+    pub(super) fn object(thread_local: bool) -> Self {
+        if thread_local {
+            Self::ThreadLocal
+        } else {
+            Self::Variable
+        }
+    }
+}
+
+enum RedeclResult {
+    Skip,
+    Proceed { prior_was_weak: bool },
+}
+
+/// Whether the declared object is a vector or an array whose leaf objects are
+/// vectors. The IR pointer carrier must not contribute pointer alignment to
+/// these C objects.
+fn is_vector_object_or_array_of_vectors(ctype: &CType) -> bool {
+    match ctype {
+        CType::Vector(..) | CType::ExtVector(..) => true,
+        CType::Array(element, _) => is_vector_object_or_array_of_vectors(element),
+        _ => false,
+    }
+}
+
+impl Lowerer {
+    // --- Global declaration lowering ---
+
+    pub(super) fn lower_global_decl(&mut self, decl: &Declaration) {
+        self.register_struct_type(&decl.type_spec);
+        // The rebuilt layout lost the attribute (typedefs re-mark in
+        // `lower_typedef`, once the typedef name resolves).
+        if decl.is_transparent_union() && !decl.is_typedef() {
+            self.mark_transparent_union(decl);
+        }
+        self.collect_enum_constants(&decl.type_spec);
+        self.declare_declarator_type_name_tags(decl);
+
+        if decl.is_typedef() {
+            self.lower_typedef(decl);
+            return;
+        }
+
+        // Freeze inherited qualifiers before a declarator can shadow the
+        // `typeof` operand used by the remaining declarators.
+        let inherited_volatile = self.scalar_typeof_is_volatile(&decl.type_spec);
+        for declarator in &decl.declarators {
+            if declarator.name.is_empty() {
+                continue;
+            }
+            let is_function_decl = DerivedDeclarator::declares_function(&declarator.derived);
+            let decl_ir_name = self.global_object_ir_name(declarator);
+            if declarator.attrs.externally_visible {
+                self.module
+                    .externally_visible_symbols
+                    .insert(decl_ir_name.clone());
+            }
+            if is_function_decl {
+                if let Some(ref zr) = declarator.attrs.zero_call_used_regs
+                    && let Some(mode) =
+                        crate::backend::zero_call_used_regs::ZeroCallUsedRegs::parse(zr)
+                {
+                    self.module
+                        .zero_call_used_regs_attrs
+                        .insert(decl_ir_name, mode);
+                }
+                if let Some(ref ns) = declarator.attrs.no_sanitize {
+                    let parsed = super::ubsan::UbsanFlags::parse_no_sanitize_attr(ns);
+                    self.decl_no_sanitize_map
+                        .entry(declarator.name.clone())
+                        .and_modify(|m| *m = m.union(parsed))
+                        .or_insert(parsed);
+                }
+                if let Some(align) = decl.alignment {
+                    self.module
+                        .function_alignments
+                        .entry(declarator.name.clone())
+                        .and_modify(|old| *old = (*old).max(align))
+                        .or_insert(align);
+                }
+            }
+            if declarator.attrs.tls_model.is_some() || (decl.is_thread_local() && !is_function_decl)
+            {
+                let ir_name = self.global_object_ir_name(declarator);
+                let subject = if is_function_decl {
+                    TlsAttrSubject::Function
+                } else {
+                    TlsAttrSubject::object(decl.is_thread_local())
+                };
+                self.record_tls_model_attr(ir_name, declarator, subject);
+            }
+            if self.should_skip_global_declarator(decl, declarator) {
+                continue;
+            }
+            if self.try_lower_register_global(decl, declarator, inherited_volatile) {
+                continue;
+            }
+            if self.try_lower_extern_global(decl, declarator, inherited_volatile) {
+                continue;
+            }
+
+            let prior_was_weak = match self.handle_global_redeclaration(decl, declarator) {
+                RedeclResult::Skip => continue,
+                RedeclResult::Proceed { prior_was_weak } => prior_was_weak,
+            };
+
+            let da = self.prepare_global_analysis(decl, declarator, inherited_volatile);
+
+            let is_extern_decl = decl.is_extern() && declarator.init.is_none();
+            if !is_extern_decl
+                && declarator.init.is_none()
+                && da.is_array
+                && self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+            {
+                self.tentative_incomplete_arrays
+                    .insert(declarator.name.clone());
+            }
+
+            // Register before evaluating initializer so self-referential
+            // initializers (e.g., `struct Node n = {&n}`) can resolve.
+            let mut ginfo = GlobalInfo::from_analysis(&da);
+            ginfo.var.address_space =
+                crate::common::type_builder::object_storage_address_space_with_object(
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
+                    &declarator.derived,
+                    declarator.attrs.object_space,
+                );
+            if let Some(ref mut ct) = ginfo.var.c_type {
+                // OBJECT declaration: the space lands on the pointee only when
+                // the DECLARATOR supplies the pointer.  A pointer from the type
+                // specifier (typedef/typeof — the kernel's DEFINE_PER_CPU
+                // spelling) keeps its plain value type while the object's
+                // storage (`var.address_space` above, exactly as gcc models
+                // `&obj`) stays in the segment.  See
+                // apply_declaration_address_space_for_object.
+                crate::common::type_builder::apply_declaration_address_space_for_object(
+                    ct,
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
+                    &declarator.derived,
+                );
+            }
+            self.globals.insert(declarator.name.clone(), ginfo);
+
+            let init = self.lower_declarator_init(decl, declarator, &da);
+            let (align, explicit_request) =
+                self.compute_static_alignment(decl, &decl.type_spec, &da);
+            let has_explicit_align = explicit_request.is_some();
+            let type_align = self
+                .typedef_alignment_for_type_spec(&decl.type_spec)
+                .copied();
+            if let Some(ginfo) = self.globals.get_mut(&declarator.name) {
+                // Record the REQUESTED alignment, not the merged object
+                // alignment: `alignof_expr` folds in the natural (or
+                // typedef-replaced) alignment itself, and a merged value
+                // would hide a typedef `aligned(N)` that lowers it.
+                ginfo.var.explicit_alignment = explicit_request;
+                ginfo.var.type_align = type_align;
+            }
+
+            // Skip emitting storage for alias/weakref/ifunc declarations.
+            if declarator.attrs.alias_target.is_some() || declarator.attrs.ifunc_target.is_some() {
+                continue;
+            }
+
+            self.emit_ir_global(
+                decl,
+                declarator,
+                &da,
+                init,
+                align,
+                has_explicit_align,
+                is_extern_decl,
+                prior_was_weak,
+            );
+        }
+    }
+
+    fn lower_typedef(&mut self, decl: &Declaration) {
+        for declarator in &decl.declarators {
+            if declarator.name.is_empty() {
+                continue;
+            }
+            let mut resolved_ctype = self.build_full_ctype(&decl.type_spec, &declarator.derived);
+            crate::common::type_builder::apply_declaration_address_space_for_object(
+                &mut resolved_ctype,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
+                &declarator.derived,
+            );
+            if !resolved_ctype.is_vector() {
+                if let Some(vector_ctype) = decl.resolve_vector_ctype(resolved_ctype.clone()) {
+                    resolved_ctype = vector_ctype;
+                }
+            }
+            // When re-processing a typedef for an anonymous struct/union, the lowerer
+            // generates a fresh `__anon_struct_N` key that differs from sema's key.
+            // If sema already stored a typedef entry with an anonymous struct key,
+            // reuse that key so that _Generic type matching (which compares CType keys)
+            // works correctly between the controlling expression type (from sema) and
+            // the association type (resolved here in the lowerer).
+            if let Some(existing) = self.types.typedefs.get(&declarator.name) {
+                let is_new_anon = matches!(&resolved_ctype, CType::Struct(k) | CType::Union(k) if k.starts_with("__anon_"));
+                let is_existing_anon = matches!(existing, CType::Struct(k) | CType::Union(k) if k.starts_with("__anon_"));
+                if is_new_anon && is_existing_anon && resolved_ctype != *existing {
+                    // Copy the layout registered under the new key to the old key,
+                    // then use the old CType so all references are consistent.
+                    let new_key = match &resolved_ctype {
+                        CType::Struct(k) | CType::Union(k) => k.to_string(),
+                        _ => unreachable!(),
+                    };
+                    let old_key = match existing {
+                        CType::Struct(k) | CType::Union(k) => k.to_string(),
+                        _ => unreachable!(),
+                    };
+                    let layout_copy = self
+                        .types
+                        .borrow_struct_layouts()
+                        .get(&new_key)
+                        .map(|l| l.as_ref().clone());
+                    if let Some(layout) = layout_copy {
+                        self.types
+                            .insert_struct_layout_scoped_from_ref(&old_key, layout);
+                    }
+                    resolved_ctype = existing.clone();
+                }
+            }
+            self.types
+                .typedefs
+                .insert(declarator.name.clone(), resolved_ctype);
+            let const_base = crate::common::qualifiers::type_name_const_base(
+                &decl.type_spec,
+                decl.is_const(),
+                self,
+            );
+            self.types
+                .set_typedef_const_base(&declarator.name, const_base);
+            let effective_alignment = {
+                let mut align = decl.alignment;
+                if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
+                    let real_sizeof = self.sizeof_type(sizeof_ts);
+                    align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
+                }
+                crate::common::types::strictest_alignment([
+                    align,
+                    decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+                ])
+            };
+            if let Some(align) = effective_alignment {
+                self.types
+                    .typedef_alignments
+                    .insert(declarator.name.clone(), align);
+            }
+        }
+        if decl.is_transparent_union() {
+            self.mark_transparent_union(decl);
+        }
+    }
+
+    /// Returns true if this declarator should be skipped (function prototypes,
+    /// function typedefs, typeof-declared functions).
+    fn should_skip_global_declarator(
+        &self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> bool {
+        // Skip function declarations (prototypes), but NOT function pointer variables.
+        if DerivedDeclarator::declares_function(&declarator.derived) && declarator.init.is_none() {
+            return true;
+        }
+        // Skip declarations using function typedefs or typeof-declared functions.
+        if declarator.init.is_none() && declarator.derived.is_empty() {
+            if let TypeSpecifier::TypedefName(tname) = &decl.type_spec {
+                if self.types.function_typedefs.contains_key(tname) {
+                    return true;
+                }
+            }
+            if matches!(
+                &decl.type_spec,
+                TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(..)
+            ) && self.known_functions.contains(&declarator.name)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Handle global register variable. Returns true if handled (caller should continue).
+    fn try_lower_register_global(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        inherited_volatile: bool,
+    ) -> bool {
+        let Some(ref reg_name) = declarator.attrs.asm_register else {
+            return false;
+        };
+        if !crate::ir::lowering::lower::is_x86_register_name(reg_name) {
+            return false;
+        }
+        let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
+        da.apply_decl_vector_type(decl);
+        let mut ginfo = GlobalInfo::from_analysis(&da);
+        ginfo.asm_register = Some(reg_name.clone());
+        ginfo.var.address_space =
+            crate::common::type_builder::object_storage_address_space_with_object(
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
+        if let Some(ref mut ct) = ginfo.var.c_type {
+            crate::common::type_builder::apply_declaration_address_space_for_object(
+                ct,
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
+                &declarator.derived,
+            );
+        }
+        self.globals.insert(declarator.name.clone(), ginfo);
+        true
+    }
+
+    /// Handle extern without initializer. Returns true if handled (caller should continue).
+    fn try_lower_extern_global(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        inherited_volatile: bool,
+    ) -> bool {
+        if !decl.is_extern() || declarator.init.is_some() {
+            return false;
+        }
+        // `int x[]; extern int x[300];` -- the extern declaration completes
+        // the composite type of the earlier tentative definition (C11
+        // 6.2.7p3), whose storage therefore has 300 elements, not one.
+        if self.tentative_incomplete_arrays.contains(&declarator.name)
+            && !self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+        {
+            let da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+            if da.is_array && da.actual_alloc_size > 0 {
+                for g in &mut self.module.globals {
+                    if g.name == declarator.name && !g.is_extern {
+                        g.size = g.size.max(da.actual_alloc_size);
+                    }
+                }
+                if let Some(ginfo) = self.globals.get_mut(&declarator.name) {
+                    ginfo.var.c_type = da.c_type.clone();
+                }
+                self.tentative_incomplete_arrays.remove(&declarator.name);
+            }
+            return true;
+        }
+        if !self.globals.contains_key(&declarator.name) {
+            let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+            self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
+            da.apply_decl_vector_type(decl);
+            let mut ginfo = GlobalInfo::from_analysis(&da);
+            ginfo.var.address_space =
+                crate::common::type_builder::object_storage_address_space_with_object(
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
+                    &declarator.derived,
+                    declarator.attrs.object_space,
+                );
+            if let Some(ref mut ct) = ginfo.var.c_type {
+                crate::common::type_builder::apply_declaration_address_space_for_object(
+                    ct,
+                    self.declaration_address_space(decl.address_space, &decl.type_spec),
+                    &declarator.derived,
+                );
+            }
+            self.globals.insert(declarator.name.clone(), ginfo);
+        }
+        self.emit_extern_tls_global(decl, declarator);
+        self.record_extern_data_size(decl, declarator);
+        true
+    }
+
+    /// Record the declared size of an `extern` data object in
+    /// [`IrModule::extern_data_sizes`]: a non-weak object symbol resolves to a
+    /// real object at least that large once the program links, so LICM may
+    /// read it speculatively (GCC's `tree_could_trap_p` makes the same
+    /// argument for non-weak `DECL_EXTERNAL` variables). Shared by the
+    /// file-scope and block-scope `extern` paths.
+    pub(super) fn record_extern_data_size(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) {
+        // `extern int U[];` has no size this unit can vouch for (the lowered
+        // allocation size of an unsized array is not the object's size).
+        if decl.is_thread_local()
+            || declarator.name.is_empty()
+            || DerivedDeclarator::declares_function(&declarator.derived)
+            || self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+        {
+            return;
+        }
+        let da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        if da.actual_alloc_size == 0 || matches!(da.c_type, Some(CType::Function(_))) {
+            return;
+        }
+        let size = self
+            .module
+            .extern_data_sizes
+            .entry(declarator.name.clone())
+            .or_insert(0);
+        *size = (*size).max(da.actual_alloc_size);
+    }
+
+    /// Emit the `extern` IrGlobal of a TLS object this unit declares but does
+    /// not define, so every reference to it is lowered with a TLS access
+    /// sequence. Shared by the file-scope and the block-scope `extern` paths:
+    /// without it a block-scope `extern __thread int z;` was addressed as
+    /// ordinary data (`z(%rip)`), which reads and WRITES the `.tdata`
+    /// initialisation template instead of the thread's copy (measured: a
+    /// store of 7 through it left the thread's `z` at its initialiser 41).
+    /// A later definition replaces the entry (`handle_global_redeclaration`).
+    pub(super) fn emit_extern_tls_global(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) {
+        if !decl.is_thread_local() || self.emitted_global_names.contains(&declarator.name) {
+            return;
+        }
+        let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        da.apply_decl_vector_type(decl);
+        self.module.globals.push(IrGlobal {
+            name: declarator.name.clone(),
+            ty: da.var_ty,
+            size: da.actual_alloc_size,
+            align: da.var_ty.align(),
+            init: GlobalInit::Zero,
+            is_static: false,
+            is_extern: true,
+            is_common: false,
+            section: None,
+            is_weak: declarator.attrs.is_weak(),
+            visibility: declarator.attrs.visibility.clone(),
+            has_explicit_align: false,
+            is_const: false,
+            is_used: false,
+            is_retain: false,
+            is_nocommon: false,
+            is_thread_local: true,
+        });
+        self.emitted_global_names.insert(declarator.name.clone());
+    }
+
+    /// The IR (= assembly) name of a file-scope object: its asm label, taken
+    /// from this declarator or an earlier declaration of the same symbol,
+    /// unless the label names a register (which pins, never renames).
+    pub(super) fn global_object_ir_name(&self, declarator: &InitDeclarator) -> String {
+        self.asm_label_map
+            .get(&declarator.name)
+            .cloned()
+            .or_else(|| declarator.attrs.asm_register.clone())
+            .filter(|n| !crate::ir::lowering::lower::is_x86_register_name(n))
+            .unwrap_or_else(|| declarator.name.clone())
+    }
+
+    /// Record the `__attribute__((tls_model))` of one declaration of the
+    /// object `ir_name`, or warn with GCC 16.2's `-Wattributes` text when the
+    /// attribute does not apply. GCC 16.2 (measured, file and block scope
+    /// alike) gives a TLS symbol the model of its LAST declaration in source
+    /// order, for every access in the translation unit: a later explicit
+    /// model replaces an earlier one, and a later plain declaration (or
+    /// definition) drops it back to the default
+    /// (`extern __thread int x __attribute__((tls_model("initial-exec")));
+    /// __thread int x;` is global-dynamic under -fPIC). So every declaration
+    /// of a thread-local object must come through here, annotated or not.
+    pub(super) fn record_tls_model_attr(
+        &mut self,
+        ir_name: String,
+        declarator: &InitDeclarator,
+        subject: TlsAttrSubject,
+    ) {
+        let why = match subject {
+            TlsAttrSubject::ThreadLocal => {
+                match declarator.attrs.tls_model {
+                    Some(model) => self.module.tls_model_attrs.insert(ir_name, model),
+                    None => self.module.tls_model_attrs.remove(&ir_name),
+                };
+                return;
+            }
+            TlsAttrSubject::Variable => "does not have thread storage duration",
+            TlsAttrSubject::Function => "is not a variable",
+        };
+        if declarator.attrs.tls_model.is_none() {
+            return;
+        }
+        self.diagnostics.borrow_mut().warning_with_kind(
+            format!(
+                "'tls_model' attribute ignored because '{}' {why}",
+                declarator.name
+            ),
+            declarator.span,
+            crate::common::error::WarningKind::Attributes,
+        );
+    }
+
+    /// Handle tentative definitions and re-declarations. Returns whether to skip
+    /// or proceed (with prior weak flag preserved).
+    fn handle_global_redeclaration(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) -> RedeclResult {
+        if !self.globals.contains_key(&declarator.name) {
+            return RedeclResult::Proceed {
+                prior_was_weak: false,
+            };
+        }
+        if declarator.init.is_none() {
+            if self.emitted_global_names.contains(&declarator.name) {
+                // `int x[]; ... int x[300];` -- the composite of the two
+                // tentative definitions is `int[300]` (C11 6.2.7p3), so the
+                // provisional one-element storage of the first is replaced.
+                // Keeping it (the old behaviour: a fixed 256-element
+                // placeholder) under-allocated any array longer than that.
+                if !decl.is_extern()
+                    && self.tentative_incomplete_arrays.contains(&declarator.name)
+                    && !self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+                {
+                    let prior_was_weak = self
+                        .module
+                        .globals
+                        .iter()
+                        .find(|g| g.name == declarator.name)
+                        .is_some_and(|g| g.is_weak);
+                    self.module.globals.retain(|g| g.name != declarator.name);
+                    self.emitted_global_names.remove(&declarator.name);
+                    self.tentative_incomplete_arrays.remove(&declarator.name);
+                    return RedeclResult::Proceed {
+                        prior_was_weak: prior_was_weak || declarator.attrs.is_weak(),
+                    };
+                }
+                let prior_is_extern = self
+                    .module
+                    .globals
+                    .iter()
+                    .any(|g| g.name == declarator.name && g.is_extern);
+                if prior_is_extern && !decl.is_extern() {
+                    // Remove old extern entry and re-emit as defined
+                    let prior_was_weak = self
+                        .module
+                        .globals
+                        .iter()
+                        .find(|g| g.name == declarator.name)
+                        .is_some_and(|g| g.is_weak);
+                    self.module.globals.retain(|g| g.name != declarator.name);
+                    self.emitted_global_names.remove(&declarator.name);
+                    return RedeclResult::Proceed { prior_was_weak };
+                }
+                // Propagate __weak to already-emitted global if this redeclaration carries it.
+                if declarator.attrs.is_weak() {
+                    for g in &mut self.module.globals {
+                        if g.name == declarator.name {
+                            g.is_weak = true;
+                            break;
+                        }
+                    }
+                }
+                return RedeclResult::Skip;
+            }
+        } else {
+            let prior_was_weak = self
+                .module
+                .globals
+                .iter()
+                .find(|g| g.name == declarator.name)
+                .is_some_and(|g| g.is_weak);
+            self.module.globals.retain(|g| g.name != declarator.name);
+            self.emitted_global_names.remove(&declarator.name);
+            self.tentative_incomplete_arrays.remove(&declarator.name);
+            return RedeclResult::Proceed { prior_was_weak };
+        }
+        RedeclResult::Proceed {
+            prior_was_weak: false,
+        }
+    }
+
+    /// Attach the qualifiers that `CType` does not carry. Every declaration
+    /// path, including an `extern` with no definition in this translation
+    /// unit, needs these flags before any expression can read the object.
+    pub(super) fn apply_declaration_qualifiers(
+        &self,
+        da: &mut DeclAnalysis,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        inherited_volatile: bool,
+    ) {
+        da.base_type_volatile = decl.is_volatile() || inherited_volatile;
+        da.base_type_const =
+            crate::common::qualifiers::type_name_const_base(&decl.type_spec, decl.is_const(), self);
+        da.object_volatile = declarator.attrs.object_volatile;
+    }
+
+    /// Run declaration analysis with vector_size, array-of-pointers fixup, unsized
+    /// array fixup, and scalar size adjustment.
+    fn prepare_global_analysis(
+        &self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        inherited_volatile: bool,
+    ) -> DeclAnalysis {
+        let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
+        da.apply_decl_vector_type(decl);
+        if da.is_array_of_pointers || da.is_array_of_func_ptrs {
+            da.struct_layout = None;
+            da.is_struct = false;
+        }
+        self.fixup_unsized_array(
+            &mut da,
+            &decl.type_spec,
+            &declarator.derived,
+            &declarator.init,
+        );
+        if declarator.init.is_none()
+            && !decl.is_extern()
+            && da.is_array
+            && self.declares_unsized_array(&decl.type_spec, &declarator.derived)
+        {
+            // A tentative definition whose array type is still incomplete
+            // at the end of the translation unit behaves as if it had a zero
+            // initializer: the array has ONE element (C11 6.9.2p2 and
+            // example 6.9.2p5; GCC warns "array assumed to have one
+            // element"). The outermost stride is the size of that element
+            // (`int w[][3]` is 12 bytes). A later complete declaration
+            // replaces this storage (handle_global_redeclaration).
+            let one = da
+                .array_dim_strides
+                .first()
+                .copied()
+                .unwrap_or(da.elem_size)
+                .max(1);
+            da.alloc_size = one;
+            da.actual_alloc_size = one;
+        }
+        self.fix_static_scalar_size(&mut da, &decl.type_spec);
+        da
+    }
+
+    /// Stack allocations may be rounded up to the target pointer width, but
+    /// static objects (including block-scope statics and TLS) need their C
+    /// object size in both the ELF symbol table and zero-filled storage.
+    pub(super) fn fix_static_scalar_size(&self, da: &mut DeclAnalysis, type_spec: &TypeSpecifier) {
+        if !da.is_array && !da.is_pointer && da.struct_layout.is_none() {
+            // Vectors use a pointer IR carrier. The fully resolved CType also
+            // includes declaration-level vector_size/ext_vector_type, which a
+            // bare sizeof(type_spec) can otherwise miss.
+            da.actual_alloc_size =
+                if let Some(vector) = da.c_type.as_ref().filter(|c| c.is_vector()) {
+                    vector.size_ctx(&*self.types.borrow_struct_layouts())
+                } else {
+                    self.sizeof_type(type_spec).max(da.var_ty.size())
+                };
+        }
+    }
+
+    fn lower_declarator_init(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        da: &DeclAnalysis,
+    ) -> GlobalInit {
+        if let Some(ref initializer) = declarator.init {
+            let init_base_ty = if da.is_pointer && !da.is_array {
+                da.var_ty
+            } else if da.is_array_of_pointers || da.is_array_of_func_ptrs {
+                IrType::Ptr
+            } else {
+                da.base_ty
+            };
+            // `struct_layout` may describe the pointee of a pointer declaration.
+            // It must not shape the pointer object's own brace initializer:
+            //
+            //     static const struct big *p = { &object };
+            //
+            // The object is one pointer wide, not `sizeof(struct big)`.  Passing
+            // the pointee layout here made compound lowering append trailing
+            // struct padding after the relocation while IrGlobal::size remained
+            // 8, bloating custom pointer-table sections and making their consumers
+            // iterate across zero-filled phantom entries.
+            let object_struct_layout = if da.is_pointer {
+                None
+            } else {
+                da.struct_layout.clone()
+            };
+            self.lower_global_init(
+                initializer,
+                &decl.type_spec,
+                init_base_ty,
+                da.is_array,
+                da.elem_size,
+                da.actual_alloc_size,
+                &object_struct_layout,
+                &da.array_dim_strides,
+                da.c_type.as_ref(),
+            )
+        } else {
+            GlobalInit::Zero
+        }
+    }
+
+    /// Alignment of a static object and, when present, the explicit request
+    /// (`aligned(N)`, `_Alignas`, typedef `aligned`) before natural alignment.
+    pub(super) fn compute_static_alignment(
+        &self,
+        decl: &Declaration,
+        type_spec: &TypeSpecifier,
+        da: &DeclAnalysis,
+    ) -> (usize, Option<usize>) {
+        let c_align = self.alignof_type(type_spec);
+        let vector_object = da
+            .c_type
+            .as_ref()
+            .filter(|ty| is_vector_object_or_array_of_vectors(ty));
+        let natural = if let Some(ty) = vector_object {
+            ty.align_ctx(&*self.types.borrow_struct_layouts())
+                .max(c_align)
+                .max(1)
+        } else if c_align > 0 {
+            c_align.max(da.var_ty.align())
+        } else {
+            da.var_ty.align()
+        };
+        // The strictest explicit source wins (C11 6.7.5p6): `_Alignas(type)`
+        // does not discard an `aligned(N)` written next to it.
+        let mut explicit = crate::common::types::strictest_alignment([
+            decl.alignment,
+            decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
+        ]);
+        if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
+            let real_sizeof = self.sizeof_type(sizeof_ts);
+            explicit = Some(explicit.map_or(real_sizeof, |a| a.max(real_sizeof)));
+        }
+        if let Some(&td_align) = self.typedef_alignment_for_type_spec(type_spec) {
+            explicit = Some(explicit.map_or(td_align, |a| a.max(td_align)));
+        }
+        match explicit {
+            Some(explicit_val) => (natural.max(explicit_val), Some(explicit_val)),
+            None => (natural, None),
+        }
+    }
+
+    fn emit_ir_global(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        da: &DeclAnalysis,
+        init: GlobalInit,
+        align: usize,
+        has_explicit_align: bool,
+        is_extern_decl: bool,
+        prior_was_weak: bool,
+    ) {
+        let global_ty = da.resolve_global_ty(&init);
+        let final_size = da.initialized_static_size(&init);
+        // For pointer variables, decl.is_const refers to the pointee type, not
+        // the pointer, so `const char *p` must NOT be treated as a read-only
+        // object -- `p` itself is writable.
+        //
+        // `char *const p` is the opposite case: the POINTER is read-only.  The
+        // parser records that separately (`decl_flag::POINTER_CONST`, set from
+        // a `const` seen after a `*` in the declarator) because the two cannot
+        // be distinguished from `is_const()` alone.
+        //
+        // The distinction matters beyond diagnostics: `classify_global` sends a
+        // const global whose initializer needs a relocation to `.data.rel.ro`,
+        // and a non-const one to `.data`.  Under -fPIE a pointer initialized
+        // with the address of a string literal needs a relocation, so getting
+        // this wrong emits an absolute R_X86_64_64 into writable `.data`, which
+        // becomes a run-time `.rela.dyn` entry at link time.
+        //
+        // linux-cachymod 6.18.47 caught this in
+        // `lib/zstd/common/error_private.c`:
+        //
+        //     static const char* const notErrorCode = "Unspecified error code";
+        //
+        // Inlined into the boot decompressor, it produced one R_X86_64_64 in
+        // `.rela.data`, and the kernel's own link-time check rejected the
+        // image:
+        //
+        //     ld: Unexpected run-time relocations (.rela) detected!
+        //
+        // GCC constant-folds the same declaration into direct PC-relative
+        // references and emits no data object at all.
+        let var_is_const = (decl.is_const()
+            && !da.is_pointer
+            && !da.is_array_of_pointers
+            && !da.is_array_of_func_ptrs)
+            || (decl.is_pointer_const() && da.is_pointer);
+
+        self.emitted_global_names.insert(declarator.name.clone());
+        // Honour the declaration's asm label (`extern int x __asm("abccb"); int x = 1;`
+        // emits the definition as `abccb:`, matching GCC).
+        // __asm__("label") redirect on a variable DEFINITION: emit the global
+        // under the asm label (glibc configure alias test:
+        // `extern __typeof (dfoo) dfoo __asm ("abccb"); int dfoo = 1;` must
+        // define `abccb`, not `dfoo`). The label may come from an EARLIER
+        // declaration of the same symbol (collected in asm_label_map), or
+        // directly on this declarator; real register names pin globals and
+        // are never used as rename targets.
+        let emit_name = self.global_object_ir_name(declarator);
+        // Keep a byte image of a CONST object whose initializer is constant
+        // and relocation-free: a later read of one of its elements or members
+        // (`static const int t[2] = {1, 2}; static int v = t[1];`) folds to the
+        // value the program loads.  A volatile object never folds (C11 6.7.3p7),
+        // and an `extern` declaration has no initializer to image.
+        //
+        // The const requirement is load-bearing (divergence from closed PR
+        // #816, whose base only consulted images from the static-initializer
+        // path where sema had already proven const-ness): HEAD's lowering
+        // calls `eval_const_expr` opportunistically on RUNTIME expressions
+        // too, so an image of a mutable object would fold reads that must
+        // observe stores (`static __thread unsigned long arr[4]` in
+        // tls_local_exec_direct folded to its zero image and dropped the
+        // whole `arr[0]+..+arr[3]` sum).  TLS and named-address-space
+        // (`__seg_gs`/`__seg_fs`) objects are excluded as well: their storage
+        // is per-thread/per-segment, so the emitted initializer does not
+        // describe what a load observes at runtime.
+        let image_storage_space =
+            crate::common::type_builder::object_storage_address_space_with_object(
+                self.declaration_address_space(decl.address_space, &decl.type_spec),
+                &declarator.derived,
+                declarator.attrs.object_space,
+            );
+        if var_is_const
+            && !decl.is_thread_local()
+            && image_storage_space == crate::common::types::AddressSpace::Default
+            && !is_extern_decl
+            && !da.base_type_volatile
+            && !da.object_volatile
+        {
+            if let Some(ctype) = da.c_type.clone() {
+                if let Some(bytes) = const_object_bytes(&init, final_size) {
+                    self.const_object_images
+                        .insert(declarator.name.clone(), ConstObjectImage { ctype, bytes });
+                }
+            }
+        }
+        // Object-placement attributes (GCC 16.2). Measured on `gcc-16 -c`:
+        //   `__attribute__((noinit))` on a zero-initialized object -> `.noinit`
+        //       (SHT_NOBITS); on an initialized one GCC warns
+        //       "ignoring 'noinit' attribute set on initialized variable".
+        //   `__attribute__((persistent))` on an initialized object -> `.persistent`
+        //       (PROGBITS); on a zero-initialized one GCC warns
+        //       "ignoring 'persistent' attribute set on uninitialized variable".
+        //   `__attribute__((retain))` keeps the object's *default* section and
+        //       adds SHF_GNU_RETAIN, in a section of its own
+        //       (`.data.<name>` / `.bss.<name>`) — handled by the backend,
+        //       which is the only place that knows the default section.
+        // An explicit `section(...)` wins over all three, as in GCC.
+        let explicit_section = declarator.attrs.section.clone();
+        let is_zero_init = matches!(init, GlobalInit::Zero);
+        let mut section = explicit_section;
+        if section.is_none() && declarator.attrs.is_noinit() {
+            if is_zero_init {
+                section = Some(".noinit".to_string());
+            } else {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring 'noinit' attribute set on initialized variable",
+                    declarator.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            }
+        }
+        if section.is_none() && declarator.attrs.is_persistent() {
+            if is_zero_init {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring 'persistent' attribute set on uninitialized variable",
+                    declarator.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            } else {
+                section = Some(".persistent".to_string());
+            }
+        }
+        self.module.globals.push(IrGlobal {
+            name: emit_name,
+            ty: global_ty,
+            size: final_size,
+            align,
+            init,
+            is_static: decl.is_static(),
+            is_extern: is_extern_decl,
+            // `__attribute__((nocommon))` overrides `-fcommon`: the tentative
+            // definition becomes a real `.bss` object rather than a common
+            // block (GCC 16.2).
+            is_common: decl.is_common() && !declarator.attrs.is_nocommon(),
+            is_nocommon: declarator.attrs.is_nocommon(),
+            section,
+            is_weak: declarator.attrs.is_weak() || prior_was_weak,
+            visibility: declarator.attrs.visibility.clone(),
+            has_explicit_align,
+            is_const: var_is_const,
+            is_used: declarator.attrs.is_used(),
+            is_retain: declarator.attrs.is_retain(),
+            is_thread_local: decl.is_thread_local(),
+        });
+    }
+
+    // --- Declaration analysis ---
+
+    /// Perform shared declaration analysis for both local and global variable declarations.
+    ///
+    /// Computes all type-related properties (base type, array info, pointer info, struct layout,
+    /// pointee type, etc.) that both `lower_local_decl` and `lower_global_decl` need.
+    pub(super) fn analyze_declaration(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> DeclAnalysis {
+        let mut base_ty = self.type_spec_to_ir(type_spec);
+        let (alloc_size, elem_size, is_array, is_pointer, array_dim_strides) =
+            self.compute_decl_info(type_spec, derived);
+
+        // For typedef'd array types, type_spec_to_ir returns Ptr but we need the element type
+        if is_array && base_ty == IrType::Ptr && !is_pointer {
+            let mut resolved = self.resolve_type_spec(type_spec);
+            let mut found = false;
+            while let TypeSpecifier::Array(inner, _) = resolved {
+                let inner_resolved = self.resolve_type_spec(inner);
+                if matches!(inner_resolved, TypeSpecifier::Array(_, _)) {
+                    resolved = inner_resolved;
+                } else {
+                    base_ty = self.type_spec_to_ir(inner);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                let ctype = self.type_spec_to_ctype(type_spec);
+                let mut ct = &ctype;
+                while let CType::Array(inner, _) = ct {
+                    ct = inner.as_ref();
+                }
+                base_ty = IrType::from_ctype(ct);
+            }
+        }
+
+        // Detect arrays-of-pointers and arrays-of-function-pointers.
+        // For declarations like `int (*ap[3])[4]` (array of pointers-to-arrays),
+        // derived = [Array(4), Pointer, Array(3)]. The last element is Array(3),
+        // making this an array-of-pointers. We check:
+        //   1. Any pointer before the LAST array in derived (not just the first array),
+        //      matching the logic in compute_decl_info which checks `last_is_array`.
+        //   2. Typedef'd pointer with array dimensions.
+        let is_array_of_pointers = is_array && {
+            let ptr_pos = derived
+                .iter()
+                .position(|d| matches!(d, DerivedDeclarator::Pointer(..)));
+            let last_arr_pos = derived
+                .iter()
+                .rposition(|d| matches!(d, DerivedDeclarator::Array(_)));
+            let has_derived_ptr_before_last_arr =
+                matches!((ptr_pos, last_arr_pos), (Some(pp), Some(ap)) if pp < ap);
+            let typedef_ptr_array =
+                ptr_pos.is_none() && last_arr_pos.is_some() && self.is_type_pointer(type_spec);
+            has_derived_ptr_before_last_arr || typedef_ptr_array
+        };
+        let is_array_of_func_ptrs = is_array
+            && derived.iter().any(|d| {
+                matches!(
+                    d,
+                    DerivedDeclarator::FunctionPointer(..) | DerivedDeclarator::Function(..)
+                )
+            });
+        let var_ty = if is_pointer || is_array_of_pointers || is_array_of_func_ptrs {
+            IrType::Ptr
+        } else {
+            base_ty
+        };
+
+        // Compute element IR type for arrays
+        let elem_ir_ty = if is_array && base_ty == IrType::Ptr && !is_array_of_pointers {
+            let ctype = self.type_spec_to_ctype(type_spec);
+            if let CType::Array(ref elem_ct, _) = ctype {
+                IrType::from_ctype(elem_ct)
+            } else {
+                base_ty
+            }
+        } else {
+            base_ty
+        };
+
+        let has_derived_ptr = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
+        let is_bool = self.is_type_bool(type_spec) && !has_derived_ptr && !is_array;
+
+        let struct_layout = self.get_struct_layout_for_type(type_spec).or_else(|| {
+            let ctype = self.type_spec_to_ctype(type_spec);
+            match &ctype {
+                CType::Pointer(inner, _) => self.struct_layout_from_ctype(inner),
+                CType::Array(_, _) => {
+                    // Unwrap all Array levels to find the innermost element type.
+                    // This handles multi-dimensional typedef'd arrays like:
+                    // typedef struct s tyst[2][2]; -> CType::Array(Array(Struct, 2), 2)
+                    let mut ct = &ctype;
+                    while let CType::Array(inner, _) = ct {
+                        ct = inner.as_ref();
+                    }
+                    self.struct_layout_from_ctype(ct)
+                }
+                _ => None,
+            }
+        });
+        let is_struct = struct_layout.is_some() && !is_pointer && !is_array;
+
+        let actual_alloc_size = if let Some(ref layout) = struct_layout {
+            if is_array || is_pointer {
+                alloc_size
+            } else {
+                layout.size
+            }
+        } else {
+            alloc_size
+        };
+
+        let pointee_type = self.compute_pointee_type(type_spec, derived);
+        let c_type = Some(self.build_full_ctype(type_spec, derived));
+
+        // Detect pointer-to-function-pointer: declared with 2+ consecutive Pointer
+        // entries before the first FunctionPointer (e.g., int (**fpp)(int, int)
+        // has derived=[Pointer, Pointer, FunctionPointer(...)]).
+        // This is NOT triggered for function-pointer-returning-function-pointer like
+        // int (*(*p)(int,int))(int,int) where Pointer entries are separated by
+        // FunctionPointer entries.
+        // This detection is needed because build_full_ctype absorbs extra pointer
+        // levels into the function's return type, making the CType shape ambiguous.
+        let is_ptr_to_func_ptr = {
+            // A pointer-to-function-pointer (e.g., int (**fpp)(int, int)) has derived
+            // = [Pointer, FunctionPointer, Pointer]. The extra indirection Pointer
+            // appears AFTER the FunctionPointer entry (added by combine_declarator_parts
+            // as "extra indirection" from inner_derived).
+            //
+            // In contrast, int *(*fnc)() has derived = [Pointer, Pointer, FunctionPointer]
+            // where pointers BEFORE FunctionPointer are return-type pointers, not extra
+            // indirection. The syntax-marker Pointer is always immediately before FunctionPointer.
+            //
+            // So the correct check is: has any Pointer entries AFTER the FunctionPointer entry.
+            let fptr_count = derived
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d,
+                        DerivedDeclarator::FunctionPointer(..) | DerivedDeclarator::Function(..)
+                    )
+                })
+                .count();
+            if fptr_count == 1 {
+                let mut found_fptr = false;
+                let mut ptrs_after_fptr = 0usize;
+                for d in derived {
+                    match d {
+                        DerivedDeclarator::FunctionPointer(..)
+                        | DerivedDeclarator::Function(..) => {
+                            found_fptr = true;
+                        }
+                        DerivedDeclarator::Pointer(..) if found_fptr => {
+                            ptrs_after_fptr += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                ptrs_after_fptr >= 1
+            } else {
+                false
+            }
+        };
+
+        DeclAnalysis {
+            base_ty,
+            var_ty,
+            alloc_size,
+            elem_size,
+            is_array,
+            is_pointer,
+            array_dim_strides,
+            is_array_of_pointers,
+            is_array_of_func_ptrs,
+            struct_layout,
+            is_struct,
+            actual_alloc_size,
+            pointee_type,
+            c_type,
+            is_bool,
+            elem_ir_ty,
+            is_ptr_to_func_ptr,
+            base_type_volatile: false,
+            base_type_const: false,
+            object_volatile: false,
+        }
+    }
+
+    /// Does this declarator declare an array whose outermost dimension is
+    /// unspecified (`int a[]`, `int *a[]`, `T a[][3]`, or a typedef of such a
+    /// type)?
+    ///
+    /// The declared object's own array dimensions are the TRAILING run of
+    /// `Array` entries in `derived`, in source order (`int w[][3]` is
+    /// `[Array(None), Array(3)]`; `int *a[]` is `[Pointer, Array(None)]`), so
+    /// the outermost dimension is the first entry of that run. A declarator
+    /// ending in `Pointer`/`Function*` is not an array at all (`int (*p)[]`
+    /// is `[Array(None), Pointer]`).
+    pub(super) fn declares_unsized_array(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> bool {
+        let run = derived
+            .iter()
+            .rev()
+            .take_while(|d| matches!(d, DerivedDeclarator::Array(_)))
+            .count();
+        if run == 0 {
+            return derived.is_empty()
+                && matches!(self.type_spec_to_ctype(type_spec), CType::Array(_, None));
+        }
+        matches!(derived[derived.len() - run], DerivedDeclarator::Array(None))
+    }
+
+    /// Fix up allocation size and strides for unsized arrays (int a[] = {...}).
+    /// Also updates c_type from Array(elem, None) to Array(elem, Some(count))
+    /// so that sizeof() returns the correct array size rather than pointer size.
+    pub(super) fn fixup_unsized_array(
+        &self,
+        da: &mut DeclAnalysis,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+        init: &Option<Initializer>,
+    ) {
+        let is_unsized = da.is_array
+            && (derived
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::Array(None)))
+                || matches!(self.type_spec_to_ctype(type_spec), CType::Array(_, None)));
+        if !is_unsized {
+            return;
+        }
+        if let Some(initializer) = init {
+            // Arrays of scalars (any rank) and character arrays initialized by
+            // a string take their bound from the array planner, which applies
+            // brace elision, designators and string rows exactly as the
+            // initializer lowering will.
+            let elem_ct = match da.c_type.as_ref() {
+                Some(CType::Array(elem, None)) => Some((**elem).clone()),
+                _ => None,
+            };
+            if let Some(elem) = &elem_ct {
+                if let Some(count) = self.unsized_array_len(initializer, elem) {
+                    da.alloc_size = count * self.resolve_ctype_size(elem);
+                    da.actual_alloc_size = da.alloc_size;
+                    if da.array_dim_strides.len() <= 1 {
+                        da.array_dim_strides = vec![da.elem_size];
+                    }
+                }
+            }
+            // Arrays of aggregates: one element per braced item, or per
+            // struct's worth of scalars with elided braces.
+            if let (Initializer::List(items), Some(layout)) = (initializer, &da.struct_layout) {
+                if !da.is_array_of_pointers && !da.is_array_of_func_ptrs && da.elem_size > 0 {
+                    let count = self.compute_struct_array_init_count(items, layout);
+                    let has_nested_lists = items
+                        .iter()
+                        .any(|item| matches!(&item.init, Initializer::List(_)));
+                    let item_size = if da.array_dim_strides.len() > 1 && has_nested_lists {
+                        da.array_dim_strides[0]
+                    } else {
+                        da.elem_size
+                    };
+                    da.alloc_size = count * item_size;
+                    da.actual_alloc_size = da.alloc_size;
+                    if da.array_dim_strides.len() == 1 {
+                        da.array_dim_strides = vec![da.elem_size];
+                    }
+                }
+            }
+            // Update c_type from Array(elem, None) to Array(elem, Some(count))
+            // so that sizeof() on this array returns the correct total size.
+            if da.elem_size > 0 && da.alloc_size > 0 {
+                let resolved_count = da.alloc_size / da.elem_size;
+                if let Some(CType::Array(elem, None)) = da.c_type.as_ref() {
+                    da.c_type = Some(CType::Array(elem.clone(), Some(resolved_count)));
+                }
+            }
+        }
+    }
+}

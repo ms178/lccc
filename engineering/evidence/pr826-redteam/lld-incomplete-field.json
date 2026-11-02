@@ -1,0 +1,11 @@
+{
+  "compiler": "LLD 21.1.0",
+  "returncode": 0,
+  "kind": 2,
+  "offset": 9,
+  "section_size": 16,
+  "actual_field": "58110100000000a5",
+  "expected_field": "5811010000000000",
+  "adjacent_preserved": true,
+  "conclusion": "accepted malformed input emits incomplete relocation; no adjacent-sentinel corruption observed"
+}
