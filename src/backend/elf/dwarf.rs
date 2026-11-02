@@ -5,6 +5,21 @@
 //! unit, retaining relocations to the final code section so both relocatable
 //! objects and linked images carry usable source line information.
 //!
+//! # Inputs that already carry debug sections
+//!
+//! `gcc -S -g` hands the assembler its compilation unit as assembly: `.debug_info`,
+//! `.debug_abbrev` and `.debug_aranges` as directives, an empty `.debug_line` for
+//! the assembler to fill, and `.debug_str`/`.debug_line_str` declared as
+//! mergeable string pools (`"MS",@progbits,1`).  Nothing here replaces such a
+//! section: the generated program is placed *after* the input's bytes and
+//! `DW_AT_stmt_list` names the offset it starts at ([`place_line_build`]), the
+//! two string tables continue the input's pools so an interned offset stays in
+//! one coordinate system ([`DwarfStrings::continuing`]), and the section table
+//! lists each name once.  The pools keep the `SHF_MERGE|SHF_STRINGS` shape GCC
+//! and GAS declare, which is what lets a linker keep one copy of every path
+//! across all objects of a link (measured: ten one-function units carry 126
+//! bytes of `.debug_str` and 144 of `.debug_line_str`; mold keeps 43 and 60).
+//!
 //! Like GAS (`dwarf2_finish`), an object whose source carries `.loc` rows but
 //! no `.debug_info` of its own also gets a synthesized compile unit per line
 //! program — `DW_AT_stmt_list` pointing at it, the code range, name, directory,
@@ -16,8 +31,14 @@
 //!
 //! The dialect is selected by [`DwarfConfig::version`], which the driver fills
 //! from `-gdwarf-<N>`; the default is 5 because that is what GCC 16.2 emits for
-//! a bare `-g` (measured). Every version from 2 through 5 has the header layout
-//! its specification requires:
+//! a bare `-g` (measured).  When the input brings its own `.debug_info` and the
+//! command line pinned no version, the generated program adopts that unit's
+//! dialect instead ([`DwarfConfig::continuing_unit`], [`unit_version`]): GAS does
+//! the same -- the same assembly assembled by plain `as` yields a version-2 line
+//! program from `-gdwarf-2` input and a version-5 one from `-gdwarf-5` input --
+//! and `DW_AT_stmt_list` binds the two, so a consumer that trusts the unit's
+//! dialect must be able to read the program it names.  Every version from 2
+//! through 5 has the header layout its specification requires:
 //!
 //! | version | unit header                       | line header            |
 //! |---------|-----------------------------------|------------------------|
@@ -69,7 +90,7 @@
 //! computed before the linker deletes bytes, and a map that is slightly too long
 //! would claim code belonging to the next unit -- a scan is better than a lie.
 //!
-use super::{ObjReloc, ObjSection, SHT_PROGBITS, parse_string_literal};
+use super::{ObjReloc, ObjSection, SHF_MERGE, SHF_STRINGS, SHT_PROGBITS, parse_string_literal};
 use crate::common::fx_hash::FxHashMap;
 
 /// Names the symbol at (section index, offset): see the module documentation.
@@ -275,14 +296,6 @@ pub(crate) struct DwarfLineLocation {
     pub sequence: u64,
 }
 
-/// One line program in a built `.debug_line`: its byte offset and the code
-/// section its rows describe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DwarfLineUnit {
-    pub offset: u64,
-    pub section_index: usize,
-}
-
 /// A sized function symbol, for its `DW_TAG_subprogram`.
 pub(crate) struct DwarfFunction<'a> {
     pub name: &'a str,
@@ -332,6 +345,10 @@ pub(crate) struct DwarfConfig {
     /// `DW_AT_language_version`: the `__STDC_VERSION__` year, so a debugger can
     /// tell C17 from C23 inside a `DW_LANG_C11` unit.
     pub language_version: Option<u32>,
+    /// Whether the command line pinned the version (`-gdwarf-<N>`), in which
+    /// case it is used exactly as given.  Unpinned, the dialect follows the unit
+    /// the input already carries -- see [`DwarfConfig::continuing_unit`].
+    pub version_pinned: bool,
 }
 
 impl DwarfConfig {
@@ -343,7 +360,25 @@ impl DwarfConfig {
             language: DW_LANG_MIPS_ASSEMBLER,
             language_name: None,
             language_version: None,
+            version_pinned: false,
         }
+    }
+
+    /// This configuration, adopting the dialect of the unit the input already
+    /// declares when the command line did not pin one.
+    ///
+    /// `DW_AT_stmt_list` binds a unit to its line program, so the program has to
+    /// be readable by whatever reads that unit: `gcc -S -g -gdwarf-2` hands over
+    /// a version-2 unit, and GAS derives its own default dialect from that unit
+    /// (measured on binutils 2.47: the same assembly assembled with plain `as`
+    /// yields a version-2 program, and `-gdwarf-5` assembly a version-5 one).
+    /// lccc therefore follows the unit too -- an explicit `-gdwarf-<N>` still
+    /// wins over it, because that is the caller saying which dialect they want.
+    pub(crate) fn continuing_unit(mut self, unit: Option<u8>) -> Self {
+        if let (Some(version), false) = (unit, self.version_pinned) {
+            self.version = clamp_version(version);
+        }
+        self
     }
 
     /// Debug info for a C translation unit.
@@ -374,6 +409,9 @@ impl DwarfConfig {
                 },
                 language_name: None,
                 language_version: None,
+                // A C translation unit is compiled here and now: there is no
+                // input unit whose dialect could be adopted.
+                version_pinned: true,
             };
         }
         let c11_or_newer = year.is_some_and(|year| year >= 201112);
@@ -390,6 +428,8 @@ impl DwarfConfig {
             // distinguishes them, and GCC emits it only from C17 on.
             language_name: year.filter(|year| *year >= 201710).map(|_| DW_LNAME_C),
             language_version: year.filter(|year| *year >= 201710),
+            // See the version-4 arm: a C unit is always written here.
+            version_pinned: true,
         }
     }
 }
@@ -432,6 +472,46 @@ impl DwarfStrings {
         Self::default()
     }
 
+    /// A table that continues a section the input already built.
+    ///
+    /// `gcc -S -g` writes `.debug_info`, `.debug_abbrev` and `.debug_aranges`
+    /// itself and leaves `.debug_line` empty for the assembler to fill, so the
+    /// generated program is appended to the caller's bytes.  The same holds for
+    /// the two string tables: interning then reuses a name that is already
+    /// there and appends only new ones, which keeps every offset in one
+    /// coordinate system -- the section's.
+    ///
+    /// Only positions that *start* a string (offset 0, or just after a NUL) can
+    /// be referenced by a `DW_FORM_strp`, so those are the ones indexed; a
+    /// caller that hands over bytes without a terminating NUL gets one, because
+    /// appending to an unterminated name would silently extend it.
+    pub(crate) fn continuing(existing: &[u8]) -> Self {
+        let mut this = Self {
+            data: existing.to_vec(),
+            offsets: FxHashMap::default(),
+        };
+        if this.data.last().is_some_and(|&byte| byte != 0) {
+            this.data.push(0);
+        }
+        let mut start = 0;
+        while start < this.data.len() {
+            match this.data[start..].iter().position(|&byte| byte == 0) {
+                Some(0) => {
+                    start += 1;
+                    continue;
+                }
+                Some(length) => {
+                    let text =
+                        String::from_utf8_lossy(&this.data[start..start + length]).into_owned();
+                    this.offsets.entry(text).or_insert(start as u32);
+                    start += length + 1;
+                }
+                None => break,
+            }
+        }
+        this
+    }
+
     /// The section offset of `text`, appending it on first use.
     fn intern(&mut self, text: &str) -> Result<u32, String> {
         if let Some(&offset) = self.offsets.get(text) {
@@ -462,10 +542,20 @@ impl DwarfStrings {
 // Line programs
 // ---------------------------------------------------------------------------
 
-/// A built `.debug_line` section and the units it holds.
+/// A built `.debug_line` section: one line program, covering `code_sections`.
+///
+/// One compilation unit has exactly one line program -- its header carries one
+/// directory table and one file table -- so the sections an object's code lives
+/// in become one *sequence* each inside that single program, which is the shape
+/// GAS and GCC both emit.  A unit per section instead would repeat the whole
+/// prologue for every function and hand a consumer one compilation unit per
+/// function: measured on a 121-function translation unit built with
+/// `-ffunction-sections`, `.debug_line` grew to 10,111 bytes for 478 rows where
+/// GCC needed 8,844 for 1,453 rows in one unit.
 pub(crate) struct DwarfLineBuild {
     pub line: ObjSection,
-    pub units: Vec<DwarfLineUnit>,
+    /// The code section each sequence describes, in emission order.
+    pub code_sections: Vec<usize>,
 }
 
 /// The assembler's `.file` records as a DWARF file table.
@@ -498,6 +588,28 @@ fn debug_file_table(files: &[(u32, String)]) -> Result<Vec<(u32, &str)>, String>
             table.push((*number, filename));
         }
     }
+    // Both tables are addressed by number -- a version 5 table's slot *i* is
+    // `.file i`, and versions 2..4 number their slots from 1 -- so the numbers
+    // have to run `0, 1, 2, ...` or `1, 2, 3, ...` in declaration order.  A
+    // skipped or reordered number would silently renumber every file after it
+    // and point every `DW_AT_decl_file` an input unit carries at the wrong
+    // name; GAS refuses such input ("unassigned file number 2", measured).
+    let starts_at_zero = table.first().is_some_and(|(number, _)| *number == 0);
+    if let Some((_, (number, _))) = table
+        .iter()
+        .enumerate()
+        .find(|(position, (number, _))| *number != *position as u32 + u32::from(!starts_at_zero))
+    {
+        return Err(format!(
+            "DWARF .file {number} is out of order: the numbers must run \
+             {} (a gap would renumber every file after it)",
+            if starts_at_zero {
+                "0, 1, 2, ...".to_string()
+            } else {
+                "1, 2, 3, ...".to_string()
+            }
+        ));
+    }
     Ok(table)
 }
 
@@ -523,6 +635,10 @@ struct LineTables<'a> {
     directories: Vec<&'a str>,
     /// `(directory index, base name)` per recorded file, in `.file` order.
     files: Vec<(u64, &'a str)>,
+    /// Whether the first recorded file is `.file 0`, which GCC's version-5
+    /// assembly declares (`.file 0 "dir" "unit.c"`): a version-5 table then
+    /// starts at that entry instead of repeating it.
+    primary_is_zero: bool,
 }
 
 /// Split every recorded file name into the directory index it resolves through
@@ -548,7 +664,45 @@ fn line_tables<'a>(file_table: &[(u32, &'a str)], comp_dir: &str) -> LineTables<
         };
         files.push((index, base));
     }
-    LineTables { directories, files }
+    LineTables {
+        directories,
+        files,
+        primary_is_zero: file_table.first().is_some_and(|(number, _)| *number == 0),
+    }
+}
+
+/// A version-5 file table is addressed by number: slot *i* holds `.file i`.
+///
+/// The file register a row sets and the `DW_AT_decl_file` a unit records are
+/// indexes into this table, and GAS builds it as "slot = number" in every
+/// dialect -- `as -g` on `.file 0 "d" "p.c"` / `.file 1 "a.c"` / `.loc 1 ...`
+/// resolves the row to `a.c` and keeps `p.c` in slot 0.  A table that renumbers
+/// the files one slot higher (a duplicate primary at 0 and the files after it)
+/// stays self-consistent for the rows it writes itself, but it rewrites the
+/// meaning of every `DW_AT_decl_file` an *input* unit already carries.  Measured
+/// on `gcc -gdwarf-5 -S` assembly of a unit that includes a header --
+/// `.file 0 "dir" "t.c"`, `.file 1 "h.h"`, `.file 2 "t.c"`, with the inlined
+/// helper recorded as `DW_AT_decl_file 1`: the renumbered table resolved that to
+/// `t.c`, GAS and this table to `h.h`.
+///
+/// Slot 0 is the primary file: `.file 0` itself when the input declares one
+/// (GCC does), and otherwise a repeat of the first declared file -- GCC's own
+/// tables repeat the unit's file there, and the default file register 1 has to
+/// name something.
+fn version_5_file_slots<'a>(tables: &LineTables<'a>) -> Vec<(u64, &'a str)> {
+    let Some(&primary) = tables.files.first() else {
+        return Vec::new();
+    };
+    if tables.primary_is_zero {
+        // `.file 0` is the primary, so the list already starts at slot 0.
+        return tables.files.clone();
+    }
+    // Slot 0 repeats the first file and the files follow it, so slot *i* is
+    // `.file i` here too.
+    let mut slots = Vec::with_capacity(tables.files.len() + 1);
+    slots.push(primary);
+    slots.extend(tables.files.iter().copied());
+    slots
 }
 
 /// The fixed fields of a line-program prologue, up to but not including the
@@ -608,18 +762,18 @@ fn append_line_prologue_tables(
             let offset = line_strings.intern(directory)?;
             push_strp(unit, &mut relocs, 0, abs32, ".debug_line_str", offset);
         }
-        // File name table: `DW_LNCT_directory_index` then `DW_LNCT_path`. Entry
-        // 0 repeats the first file, because the line-program file register
-        // starts at 1: index *i* of the table is file *i*, and nothing may fall
-        // off the front.
+        // File name table: `DW_LNCT_directory_index` then `DW_LNCT_path`, one
+        // entry per file with entry *i* being `.file i` (see
+        // [`version_5_file_slots`] for why the numbering is the index).
         unit.push(2); // file_name_entry_format_count
         write_uleb128(DW_LNCT_DIRECTORY_INDEX, unit);
         write_uleb128(DW_FORM_UDATA, unit);
         write_uleb128(DW_LNCT_PATH, unit);
         write_uleb128(DW_FORM_LINE_STRP, unit);
-        write_uleb128(tables.files.len() as u64 + 1, unit);
-        for (index, base) in std::iter::once(&tables.files[0]).chain(tables.files.iter()) {
-            write_uleb128(*index, unit);
+        let slots = version_5_file_slots(tables);
+        write_uleb128(slots.len() as u64, unit);
+        for (index, base) in slots {
+            write_uleb128(index, unit);
             let offset = line_strings.intern(base)?;
             push_strp(unit, &mut relocs, 0, abs32, ".debug_line_str", offset);
         }
@@ -682,11 +836,23 @@ pub(crate) fn build_dwarf_line_section(
     }
 
     let file_table = debug_file_table(files)?;
+    // Version 5 addresses its file table by number: slot 0 is the primary file,
+    // slot *i* is `.file i`.  Versions 2..4 number their entries from 1, so the
+    // register is the entry's position in that table -- which the contiguity
+    // rule in [`debug_file_table`] makes equal to the number as well.
+    let five = config.version >= 5;
     let file_index = |number: u32| -> Option<u64> {
-        file_table
+        if five && number == 0 {
+            return Some(0); // the primary file, always slot 0
+        }
+        let position = file_table
             .iter()
-            .position(|(candidate, _)| *candidate == number)
-            .map(|i| i as u64 + 1)
+            .position(|(candidate, _)| *candidate == number)?;
+        Some(if five {
+            u64::from(number)
+        } else {
+            position as u64 + 1
+        })
     };
 
     // GAS carries is_stmt and ISA across section switches. Resolve those
@@ -719,55 +885,64 @@ pub(crate) fn build_dwarf_line_section(
 
     let tables = line_tables(&file_table, comp_dir);
 
-    let mut data = Vec::new();
+    // One compilation unit owns exactly one line program -- its header carries
+    // one directory table and one file table -- so the sections this object's
+    // code lives in become one *sequence* each inside that single program,
+    // which is what GAS and GCC emit (measured: `as` 2.47 and `gcc` 16.2 write
+    // one unit with three sequences for three code sections, while a unit per
+    // section would repeat the prologue and the tables for every one of them).
+    //
+    // `DW_LNE_end_sequence` resets every row register to its initial value
+    // (DWARF 5 §6.2.5.3), so the encoder's state starts from the defaults at
+    // each sequence -- the same rule a consumer applies when it decodes them.
+    let opcode_base = if config.version >= 3 {
+        OPCODE_BASE
+    } else {
+        OPCODE_BASE_DWARF2 as u8
+    };
+    let mut unit = Vec::new();
     let mut relocs = Vec::new();
-    let mut units = Vec::new();
+    let mut code_sections = Vec::new();
+    unit.extend_from_slice(&[0; 4]); // unit_length, patched below
+    unit.extend_from_slice(&(config.version as u16).to_le_bytes());
+    if config.version >= 5 {
+        // DWARF 5's line-program header names its own address size and
+        // segment selector size; there is no unit type here (unlike
+        // `.debug_info`).
+        unit.push(address_size as u8);
+        unit.push(0); // segment_selector_size
+    }
+    let header_length_at = unit.len();
+    unit.extend_from_slice(&[0; 4]); // header_length, patched below
+    let header_start = unit.len();
+
+    write_line_prologue_header(&mut unit, config, opcode_base);
+    // The version 5 tables name their paths through relocations written against
+    // the unit's own start, and the unit *is* the section: offset 0, so the
+    // offsets need no rebasing.
+    relocs.extend(append_line_prologue_tables(
+        &mut unit,
+        config,
+        &tables,
+        comp_dir,
+        abs32,
+        line_strings,
+    )?);
+    let header_length = unit.len() - header_start;
+    let header_length = u32::try_from(header_length)
+        .map_err(|_| "DWARF line-table header exceeds 32-bit length".to_string())?;
+    unit[header_length_at..header_length_at + 4].copy_from_slice(&header_length.to_le_bytes());
+
     for (section_index, rows) in rows_by_section.iter_mut().enumerate() {
         if rows.is_empty() {
             continue;
         }
-        units.push(DwarfLineUnit {
-            offset: data.len() as u64,
-            section_index,
-        });
+        code_sections.push(section_index);
         rows.sort_by_key(|(row, _, _)| (row.offset, row.sequence));
         let code_section = &sections[section_index];
-        let opcode_base = if config.version >= 3 {
-            OPCODE_BASE
-        } else {
-            OPCODE_BASE_DWARF2 as u8
-        };
-        let mut unit = Vec::new();
-        unit.extend_from_slice(&[0; 4]); // unit_length, patched below
-        unit.extend_from_slice(&(config.version as u16).to_le_bytes());
-        if config.version >= 5 {
-            // DWARF 5's line-program header names its own address size and
-            // segment selector size; there is no unit type here (unlike
-            // `.debug_info`).
-            unit.push(address_size as u8);
-            unit.push(0); // segment_selector_size
-        }
-        let header_length_at = unit.len();
-        unit.extend_from_slice(&[0; 4]); // header_length, patched below
-        let header_start = unit.len();
-
-        write_line_prologue_header(&mut unit, config, opcode_base);
-        let table_relocs =
-            append_line_prologue_tables(&mut unit, config, &tables, comp_dir, abs32, line_strings)?;
-        // The tables name their paths through relocations written against the
-        // unit's own start; the section needs the offsets the unit will have
-        // once it is appended to it.
-        relocs.extend(table_relocs.into_iter().map(|mut reloc| {
-            reloc.offset += data.len() as u64;
-            reloc
-        }));
-        let header_length = unit.len() - header_start;
-        let header_length = u32::try_from(header_length)
-            .map_err(|_| "DWARF line-table header exceeds 32-bit length".to_string())?;
-        unit[header_length_at..header_length_at + 4].copy_from_slice(&header_length.to_le_bytes());
-
-        // Set the initial code address. The linker resolves this relocation
-        // against the executable section symbol and folds in the row offset.
+        // A sequence starts by naming its first address; the linker resolves
+        // the relocation against the code section's symbol and folds in the row
+        // offset.
         let first_offset = rows[0].0.offset;
         let (symbol_name, addend) = match symbol_at.as_deref_mut() {
             Some(symbol_at) => (symbol_at(section_index, first_offset), 0),
@@ -781,7 +956,7 @@ pub(crate) fn build_dwarf_line_section(
         push_set_address(
             &mut unit,
             &mut relocs,
-            data.len(),
+            0,
             address_size,
             absolute_relocation,
             symbol_name,
@@ -816,7 +991,7 @@ pub(crate) fn build_dwarf_line_section(
                     push_set_address(
                         &mut unit,
                         &mut relocs,
-                        data.len(),
+                        0,
                         address_size,
                         absolute_relocation,
                         symbol_name,
@@ -851,7 +1026,13 @@ pub(crate) fn build_dwarf_line_section(
             // version 3 opcodes, and `set_discriminator` is a version 4
             // extended opcode: a unit of an older version cannot express them,
             // so the state is dropped rather than written in a vocabulary its
-            // consumer does not have (GCC drops them the same way).
+            // consumer does not have.  GAS writes the opcode into a version 2
+            // or 3 unit anyway (measured on 2.47: `-gdwarf-2` assembly with
+            // `.loc ... discriminator 1` comes back with a `DW_LNE_`
+            // discriminator record), which leaves that unit describing an
+            // opcode its own dialect never defined; a consumer that trusts the
+            // header cannot decode it.  Dropping the state keeps the program
+            // readable by the consumer the header announces.
             if isa != current_isa && config.version >= 3 {
                 unit.push(12); // DW_LNS_set_isa
                 write_uleb128(isa, &mut unit);
@@ -895,7 +1076,7 @@ pub(crate) fn build_dwarf_line_section(
                 push_set_address(
                     &mut unit,
                     &mut relocs,
-                    data.len(),
+                    0,
                     address_size,
                     absolute_relocation,
                     symbol_name,
@@ -907,19 +1088,17 @@ pub(crate) fn build_dwarf_line_section(
             }
         }
         unit.extend_from_slice(&[0, 1, 1]); // DW_LNE_end_sequence
-
-        let unit_length = u32::try_from(unit.len() - 4)
-            .map_err(|_| "DWARF line-table unit exceeds 32-bit length".to_string())?;
-        unit[..4].copy_from_slice(&unit_length.to_le_bytes());
-        data.extend_from_slice(&unit);
     }
 
-    if data.is_empty() {
+    if code_sections.is_empty() {
         return Ok(None);
     }
+    let unit_length = u32::try_from(unit.len() - 4)
+        .map_err(|_| "DWARF line-table unit exceeds 32-bit length".to_string())?;
+    unit[..4].copy_from_slice(&unit_length.to_le_bytes());
     Ok(Some(DwarfLineBuild {
-        line: debug_section(".debug_line", data, relocs),
-        units,
+        line: debug_section(".debug_line", unit, relocs),
+        code_sections,
     }))
 }
 
@@ -934,6 +1113,9 @@ pub(crate) struct DwarfInfoBuild {
     pub info: ObjSection,
     pub abbrev: ObjSection,
     pub aranges: Option<ObjSection>,
+    /// `.debug_ranges`/`.debug_rnglists`, present only when the unit's code is
+    /// not one contiguous section (see [`build_debug_ranges`]).
+    pub ranges: Option<ObjSection>,
 }
 
 /// Every attribute form one object's units use, decided once from the dialect.
@@ -970,6 +1152,10 @@ struct UnitForms {
     stmt_list: u64,
     external: u64,
     language: u64,
+    /// `DW_AT_ranges`: a section offset from version 4 on, the same four bytes
+    /// as a constant before it (the attribute is a GNU extension in DWARF 2 and
+    /// a standard one from DWARF 3, where its form is `DW_FORM_data4`).
+    ranges: u64,
 }
 
 impl UnitForms {
@@ -1005,6 +1191,11 @@ impl UnitForms {
             } else {
                 DW_FORM_DATA2
             },
+            ranges: if four {
+                DW_FORM_SEC_OFFSET
+            } else {
+                DW_FORM_DATA4
+            },
         }
     }
 }
@@ -1020,6 +1211,7 @@ fn declare_unit_abbrevs(
     abbrev: &mut Vec<u8>,
     config: DwarfConfig,
     forms: UnitForms,
+    range_list: bool,
 ) -> [[u64; 2]; 2] {
     let mut cu_attrs = vec![
         (DW_AT_NAME, forms.unit_path),
@@ -1033,11 +1225,18 @@ fn declare_unit_abbrevs(
     if config.language_version.is_some() {
         cu_attrs.push((DW_AT_LANGUAGE_VERSION, DW_FORM_DATA4));
     }
-    cu_attrs.extend_from_slice(&[
-        (DW_AT_LOW_PC, DW_FORM_ADDR),
-        (DW_AT_HIGH_PC, forms.high_pc),
-        (DW_AT_STMT_LIST, forms.stmt_list),
-    ]);
+    if range_list {
+        // Code in several sections cannot be described by one low/high pair,
+        // so the unit names a range list instead; the pair form would have to
+        // span the gaps between sections, claiming code that belongs to
+        // another unit -- and, once the linker places `.text.foo` and
+        // `.text.bar` apart, to unrelated code entirely.
+        cu_attrs.push((DW_AT_RANGES, forms.ranges));
+        cu_attrs.push((DW_AT_LOW_PC, DW_FORM_ADDR));
+    } else {
+        cu_attrs.extend_from_slice(&[(DW_AT_LOW_PC, DW_FORM_ADDR), (DW_AT_HIGH_PC, forms.high_pc)]);
+    }
+    cu_attrs.push((DW_AT_STMT_LIST, forms.stmt_list));
     declare_abbrev(abbrev, 1, DW_TAG_COMPILE_UNIT, true, &cu_attrs);
     // The unspecified return type GAS uses, so a debugger never assumes `int`.
     declare_abbrev(abbrev, 2, DW_TAG_UNSPECIFIED_TYPE, false, &[]);
@@ -1080,6 +1279,52 @@ fn declare_unit_abbrevs(
     subprogram_code
 }
 
+/// The code sections a unit describes, in section order.
+///
+/// That is every section its line program has a sequence for, plus every
+/// section that holds a sized function symbol without a row: a function that
+/// optimization folded to nothing still has an address a debugger may search
+/// for, and a range list has to cover every address the unit's DIEs name.
+/// A section neither list names is not this unit's code.  One pass over the
+/// section table and one over the symbols; a name that does not resolve is a
+/// writer bug, not input, because both lists are built from this same table.
+///
+/// Returns the coverage as a bitmap indexed by section (the subprogram walk
+/// asks it again) and the covered sections in section order (the unit's address
+/// map walks those).
+fn covered_code_sections<'a, 's>(
+    sections: &'s [DwarfSectionInfo<'a>],
+    code_sections: &[usize],
+    functions: &[DwarfFunction<'a>],
+) -> Result<(Vec<bool>, Vec<&'s DwarfSectionInfo<'a>>), String> {
+    let mut covered = vec![false; sections.len()];
+    for &index in code_sections {
+        let slot = covered
+            .get_mut(index)
+            .ok_or_else(|| format!("internal: DWARF line build names missing section {index}"))?;
+        *slot = true;
+    }
+    for function in functions {
+        if function.size == 0 {
+            continue;
+        }
+        let slot = covered.get_mut(function.section_index).ok_or_else(|| {
+            format!(
+                "internal: DWARF function '{}' names missing section {}",
+                function.name, function.section_index
+            )
+        })?;
+        *slot = true;
+    }
+    let listed: Vec<&DwarfSectionInfo<'a>> = covered
+        .iter()
+        .enumerate()
+        .filter(|&(_, inside)| *inside)
+        .map(|(index, _)| &sections[index])
+        .collect();
+    Ok((covered, listed))
+}
+
 /// Build `.debug_info` and `.debug_abbrev` for the line programs `units`.
 ///
 /// Each unit gets one `DW_TAG_compile_unit` spanning its code section, with a
@@ -1111,7 +1356,8 @@ fn declare_unit_abbrevs(
 /// `DW_AT_language` takes the smallest constant form that holds its code.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dwarf_info_sections(
-    units: &[DwarfLineUnit],
+    code_sections: &[usize],
+    stmt_list: u64,
     files: &[(u32, String)],
     locations: &[DwarfLineLocation],
     sections: &[DwarfSectionInfo<'_>],
@@ -1127,7 +1373,7 @@ pub(crate) fn build_dwarf_info_sections(
     line_strings: &mut DwarfStrings,
     mut symbol_at: SymbolAt<'_, '_>,
 ) -> Result<Option<DwarfInfoBuild>, String> {
-    if units.is_empty() {
+    if code_sections.is_empty() {
         return Ok(None);
     }
     if !matches!(address_size, 4 | 8) {
@@ -1174,77 +1420,104 @@ pub(crate) fn build_dwarf_info_sections(
         if row_offset >= end || line == 0 || file_number == 0 {
             return None;
         }
-        let file = file_table.iter().position(|(n, _)| *n == file_number)? + 1;
-        Some((file as u64, u64::from(line)))
+        // The same numbering the line program uses (see `file_index`): the
+        // number itself for version 5, the 1-based slot before it.
+        let position = file_table.iter().position(|(n, _)| *n == file_number)?;
+        let file = if config.version >= 5 {
+            u64::from(file_number)
+        } else {
+            position as u64 + 1
+        };
+        Some((file, u64::from(line)))
     };
 
+    let (covered, code) = covered_code_sections(sections, code_sections, functions)?;
+    let Some(first) = code.first() else {
+        return Ok(None);
+    };
+    // One range covers the unit exactly when its code is one contiguous
+    // section; anything else needs a range list.
+    let range_list = code.len() > 1;
+
     let mut abbrev = Vec::new();
-    let subprogram_code = declare_unit_abbrevs(&mut abbrev, config, forms);
+    let subprogram_code = declare_unit_abbrevs(&mut abbrev, config, forms, range_list);
 
     let mut info = Vec::new();
     let mut relocs = Vec::new();
-    // One address range per unit, keyed by the unit's offset in `.debug_info`.
-    let mut ranges: Vec<(u64, &DwarfSectionInfo<'_>)> = Vec::with_capacity(units.len());
     let length32 = |value: u64, what: &str| {
         u32::try_from(value).map_err(|_| format!("DWARF {what} exceeds 32 bits"))
     };
-    for unit in units {
-        let code = sections.get(unit.section_index).ok_or_else(|| {
-            format!(
-                "internal: DWARF line unit refers to missing section {}",
-                unit.section_index
-            )
-        })?;
-        let start = info.len();
-        ranges.push((start as u64, code));
-        info.extend_from_slice(&[0; 4]); // unit_length, patched below
-        info.extend_from_slice(&(config.version as u16).to_le_bytes());
-        if config.version >= 5 {
-            info.push(DW_UT_COMPILE);
-            info.push(address_size as u8);
-            push_reloc(&mut info, &mut relocs, abs32, 4, ".debug_abbrev", 0)?;
-        } else {
-            push_reloc(&mut info, &mut relocs, abs32, 4, ".debug_abbrev", 0)?;
-            info.push(address_size as u8);
-        }
+    let start = info.len();
+    info.extend_from_slice(&[0; 4]); // unit_length, patched below
+    info.extend_from_slice(&(config.version as u16).to_le_bytes());
+    if config.version >= 5 {
+        info.push(DW_UT_COMPILE);
+        info.push(address_size as u8);
+        push_reloc(&mut info, &mut relocs, abs32, 4, ".debug_abbrev", 0)?;
+    } else {
+        push_reloc(&mut info, &mut relocs, abs32, 4, ".debug_abbrev", 0)?;
+        info.push(address_size as u8);
+    }
 
-        write_uleb128(1, &mut info);
-        // Unit name, compilation directory and producer, in abbreviation order.
-        for (text, form) in [
-            (primary_file, forms.unit_path),
-            (comp_dir, forms.unit_path),
-            (producer, forms.string),
-        ] {
-            write_string_attribute(
-                text,
-                form,
-                &mut info,
-                &mut relocs,
-                abs32,
-                strings,
-                line_strings,
-            )?;
-        }
-        if forms.language == DW_FORM_DATA1 {
-            info.push(u8::try_from(config.language).map_err(|_| {
-                format!(
-                    "DWARF language code {} does not fit in a byte",
-                    config.language
-                )
-            })?);
+    write_uleb128(1, &mut info);
+    // Unit name, compilation directory and producer, in abbreviation order.
+    for (text, form) in [
+        (primary_file, forms.unit_path),
+        (comp_dir, forms.unit_path),
+        (producer, forms.string),
+    ] {
+        write_string_attribute(
+            text,
+            form,
+            &mut info,
+            &mut relocs,
+            abs32,
+            strings,
+            line_strings,
+        )?;
+    }
+    if forms.language == DW_FORM_DATA1 {
+        info.push(u8::try_from(config.language).map_err(|_| {
+            format!(
+                "DWARF language code {} does not fit in a byte",
+                config.language
+            )
+        })?);
+    } else {
+        info.extend_from_slice(&config.language.to_le_bytes());
+    }
+    if let Some(name) = config.language_name {
+        info.push(u8::try_from(name).map_err(|_| "DW_AT_language_name too large")?);
+    }
+    if let Some(version) = config.language_version {
+        info.extend_from_slice(&version.to_le_bytes());
+    }
+    if range_list {
+        // The offset of the first range list.  A version 5 table starts with
+        // its twelve-byte header, so its first list -- and therefore this
+        // attribute -- is 12; `.debug_ranges` has no header and starts at 0.
+        let (section, addend) = if config.version >= 5 {
+            (".debug_rnglists", 12)
         } else {
-            info.extend_from_slice(&config.language.to_le_bytes());
-        }
-        if let Some(name) = config.language_name {
-            info.push(u8::try_from(name).map_err(|_| "DW_AT_language_name too large")?);
-        }
-        if let Some(version) = config.language_version {
-            info.extend_from_slice(&version.to_le_bytes());
-        }
-        push_reloc(&mut info, &mut relocs, abs_addr, address_size, code.name, 0)?;
+            (".debug_ranges", 0)
+        };
+        push_reloc(&mut info, &mut relocs, abs32, 4, section, addend)?;
+    }
+    // The unit's base address: the start of its first range.  With a range
+    // list present this is the base a consumer may offset ranges against
+    // (DWARF 5 §2.17.3); without one it is simply the start of the code.
+    push_reloc(
+        &mut info,
+        &mut relocs,
+        abs_addr,
+        address_size,
+        first.name,
+        0,
+    )?;
+    if !range_list {
         if forms.high_pc == DW_FORM_ADDR {
             if let Some(symbol_at) = symbol_at.as_deref_mut() {
-                let end = symbol_at(unit.section_index, code.size);
+                let end = symbol_at(code_sections[0], first.size);
                 push_reloc(&mut info, &mut relocs, abs_addr, address_size, &end, 0)?;
             } else {
                 push_reloc(
@@ -1252,100 +1525,137 @@ pub(crate) fn build_dwarf_info_sections(
                     &mut relocs,
                     abs_addr,
                     address_size,
-                    code.name,
-                    code.size,
+                    first.name,
+                    first.size,
                 )?;
             }
         } else {
-            info.extend_from_slice(&code.size.to_le_bytes());
+            info.extend_from_slice(&first.size.to_le_bytes());
         }
-        push_reloc(&mut info, &mut relocs, abs32, 4, ".debug_line", unit.offset)?;
+    }
+    // The object has one line program; `stmt_list` is where it starts, which is
+    // zero unless the input had already begun a `.debug_line` section of its
+    // own (`gcc -S -g` leaves an empty one for the assembler to fill).
+    push_reloc(&mut info, &mut relocs, abs32, 4, ".debug_line", stmt_list)?;
 
-        let void_die = length32((info.len() - start) as u64, "unit")?;
-        write_uleb128(2, &mut info);
+    let void_die = length32((info.len() - start) as u64, "unit")?;
+    write_uleb128(2, &mut info);
 
-        let mut members: Vec<&DwarfFunction<'_>> = functions
-            .iter()
-            .filter(|f| f.section_index == unit.section_index && f.size != 0)
-            .filter(|f| {
-                f.offset
-                    .checked_add(f.size)
-                    .is_some_and(|end| end <= code.size)
-            })
-            .collect();
-        members.sort_by(|a, b| (a.offset, a.name).cmp(&(b.offset, b.name)));
-        for function in members {
-            if function.name.as_bytes().contains(&0) {
-                return Err(format!(
-                    "DWARF function name contains a NUL byte: {:?}",
-                    function.name
-                ));
-            }
-            let known = declaration(unit.section_index, function.offset, function.size);
-            let abbrev_code =
-                subprogram_code[usize::from(known.is_none())][usize::from(function.external)];
-            write_uleb128(abbrev_code, &mut info);
-            write_string_attribute(
-                function.name,
-                forms.string,
+    let mut members: Vec<&DwarfFunction<'_>> = functions
+        .iter()
+        .filter(|f| f.size != 0 && covered[f.section_index])
+        .filter(|f| {
+            sections[f.section_index]
+                .size
+                .checked_sub(f.size)
+                .is_some_and(|limit| f.offset <= limit)
+        })
+        .collect();
+    members.sort_by(|a, b| {
+        (a.section_index, a.offset, a.name).cmp(&(b.section_index, b.offset, b.name))
+    });
+    for function in members {
+        if function.name.as_bytes().contains(&0) {
+            return Err(format!(
+                "DWARF function name contains a NUL byte: {:?}",
+                function.name
+            ));
+        }
+        let known = declaration(function.section_index, function.offset, function.size);
+        let abbrev_code =
+            subprogram_code[usize::from(known.is_none())][usize::from(function.external)];
+        write_uleb128(abbrev_code, &mut info);
+        write_string_attribute(
+            function.name,
+            forms.string,
+            &mut info,
+            &mut relocs,
+            abs32,
+            strings,
+            line_strings,
+        )?;
+        if config.version < 4 {
+            // `DW_FORM_flag`: the byte after the name says whether the
+            // function is external. From DWARF 4 on the attribute is a
+            // `flag_present` and only exists on external functions.
+            info.push(u8::from(function.external));
+        }
+        if let Some((file, line)) = known {
+            write_uleb128(file, &mut info);
+            write_uleb128(line, &mut info);
+        }
+        info.extend_from_slice(&void_die.to_le_bytes());
+        if let Some(symbol_at) = symbol_at.as_deref_mut() {
+            let start_at = symbol_at(function.section_index, function.offset);
+            let end_at = symbol_at(function.section_index, function.offset + function.size);
+            push_reloc(&mut info, &mut relocs, abs_addr, address_size, &start_at, 0)?;
+            push_reloc(&mut info, &mut relocs, abs_addr, address_size, &end_at, 0)?;
+        } else {
+            let section = &sections[function.section_index];
+            push_reloc(
                 &mut info,
                 &mut relocs,
-                abs32,
-                strings,
-                line_strings,
+                abs_addr,
+                address_size,
+                section.name,
+                function.offset,
             )?;
-            if config.version < 4 {
-                // `DW_FORM_flag`: the byte after the name says whether the
-                // function is external. From DWARF 4 on the attribute is a
-                // `flag_present` and only exists on external functions.
-                info.push(u8::from(function.external));
-            }
-            if let Some((file, line)) = known {
-                write_uleb128(file, &mut info);
-                write_uleb128(line, &mut info);
-            }
-            info.extend_from_slice(&void_die.to_le_bytes());
-            if let Some(symbol_at) = symbol_at.as_deref_mut() {
-                let start = symbol_at(unit.section_index, function.offset);
-                let end = symbol_at(unit.section_index, function.offset + function.size);
-                push_reloc(&mut info, &mut relocs, abs_addr, address_size, &start, 0)?;
-                push_reloc(&mut info, &mut relocs, abs_addr, address_size, &end, 0)?;
-            } else {
+            if forms.high_pc == DW_FORM_ADDR {
+                let end = function.offset.checked_add(function.size).ok_or_else(|| {
+                    "internal: DWARF function range overflows the code section".to_string()
+                })?;
                 push_reloc(
                     &mut info,
                     &mut relocs,
                     abs_addr,
                     address_size,
-                    code.name,
-                    function.offset,
+                    section.name,
+                    end,
                 )?;
-                if forms.high_pc == DW_FORM_ADDR {
-                    let end = function.offset.checked_add(function.size).ok_or_else(|| {
-                        "internal: DWARF function range overflows the code section".to_string()
-                    })?;
-                    push_reloc(
-                        &mut info,
-                        &mut relocs,
-                        abs_addr,
-                        address_size,
-                        code.name,
-                        end,
-                    )?;
-                } else {
-                    info.extend_from_slice(&function.size.to_le_bytes());
-                }
+            } else {
+                info.extend_from_slice(&function.size.to_le_bytes());
             }
         }
-        info.push(0); // end of the unit's children
-
-        let unit_length = length32((info.len() - start - 4) as u64, "unit")?;
-        info[start..start + 4].copy_from_slice(&unit_length.to_le_bytes());
     }
+    info.push(0); // end of the unit's children
+
+    let unit_length = length32((info.len() - start - 4) as u64, "unit")?;
+    info[start..start + 4].copy_from_slice(&unit_length.to_le_bytes());
     Ok(Some(DwarfInfoBuild {
         info: debug_section(".debug_info", info, relocs),
         abbrev: debug_section(".debug_abbrev", abbrev, Vec::new()),
-        aranges: build_debug_aranges(&ranges, address_size, abs32, abs_addr, labels)?,
+        aranges: build_debug_aranges(start as u64, &code, address_size, abs32, abs_addr, labels)?,
+        ranges: build_debug_ranges(config, &code, address_size, abs_addr)?,
     }))
+}
+
+/// Move a built line program to where it starts inside the section it belongs
+/// to, and answer that offset.
+///
+/// The builder writes one program starting at zero, which is the whole section
+/// for an assembler-generated object.  An input that declares `.debug_line`
+/// itself -- `gcc -S -g` emits `.section .debug_line` and an empty
+/// `.Ldebug_line0`, expecting the assembler to fill it, exactly as GAS does --
+/// keeps its bytes and the generated program follows them; every relocation
+/// offset then moves by the prefix length, and the program's offset is the
+/// `DW_AT_stmt_list` value of the unit that describes it.
+pub(crate) fn place_line_build(build: &mut DwarfLineBuild, prefix: &[u8]) -> Result<u64, String> {
+    let base = u64::try_from(prefix.len())
+        .map_err(|_| "debug section prefix exceeds the addressable size".to_string())?;
+    if base == 0 {
+        return Ok(0);
+    }
+    for reloc in &mut build.line.relocs {
+        reloc.offset = reloc
+            .offset
+            .checked_add(base)
+            .ok_or_else(|| "DWARF line-table relocation offset overflows".to_string())?;
+    }
+    let mut data = Vec::with_capacity(prefix.len() + build.line.data.len());
+    data.extend_from_slice(prefix);
+    data.append(&mut build.line.data);
+    build.line.data = data;
+    Ok(base)
 }
 
 /// Write one string attribute in the encoding its form names: inline for
@@ -1393,81 +1703,206 @@ fn declare_abbrev(abbrev: &mut Vec<u8>, code: u64, tag: u64, children: bool, att
     abbrev.extend_from_slice(&[0, 0]);
 }
 
-/// Build `.debug_aranges`: the address map a consumer reads *before* the units,
-/// so mapping an address to a compile unit costs one binary search instead of a
-/// walk over every unit header.
+/// Build `.debug_aranges`: the address map a consumer reads *before* the
+/// units, so mapping an address to a compile unit costs one binary search
+/// instead of a walk over every unit header.
 ///
-/// One set per unit, exactly as GCC emits: the set names its unit's offset in
-/// `.debug_info` (a relocation, because the linker concatenates the sections of
-/// every object) and then lists the addresses the unit covers.  Addresses are
-/// `address_size` bytes and the length that follows each one is the same size, so
-/// for a compile unit that spans its code section there is one `(address,
-/// length)` tuple -- followed by the zero tuple that ends the set.
+/// One set per compilation unit, exactly as GCC emits: the set names the unit's
+/// offset in `.debug_info` (a relocation, because the linker concatenates the
+/// sections of every object) and then lists every address range the unit
+/// covers, one `(address, length)` tuple per code section -- followed by the
+/// zero tuple that ends the set.  The specification requires the first tuple to
+/// start on a multiple of the tuple size counted from the set's own length
+/// field, which is 12 bytes of header on a 64-bit target and therefore four
+/// bytes of padding: the same shape GCC 16.2 writes (measured: length 76, three
+/// tuples and a terminator for a three-section unit).
 ///
 /// A relaxing target gets no table.  Its lengths are computed before the linker
 /// deletes bytes (RISC-V relaxation), so a range would be slightly too long and
 /// would claim code that belongs to the next unit: an address map that is wrong
 /// is worse than the scan a consumer falls back to.  `labels` is that case.
 fn build_debug_aranges(
-    ranges: &[(u64, &DwarfSectionInfo<'_>)],
+    info_offset: u64,
+    code: &[&DwarfSectionInfo<'_>],
     address_size: usize,
     abs32: u32,
     abs_addr: u32,
     labels: bool,
 ) -> Result<Option<ObjSection>, String> {
-    if labels || ranges.is_empty() {
+    if labels {
         return Ok(None);
     }
-    // A tuple is an address and a length, and the specification requires the
-    // first tuple of a set to start on a multiple of that size counted from the
-    // set's own length field.
+    // A unit whose sections all hold no bytes covers no address; an empty tuple
+    // would only give a consumer something to skip.
+    let ranges: Vec<&&DwarfSectionInfo<'_>> = code.iter().filter(|c| c.size != 0).collect();
+    if ranges.is_empty() {
+        return Ok(None);
+    }
     let tuple = 2 * address_size;
     let mut data = Vec::new();
     let mut relocs = Vec::new();
-    for &(info_offset, code) in ranges {
-        if code.size == 0 {
-            // A unit without bytes covers no address; an empty tuple would only
-            // give a consumer something to skip.
-            continue;
-        }
-        let set_start = data.len();
-        data.extend_from_slice(&[0; 4]); // unit_length, patched below
-        data.extend_from_slice(&2u16.to_le_bytes()); // version: always 2
-        push_reloc(&mut data, &mut relocs, abs32, 4, ".debug_info", info_offset)?;
-        data.push(u8::try_from(address_size).map_err(|_| "DWARF address size")?);
-        data.push(0); // segment_selector_size: no segments
-        let header = data.len() - set_start;
-        let padding = (tuple - header % tuple) % tuple;
-        data.resize(data.len() + padding, 0);
-        push_reloc(&mut data, &mut relocs, abs_addr, address_size, code.name, 0)?;
+    data.extend_from_slice(&[0; 4]); // unit_length, patched below
+    data.extend_from_slice(&2u16.to_le_bytes()); // version: always 2
+    push_reloc(&mut data, &mut relocs, abs32, 4, ".debug_info", info_offset)?;
+    data.push(u8::try_from(address_size).map_err(|_| "DWARF address size")?);
+    data.push(0); // segment_selector_size: no segments
+    let padding = (tuple - data.len() % tuple) % tuple;
+    data.resize(data.len() + padding, 0);
+    for section in ranges {
+        push_reloc(
+            &mut data,
+            &mut relocs,
+            abs_addr,
+            address_size,
+            section.name,
+            0,
+        )?;
         // The length is a constant tuple field, so it is `address_size` bytes
         // wide. A section larger than the target's address space is a malformed
         // input, not something to truncate silently.
-        let size = code.size.to_le_bytes();
+        let size = section.size.to_le_bytes();
         if size[address_size..].iter().any(|&byte| byte != 0) {
             return Err(format!(
                 "DWARF address range length {:#x} does not fit the target's {}-byte \
                  addresses",
-                code.size, address_size
+                section.size, address_size
             ));
         }
         data.extend_from_slice(&size[..address_size]);
-        data.resize(data.len() + tuple, 0); // the terminating zero tuple
-        let length = u32::try_from(data.len() - set_start - 4)
-            .map_err(|_| "DWARF address range set exceeds 32 bits".to_string())?;
-        data[set_start..set_start + 4].copy_from_slice(&length.to_le_bytes());
     }
-    if data.is_empty() {
+    data.resize(data.len() + 2 * address_size, 0); // the terminating zero tuple
+    let length = u32::try_from(data.len() - 4)
+        .map_err(|_| "DWARF address range set exceeds 32 bits".to_string())?;
+    data[..4].copy_from_slice(&length.to_le_bytes());
+    Ok(Some(debug_section(".debug_aranges", data, relocs)))
+}
+
+/// Build the range list a unit with code in more than one section needs:
+/// `.debug_rnglists` for version 5 and `.debug_ranges` for the versions that
+/// predate it.
+///
+/// Version 5's section is a table with a twelve-byte header -- unit length,
+/// version, address size, segment selector size and an offset table count of
+/// zero -- followed by one list.  Each range is `DW_RLE_start_length`: the
+/// start is an `address_size` relocation against the code section (the linker
+/// decides where the section lands, so an offset could not be known here) and
+/// the length is a constant, which is a ULEB128 and therefore never truncates.
+/// `DW_RLE_end_of_list` ends it.  The three ranges of a three-section unit cost
+/// 43 bytes, the size GCC 16.2 emits for the same input.
+///
+/// Before version 5 the ranges are pairs of `address_size` addresses followed by
+/// a zero pair, with no header: the unit points at the list directly, so the
+/// same three ranges cost 64 bytes on a 64-bit target.
+///
+/// A single contiguous section needs none of this -- its unit carries a
+/// `DW_AT_low_pc`/`DW_AT_high_pc` pair, which is smaller than a section offset
+/// plus this table -- so `code.len() < 2` writes nothing at all.
+fn build_debug_ranges(
+    config: DwarfConfig,
+    code: &[&DwarfSectionInfo<'_>],
+    address_size: usize,
+    abs_addr: u32,
+) -> Result<Option<ObjSection>, String> {
+    if code.len() < 2 {
         return Ok(None);
     }
-    Ok(Some(debug_section(".debug_aranges", data, relocs)))
+    let mut data = Vec::new();
+    let mut relocs = Vec::new();
+    if config.version >= 5 {
+        data.extend_from_slice(&[0; 4]); // unit_length, patched below
+        data.extend_from_slice(&5u16.to_le_bytes());
+        data.push(u8::try_from(address_size).map_err(|_| "DWARF address size")?);
+        data.push(0); // segment_selector_size
+        data.extend_from_slice(&0u32.to_le_bytes()); // offset_entry_count
+        for section in code {
+            if section.size == 0 {
+                continue;
+            }
+            data.push(DW_RLE_START_LENGTH);
+            push_reloc(
+                &mut data,
+                &mut relocs,
+                abs_addr,
+                address_size,
+                section.name,
+                0,
+            )?;
+            write_uleb128(section.size, &mut data);
+        }
+        data.push(DW_RLE_END_OF_LIST);
+        let length = u32::try_from(data.len() - 4)
+            .map_err(|_| "DWARF range list exceeds 32 bits".to_string())?;
+        data[..4].copy_from_slice(&length.to_le_bytes());
+        Ok(Some(debug_section(".debug_rnglists", data, relocs)))
+    } else {
+        for section in code {
+            if section.size == 0 {
+                continue;
+            }
+            // A base-address pair would cost a third relocation and buy
+            // nothing: the entries are absolute addresses either way.
+            push_reloc(
+                &mut data,
+                &mut relocs,
+                abs_addr,
+                address_size,
+                section.name,
+                0,
+            )?;
+            push_reloc(
+                &mut data,
+                &mut relocs,
+                abs_addr,
+                address_size,
+                section.name,
+                section.size,
+            )?;
+        }
+        data.resize(data.len() + 2 * address_size, 0); // terminating zero pair
+        Ok(Some(debug_section(".debug_ranges", data, relocs)))
+    }
+}
+
+/// The DWARF version the input's `.debug_info` declares, if it declares one.
+///
+/// The first unit header is `length` (4 or 12 bytes), then the version as a
+/// 2-byte little-endian number; a section too short to hold that much states no
+/// version, and a number outside 2..=5 is not a DWARF unit version at all.  A
+/// section holding several units is read through its first, which is the one an
+/// inputs' `.loc` rows belong to.
+pub(crate) fn unit_version(info: &[u8]) -> Option<u8> {
+    let low = *info.get(4)?;
+    let high = *info.get(5)?;
+    let version = u16::from_le_bytes([low, high]);
+    u8::try_from(version)
+        .ok()
+        .filter(|version| (2..=5).contains(version))
+}
+
+/// The string pools among the debug sections.
+///
+/// `.debug_str` and `.debug_line_str` are NUL-separated pools of whole strings
+/// that a relocation may only point *into at a string's first byte*, which is
+/// exactly the invariant `SHF_MERGE|SHF_STRINGS` states -- so GCC, GAS and
+/// every other producer flag them mergeable (`@progbits,1`), and a linker is
+/// then free to keep one copy of each string across all objects of a link.
+/// lccc marks them the same way: an object built from GCC's own assembly
+/// declares `.section .debug_str,"MS",@progbits,1`, and dropping that attribute
+/// (as a plain `PROGBITS` with flags 0 does) costs every multi-object link one
+/// copy of the producer, directory and file-name strings per object, and makes
+/// lccc objects the only ones a linker cannot dedupe.
+fn debug_section_flags(name: &str) -> u64 {
+    match name {
+        ".debug_str" | ".debug_line_str" => SHF_MERGE | SHF_STRINGS,
+        _ => 0,
+    }
 }
 
 fn debug_section(name: &str, data: Vec<u8>, relocs: Vec<ObjReloc>) -> ObjSection {
     ObjSection {
         name: name.to_string(),
         sh_type: SHT_PROGBITS,
-        sh_flags: 0,
+        sh_flags: debug_section_flags(name),
         sh_size: None,
         data,
         sh_addralign: 1,
@@ -1494,6 +1929,7 @@ const DW_TAG_UNSPECIFIED_TYPE: u64 = 0x3b;
 const DW_AT_NAME: u64 = 0x03;
 const DW_AT_STMT_LIST: u64 = 0x10;
 const DW_AT_LOW_PC: u64 = 0x11;
+const DW_AT_RANGES: u64 = 0x55;
 const DW_AT_HIGH_PC: u64 = 0x12;
 const DW_AT_LANGUAGE: u64 = 0x13;
 const DW_AT_COMP_DIR: u64 = 0x1b;
@@ -1528,6 +1964,10 @@ const DW_FORM_FLAG_PRESENT: u64 = 0x19;
 /// version-5 directory and file name tables.
 const DW_LNCT_PATH: u64 = 0x01;
 const DW_LNCT_DIRECTORY_INDEX: u64 = 0x02;
+/// `DW_RLE_start_length` and `DW_RLE_end_of_list`: the two range-list entry
+/// kinds a unit with several code sections needs.
+const DW_RLE_START_LENGTH: u8 = 0x07;
+const DW_RLE_END_OF_LIST: u8 = 0x00;
 /// `DW_LANG_C89`, `DW_LANG_C99`, `DW_LANG_C11`.
 const DW_LANG_C89: u16 = 0x0001;
 const DW_LANG_C99: u16 = 0x000c;
@@ -1594,6 +2034,39 @@ mod tests {
             size: 0x40,
             is_executable: true,
         }]
+    }
+
+    /// Two code sections, the shape `-ffunction-sections` produces: `.text` of
+    /// 0x40 bytes and a 0x20-byte `.text.unlikely` after it.
+    fn split_sections() -> Vec<DwarfSectionInfo<'static>> {
+        vec![
+            DwarfSectionInfo {
+                name: ".text",
+                size: 0x40,
+                is_executable: true,
+            },
+            DwarfSectionInfo {
+                name: ".text.unlikely",
+                size: 0x20,
+                is_executable: true,
+            },
+        ]
+    }
+
+    /// One row per code section, at offset 0 and 0x10.
+    fn split_rows() -> Vec<DwarfLineLocation> {
+        vec![
+            row(0, 1, 1),
+            DwarfLineLocation {
+                section_index: 1,
+                offset: 0x10,
+                file_number: 1,
+                line: 3,
+                column: 0,
+                options: DwarfLocOptions::default(),
+                sequence: 1,
+            },
+        ]
     }
 
     fn row(offset: u64, file_number: u32, line: u32) -> DwarfLineLocation {
@@ -1973,13 +2446,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(
-            line.units,
-            [DwarfLineUnit {
-                offset: 0,
-                section_index: 0
-            }]
-        );
+        assert_eq!(line.code_sections, [0], "one sequence for one code section");
         let mut at = 4;
         assert_eq!(read_u16(&line.line.data, &mut at), 5, "DWARF 5 line table");
         assert_eq!(line.line.data[at], 8, "address size");
@@ -2010,7 +2477,8 @@ mod tests {
             },
         ];
         let info = build_dwarf_info_sections(
-            &line.units,
+            &line.code_sections,
+            0,
             &files,
             &rows,
             &text_section(),
@@ -2238,7 +2706,8 @@ mod tests {
             }
 
             let info = build_dwarf_info_sections(
-                &line.units,
+                &line.code_sections,
+                0,
                 &files,
                 &rows,
                 &text_section(),
@@ -2308,7 +2777,8 @@ mod tests {
             .unwrap()
             .unwrap();
             let info = build_dwarf_info_sections(
-                &line.units,
+                &line.code_sections,
+                0,
                 &files,
                 &rows,
                 &text_section(),
@@ -2372,6 +2842,335 @@ mod tests {
         }
     }
 
+    /// Code in more than one section is *one* line program holding one
+    /// sequence per section -- the shape GAS 2.47 and GCC 16.2 both write --
+    /// not one program per section.  Each sequence starts with a relocated
+    /// `DW_LNE_set_address`, so the number of address relocations is the number
+    /// of sequences.
+    #[test]
+    fn one_line_program_holds_a_sequence_per_code_section() {
+        let files = [(1, "s.c".to_string())];
+        let rows = split_rows();
+        let sections = split_sections();
+        let mut line_strings = DwarfStrings::new();
+        let line = build_dwarf_line_section(
+            &files,
+            &rows,
+            &sections,
+            8,
+            ABS64,
+            ABS32,
+            "/src",
+            DwarfConfig::for_c(5, None),
+            &mut line_strings,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(line.code_sections, [0, 1], "one sequence per code section");
+        let addresses = line
+            .line
+            .relocs
+            .iter()
+            .filter(|r| r.reloc_type == ABS64)
+            .map(|r| (r.symbol_name.as_str(), r.addend))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            addresses,
+            [(".text", 0), (".text.unlikely", 0x10)],
+            "each sequence names its own first address"
+        );
+        // The section is one unit: its length field spans everything that
+        // follows, prologue included.
+        let unit_length = u32::from_le_bytes(line.line.data[..4].try_into().unwrap()) as usize;
+        assert_eq!(unit_length + 4, line.line.data.len());
+        // One prologue, not one per section: a second copy would at least
+        // double the section, since the prologue dominates two sequences.
+        let single = build_dwarf_line_section(
+            &files,
+            &rows[..1],
+            &text_section(),
+            8,
+            ABS64,
+            ABS32,
+            "/src",
+            DwarfConfig::for_c(5, None),
+            &mut line_strings,
+            None,
+        )
+        .unwrap()
+        .unwrap()
+        .line
+        .data;
+        assert!(
+            line.line.data.len() < single.len() + 0x40,
+            "the second sequence costs its statements, not a second prologue"
+        );
+    }
+
+    /// Code in several sections cannot be one `DW_AT_low_pc`/`high_pc` pair, so
+    /// the unit names a range list: `.debug_rnglists` from version 5 and
+    /// `.debug_ranges` before it.
+    #[test]
+    fn split_code_gets_a_range_list_the_unit_points_at() {
+        let files = [(1, "s.c".to_string())];
+        let rows = split_rows();
+        let sections = split_sections();
+        let one_section = text_section();
+        for (version, range_section, form) in [
+            (2u8, ".debug_ranges", DW_FORM_DATA4),
+            (3, ".debug_ranges", DW_FORM_DATA4),
+            (4, ".debug_ranges", DW_FORM_SEC_OFFSET),
+            (5, ".debug_rnglists", DW_FORM_SEC_OFFSET),
+        ] {
+            let config = DwarfConfig::for_c(version, None);
+            let mut strings = DwarfStrings::new();
+            let mut line_strings = DwarfStrings::new();
+            let line = build_dwarf_line_section(
+                &files,
+                &rows,
+                &sections,
+                8,
+                ABS64,
+                ABS32,
+                "/src",
+                config,
+                &mut line_strings,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let info = build_dwarf_info_sections(
+                &line.code_sections,
+                0,
+                &files,
+                &rows,
+                &sections,
+                &[],
+                "s.c",
+                "/src",
+                "p",
+                8,
+                ABS32,
+                ABS64,
+                config,
+                &mut strings,
+                &mut line_strings,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let ranges = info.ranges.as_ref().expect("split code needs a range list");
+            assert_eq!(ranges.name, range_section, "version {version}");
+            // The unit's own attributes name the list, never a high PC.
+            let attrs: Vec<(u64, u64)> = abbreviation_table(&info.abbrev.data)
+                .into_iter()
+                .find(|(_, tag, _)| *tag == DW_TAG_COMPILE_UNIT)
+                .map(|(_, _, attrs)| attrs)
+                .expect("the unit abbreviation");
+            assert_eq!(
+                attrs
+                    .iter()
+                    .find(|(at, _)| *at == DW_AT_RANGES)
+                    .map(|(_, f)| *f),
+                Some(form),
+                "version {version}: {attrs:?}"
+            );
+            assert!(
+                !attrs.iter().any(|(at, _)| *at == DW_AT_HIGH_PC),
+                "version {version}: a range list replaces the pair"
+            );
+            let list_offset = if version >= 5 { 12u64 } else { 0 };
+            let range_reloc = info
+                .info
+                .relocs
+                .iter()
+                .find(|r| r.symbol_name == range_section)
+                .map(|r| (r.reloc_type, r.addend))
+                .expect("the list offset travels as a relocation");
+            assert_eq!(
+                range_reloc,
+                (ABS32, list_offset as i64),
+                "version {version}"
+            );
+            if version >= 5 {
+                let data = &ranges.data;
+                assert_eq!(
+                    u32::from_le_bytes(data[..4].try_into().unwrap()) as usize + 4,
+                    data.len()
+                );
+                assert_eq!(u16::from_le_bytes([data[4], data[5]]), 5);
+                assert_eq!(data[6], 8, "address size");
+                assert_eq!(data[7], 0, "no segments");
+                assert_eq!(
+                    u32::from_le_bytes(data[8..12].try_into().unwrap()),
+                    0,
+                    "no offset table: the list is named by section offset"
+                );
+                // Two `start_length` entries and the end marker: a kind byte,
+                // an `address_size` address and a ULEB128 length each, then the
+                // end marker.
+                assert_eq!(data[12], DW_RLE_START_LENGTH);
+                assert_eq!(data[21], 0x40, "the first section's length");
+                assert_eq!(data[22], DW_RLE_START_LENGTH);
+                assert_eq!(data[31], 0x20, "the second section's length");
+                assert_eq!(data[32], DW_RLE_END_OF_LIST);
+                assert_eq!(data.len(), 33);
+                let relocs: Vec<_> = ranges
+                    .relocs
+                    .iter()
+                    .map(|r| (r.offset, r.symbol_name.as_str(), r.addend))
+                    .collect();
+                assert_eq!(
+                    relocs,
+                    [(13, ".text", 0), (23, ".text.unlikely", 0)],
+                    "each range starts at a relocated address"
+                );
+            } else {
+                // Two address pairs and the terminating zero pair,
+                // `address_size` bytes per address.
+                assert_eq!(ranges.data.len(), 6 * 8);
+                let relocs: Vec<_> = ranges
+                    .relocs
+                    .iter()
+                    .map(|r| (r.offset, r.symbol_name.as_str(), r.addend))
+                    .collect();
+                assert_eq!(
+                    relocs,
+                    [
+                        (0, ".text", 0),
+                        (8, ".text", 0x40),
+                        (16, ".text.unlikely", 0),
+                        (24, ".text.unlikely", 0x20)
+                    ]
+                );
+                assert!(ranges.data[32..].iter().all(|&b| b == 0));
+            }
+            // A single contiguous section needs none of this.
+            let mut single_info = build_dwarf_info_sections(
+                &[0],
+                0,
+                &files,
+                &[row(0, 1, 1)],
+                &one_section,
+                &[],
+                "s.c",
+                "/src",
+                "p",
+                8,
+                ABS32,
+                ABS64,
+                config,
+                &mut DwarfStrings::new(),
+                &mut DwarfStrings::new(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(single_info.ranges.is_none(), "version {version}");
+            let single_attrs: Vec<(u64, u64)> = abbreviation_table(&single_info.abbrev.data)
+                .into_iter()
+                .find(|(_, tag, _)| *tag == DW_TAG_COMPILE_UNIT)
+                .map(|(_, _, attrs)| attrs)
+                .unwrap();
+            assert!(!single_attrs.iter().any(|(at, _)| *at == DW_AT_RANGES));
+            single_info.info.data.clear();
+        }
+    }
+
+    /// The address map carries one tuple per code section of the unit, in one
+    /// set -- exactly the shape GCC 16.2 writes for a split unit.
+    #[test]
+    fn the_address_map_lists_every_section_of_a_split_unit() {
+        let files = [(1, "s.c".to_string())];
+        let rows = split_rows();
+        let sections = split_sections();
+        let config = DwarfConfig::for_c(5, None);
+        let mut line_strings = DwarfStrings::new();
+        let line = build_dwarf_line_section(
+            &files,
+            &rows,
+            &sections,
+            8,
+            ABS64,
+            ABS32,
+            "/src",
+            config,
+            &mut line_strings,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let info = build_dwarf_info_sections(
+            &line.code_sections,
+            0,
+            &files,
+            &rows,
+            &sections,
+            &[],
+            "s.c",
+            "/src",
+            "p",
+            8,
+            ABS32,
+            ABS64,
+            config,
+            &mut DwarfStrings::new(),
+            &mut line_strings,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let aranges = info.aranges.expect("a fixed-layout target gets a map");
+        // 4 length + 2 version + 4 unit offset + 1 address size + 1 segment
+        // size, padded to 16, then two tuples and the terminating tuple.
+        assert_eq!(aranges.data.len(), 4 + 12 + 16 * 3);
+        assert_eq!(
+            u32::from_le_bytes(aranges.data[..4].try_into().unwrap()) as usize + 4,
+            aranges.data.len()
+        );
+        let relocs: Vec<_> = aranges
+            .relocs
+            .iter()
+            .map(|r| (r.offset, r.symbol_name.as_str(), r.addend))
+            .collect();
+        assert_eq!(
+            relocs,
+            [
+                (6, ".debug_info", 0),
+                (16, ".text", 0),
+                (32, ".text.unlikely", 0)
+            ]
+        );
+        assert!(aranges.data[48..].iter().all(|&b| b == 0));
+    }
+
+    /// A range list's lengths are constants, so they are ULEB128 and cannot
+    /// truncate: a section larger than 4 GiB is described exactly, where the
+    /// address-map tuple would have to truncate it.
+    #[test]
+    fn a_range_list_length_never_truncates() {
+        let huge = [
+            DwarfSectionInfo {
+                name: ".text",
+                size: u64::from(u32::MAX) + 1,
+                is_executable: true,
+            },
+            DwarfSectionInfo {
+                name: ".text.unlikely",
+                size: 0x10,
+                is_executable: true,
+            },
+        ];
+        let ranges =
+            build_debug_ranges(DwarfConfig::for_c(5, None), &[&huge[0], &huge[1]], 8, ABS64)
+                .unwrap()
+                .unwrap();
+        assert_eq!(ranges.name, ".debug_rnglists");
+        // The length is the five-byte ULEB128 of 0x1_0000_0000.
+        assert_eq!(&ranges.data[21..26], &[0x80, 0x80, 0x80, 0x80, 0x10]);
+    }
+
     /// A range length is a constant tuple field of `address_size` bytes.  A
     /// section larger than the target's address space cannot be described by
     /// one, and truncating it would claim a range that ends somewhere else
@@ -2403,7 +3202,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let built = build_dwarf_info_sections(
-            &line.units,
+            &line.code_sections,
+            0,
             &files,
             &rows,
             &huge,
@@ -2457,7 +3257,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let info = build_dwarf_info_sections(
-            &line.units,
+            &line.code_sections,
+            0,
             &files,
             &rows,
             &empty,
@@ -2908,7 +3709,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let info = build_dwarf_info_sections(
-            &line.units,
+            &line.code_sections,
+            0,
             &files,
             &rows,
             &text_section(),
@@ -2949,15 +3751,13 @@ mod tests {
 
     #[test]
     fn an_assembly_source_records_the_assembler_language() {
-        let units = [DwarfLineUnit {
-            offset: 0,
-            section_index: 0,
-        }];
+        let units = [0usize];
         let config = DwarfConfig::assembler(4);
         let mut strings = DwarfStrings::new();
         let mut line_strings = DwarfStrings::new();
         let info = build_dwarf_info_sections(
             &units,
+            0,
             &[],
             &[],
             &text_section(),
@@ -3068,7 +3868,8 @@ mod tests {
             external: true,
         }];
         let info = build_dwarf_info_sections(
-            &line.units,
+            &line.code_sections,
+            0,
             &files,
             &rows,
             &text_section(),
@@ -3131,6 +3932,153 @@ mod tests {
         assert!(
             info.aranges.is_none(),
             "a relaxing target must not publish an approximate address map"
+        );
+    }
+
+    /// `.debug_str` and `.debug_line_str` are NUL-separated pools of whole
+    /// strings, which is exactly what `SHF_MERGE|SHF_STRINGS` says to a linker;
+    /// GCC and GAS flag both that way (`.section .debug_str,"MS",@progbits,1`).
+    /// Measured on ten one-function units: 126 bytes of `.debug_str` and 144 of
+    /// `.debug_line_str` unmerged, 43 and 60 after mold's merge -- and only for
+    /// objects that carry the flags.  Nothing else may claim the flags: a
+    /// mergeable section promises its entries are strings, and a linker that
+    /// believes a byte stream is one rewrites offsets that are not string
+    /// starts.
+    #[test]
+    fn the_string_pools_are_marked_mergeable_and_nothing_else_is() {
+        for name in [".debug_str", ".debug_line_str"] {
+            let mut strings = DwarfStrings::new();
+            assert_eq!(strings.intern("producer").unwrap(), 0);
+            let section = strings.into_section(name).expect("non-empty pool");
+            assert_eq!(section.name, name);
+            assert_eq!(section.sh_flags, SHF_MERGE | SHF_STRINGS, "{name}");
+            assert_eq!(section.sh_addralign, 1, "{name} holds bytes");
+            assert_eq!(section.sh_type, SHT_PROGBITS, "{name}");
+            assert_eq!(
+                debug_section_flags(name) & !(SHF_MERGE | SHF_STRINGS),
+                0,
+                "{name} carries no other flag"
+            );
+        }
+        for name in [
+            ".debug_info",
+            ".debug_abbrev",
+            ".debug_line",
+            ".debug_aranges",
+            ".debug_rnglists",
+            ".debug_ranges",
+            ".debug_str_offsets",
+        ] {
+            assert_eq!(
+                debug_section(name, vec![0], Vec::new()).sh_flags,
+                0,
+                "{name} is a byte stream, not a string pool"
+            );
+        }
+    }
+
+    /// An input that already declares `.debug_str`/`.debug_line_str` (GCC's own
+    /// assembly does) is *continued*, never replaced: the object then holds one
+    /// pool whose head is the input's bytes, and a name the input already had
+    /// keeps its offset, because the input's `.debug_info` -- copied verbatim --
+    /// refers to it by number.
+    #[test]
+    fn an_input_string_pool_is_continued_not_replaced() {
+        let mut strings = DwarfStrings::continuing(b"producer\0/tmp\0");
+        assert_eq!(strings.intern("producer").unwrap(), 0, "reuses the input's");
+        assert_eq!(strings.intern("/tmp").unwrap(), 9, "reuses the input's");
+        assert_eq!(strings.intern("new").unwrap(), 14, "appends after it");
+        assert_eq!(
+            strings.into_section(".debug_str").unwrap().data,
+            b"producer\0/tmp\0new\0",
+            "one pool, input first, and it still ends in a NUL"
+        );
+        // Without the closing NUL an appended name would fuse with the input's
+        // last one and every later reference would read a suffix.
+        let mut open = DwarfStrings::continuing(b"abc");
+        assert_eq!(open.intern("d").unwrap(), 4);
+        assert_eq!(open.into_section(".debug_str").unwrap().data, b"abc\0d\0");
+        // A pool that already holds its NUL is left exactly as it was.
+        let mut closed = DwarfStrings::continuing(b"abc\0");
+        assert_eq!(closed.intern("abc").unwrap(), 0);
+        assert_eq!(closed.into_section(".debug_str").unwrap().data, b"abc\0");
+    }
+
+    /// An input that declares `.debug_line` (GCC writes an empty one; hand
+    /// written assembly may carry a program) keeps that program: the generated
+    /// one is written *after* the input's bytes, `DW_AT_stmt_list` is the offset
+    /// it starts at, and every relocation moves with it.  Dropping the input's
+    /// program instead would leave its `DW_AT_stmt_list` pointing at the new
+    /// header's first byte, which decodes as whatever the two have in common.
+    #[test]
+    fn an_input_line_program_is_continued_not_replaced() {
+        let files = [(1u32, "ms.c".to_string())];
+        let rows = [DwarfLineLocation {
+            section_index: 0,
+            offset: 0,
+            file_number: 1,
+            line: 1,
+            column: 3,
+            options: DwarfLocOptions::default(),
+            sequence: 0,
+        }];
+        let build = || {
+            let mut line_strings = DwarfStrings::new();
+            build_dwarf_line_section(
+                &files,
+                &rows,
+                &text_section(),
+                8,
+                ABS64,
+                ABS32,
+                "/src",
+                DwarfConfig::for_c(5, None),
+                &mut line_strings,
+                None,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let original = build();
+        assert!(
+            !original.line.relocs.is_empty(),
+            "the row's address is a relocation"
+        );
+        let offsets: Vec<u64> = original.line.relocs.iter().map(|r| r.offset).collect();
+
+        // A program the input already carries, 7 bytes of it.
+        let prefix = b"\x07\0\0\0\x05\0\x01";
+        let mut continued = build();
+        assert_eq!(place_line_build(&mut continued, prefix).unwrap(), 7);
+        assert_eq!(
+            &continued.line.data[..7],
+            prefix,
+            "the input's program leads"
+        );
+        assert_eq!(
+            &continued.line.data[7..],
+            &original.line.data[..],
+            "the generated program follows it byte for byte"
+        );
+        let moved: Vec<u64> = continued.line.relocs.iter().map(|r| r.offset).collect();
+        assert_eq!(
+            moved,
+            offsets.iter().map(|o| o + 7).collect::<Vec<_>>(),
+            "every relocation moves with the program it belongs to"
+        );
+
+        // No input program: nothing moves, and the offset is zero.
+        let mut plain = build();
+        assert_eq!(place_line_build(&mut plain, b"").unwrap(), 0);
+        assert_eq!(plain.line.data, original.line.data);
+        assert_eq!(
+            plain
+                .line
+                .relocs
+                .iter()
+                .map(|r| r.offset)
+                .collect::<Vec<_>>(),
+            offsets
         );
     }
 }

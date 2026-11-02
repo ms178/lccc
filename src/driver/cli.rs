@@ -2153,6 +2153,7 @@ impl Driver {
                     self.debug_info = true;
                     if let Some(version) = dwarf_version_selector(arg) {
                         self.dwarf_version = version;
+                        self.dwarf_version_explicit = true;
                     }
                 }
                 // `-gdwarf` asks for the DWARF format at its default version,
