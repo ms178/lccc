@@ -463,6 +463,155 @@ converge in one round rather than fighting.
 test that drives `thread_trampolines` directly for both the two-hop chain and the
 cyclic chain, asserting the text is left byte-identical in the cyclic case.
 
+### 5.5 x86-64 ↔ i686: exact register-clobber oracle, and the i686 scratch-save pass resurrected
+
+This round is x86-only: the two x86 back ends share one ISA and one machine
+model, so anything one of them knows about an instruction's implicit operands is
+true for the other. They had drifted.
+
+**1. `instruction_modifies_reg_id` is now exact (backlog item 8, x86-64).**
+The predicate deciding whether a `push %R` may be dropped answered
+`dest_reg == 0 && reg_id == 2` when the classified destination was `%rax`,
+carrying a `TODO: could be more precise`. The guess is wrong in *both*
+directions:
+
+| direction | consequence | example |
+|---|---|---|
+| too coarse | lost eliminations | `pushq %rdx … <`%rax`-only span> … popq %rdx` was refused, because "a `%rax` writer might write `%rdx`" |
+| too narrow | unsound-looking holes | `cpuid`, `rdtsc`, `rep stosq`, `xchg`, `lock xadd` classify with `dest_reg == REG_NONE`, so their implicit writes were invisible |
+
+The predicate now asks the ISA table that the classifier already owns:
+`implicit_write_refs` (the exact *write* half of `classify_implicit_operands`,
+which both x86 back ends maintain against the architecture) plus the classified
+destination plus the two-destination forms that AT&T's "last operand is the
+destination" rule cannot express (`xchg`, `xadd`, `cmpxchg`). The two-destination
+logic and the prefix-stripping mnemonic helper moved into `types.rs`
+(`line_writes_gp_family`, `names_a_second_destination`, `unadorned_mnemonic`) so
+the push/pop pass and the fold passes cannot disagree about them again.
+
+**2. The same table gained `pcmpistri`/`pcmpestri` on both back ends.**
+SSE4.2's string compares return their index in `%ecx` and the explicit-length
+form takes both lengths from `%eax`/`%edx`; neither oracle modelled it, so a
+`%rcx` live across `pcmpistri` looked dead. Not emitted by our codegen today,
+which is exactly why it is worth writing down now: the table is the fail-closed
+substrate every windowed pass reasons with.
+
+**3. Fold precision (x86-64).** The two `cltq`-past-a-neutral-instruction scans
+in `local_patterns` used `has_implicit_reg_usage` — a coarse "may touch some
+register" veto — to answer "does this line write `%rax`". It said yes for `cqto`
+(writes `%rdx`), `mulx` (reads `%rdx`), `shld` (reads `%cl`) and `rep` (writes
+`%rcx`), refusing folds that are provably safe. Both sites now ask
+`line_writes_gp_family(text, 0)`.
+
+**4. i686: scratch-save elimination (`eliminate_push_pop_pairs`) is live again.**
+The pass existed, was found unsafe ("callee-save/leal epilogue interactions"),
+and was left wired to nothing while the emitter kept saving `%ecx`/`%edx`
+defensively — the 32-bit SWAR popcount alone pays two stack round-trips per call.
+Rather than delete it, the invariant it was missing is now enforced explicitly in
+`scan_push_pop_span`:
+
+* the span must contain **no label, branch, call, `ret`, indirect jump or inline
+  asm**. The call case is the one a register-based safety test cannot see: under
+  cdecl every stack argument sits four bytes higher with the save in place, so
+  deleting the pair moves the callee's whole argument list;
+* no `%esp`/`%sp` mention and no architectural stack-pointer write (`leave`,
+  `enter`) — this is the epilogue interaction that made the original pass
+  unsafe: a `leal -8(%ebp), %esp` inside the span would be re-pointed;
+* no `pushf`/`popf` (they own the very slot the save created) and no non-inert
+  or CFI directive (`.cfi_adjust_cfa_offset` describes the push being removed);
+* nested `push`/`pop` pairs must balance inside the span.
+
+On top of that proof, two removal rules, both ported from the x86-64 pass:
+
+1. **untouched span** — the register already holds its incoming value on both
+   sides, so save and restore are both dead weight (safe for callee-saved
+   registers too, and for `%ebp`, since nothing about the value changes);
+2. **dead restore value** — the span writes the register but nothing reads it
+   after the `pop`. Callee-saved registers are excluded (the caller owns their
+   value at `ret`, which intra-function liveness cannot see), and a
+   loop-carried save whose only reader is the next iteration's own `push` is
+   decided by re-solving the enclosing function with that single read
+   neutralised (`GprLiveness::live_after_dropping_region`, the i686 counterpart
+   of the x86-64 `FileLiveness::live_after_dropping_region`), bounded to 64
+   re-solves per invocation.
+
+Writing detection is now exact rather than the old union test: the previous
+implementation asked `line_references_reg` (reads ∪ writes), so a span that
+merely *read* the saved register — `pushl %ecx; imull %ecx, %eax; popl %ecx` —
+kept the pair for no reason.
+
+The pass is pipelined in phase 4 (after `optimize_cfg_register_liveness`
+establishes the CFG solution and before `eliminate_unused_callee_saves`), with a
+bounded fixpoint against the dead-move/dead-store sweeps so the staging lines
+that only fed a removed pair are reclaimed in the same run. Kill switch:
+`CCC_NO_I686_PUSH_POP`.
+
+**5. The classified destination now yields to the implicit *read* set.** The
+destination parser names `%rax` as the primary destination of
+`cqto`/`cdq`/`cqo`/`cltd`/`cwtd`/`cwd`, because `parse_dest_reg_fast` returns one
+family and those instructions are "the `%rax` family". They do not write `%rax`
+at all: `%rax` is their implicit *input* and `%rdx` is their only output, which
+the write set reports exactly. Both oracles therefore suppress a classified
+destination when the same line implicitly reads that family
+(`line_writes_gp_family` on x86-64, `line_writes_family` on i686) — the rule
+`passes::helpers::writes_family` has always applied, now shared with the push/pop
+paths, and cross-checked by `writes_family_tests::agrees_with_the_shared_oracle`
+so the two can never drift apart again (the shared oracle is a strict superset:
+it adds the two-destination forms and the barrier kinds). This is what makes
+`pushl %eax; cltd; popl %eax` provably redundant rather than merely "kept".
+
+**6. i686: the implicit-operand oracle got the 32-bit-relevant ISA rows it was
+missing and the x86-64 fast path.** `pushf`/`popf`/`iret` (they read and write
+`%esp`), `int1`/`int3`/`into`, `xbegin`, `monitorx`/`mwaitx`/`skinit`/`clzero`,
+`rdpkru`/`wrpkru`/`rdpru`/`wrmsrns`, `pconfig` — plus a leading fast-path match
+for the highest-frequency mnemonics whose table entry is `(0, 0)`. The fast path
+matters because `line_reg_use_def` asks the oracle once per register family,
+i.e. eight times per line, and every windowed pass asks again for every line it
+walks; the x86-64 oracle has had this fast path since it was written.
+
+**Evidence.** `push_pop.rs` gains a `register_clobber_tests` module that pins
+every row above — the `%rdx`-across-`%rax`-only-span case that used to be
+refused, `cqto` vs `cltq` asymmetry, `cpuid`'s four families, `rep stosq`,
+one-operand vs two-operand `imulq`, `mulx` reading rather than writing `%rdx`,
+`pcmpistri` writing `%rcx`, `xchg`/`xadd`/`lock xadd`/`cmpxchg` two-destination
+behaviour, and the call clobber set. The i686 peephole gains eleven behavioural
+tests: untouched-span removal, read-only-span removal, the read-only `cltd`
+case, dead restore value, live restore kept, callee-saved kept, call-in-span
+kept, five stack-pointer dependence shapes refused, and the loop-carried pair
+both ways. The x86-64 pair scan gains its own module (`pair_scan_tests`), since
+the holes above were all in code no test covered: an untouched span, a label
+inside the span, a conditional branch inside it, four stack-pointer shapes
+(`movq %rax, %rsp`, a `%rsp`-relative load, `subq` to `%rsp`, `pushfq`/`popfq`)
+and a span long enough to need the widened window.
+
+**7. The x86-64 pair scan had three soundness holes, found by red-teaming the
+port.** Porting `scan_push_pop_span` to i686 forced an enumeration of everything
+the x86-64 pass had to prove, and the enumeration did not match the code: it
+hand-listed `Call | Jmp | JmpIndirect | Ret` as barriers and therefore *stepped
+over* a `Label` (a second entry point into the span, so the `pop` is reachable
+without the `push` — deleting the pair pops a return address on that path), a
+`CondJmp` (the pair is unbalanced on the taken side) and any opaque inline-asm
+block. `instruction_modifies_stack` had the mirror problem: it listed
+`subq`/`addq`-to-`%rsp` and `%rsp`-relative memory operands, so `movq %rax, %rsp`
+and `leaq -8(%rbp), %rsp` — the epilogue restores — were not stack dependencies
+at all. Both are now one predicate each: `LineInfo::is_barrier` (the crate's
+single answer to "may a window step over this line", which already includes
+labels, all four branch kinds, `Ret`, `Push`/`Pop`, inline asm and non-inert
+directives) and "the text mentions the stack pointer in any spelling". The window
+also grows from three lines to eight now that its proof obligations are stated
+once.
+
+**8. The i686 CFG fixpoint was doing O(rounds x lines) oracle work.** Each round
+called `line_reg_use_def` for every line, and that function asked
+`line_references_reg` once per register family — nine `classify_implicit_operands`
+calls per line per round, plus a `direct_jump_target` parse of every line. The
+per-line facts (use/def, neutralised mask, return-use markers, resolved branch
+target) do not depend on the iteration, so they are computed once per function
+and the rounds only move bits. The union form is also exact rather than
+approximate: `line_references_reg(line, r)` *is* "the text names `r`, or the
+oracle mentions it", so one oracle call plus eight `contains` tests reproduces it
+by construction.
+
 ## 6. Ranked cross-pollination backlog
 
 Ordered by (correctness impact × reach) / risk. Every item names donor, recipient
@@ -477,7 +626,7 @@ and the mechanism.
 | 5 | `propagate_address_aliases` + `eliminate_repeated_slot_loads` | AArch64 → RISC-V | repeated slot loads in loops | low | RISC-V has the slot dataflow this pass needs |
 | 6 | `global_store_forwarding` + `global_dead_store_elimination` | RISC-V → AArch64 | address-taken slot traffic | medium | needs the cross-block value numbering RISC-V already built |
 | 7 | ~~`cbz`/`cbnz` fusion with range checking~~ (§5.3) | i686 `fuse_setcc_branch` + RISC-V `rewrite_far_jumps_to_near` → AArch64 | **done** — one instruction and one taken branch fewer per boolean branch | medium | `cbz`/`b.cond` reach ±1 MB, not ±32 KiB; the census guard was already there |
-| 8 | `instruction_modifies_reg_id` precision (`mul`/`div` clobbers, `Other{dest_reg}`) | new | fewer spills around `push`/`pop` sequences | medium | x86-only; the TODO is in `x86/codegen/peephole/passes/push_pop.rs` |
+| 8 | ~~`instruction_modifies_reg_id` precision~~ (§5.5) | new | **done** — exact implicit-write oracle + two-destination forms; `TODO` deleted | medium | x86-only; the same oracle also re-enabled the i686 scratch-save pass |
 | 9 | pass manifest for the x86-64 tree | x86-64 → tree-wide | reviewability, generator-friendly | low | precondition for #10 |
 | 10 | split the i686/ARM/RISC-V monoliths along the x86-64 pass-file pattern | x86-64 → i686, ARM, RISC-V | bisectability, per-pass tests | high (mechanical churn) | do pass-by-pass, never as one commit |
 

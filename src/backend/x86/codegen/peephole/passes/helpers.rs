@@ -1143,6 +1143,47 @@ mod writes_family_tests {
         assert!(!writes_family(&info, "cqto", 0));
     }
 
+    /// `line_writes_gp_family` (in `types.rs`, so the passes that cannot reach
+    /// this module can still ask) must never be NARROWER than this acceptance
+    /// predicate: a family this one calls written and the other does not would
+    /// split "does this line clobber the family" between the push/pop pass and
+    /// every fold. It is deliberately WIDER in two documented ways — the
+    /// two-destination forms (`xchg`/`xadd`/`cmpxchg` write an operand the AT&T
+    /// destination rule does not name) and the barrier kinds (`Call`,
+    /// `InlineAsm`, `JmpIndirect`), whose clobber set belongs to the caller's
+    /// window proof.
+    #[test]
+    fn agrees_with_the_shared_oracle() {
+        for text in [
+            "cqto",
+            "cltq",
+            "cltd",
+            "cpuid",
+            "rdtsc",
+            "rep stosq",
+            "idivq %r11",
+            "imulq %r11",
+            "imulq %r11, %rax",
+            "mulxq %r11, %rax, %rcx",
+            "xchgq %rbx, %rcx",
+            "lock xaddl %eax, %ebx",
+            "cmpxchgq %rbx, (%rdi)",
+            "pcmpistri $0, %xmm1, %xmm2",
+            "addq %rax, %rax",
+            "movq %rdi, %rcx",
+            "movq %rdi, (%rsp)",
+            "shlq %cl, %rax",
+        ] {
+            let info = classify_line(text);
+            for fam in 0u8..=7 {
+                assert!(
+                    !writes_family(&info, text, fam) || line_writes_gp_family(&info, text, fam),
+                    "{text} family {fam}: writes_family says yes, the shared oracle says no"
+                );
+            }
+        }
+    }
+
     #[test]
     fn covers_the_implicit_second_output() {
         let info = classify_line("    idivq %r11");

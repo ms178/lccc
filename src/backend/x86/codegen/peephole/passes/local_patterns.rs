@@ -2124,10 +2124,15 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             // --- Extended scan: cltq past non-rax-clobbering instructions ---
             if next_ext == ExtKind::Cltq && !is_redundant_ext {
                 let i_writes_rax = match infos[i].kind {
+                    // Exact implicit-write half instead of the coarse
+                    // `has_implicit_reg_usage` veto, which answered "yes" for
+                    // `cqto` (writes %rdx), `mulx` (reads %rdx) and every other
+                    // implicit-operand instruction regardless of family, and so
+                    // refused folds that a `%rax`-preserving line allows.
                     LineKind::Other { dest_reg } => {
                         dest_reg == 0
                             || dest_reg == REG_NONE
-                            || has_implicit_reg_usage(infos[i].trimmed(store.get(i)))
+                            || line_writes_gp_family(&infos[i], infos[i].trimmed(store.get(i)), 0)
                     }
                     LineKind::LoadRbp { reg, .. } => reg == 0,
                     LineKind::StoreRbp { .. } => false,
@@ -2178,7 +2183,11 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             LineKind::Other { dest_reg } => {
                                 dest_reg == 0
                                     || dest_reg == REG_NONE
-                                    || has_implicit_reg_usage(infos[k].trimmed(store.get(k)))
+                                    || line_writes_gp_family(
+                                        &infos[k],
+                                        infos[k].trimmed(store.get(k)),
+                                        0,
+                                    )
                             }
                             LineKind::LoadRbp { reg, .. } => reg == 0,
                             _ => true, // conservative: treat unknown as writing rax
