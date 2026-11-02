@@ -1998,6 +1998,29 @@ pub(super) fn propagate_wide_values(
     }
 }
 
+/// Place deferred giant objects at the deepest addresses of the frame.
+///
+/// A giant object forces the frame past the imm32 displacement window, so its
+/// own base cannot be named by a frame-relative memory operand; every access
+/// to it materialises the address instead. Placing it after every other slot
+/// keeps the ordinary slots (parameters, spills, temporaries) inside the
+/// window, which is what makes their displacements encodable when no second
+/// anchor exists. Alignment is honoured exactly as `assign_slot` does
+/// elsewhere, and the returned total space covers the objects.
+pub(super) fn place_giant_allocas_late(
+    state: &mut crate::backend::state::CodegenState,
+    deferred: &mut Vec<(u32, i64, i64)>,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    mut total_space: i64,
+) -> i64 {
+    for (dest_id, size, align) in deferred.drain(..) {
+        let (slot, new_space) = assign_slot(total_space, size, align);
+        state.value_locations.insert(dest_id, StackSlot(slot));
+        total_space = new_space;
+    }
+    total_space
+}
+
 #[cfg(test)]
 mod scalar_lane_slot_tests {
     use super::*;
@@ -2132,27 +2155,4 @@ mod scalar_lane_slot_tests {
             assert_eq!(&memory[lo..hi], &patterns[i].to_le_bytes()[..hi - lo]);
         }
     }
-}
-
-/// Place deferred giant objects at the deepest addresses of the frame.
-///
-/// A giant object forces the frame past the imm32 displacement window, so its
-/// own base cannot be named by a frame-relative memory operand; every access
-/// to it materialises the address instead. Placing it after every other slot
-/// keeps the ordinary slots (parameters, spills, temporaries) inside the
-/// window, which is what makes their displacements encodable when no second
-/// anchor exists. Alignment is honoured exactly as `assign_slot` does
-/// elsewhere, and the returned total space covers the objects.
-pub(super) fn place_giant_allocas_late(
-    state: &mut crate::backend::state::CodegenState,
-    deferred: &mut Vec<(u32, i64, i64)>,
-    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
-    mut total_space: i64,
-) -> i64 {
-    for (dest_id, size, align) in deferred.drain(..) {
-        let (slot, new_space) = assign_slot(total_space, size, align);
-        state.value_locations.insert(dest_id, StackSlot(slot));
-        total_space = new_space;
-    }
-    total_space
 }
