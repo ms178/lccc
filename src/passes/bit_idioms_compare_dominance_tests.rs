@@ -2,7 +2,9 @@
 //!
 //! `(a != 0) & (a > 4)`, `(a > 0) & (a > 99)`, `(a < 10) & (a < 5)` and their
 //! disjunctive twins are the shapes accepted here; the fold answers with a
-//! `Copy` of one of the join's own operands.
+//! `Copy` of one of the join's own operands, or of the join's constant value
+//! when the conjunction is empty (`(a < 5) & (a > 10)`) or the disjunction
+//! covers every value (`(a < 5) | (a > 4)`).
 //!
 //! Every semantic check evaluates the ORIGINAL pair and the REPLACEMENT the
 //! matcher returns over the whole 8-bit ring, and over the 16-bit ring for the
@@ -133,9 +135,15 @@ fn agree_over_ring(
     else {
         return false;
     };
-    let copies_first = match src {
-        Operand::Value(Value(1)) => true,
-        Operand::Value(Value(2)) => false,
+    // `Some(true)`: the first operand; `Some(false)`: the second; `None`: the
+    // join's constant, read from the replacement itself.
+    let (copies, constant) = match src {
+        Operand::Value(Value(1)) => (Some(true), 0),
+        Operand::Value(Value(2)) => (Some(false), 0),
+        Operand::Const(c) => match c.to_i64() {
+            Some(answer @ (0 | 1)) => (None, answer as u8),
+            _ => return false,
+        },
         _ => return false,
     };
     let ring = 1u64 << bits.min(16);
@@ -143,12 +151,31 @@ fn agree_over_ring(
         let a = cmp_result(op_a, x, const_a as u64, bits);
         let b = cmp_result(op_b, x, const_b as u64, bits);
         let want = join_value(logic, a, b) as u8;
-        let got = if copies_first { a as u8 } else { b as u8 };
+        let got = match copies {
+            Some(true) => a as u8,
+            Some(false) => b as u8,
+            None => constant,
+        };
         if want != got {
             return false;
         }
     }
     true
+}
+
+/// Assert the matcher's answer is the join's constant `answer`.
+#[track_caller]
+fn assert_constant(replacement: Option<Instruction>, answer: i64) {
+    match replacement {
+        Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(c),
+        }) => {
+            assert_eq!(dest, Value(3), "the join's dest is kept");
+            assert_eq!(c.to_i64(), Some(answer), "the join's constant");
+        }
+        other => panic!("expected the constant {answer}, got {other:?}"),
+    }
 }
 
 const OPS: [IrCmpOp; 10] = [
@@ -252,13 +279,43 @@ fn the_constant_may_sit_on_the_left() {
 }
 
 #[test]
-fn unrelated_bounds_are_left_alone() {
-    // `(x < 5) & (x > 10)` describes nothing, but neither conjunct implies the
-    // other, so the pair stays as written (the range folder owns emptiness).
-    let (defs, inst) = join_fixture(IrBinOp::And, IrType::I32, IrCmpOp::Slt, 5, IrCmpOp::Sgt, 10);
+fn disjoint_conjunctions_are_false_and_covering_disjunctions_true() {
+    use IrCmpOp::*;
+    let fold = |logic, op_a, a, op_b, b| {
+        let (defs, inst) = join_fixture(logic, IrType::I32, op_a, a, op_b, b);
+        compare_dominance::fold_compare_dominance(&inst, &defs)
+    };
+    // Empty conjunctions: two separated rays, two different points, a point
+    // and its own exclusion, adjacent rays, and the unsigned ring.
+    assert_constant(fold(IrBinOp::And, Slt, 5, Sgt, 10), 0);
+    assert_constant(fold(IrBinOp::And, Eq, 3, Eq, 4), 0);
+    assert_constant(fold(IrBinOp::And, Eq, 3, Ne, 3), 0);
+    assert_constant(fold(IrBinOp::And, Slt, 5, Sgt, 4), 0);
+    assert_constant(fold(IrBinOp::And, Ult, 3, Ugt, 2), 0);
+    // Covering disjunctions: adjacent rays, a point and its exclusion, an
+    // exclusion the other side contains, and two different exclusions.
+    assert_constant(fold(IrBinOp::Or, Slt, 5, Sgt, 4), 1);
+    assert_constant(fold(IrBinOp::Or, Ne, 3, Eq, 3), 1);
+    assert_constant(fold(IrBinOp::Or, Ne, 3, Slt, 10), 1);
+    assert_constant(fold(IrBinOp::Or, Ne, 3, Ne, 4), 1);
+    assert_constant(fold(IrBinOp::Or, Sle, 5, Sge, 5), 1);
+}
+
+#[test]
+fn a_join_with_a_witness_is_not_constant() {
+    use IrCmpOp::*;
+    // `x == 5` satisfies both, so the conjunction is not empty (and neither
+    // conjunct implies the other, so it stays as written)...
+    let (defs, inst) = join_fixture(IrBinOp::And, IrType::I32, Sle, 5, Sge, 5);
     assert!(compare_dominance::fold_compare_dominance(&inst, &defs).is_none());
-    // `(x < 5) & (x < 10)` is unresolved in the other direction only for `Or`.
-    let (defs, inst) = join_fixture(IrBinOp::Or, IrType::I32, IrCmpOp::Slt, 5, IrCmpOp::Sgt, 10);
+    // ...and `x == 5` satisfies neither disjunct here.
+    let (defs, inst) = join_fixture(IrBinOp::Or, IrType::I32, Slt, 5, Sgt, 5);
+    assert!(compare_dominance::fold_compare_dominance(&inst, &defs).is_none());
+    // `x == 7` falsifies `(x < 5) | (x > 10)`.
+    let (defs, inst) = join_fixture(IrBinOp::Or, IrType::I32, Slt, 5, Sgt, 10);
+    assert!(compare_dominance::fold_compare_dominance(&inst, &defs).is_none());
+    // Orderings must still agree: `(x <s 0) & (x >u 5)` holds for x = -1.
+    let (defs, inst) = join_fixture(IrBinOp::And, IrType::I32, Slt, 0, Ugt, 5);
     assert!(compare_dominance::fold_compare_dominance(&inst, &defs).is_none());
 }
 

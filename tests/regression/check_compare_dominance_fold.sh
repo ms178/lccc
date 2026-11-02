@@ -6,6 +6,8 @@
 #   (x > 0)  & (x > 99)     is   x > 99      the tighter floor decides both
 #   (x < 10) & (x < 5)      is   x < 5       the tighter ceiling decides both
 #   (x != 0) | (x > 4)      is   x != 0      the floor implies the guard
+#   (x < 5)  & (x > 10)     is   0           the two sets are disjoint
+#   (x < 5)  | (x > 4)      is   1           the two sets cover everything
 #
 # C spells range guards this way everywhere (`if (n && n > 4)`,
 # `p && p->len > 8` after inlining, `assert(i < n && i < max)`), and each site
@@ -21,9 +23,12 @@
 #      and (keeping the implied operand) in a disjunction,
 #   2. the folded body contains the surviving comparison's flag only -- the
 #      eliminated comparison's `set*` must be gone,
-#   3. the two shapes that must NOT fold stay at their exact count in both
-#      builds: comparisons of DIFFERENT values, and two bounds that describe
-#      nothing while neither implies the other,
+#   3. the shapes that must NOT fold stay at their exact count in both
+#      builds: comparisons of DIFFERENT values, and two bounds that neither
+#      imply each other nor decide the join (`(x < 5) | (x > 10)`, which the
+#      range-check fusion turns into one unsigned compare either way); the empty
+#      conjunction and the covering disjunction are a bare constant (GCC 16.2
+#      and Clang 23.1.4 emit the same two lines),
 #   4. `CCC_NO_COMPARE_DOMINANCE=1` brings every folded shape back, which is
 #      what proves the assertions above belong to this fold and not to some
 #      other rule that happens to agree today,
@@ -52,9 +57,14 @@ long     guard64(long x)          { return (x != 0) & (x > 4); }
 short    guard16(short x)         { return (x != 0) & (x > 4); }
 signed char guard8(signed char x) { return (x != 0) & (x > 4); }
 
-/* Controls.  Two bounds that describe nothing: neither implies the other, so
-   the pair must stay as written (the range folder owns emptiness). */
+/* Degenerate joins: disjoint sets are never both true, and covering sets are
+   never both false, so each join is a constant. */
 int      unrelated(int x)         { return (x < 5) & (x > 10); }
+int      covered(int x)           { return (x < 5) | (x > 4); }
+/* Control.  Two bounds that neither imply each other nor decide the join
+   (x = 7 falsifies it, x = 0 satisfies it).  The range-check fusion owns it
+   (`x - 5 >u 5`, five lines, as in GCC and Clang) with or without this fold. */
+int      gap(int x)               { return (x < 5) | (x > 10); }
 /* Control.  Two DIFFERENT values: neither comparison says anything about the
    other. */
 int      two_values(int x, int y) { return (x != 0) & (y > 4); }
@@ -131,11 +141,17 @@ fi
 lacks "$(fn_body "$tmp/shapes.s" or_guard)" 'cmpl[[:space:]]\+\$4' \
     "or_guard answered with the floor instead of the guard"
 
-# ── 3. Controls: the shapes that must not fold ─────────────────────────────
-expect unrelated 9 shapes.s
+# ── 3. Controls, and the two joins that are constants ──────────────────────
+expect unrelated 2 shapes.s
 expect unrelated 9 off.s
+expect covered 2 shapes.s
+expect covered 9 off.s
+expect gap 5 shapes.s
+expect gap 5 off.s
 expect two_values 9 shapes.s
 expect two_values 9 off.s
+lacks "$(fn_body "$tmp/shapes.s" unrelated)" 'cmp' "the empty conjunction still compares"
+lacks "$(fn_body "$tmp/shapes.s" covered)" 'cmp' "the covering disjunction still compares"
 
 # ── 4. The kill switch owns the shapes ─────────────────────────────────────
 # With the fold off every folded shape must be back at its unfolded count and
@@ -164,6 +180,8 @@ static long     guard64(long x)          { return (x != 0) & (x > 4); }
 static short    guard16(short x)         { return (x != 0) & (x > 4); }
 static signed char guard8(signed char x) { return (x != 0) & (x > 4); }
 static int      unrelated(int x)         { return (x < 5) & (x > 10); }
+static int      covered(int x)           { return (x < 5) | (x > 4); }
+static int      gap(int x)               { return (x < 5) | (x > 10); }
 static int      two_values(int x, int y) { return (x != 0) & (y > 4); }
 /* The same dominance one step away from the accepted shapes: a guard against a
    bound that does NOT exclude zero must not be dropped. */
@@ -191,6 +209,8 @@ int main(void) {
         mix((unsigned)guard16(s));
         mix((unsigned)(signed char)guard8((signed char)s));
         mix((unsigned)unrelated((int)s));
+        mix((unsigned)covered((int)s));
+        mix((unsigned)gap((int)s));
         mix((unsigned)two_values((int)s, (int)(unsigned short)(u * 7u)));
         mix((unsigned)negative_floor((int)s));
         mix((unsigned)min_floor((int)s));
@@ -208,6 +228,8 @@ int main(void) {
                 mix((unsigned)or_guard(edges[i]));
                 mix((unsigned long long)guard64((long)edges[i] * 1000003L));
                 mix((unsigned)unrelated(edges[i]));
+                mix((unsigned)covered(edges[i]));
+                mix((unsigned)gap(edges[i]));
                 mix((unsigned)two_values(edges[i], edges[j]));
                 mix((unsigned)negative_floor(edges[i]));
                 mix((unsigned)min_floor(edges[i]));
@@ -253,7 +275,7 @@ if command -v "${GCC_ORACLE:-gcc-16}" >/dev/null 2>&1; then
 fi
 
 # ── Instruction counts, printed so a drift is visible in the CI log ────────
-for name in guard floor_ ceiling zero_floor or_guard guard64 guard16 guard8 unrelated two_values; do
+for name in guard floor_ ceiling zero_floor or_guard guard64 guard16 guard8 unrelated covered gap two_values; do
     echo "  $name: $(count "$tmp/shapes.s" "$name") instructions (fold off: $(count "$tmp/off.s" "$name"))"
 done
 

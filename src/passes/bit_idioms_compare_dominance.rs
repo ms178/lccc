@@ -30,6 +30,14 @@
 //! fold never needs a value range analysis and never assumes a width's
 //! extremes: a comparison that is empty in its own ring (`u32 x < 0`) simply
 //! stays unmatched, which is a missed fold, never a wrong one.
+//!
+//! The same exact sets decide the two degenerate joins, which GCC 16.2 and
+//! Clang 23.1.4 both fold to a constant: a conjunction of DISJOINT sets is 0
+//! (`(x < 5) & (x > 10)`, `(x == 3) & (x == 4)`), and a disjunction whose
+//! sets cover every integer is 1 (`(x < 5) | (x > 4)`, `(x != 3) | (x < 10)`).
+//! Both are judged over the integers, and the comparisons' sets in their own
+//! ring are those integer sets intersected with the ring's range, so
+//! disjointness and coverage carry over to every width and ordering.
 
 use super::*;
 
@@ -147,6 +155,35 @@ fn is_subset(inner: ValueSet, outer: ValueSet) -> bool {
     }
 }
 
+/// The complement of a set [`value_set`] produced, which is again such a set:
+/// a point and a co-point swap, and a ray becomes the opposite ray.  A bounded
+/// interval cannot come from one comparison and has no complement here.
+fn complement(set: ValueSet) -> Option<ValueSet> {
+    match (set.lo, set.hi, set.excluded) {
+        (NEG_INF, POS_INF, Some(point)) => Some(ValueSet {
+            lo: point,
+            hi: point,
+            excluded: None,
+        }),
+        (lo, hi, None) if lo == hi && lo != NEG_INF && hi != POS_INF => Some(ValueSet {
+            lo: NEG_INF,
+            hi: POS_INF,
+            excluded: Some(lo),
+        }),
+        (NEG_INF, hi, None) if hi != POS_INF => Some(ValueSet {
+            lo: hi + 1,
+            hi: POS_INF,
+            excluded: None,
+        }),
+        (lo, POS_INF, None) if lo != NEG_INF => Some(ValueSet {
+            lo: NEG_INF,
+            hi: lo - 1,
+            excluded: None,
+        }),
+        _ => None,
+    }
+}
+
 /// The ordering both comparisons share, or `None` when they disagree.  `Eq`/`Ne`
 /// admit either ordering, so an unconstrained sibling decides.
 fn shared_ordering(a: IrCmpOp, b: IrCmpOp) -> Option<bool> {
@@ -165,12 +202,13 @@ fn shared_ordering(a: IrCmpOp, b: IrCmpOp) -> Option<bool> {
 }
 
 /// `(a != 0) & (a > 4)` is `a > 4`; `(a > 0) & (a > 99)` is `a > 99`;
-/// `(a < 10) & (a < 5)` is `a < 5`; `(a != 0) | (a > 4)` is `a != 0`.
+/// `(a < 10) & (a < 5)` is `a < 5`; `(a != 0) | (a > 4)` is `a != 0`;
+/// `(a < 5) & (a > 10)` is 0 and `(a < 5) | (a > 4)` is 1.
 ///
 /// Requires both join operands to be comparisons of the same SSA value at the
 /// same integer type, so both sides are 0/1 and `&`/`|` are logical.  The
 /// replacement copies the surviving operand, which keeps the join's own type
-/// and boolean carrier.
+/// and boolean carrier, or the join's constant answer in the join's type.
 pub(super) fn fold_compare_dominance(
     inst: &Instruction,
     defs: &[Option<Instruction>],
@@ -180,7 +218,7 @@ pub(super) fn fold_compare_dominance(
         op: logic @ (IrBinOp::And | IrBinOp::Or),
         lhs,
         rhs,
-        ty: _,
+        ty,
     } = inst
     else {
         return None;
@@ -194,6 +232,24 @@ pub(super) fn fold_compare_dominance(
     let bits = a.ty.size() * 8;
     let set_a = value_set(a.op, constant_value(a.constant, bits, signed));
     let set_b = value_set(b.op, constant_value(b.constant, bits, signed));
+    // The degenerate joins first: `a & b` over disjoint sets is never true,
+    // and `a | b` over sets covering every integer is never false.  Exact by
+    // `is_subset`: `a ∩ b = ∅` iff `a ⊆ ¬b`, and `a ∪ b = ℤ` iff `¬a ⊆ b`.
+    let constant = if *logic == IrBinOp::And {
+        complement(set_b)
+            .is_some_and(|not_b| is_subset(set_a, not_b))
+            .then_some(0)
+    } else {
+        complement(set_a)
+            .is_some_and(|not_a| is_subset(not_a, set_b))
+            .then_some(1)
+    };
+    if let Some(answer) = constant {
+        return Some(Instruction::Copy {
+            dest: *dest,
+            src: Operand::Const(IrConst::from_i64(answer, *ty)),
+        });
+    }
     // A conjunction is its stronger conjunct and a disjunction its weaker one:
     // `a & b` is `a` when `a` implies `b`, and `b` when `b` implies `a`; the
     // disjunction keeps the opposite operand under each implication.  (The
