@@ -40,3 +40,13 @@ __attribute__((noinline)) int probe_loop_sixty_four_pages(int seed)
     }
     return frame[0] + frame[63 * PAGE];
 }
+
+/* Every `tests/regression/*.c` is compiled AND linked as a standalone program by
+ * run_regression.py, so this file needs an entry point even though nothing here
+ * calls the two fixtures: their external linkage is what keeps their prologues
+ * in the object, and `main` is what keeps the corpus link from failing on a
+ * fixture that has no `main` by design. */
+int main(void)
+{
+    return 0;
+}
