@@ -213,6 +213,52 @@ pub struct MacroTable {
     /// line (corpus pins exact lines for `#pragma GCC dependency`
     /// reached via `_Pragma`).
     pending_pragmas: std::cell::RefCell<Vec<(String, usize)>>,
+    /// Builtins the source removed with `#undef`.
+    ///
+    /// A dynamic builtin is not a macro-table entry that `#undef` can simply
+    /// delete: `__LINE__` and `__COUNTER__` are computed per token, and
+    /// `__FILE__`, `__INCLUDE_LEVEL__` and `__TIMESTAMP__` are *re-materialised*
+    /// on every file transition. Without this set, `#undef __FILE__` followed by
+    /// any `#include` would silently bring the macro back (measured: GCC 16.2
+    /// and Clang 23.1.4 both leave all five undefined for the rest of the
+    /// translation unit), which is exactly the "did my `#undef` work?" question
+    /// that portable code asks in its own feature probes.
+    suppressed: FxHashSet<String>,
+}
+
+/// Preprocessor builtins that are not plain replacement lists.
+///
+/// Members are recognised by `#ifdef`/`defined()` whether or not they are
+/// currently in the table, they can be removed for the rest of the translation
+/// unit with `#undef`, and a user `#define` of one of them wins over the
+/// builtin value.
+pub(super) const DYNAMIC_BUILTINS: [&str; 5] = [
+    "__LINE__",
+    "__COUNTER__",
+    "__FILE__",
+    "__INCLUDE_LEVEL__",
+    "__TIMESTAMP__",
+];
+
+/// True when `name` is one of the five builtins above. A linear scan over five
+/// short strings beats hashing for the callers, all of which run per token or
+/// per directive.
+#[inline]
+pub(super) fn is_dynamic_builtin(name: &str) -> bool {
+    DYNAMIC_BUILTINS.contains(&name)
+}
+
+/// Builtins that a `-dM` dump must not list as definitions.
+///
+/// GCC and Clang keep these in preprocessor state rather than in the macro
+/// table, so neither reference compiler prints them from `-dM -E` (measured on
+/// gcc-16 and clang-23: all eight are absent). lccc materialises `__FILE__`,
+/// `__INCLUDE_LEVEL__` and `__TIMESTAMP__` into the table precisely so that
+/// `#ifdef`, `#undef`, `-dM`-independent line splicing and re-materialisation
+/// need no special cases elsewhere; the dump then removes them by name so a
+/// `-dM` diff against either reference is about real feature macros.
+pub(super) fn is_builtin_without_definition(name: &str) -> bool {
+    is_dynamic_builtin(name) || matches!(name, "__DATE__" | "__TIME__" | "__BASE_FILE__")
 }
 
 impl MacroTable {
@@ -229,6 +275,7 @@ impl MacroTable {
             track_expansions: Cell::new(false),
             asm_mode: false,
             pending_pragmas: std::cell::RefCell::new(Vec::new()),
+            suppressed: FxHashSet::default(),
         }
     }
 
@@ -239,18 +286,52 @@ impl MacroTable {
     }
 
     /// Define a new macro.
+    ///
+    /// A definition of a dynamic builtin cancels an earlier `#undef` of it: the
+    /// user has taken ownership of the name, so the preprocessor must stop
+    /// substituting its own value (GCC 16.2: `#undef __LINE__` then
+    /// `#define __LINE__ 42` makes every later `__LINE__` expand to 42).
     pub fn define(&mut self, def: MacroDef) {
+        if is_dynamic_builtin(&def.name) {
+            self.suppressed.remove(&def.name);
+        }
         self.macros.insert(def.name.clone(), def);
     }
 
     /// Undefine a macro.
+    ///
+    /// For a dynamic builtin this also records the removal so that later file
+    /// transitions cannot re-materialise it (see `suppressed`).
     pub fn undefine(&mut self, name: &str) {
         self.macros.remove(name);
+        if is_dynamic_builtin(name) {
+            self.suppressed.insert(name.to_string());
+        }
+    }
+
+    /// Whether the builtin `name` is currently suppressed by `#undef`.
+    #[inline]
+    pub(super) fn builtin_suppressed(&self, name: &str) -> bool {
+        !self.suppressed.is_empty() && self.suppressed.contains(name)
+    }
+
+    /// Whether `name` should expand to the preprocessor-computed value right
+    /// now: it is a dynamic builtin, the source has not `#undef`ed it, and the
+    /// table does not hold a user definition of that name.
+    ///
+    /// The table check comes last so the common case (a token that is not a
+    /// builtin at all) costs five short comparisons.
+    #[inline]
+    pub(super) fn builtin_expands(&self, name: &str) -> bool {
+        is_dynamic_builtin(name)
+            && !self.builtin_suppressed(name)
+            && !self.macros.contains_key(name)
     }
 
     /// Check if a macro is defined.
     pub fn is_defined(&self, name: &str) -> bool {
-        name == "__COUNTER__" || name == "__LINE__" || self.macros.contains_key(name)
+        (is_dynamic_builtin(name) && !self.builtin_suppressed(name))
+            || self.macros.contains_key(name)
             // These are special preprocessor operators, not real macros.
             // They need to be recognized by #ifdef but are evaluated as
             // special functions in #if expressions by resolve_defined_in_expr().
@@ -309,26 +390,55 @@ impl MacroTable {
         }
     }
 
-    /// Set the __FILE__ macro body without allocating a full MacroDef.
-    /// If __FILE__ already exists in the table, only its body is updated.
-    /// Otherwise, a new entry is created.
-    /// This avoids 2 full MacroDef allocations per #include directive.
-    pub fn set_file(&mut self, body: String) {
-        if let Some(existing) = self.macros.get_mut("__FILE__") {
-            existing.body = body;
-        } else {
-            self.macros.insert(
-                "__FILE__".to_string(),
-                MacroDef {
-                    name: "__FILE__".to_string(),
-                    is_function_like: false,
-                    params: Vec::new(),
-                    is_variadic: false,
-                    has_named_variadic: false,
-                    body,
-                },
-            );
+    /// Set the body of a file-scoped builtin (`__FILE__`, `__INCLUDE_LEVEL__`,
+    /// `__TIMESTAMP__`) without allocating a whole `MacroDef`.
+    ///
+    /// These three change twice per `#include` (once entering, once leaving), so
+    /// the body is updated in place; only the first sight of a name allocates.
+    /// A name the source `#undef`ed is left alone: the transition that is asking
+    /// must not resurrect a macro that is gone for the rest of the translation
+    /// unit.
+    pub fn set_builtin_body(&mut self, name: &'static str, body: &str) {
+        if self.builtin_suppressed(name) {
+            return;
         }
+        match self.macros.get_mut(name) {
+            Some(existing) => {
+                if existing.body != body {
+                    existing.body.clear();
+                    existing.body.push_str(body);
+                }
+            }
+            None => {
+                self.macros.insert(
+                    name.to_string(),
+                    MacroDef {
+                        name: name.to_string(),
+                        is_function_like: false,
+                        params: Vec::new(),
+                        is_variadic: false,
+                        has_named_variadic: false,
+                        body: body.to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// `__FILE__`'s replacement list (a quoted string).
+    pub fn set_file(&mut self, body: String) {
+        self.set_builtin_body("__FILE__", &body);
+    }
+
+    /// `__INCLUDE_LEVEL__`'s replacement list (a decimal integer).
+    ///
+    /// Formatted through a stack buffer: the value is a small depth and the buffer is
+    /// copied into the macro immediately, so nesting depth never touches the
+    /// allocator beyond the initial macro creation.
+    pub fn set_include_level(&mut self, level: usize) {
+        let mut buf = itoa::Buffer::new();
+        let text = buf.format(level);
+        self.set_builtin_body("__INCLUDE_LEVEL__", text);
     }
 
     /// Get the current __FILE__ macro body.
@@ -702,8 +812,10 @@ impl MacroTable {
             return self.handle_pragma_operator(bytes, i, ident, result, expanding);
         }
 
-        // Handle __COUNTER__ built-in
-        if ident == "__COUNTER__" {
+        // Handle __COUNTER__ built-in. `builtin_expands` is what makes
+        // `#undef __COUNTER__` and a user `#define __COUNTER__` behave: the
+        // builtin value applies only while the name is still the compiler's.
+        if ident == "__COUNTER__" && self.builtin_expands(ident) {
             let val = self.counter.get();
             self.counter.set(val + 1);
             let mut buf = itoa::Buffer::new();
@@ -714,7 +826,7 @@ impl MacroTable {
         // Handle __LINE__ built-in: inside a macro expansion the value is
         // pinned to the invocation line; at top level it is the physical
         // line of this very token (per-offset resolution).
-        if ident == "__LINE__" {
+        if ident == "__LINE__" && self.builtin_expands(ident) {
             let val = match self.line_pinned.get() {
                 Some(v) => v,
                 None => self.resolve_line(start),

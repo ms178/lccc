@@ -608,51 +608,12 @@ impl Preprocessor {
 
     /// Return C-standard `__DATE__` and `__TIME__` macro replacement lists.
     ///
-    /// `SOURCE_DATE_EPOCH` is honored for reproducible builds.  Without it we
-    /// use the current system time.  The conversion is UTC-only and uses safe
-    /// `std` code to preserve CCC's zero-dependency / no-new-unsafe policy.
+    /// Both macros are sampled in one call so they can never straddle a second
+    /// boundary, and both are rendered by `common::host_time`, which follows the
+    /// host's local zone exactly as GCC and Clang do and switches to UTC when
+    /// `SOURCE_DATE_EPOCH` supplies the instant.
     fn current_date_time_macros() -> (String, String) {
-        let secs = std::env::var("SOURCE_DATE_EPOCH")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64
-            });
-        let (year, month, day, hour, min, sec) = Self::unix_utc_to_ymdhms(secs);
-        const MONTHS: [&str; 12] = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ];
-        let month_name = MONTHS[(month.saturating_sub(1) as usize).min(11)];
-        (
-            format!("\"{} {:>2} {}\"", month_name, day, year),
-            format!("\"{:02}:{:02}:{:02}\"", hour, min, sec),
-        )
-    }
-
-    /// Convert a Unix timestamp to UTC calendar components using Howard
-    /// Hinnant's civil date algorithm.  Handles pre-epoch values too, which is
-    /// useful for SOURCE_DATE_EPOCH test cases.
-    fn unix_utc_to_ymdhms(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
-        let days = secs.div_euclid(86_400);
-        let sod = secs.rem_euclid(86_400);
-        let hour = (sod / 3600) as u32;
-        let min = ((sod % 3600) / 60) as u32;
-        let sec = (sod % 60) as u32;
-
-        let z = days + 719_468;
-        let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096).div_euclid(365);
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2).div_euclid(153);
-        let d = doy - (153 * mp + 2).div_euclid(5) + 1;
-        let m = mp + if mp < 10 { 3 } else { -9 };
-        let year = y + if m <= 2 { 1 } else { 0 };
-        (year, m as u32, d as u32, hour, min, sec)
+        crate::common::host_time::date_time_bodies()
     }
 
     /// Locate the bundled `include/` directory shipped alongside the binary.
