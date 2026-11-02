@@ -208,3 +208,68 @@ successful. `bash -n scripts/ci_local.sh` and `git diff --check` pass. No compil
 source changed during this host/CI repair; the local full kernel process remains
 on the previously validated compiler binaries. The new revision still needs
 fresh hosted CI and the outstanding acceptance gates listed above.
+
+## PID-1 console and stronger guest-runtime audit
+
+Inspection of Linux 6.18.58 `init/main.c:console_on_rootfs()` found another
+concrete smoke-harness defect: it opens `/dev/console` and initializes PID 1's
+three standard descriptors **before** executing `/init`. The old unprivileged
+`find | cpio` archive contained an empty /dev directory and no console node.
+Creating device nodes only later inside /init cannot prevent the initial console
+warning or retroactively initialize those descriptors.
+
+The harness now uses the kernel's genuine **host-built** `usr/gen_init_cpio`
+(default inferred from the bzImage tree; explicit GEN_INIT_CPIO supported).
+Its manifest provides console character device 5:1 (0600), null 1:3 (0666),
+root-owned directory/file metadata, /bin/sh -> busybox and executable /init.
+This needs no host root privileges, fakeroot, custom archive writer or validator
+shim. A missing/failing generator is a hard failure. Relative input filenames
+handle whitespace in TMPDIR. Redundant staging-directory/symlink/chmod operations
+were removed because the manifest supplies that metadata directly.
+
+Alternatives rejected: privileged mknod is unavailable to the sandbox and
+unnecessary; reopening descriptors in /init leaves the kernel's initial-console
+warning unfixed; a new custom CPIO writer would duplicate a standard Linux host
+tool and add archive-format/security maintenance. No compiler optimization or
+whole-program speedup is claimed for this host-harness repair.
+
+The real guest script now also mounts devtmpfs and a bounded 32 MiB tmpfs, runs
+two concurrent workers writing/checksumming 8 MiB of zeros apiece, checks each
+worker's exit status separately, compares both files and syncs before emitting
+`LCCC_DEFCFG_MEMORY_IO_PASS`. The SHA256 was independently computed as
+`2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74`.
+This exercises process scheduling, demand-zero pages, tmpfs allocation and VFS
+I/O/data integrity; it is not exhaustive hardware or kernel correctness proof.
+The verdict requires this new marker and rejects kernel WARNING/BUG output and
+the initial-console warning as well as the existing panic/Oops/failure markers.
+
+Executed validation:
+
+* Expanded hermetic harness regression PASS: original success/security verdicts,
+  missing runtime marker, kernel warning, console failure, missing/failing archive
+  tool, whitespace TMPDIR, and split Debian firmware discovery/refusal.
+* The **actual generated** worker/join shell logic passes with both command-stub
+  workers succeeding and correctly rejects either first-worker or last-worker
+  failure. These are explicitly status-propagation unit tests, not guest boots.
+* Embedded init passes both Bash syntax validation and real BusyBox ash `sh -n`.
+* Real Linux gen_init_cpio built by GCC 16.2 generated the archive, including in a
+  whitespace-containing TMPDIR. Independent newc decoding verified all 9 entries,
+  device major/minor/modes, root ownership, /bin/sh target, executable /init,
+  embedded workload, and byte-for-byte equality of the actual static BusyBox.
+  Archive SHA256:
+  `ef8cc0e8031100eab4c52a0c7ca9ecf8398beeb418cb2f6c93cd5fa7cf43bda3`.
+  Only QEMU was a fixture for this archive test; **no guest boot is claimed**.
+* Private Debian `file` needed its actual private magic database selected in its
+  wrapper. Corrected host-only MAGIC to the verified package's
+  `usr/lib/file/magic.mgc`; real file now recognizes the static BusyBox. This is
+  an environment repair, not weakening the static-binary preflight.
+* Workflow shell validator PASS (13 files, 2 rules), hosted/local gate parity
+  PASS (503 commands, 27 invocation contracts), and git diff --check PASS.
+
+At this observation the original local full build is still running (over 1700
+C translation units compiled, no compile error observed), with genuine objtool,
+4 GiB swap and the existing optimized fastbuild compiler/linker. Every hosted
+check for 3bc6e92b1 except the still-running full kernel job has completed
+successfully, including Test Suite and authenticated ICX. These are **not**
+results for the new harness revision. Full link/guest boot and all previously
+listed compiler warning/option/semantic/performance findings remain open.

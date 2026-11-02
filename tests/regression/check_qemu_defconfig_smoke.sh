@@ -13,7 +13,18 @@ printf '#!/bin/sh\necho "fake: statically linked"\n' > "$work/bin/file"
 printf '#!/bin/sh\ncat >/dev/null; printf archive\n' > "$work/bin/cpio"
 printf '#!/bin/sh\ncat\n' > "$work/bin/gzip"
 printf '#!/bin/sh\nexit 0\n' > "$work/bin/busybox"
+cat > "$work/bin/gen_init_cpio" <<'ARCHIVE'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == -t && $2 == 0 && $# -eq 3 ]]
+grep -qx 'nod /dev/console 600 0 0 c 5 1' "$3"
+grep -qx 'nod /dev/null 666 0 0 c 1 3' "$3"
+[[ -f bin/busybox && -f init ]]
+cp init "$CAPTURE_INIT"
+printf archive
+ARCHIVE
 chmod +x "$work/bin/"*
+export GEN_INIT_CPIO="$work/bin/gen_init_cpio" CAPTURE_INIT="$work/captured-init"
 cat > "$work/qemu" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -30,12 +41,16 @@ LCCC_DEFCFG_BOOT_BEGIN
 Linux version test (lccc synthetic compiler identity)
 LCCC_DEFCFG_CPUS=2
 LCCC_DEFCFG_SERIAL=the quick brown fox 0123456789 !?
+LCCC_DEFCFG_MEMORY_IO_PASS
 LCCC_DEFCFG_BOOT_PASS
 reboot: Power down
 LOG
 esac
 [[ ${FAKE_QEMU_CASE:-pass} != wrong-compiler ]] || sed -i 's/lccc synthetic/gcc synthetic/' "$log"
 [[ ${FAKE_QEMU_CASE:-pass} != panic ]] || echo 'Kernel panic - synthetic' >> "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != runtime-warning ]] || echo 'WARNING: synthetic kernel warning' >> "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != missing-workload ]] || sed -i '/LCCC_DEFCFG_MEMORY_IO_PASS/d' "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != console ]] || echo 'Warning: unable to open an initial console.' >> "$log"
 [[ ${FAKE_QEMU_CASE:-pass} != exit ]] || exit 1
 FAKE
 chmod +x "$work/qemu"
@@ -48,7 +63,26 @@ FAKE_QEMU_CASE=pass "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/
 [[ ! -L "$BOOT_LOG" && $(cat "$work/victim") == 'do not overwrite' ]] || {
   echo 'FAIL: output symlink followed' >&2; exit 1;
 }
-for case in missing no-log panic exit wrong-compiler; do
+# Check the actual embedded guest script's syntax, not just the fake verdict.
+bash -n "$CAPTURE_INIT"
+# Execute the generated worker/join logic with isolated command stubs. In
+# particular, the first child's failure must not be hidden by the second's
+# success. This tests status propagation, not guest I/O or kernel execution.
+workers=$(sed -n '/^pids=$/,/^for pid in /p' "$CAPTURE_INIT")
+[[ -n "$workers" ]]
+for failure in none a b; do
+  if FAIL_WORKER=$failure bash -e -c '
+    dd() { [[ $FAIL_WORKER == none || "$*" != *"data-$FAIL_WORKER"* ]]; }
+    sha256sum() { cat >/dev/null; }
+    fail() { exit 1; }
+    eval "$1"
+  ' bash "$workers"; then
+    [[ $failure == none ]] || { echo "FAIL: worker $failure failure hidden" >&2; exit 1; }
+  else
+    [[ $failure != none ]] || { echo 'FAIL: successful workers rejected' >&2; exit 1; }
+  fi
+done
+for case in missing no-log panic exit wrong-compiler runtime-warning missing-workload console; do
   if FAKE_QEMU_CASE=$case "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >"$work/out" 2>&1; then
     echo "FAIL: QEMU smoke accepted $case" >&2; cat "$work/out" >&2; exit 1
   fi
@@ -56,6 +90,17 @@ done
 if "$root/scripts/qemu_defconfig_smoke.sh" "$work/absent" >/dev/null 2>&1; then
   echo 'FAIL: missing image accepted' >&2; exit 1
 fi
+if GEN_INIT_CPIO="$work/absent" "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/null 2>&1; then
+  echo 'FAIL: missing archive generator accepted' >&2; exit 1
+fi
+printf '#!/bin/sh\nprintf partial-archive\nexit 1\n' > "$work/bad-generator"
+chmod +x "$work/bad-generator"
+if GEN_INIT_CPIO="$work/bad-generator" "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/null 2>&1; then
+  echo 'FAIL: failed archive generator accepted' >&2; exit 1
+fi
+mkdir -p "$work/tmp with spaces"
+TMPDIR="$work/tmp with spaces" FAKE_QEMU_CASE=pass \
+  "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/null
 # Exercise the real staging helper against hermetic Debian split directories.
 # Nothing from the machine's own /usr/share or /usr/lib may satisfy these tests.
 source "$root/scripts/qemu_firmware.sh"
