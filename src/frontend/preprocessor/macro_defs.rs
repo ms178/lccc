@@ -231,6 +231,19 @@ pub struct MacroTable {
     file_stack: std::cell::RefCell<Vec<std::path::PathBuf>>,
     /// `__TIMESTAMP__` bodies, keyed by physical path (see `file_stack`).
     timestamp_bodies: std::cell::RefCell<FxHashMap<std::path::PathBuf, String>>,
+    /// Builtins whose definition *this compiler* supplied (bit set) -- see
+    /// `BUILTIN_NAMES`. Those are the ones a `-dM` dump omits, because both
+    /// reference compilers keep them in preprocessor state rather than in the
+    /// macro table and therefore never print them (measured on gcc-16 and
+    /// clang-23: all eight are absent). A definition the *source* supplied is
+    /// listed, again like both oracles (`-D__DATE__="x" -dM -E` prints
+    /// `#define __DATE__ "x"`).
+    compiler_owned: Cell<u8>,
+    /// Builtins the source defined (`-D`, `#define`). A user definition wins
+    /// over materialisation and over lazy expansion: `#define __FILE__ "mine"`
+    /// must survive an `#include`, which both oracles do and lccc did not (it
+    /// re-materialised the header's name inside the header).
+    user_owned: Cell<u8>,
     /// Builtins the source removed with `#undef`.
     ///
     /// A dynamic builtin is not a macro-table entry that `#undef` can simply
@@ -266,17 +279,36 @@ pub(super) fn is_dynamic_builtin(name: &str) -> bool {
     DYNAMIC_BUILTINS.contains(&name)
 }
 
-/// Builtins that a `-dM` dump must not list as definitions.
+/// Every builtin the preprocessor owns a definition for, in bit order.
 ///
-/// GCC and Clang keep these in preprocessor state rather than in the macro
-/// table, so neither reference compiler prints them from `-dM -E` (measured on
-/// gcc-16 and clang-23: all eight are absent). lccc materialises `__FILE__`,
-/// `__INCLUDE_LEVEL__` and `__TIMESTAMP__` into the table precisely so that
-/// `#ifdef`, `#undef`, `-dM`-independent line splicing and re-materialisation
-/// need no special cases elsewhere; the dump then removes them by name so a
-/// `-dM` diff against either reference is about real feature macros.
-pub(super) fn is_builtin_without_definition(name: &str) -> bool {
-    is_dynamic_builtin(name) || matches!(name, "__DATE__" | "__TIME__" | "__BASE_FILE__")
+/// The first four are *materialised* (their body is a table entry, updated by
+/// `set_builtin_body`); the last four are computed at expansion or carry no
+/// body of their own. Both facts are tracked as bitmasks over this list rather
+/// than as hash sets: there are eight of them, the checks run per directive and
+/// per dump line, and a `u8` test cannot allocate.
+const BUILTIN_NAMES: [&str; 8] = [
+    "__FILE__",
+    "__BASE_FILE__",
+    "__DATE__",
+    "__TIME__",
+    "__LINE__",
+    "__COUNTER__",
+    "__INCLUDE_LEVEL__",
+    "__TIMESTAMP__",
+];
+
+/// Bit for `name` in the ownership masks, or `None` for an ordinary macro.
+#[inline]
+fn builtin_bit(name: &str) -> Option<u8> {
+    // A length check rejects every non-builtin in one comparison, so this costs
+    // the same as the `matches!` it replaces on the hot path.
+    match name.len() {
+        6..=17 => BUILTIN_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .map(|index| 1u8 << index),
+        _ => None,
+    }
 }
 
 impl MacroTable {
@@ -294,6 +326,8 @@ impl MacroTable {
             asm_mode: false,
             pending_pragmas: std::cell::RefCell::new(Vec::new()),
             suppressed: FxHashSet::default(),
+            compiler_owned: Cell::new(0),
+            user_owned: Cell::new(0),
             file_stack: std::cell::RefCell::new(Vec::new()),
             timestamp_bodies: std::cell::RefCell::new(FxHashMap::default()),
         }
@@ -312,6 +346,10 @@ impl MacroTable {
     /// substituting its own value (GCC 16.2: `#undef __LINE__` then
     /// `#define __LINE__ 42` makes every later `__LINE__` expand to 42).
     pub fn define(&mut self, def: MacroDef) {
+        if let Some(bit) = builtin_bit(&def.name) {
+            self.user_owned.set(self.user_owned.get() | bit);
+            self.compiler_owned.set(self.compiler_owned.get() & !bit);
+        }
         if is_dynamic_builtin(&def.name) {
             self.suppressed.remove(&def.name);
         }
@@ -324,8 +362,32 @@ impl MacroTable {
     /// transitions cannot re-materialise it (see `suppressed`).
     pub fn undefine(&mut self, name: &str) {
         self.macros.remove(name);
+        if let Some(bit) = builtin_bit(name) {
+            // Neither the compiler's definition nor the source's survives.
+            self.compiler_owned.set(self.compiler_owned.get() & !bit);
+            self.user_owned.set(self.user_owned.get() & !bit);
+        }
         if is_dynamic_builtin(name) {
             self.suppressed.insert(name.to_string());
+        }
+    }
+
+    /// Whether the definition of `name` in the table (if any) was supplied by
+    /// this compiler rather than by the source.
+    #[inline]
+    pub(super) fn builtin_is_compiler_owned(&self, name: &str) -> bool {
+        match builtin_bit(name) {
+            Some(bit) => self.compiler_owned.get() & bit != 0,
+            None => false,
+        }
+    }
+
+    /// Whether the source has taken ownership of the builtin `name`.
+    #[inline]
+    fn builtin_is_user_owned(&self, name: &str) -> bool {
+        match builtin_bit(name) {
+            Some(bit) => self.user_owned.get() & bit != 0,
+            None => false,
         }
     }
 
@@ -419,8 +481,11 @@ impl MacroTable {
     /// must not resurrect a macro that is gone for the rest of the translation
     /// unit.
     pub fn set_builtin_body(&mut self, name: &'static str, body: &str) {
-        if self.builtin_suppressed(name) {
+        if self.builtin_suppressed(name) || self.builtin_is_user_owned(name) {
             return;
+        }
+        if let Some(bit) = builtin_bit(name) {
+            self.compiler_owned.set(self.compiler_owned.get() | bit);
         }
         match self.macros.get_mut(name) {
             Some(existing) => {

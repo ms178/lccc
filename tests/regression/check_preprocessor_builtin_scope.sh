@@ -212,6 +212,33 @@ if [ "$have_gcc" -eq 1 ]; then
         || fail "#define after #undef: gcc-16 disagrees: '$ref'"
 fi
 
+# A definition the *source* supplied wins over the compiler's own: the header
+# below must see "mine", not its own name. Both oracles keep the user's macro
+# across the include; re-materialising the builtin inside the header is what lccc
+# used to do.
+printf 'const char *in_header = __FILE__;\n' >"$tmp/inner.h"
+cat >"$tmp/userfile.c" <<'C'
+#define __FILE__ "mine"
+#define __DATE__ "user date"
+#include "inner.h"
+const char *after = __FILE__;
+const char *date_here = __DATE__;
+C
+mine=$(preprocess "$CCC" "$tmp/userfile.c")
+expect_line "$mine" "user __FILE__" 'const char *in_header = "mine";'
+expect_line "$mine" "user __FILE__" 'const char *after = "mine";'
+expect_line "$mine" "user __DATE__" 'const char *date_here = "user date";'
+if [ "$have_gcc" -eq 1 ]; then
+    ref=$(preprocess "$GCC" "$tmp/userfile.c")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "user __FILE__: gcc-16 disagrees: '$ref'"
+fi
+if [ "$have_clang" -eq 1 ]; then
+    ref=$(preprocess "$CLANG" "$tmp/userfile.c")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "user __FILE__: clang-23 disagrees: '$ref'"
+fi
+
 # --- 3. __TIMESTAMP__: per file, local zone, SOURCE_DATE_EPOCH --------------
 # 981173106 = 2001-02-03T04:05:06Z (a Saturday), 946684798 = 1999-12-31T23:59:58Z.
 printf 'const char *stamp_a = __TIMESTAMP__;\n' >"$tmp/stamp_a.h"
@@ -334,6 +361,24 @@ for name in __GNUC__ __STDC_VERSION__ __x86_64__; do
         fail "-dM: '$name' must still be listed (the filter must not over-reach)"
     fi
 done
+# ... but a definition the source supplied IS listed, exactly as both oracles
+# list `-D__DATE__="x"`. A name-based filter would hide it.
+user_dump=$("$CCC" -dM -E -D__DATE__='"x"' -D__FILE__='"y"' -D__TIMESTAMP__='"z"' -x c /dev/null)
+for spec in '__DATE__ "x"' '__FILE__ "y"' '__TIMESTAMP__ "z"'; do
+    if ! printf '%s\n' "$user_dump" | grep -qF "#define $spec"; then
+        fail "-dM: a user-supplied definition must be listed: '#define $spec'"
+    fi
+done
+if [ "$have_gcc" -eq 1 ]; then
+    ref_dump=$("$GCC" -dM -E -D__DATE__='"x"' -D__FILE__='"y"' -D__TIMESTAMP__='"z"' -x c /dev/null)
+    for name in __DATE__ __FILE__ __TIMESTAMP__; do
+        mine_listed=$(printf '%s\n' "$user_dump" | grep -c "^#define $name ")
+        ref_listed=$(printf '%s\n' "$ref_dump" | grep -c "^#define $name ")
+        [ "$mine_listed" = "$ref_listed" ] \
+            || fail "-dM: '$name' listing ($mine_listed) differs from gcc-16 ($ref_listed)"
+    done
+fi
+
 if [ "$have_gcc" -eq 1 ]; then
     ref=$("$GCC" -dM -E -x c /dev/null)
     for name in __FILE__ __LINE__ __DATE__ __TIME__ __TIMESTAMP__ __INCLUDE_LEVEL__ \

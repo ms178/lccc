@@ -1038,14 +1038,8 @@ impl Preprocessor {
         self.macros.set_file(format!("\"{}\"", filename));
         // __BASE_FILE__ always expands to the main input file name,
         // unlike __FILE__ which changes during #include processing.
-        self.macros.define(MacroDef {
-            name: "__BASE_FILE__".to_string(),
-            is_function_like: false,
-            params: Vec::new(),
-            is_variadic: false,
-            has_named_variadic: false,
-            body: format!("\"{}\"", filename),
-        });
+        self.macros
+            .set_builtin_body("__BASE_FILE__", &format!("\"{}\"", filename));
         // Push the file path onto the include stack for relative includes.
         // Use make_absolute (not canonicalize) to preserve symlinks, matching GCC
         // behavior: #include "..." searches relative to the directory where the
@@ -1098,18 +1092,20 @@ impl Preprocessor {
     /// lists. This output is used by build systems like Meson to detect compiler
     /// features via preprocessor defines (e.g., `__GNUC__`, `__GNUC_MINOR__`).
     ///
-    /// The compiler's own builtins are omitted, exactly as `gcc-16 -dM -E` and
-    /// `clang-23 -dM -E` omit them: `__FILE__`, `__LINE__`, `__DATE__`,
-    /// `__TIME__`, `__TIMESTAMP__`, `__INCLUDE_LEVEL__`, `__BASE_FILE__` and
-    /// `__COUNTER__` are not definitions a program can portably test for, and
-    /// listing them made a `-dM` diff against either reference compiler report
-    /// seven lines that exist only here. See
-    /// [`is_builtin_without_definition`] for the list and the measurements.
+    /// The compiler's own builtin definitions are omitted, exactly as
+    /// `gcc-16 -dM -E` and `clang-23 -dM -E` omit them: `__FILE__`, `__LINE__`,
+    /// `__DATE__`, `__TIME__`, `__TIMESTAMP__`, `__INCLUDE_LEVEL__`,
+    /// `__BASE_FILE__` and `__COUNTER__` are preprocessor state in both
+    /// references, so listing them made a `-dM` diff report seven lines that
+    /// exist only here. A definition the *source* supplied is still listed --
+    /// both oracles print `-D__DATE__="x"` -- which is why the filter asks
+    /// whether the entry is the compiler's rather than whether its name is on a
+    /// list.
     pub fn dump_defines(&self) -> String {
         let mut defs: Vec<String> = self
             .macros
             .iter()
-            .filter(|def| !super::macro_defs::is_builtin_without_definition(&def.name))
+            .filter(|def| !self.macros.builtin_is_compiler_owned(&def.name))
             .map(|def| {
                 if def.is_function_like {
                     let params = def.params.join(",");

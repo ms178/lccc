@@ -563,9 +563,12 @@ impl Preprocessor {
             self.define_simple_macro("__WCHAR_TYPE__", "short unsigned int");
         }
 
+        // Materialised through `set_builtin_body`, which marks them as the
+        // compiler's own definitions (so `-dM` omits them, like both oracles)
+        // and refuses to overwrite a `-D__DATE__=...` the command line supplied.
         let (date_macro, time_macro) = Self::current_date_time_macros();
-        self.define_simple_macro("__DATE__", &date_macro);
-        self.define_simple_macro("__TIME__", &time_macro);
+        self.macros.set_builtin_body("__DATE__", &date_macro);
+        self.macros.set_builtin_body("__TIME__", &time_macro);
 
         // Note: __builtin_expect is handled as a real builtin (not a macro)
         // to properly evaluate side effects in the second argument.

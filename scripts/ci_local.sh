@@ -264,6 +264,9 @@ gate "frontend-promotion-sweep" fast \
 gate "frontend-preprocessor-builtins" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" CLANG="${CLANG23:-clang-23}" \
     bash tests/regression/check_preprocessor_builtin_scope.sh
+gate "conditional-carrier-families" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_conditional_carrier.sh
 gate "asm-flag-outputs" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \
