@@ -57,7 +57,7 @@ directives, labels or comments, as every table in the design doc does.
 | `__builtin_parityll(x)` (control) | 11 = 11 | 16 = 16 | 13 = 13 | 17 = 17 |
 | `__builtin_parity(u8)` | 8 → **5** | 10 → **6** | 14 = 14 | 16 = 16 |
 | `__builtin_parity(u16)` | 8 → **5** | 10 → **7** | 14 = 14 | 18 = 18 |
-| `__builtin_popcount(u8)` | 17 → **8** | 19 → **11** | 13 = 13 | 24 = 24 |
+| `__builtin_popcount(u8)` | 17 → **8** | 19 → **11** (10 when the argument load's mask and the narrow prelude's `andl $0xff` coincide) | 13 = 13 | 24 = 24 |
 | `__builtin_popcount(u16)` | 17 = 17 | 19 = 19 | 13 = 13 | 26 = 26 |
 | `__builtin_popcount(x) & 1` (control) | 8 = 8 | 13 = 13 | 13 = 13 | 16 = 16 |
 | `1u << (32 - clz(x - 1))` (control) | 9 = 9 | 17 = 17 | 16 = 16 | 32 = 32 |

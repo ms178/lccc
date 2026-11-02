@@ -251,7 +251,15 @@ pini686 par32 13
 # calling convention adds.
 pini686 par8 6
 pini686 par16 7
-pini686 pc8 11
+# The byte count is pinned as a bound, not a number: it is 10 or 11 depending
+# on whether the argument load (`movzbl 16(%esp)`) and the narrow prelude's
+# `andl $0xff` are both emitted, which is a frame/argument-lowering detail and
+# not this rule's business.  The shape is what matters and it is checked above
+# on x86-64; here the count must stay in the multiplier form's neighbourhood
+# instead of the 19-instruction SWAR's.
+i686pc8=$(count_of pc8 "$tmp/i686.s")
+[ "$i686pc8" -le 12 ] || fail "pc8: $i686pc8 instructions on i686, expected the multiplier form (< 13)"
+grep -q '0x55555555' <<<"$(fn_body pc8 "$tmp/i686.s")" && fail "pc8 still runs the 32-bit SWAR on i686"
 
 # ---- 6. Values -----------------------------------------------------------
 src=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/parity_and_popcount.c
