@@ -3524,6 +3524,7 @@ impl ArchCodegen for ArmCodegen {
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
         fn emit_int_bitreverse(&mut self, ty: IrType) => emit_int_bitreverse_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
+        fn emit_int_parity(&mut self, ty: IrType) => emit_int_parity_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
         fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) => emit_copy_i128_impl;
         // comparison

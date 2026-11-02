@@ -115,20 +115,18 @@ impl Lowerer {
                 self.emit_cast_val(Operand::Value(pc), op_ty, IrType::I32)
             }
             "__builtin_parityg" => {
-                let pc = self.fresh_value();
+                // Parity is its own operation: the count is not wanted, only
+                // its low bit, and `IrUnaryOp::Parity` is what lets a backend
+                // answer with the hardware parity flag (x86) or a table
+                // lookup (the RISCs) instead of a full population count.
+                let par = self.fresh_value();
                 self.emit(Instruction::UnaryOp {
-                    dest: pc,
-                    op: IrUnaryOp::Popcount,
+                    dest: par,
+                    op: IrUnaryOp::Parity,
                     src: Operand::Value(val),
                     ty: op_ty,
                 });
-                let pc32 = self.emit_cast_val(Operand::Value(pc), op_ty, IrType::I32);
-                self.emit_binop_val(
-                    IrBinOp::And,
-                    Operand::Value(pc32),
-                    Operand::Const(IrConst::I32(1)),
-                    IrType::I32,
-                )
+                self.emit_cast_val(Operand::Value(par), op_ty, IrType::I32)
             }
             "__builtin_ffsg" => {
                 let is_zero = self.emit_cmp_val(
@@ -342,27 +340,23 @@ impl Lowerer {
                 self.emit_cast_val(Operand::Value(sum), IrType::U64, IrType::I32)
             }
             "__builtin_parityg" => {
-                // XOR-fold 128 -> 64 before popcount: cuts Popcount work in half!
+                // Parity of a 128-bit value is the XOR of its halves' parities,
+                // so the halves fold together first and the 64-bit parity of
+                // the result is the answer.
                 let xored = self.emit_binop_val(
                     IrBinOp::Xor,
                     Operand::Value(lo),
                     Operand::Value(hi),
                     IrType::U64,
                 );
-                let pc = self.fresh_value();
+                let par = self.fresh_value();
                 self.emit(Instruction::UnaryOp {
-                    dest: pc,
-                    op: IrUnaryOp::Popcount,
+                    dest: par,
+                    op: IrUnaryOp::Parity,
                     src: Operand::Value(xored),
                     ty: IrType::U64,
                 });
-                let pc32 = self.emit_cast_val(Operand::Value(pc), IrType::U64, IrType::I32);
-                self.emit_binop_val(
-                    IrBinOp::And,
-                    Operand::Value(pc32),
-                    Operand::Const(IrConst::I32(1)),
-                    IrType::I32,
-                )
+                self.emit_cast_val(Operand::Value(par), IrType::U64, IrType::I32)
             }
             "__builtin_clzg" => {
                 let hi_nz = self.emit_cmp_val(

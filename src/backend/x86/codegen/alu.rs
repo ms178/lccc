@@ -218,16 +218,24 @@ impl X86Codegen {
     /// instructions on every input's critical path; the nonzero path here is
     /// `test; jnz; bsr; xor` with the jump well predicted, so it is kept.
     fn emit_clz32_rax_baseline(&mut self) {
-        let nz = self.state.fresh_label("clz_nz");
-        let done = self.state.fresh_label("clz_done");
-        self.state.emit("    testl %eax, %eax");
-        self.state.out.emit_jcc_label("    jnz", &nz);
-        self.state.emit("    movl $32, %eax");
-        self.state.out.emit_jmp_label(&done);
-        self.state.out.emit_named_label(&nz);
-        self.state.emit("    bsrl %eax, %eax");
+        // `bsr` leaves its destination untouched when its source is zero --
+        // the same architectural guarantee `emit_ctz32_rax_baseline` leans on
+        // for `bsf`, and what Clang emits for a `clz` that must answer 32 at
+        // zero (`mov $63; bsr; xor $31`).  Preloading the result with 63 makes
+        // the zero case come out of the same `xor $31` as every other input
+        // (63 ^ 31 == 32), so the branch arm this used to carry -- test, jnz,
+        // mov $32, jmp -- is gone: four instructions, none of them a branch,
+        // where the old form was six with a taken jump.
+        //
+        // The sentinel has to reach %eax before `bsr` reads the operand, so the
+        // operand is staged in %rcx; the dead-scratch peephole removes the
+        // bracketing pair whenever nothing live holds that register.
+        self.state.emit("    pushq %rcx");
+        self.state.emit("    movl %eax, %ecx");
+        self.state.emit("    movl $63, %eax");
+        self.state.emit("    bsrl %ecx, %eax");
         self.state.emit("    xorl $31, %eax");
-        self.state.out.emit_named_label(&done);
+        self.state.emit("    popq %rcx");
     }
 
     /// 32-bit trailing-zero count of %eax without TZCNT, defined at zero.
@@ -279,16 +287,13 @@ impl X86Codegen {
             }
             IrType::I32 | IrType::U32 => self.emit_clz32_rax_baseline(),
             _ => {
-                let nz = self.state.fresh_label("clz_nz");
-                let done = self.state.fresh_label("clz_done");
-                self.state.emit("    testq %rax, %rax");
-                self.state.out.emit_jcc_label("    jnz", &nz);
-                self.state.emit("    movl $64, %eax");
-                self.state.out.emit_jmp_label(&done);
-                self.state.out.emit_named_label(&nz);
-                self.state.emit("    bsrq %rax, %rax");
-                self.state.emit("    xorq $63, %rax");
-                self.state.out.emit_named_label(&done);
+                // The same sentinel, one width up: 127 ^ 63 == 64.
+                self.state.emit("    pushq %rcx");
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    movl $127, %eax");
+                self.state.emit("    bsrq %rcx, %rax");
+                self.state.emit("    xorl $63, %eax");
+                self.state.emit("    popq %rcx");
             }
         }
     }
@@ -474,6 +479,94 @@ impl X86Codegen {
             self.state.emit("    imulq %rdx, %rax"); // *0x0101..0101
             self.state.emit("    shrq $56, %rax"); // top byte = popcount
             self.state.emit("    popq %rdx");
+            self.state.emit("    popq %rcx");
+        }
+    }
+
+    /// PARITY: the XOR of every bit, as 0 or 1.
+    ///
+    /// Parity is the population count *modulo two*, and that is a different
+    /// question from the count: the count has to produce the whole sum, while
+    /// parity only needs its low bit, and x86 computes the low bit of any byte
+    /// it has just written -- PF is defined on the low byte of a result.  So
+    /// the reduction is two XORs and a flag:
+    ///
+    /// * 32-bit: `x ^ (x >> 16)` puts the parity of all 32 bits in the low
+    ///   sixteen, `xor %ah, %al` folds those into one byte, and `setnp` reads
+    ///   PF of that byte.  PF is 1 for even parity, `setnp` inverts it to the
+    ///   builtin's 1-for-odd, and `movzbl` clears the bits above the answer.
+    /// * 64-bit: the same, with an extra shift/XOR pair to fold 64 bits to 32
+    ///   first.
+    /// * 8- and 16-bit: the operand is already normalized, so the `%ah` fold is
+    ///   the whole reduction -- no scratch register at all.
+    ///
+    /// Both oracles emit this fold (GCC 16.2 and Clang 23.1.4: six instructions
+    /// for `parity32`, measured), while LCCC used to lower `__builtin_parity`
+    /// as `Popcount(x) & 1` -- the seventeen-instruction SWAR count followed by
+    /// `andl $1`.  With POPCNT the count is one instruction and `popcntl;
+    /// andl $1` is unbeatable, so that shape is kept for `-mpopcnt` targets.
+    ///
+    /// `%rcx` is the scratch register here for the same reason as in the SWAR
+    /// count above, and it is saved around the sequence so that a live value in
+    /// it survives; `dead_scratch_saves` deletes the pair when it is dead.
+    pub(super) fn emit_int_parity_impl(&mut self, ty: IrType) {
+        let narrow = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
+        let narrow_32 = narrow || matches!(ty, IrType::I32 | IrType::U32);
+        let byte = matches!(ty, IrType::I8 | IrType::U8);
+        if self.popcnt_enabled {
+            // The count is over the whole register, so it needs the mask the
+            // load's extension may not have given it.
+            if narrow {
+                if byte {
+                    self.state.emit("    movzbl %al, %eax");
+                } else {
+                    self.state.emit("    movzwl %ax, %eax");
+                }
+            }
+            if narrow_32 {
+                self.state.emit("    popcntl %eax, %eax");
+            } else {
+                self.state.emit("    popcntq %rax, %rax");
+            }
+            self.state.emit("    andl $1, %eax");
+            return;
+        }
+        // The fold needs a second register; %rcx is the staging register the
+        // SWAR count above uses, and the dead-scratch peephole removes the
+        // bracketing pair once it can prove nothing live reads it.
+        let mut scratch = false;
+        if !narrow_32 {
+            self.state.emit("    pushq %rcx");
+            self.state.emit("    movq %rax, %rcx");
+            self.state.emit("    shrq $32, %rcx");
+            self.state.emit("    xorq %rcx, %rax");
+            self.state.emit("    movq %rax, %rcx");
+            self.state.emit("    shrq $16, %rcx");
+            self.state.emit("    xorl %ecx, %eax");
+            self.state.emit("    xorb %ah, %al");
+            scratch = true;
+        } else if narrow {
+            // PF is the parity of the low byte of the flag-setting result, and
+            // both forms below read only bits 0-15 of %eax -- which the load's
+            // extension (zero for unsigned, all-ones for signed) cannot reach
+            // -- so neither needs the mask that the count above does.  A byte
+            // has nothing to fold: `testb` reads the byte itself.
+            if byte {
+                self.state.emit("    testb %al, %al");
+            } else {
+                self.state.emit("    xorb %ah, %al");
+            }
+        } else {
+            self.state.emit("    pushq %rcx");
+            self.state.emit("    movl %eax, %ecx");
+            self.state.emit("    shrl $16, %ecx");
+            self.state.emit("    xorl %ecx, %eax");
+            self.state.emit("    xorb %ah, %al");
+            scratch = true;
+        }
+        self.state.emit("    setnp %al");
+        self.state.emit("    movzbl %al, %eax");
+        if scratch {
             self.state.emit("    popq %rcx");
         }
     }

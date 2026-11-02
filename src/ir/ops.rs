@@ -455,6 +455,18 @@ pub enum IrUnaryOp {
     Bswap,
     BitReverse,
     Popcount,
+    /// XOR of every bit of the operand, as 0 or 1 in the operand's own type.
+    ///
+    /// This is `__builtin_parity` as a first-class operation rather than
+    /// `Popcount(v) & 1`.  The two are not the same shape: a population count
+    /// must produce the whole sum, while parity only needs the sum modulo 2,
+    /// and every architecture computes the second one shorter -- x86 reads the
+    /// hardware parity flag of a byte that the XOR fold leaves in the low
+    /// byte, and the RISCs fold down to a four-bit nibble and index a 16-bit
+    /// table.  Lowering it as `popcount & 1` also hides the fact from every
+    /// backend, so each one paid for the twenty-instruction count it did not
+    /// need.
+    Parity,
     /// __builtin_constant_p: returns 1 if operand is a compile-time constant, 0 otherwise.
     /// Lowered as an IR instruction so it can be resolved after inlining and constant propagation.
     IsConstant,
