@@ -620,6 +620,86 @@ fn label_name(line: &str) -> Option<&str> {
 
 // ── Main entry point ─────────────────────────────────────────────────────────
 
+/// The line ranges the peephole must leave exactly as emitted because they
+/// contain inline assembly: every function (`.type NAME, %function` through
+/// `.size NAME, .-NAME`) with an `#APP` region in its body, and every
+/// top-level `#APP` ... `#NO_APP` region outside a function.
+///
+/// Why whole functions: an asm statement's operands are bound to registers
+/// by constraints the text does not show -- `register long x8 asm("x8")`
+/// feeding `svc 0` is read by the `svc`, yet no later line names `x8` until
+/// the next `movz x8, #93`, so a textual "first later mention overwrites
+/// it" scan (`eliminate_overwritten_moves`) deleted the system-call number
+/// and the length (`write` became `semget` under qemu-aarch64).  The staging
+/// moves, the outputs' stores and every fact cached across the statement
+/// live in the surrounding code, so the unit of opacity is the function,
+/// exactly as for RISC-V's volatile-access quarantine.
+///
+/// `None` when the structure is not the code generator's own (unbalanced
+/// markers, a `.type`/`.size` pair that does not match): the caller then
+/// leaves the whole translation unit unchanged.
+fn inline_asm_protected_ranges(lines: &[String]) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut function: Option<(&str, usize, bool)> = None; // (name, start, has asm)
+    let mut depth = 0usize;
+    let mut region_start: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t == "#APP" {
+            match function.as_mut() {
+                Some((_, _, has_asm)) => *has_asm = true,
+                None if depth == 0 => region_start = Some(i),
+                None => {}
+            }
+            depth = depth.checked_add(1)?;
+            continue;
+        }
+        if t == "#NO_APP" {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 && function.is_none() {
+                ranges.push(region_start.take()?..i + 1);
+            }
+            continue;
+        }
+        if depth > 0 {
+            continue; // the statement's own text: whatever the user wrote
+        }
+        if let Some(rest) = t.strip_prefix(".type ") {
+            let Some((name, kind)) = rest.split_once(',') else {
+                continue;
+            };
+            if matches!(kind.trim(), "%function" | "@function") {
+                if function.is_some() {
+                    return None;
+                }
+                function = Some((name.trim(), i, false));
+            }
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(".size ")
+            && let Some((name, expr)) = rest.split_once(',')
+            && let Some((open, start, has_asm)) = function
+            && name.trim() == open
+        {
+            if expr.trim().strip_prefix(".-") != Some(open) {
+                return None;
+            }
+            if has_asm {
+                ranges.push(start..i + 1);
+            }
+            function = None;
+        }
+    }
+    if function.is_some() || depth != 0 {
+        return None;
+    }
+    Some(ranges)
+}
+
+/// Stand-in text for a protected line while the passes run: it names no
+/// register and matches no pattern.  Never emitted.
+const OPAQUE_LINE: &str = "# lccc_a64_inline_asm_opaque";
+
 /// Run peephole optimization on AArch64 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
@@ -633,11 +713,38 @@ pub fn peephole_optimize(asm: String) -> String {
     if n == 0 {
         return asm;
     }
+    // Functions holding inline assembly stay byte-for-byte as emitted (see
+    // `inline_asm_protected_ranges`); labels and CFI bounds stay visible as
+    // the boundaries the passes segment by.  The originals go back in order
+    // at the end: passes may insert lines (`n` is re-read below), so the
+    // placeholders, not their indices, are the bookmarks.
+    let protected_ranges = if asm.contains("#APP") {
+        match inline_asm_protected_ranges(&lines) {
+            Some(ranges) => ranges,
+            None => return asm,
+        }
+    } else {
+        Vec::new()
+    };
+    let has_opaque = !protected_ranges.is_empty();
+    let mut protected: Vec<String> = Vec::new();
+    for range in protected_ranges {
+        for i in range {
+            let t = lines[i].trim();
+            if kinds[i] == LineKind::Label || t == ".cfi_startproc" || t == ".cfi_endproc" {
+                continue;
+            }
+            protected.push(std::mem::replace(&mut lines[i], OPAQUE_LINE.to_string()));
+            kinds[i] = LineKind::Other;
+        }
+    }
     crate::backend::peephole_common::hide_debug_rows(&lines, &mut kinds, LineKind::Nop);
 
     // Phase 1: Iterative local passes (up to 8 rounds)
     let rotate = std::env::var("CCC_NO_LOOP_ROTATE").is_err();
-    let merge_blocks = std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
+    // Block merging is off beside an opaque function: branches inside it are
+    // hidden, so its labels look unreferenced to the merge's CFG.
+    let merge_blocks = !has_opaque && std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
     let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
     let mut changed = true;
     let mut rounds = 0;
@@ -733,6 +840,26 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_stores(&lines, &mut kinds, n);
             rounds2 += 1;
+        }
+    }
+
+    // Put the protected lines back, in order, and keep every one of them: no
+    // pass may delete or duplicate opaque code.  A placeholder count that no
+    // longer matches means a pass did exactly that, and the only safe answer
+    // is the unoptimized text.
+    if !protected.is_empty() {
+        let mut originals = protected.into_iter();
+        for i in 0..lines.len() {
+            if lines[i] == OPAQUE_LINE {
+                let Some(original) = originals.next() else {
+                    return asm;
+                };
+                lines[i] = original;
+                kinds[i] = LineKind::Other;
+            }
+        }
+        if originals.next().is_some() {
+            return asm;
         }
     }
 
@@ -6809,6 +6936,91 @@ fn hoist_loop_invariant_remats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two system calls with register-variable operands, as nolibc and the
+    /// kernel spell them: `svc 0` reads x8 and x0-x2 although no line after
+    /// the staging names them before the next call overwrites x8 and x2.
+    fn two_syscalls(name: &str) -> String {
+        format!(
+            concat!(
+                ".text\n.globl {n}\n.type {n}, %function\n{n}:\n.cfi_startproc\n",
+                "    stp x29, x30, [sp, #-48]!\n    mov x29, sp\n",
+                "    add x0, sp, #16\n    str x0, [sp, #24]\n",
+                "    movz x0, #1\n    movz x8, #64\n    ldr x1, [sp, #24]\n    movz x2, #17\n",
+                "#APP\n    svc 0\n#NO_APP\n",
+                "    str x0, [sp, #32]\n",
+                "    mov x0, #0\n    movz x8, #93\n    mov x1, #0\n    mov x2, #0\n",
+                "#APP\n    svc 0\n#NO_APP\n",
+                "    ldp x29, x30, [sp], #48\n    ret\n",
+                ".cfi_endproc\n.size {n}, .-{n}\n"
+            ),
+            n = name
+        )
+    }
+
+    #[test]
+    fn inline_asm_inputs_survive_a_later_overwrite() {
+        let asm = two_syscalls("entry");
+        let out = peephole_optimize(asm.clone());
+        assert_eq!(
+            out.trim_end(),
+            asm.trim_end(),
+            "a function with asm is left as emitted"
+        );
+        assert!(
+            out.contains("movz x8, #64") && out.contains("movz x2, #17"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_quarantine_is_per_function() {
+        // The neighbour without asm keeps its optimizations: the dead
+        // `mov x0, #0` (overwritten before any read) still goes.
+        let plain = concat!(
+            ".globl g\n.type g, %function\ng:\n.cfi_startproc\n",
+            "    mov x0, #0\n    mov x0, #7\n    ret\n",
+            ".cfi_endproc\n.size g, .-g\n"
+        );
+        let asm = format!("{}{plain}", two_syscalls("entry"));
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("movz x8, #64") && out.contains("movz x2, #17"),
+            "{out}"
+        );
+        let g = &out[out.find("g:").unwrap()..];
+        assert!(
+            !g.contains("mov x0, #0"),
+            "the plain function is still optimized:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_function_without_unwind_tables_is_bounded_by_type_and_size() {
+        // -fno-asynchronous-unwind-tables: no CFI, `.type`/`.size` only.
+        let asm = two_syscalls("entry")
+            .replace(".cfi_startproc\n", "")
+            .replace(".cfi_endproc\n", "");
+        let out = peephole_optimize(asm.clone());
+        assert_eq!(out.trim_end(), asm.trim_end());
+    }
+
+    #[test]
+    fn top_level_asm_is_left_alone() {
+        let asm = concat!(
+            "#APP\n#APP\n.globl _start\n_start:\n    mov x29, #0\n    mov x1, x1\n",
+            "    bl entry\n1:\n    b 1b\n#NO_APP\n#NO_APP\n"
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert_eq!(out.trim_end(), asm.trim_end());
+    }
+
+    #[test]
+    fn unbalanced_inline_asm_markers_leave_the_unit_unchanged() {
+        let asm = two_syscalls("entry").replacen("#NO_APP\n", "", 1);
+        let out = peephole_optimize(asm.clone());
+        assert_eq!(out, asm);
+    }
 
     /// `-g` rows are hidden from every pass: a row between a dead `mov` and
     /// its overwrite must not keep it (k_hashmix.c kept `mov x0, #0` at -O0).
