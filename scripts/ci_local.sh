@@ -2741,6 +2741,14 @@ gate "const-array-promote" fast \
 gate "range-fold-branch" fast \
     bash tests/regression/check_range_fold_branch.sh
 
+# A 32-bit compare against a constant whose top bit is set encodes as an imm32
+# bit pattern (`cmpl $-1` for 4294967295, `$-1640531535` for the golden-ratio
+# hash constant); staging it through a register is one instruction more than
+# GCC and Clang spend, and it is invisible in a semantics test.  The 64-bit
+# controls in the same gate keep the sign-extended rule honest.
+gate "cmp-imm32-pattern" fast \
+    bash tests/regression/check_cmp_imm32_pattern.sh
+
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
 # need a kernel tree: executable bytes must be summed by section FLAG (the boot
