@@ -34,6 +34,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
+      # An explicit job permission map removes omitted scopes, including Actions.
+      # Read is required for the log/artifact export; write is not required.
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@v7
