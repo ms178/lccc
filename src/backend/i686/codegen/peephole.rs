@@ -24214,9 +24214,7 @@ f:
         // store becomes a byte store, and then nothing reads the masked value
         // and rule 1 is entitled to delete it). Here the `je` consumes the
         // flags the AND defined, which is the licence `movzx` does not have.
-        let asm = pair_fn(
-            "    andl $255, %eax\n    je .Lok\n    movl %eax, 4(%esp)\n.Lok:\n",
-        );
+        let asm = pair_fn("    andl $255, %eax\n    je .Lok\n    movl %eax, 4(%esp)\n.Lok:\n");
         let out = peephole_optimize(asm);
         assert!(out.contains("andl $255"), "live flags keep the AND:\n{out}");
         assert!(!out.contains("movzbl %al"), "no zero extension:\n{out}");
