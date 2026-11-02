@@ -113,9 +113,9 @@ jobs:
           df -h /
           sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
           df -h /
-      - name: Enable 8 GiB swap
+      - name: Enable 4 GiB swap
         env:
-          LCCC_CI_SWAP_SIZE: 8G
+          LCCC_CI_SWAP_SIZE: 4G
         run: bash scripts/ci_enable_swap.sh
       - name: Provision host tools
         run: |

@@ -2,6 +2,9 @@
 # Exercise the verdict with a fake QEMU: no guest boot is claimed here.
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+# Keep hosted kernel compilation under the same explicit swap policy as the
+# local acceptance build; no validator or security setting changes with it.
+grep -q 'LCCC_CI_SWAP_SIZE: 4G' "$root/.github/workflows/kernel-61858.yml"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/firmware" "$work/bin"
