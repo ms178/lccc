@@ -94,8 +94,11 @@ expect guard 4 shapes.s
 expect floor_ 4 shapes.s
 expect ceiling 4 shapes.s
 expect zero_floor 4 shapes.s
-expect guard64 5 shapes.s
-expect guard16 5 shapes.s
+# 64- and 16-bit answers are a `setg` into the zeroed %eax, nothing more: the
+# extension chain that used to widen the flag twice collapses into it (GCC
+# 16.2 and Clang 23.1.4 emit the same four lines).
+expect guard64 4 shapes.s
+expect guard16 4 shapes.s
 expect guard8 4 shapes.s
 
 for name in guard floor_ zero_floor guard64 guard16 guard8; do

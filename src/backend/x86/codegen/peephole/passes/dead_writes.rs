@@ -65,11 +65,13 @@ fn droppable_source(op: &str, src: &str) -> bool {
 /// on every program): bitops -100,000,000 Ir (-3.39%, five dead instructions
 /// per iteration), zstd_count -1.86%, linux_find_bit -0.14%, nothing slower.
 ///
-/// Coverage is bounded by `flags_dead_after`, whose scan stops at a label: in
-/// ring_fifo the dead `movl %r10d, %r13d; shlq $2, %r13` pair sits directly
-/// before `.LBB5`, the flags therefore cannot be proven dead, and the pair
-/// survives (Callgrind confirms ring_fifo is unchanged).  Recovering it needs
-/// a CFG-based flag liveness; the linear scan is sound, merely imprecise.
+/// Coverage is bounded by `flags_dead_after`: its walk runs through labels
+/// (the fall-through path), follows forward branches whose condition reads
+/// none of the live flags, and ends with the flags dead at `ret` and at a
+/// codegen-marked sibling call.  A backward branch, or an edge beyond the
+/// walk's window or budget, answers "live", which only costs a deletion.
+/// At a sibling call the destination's own liveness still comes from the
+/// call's argument markers, so a staged argument register is never dead.
 const FLAG_WRITING_PURE_ARITH: &[&str] = &[
     "shl", "shr", "sar", "sal", "rol", "ror", "shld", "shrd", "add", "sub", "and", "or", "xor",
     "inc", "dec", "neg", "not", "imul", "bt", "bts", "btr", "btc", "bsf", "bsr", "popcnt", "lzcnt",
