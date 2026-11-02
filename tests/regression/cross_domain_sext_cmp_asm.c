@@ -35,3 +35,42 @@ int keep64_gap(long long x) { return (unsigned long long)(int)x >= 1844674407156
 
 /* Above the last member: everything is below it. */
 int keep64_high(long long x) { return (unsigned long long)(int)x <= 18446744073709551615ULL; }
+
+/* The suite builds and runs every file in this directory against the GCC
+   differential, so this one drives its own shapes rather than being
+   emission-only: the values must agree with GCC's, which the differential
+   checks.  The exhaustive model lives in cross_domain_sext_cmp.c. */
+static int failures;
+static void expect(int got, int want, const char *what) {
+    if (got != want) {
+        ++failures;
+        (void)what;
+    }
+}
+int main(void) {
+    volatile int xs[] = {0, 1, -1, 127, -128, 128, 300, -300, 255, -255};
+    volatile long long ws[] = {0, 1, -1, 2147483647LL, -2147483648LL, 4294967295LL};
+    for (unsigned i = 0; i < sizeof xs / sizeof xs[0]; i++) {
+        int x = xs[i];
+        /* `(unsigned)(signed char)x < 300` is `x`'s low byte being
+           non-negative, spelled without the naive rewrite. */
+        expect(fire_lt(x), (signed char)x >= 0, "fire_lt");
+        expect(fire_le(x), (signed char)x >= 0, "fire_le");
+        expect(fire_ge(x), (signed char)x < 0, "fire_ge");
+        expect(fire_gt(x), (signed char)x < 0, "fire_gt");
+        expect(fire16_ge(x), (short)x < 0, "fire16_ge");
+        expect(keep_in_half(x), (unsigned)(signed char)x < 5u, "keep_in_half");
+        expect(keep16_in_half(x), (unsigned)(short)x < 300u, "keep16_in_half");
+        expect(keep_gap(x), (unsigned)(signed char)x >= 4294967169u, "keep_gap");
+    }
+    for (unsigned i = 0; i < sizeof ws / sizeof ws[0]; i++) {
+        long long w = ws[i];
+        expect(fire64_ge(w), (int)w < 0, "fire64_ge");
+        expect(fire64_gt(w), (int)w < 0, "fire64_gt");
+        expect(keep64_gap(w), (unsigned long long)(int)w >= 18446744071562067969ULL,
+               "keep64_gap");
+        expect(keep64_high(w), (unsigned long long)(int)w <= 18446744073709551615ULL,
+               "keep64_high");
+    }
+    return failures;
+}
