@@ -103,3 +103,20 @@ Binary identities:
 
 This validates the merged compiler code, not a fresh whole-kernel boot. The
 acceptance gaps above remain; proceed with boot-only before full kernel/QEMU.
+
+## Hosted composed-gate follow-up (compiler binary unchanged)
+
+At 53c78736a, frontend shard c job 125545226031 failed because
+`check_warning_precedence.py` imports the historical two-argument `run(lccc,
+gcc)` interface. The standalone new timestamp runner had made Clang a required
+third Python argument. Restore source compatibility with a default that resolves
+the configured modern Clang; **the Clang controls still execute and remain
+mandatory**, rather than being skipped for imported callers.
+
+The exact composed gate now exits zero locally, including 60 pragma-mode,
+697 include-path, 688 date/time, 2940 layout/file-constant, 6 negative-level,
+720 enum-conversion checks, 54 enum ABI executions and 12 cross-target verbose
+assembly modes. Local ICX remains explicitly unmeasured; authenticated hosted
+ICX is a separate required check. No compiler Rust source or binary changed,
+so the already-running current-compiler full-kernel process is not invalidated.
+This fixes the observed hosted failure; it does not predeclare a green rerun.

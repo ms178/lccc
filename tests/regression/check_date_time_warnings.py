@@ -28,7 +28,11 @@ FIXTURES = [
 ]
 
 
-def run(lccc: list[str], gcc: list[str], clang: list[str]) -> None:
+def run(lccc: list[str], gcc: list[str], clang: list[str] | None = None) -> None:
+    # check_warning_precedence imports the historical two-argument API.
+    # Keep that caller compatible without dropping the mandatory Clang controls.
+    if clang is None:
+        clang = shlex.split(os.environ.get('CLANG', 'clang-23'))
     env = {**os.environ, 'SOURCE_DATE_EPOCH': '0', 'TZ': 'UTC', 'LC_ALL': 'C'}
     flags = [([], None), (['-Wall', '-Wextra'], None), (['-Wdate-time'], 'warning'),
              (['-Werror=date-time'], 'error'), (['-Werror=date-time', '-Wno-error=date-time'], 'warning'),
