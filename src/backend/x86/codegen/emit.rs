@@ -8323,6 +8323,12 @@ impl X86Codegen {
 }
 
 impl ArchCodegen for X86Codegen {
+    fn emit_indirect_branch_landing_pad(&mut self) {
+        if self.state.cf_protection_branch {
+            self.state.emit("    endbr64");
+        }
+    }
+
     fn legalize_function_abi<'a>(&self, func: &'a IrFunction) -> std::borrow::Cow<'a, IrFunction> {
         crate::backend::x86::ms_wide_abi::legalize(func)
     }

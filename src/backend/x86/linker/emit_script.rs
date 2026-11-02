@@ -945,10 +945,57 @@ impl ScriptDefsyms {
     }
 }
 
+/// Ordinary ELF tables are bookkeeping, not user script inputs.
+fn is_script_input(section: &linker_common::Elf64Section) -> bool {
+    !matches!(
+        section.sh_type,
+        SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_
+    ) && !(section.sh_type == SHT_STRTAB_ && section.flags & SHF_ALLOC_ == 0)
+        && !(section.size == 0 && section.name.is_empty())
+}
+
+fn is_script_orphan(script: &LinkerScript, section: &linker_common::Elf64Section) -> bool {
+    is_script_input(section)
+        && section.flags & 0x8000_0000 == 0 // SHF_EXCLUDE
+        && !script.sections.iter().any(|item| {
+            let SectionsItem::Output(def) = item else { return false; };
+            def.items.iter().any(|body| {
+                matches!(body, SecItem::Input(spec)
+                    if spec.patterns.iter().any(|pattern| glob_match(pattern, &section.name)))
+            })
+        })
+}
+
+/// Treatment of live input sections unmatched by the caller's script.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OrphanHandling {
+    #[default]
+    Place,
+    Warn,
+    Error,
+    Discard,
+}
+
+impl OrphanHandling {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "place" => Ok(Self::Place),
+            "warn" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            "discard" => Ok(Self::Discard),
+            _ => Err(format!(
+                "invalid argument to option '--orphan-handling': '{value}'"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ScriptLinkExtras {
     pub build_id_style: linker_common::BuildIdStyle,
     pub print_memory_usage: bool,
+    pub orphan_handling: OrphanHandling,
+    pub fatal_warnings: bool,
 }
 
 pub fn link_with_script(
@@ -979,6 +1026,7 @@ pub fn link_with_script(
         &ScriptLinkExtras {
             build_id_style: linker_common::BuildIdStyle::Sha1,
             print_memory_usage: false,
+            ..ScriptLinkExtras::default()
         },
     )
 }
@@ -1045,6 +1093,7 @@ pub fn link_with_script_i386(
         &ScriptLinkExtras {
             build_id_style: linker_common::BuildIdStyle::Sha1,
             print_memory_usage: false,
+            ..ScriptLinkExtras::default()
         },
     )
 }
@@ -1179,7 +1228,7 @@ fn link_with_script_machine(
     // assigning `start = .; *(registry); stop = .` does not root a registry in
     // GNU ld; the script author must say KEEP, which is why the distinction is
     // retained in the parsed AST.
-    let dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
+    let mut dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
         let mut kept: FxHashSet<(usize, usize)> = FxHashSet::default();
         for item in &script.sections {
             let SectionsItem::Output(def) = item else {
@@ -1247,6 +1296,34 @@ fn link_with_script_machine(
         }
     }
 
+    // Resolve strong/weak winners first, as GNU ld does: discarding the
+    // winning strong definition must NOT resurrect a losing weak definition.
+    // But prune input FDEs and exclude discarded definitions from dynamic
+    // export planning before layout or synthesized metadata is built.
+    if extras.orphan_handling == OrphanHandling::Discard {
+        for (oi, object) in objects.iter().enumerate() {
+            for (si, section) in object.sections.iter().enumerate() {
+                if is_script_orphan(&script, section) {
+                    dead_sections.insert((oi, si));
+                }
+            }
+        }
+        linker_common::prune_dead_fdes(objects, &dead_sections);
+    }
+
+    // GNU --defsym expressions can still read a discarded input's offset
+    // (its section address is zero). Expose that temporary absolute view to
+    // the expression planner, not to ordinary relocations or output symbols.
+    let mut discarded_values = Vec::new();
+    if extras.orphan_handling == OrphanHandling::Discard {
+        for (name, row) in &mut def_syms {
+            if dead_sections.contains(&(row.0, row.1 as usize)) {
+                discarded_values.push((name.clone(), row.2));
+                *row = defsym_row(row.2);
+            }
+        }
+    }
+
     // ── --defsym SYMBOL=EXPRESSION ──
     // Applied once the object-derived table is complete, so an alias can copy a
     // real definition and an expression can read one. The script path used to
@@ -1277,6 +1354,20 @@ fn link_with_script_machine(
         .map(|a| a.symbol.clone())
         .collect();
     let mut script_defsyms = apply_script_defsyms(&mut def_syms, defsym_defs, &script_assigned)?;
+    if !discarded_values.is_empty() {
+        let overrides: FxHashSet<&str> =
+            defsym_defs.iter().map(|(name, _)| name.as_str()).collect();
+        for (name, value) in discarded_values {
+            // Deferred expressions can mix this absolute with a live address.
+            script_defsyms
+                .shadow
+                .entry(name.clone())
+                .or_insert_with(|| defsym_row(value));
+            if !overrides.contains(name.as_str()) {
+                def_syms.remove(&name);
+            }
+        }
+    }
 
     // Symbols the *inputs* declared STV_HIDDEN/STV_INTERNAL. Visibility is an
     // ABI property decided by the compiler; the linker must honour it before
@@ -1345,7 +1436,7 @@ fn link_with_script_machine(
             script_dynamic = Some(plan);
         }
     }
-    let objects: &[Object] = owned_objects.as_deref().unwrap_or(objects);
+    let objects: &mut [Object] = owned_objects.as_deref_mut().unwrap_or(objects);
 
     // ── Assign input sections to output sections ──
     // Collect allocatable + INFO-listed input sections.
@@ -1358,17 +1449,52 @@ fn link_with_script_machine(
             // Ordinary object string/symbol/relocation tables are linker
             // metadata rather than input sections.  An allocated string table
             // is different: .dynstr must participate in script matching.
-            if matches!(
-                sec.sh_type,
-                SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_
-            ) || (sec.sh_type == SHT_STRTAB_ && sec.flags & SHF_ALLOC_ == 0)
-            {
-                continue;
-            }
-            if sec.size == 0 && sec.name.is_empty() {
+            if !is_script_input(sec) {
                 continue;
             }
             unassigned.push((oi, si));
+        }
+    }
+
+    // Diagnose BEFORE synthesising output rules for non-alloc orphans. Those
+    // rules implement placement, not an explicit match in the user's script.
+    // Empty named sections count too; GC-dead sections and ELF bookkeeping do
+    // not. Keep input order for reproducible diagnostics, without cloning data.
+    if extras.orphan_handling != OrphanHandling::Place {
+        let orphans: Vec<(usize, usize)> = unassigned
+            .iter()
+            .copied()
+            .filter(|&(oi, si)| is_script_orphan(&script, &objects[oi].sections[si]))
+            .collect();
+        for &(oi, si) in &orphans {
+            let section = &objects[oi].sections[si];
+            let source = &objects[oi].source_name;
+            match extras.orphan_handling {
+                OrphanHandling::Error => {
+                    return Err(format!(
+                        "unplaced orphan section '{}' from '{}'",
+                        section.name, source
+                    ));
+                }
+                OrphanHandling::Warn => {
+                    let message = format!(
+                        "orphan section '{}' from '{}' being placed in section '{}'",
+                        section.name, source, section.name
+                    );
+                    if extras.fatal_warnings {
+                        return Err(format!("warning treated as error: {message}"));
+                    }
+                    eprintln!("lccc-ld: warning: {message}");
+                }
+                OrphanHandling::Discard | OrphanHandling::Place => {}
+            }
+        }
+        if extras.orphan_handling == OrphanHandling::Discard && !orphans.is_empty() {
+            dead_sections.extend(orphans);
+            unassigned.retain(|input| !dead_sections.contains(input));
+            def_syms
+                .retain(|_, location| !dead_sections.contains(&(location.0, location.1 as usize)));
+            linker_common::prune_dead_fdes(objects, &dead_sections);
         }
     }
 

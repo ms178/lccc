@@ -2865,6 +2865,10 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     /// The accumulator value must be preserved across the call.
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType);
 
+    /// Target-specific landing pad for an address-taken basic block.
+    /// Non-CET targets need no instruction; x86 emits it only when enabled.
+    fn emit_indirect_branch_landing_pad(&mut self) {}
+
     /// Emit a label address load (GCC &&label extension).
     fn emit_label_addr(&mut self, dest: &Value, label: &str) {
         self.emit_global_addr(dest, label);

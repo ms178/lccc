@@ -1347,15 +1347,20 @@ impl Lowerer {
             // Downstream consumers key on the section name (e.g. the
             // loop-alignment pass skips unlikely-section functions, whose
             // padding could never be amortized).
-            section: func.attrs.section.clone().or_else(|| {
-                func.attrs.is_cold().then(|| {
-                    if is_retain {
-                        format!(".text.unlikely.{emitted_name}")
-                    } else {
-                        ".text.unlikely".to_string()
-                    }
-                })
-            }),
+            section: func
+                .attrs
+                .section
+                .clone()
+                .or_else(|| self.function_decl_sections.get(&func.name).cloned())
+                .or_else(|| {
+                    func.attrs.is_cold().then(|| {
+                        if is_retain {
+                            format!(".text.unlikely.{emitted_name}")
+                        } else {
+                            ".text.unlikely".to_string()
+                        }
+                    })
+                }),
             visibility: func.attrs.visibility.clone(),
             is_weak: func.attrs.is_weak(),
             is_used: func.attrs.is_used() || self.used_function_decls.contains(&func.name),

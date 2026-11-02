@@ -730,6 +730,10 @@ impl I686Codegen {
     // ---- emit_prologue ----
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
+        if self.state.cf_protection_branch {
+            self.state.emit("    endbr32");
+        }
+
         // Single source of truth for materialisation widths (and for the
         // narrow-index extension in the SIB emitters) -- the same
         // `compute_value_type_map` the x86-64 backend seeds in its prologue.

@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 448.02,
+      "predicted_gate_seconds": 459.06,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -260,8 +260,12 @@
           "name": "python3 tests/regression/verify_pr713_audit.py --quiet"
         },
         {
-          "measured_s": 0.25,
+          "measured_s": 2.37,
           "name": "python3 tests/linker/check_rwx_segments.py"
+        },
+        {
+          "measured_s": 8.92,
+          "name": "python3 tests/regression/check_kernel_codegen_contracts.py"
         },
         {
           "measured_s": 3.44,

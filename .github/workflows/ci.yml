@@ -2547,6 +2547,7 @@ jobs:
         python3 tests/regression/check_llvm_scalar_facts.py
         python3 tests/regression/verify_pr713_audit.py --quiet
         python3 tests/linker/check_rwx_segments.py
+        python3 tests/regression/check_kernel_codegen_contracts.py
         bash tests/regression/check_map_i64_two_lane.sh
         env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run
         # Single-bit selection must execute correctly on the non-host backends,

@@ -4,7 +4,7 @@ use crate::backend::linker_common::Elf64Object;
 pub use crate::backend::linker_common::{
     BuildIdStyle, check_rwx_segments, convert_elf_file_to_flat_binary,
 };
-pub use crate::backend::x86::linker::emit_script::ScriptLinkExtras;
+pub use crate::backend::x86::linker::emit_script::{OrphanHandling, ScriptLinkExtras};
 
 /// GNU property note flags, shared by every link path (built-in, shared
 /// object and linker-script links).

@@ -273,3 +273,83 @@ check for 3bc6e92b1 except the still-running full kernel job has completed
 successfully, including Test Suite and authenticated ICX. These are **not**
 results for the new harness revision. Full link/guest boot and all previously
 listed compiler warning/option/semantic/performance findings remain open.
+
+## Orphan/CET/prototype-section blocker repair checkpoint (still NOT ready)
+
+Implemented and locally exercised with the current optimized fastbuild binaries:
+
+* The explicit-script x86-64/i386 `lccc-ld` path accepts all four
+  `--orphan-handling` policies, in joined and separated spelling. Empty named
+  inputs count as orphans; GC-dead inputs, ELF bookkeeping and SHF_EXCLUDE do
+  not. Explicit wildcard and `/DISCARD/` matches are not orphans. Fatal warnings
+  are enforced. Default placement avoids the new diagnostic classification pass.
+  **Scope limitation:** non-default policies without an explicit script are
+  rejected, not implemented; shared compiler-driver option plumbing is unfinished.
+* Discard chooses strong/weak winners before deleting definitions: GNU does not
+  resurrect a losing weak symbol after discarding the strong winner. Dead input
+  definitions are excluded before dynamic-export planning, and their FDEs are
+  pruned before layout. GNU `--defsym` expressions deliberately see a discarded
+  input's section-relative offset with section base zero. Preserve this value
+  for aliases and deferred expressions without allowing ordinary relocations to
+  silently bind to it. This ordering follows measured GNU behavior, not an
+  assumption about weak fallback or alias failure.
+* A single observable-label map distinguishes actual indirect targets (global
+  label initializers and `LabelAddr`) from direct asm-goto-only destinations.
+  A default no-op architecture hook emits ENDBR64/ENDBR32 when branch protection
+  is enabled. i686 now propagates that option and protects function entries too.
+  Direct asm-goto destinations receive no unnecessary landing pad. Other
+  architectures retain the no-op behavior and execute the common goto fixture.
+* Function definitions inherit explicit sections from function prototypes in the
+  existing signature prepass, including function-type typedef declarations.
+  Function-pointer objects are not function entities. Explicit inherited sections
+  take precedence over cold-section fallback. The actual hugetlb header annotates
+  both the target and weak alias; alias-only propagation was not its root cause.
+  GCC 16.2 also applies a section declared after a definition; Clang 23.1.4 warns
+  and ignores it. The GNU-specific case is tested separately, not presented as
+  agreement between the oracles. Conflicting redeclaration diagnostics have not
+  been comprehensively audited.
+
+Validation receipts in the user workspace:
+
+* `kernel-orphan-ibt-build2.log`: optimized fastbuild binaries rebuilt successfully.
+* `kernel-blocker-clippy.log`: `cargo clippy --profile fastbuild --bins -- -D warnings`
+  PASS, 54.07 seconds; formatting and diff whitespace checks PASS.
+* `orphan-policy-rwx-regression.log`: existing ELF32/64 RWX/flat/driver matrix,
+  AArch64/RV64 shared and QEMU tests, 16 discard-none links, and **128** new
+  GNU-oracle orphan-policy checks PASS. Includes zero-size inputs, GC, exclusions,
+  last-option-wins, invalid/missing values, ordinary discarded references, weak
+  resolution, absolute/deferred defsym expressions and FDE pruning. 2.368 seconds.
+* `kernel-codegen-contracts.log`: **83** object/runtime contracts PASS at O0/O2/Os.
+  LCCC x86-64/i686/AArch64/RV64, native GCC **16.2.0**, Clang **23.1.4**; branch,
+  full and disabled CET modes on x86; direct asm-goto disassembly; actual bytes at
+  computed-goto and function-entry targets; section/weak-alias checks and runtime.
+  Cross runtimes use QEMU. 8.918 seconds with the kernel build running concurrently.
+  **ICX is explicitly UNMEASURED locally**, not counted as passing.
+* Hosted/local parity PASS: 504 commands, 27 invocation contracts. The additional
+  gate and measured costs are recorded in the shard plan; lane balance PASS.
+* `kernel-blocker-boot-gate.log`: fresh actual Linux 6.18.58 boot-only gate PASS,
+  `_end=31056`, limit 32768, headroom 1712 bytes; GNU flat bytes identical; all
+  24 boot objects pass the baseline ISA scan. setup.bin SHA256
+  `97aea81fdca529293419185d39b57434b54c11dd55eb1356ac0be025ccf73cae`.
+  This is **32 bytes larger** than the previous 31024-byte observation, not a
+  performance/code-size improvement.
+* `kernel-blocker-actual-objects.log`: actual patched Linux `kernel/bpf/core.o`
+  and `mm/hugetlb.o` rebuild PASS through the canonical harness, with compiler
+  identity invalidation intact. Both `__alloc_bootmem_huge_page` and its weak
+  `alloc_bootmem_huge_page` alias have identical addresses in `.init.text`.
+* `kernel-blocker-bpf-objtool.log`: genuine kernel objtool
+  `--ibt --link --dry-run --Werror kernel/bpf/core.o` returns zero with no
+  diagnostics. This focused dry run is NOT validation of final vmlinux.
+
+Latest main was fetched and merged: already up to date at
+`d202421fe236290f019969992c1c2a5669ae9615`.
+
+The canonical full build is now running again with unchanged compiler/linker
+hashes, preserved configuration, real objtool and 4 GiB swap. Logs:
+`kernel-blocker-full-build.log`, then (only after successful build)
+`kernel-blocker-qemu-run.log` / `kernel-blocker-qemu.log`.
+**No successful final vmlinux link or guest boot is established at this checkpoint.**
+The build still prints unsupported option/warning families. All-13-family
+completion, zero kernel warnings, all-architecture/default-link orphan support,
+local ICX, measured runtime/code-size gains and green CI for this revision remain
+open. This is a pending checkpoint, not the requested production-ready delivery.

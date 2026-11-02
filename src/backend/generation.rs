@@ -6357,17 +6357,23 @@ fn generate_function_body(
     // one would make `&&label` compare equal to the next label. CFG merge
     // already refuses to fuse these; the emitter must not undo that by
     // omitting the only instruction that separated the labels.
-    let mut observable_labels: FxHashSet<_> =
-        func.global_init_label_blocks.iter().copied().collect();
+    // One map, rather than two sets: true means an indirect-branch target;
+    // false means an asm-goto-only label whose address identity still matters.
+    let mut observable_labels: FxHashMap<_, bool> = func
+        .global_init_label_blocks
+        .iter()
+        .copied()
+        .map(|label| (label, true))
+        .collect();
     for b in &func.blocks {
         for inst in &b.instructions {
             match inst {
                 Instruction::LabelAddr { label, .. } => {
-                    observable_labels.insert(*label);
+                    observable_labels.insert(*label, true);
                 }
                 Instruction::InlineAsm { goto_labels, .. } => {
                     for (_, label) in goto_labels {
-                        observable_labels.insert(*label);
+                        observable_labels.entry(*label).or_insert(false);
                     }
                 }
                 _ => {}
@@ -6448,8 +6454,12 @@ fn generate_function_body(
             }
             cg.state().out.emit_block_label(block.label.0);
         }
+        let address_kind = observable_labels.get(&block.label).copied();
         cg.state()
-            .begin_block_address_identity(observable_labels.contains(&block.label));
+            .begin_block_address_identity(address_kind.is_some());
+        if address_kind == Some(true) && Some(block.label) != entry_label {
+            cg.emit_indirect_branch_landing_pad();
+        }
 
         let fuse_idx = detect_cmp_branch_fusion(
             block,

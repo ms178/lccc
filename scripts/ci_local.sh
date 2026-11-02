@@ -406,6 +406,9 @@ gate "ci-link-oracle-provisioning" fast \
 gate "linker-rwx-segments" fast \
     python3 tests/linker/check_rwx_segments.py
 
+gate "kernel-codegen-contracts" fast \
+    python3 tests/regression/check_kernel_codegen_contracts.py
+
 # GAS `. =` / `.org` parity: macro vector layout, relaxation fixup, fill bytes,
 # numeric locals and fail-closed malformed expressions on ELF32/ELF64.
 gate "assembler-dot-assignment" fast \

@@ -750,6 +750,7 @@ impl I686Codegen {
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
         self.state.apply_tls_options(opts);
+        self.state.cf_protection_branch = opts.cf_protection_branch;
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.state.no_plt = opts.no_plt;
@@ -3114,6 +3115,12 @@ impl I686Codegen {
 // ─── ArchCodegen trait implementation ────────────────────────────────────────
 
 impl ArchCodegen for I686Codegen {
+    fn emit_indirect_branch_landing_pad(&mut self) {
+        if self.state.cf_protection_branch {
+            self.state.emit("    endbr32");
+        }
+    }
+
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
     /// `#` starts a comment in this target's GAS syntax, so the markers are
     /// invisible to the assembler, to objdump, and to this backend's text

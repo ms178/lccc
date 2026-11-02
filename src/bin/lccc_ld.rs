@@ -378,6 +378,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut emulation = Emulation::X86_64;
     let mut trace = false;
     let mut fatal_warnings = false;
+    let mut orphan_handling = lccc::linker_entry::OrphanHandling::Place;
     let mut warn_rwx_segments = true;
     let mut print_memory_usage = false;
     let mut oformat_binary = false;
@@ -915,8 +916,17 @@ fn run(args: &[String]) -> Result<(), String> {
                     if !kw.is_empty() {
                         handle_z_keyword(kw, &mut passthrough);
                     }
-                } else if a.starts_with("--orphan-handling")
-                    || a.starts_with("--sort-section")
+                } else if a == "--orphan-handling" || a.starts_with("--orphan-handling=") {
+                    let value = if let Some((_, value)) = a.split_once('=') {
+                        value
+                    } else {
+                        i += 1;
+                        args.get(i)
+                            .map(String::as_str)
+                            .ok_or("missing argument to '--orphan-handling'")?
+                    };
+                    orphan_handling = lccc::linker_entry::OrphanHandling::parse(value)?;
+                } else if a.starts_with("--sort-section")
                     || a.starts_with("--print-")
                     // `--no-undefined-version` is a real GNU flag ("Disallow
                     // undefined version"), so it must not fall through to the
@@ -955,6 +965,12 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         i += 1;
+    }
+
+    if script_path.is_none() && orphan_handling != lccc::linker_entry::OrphanHandling::Place {
+        return Err(
+            "non-default --orphan-handling currently requires an explicit linker script".into(),
+        );
     }
 
     if fatal_warnings && !top_warnings.is_empty() {
@@ -1149,6 +1165,8 @@ fn run(args: &[String]) -> Result<(), String> {
         let extras = lccc::linker_entry::ScriptLinkExtras {
             build_id_style,
             print_memory_usage,
+            orphan_handling,
+            fatal_warnings,
         };
         let res = if elf_i386 {
             lccc::linker_entry::link_with_script_i386_extras(

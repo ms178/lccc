@@ -72,6 +72,8 @@ pub struct Lowerer {
     /// declarations after a definition. `retain` roots linker GC; `used` roots
     /// frontend/IR DCE. They are intentionally independent.
     pub(super) retained_function_decls: FxHashSet<String>,
+    /// Explicit function sections inherited from file-scope prototypes.
+    pub(super) function_decl_sections: FxHashMap<String, String>,
     pub(super) used_function_decls: FxHashSet<String>,
     /// Function names declared `__attribute__((noplt))`. Filtered against the
     /// definitions of this unit once lowering is complete, because GCC only
@@ -378,6 +380,7 @@ impl Lowerer {
             defined_functions: FxHashSet::default(),
             static_functions: FxHashSet::default(),
             retained_function_decls: FxHashSet::default(),
+            function_decl_sections: FxHashMap::default(),
             used_function_decls: FxHashSet::default(),
             noplt_decl_names: FxHashSet::default(),
             error_functions: FxHashSet::default(),
@@ -1019,6 +1022,11 @@ impl Lowerer {
                             && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
                                 if self.types.function_typedefs.contains_key(name)));
                     if function_entity && !decl.is_typedef() && !declarator.name.is_empty() {
+                        if let Some(section) = &declarator.attrs.section {
+                            self.function_decl_sections
+                                .entry(declarator.name.clone())
+                                .or_insert_with(|| section.clone());
+                        }
                         if declarator.attrs.is_retain() {
                             self.retained_function_decls.insert(declarator.name.clone());
                         }
