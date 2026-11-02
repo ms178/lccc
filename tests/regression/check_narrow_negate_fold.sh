@@ -15,32 +15,43 @@
 # the extension's high bits die in the truncation, so `(I32)(-(I64)(I32)v)` is
 # `-(I32)v` and both the extension and the second copy disappear.
 #
-# The negate fold is restricted to that one width pair because it MEASURED as a
-# pure win there and as a pessimisation elsewhere (see the comment on the fold
-# in `src/passes/simplify.rs`).  The narrower shapes are therefore pinned as
-# controls: their counts must not move, so widening the fold later has to come
-# with a fresh measurement instead of slipping in.
+# THE LOWERING NOW DOES PART OF THIS FIRST, and the split is measured rather
+# than assumed (`c-frontend: unary -/~/+ wrap at the promoted type, not the
+# carrier` emits `-` and `~` at the width their result is observed at):
+#
+#   * an `int` result no longer arrives as a 64-bit negate truncated to 32, so
+#     `negcast` matches nothing any C frontend produces.  Disabling it
+#     reproduces all 1,212 compilable `tests/regression/*.c` files byte for
+#     byte, and every shape in this file.  Section 2 pins that by requiring the
+#     two builds to agree, so a reintroduced wide negate fails a gate instead of
+#     quietly costing two instructions a site;
+#   * a SUB-WORD result still truncates, so `(T)~x` is still
+#     `trunc(Not_{I32}(ext))` and `notcast` is what narrows it -- worth exactly
+#     one instruction a site.  Sections 2b and 5 own that shape end-to-end.
+#
+# The negate fold stays restricted to the 64-bit-source/32-bit-destination pair
+# because that is the ONE pair where it measured as a pure win; the narrower
+# shapes are pinned as controls, so widening it later has to come with a fresh
+# measurement instead of slipping in (see the comment on the fold in
+# `src/passes/simplify.rs`).
 #
 # The complement (`notcast`) needs no width restriction -- `Not` is bitwise and
 # therefore commutes with truncation outright -- but it does need the outer step
 # to be a NARROWING one, because `ext(~x)` and `~ext(x)` differ in the high
-# bits.  Its owned shape is the `x & ~(1 << n)` bit-clear, which used to widen
-# the complement to 64 bits and pay `cltq; notq` for it.
-#
-# That last shape now has an owner ABOVE this rule: `fold_bit_select` collapses
-# `x & ~(1u << n)` to a `BitClear`, which x86 lowers to one `btr` (3
-# instructions, GCC's count), so in the default pipeline the round trip
-# `notcast` used to repair is never built.  The rule is still owned, and the
-# assertions below prove it under `CCC_NO_BIT_SELECT=1`: `notcast` is what takes
-# that build from 9 instructions with `cltq; notq` to 8 with `notl`.  Both
-# builds are pinned, so a future reader can see which rule does the work.
+# bits.  Its original shape, the `x & ~(1 << n)` bit-clear, now has an owner
+# ABOVE this rule: `fold_bit_select` collapses it to a `BitClear`, which x86
+# lowers to one `btr` (3 instructions, GCC's count).  Both that build and the
+# `CCC_NO_BIT_SELECT=1` fallback are pinned, so a future reader can see which
+# rule does the work; in the fallback neither build reaches `notcast`, because
+# a 32-bit result gets its 32-bit complement from the lowering.
 #
 # The gate pins five things, because an instruction-count win that changes
 # answers is worthless:
 #
 #   1. the emitted shapes (no extension/truncation round trip survives),
-#   2. that the round trip comes back under `CCC_SIMPLIFY_SKIP=negcast`, which
-#      is what proves the assertions above belong to this fold,
+#   2. that `CCC_SIMPLIFY_SKIP=negcast` changes NOTHING, which is what records
+#      that the lowering now owns the narrow negate and this fold is a safety
+#      net (section 2 says how that was measured and what to do if it changes),
 #   3. that `0 - x` is a `Neg` and the float spelling is NOT (IEEE: `0.0 - x`
 #      is `+0.0` at `x = +0.0`, while `-x` is `-0.0`),
 #   4. that a WIDENING cast keeps its wide negate (the high bits are observed),
@@ -68,6 +79,11 @@ unsigned long  notw(unsigned x)       { return ~(unsigned long)x; }
 /* Control: the negation is observed at the WIDE width, so it must stay there
    (folding it to `-(int)` would drop the sign extension of `x`). */
 long           wide(int x)            { return -(long)x; }
+/* The complement's LIVE shape after the lowering change: a sub-word result
+   truncates, so `(T)~x` is still `trunc(Not_{I32}(ext))` and `notcast` is what
+   narrows it.  These two are the fold's end-to-end owner. */
+unsigned short nots16(unsigned short x) { return (unsigned short)~x; }
+unsigned char  nots8(unsigned char x)   { return (unsigned char)~x; }
 /* Control: IEEE 754 says `0.0 - x` is not `-x` at `x = +0.0`, so the float
    subtraction must keep its `subsd` rather than become a sign flip. */
 double         fsub(double x)         { return 0.0 - x; }
@@ -137,23 +153,33 @@ expect neg8 4 no_negcast.s
 expect negs16 4 no_negcast.s
 expect isol16 6 no_negcast.s
 
-# ── 2. The fold owns the shapes ─────────────────────────────────────────────
-# With `negcast` off the round trip must return, otherwise the assertions above
-# are satisfied by some other rule and would not catch this one regressing.
-n=$(count "$tmp/no_negcast.s" notzero)
-[ "$n" -gt 6 ] || {
-    echo "CCC_SIMPLIFY_SKIP=negcast leaves notzero folded ($n instructions)" >&2
-    fn_body "$tmp/no_negcast.s" notzero >&2
-    exit 1
-}
-if ! has "$(fn_body "$tmp/no_negcast.s" notzero)" 'negq'; then
-    echo "CCC_SIMPLIFY_SKIP=negcast does not restore the 64-bit negate:" >&2
-    fn_body "$tmp/no_negcast.s" notzero >&2
+# ── 2. Who owns the narrow negate now ───────────────────────────────────────
+# It used to be this fold: the lowering negated at the carrier width, so
+# `-(x != 0)` arrived as `trunc32(neg64(ext64(cmp)))` and `negcast` was what
+# turned it into a 32-bit `Neg`.  The lowering now negates at the PROMOTED type
+# (`c-frontend: unary -/~/+ wrap at the promoted type, not the carrier`), so the
+# round trip is never built and the fold has nothing to match.
+#
+# That is measured, not assumed: with `CCC_SIMPLIFY_SKIP=negcast` the entire
+# 1,212-file regression corpus compiles to byte-identical assembly, and so does
+# every shape in this file.  The rule is kept anyway -- it is a sound rewrite
+# (negation is a ring operation and the extension's high bits die in the
+# truncation), it costs one match, and any future producer of the wide shape
+# gets it for free rather than paying two instructions per site in silence.
+#
+# So the assertion is about OWNERSHIP: the two builds must agree.  If a future
+# lowering reintroduces the wide negate, this fails and says what happened,
+# because the decision that follows -- retire the rule, or re-pin it as the
+# owner with a fresh measurement -- is not one a silent pass should make.
+if ! cmp -s "$tmp/shapes.s" "$tmp/no_negcast.s"; then
+    echo "CCC_SIMPLIFY_SKIP=negcast changed the emitted code, so this simplify rule is" >&2
+    echo "reachable again (the lowering no longer owns the narrow negate). Re-measure" >&2
+    echo "and re-pin the ownership; do not just accept the new output:" >&2
+    diff "$tmp/shapes.s" "$tmp/no_negcast.s" | sed -n '1,20p' >&2
     exit 1
 fi
 
-# ── 2b. The eligible bit-clear is now a single BTR; notcast still owns the
-#       fallback underneath it ─────────────────────────────────────────────
+# ── 2b. `notcast` owns the sub-word complement; `btr` owns the bit-clear ────
 # `bit_idioms` recognizes `x & ~(1 << n)` as BitClear, so the production shape
 # is the native bit instruction, not a 32-bit NOT.  Pin that win, then disable
 # the selection fold to keep the original complement-width contract covered.
@@ -168,19 +194,38 @@ for label in bclear bclearu; do
     lacks "$(fn_body "$tmp/shapes.s" "$label")" 'not[q l]\|cltq\|shl' \
         "$label still spells the bit-clear as shift/complement"
 done
-# With selection disabled, `notcast` owns the 32-bit complement: 8 instructions
-# folded, 9 with the rule off, and the wide NOT returns only in the latter.
+# With selection disabled the bit-clear still complements at 32 bits, in BOTH
+# builds: for a 32-bit result the lowering emits `Not_{I32}` itself, so there is
+# no wide complement left for `notcast` to narrow here.  Pinned at 8 either way.
 expect bclear 8 no_bit_select.s
 expect bclearu 8 no_bit_select.s
-if ! has "$(fn_body "$tmp/no_bit_select.s" bclear)" 'notl'; then
-    echo "bclear fallback must complement at 32 bits:" >&2
-    fn_body "$tmp/no_bit_select.s" bclear >&2
+expect bclear 8 no_notcast_no_select.s
+for build in no_bit_select.s no_notcast_no_select.s; do
+    if ! has "$(fn_body "$tmp/$build" bclear)" 'notl'; then
+        echo "bclear fallback must complement at 32 bits in $build:" >&2
+        fn_body "$tmp/$build" bclear >&2
+        exit 1
+    fi
+done
+# `notcast` itself is NOT dead: a sub-word result still truncates, so `(T)~x`
+# arrives as `trunc(Not_{I32}(ext))` -- the lowering change took away the
+# 64-bit spelling for `int` results, not this one.  It is worth exactly one
+# instruction per site, and that is what these four counts pin:
+#
+#   `(unsigned short)~x`  folded: `notq; movl`                    3
+#                         unfolded: `movzwl; notl; movzwl`         4
+expect nots16 3 shapes.s
+expect nots8 3 shapes.s
+expect nots16 4 no_notcast.s
+expect nots8 4 no_notcast.s
+if ! has "$(fn_body "$tmp/no_notcast.s" nots16)" 'notl'; then
+    echo "CCC_SIMPLIFY_SKIP=notcast does not restore the 32-bit complement:" >&2
+    fn_body "$tmp/no_notcast.s" nots16 >&2
     exit 1
 fi
-expect bclear 9 no_notcast_no_select.s
-if ! has "$(fn_body "$tmp/no_notcast_no_select.s" bclear)" 'notq'; then
-    echo "CCC_SIMPLIFY_SKIP=notcast does not restore the 64-bit complement:" >&2
-    fn_body "$tmp/no_notcast_no_select.s" bclear >&2
+if ! has "$(fn_body "$tmp/shapes.s" nots16)" 'notq'; then
+    echo "nots16 must keep the wide complement (the truncation is what makes it legal):" >&2
+    fn_body "$tmp/shapes.s" nots16 >&2
     exit 1
 fi
 # A widening cast keeps its wide complement in every build.
@@ -254,6 +299,10 @@ static double         fsub(double x)         { return 0.0 - x; }
    negation is part of the answer: this row is what a fold that trusts the low
    bits alone would break. */
 static unsigned       keep_width(unsigned short x) { return (unsigned short)-x; }
+/* The complement's narrow row: `notcast` narrows these two, so it is part of
+   every build's answer and of the gcc comparison below. */
+static unsigned short nots16(unsigned short x) { return (unsigned short)~x; }
+static unsigned char  nots8(unsigned char x)   { return (unsigned char)~x; }
 
 static unsigned long long fnv = 1469598103934665603ull;
 static void mix(unsigned long long v) {
@@ -271,6 +320,8 @@ int main(void) {
         mix((unsigned short)negs16((short)s));
         mix(isol16(s));
         mix(keep_width(s));
+        mix(nots16(s));
+        mix(nots8((unsigned char)x));
         mix((unsigned)wide((int)s));
         mix(notzero((int)s));
         mix(notzero(-(int)s));
@@ -336,7 +387,7 @@ if command -v "${GCC_ORACLE:-gcc-16}" >/dev/null 2>&1; then
 fi
 
 # ── Instruction counts, printed so a drift is visible in the CI log ─────────
-for name in neg16 neg8 negs16 isol16 notzero wide fsub bclear bclearu notw; do
+for name in neg16 neg8 negs16 isol16 notzero wide fsub bclear bclearu notw nots16 nots8; do
     echo "  $name: $(count "$tmp/shapes.s" "$name") instructions (negcast off: $(count "$tmp/no_negcast.s" "$name"))"
 done
 

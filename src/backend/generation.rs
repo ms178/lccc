@@ -578,7 +578,7 @@ fn escape_dwarf_path(path: &str) -> String {
 ///
 /// `allow_u32_wrap` recovers `U32 0xFFFF_FFFF → -1` only for ≤32-bit adds.
 /// Doing this for a 64-bit add would turn `base + 4294967295` into `base-1`.
-fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
+pub(crate) fn foldable_const_disp(c: &IrConst, allow_u32_wrap: bool) -> Option<i64> {
     let v = c.to_i64()?;
     if (i32::MIN as i64..=i32::MAX as i64).contains(&v) {
         return Some(v);
@@ -5963,6 +5963,17 @@ fn generate_function_body(
     let raw_space = cg.calculate_stack_space(func);
     let frame_size = cg.aligned_frame_size(raw_space);
     cg.state().frame_size = frame_size;
+    // A frame past the imm32 window is only addressable through a frame
+    // pointer: with `%rbp` established, `%rsp` sits exactly `frame_size` below
+    // it and serves as a second anchor for the bottom of the frame (and the
+    // accesses no anchor reaches materialise their address). Without a frame
+    // pointer `%rsp` is the only base, so every slot must be within 2 GiB of
+    // it, which a frame of this size violates by construction. Keeping the
+    // frame pointer costs one register in a function that cannot be written
+    // by accident and makes one addressing mode -- the validated one -- total.
+    if frame_size > i32::MAX as i64 {
+        cg.state().omit_frame_pointer = false;
+    }
     cg.emit_prologue(func, frame_size);
     // Use counts must be visible to `emit_store_params`: the x86 prologue
     // materialises late ABI parameter reads through `store_rax_to`, which

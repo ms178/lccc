@@ -2427,15 +2427,11 @@ impl X86Codegen {
             }
         };
         self.state.emit("    pushfq");
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size += 8;
-        }
+        self.state.out.rsp_frame_size += 8;
         self.operand_to_rax(false_val);
         self.operand_to_rcx(true_val);
         self.state.emit("    popfq");
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size -= 8;
-        }
+        self.state.out.rsp_frame_size -= 8;
         self.emit_cmov_typed(cc, "rcx", "rax", ty);
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
@@ -2456,15 +2452,11 @@ impl X86Codegen {
                     let d_name = phys_reg_name(d_reg);
                     self.emit_legacy_cond_test(cond);
                     self.state.emit("    pushfq");
-                    if self.state.out.use_rsp_addressing {
-                        self.state.out.rsp_frame_size += 8;
-                    }
+                    self.state.out.rsp_frame_size += 8;
                     self.operand_to_callee_reg(false_val, d_reg);
                     self.operand_to_rcx(true_val);
                     self.state.emit("    popfq");
-                    if self.state.out.use_rsp_addressing {
-                        self.state.out.rsp_frame_size -= 8;
-                    }
+                    self.state.out.rsp_frame_size -= 8;
                     self.state
                         .emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
                     self.state.reg_cache.invalidate_acc();
@@ -2473,15 +2465,11 @@ impl X86Codegen {
             }
             self.emit_legacy_cond_test(cond);
             self.state.emit("    pushfq");
-            if self.state.out.use_rsp_addressing {
-                self.state.out.rsp_frame_size += 8;
-            }
+            self.state.out.rsp_frame_size += 8;
             self.operand_to_rax(false_val);
             self.operand_to_rcx(true_val);
             self.state.emit("    popfq");
-            if self.state.out.use_rsp_addressing {
-                self.state.out.rsp_frame_size -= 8;
-            }
+            self.state.out.rsp_frame_size -= 8;
             self.state.emit("    cmovneq %rcx, %rax");
             self.state.reg_cache.invalidate_acc();
             self.store_rax_to(dest);
@@ -2689,15 +2677,11 @@ impl X86Codegen {
                 // Legacy path: condition not testable in place.
                 self.emit_legacy_cond_test(cond);
                 self.state.emit("    pushfq");
-                if self.state.out.use_rsp_addressing {
-                    self.state.out.rsp_frame_size += 8;
-                }
+                self.state.out.rsp_frame_size += 8;
                 self.operand_to_callee_reg(false_val, d_reg);
                 self.operand_to_rcx(true_val);
                 self.state.emit("    popfq");
-                if self.state.out.use_rsp_addressing {
-                    self.state.out.rsp_frame_size -= 8;
-                }
+                self.state.out.rsp_frame_size -= 8;
                 self.state
                     .emit_fmt(format_args!("    cmovneq %rcx, %{}", d_name));
                 self.state.reg_cache.invalidate_acc();
@@ -2724,15 +2708,11 @@ impl X86Codegen {
         // Legacy pushfq fallback (condition not testable in place).
         self.emit_legacy_cond_test(cond);
         self.state.emit("    pushfq");
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size += 8;
-        }
+        self.state.out.rsp_frame_size += 8;
         self.operand_to_rax(false_val);
         self.operand_to_rcx(true_val);
         self.state.emit("    popfq");
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size -= 8;
-        }
+        self.state.out.rsp_frame_size -= 8;
         self.state.emit("    cmovneq %rcx, %rax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);

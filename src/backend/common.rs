@@ -1399,6 +1399,41 @@ fn link_builtin_native(
     Ok(())
 }
 
+/// The register an x86 stack slot's memory operand is anchored on.
+///
+/// A frame has two anchors: `%rbp`, which the prologue establishes, and
+/// `%rsp`, which sits exactly one frame below it. Which one can name a given
+/// slot depends on the displacement each can encode, so the choice is made once
+/// -- by [`AsmOutput::slot_operand_parts_opt`] -- and carried upwards in this
+/// type rather than in a string. Callers that add an index register (the
+/// indexed-GEP emitters) read the register back with [`SlotBase::name`];
+/// callers that write a whole operand use [`SlotBase::spelling`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SlotBase {
+    FramePointer,
+    StackPointer,
+}
+
+impl SlotBase {
+    /// The register name without the `%` prefix, for `disp(%base, %index)`.
+    #[inline]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            SlotBase::FramePointer => "rbp",
+            SlotBase::StackPointer => "rsp",
+        }
+    }
+
+    /// The complete `(%reg)` suffix of a one-register memory operand.
+    #[inline]
+    pub(crate) fn spelling(self) -> &'static str {
+        match self {
+            SlotBase::FramePointer => "(%rbp)",
+            SlotBase::StackPointer => "(%rsp)",
+        }
+    }
+}
+
 /// Assembly output buffer with helpers for emitting text.
 ///
 /// Besides the generic `emit` and `emit_fmt` methods, this provides specialized
@@ -1416,10 +1451,49 @@ pub struct AsmOutput {
     /// When true, stack slot references use RSP-relative addressing instead of RBP.
     /// Set when the frame pointer is omitted (-fomit-frame-pointer).
     pub use_rsp_addressing: bool,
-    /// Total frame size (needed to convert rbp-relative offsets to rsp-relative).
-    /// RBP-relative: offset(%rbp) where offset is negative
-    /// RSP-relative: (frame_size + offset)(%rsp) since RSP = RBP - frame_size
+    /// The live `%rsp` delta that a slot displacement has to account for, on top
+    /// of the frame itself.
+    ///
+    /// The invariant, stated once because every `%rsp`-anchored access depends
+    /// on it: after the prologue
+    ///
+    /// ```text
+    ///     %rbp - %rsp == frame_size + rsp_frame_size        (frame-pointer mode)
+    ///     %rsp          == entry %rsp - rsp_frame_size      (frame-pointer omitted)
+    /// ```
+    ///
+    /// so a slot at `offset` from `%rbp` is at `rsp_frame_size + offset` from
+    /// `%rsp` in the omitted mode and at `frame_size + rsp_frame_size + offset`
+    /// (the anchor) in frame-pointer mode. The two differ in what the counter
+    /// *means* because the modes pay for the frame differently: with a frame
+    /// pointer the callee-saved pushes are paid out of the frame (`local_size`
+    /// is reduced by exactly the pushed bytes), so they do not appear here,
+    /// while call staging and the atomic loops move `%rsp` past the frame and
+    /// do. Without a frame pointer the whole allocation is the counter.
+    ///
+    /// The value is live: it is bumped around every push and staging window, so
+    /// an access in between is spelled from the `%rsp` of that instant.
     pub rsp_frame_size: i64,
+    /// x86 frame-pointer mode only: `Some(frame_size)` when the frame is too
+    /// large for every slot offset to be an `imm32` `%rbp` displacement, so an
+    /// access can be anchored on `%rsp` instead. `%rsp` sits `frame_size`
+    /// below `%rbp` once the prologue has run, and every later move is
+    /// accounted for by [`Self::rsp_frame_size`], which the access arithmetic
+    /// adds -- so the anchor stays exact *inside* a call-staging window, where
+    /// an access and a moved `%rsp` do coexist.
+    ///
+    /// x86 encodes `disp(%rbp)` in 32 signed bits, so a frame above 2 GiB has
+    /// slot offsets with **no encoding at all** -- a legal 3 GiB automatic
+    /// object produced `movb %al, -3221225472(%rbp)`, which GNU as rejects
+    /// ("out of range of signed 32bit displacement").  Choosing the anchor per
+    /// access recovers every case where one of the two anchors can reach the
+    /// slot, at zero instruction cost; only an object whose interior is more
+    /// than 2 GiB from *both* anchors needs a materialised address, and the
+    /// folds decline those (see `slot_operand_parts`).
+    ///
+    /// `None` for every other target and for ordinary frames, so the common
+    /// path is one predictable branch on a field that is already in cache.
+    pub x86_rsp_anchor: Option<i64>,
     /// DEBUG-ONLY shadow epoch of instructions that write any part of %rax.
     ///
     /// Every public emit method ends in `debug_scan_tail()`, so each completed
@@ -2141,6 +2215,7 @@ impl AsmOutput {
             label_counter: 0,
             use_rsp_addressing: false,
             rsp_frame_size: 0,
+            x86_rsp_anchor: None,
             #[cfg(debug_assertions)]
             rax_write_epoch: 0,
             #[cfg(debug_assertions)]
@@ -2413,19 +2488,144 @@ impl AsmOutput {
         self.debug_scan_tail();
     }
 
+    /// Whether a folded memory operand can name this slot at all.
+    ///
+    /// A fold embeds the displacement in the instruction, so it needs an
+    /// encodable one. A caller that can reach the slot another way (by
+    /// materialising its address with `leaq slot`) must ask this first and take
+    /// that path when it says no.
+    #[inline]
+    pub(crate) fn slot_disp_encodable(&self, offset: i64) -> bool {
+        self.slot_operand_parts_opt(offset).is_some()
+    }
+
+    /// The `(disp, base)` spelling of a slot's memory operand, or `None` when no
+    /// anchor can encode the displacement.
+    ///
+    /// Three anchors are possible, in order of preference:
+    ///
+    /// * `%rsp` directly, when the frame pointer is omitted (the long-standing
+    ///   `-fomit-frame-pointer` mode, where `rsp_frame_size` models the live
+    ///   `%rsp` delta);
+    /// * `%rbp`, whenever the offset is an `imm32` -- the encoding every
+    ///   ordinary frame uses, and the only one that costs nothing;
+    /// * `%rsp` again, for an offset that `%rbp` cannot encode but `%rsp` can,
+    ///   which is exactly what `x86_rsp_anchor` authorises. The anchor is the
+    ///   frame size and `rsp_frame_size` is the live displacement of the
+    ///   temporaries pushed below the frame base (see `emit_prologue_impl`), so
+    ///   adding both keeps the spelling exact inside a call-staging window too.
+    ///
+    /// `None` is not an error: a caller that forms the address in a register
+    /// (`leaq slot`, `movq $disp, %r; leaq (%base,%r), %r`) still reaches the
+    /// slot. Only a fold -- which embeds the displacement in the instruction --
+    /// cannot, and it asks [`Self::slot_disp_encodable`] first.
+    #[inline]
+    pub(crate) fn slot_operand_parts_opt(&self, offset: i64) -> Option<(i64, SlotBase)> {
+        if self.use_rsp_addressing {
+            let disp = self.rsp_frame_size.checked_add(offset)?;
+            return i32::try_from(disp)
+                .is_ok()
+                .then_some((disp, SlotBase::StackPointer));
+        }
+        if i32::try_from(offset).is_ok() {
+            return Some((offset, SlotBase::FramePointer));
+        }
+        let via_rsp = self
+            .x86_rsp_anchor?
+            .checked_add(self.rsp_frame_size)?
+            .checked_add(offset)?;
+        i32::try_from(via_rsp)
+            .is_ok()
+            .then_some((via_rsp, SlotBase::StackPointer))
+    }
+
+    #[inline]
+    pub(crate) fn slot_operand_parts(&self, offset: i64) -> (i64, SlotBase) {
+        if let Some(parts) = self.slot_operand_parts_opt(offset) {
+            return parts;
+        }
+        // No anchor reaches this slot. A memory operand cannot name it, so
+        // there is no correct text to emit here: `emit_instr_rbp_reg` handles
+        // the materialised forms (`leaq` split into two instructions) itself,
+        // and every other caller is a fold that must have consulted
+        // `slot_disp_encodable` first. Fail loudly rather than emit a
+        // displacement the assembler will reject -- and, worse, one a *large*
+        // frame could spell with the wrong anchor.
+        panic!(
+            "frame slot {offset} has no imm32 displacement from %rbp or %rsp \
+             (frame {frame_size} bytes, rsp mode: {rsp_mode}, rsp anchor: {anchor:?}); \
+             this frame shape needs an address materialised in a register",
+            frame_size = self.rsp_frame_size,
+            rsp_mode = self.use_rsp_addressing,
+            anchor = self.x86_rsp_anchor,
+        )
+    }
+
+    /// Write the x86 slot operand `disp(%rbp)` / `disp(%rsp)` with the anchor
+    /// chosen by [`Self::slot_operand_parts`].
+    #[inline]
+    pub(crate) fn write_slot_operand(&mut self, offset: i64) {
+        let (disp, base) = self.slot_operand_parts(offset);
+        write_i64_fast(&mut self.buf, disp);
+        self.buf.push_str(base.spelling());
+    }
+
     /// Emit: `    {mnemonic} {offset}(%rbp), %{reg}`
     /// Used for loads from stack slots.
     #[inline]
     pub fn emit_instr_rbp_reg(&mut self, mnemonic: &str, offset: i64, reg: &str) {
+        // `leaq slot, %r64` is how this backend materialises a frame address.
+        // When no anchor can encode the slot's displacement, the address is
+        // still expressible: split it into the constant and a base-only LEA.
+        //
+        //     movq $D, %r64          # D = -offset from %rbp, or rsp_frame_size
+        //                            #     + offset in rsp mode
+        //     leaq (%BASE,%r64), %r64
+        //
+        // Neither instruction writes flags (`lea` is defined not to), so this
+        // substitution is invisible to every flag-sensitive consumer, and it
+        // needs no scratch register: `%r64` is the destination the caller asked
+        // for. Frames beyond 2 GiB are the only way to reach it.
+        if mnemonic == "    leaq" && !self.slot_disp_encodable(offset) {
+            // A frame whose slots are not reachable from either anchor is
+            // bounded by the frame size, which is itself an addressable
+            // object size, so the constant below cannot overflow; a wrap would
+            // mean a frame beyond the address space, which the front end
+            // rejects. Assert the invariant rather than silently mis-encode.
+            let disp = if self.use_rsp_addressing {
+                self.rsp_frame_size.checked_add(offset)
+            } else {
+                Some(offset)
+            };
+            if let Some(disp) = disp {
+                let base = if self.use_rsp_addressing {
+                    SlotBase::StackPointer
+                } else {
+                    SlotBase::FramePointer
+                }
+                .name();
+                self.buf.push_str("    movq $");
+                write_i64_fast(&mut self.buf, disp);
+                self.buf.push_str(", %");
+                self.buf.push_str(reg);
+                self.buf.push('\n');
+                self.debug_scan_tail();
+                self.buf.push_str("    leaq (%");
+                self.buf.push_str(base);
+                self.buf.push_str(",%");
+                self.buf.push_str(reg);
+                self.buf.push_str("), %");
+                self.buf.push_str(reg);
+                self.buf.push('\n');
+                self.debug_scan_tail();
+                return;
+            }
+            debug_assert!(false, "slot {offset} overflows i64 frame arithmetic");
+        }
         self.buf.push_str(mnemonic);
         self.buf.push(' ');
-        if self.use_rsp_addressing {
-            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
-            self.buf.push_str("(%rsp), %");
-        } else {
-            write_i64_fast(&mut self.buf, offset);
-            self.buf.push_str("(%rbp), %");
-        }
+        self.write_slot_operand(offset);
+        self.buf.push_str(", %");
         self.buf.push_str(reg);
         self.buf.push('\n');
         self.debug_scan_tail();
@@ -2475,13 +2675,8 @@ impl AsmOutput {
         self.buf.push_str("    ");
         self.buf.push_str(mnem);
         self.buf.push_str(" $0, ");
-        if self.use_rsp_addressing {
-            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
-            self.buf.push_str("(%rsp)\n");
-        } else {
-            write_i64_fast(&mut self.buf, offset);
-            self.buf.push_str("(%rbp)\n");
-        }
+        self.write_slot_operand(offset);
+        self.buf.push('\n');
         // This method is the sink that falsified the "every public emit
         // method ends in debug_scan_tail()" banner (PR #637 audit, F2): a
         // completed line without a scan is a line the epoch validator is
@@ -2500,13 +2695,7 @@ impl AsmOutput {
         self.buf.push_str(" %");
         self.buf.push_str(reg);
         self.buf.push_str(", ");
-        if self.use_rsp_addressing {
-            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
-            self.buf.push_str("(%rsp)");
-        } else {
-            write_i64_fast(&mut self.buf, offset);
-            self.buf.push_str("(%rbp)");
-        }
+        self.write_slot_operand(offset);
         self.buf.push('\n');
         self.debug_scan_tail();
     }
@@ -2582,13 +2771,7 @@ impl AsmOutput {
     pub fn emit_instr_rbp(&mut self, mnemonic: &str, offset: i64) {
         self.buf.push_str(mnemonic);
         self.buf.push(' ');
-        if self.use_rsp_addressing {
-            write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
-            self.buf.push_str("(%rsp)");
-        } else {
-            write_i64_fast(&mut self.buf, offset);
-            self.buf.push_str("(%rbp)");
-        }
+        self.write_slot_operand(offset);
         self.buf.push('\n');
         self.debug_scan_tail();
     }
@@ -4888,7 +5071,7 @@ mod rcx_epoch_analyzer_tests {
 /// does not exist in release builds.
 #[cfg(all(test, debug_assertions))]
 mod rcx_epoch_sink_coverage_tests {
-    use super::AsmOutput;
+    use super::{AsmOutput, SlotBase};
 
     /// Both shadow epochs ride the SAME line walk: a %rcx write moves only
     /// the %rcx epoch, a %rax write only the %rax epoch, and a
@@ -4957,5 +5140,94 @@ mod gcc_version_discovery_tests {
             installed_gcc_versions(&[root.clone(), root]),
             ["17.1.10", "17.1.2", "16", "14", "9"]
         );
+    }
+}
+
+#[cfg(test)]
+mod slot_operand_split_tests {
+    use super::{AsmOutput, SlotBase};
+
+    fn out(rsp_mode: bool, rsp_frame: i64, anchor: Option<i64>) -> AsmOutput {
+        let mut o = AsmOutput::new();
+        o.use_rsp_addressing = rsp_mode;
+        o.rsp_frame_size = rsp_frame;
+        o.x86_rsp_anchor = anchor;
+        o
+    }
+
+    #[test]
+    fn frame_pointer_displacement_wins_when_it_fits() {
+        let o = out(false, 0, None);
+        assert_eq!(
+            o.slot_operand_parts_opt(-8),
+            Some((-8, SlotBase::FramePointer))
+        );
+        let top = i32::MIN as i64;
+        assert_eq!(
+            o.slot_operand_parts_opt(top),
+            Some((top, SlotBase::FramePointer))
+        );
+    }
+
+    #[test]
+    fn rsp_mode_adds_the_frame_size() {
+        let o = out(true, 4096, None);
+        assert_eq!(
+            o.slot_operand_parts_opt(-8),
+            Some((4088, SlotBase::StackPointer))
+        );
+        // A slot the frame size cannot bring into range stays unreachable.
+        assert_eq!(o.slot_operand_parts_opt(-(1i64 << 40)), None);
+    }
+
+    #[test]
+    fn big_frame_uses_the_rsp_anchor_for_the_bottom_half() {
+        let frame = 1i64 << 32;
+        let o = out(false, 0, Some(frame));
+        // Below the imm32 window from %rbp, but `frame + offset` is small.
+        assert_eq!(
+            o.slot_operand_parts_opt(-frame + 48),
+            Some((48, SlotBase::StackPointer))
+        );
+        // Fits %rbp: the frame register must win (shorter encoding, no anchor
+        // dependency at the use site).
+        assert_eq!(
+            o.slot_operand_parts_opt(-16),
+            Some((-16, SlotBase::FramePointer))
+        );
+    }
+
+    #[test]
+    fn middle_of_a_4_gib_frame_has_no_anchor() {
+        let frame = 6 * (1i64 << 30);
+        let o = out(false, 0, Some(frame));
+        // 2.5 GiB into the object: > 2^31 from both %rbp and %rsp.
+        assert_eq!(o.slot_operand_parts_opt(-frame + (5 << 29) + 40), None);
+        assert!(!o.slot_disp_encodable(-frame + (5 << 29) + 40));
+    }
+
+    #[test]
+    fn far_slot_leaq_splits_into_a_materialised_address() {
+        // 6 GiB frame, a slot 3.5 GiB below %rbp: 3.5 GiB from %rbp and
+        // 2.5 GiB from %rsp, so neither anchor can encode it.
+        let frame = 6 * (1i64 << 30);
+        let offset = -(14i64 << 28);
+        let mut o = out(false, 0, Some(frame));
+        assert!(!o.slot_disp_encodable(offset));
+        // `leaq` must become `movq $disp` + a base-only LEA.
+        o.emit_instr_rbp_reg("    leaq", offset, "r11");
+        let text = o.buf.clone();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with("    movq $"), "{text}");
+        assert!(lines[0].ends_with(", %r11"), "{text}");
+        assert_eq!(lines[1].trim(), "leaq (%rbp,%r11), %r11", "{text}");
+    }
+
+    #[test]
+    fn encodable_slot_leaq_stays_a_single_instruction() {
+        let mut o = out(false, 0, None);
+        o.emit_instr_rbp_reg("    leaq", -24, "rax");
+        assert_eq!(o.buf.trim_end(), "    leaq -24(%rbp), %rax");
     }
 }

@@ -213,7 +213,16 @@ def fn(path, name):
     if not m:
         print(f"  FAIL: could not extract {name} from {path}", file=sys.stderr)
         sys.exit(1)
-    ins = [l for l in m.group(1).splitlines() if re.match(r'^\s+[a-z]', l)]
+    # An instruction is an instruction at any column. This used to require
+    # leading whitespace, which silently dropped lccc's prologue/epilogue stack
+    # adjustment: they were the two lines it emitted at column 0, so lccc's
+    # count was flattered by two against gcc's -- which always indents -- and
+    # the pins below were set against the flattered number. Directives start
+    # with '.', labels end with ':' and have no whitespace after the mnemonic
+    # slot, so neither is counted here.
+    ins = [l for l in m.group(1).splitlines()
+           if re.match(r'^\s*[a-z][a-z0-9]*(\s|$)', l)
+           and not re.match(r'^\s*[A-Za-z_.][A-Za-z0-9_.]*:', l)]
     return len(ins), sum(1 for l in ins if STK.search(l))
 d_i, d_s = fn(f"{work}/rot_def.s", "rot")
 l_i, l_s = fn(f"{work}/rot_leg.s", "rot")
@@ -263,13 +272,23 @@ if not d_i < g_i:
 # one stack-reference count. Keep the new deterministic ceiling tight; the
 # differential runtime benchmark and the strict-vs-legacy checks below remain
 # independent guards (these static counts are not presented as cycle counts).
+#
+# Re-measured 2026-11-02, with the instruction counter fixed: it required
+# leading whitespace, so it silently dropped the two lines lccc emitted at
+# column 0 -- the prologue and epilogue stack adjustment -- while counting the
+# two gcc emits (gcc always indents). lccc's count was flattered by exactly two
+# against the oracle, and the absolute pin above was set against the flattered
+# number. On one tree, measured through the corrected counter: default and
+# escape-off 53/4, legacy 59/9, GCC 16.2 60/6. The pin is therefore 53/4, and
+# the "beats the oracle" assertion below now compares like with like (53 < 60
+# rather than 51 < 60 against an undercounted self).
 # Against legacy only strict dominance on both axes is required: the legacy
 # arm is a kill switch that shares the allocator, so allocator work shrinks
 # it too (the 2026-10-20 phi-blocker re-homing took it from 63/27 to 59/12
 # with both resolver arms unchanged) -- a fixed margin over it would fail
 # exactly when the allocator improves. The absolute pin is what holds the
 # resolver's contribution.
-if not (k_i <= 51 and k_s <= 4 and k_i < l_i and k_s < l_s):
+if not (k_i <= 53 and k_s <= 4 and k_i < l_i and k_s < l_s):
     bad.append(f"escape-off resolver shape regressed ({k_i} insns/{k_s} stkref; "
                f"legacy {l_i}/{l_s}): resolver contribution changed")
 # The escape must never make THIS shape worse than no-escape-at-all: the
@@ -368,7 +387,16 @@ def fn(path, name):
     if not m:
         print(f"  FAIL: could not extract {name} from {path}", file=sys.stderr)
         sys.exit(1)
-    ins = [l for l in m.group(1).splitlines() if re.match(r'^\s+[a-z]', l)]
+    # An instruction is an instruction at any column. This used to require
+    # leading whitespace, which silently dropped lccc's prologue/epilogue stack
+    # adjustment: they were the two lines it emitted at column 0, so lccc's
+    # count was flattered by two against gcc's -- which always indents -- and
+    # the pins below were set against the flattered number. Directives start
+    # with '.', labels end with ':' and have no whitespace after the mnemonic
+    # slot, so neither is counted here.
+    ins = [l for l in m.group(1).splitlines()
+           if re.match(r'^\s*[a-z][a-z0-9]*(\s|$)', l)
+           and not re.match(r'^\s*[A-Za-z_.][A-Za-z0-9_.]*:', l)]
     return len(ins), sum(1 for l in ins if STK.search(l))
 d_i, d_s = fn(f"{work}/sha_def.s", "sha256_transform")
 l_i, l_s = fn(f"{work}/sha_leg.s", "sha256_transform")

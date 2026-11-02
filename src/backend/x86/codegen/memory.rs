@@ -1,6 +1,7 @@
 //! X86Codegen: memory operations (load, store, memcpy, GEP, stack).
 
 use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+use crate::backend::common::SlotBase;
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
@@ -892,6 +893,44 @@ impl X86Codegen {
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
 
+    /// Materialize a far slot's address into `%rcx`.
+    ///
+    /// The paths below write a slot operand straight into the text buffer
+    /// instead of going through a fold, so the operand splitter's anchor
+    /// choice is all they get. When neither `%rbp` nor the `%rsp` anchor
+    /// leaves an imm32 displacement -- frames past 4 GiB with a frame
+    /// pointer, or any frame past 2 GiB in `-fomit-frame-pointer` mode -- the
+    /// address has to be formed first:
+    ///
+    ///     movq $D, %rcx           # D = the slot's displacement from the base
+    ///     leaq (%rsp,%rcx), %rcx
+    ///
+    /// `%rcx` is this backend's secondary scratch register, and `reg_cache` is
+    /// invalidated so no later path reuses a value it believed was live there.
+    /// Returns `Some("(%rcx)")` when it materialized, `None` (emitting nothing)
+    /// for the ordinary encodable case.
+    fn slot_operand_via_rcx_if_far(&mut self, slot: StackSlot) -> Option<&'static str> {
+        let out = &mut self.state.out;
+        if out.slot_disp_encodable(slot.0) {
+            return None;
+        }
+        let (disp, base) = if out.use_rsp_addressing {
+            (out.rsp_frame_size.checked_add(slot.0)?, "rsp")
+        } else {
+            (slot.0, "rbp")
+        };
+        out.write_str("    movq $");
+        out.write_i64(disp);
+        out.write_str(", %rcx");
+        out.newline();
+        out.write_str("    leaq (%");
+        out.write_str(base);
+        out.write_str(",%rcx), %rcx");
+        out.newline();
+        self.state.reg_cache.invalidate_all();
+        Some("(%rcx)")
+    }
+
     /// Try to emit a constant-immediate store: `movX $IMM, ADDR`.
     /// Bypasses the accumulator entirely, saving 1-3 instructions.
     /// `imm` is the print value already validated by [`direct_store_imm`]:
@@ -903,18 +942,16 @@ impl X86Codegen {
         match addr {
             Some(SlotAddr::Direct(slot)) => {
                 // Store constant directly to stack slot: movX $IMM, N(%rsp/%rbp)
+                let far = self.slot_operand_via_rcx_if_far(slot);
                 let out = &mut self.state.out;
                 out.write_str("    ");
                 out.write_str(store_instr);
                 out.write_str(" $");
                 out.write_i64(imm);
                 out.write_str(", ");
-                if out.use_rsp_addressing {
-                    out.write_i64(out.rsp_frame_size + slot.0);
-                    out.write_str("(%rsp)");
-                } else {
-                    out.write_i64(slot.0);
-                    out.write_str("(%rbp)");
+                match far {
+                    Some(operand) => out.write_str(operand),
+                    None => out.write_slot_operand(slot.0),
                 }
                 out.newline();
                 self.state.reg_cache.invalidate_all();
@@ -1428,18 +1465,16 @@ impl X86Codegen {
                         match addr {
                             Some(SlotAddr::Direct(slot)) => {
                                 let folded_slot = StackSlot(slot.0 + offset);
+                                let far = self.slot_operand_via_rcx_if_far(folded_slot);
                                 let out = &mut self.state.out;
                                 out.write_str("    ");
                                 out.write_str(store_instr);
                                 out.write_str(" $");
                                 out.write_i64(imm_print);
                                 out.write_str(", ");
-                                if out.use_rsp_addressing {
-                                    out.write_i64(out.rsp_frame_size + folded_slot.0);
-                                    out.write_str("(%rsp)");
-                                } else {
-                                    out.write_i64(folded_slot.0);
-                                    out.write_str("(%rbp)");
+                                match far {
+                                    Some(operand) => out.write_str(operand),
+                                    None => out.write_slot_operand(folded_slot.0),
                                 }
                                 out.newline();
                                 self.state.reg_cache.invalidate_all();
@@ -2421,31 +2456,32 @@ impl X86Codegen {
         true
     }
 
-    /// SIB memory operand anchored at the frame register with an alloca slot
-    /// offset: `slot+disp(%rbp/%rsp,%idx,scale)`. Mirrors `slot_ref`'s
-    /// rsp-frame-size adjustment for `use_rsp_addressing` functions. When
-    /// the final displacement is zero on an rbp frame, "0" is kept: a bare
-    /// `(%rbp,%idx,s)` with no displacement is ambiguous in the encoder.
-    fn sib_mem64_frame(&self, slot_off: i64, index_reg: &str, shift: u8, disp: i64) -> String {
+    /// SIB memory operand anchored at a frame register:
+    /// `disp(%rbp/%rsp, %idx, scale)`, with the base and displacement already
+    /// resolved by `AsmOutput::slot_operand_parts_opt`.
+    ///
+    /// `disp` must be an `imm32`: the SIB encoding has no other form. The
+    /// caller enforces that before building the operand, which is what keeps a
+    /// >2 GiB frame from emitting `-3221225544(%rbp, %r11)` -- a displacement
+    /// the assembler rejects outright. `huge_frame_runtime.c` produces exactly
+    /// that at -O1, where the pointer walk over a 3 GiB object folds into one
+    /// SIB access.
+    ///
+    /// A zero displacement is spelled out on an `%rbp` base: a bare
+    /// `(%rbp,%idx,s)` with mod=00 relocates the base to RIP. On an `%rsp` base
+    /// SIB is unambiguous, so `0` is omitted.
+    fn sib_mem64_frame(disp: i64, base: SlotBase, index_reg: &str, shift: u8) -> String {
+        debug_assert!(
+            i32::try_from(disp).is_ok(),
+            "SIB frame displacement {disp} does not fit imm32"
+        );
         // NOTE: no leading '%' — the format literals below supply it
         // (`%{}`), matching phys_reg_name's no-prefix convention.
-        let frame = if self.state.out.use_rsp_addressing {
-            "rsp"
-        } else {
-            "rbp"
-        };
-        let off = if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size + slot_off
-        } else {
-            slot_off
-        } + disp;
-        // On an rbp frame the displacement is always materialised: a bare
-        // `(%rbp,%idx,s)` with mod=00 would relocate the base to RIP. On an
-        // rsp frame SIB base=rsp is unambiguous, so 0 can be omitted.
-        let d = if off == 0 && frame == "rsp" {
+        let frame = base.name();
+        let d = if disp == 0 && base == SlotBase::StackPointer {
             String::new()
         } else {
-            format!("{}", off)
+            format!("{}", disp)
         };
         if shift == 0 {
             format!("{}(%{}, %{})", d, frame, index_reg)
@@ -2455,8 +2491,16 @@ impl X86Codegen {
     }
 
     /// Alloca-base arm for indexed addressing: the base is a frame slot
-    /// (Direct), the SIB anchors at %rbp/%rsp. Returns None when the base is
-    /// not a plain Direct alloca slot (register-held, Indirect, OverAligned).
+    /// (Direct), the SIB anchors at `%rbp` or `%rsp`. Returns None when the
+    /// base is not a plain Direct alloca slot (register-held, Indirect,
+    /// OverAligned) or when no `imm32` displacement can name the slot.
+    ///
+    /// The displacement comes from the *same* splitter the plain slot operands
+    /// use, so the omitted frame pointer, the `%rsp` anchor of a >2 GiB frame
+    /// and the live push delta all apply here for free, and the imm32 rule is
+    /// stated exactly once. Refusing is the supported answer: the caller
+    /// rematerialises the skipped GEP (`IndexedGepInfo::orig_offset`) and the
+    /// access goes through a computed address instead.
     fn frame_sib_for_alloca_base(
         &self,
         base: &Value,
@@ -2470,7 +2514,15 @@ impl X86Codegen {
         }
         match self.state.resolve_slot_addr(base.0) {
             Some(SlotAddr::Direct(slot)) => {
-                Some(self.sib_mem64_frame(slot.0 as i64, phys_reg_name(idx_reg), shift, disp))
+                let (off, anchor) = self.state.out.slot_operand_parts_opt(slot.0 as i64)?;
+                let off = off.checked_add(disp)?;
+                i32::try_from(off).ok()?;
+                Some(Self::sib_mem64_frame(
+                    off,
+                    anchor,
+                    phys_reg_name(idx_reg),
+                    shift,
+                ))
             }
             _ => None,
         }
@@ -2490,12 +2542,13 @@ impl X86Codegen {
     ) -> Option<String> {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
             // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            // Resolve the operand FIRST: `ensure_sib_index_form` emits a fixup
+            // instruction, and a refusal must not leave half an access behind.
+            let mem = self.frame_sib_for_alloca_base(base, index, shift, disp)?;
             if !self.ensure_sib_index_form(index) {
                 return None;
             }
-            return self
-                .frame_sib_for_alloca_base(base, index, shift, disp)
-                .map(|mem| format!("{seg}{mem}"));
+            return Some(format!("{seg}{mem}"));
         };
         if is_xmm_reg(b)
             || self
@@ -2734,18 +2787,16 @@ impl X86Codegen {
             "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "eax",
             _ => Self::reg_for_type("rax", ty),
         };
+        let far = self.slot_operand_via_rcx_if_far(slot);
         let out = &mut self.state.out;
         out.write_str("    ");
         out.write_str(instr);
         out.write_str(" %");
         out.write_str(reg);
         out.write_str(", ");
-        if out.use_rsp_addressing {
-            out.write_i64(out.rsp_frame_size + slot.0);
-            out.write_str("(%rsp)");
-        } else {
-            out.write_i64(slot.0);
-            out.write_str("(%rbp)");
+        match far {
+            Some(operand) => out.write_str(operand),
+            None => out.write_slot_operand(slot.0),
         }
         out.newline();
     }
@@ -2761,17 +2812,16 @@ impl X86Codegen {
             "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "%eax",
             _ => "%rax",
         };
+        let far = self.slot_operand_via_rcx_if_far(slot);
         let out = &mut self.state.out;
         out.write_str("    ");
         out.write_str(instr);
         out.write_str(" ");
-        if out.use_rsp_addressing {
-            out.write_i64(out.rsp_frame_size + slot.0);
-            out.write_str("(%rsp), ");
-        } else {
-            out.write_i64(slot.0);
-            out.write_str("(%rbp), ");
+        match far {
+            Some(operand) => out.write_str(operand),
+            None => out.write_slot_operand(slot.0),
         }
+        out.write_str(", ");
         out.write_str(dest_reg);
         out.newline();
     }

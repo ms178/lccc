@@ -403,26 +403,9 @@ impl Lowerer {
                 Some(IrConst::I64(align as i64))
             }
             Expr::Conditional(cond, then_e, else_e, _) => {
-                // A literal's array address is non-null, even though it has no
-                // numeric IrConst. Keep this in sync with sema's selection.
-                if shared_const_eval::string_literal_condition(cond) {
-                    return self.eval_const_expr(then_e);
-                }
-                let cond_val = self.eval_const_expr(cond)?;
-                if self.const_truth(&cond_val, cond) {
-                    self.eval_const_expr(then_e)
-                } else {
-                    self.eval_const_expr(else_e)
-                }
+                self.eval_conditional_const(cond, then_e, else_e)
             }
-            Expr::GnuConditional(cond, else_e, _) => {
-                let cond_val = self.eval_const_expr(cond)?;
-                if self.const_truth(&cond_val, cond) {
-                    Some(cond_val) // condition value is used as result
-                } else {
-                    self.eval_const_expr(else_e)
-                }
-            }
+            Expr::GnuConditional(cond, else_e, _) => self.eval_gnu_conditional_const(cond, else_e),
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
                 if let Some(val) = self.eval_const_expr(inner) {
                     Some(IrConst::I64(if self.const_truth(&val, inner) {
@@ -1056,6 +1039,58 @@ impl Lowerer {
             return None;
         }
         self.read_const_scalar(&image.bytes, offset, &ctype)
+    }
+
+    /// Fold a `?:` whose condition is a constant (C11 6.5.15).
+    ///
+    /// Split out of `eval_const_expr` so the common-type reinterpretation below
+    /// has exactly one definition: the same rule previously appeared twice (here
+    /// and in the GNU `a ?: b` arm), which is a divergence hazard -- the two
+    /// spellings of one operator must not be able to fold differently.
+    fn eval_conditional_const(&self, cond: &Expr, then_e: &Expr, else_e: &Expr) -> Option<IrConst> {
+        if shared_const_eval::string_literal_condition(cond) {
+            return self.eval_const_expr(then_e);
+        }
+        let cond_val = self.eval_const_expr(cond)?;
+        let live = if self.const_truth(&cond_val, cond) {
+            then_e
+        } else {
+            else_e
+        };
+        let value = self.eval_const_expr(live)?;
+        Some(self.ternary_common_value(then_e, else_e, value))
+    }
+
+    /// Fold GNU `a ?: b`, which is `a ? a : b` with `a` evaluated once, so the
+    /// condition's own value is the result when it is true.
+    fn eval_gnu_conditional_const(&self, cond: &Expr, else_e: &Expr) -> Option<IrConst> {
+        let cond_val = self.eval_const_expr(cond)?;
+        let value = if self.const_truth(&cond_val, cond) {
+            cond_val // the condition value is the result
+        } else {
+            self.eval_const_expr(else_e)?
+        };
+        Some(self.ternary_common_value(cond, else_e, value))
+    }
+
+    /// Reinterpret a folded conditional's value at the operator's C common type
+    /// (C11 6.5.15p5).
+    ///
+    /// The result is a value of that type, so the live arm's constant must be
+    /// reinterpreted at its width: folding `1 ? -1 : 1u` to a bare -1 loses the
+    /// `unsigned int` value 4294967295, and every enclosing conversion then
+    /// sign-extends it instead of zero-extending it.
+    fn ternary_common_value(&self, left: &Expr, right: &Expr, value: IrConst) -> IrConst {
+        match (
+            self.expr_ctype(left),
+            self.expr_ctype(right),
+            value.to_i64(),
+        ) {
+            (left_ct, right_ct, Some(bits)) if left_ct.is_integer() && right_ct.is_integer() => {
+                IrConst::I64(CType::ternary_value_as_i64(&left_ct, &right_ct, bits))
+            }
+            _ => value,
+        }
     }
 
     /// Decode one scalar of `ctype` out of an object's byte image.
