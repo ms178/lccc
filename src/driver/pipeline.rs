@@ -136,6 +136,12 @@ pub struct Driver {
     /// version GCC 16.2 emits for a bare `-g`, so the same command line
     /// produces the same dialect from both compilers.
     pub(super) dwarf_version: u8,
+    /// Whether `-gdwarf-<N>` pinned [`Self::dwarf_version`].  Unpinned, the
+    /// line program generated for an input that brings its own `.debug_info`
+    /// adopts that unit's dialect; a pinned version always wins (the caller
+    /// asked for a dialect, and the program is the only DWARF an assembler
+    /// emits for such an input).
+    pub(super) dwarf_version_explicit: bool,
     pub(super) defines: Vec<CliDefine>,
     pub(super) include_paths: Vec<String>,
     /// Quote-only include paths (from -iquote flags).
@@ -659,6 +665,7 @@ impl Driver {
             mode: CompileMode::Full,
             debug_info: false,
             dwarf_version: crate::backend::elf::DWARF_DEFAULT_VERSION,
+            dwarf_version_explicit: false,
             defines: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
@@ -1606,7 +1613,9 @@ impl Driver {
             return None;
         }
         Some(if assembly {
-            DwarfConfig::assembler(self.dwarf_version)
+            let mut config = DwarfConfig::assembler(self.dwarf_version);
+            config.version_pinned = self.dwarf_version_explicit;
+            config
         } else {
             DwarfConfig::for_c(self.dwarf_version, self.stdc_version)
         })

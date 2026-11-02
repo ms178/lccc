@@ -708,8 +708,7 @@ impl ElfWriter {
                 Ok(())
             }
             AsmDirective::Loc(file, line, column, options) => {
-                self.base.debug_loc(*file, *line, *column, *options);
-                Ok(())
+                self.base.debug_loc(*file, *line, *column, *options)
             }
             AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
             AsmDirective::Cfi(name, _) => Err(format!(
