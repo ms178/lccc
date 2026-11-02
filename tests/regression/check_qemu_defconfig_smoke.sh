@@ -56,10 +56,27 @@ done
 if "$root/scripts/qemu_defconfig_smoke.sh" "$work/absent" >/dev/null 2>&1; then
   echo 'FAIL: missing image accepted' >&2; exit 1
 fi
-# The Debian transport deliberately excludes recommendations. qemu-system-x86
-# alone does not then install ipxe-qemu, which owns the mandatory EFI NIC ROM.
-# Keep both hosted installation paths explicit rather than depending on the
-# runner's preinstalled firmware. This is dependency coverage, not a guest boot.
+# Exercise the real staging helper against hermetic Debian split directories.
+# Nothing from the machine's own /usr/share or /usr/lib may satisfy these tests.
+source "$root/scripts/qemu_firmware.sh"
+mkdir -p "$work/sysroot/usr/share/qemu" "$work/sysroot/usr/share/seabios" \
+  "$work/sysroot/usr/lib/ipxe/qemu" "$work/staged" "$work/missing-stage"
+for f in linuxboot_dma.bin kvmvapic.bin; do
+  printf '%s' "$f" > "$work/sysroot/usr/share/qemu/$f"
+done
+printf bios > "$work/sysroot/usr/share/seabios/bios-256k.bin"
+printf ipxe > "$work/sysroot/usr/lib/ipxe/qemu/efi-e1000.rom"
+QEMU_DATA_DIR= lccc_qemu_stage_firmware "$work/staged" "$work/sysroot"
+[[ $(cat "$work/staged/efi-e1000.rom") == ipxe ]]
+[[ $(cat "$work/staged/bios-256k.bin") == bios ]]
+rm "$work/sysroot/usr/lib/ipxe/qemu/efi-e1000.rom"
+if QEMU_DATA_DIR= lccc_qemu_stage_firmware "$work/missing-stage" "$work/sysroot" >"$work/missing-out" 2>&1; then
+  echo 'FAIL: firmware staging accepted an absent iPXE ROM' >&2; exit 1
+fi
+grep -q 'missing QEMU firmware: efi-e1000.rom' "$work/missing-out"
+# Also pin the explicit provider in both install paths, even though the current
+# Debian dependency graph already installs it transitively. No guest boot is
+# claimed by these dependency and layout checks.
 install_paths=0
 while IFS= read -r install; do
   [[ " $install " == *' ipxe-qemu '* ]] || {

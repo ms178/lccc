@@ -37,13 +37,10 @@ chmod +x "$work/root/init"
 ( cd "$work/root" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -1 > "$work/initramfs.cpio.gz" )
 # Debian splits the required firmware across QEMU and SeaBIOS. An explicit
 # QEMU_DATA_DIR can instead name a complete self-contained firmware directory.
-for f in bios-256k.bin linuxboot_dma.bin kvmvapic.bin efi-e1000.rom; do
-  found=0
-  for d in ${QEMU_DATA_DIR:+"$QEMU_DATA_DIR"} /usr/share/qemu /usr/share/seabios; do
-    if [[ -f "$d/$f" ]]; then ln -s "$d/$f" "$work/firmware/$f"; found=1; break; fi
-  done
-  ((found)) || { echo "missing QEMU firmware: $f" >&2; exit 1; }
-done
+# Debian's iPXE ROMs live in /usr/lib/ipxe/qemu, not /usr/share/qemu.
+# shellcheck source=qemu_firmware.sh
+source "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/qemu_firmware.sh"
+lccc_qemu_stage_firmware "$work/firmware"
 # Write into the private directory, never through a predictable /tmp log path.
 # A stale output log cannot make a failed QEMU invocation pass. Publish via an
 # atomic same-directory rename (replacing a symlink, not following it).

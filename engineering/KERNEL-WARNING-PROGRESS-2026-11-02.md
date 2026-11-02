@@ -122,14 +122,26 @@ the latter incorrectly shadows kernel tools' own linux/types.h and classifies
 glibc headers as project headers under GCC's redundant-declaration warnings.
 No warning flag or real objtool validation was disabled to correct that setup.
 
-The export's `--no-install-recommends` exposed a missing dependency:
-`qemu-system-x86` alone omitted `ipxe-qemu`, which provides the smoke test's
-required `efi-e1000.rom`. Both workflow install paths now request it explicitly.
-The smoke regression checks both install paths, retains its original verdict
-and symlink-security checks, and passes. A separate temporary fixture with
-`ipxe-qemu` removed fails with the expected missing-dependency diagnostic.
-Workflow shell validation (13 files, 2 rules) and `git diff --check` pass.
-These fixture checks do **not** claim a guest boot.
+**Corrected diagnosis after inspecting the full package manifest:** the original
+export already included `ipxe-qemu` transitively (its SHA256SUMS entry appears in
+the first restore log). The initial claim that `--no-install-recommends` omitted
+that package was wrong. The real defect was firmware discovery: Debian installs
+`efi-e1000.rom` under `/usr/lib/ipxe/qemu`, while the smoke script searched only
+`/usr/share/qemu` and `/usr/share/seabios`. The shared staging helper now searches
+all three locations as well as the explicit QEMU_DATA_DIR. The workflow also
+names `ipxe-qemu` explicitly to document the requirement; that alone is **not**
+the root-cause fix. Workflow path filters include the smoke script, helper and
+regression so future changes trigger actual kernel validation.
+
+The regression retains its original verdict and symlink-security checks, tests
+both explicit package requests, and now exercises the real helper against a
+hermetic Debian split-directory layout: BIOS under share/seabios, QEMU ROMs under
+share/qemu and iPXE under lib/ipxe/qemu. It checks the selected bytes and removes
+the EFI ROM to verify a hard failure without machine-installed firmware masking
+the absence. These fixtures pass. A separate temporary fixture with the explicit
+package request removed also fails as expected. Workflow shell validation
+(13 files, 2 rules) and `git diff --check` pass. None of these fixtures claims a
+guest boot.
 
 For this already-exported local host environment, the missing EFI ROM was
 retrieved from upstream `qemu/qemu`, tag `v7.2.0`, path
@@ -137,8 +149,15 @@ retrieved from upstream `qemu/qemu`, tag `v7.2.0`, path
 `6312b11c2f5868bb6e5f0f15dfa31ad7dbda0a02` (159232 bytes), verified against
 its Git object ID and SHA256
 `f37222fcdf0481bfbaf7a16d9aaf740aeb41d3d24c187801eb6e9a628cec0fc8`.
-The real QEMU 7.2.22 executable starts successfully with this private firmware
-prefix. This is host firmware, not substituted kernel code or a fake validator.
+This upstream copy was an initial local transport workaround, **not** evidence
+that the Debian package lacked the file. The refreshed export from check
+125253134759 was recovered and verified (archive SHA256
+`80dc7eb2323c48bddfd6f7edcb49f69caba4570affd4016049a513ac70544bac`, still
+93 packages). The local prefix now uses the actual packaged Debian iPXE ROM,
+249856 bytes, SHA256
+`f034ae9a3fef092f2d55a7a46cfe2c1cc81469ee1166878e6c6ce70d12ebaa74`.
+Real QEMU 7.2.22 starts with default PC devices and this private firmware prefix.
+This tests real firmware loading, not a kernel boot, and uses no fake validator.
 
 Fresh preparation applied all 29 package patches to Linux tag v6.18.58,
 commit `2926d88bb7fc4608fd942453d929c39e4e5ec006`, package commit

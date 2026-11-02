@@ -7,6 +7,9 @@ on:
       - 'scripts/build_kernel_boot.sh'
       - 'scripts/build_kernel_full.sh'
       - 'scripts/prepare_kernel_tree.sh'
+      - 'scripts/qemu_defconfig_smoke.sh'
+      - 'scripts/qemu_firmware.sh'
+      - 'tests/regression/check_qemu_defconfig_smoke.sh'
   workflow_dispatch:
     inputs:
       export_host_prerequisites:
@@ -37,8 +40,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/kernel-host-debs"
           docker run --rm -v "$RUNNER_TEMP/kernel-host-debs:/out" debian:bookworm bash -euc '
             apt-get update -qq
-            # ipxe-qemu supplies efi-e1000.rom; it is otherwise only a
-            # recommendation and is omitted by --no-install-recommends.
+            # Name the required firmware provider explicitly, even when
+            # qemu-system-common already pulls it in transitively.
             apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file
             cp /var/cache/apt/archives/*.deb /out/
           '
