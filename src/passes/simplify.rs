@@ -4058,7 +4058,12 @@ fn cmp_range_decides(op: IrCmpOp, ty: IrType, range: CmpRange, c: i64) -> Option
 /// `x`'s own width it is `test`/`setns` on the byte -- one instruction less
 /// than GCC's three.  It is the rule `keep_schar_ult` in
 /// `evidence/2026-11-02-compare-intervals` recorded as refused.
-fn cross_domain_sign_test(op: IrCmpOp, ty: IrType, cast: Option<&CastDef>, c: i64) -> Option<IrCmpOp> {
+fn cross_domain_sign_test(
+    op: IrCmpOp,
+    ty: IrType,
+    cast: Option<&CastDef>,
+    c: i64,
+) -> Option<IrCmpOp> {
     let cdef = cast.filter(|c| {
         c.to_ty == ty
             && c.from_ty.is_integer()
