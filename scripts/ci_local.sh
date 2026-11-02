@@ -259,6 +259,8 @@ gate "frontend-duplicate-definition" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_duplicate_definition.sh
 gate "frontend-differential-family" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_differential.sh
+gate "frontend-promotion-sweep" fast \
+    python3 tests/regression/check_frontend_promotion_sweep.py --lccc "$LCCC"
 gate "asm-flag-outputs" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \
