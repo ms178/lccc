@@ -30,6 +30,13 @@ const PT_LOAD_: u32 = 1;
 const PT_TLS_: u32 = 7;
 const PT_NOTE_: u32 = 4;
 const PT_GNU_PROPERTY_: u32 = 0x6474e553;
+
+/// ELF section permission bits and program-header bits have different positions.
+fn section_segment_permissions(flags: u64) -> u32 {
+    4 | if flags & SHF_WRITE_ != 0 { 2 } else { 0 }
+        | if flags & SHF_EXECINSTR_ != 0 { 1 } else { 0 }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptMachine {
     X86_64,
@@ -2117,6 +2124,14 @@ fn link_with_script_machine(
                         && (def.name.starts_with(".bss") || def.name.starts_with(".brk"))
                         && size > 0);
 
+                // GNU ld's default text_read_only policy clears WRITE on
+                // the canonical .text output after combining input flags
+                // (ldlang.c: "Look for a text section and set the readonly
+                // attribute in it"). Other output names retain the union of
+                // input flags, including empty typed markers.
+                if def.name == ".text" {
+                    flags &= !SHF_WRITE_;
+                }
                 if is_alloc {
                     flags |= SHF_ALLOC_;
                 }
@@ -3522,6 +3537,7 @@ fn link_with_script_machine(
         let mut max_mem = 0u64;
         let mut min_lma = u64::MAX;
         let mut segment_align = 1u64;
+        let mut inferred_flags = 4u32;
         for (i, os) in out_secs.iter().enumerate() {
             if !os.is_alloc || os.size == 0 {
                 continue;
@@ -3529,6 +3545,7 @@ fn link_with_script_machine(
             if !sec_phdrs[i].contains(&decl.name) {
                 continue;
             }
+            inferred_flags |= section_segment_permissions(os.flags);
             segment_align = segment_align.max(os.align);
             min_v = min_v.min(os.vaddr);
             max_mem = max_mem.max(os.vaddr + os.size);
@@ -3579,10 +3596,7 @@ fn link_with_script_machine(
         }
         let filesz = max_f.saturating_sub(min_f);
         let memsz = max_mem - min_v;
-        let flags = decl.flags.unwrap_or(match decl.ptype {
-            PT_LOAD_ => 5,
-            _ => 4,
-        }) as u32;
+        let flags = decl.flags.map_or(inferred_flags, |flags| flags as u32);
         let align = if decl.ptype == PT_LOAD_ {
             page
         } else {
@@ -3604,31 +3618,31 @@ fn link_with_script_machine(
         // distinct LMAs, so a VMA-derived memsz can come out smaller than the
         // file image and produce `filesz > memsz`, which readelf rejects and
         // loaders treat as corrupt.
-        let alloc = |o: &&OutSec| o.is_alloc && o.size > 0;
-        let min_v = out_secs
-            .iter()
-            .filter(alloc)
-            .map(|o| o.lma)
-            .min()
-            .unwrap_or(0);
-        let max_m = out_secs
-            .iter()
-            .filter(alloc)
-            .map(|o| o.lma + o.size)
-            .max()
-            .unwrap_or(0);
-        let min_f = out_secs
-            .iter()
-            .filter(|o| alloc(o) && !o.nobits)
-            .map(|o| o.file_offset)
-            .min()
-            .unwrap_or(0);
-        let max_f = out_secs
-            .iter()
-            .filter(|o| alloc(o) && !o.nobits)
-            .map(|o| o.file_offset + o.size)
-            .max()
-            .unwrap_or(0);
+        // Compute bounds and permissions together. Empty outputs occupy no
+        // memory and cannot add write/execute permission to this segment.
+        let mut min_v = u64::MAX;
+        let mut max_m = 0;
+        let mut min_f = u64::MAX;
+        let mut max_f = 0;
+        let mut flags = 4;
+        for section in &out_secs {
+            if !section.is_alloc || section.size == 0 {
+                continue;
+            }
+            min_v = min_v.min(section.lma);
+            max_m = max_m.max(section.lma + section.size);
+            flags |= section_segment_permissions(section.flags);
+            if !section.nobits {
+                min_f = min_f.min(section.file_offset);
+                max_f = max_f.max(section.file_offset + section.size);
+            }
+        }
+        if min_v == u64::MAX {
+            min_v = 0;
+        }
+        if min_f == u64::MAX {
+            min_f = 0;
+        }
         let filesz = max_f.saturating_sub(min_f);
         let memsz = (max_m.saturating_sub(min_v)).max(filesz);
         write_script_phdr(
@@ -3636,7 +3650,7 @@ fn link_with_script_machine(
             &mut out,
             machine.ehdr_size() as usize,
             PT_LOAD_,
-            7,
+            flags,
             min_f,
             min_v,
             min_v,

@@ -236,6 +236,8 @@ def main() -> int:
 
     from check_discard_none import run as check_discard_none
     check_discard_none(ld)
+    from check_script_segment_permissions import run as check_script_segment_permissions
+    check_script_segment_permissions(ld)
     from check_orphan_handling import run as check_orphan_handling
     check_orphan_handling(ld)
     return 0

@@ -12,7 +12,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 META = '*(.got .got.plt .igot.plt .iplt .rel.* .rela.* .note.gnu.property)'
-SCRIPT = ('ENTRY(_start) SECTIONS { . = 0x10000; .text : { *(.text*) } '
+SCRIPT = ('ENTRY(_start) PHDRS { image PT_LOAD FLAGS(5); } '
+          'SECTIONS { . = 0x10000; .text : { *(.text*) } :image '
           '.data : { *(.data*) } .bss : { *(.bss*) } .meta : { ' + META + ' } '
           '/DISCARD/ : { *(.note.GNU-stack) DISCARDS } EXTRA_RULE }')
 
