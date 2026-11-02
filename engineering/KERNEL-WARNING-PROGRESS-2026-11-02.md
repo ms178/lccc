@@ -474,3 +474,43 @@ Logs: `/home/user/kernel-full-fixed.log`, then
 `/home/user/kernel-qemu-fixed{,-result}.log`. No new full-link/guest result is
 claimed yet. All-thirteen warning/option completion, zero warnings, measured
 runtime/code-size gains and current-head green CI remain outstanding.
+
+## Fresh latest-main full build and guest evidence (7548b21e3)
+
+The compiler source at 1c738ef92, with the workflow-only 7548b21e3 follow-up,
+completed the actual patched 6.18.58 defconfig **native full link and bzImage**.
+The build log contains 2,939 `CC` progress lines. Image SHA256:
+`d53801e0e5aebffdbabd23c2f1fb65f0e2764e707b614e133f2ce3ecddf591d5`.
+The fresh boot-first setup remains 31,024 / 32,768 bytes, with GNU flat-image
+parity and 24 ISA scans passing. No GCC kernel-target build was performed.
+
+The first QEMU launch stopped before guest execution because the restored host
+prefix's QEMU_DATA_DIR covered QEMU but not SeaBIOS. Staging the real packaged
+QEMU/SeaBIOS/iPXE files into a complete private directory corrected that local
+environment; no validator or virtual device was removed. The unchanged image
+then passed the strict traced smoke on **both qemu64 and max**, two CPUs each:
+version/serial markers, both concurrent 8 MiB demand-zero/tmpfs/hash workers,
+comparison, sync and clean power-off. Real system QEMU is 7.2.22. These are
+bounded smoke results, not a claim that every kernel subsystem works flawlessly.
+The guest still reports missing optional wireless regulatory.db firmware.
+
+**Full objtool is NOT clean.** The final vmlinux.o reports 416 warnings:
+271 indirect-call mitigation warnings, 86 returns with UACCESS enabled,
+56 redundant UACCESS disables, and three calls with UACCESS enabled.
+The build accepted these warnings; successful link/guest smoke is not a strict
+objtool acceptance pass. The warnings remain visible and require fixes.
+
+The follow-up callback audit repairs the global-cell mitigation/snapshot defect
+and the GOT-call mitigation bypass; see
+`engineering/CALLBACK-MITIGATION-AUDIT-2026-11-02.md`. Its compiler has passed
+215 object/runtime contracts against GCC 16.2.0 and Clang 23.1.4, all three
+Microsoft ABI suites, the symbol-version regression and all-target Clippy with
+-D warnings. Actual arch/x86/events/core.c rebuilt with this compiler passes
+real objtool --retpoline --Werror. This is focused evidence only: this follow-up
+compiler has **not** yet completed a fresh full kernel/QEMU pipeline. ICX 2026.2
+is not installed locally; the authenticated vendor CI lane now explicitly
+requires it for these same native contracts. Hosted results are pending.
+
+All remaining warning families/options, zero build warnings, complete strict
+objtool validation and measured kernel performance gains remain open. No
+production-ready or universal-performance claim is made.

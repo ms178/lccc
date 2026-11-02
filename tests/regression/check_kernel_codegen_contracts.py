@@ -56,10 +56,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--gcc', default=os.environ.get('GCC_ORACLE_BIN') or shutil.which('gcc-16') or shutil.which('gcc'))
     parser.add_argument('--clang', default=os.environ.get('CLANG') or shutil.which('clang-23') or shutil.which('clang'))
-    parser.add_argument('--icx', default=shutil.which('icx'))
+    parser.add_argument('--icx', default=os.environ.get('LCCC_ICX_BIN') or shutil.which('icx'))
+    parser.add_argument('--require-icx', action='store_true')
+    parser.add_argument('--native-only', action='store_true',
+                        help='native oracle lane; default still requires all four LCCC targets')
     args = parser.parse_args()
     assert args.gcc and args.clang, 'GCC and Clang oracles are required'
-    jobs = [(name, ROOT/f'target/fastbuild/lccc-{name}') for name in STARTS]
+    assert not args.require_icx or args.icx, 'authenticated ICX oracle required'
+    targets = ('x86',) if args.native_only else STARTS
+    jobs = [(name, ROOT/f'target/fastbuild/lccc-{name}') for name in targets]
     jobs += [('gcc', Path(shutil.which(args.gcc) or args.gcc)),
              ('clang', Path(shutil.which(args.clang) or args.clang))]
     if args.icx:
@@ -84,6 +89,8 @@ def main():
                 print(version)
                 if name == 'gcc':
                     assert re.search(r'\b16\.2\.0\b', version), ('expected reviewed GCC 16.2', version)
+                if name == 'icx':
+                    assert re.search(r'\b2026\.2(?:\.\d+)?\b', version), ('expected reviewed ICX 2026.2', version)
                 if name == 'clang':
                     assert re.search(r'clang version 23\.1\.4\b', version), ('expected reviewed Clang 23.1.4', version)
             # Standalone return-transfer ABI fixture, not Linux kernel code.
@@ -129,6 +136,66 @@ def main():
                          start, thunk_source, '-o', output])
                     run(([emulator] if emulator else []) + [output])
                     checks += 2
+            # Mutable global callback cells used to bypass retpolines through
+            # the RIP-relative load/call fold. Inspect object code (not just
+            # assembly spelling) and execute stack-argument calls through real
+            # speculation-trapping thunks. These are not Linux target sources.
+            if architecture == 'x86':
+                thunks = work / 'indirect-thunks.S'
+                definitions = ['.text']
+                for reg in ('rax', 'rbx', 'rcx', 'rdx', 'rsi', 'rdi', 'rbp',
+                            'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15'):
+                    definitions += [f'.globl __x86_indirect_thunk_{reg}',
+                                    f'__x86_indirect_thunk_{reg}:',
+                                    'call 2f', '1: pause', 'lfence', 'jmp 1b',
+                                    f'2: mov %{reg},(%rsp)', 'ret']
+                definitions += ['.section .note.GNU-stack,"",@progbits']
+                thunks.write_text('\n'.join(definitions) + '\n')
+                got_source = work / 'got-variadic.c'
+                got_source.write_text(
+                    'extern double external_v(double, int, ...);\n'
+                    'int main(void) { return external_v(1.5, 7, 3.25) != 11.75; }\n')
+                got_impl = work / 'got-variadic-impl.c'
+                got_impl.write_text(
+                    '#include <stdarg.h>\n'
+                    'double external_v(double first, int n, ...) {\n'
+                    'va_list ap; va_start(ap, n); double last = va_arg(ap, double);\n'
+                    'va_end(ap); return first + n + last; }\n')
+                got_impl_obj = work / f'{name}-got-impl.o'
+                run([compiler, '-O2', '-fno-pie', '-c', got_impl, '-o', got_impl_obj])
+                for opt in ('-O0', '-O2', '-Os'):
+                    for mode in ('external', 'inline', 'none'):
+                        if name in ('clang', 'icx'):
+                            branch_flags = {'external': ['-mretpoline-external-thunk'],
+                                            'inline': ['-mretpoline'], 'none': []}[mode]
+                        else:
+                            branch_flags = ([] if mode == 'none' else
+                                            ['-mindirect-branch=thunk-' +
+                                             ('extern' if mode == 'external' else 'inline')])
+                        obj = work / f'{name}-{opt}-{mode}-global.o'
+                        run([compiler, opt, '-fno-pie', *branch_flags, '-c',
+                             HERE / 'global_indirect_thunks.c', '-o', obj])
+                        disassembly = run(['objdump', '-dr', obj])
+                        raw = re.search(r'\b(?:call|jmp)q?\s+\*', disassembly)
+                        assert bool(raw) == (mode == 'none'), (name, opt, mode, disassembly)
+                        if mode == 'external':
+                            assert '__x86_indirect_thunk_' in disassembly, disassembly
+                        output = work / f'{name}-{opt}-{mode}-global-runtime'
+                        run([compiler, '-fno-pie', '-nostdlib', '-static',
+                             start, obj, thunks, '-o', output])
+                        run([output])
+                        checks += 2
+                        got_obj = work / f'{name}-{opt}-{mode}-got.o'
+                        run([compiler, opt, '-fno-pie', '-fno-plt', *branch_flags,
+                             '-c', got_source, '-o', got_obj])
+                        got_disassembly = run(['objdump', '-dr', got_obj])
+                        got_raw = re.search(r'\b(?:call|jmp)q?\s+\*', got_disassembly)
+                        assert bool(got_raw) == (mode == 'none'), (name, opt, mode, got_disassembly)
+                        got_output = work / f'{name}-{opt}-{mode}-got-runtime'
+                        run([compiler, '-fno-pie', '-nostdlib', '-static', start,
+                             got_obj, got_impl_obj, thunks, '-o', got_output])
+                        run([got_output])
+                        checks += 2
             for opt in ('-O0', '-O2', '-Os'):
                 obj = work/f'{name}-sections.o'
                 run([compiler, opt, '-c', HERE/'function_prototype_sections.c', '-o', obj])

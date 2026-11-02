@@ -7550,10 +7550,9 @@ impl X86Codegen {
         // `call __x86_indirect_thunk_r10`, whose name encodes the register
         // and whose patching contract the mature path owns: reject the
         // typed path for indirect calls in both thunk modes instead of
-        // approximating it. The paravirt fast-path (callee resolves to
-        // global+offset) must likewise keep the mature path: it emits the
-        // patchable `call *sym+off(%rip)` the kernel alternatives
-        // machinery rewrites at boot.
+        // approximating it. Statically resolved symbol addresses also keep
+        // the mature path so interposition and nonzero offsets retain their
+        // established direct-call semantics.
         let (plan, target): (super::isel::TypedCallPlan, CallTarget) = if let Some(sym) = direct_sym
         {
             if self.state.needs_got_call(sym) {
@@ -7577,8 +7576,8 @@ impl X86Codegen {
             if self.state.indirect_branch_thunk || self.state.indirect_branch_thunk_inline {
                 return false;
             }
-            if self.try_resolve_indirect_call_global(fp).is_some() {
-                return false; // patchable `call *sym(%rip)` form is load-bearing
+            if self.try_resolve_direct_call_global(fp).is_some() {
+                return false; // preserve direct-symbol interposition/offset handling
             }
             let callee_src = match arg_src(fp) {
                 Some(s) => s,
