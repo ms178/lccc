@@ -54,13 +54,14 @@ def sections(obj):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--gcc', default=os.environ.get('GCC') or shutil.which('gcc-16') or shutil.which('gcc'))
+    parser.add_argument('--gcc', default=os.environ.get('GCC_ORACLE_BIN') or shutil.which('gcc-16') or shutil.which('gcc'))
     parser.add_argument('--clang', default=os.environ.get('CLANG') or shutil.which('clang-23') or shutil.which('clang'))
     parser.add_argument('--icx', default=shutil.which('icx'))
     args = parser.parse_args()
     assert args.gcc and args.clang, 'GCC and Clang oracles are required'
     jobs = [(name, ROOT/f'target/fastbuild/lccc-{name}') for name in STARTS]
-    jobs += [('gcc', Path(args.gcc)), ('clang', Path(args.clang))]
+    jobs += [('gcc', Path(shutil.which(args.gcc) or args.gcc)),
+             ('clang', Path(shutil.which(args.clang) or args.clang))]
     if args.icx:
         jobs.append(('icx', Path(args.icx)))
     else:
@@ -79,7 +80,12 @@ def main():
             start.write_text('.text\n.globl _start\n_start:\n' + STARTS[architecture] +
                              '.section .note.GNU-stack,"",%progbits\n')
             if name in ('gcc', 'clang', 'icx'):
-                print(run([compiler, '--version']).splitlines()[0])
+                version = run([compiler, '--version']).splitlines()[0]
+                print(version)
+                if name == 'gcc':
+                    assert re.search(r'\b16\.2\.0\b', version), ('expected reviewed GCC 16.2', version)
+                if name == 'clang':
+                    assert re.search(r'clang version 23\.1\.4\b', version), ('expected reviewed Clang 23.1.4', version)
             # Standalone return-transfer ABI fixture, not Linux kernel code.
             # Linux's runtime patcher requires JMP sites, not Jcc-to-thunk.
             if architecture in ('x86', 'i686'):
@@ -145,17 +151,7 @@ def main():
                     if architecture in ('x86', 'i686'):
                         disassembly = run(['objdump', '-d', '--disassemble=asm_only', output])
                         count = len(re.findall(r'\bendbr(?:32|64)\b', disassembly))
-                        if name in ('clang', 'icx') and enabled:
-                            # Some reviewed LLVM builds conservatively mark a
-                            # direct asm-goto target as an indirect destination.
-                            # This is redundant, not incorrect. Keep LCCC's
-                            # stricter entry-only code-size contract below;
-                            # the executable fixture independently verifies IBT
-                            # on every genuinely address-taken destination.
-                            assert count in (1, 2), (name, opt, mode, disassembly)
-                            print(f'OBSERVED {name} {opt} {mode}: asm-only ENDBR count={count}')
-                        else:
-                            assert count == int(enabled), (name, opt, mode, disassembly)
+                        assert count == int(enabled), (name, opt, mode, disassembly)
                     checks += 1
             print(f'PASS {name}: sections, weak alias, computed goto, function entry, asm-goto')
         # GCC applies a section declared after the body, whereas Clang warns

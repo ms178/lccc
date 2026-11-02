@@ -2448,6 +2448,7 @@ mod invocation_continuation_tests {
             ("twice", Some("a"), "a + a"),
         ] {
             t.define(MacroDef {
+                is_time_builtin: false,
                 name: name.into(),
                 is_function_like: params.is_some(),
                 params: params
