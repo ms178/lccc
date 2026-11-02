@@ -99,23 +99,23 @@ impl RiscvCodegen {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
         if op == IrBinOp::BitTest {
-            // RISC-V has no BT. Reduce the index modulo the *operation* width,
-            // then logical-shift the base right and isolate bit zero. `srlw`
-            // is the 32-bit form; subword operations use XLEN shifts after the
-            // explicit modulo, and the 0/1 result is already canonical.
+            // RISC-V has no BT (Zbs `bext` is not modelled): logical-shift the
+            // base right by the index modulo the *operation* width and isolate
+            // bit zero.  `srlw` reads only the low 5 bits of its count and
+            // `srl` the low 6, which IS the modulo at 32/64 bits; subword
+            // widths reduce explicitly and then use the XLEN shift.  The `andi`
+            // result is 0 or 1, canonical in every integer type's register
+            // form (signext(low32) and zero-extension agree on it), so no
+            // re-extension follows.
             let bits = (ty.size() * 8) as u32;
             debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
-            if bits < 64 {
+            if bits < 32 {
                 self.state
                     .emit_fmt(format_args!("    andi t2, t2, {}", bits - 1));
             }
             let shift = if use_32bit { "srlw" } else { "srl" };
             self.state.emit_fmt(format_args!("    {shift} t0, t1, t2"));
             self.state.emit("    andi t0, t0, 1");
-            if use_32bit {
-                self.state.emit("    slli t0, t0, 32");
-                self.state.emit("    srli t0, t0, 32");
-            }
             self.store_t0_to(dest);
             return;
         }

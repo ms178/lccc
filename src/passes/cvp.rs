@@ -507,28 +507,13 @@ fn null_compare_verdict(
         };
     }
     if never_null_address(func, defs, defined_syms, rhs, 4) && is_null_const(lhs) {
-        return match swap_op(op) {
+        return match op.swapped() {
             IrCmpOp::Eq | IrCmpOp::Ult | IrCmpOp::Ule => Some(false),
             IrCmpOp::Ne | IrCmpOp::Ugt | IrCmpOp::Uge => Some(true),
             _ => None,
         };
     }
     None
-}
-
-fn swap_op(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq => IrCmpOp::Eq,
-        IrCmpOp::Ne => IrCmpOp::Ne,
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-    }
 }
 
 /// `value OP const` canonical form of a compare, if exactly one side is an
@@ -552,7 +537,7 @@ fn canonical_pred(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Opti
         }),
         (Operand::Const(k), Operand::Value(v)) => Some(Pred {
             value: *v,
-            op: swap_op(op),
+            op: op.swapped(),
             c: k.to_i128()?,
             bits,
         }),
@@ -1830,7 +1815,7 @@ mod tests {
             IrCmpOp::Uge,
         ] {
             for swap in [false, true] {
-                let want = expected_verdict(if swap { swap_op(op) } else { op });
+                let want = expected_verdict(if swap { op.swapped() } else { op });
                 let mut f = global_addr_null_compare_case(op, swap);
                 run_function_with_symbols(&mut f, &bench_syms());
                 let ok = matches!(

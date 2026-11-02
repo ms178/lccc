@@ -944,10 +944,16 @@ impl I686Codegen {
             };
             emit!(self.state, "    btl {}, {}", idx_ref, base_ref);
         }
-        let true_label = true_block.as_label();
-        let false_label = false_block.as_label();
-        emit!(self.state, "    jc {}", true_label);
-        emit!(self.state, "    jmp {}", false_label);
+        // CF = the tested bit: `jc` to the true block, or `jnc` to the false
+        // block when the true block falls through (the x86-64 shape).
+        if self.state.next_block_label == Some(true_block) {
+            emit!(self.state, "    jnc {}", false_block.as_label());
+        } else {
+            emit!(self.state, "    jc {}", true_block.as_label());
+            if self.state.next_block_label != Some(false_block) {
+                emit!(self.state, "    jmp {}", false_block.as_label());
+            }
+        }
         self.state.reg_cache.invalidate_all();
     }
 

@@ -809,6 +809,11 @@ impl ArmCodegen {
 
     /// Get the register name for a Value if it has a register assignment.
     /// Returns (64-bit name, 32-bit name) pair.
+    /// [`Self::value_reg_name`] for the sibling codegen modules.
+    pub(super) fn value_reg_name_pub(&self, v: &Value) -> Option<(&'static str, &'static str)> {
+        self.value_reg_name(v)
+    }
+
     fn value_reg_name(&self, v: &Value) -> Option<(&'static str, &'static str)> {
         self.reg_assignments
             .get(&v.0)
@@ -2839,6 +2844,34 @@ impl ArchCodegen for ArmCodegen {
     fn supports_fused_fp_cmp_branch(&self) -> bool {
         true
     }
+    fn supports_fused_bit_test_branch(&self) -> bool {
+        // `tst`/`lsr; tst` + `b.cond` instead of materializing the 0/1 test
+        // and branching on it with `cbnz` (same kill switch as x86).
+        std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
+    }
+    fn supports_fused_bit_test_cmp(&self) -> bool {
+        std::env::var_os("CCC_NO_BT_FLAG_FUSION").is_none()
+    }
+    /// A condition already in its GP home is tested in place: `cbnz xN`
+    /// reads exactly the 64 bits `mov x0, xN; cbnz x0` read, one move less.
+    fn emit_cond_branch_blocks(
+        &mut self,
+        cond: &Operand,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        if let Some(reg) = self.operand_reg(cond).filter(|r| !is_arm_fp_phys(*r)) {
+            self.state.emit_fmt(format_args!(
+                "    cbnz {}, {}",
+                callee_saved_name(reg),
+                true_block.as_label()
+            ));
+        } else {
+            self.emit_load_operand(cond);
+            self.emit_branch_nonzero(&true_block.as_label());
+        }
+        self.emit_branch_to_block(false_block);
+    }
     fn supports_fused_cmp_select(&self) -> bool {
         true
     }
@@ -3532,6 +3565,8 @@ impl ArchCodegen for ArmCodegen {
         fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
         fn emit_f128_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) => emit_f128_cmp_impl;
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
+        fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
+        fn emit_fused_bit_test_cmp(&mut self, dest: &Value, base: &Operand, index: &Operand, ty: IrType, bit_clear: bool) -> bool => emit_fused_bit_test_cmp_impl;
         fn emit_fused_cmp_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, true_val: &Operand, false_val: &Operand, dest: &Value, sel_ty: IrType) => emit_fused_cmp_select_impl;
         fn emit_conditional_increment_select(&mut self, dest: &Value, cond: &Operand, base: &Operand, increment_on_true: bool, ty: IrType) => emit_conditional_increment_select_impl;
         fn emit_fused_cmp_conditional_increment_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, base: &Operand, increment_on_true: bool, dest: &Value, sel_ty: IrType) => emit_fused_cmp_conditional_increment_select_impl;

@@ -1185,10 +1185,16 @@ fn is_conditional_jump(s: &str) -> bool {
     if b.len() < 3 || b[0] != b'j' {
         return false;
     }
-    // jCC where CC is one of: e, ne, l, le, g, ge, b, be, a, ae, s, ns, o, no, p, np, z, nz
+    // jCC where CC is one of: e, ne, l, le, g, ge, b, be, a, ae, s, ns, o, no,
+    // p, np, z, nz, and the carry aliases c / nc that the bit-test branch
+    // emits (`btl %ecx, %esi; jc .L`).  A `jc` left unclassified is an `Other`
+    // line: its block loses the taken edge, CFG liveness sees only the
+    // fall-through successor, and a move that only the taken block reads is
+    // deleted as dead (`if ((x >> n) & 1) hit(n);` at -O1 called `hit` with a
+    // stale register).
     matches!(
         &s[1..2],
-        "e" | "a" | "b" | "g" | "l" | "s" | "o" | "p" | "z" | "n"
+        "e" | "a" | "b" | "c" | "g" | "l" | "s" | "o" | "p" | "z" | "n"
     ) && s.contains(' ')
 }
 
@@ -1201,8 +1207,8 @@ fn invert_cc(cc: &str) -> Option<&'static str> {
         "ge" => Some("l"),
         "le" => Some("g"),
         "g" => Some("le"),
-        "b" => Some("ae"),
-        "ae" => Some("b"),
+        "b" | "c" => Some("ae"),
+        "ae" | "nc" => Some("b"),
         "be" => Some("a"),
         "a" => Some("be"),
         "s" => Some("ns"),
@@ -1237,7 +1243,7 @@ fn parse_setcc(s: &str) -> Option<&str> {
     // Validate it's a real condition code
     match cc {
         "e" | "ne" | "z" | "nz" | "l" | "le" | "g" | "ge" | "b" | "be" | "a" | "ae" | "s"
-        | "ns" | "o" | "no" | "p" | "np" => Some(cc),
+        | "ns" | "o" | "no" | "p" | "np" | "c" | "nc" => Some(cc),
         _ => None,
     }
 }
@@ -16137,6 +16143,49 @@ fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `void b_shr(u32 x, u32 n) { if ((x >> n) & 1) hit(n); }` at -O1: the
+    /// exact pre-peephole text of the miscompile.  With `jc` unclassified the
+    /// block lost its taken edge, `movl %eax, %edi` looked dead (the only
+    /// other successor pops %edi), and `hit` received the caller's %edi.
+    #[test]
+    fn carry_alias_branches_keep_their_taken_edge() {
+        let asm = "b_shr:\n.cfi_startproc\n    pushl %ebx\n    pushl %esi\n    pushl %edi\n\
+                   \x20   movl 16(%esp), %eax\n    movl %eax, %esi\n\
+                   \x20   movl 20(%esp), %eax\n    movl %eax, %edi\n\
+                   \x20   btl %edi, %esi\n    jc .LBB1\n    jmp .LBB2\n.LBB1:\n\
+                   \x20   subl $16, %esp\n    movl %edi, %eax\n    movl %eax, 0(%esp)\n\
+                   \x20   call hit@PLT\n    addl $16, %esp\n.LBB2:\n\
+                   \x20   popl %edi\n    popl %esi\n    popl %ebx\n    ret\n\
+                   .cfi_endproc\n.size b_shr, .-b_shr\n";
+        let out = peephole_optimize(asm.to_string());
+        let body: Vec<&str> = out.lines().map(str::trim).collect();
+        let taken = body
+            .iter()
+            .position(|l| *l == ".LBB1:")
+            .expect("taken block kept");
+        // %edi must be written on the path into the taken block, which reads it
+        // (directly or through a forwarded copy of %eax).
+        let defs_edi = body[..taken]
+            .iter()
+            .any(|l| l.ends_with(", %edi") && !l.starts_with("push") && !l.starts_with("pop"));
+        let reads_edi = body[taken..]
+            .iter()
+            .any(|l| l.contains("%edi") && !l.starts_with("popl"));
+        assert!(
+            defs_edi || !reads_edi,
+            "taken block reads an undefined %edi:\n{out}"
+        );
+        assert!(
+            classify_line("    jc .LBB1").kind == LineKind::CondJmp
+                && classify_line("    jnc .LBB1").kind == LineKind::CondJmp,
+            "carry aliases must classify as conditional jumps"
+        );
+        assert_eq!(invert_cc("c"), Some("ae"));
+        assert_eq!(invert_cc("nc"), Some("b"));
+        assert_eq!(parse_setcc("setc %al"), Some("c"));
+        assert_eq!(parse_setcc("setnc %al"), Some("nc"));
+    }
 
     #[test]
     fn volatile_regions_keep_repeated_stack_loads_and_stores() {

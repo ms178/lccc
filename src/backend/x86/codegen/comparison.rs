@@ -541,6 +541,33 @@ cached_knob!(
     "CCC_NO_FLAG_FUSION"
 );
 cached_knob!(
+    /// `CCC_NO_BT_FLAG_FUSION`: always materialise a bit test's boolean
+    /// (`bt; setc`) instead of handing CF to its consumer.
+    no_bt_flag_fusion,
+    "CCC_NO_BT_FLAG_FUSION"
+);
+
+cached_knob!(
+    /// `CCC_NO_BT_ADC_FUSION`: materialise a bit test that feeds an add or
+    /// subtract (`bt; setc; add`) instead of folding CF in (`bt; adc $0`).
+    no_bt_adc_fusion,
+    "CCC_NO_BT_ADC_FUSION"
+);
+
+/// Whether a `BitTest` feeding an add/subtract may fold its CF into it
+/// (`bt; adc $0` / `bt; sbb $0`).  Every flag-fusion knob disables it too.
+pub(super) fn bit_test_adc_fusion_enabled() -> bool {
+    bit_test_flag_fusion_enabled() && !no_bt_adc_fusion()
+}
+
+/// Whether a `BitTest` may leave its answer in CF for the next instruction
+/// (`bt; cmovb`, `bt; setnc`) instead of materializing it.  The prologue's
+/// fused-producer scan and the emitters must agree on this, so both read it;
+/// every knob that forces a materialized compare forces it for a bit test.
+pub(super) fn bit_test_flag_fusion_enabled() -> bool {
+    !no_flag_fusion() && !v9_select() && !no_inplace_select() && !no_bt_flag_fusion()
+}
+cached_knob!(
     /// `CCC_V9_SELECT`: the legacy v9 select emission.
     v9_select,
     "CCC_V9_SELECT"
@@ -1089,10 +1116,10 @@ impl X86Codegen {
     }
 
     /// Fused BitTest→CondBranch: `bt index, base` then `jc/jnc`. CF holds
-    /// the selected bit; nothing is materialized. The base (mask) prefers
-    /// its register home; constants and slot-resident values stage through
-    /// %rax (the accumulator scratch — dead here because the BitTest result
-    /// was never materialized). A variable index stages through %rcx.
+    /// the selected bit; nothing is materialized.  Operand staging is
+    /// [`Self::emit_bt_flags`]'s (fresh GPR homes in place, %rax/%rcx
+    /// otherwise -- both dead here because the BitTest result was never
+    /// materialized).
     pub(super) fn emit_fused_bit_test_branch_blocks_impl(
         &mut self,
         base: &Operand,
@@ -1101,106 +1128,8 @@ impl X86Codegen {
         true_block: BlockId,
         false_block: BlockId,
     ) {
-        let use_32bit = ty.size() <= 4;
-        // Stage the BASE for the r/m operand of BT.
-        let base_reg: String = match base {
-            Operand::Value(v) => {
-                // XMM-homed base (bit-punned float word): no GPR names;
-                // stage through the accumulator, which handles xmm->GPR.
-                if let Some(&reg) = self
-                    .reg_assignments
-                    .get(&v.0)
-                    .filter(|r| !super::emit::is_xmm_reg(**r))
-                {
-                    if use_32bit {
-                        format!("%{}", super::emit::phys_reg_name_32(reg))
-                    } else {
-                        format!("%{}", super::emit::phys_reg_name(reg))
-                    }
-                } else {
-                    self.operand_to_rax(base);
-                    if use_32bit {
-                        "%eax".to_string()
-                    } else {
-                        "%rax".to_string()
-                    }
-                }
-            }
-            Operand::Const(_) => {
-                self.operand_to_rax(base);
-                if use_32bit {
-                    "%eax".to_string()
-                } else {
-                    "%rax".to_string()
-                }
-            }
-        };
-        // BT with an immediate index; otherwise index in a register.
-        let const_index = match index {
-            Operand::Const(c) => c.to_i64().filter(|v| *v >= 0 && *v <= i32::MAX as i64),
-            _ => None,
-        };
-        let bt = if use_32bit { "btl" } else { "btq" };
-        if let Some(imm) = const_index {
-            let width: u32 = if use_32bit { 32 } else { 64 };
-            let bit = (imm as u32) % width;
-            self.state
-                .emit_fmt(format_args!("    {bt} ${bit}, {base_reg}"));
-        } else {
-            // The index register: prefer its home when it does not alias the
-            // staged base; otherwise stage through %rcx.
-            let idx_reg: String = match index {
-                Operand::Value(v) => match self
-                    .reg_assignments
-                    .get(&v.0)
-                    .filter(|r| !super::emit::is_xmm_reg(**r))
-                {
-                    Some(&reg) => {
-                        let name = if use_32bit {
-                            format!("%{}", super::emit::phys_reg_name_32(reg))
-                        } else {
-                            format!("%{}", super::emit::phys_reg_name(reg))
-                        };
-                        if name == base_reg {
-                            // Same register for base and index: bt r,r is
-                            // still well-defined (tests bit idx%width of the
-                            // same value) — keep it.
-                            name
-                        } else {
-                            name
-                        }
-                    }
-                    None => {
-                        self.operand_to_rcx(index);
-                        if use_32bit {
-                            "%ecx".to_string()
-                        } else {
-                            "%rcx".to_string()
-                        }
-                    }
-                },
-                _ => {
-                    self.operand_to_rcx(index);
-                    if use_32bit {
-                        "%ecx".to_string()
-                    } else {
-                        "%rcx".to_string()
-                    }
-                }
-            };
-            self.state
-                .emit_fmt(format_args!("    {bt} {idx_reg}, {base_reg}"));
-        }
-        // CF = tested bit. jc = branch when set (BitTest result nonzero).
-        if self.state.next_block_label == Some(true_block) {
-            self.state.out.emit_jcc_block("jnc", false_block.0);
-        } else {
-            self.state.out.emit_jcc_block("jc", true_block.0);
-            if self.state.next_block_label != Some(false_block) {
-                self.state.out.emit_jmp_block(false_block.0);
-            }
-        }
-        self.state.reg_cache.invalidate_all();
+        self.emit_bt_flags(base, index, ty.size() <= 4);
+        self.emit_carry_branch(true_block, false_block);
     }
 
     /// Map an integer comparison opcode to the jcc mnemonic for the

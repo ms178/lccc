@@ -3554,6 +3554,22 @@ jobs:
             done
           done
         done
+    - name: Bit-test fusion counts and browser checksum against ICX
+      run: |
+        mkdir -p intel-evidence
+        python3 engineering/evidence/2026-11-02-bit-test-fusion/measure.py \
+          --icx "$LCCC_ICX_BIN" --target x86-64 --notice \
+          --json intel-evidence/bit-test-fusion-counts.json
+        fixtures=tests/regression/fixtures/bit_width
+        printf '%s\n' '#include <stdio.h>' \
+          'unsigned long long browser_bits_checksum(void);' \
+          'int main(void) { unsigned long long v = browser_bits_checksum(); printf("%llu\n", v); return v != 2932816357278149644ull; }' \
+          > intel-evidence/browser-main.c
+        for level in -O0 -O2 -O3; do
+          "$LCCC_ICX_BIN" "$level" "$fixtures/browser_bits.c" "$fixtures/browser_driver.c" \
+            intel-evidence/browser-main.c -o intel-evidence/browser-icx
+          intel-evidence/browser-icx
+        done
     - name: Retain authenticated package, probe and binary identities
       if: always()
       uses: actions/upload-artifact@v7

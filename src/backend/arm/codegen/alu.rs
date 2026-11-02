@@ -565,20 +565,9 @@ impl ArmCodegen {
             let dest_name = callee_saved_name(dest_phys);
             let dest_name_32 = callee_saved_name_32(dest_phys);
 
-            if matches!(op, IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle)
-                && matches!(
-                    ty,
-                    IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr
-                )
-            {
-                // The register-direct form is written for the 32/64-bit
-                // views.  Narrow operations take the accumulator path, which
-                // reduces the index modulo the operation width and
-                // canonicalizes the signed/unsigned result.
-                if self.emit_bit_modify_into(op, dest_phys, lhs, rhs, use_32bit) {
-                    self.state.reg_cache.invalidate_acc();
-                    return;
-                }
+            if self.emit_bit_op_into(op, dest_phys, lhs, rhs, ty, use_32bit) {
+                self.state.reg_cache.invalidate_acc();
+                return;
             }
 
             let is_shift = matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr);
@@ -984,6 +973,31 @@ impl ArmCodegen {
         self.store_x0_to(dest);
     }
 
+    /// The bit operations' register-direct forms, written for the 32/64-bit
+    /// views.  Narrow operations (and every refusal) take the accumulator
+    /// path, which reduces the index modulo the operation width and
+    /// canonicalizes the signed/unsigned result.
+    fn emit_bit_op_into(
+        &mut self,
+        op: IrBinOp,
+        dest_phys: crate::backend::regalloc::PhysReg,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        use_32bit: bool,
+    ) -> bool {
+        let wide = matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64);
+        match op {
+            IrBinOp::BitSet | IrBinOp::BitClear | IrBinOp::BitToggle
+                if wide || ty == IrType::Ptr =>
+            {
+                self.emit_bit_modify_into(op, dest_phys, lhs, rhs, use_32bit)
+            }
+            IrBinOp::BitTest if wide => self.emit_bit_test_into(dest_phys, lhs, rhs, use_32bit),
+            _ => false,
+        }
+    }
+
     /// `BitSet`/`BitClear` into a destination that already has a register
     /// home: stage the base there, build the one-hot mask in x3 and `orr`
     /// (set) or `bic` (clear) it in place.  Three instructions, the same
@@ -1056,6 +1070,82 @@ impl ArmCodegen {
         let mnemonic = Self::bit_modify_mnemonic(op);
         self.state
             .emit_fmt(format_args!("    {mnemonic} {dest}, {read}, {r}3"));
+        true
+    }
+
+    /// `dest = BitTest(base, index)` straight into the destination's GP home
+    /// (32/64-bit views): `ubfx` for an immediate index, `lsr` + `and #1` for
+    /// a variable one -- LSRV reduces its amount modulo the register width,
+    /// which is the IR's BitTest semantics at these widths.  Register-homed
+    /// operands are read in place; a homeless base is staged into the
+    /// destination (into x0 when the destination holds the index), a homeless
+    /// index into x0 after the base.  The accumulator path stages both
+    /// operands through x1/x2 and copies the result out of x0: three moves
+    /// more for the same two instructions.
+    ///
+    /// Declined (the accumulator path runs) when two different values share
+    /// one register here -- the allocator boundary case `emit3!` repairs from
+    /// a stack slot.
+    pub(super) fn emit_bit_test_into(
+        &mut self,
+        dest_phys: crate::backend::regalloc::PhysReg,
+        base: &Operand,
+        index: &Operand,
+        use_32bit: bool,
+    ) -> bool {
+        let (r, width) = if use_32bit { ('w', 32) } else { ('x', 64) };
+        let name = |reg: crate::backend::regalloc::PhysReg| {
+            if use_32bit {
+                callee_saved_name_32(reg)
+            } else {
+                callee_saved_name(reg)
+            }
+        };
+        let dest = name(dest_phys);
+        let base_reg = self.operand_reg(base).filter(|r| !is_arm_fp_phys(*r));
+        if let Some(imm) = Self::const_as_imm12(index) {
+            let bit = (imm as i64).rem_euclid(width);
+            let src = match base_reg {
+                Some(reg) => name(reg),
+                None => {
+                    self.operand_to_callee_reg(base, dest_phys);
+                    dest
+                }
+            };
+            self.state
+                .emit_fmt(format_args!("    ubfx {dest}, {src}, #{bit}, #1"));
+            return true;
+        }
+        let idx_reg = self.operand_reg(index).filter(|r| !is_arm_fp_phys(*r));
+        if let (Operand::Value(b), Operand::Value(i), Some(br), Some(ir)) =
+            (base, index, base_reg, idx_reg)
+        {
+            if b.0 != i.0 && br.0 == ir.0 {
+                return false;
+            }
+        }
+        let src = match base_reg {
+            Some(reg) => name(reg).to_string(),
+            None if idx_reg == Some(dest_phys) => {
+                self.operand_to_x0(base);
+                format!("{r}0")
+            }
+            None => {
+                self.operand_to_callee_reg(base, dest_phys);
+                dest.to_string()
+            }
+        };
+        let amount = match idx_reg {
+            Some(reg) => name(reg).to_string(),
+            None => {
+                self.operand_to_x0(index);
+                format!("{r}0")
+            }
+        };
+        self.state
+            .emit_fmt(format_args!("    lsr {dest}, {src}, {amount}"));
+        self.state
+            .emit_fmt(format_args!("    and {dest}, {dest}, #1"));
         true
     }
 

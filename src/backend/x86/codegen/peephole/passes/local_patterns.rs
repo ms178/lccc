@@ -5704,6 +5704,15 @@ pub(super) fn fuse_signext_and_move(store: &mut LineStore, infos: &mut [LineInfo
 // ext2 -- unless Y is X's family, which ext2 overwrites in full anyway.
 // Immediates are refused (`movslq $5` does not exist) and so are high-byte
 // sources (`movsbq %ah` cannot be encoded).
+//
+// ext2 may also read MORE than the W bits ext1 produced (W2 > W), when the
+// bits above W are known: a zero-extension leaves X below 2^W, so any W2-bit
+// extension of X -- signed or not -- is that zero-extension (`movzbl %dl,
+// %edx; movslq %edx, %rax` is `movzbl %dl, %eax`, the shape of a compare
+// returned as `long`); a sign-extension leaves bits W-1.. equal, so a W2-bit
+// sign-extension is the W-bit one (`movsbl %dl, %edx; movslq %edx, %rax` is
+// `movsbq %dl, %rax`). A zero-extension of a sign-extended value is neither
+// and is refused.
 fn ext_source_width(mnemonic: &str) -> Option<u8> {
     match mnemonic {
         "movsbl" | "movsbq" | "movzbl" | "movzbq" => Some(8),
@@ -5761,7 +5770,16 @@ pub(super) fn collapse_extension_chains(store: &mut LineStore, infos: &mut [Line
             i += 1;
             continue;
         };
-        let narrow_name = match w {
+        let Some(widened) = chain_widening(m1, w, m2) else {
+            i += 1;
+            continue;
+        };
+        let read_width = if widened {
+            ext_source_width(m2).unwrap_or(w)
+        } else {
+            w
+        };
+        let narrow_name = match read_width {
             8 => REG_NAMES[3][x as usize],
             16 => REG_NAMES[2][x as usize],
             _ => REG_NAMES[1][x as usize],
@@ -5770,9 +5788,7 @@ pub(super) fn collapse_extension_chains(store: &mut LineStore, infos: &mut [Line
             i += 1;
             continue;
         };
-        if m2 == "movl"
-            || ext_source_width(m2) != Some(w)
-            || xsub != narrow_name
+        if xsub != narrow_name
             || y > REG_GP_MAX
             || (ydst != REG_NAMES[0][y as usize] && ydst != REG_NAMES[1][y as usize])
         {
@@ -5783,7 +5799,11 @@ pub(super) fn collapse_extension_chains(store: &mut LineStore, infos: &mut [Line
             i += 1;
             continue;
         }
-        let fused = format!("    {m2} {src}, {ydst}");
+        let fused = if widened {
+            widened_chain_line(m1, w, src, y, ydst == REG_NAMES[0][y as usize])
+        } else {
+            format!("    {m2} {src}, {ydst}")
+        };
         replace_line(store, &mut infos[k], k, fused);
         mark_nop(&mut infos[i]);
         dead.invalidate(store, infos, k);
@@ -5791,6 +5811,36 @@ pub(super) fn collapse_extension_chains(store: &mut LineStore, infos: &mut [Line
         i = k + 1;
     }
     changed
+}
+
+/// Whether `ext2` (`m2`) after `ext1` (`m1`, from `w` bits) collapses:
+/// `Some(false)` for the same-width chain, `Some(true)` for the widening one
+/// (see the section comment), `None` otherwise.
+fn chain_widening(m1: &str, w: u8, m2: &str) -> Option<bool> {
+    let w2 = ext_source_width(m2)?;
+    if w2 == w {
+        return (m2 != "movl").then_some(false);
+    }
+    let zero1 = matches!(m1, "movzbl" | "movzbq" | "movzwl" | "movzwq");
+    let sign1 = matches!(m1, "movsbl" | "movsbq" | "movswl" | "movswq");
+    let sign2 = matches!(m2, "movswl" | "movswq" | "movslq");
+    (w2 > w && (zero1 || (sign1 && sign2))).then_some(true)
+}
+
+/// The single extension of `src` (from `w` bits, as `m1` extends it) into
+/// register `y` that a widening chain collapses to: the zero-extension writes
+/// the 32-bit name (which clears bits 32..63 as well), the sign-extension
+/// keeps ext2's destination width (`wide`: 64-bit), since a 32-bit
+/// destination clears bits 32..63 where a 64-bit one copies the sign.
+fn widened_chain_line(m1: &str, w: u8, src: &str, y: RegId, wide: bool) -> String {
+    let from = if w == 8 { 'b' } else { 'w' };
+    if m1.starts_with("movz") {
+        format!("    movz{from}l {src}, {}", REG_NAMES[1][y as usize])
+    } else if wide {
+        format!("    movs{from}q {src}, {}", REG_NAMES[0][y as usize])
+    } else {
+        format!("    movs{from}l {src}, {}", REG_NAMES[1][y as usize])
+    }
 }
 
 #[cfg(test)]
@@ -5848,12 +5898,120 @@ mod extension_chain_tests {
     }
 
     #[test]
+    fn widening_chains_collapse_onto_the_narrow_extension() {
+        for (body, want) in [
+            // `long f(int a, int b) { return a < b; }`: the boolean's zext
+            // and the int-to-long sext are one zero-extension (X is not
+            // %rdx here: `ret` may return the %rdx:%rax pair)
+            (
+                "    movzbl %cl, %ecx\n    movslq %ecx, %rax\n",
+                "movzbl %cl, %eax",
+            ),
+            (
+                "    movzwl (%rsi), %ecx\n    movslq %ecx, %rdx\n",
+                "movzwl (%rsi), %edx",
+            ),
+            (
+                "    movzbl %al, %ecx\n    movswq %cx, %rdx\n",
+                "movzbl %al, %edx",
+            ),
+            (
+                "    movzbl %al, %ecx\n    movl %ecx, %edx\n",
+                "movzbl %al, %edx",
+            ),
+            // a sign-extension's upper bits are its sign: a wider
+            // sign-extension is the narrow one, at ext2's destination width
+            (
+                "    movsbl %al, %r12d\n    movswq %r12w, %rdx\n",
+                "movsbq %al, %rdx",
+            ),
+            (
+                "    movsbl %al, %ecx\n    movslq %ecx, %rdx\n",
+                "movsbq %al, %rdx",
+            ),
+            (
+                "    movsbl %al, %ecx\n    movswl %cx, %edx\n",
+                "movsbl %al, %edx",
+            ),
+            (
+                "    movswq %ax, %rcx\n    movslq %ecx, %rcx\n",
+                "movswq %ax, %rcx",
+            ),
+        ] {
+            assert_eq!(run(body), vec![want.to_string()], "{body}");
+        }
+    }
+
+    /// Every collapsed pair computes exactly what the chain computed, for
+    /// every 16-bit source value: the rule is checked against a model of
+    /// the two extensions rather than trusted.
+    #[test]
+    fn widening_rule_matches_the_two_extension_model() {
+        // (source bits, signed, 64-bit destination)
+        let shape = |m: &str| match m {
+            "movzbl" => (8, false, false),
+            "movzbq" => (8, false, true),
+            "movzwl" => (16, false, false),
+            "movzwq" => (16, false, true),
+            "movsbl" => (8, true, false),
+            "movsbq" => (8, true, true),
+            "movswl" => (16, true, false),
+            "movswq" => (16, true, true),
+            "movslq" => (32, true, true),
+            "movl" => (32, false, false),
+            other => panic!("no model for {other}"),
+        };
+        let ext = |m: &str, v: u64| -> u64 {
+            let (from, signed, to64) = shape(m);
+            let low = v & ((1u64 << from) - 1);
+            let full = if signed && low >> (from - 1) == 1 {
+                low | (u64::MAX << from)
+            } else {
+                low
+            };
+            if to64 { full } else { full & 0xFFFF_FFFF }
+        };
+        let all = [
+            "movzbl", "movzbq", "movzwl", "movzwq", "movsbl", "movsbq", "movswl", "movswq",
+            "movslq", "movl",
+        ];
+        let mut pairs = 0;
+        for m1 in all {
+            let w = ext_source_width(m1).expect("an extension");
+            for m2 in all {
+                if chain_widening(m1, w, m2) != Some(true) {
+                    continue;
+                }
+                pairs += 1;
+                let line = widened_chain_line(m1, w, "%al", 0, shape(m2).2);
+                let m = line.split_whitespace().next().expect("a mnemonic");
+                for v in 0..=u64::from(u16::MAX) {
+                    assert_eq!(
+                        ext(m, v),
+                        ext(m2, ext(m1, v)),
+                        "{m1} then {m2} as {m} on {v:#x}"
+                    );
+                }
+            }
+        }
+        // byte zero-extensions under 6 wider readers, word ones under the 2
+        // 32-bit readers; byte sign-extensions under 3 wider
+        // sign-extensions, word ones under `movslq`
+        assert_eq!(pairs, 2 * 6 + 2 * 2 + 2 * 3 + 2);
+    }
+
+    #[test]
     fn refused_shapes_are_untouched() {
         let cases = [
             // X read afterwards
             "    movsbl %al, %r12d\n    movsbq %r12b, %rdx\n    addl %r12d, %edx\n",
-            // ext2 reads MORE bits than ext1 preserved from S
-            "    movsbl %al, %r12d\n    movswq %r12w, %rdx\n",
+            // ext2 zero-extends more bits than ext1 sign-extended
+            "    movsbl %al, %r12d\n    movzwq %r12w, %rdx\n",
+            "    movsbl %al, %ecx\n    movl %ecx, %edx\n",
+            // ext2 reads FEWER bits than ext1 produced (not this rule)
+            "    movswl %ax, %ecx\n    movsbq %cl, %rdx\n",
+            // the widening rule still needs X dead
+            "    movzbl %cl, %ecx\n    movslq %ecx, %rax\n    addl %ecx, %eax\n",
             // X is still read (16 bits of the zero-extension) afterwards
             "    movzbl %al, %r12d\n    movsbq %r12b, %rdx\n    movswq %r12w, %rcx\n",
             // immediate source
@@ -9144,7 +9302,8 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
 //   only through `movq` — an `movl` relay would truncate the 64-bit sum.
 //
 // Immediates take the same path: `movq %A,%X; addl $K,%X; movq %X,%Y` →
-// `leal K(%A), %Y`. This subsumes the immediate 2-line fold of
+// `leal K(%A), %Y`, and so does a subtracted immediate (`subl $K` is the add
+// of `-K`; a subtracted register has no LEA form). This subsumes the immediate 2-line fold of
 // `fuse_copy_and_operation` (which handles only `addq $imm`) and adds the
 // 32-bit and relayed forms nothing else covers. The immediate text passes
 // through verbatim after a strict shape check: `add $imm32` and a disp32
@@ -9199,10 +9358,18 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
             continue;
         }
         let add_t = infos[j].trimmed(store.get(j)).to_string();
-        let (add_w, op_w, arest) = if let Some(r) = add_t.strip_prefix("addq ") {
-            (64u8, 64u8, r)
+        // A subtract of an immediate is the add of its negation (`movl %esi,
+        // %r10d; subl $1, %r10d` -> `leal -1(%rsi), %r10d`, GCC 16.2's and
+        // Clang 23.1.4's spelling of dav1d's `sby - 1` index); a subtract of
+        // a register has no LEA form and is refused below.
+        let (add_w, op_w, arest, negate) = if let Some(r) = add_t.strip_prefix("addq ") {
+            (64u8, 64u8, r, false)
         } else if let Some(r) = add_t.strip_prefix("addl ") {
-            (32u8, 32u8, r)
+            (32u8, 32u8, r, false)
+        } else if let Some(r) = add_t.strip_prefix("subq ") {
+            (64u8, 64u8, r, true)
+        } else if let Some(r) = add_t.strip_prefix("subl ") {
+            (32u8, 32u8, r, true)
         } else {
             i += 1;
             continue;
@@ -9231,7 +9398,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
             Imm(String),
         }
         let addend = if let Some(fam) = plain_gp_operand(add_src) {
-            if fam == x_fam {
+            if fam == x_fam || negate {
                 i += 1;
                 continue;
             }
@@ -9282,12 +9449,23 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
             if is_neg {
                 v = -v;
             }
+            // The subtrahend's value range is the addend's: the negation is
+            // exact in i128, and the checks below then admit only negated
+            // values a disp32 can carry (`subq $-2147483648` negates to 2^31,
+            // which no displacement encodes, and stays a SUB).
+            if negate {
+                v = -v;
+            }
             let disp_text = if add_w == 64 {
                 if v < i32::MIN as i128 || v > i32::MAX as i128 {
                     i += 1;
                     continue;
                 }
-                imm.to_string()
+                if negate {
+                    v.to_string()
+                } else {
+                    imm.to_string()
+                }
             } else {
                 // A real imm32 emission carries a value in [-2^32, 2^32)
                 // (the backend stages anything wider); refuse the rest.
@@ -9297,7 +9475,11 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
                 }
                 let signed32 = ((v + (1i128 << 31)) & ((1i128 << 32) - 1)) - (1i128 << 31);
                 if v >= i32::MIN as i128 && v <= i32::MAX as i128 {
-                    imm.to_string()
+                    if negate {
+                        v.to_string()
+                    } else {
+                        imm.to_string()
+                    }
                 } else {
                     (signed32 as i64).to_string()
                 }
@@ -11712,6 +11894,77 @@ mod staged_add_relay_tests {
                 || l == "addl %edi, %ebp"
                 || l == "movq %rbp, %r13"),
             "staging copy, add and relay must all disappear:\n{}",
+            out.join("\n")
+        );
+    }
+
+    /// A subtracted immediate is the add of its negation: dav1d's `sby - 1`
+    /// bit index (`thread_task.c:649`/`:820`) stages `movl %esi, %r10d;
+    /// subl $1, %r10d`, which GCC 16.2 and Clang 23.1.4 both spell as one
+    /// `leal -1(%rsi)`.  The extremes stay exact: the 32-bit form wraps
+    /// (`subl $-2147483648` is `+2^31` mod 2^32), the 64-bit form refuses the
+    /// one negation no disp32 carries, and a subtracted register (no LEA
+    /// form) is never touched.
+    #[test]
+    fn subtracted_immediates_fold_as_negated_displacements() {
+        let fold = |sub: &str| {
+            run(&format!(
+                ".cfi_startproc\n    movl %esi, %r10d\n    {sub}, %r10d\n    btl %r10d, %edi\n    setc %al\n    ret\n.cfi_endproc\n"
+            ))
+        };
+        let out = fold("subl $1");
+        assert!(
+            out.iter().any(|l| l == "leal -1(%rsi), %r10d"),
+            "{}",
+            out.join("\n")
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("subl")),
+            "{}",
+            out.join("\n")
+        );
+        let out = fold("subl $-2147483648");
+        assert!(
+            out.iter().any(|l| l == "leal -2147483648(%rsi), %r10d"),
+            "the 32-bit negation wraps exactly:\n{}",
+            out.join("\n")
+        );
+        let out = fold("subl $-7");
+        assert!(
+            out.iter().any(|l| l == "leal 7(%rsi), %r10d"),
+            "{}",
+            out.join("\n")
+        );
+        let wide = |sub: &str| {
+            run(&format!(
+                ".cfi_startproc\n    movq %rsi, %r10\n    {sub}, %r10\n    movq %r10, (%rdi)\n    ret\n.cfi_endproc\n"
+            ))
+        };
+        let out = wide("subq $5");
+        assert!(
+            out.iter().any(|l| l == "leaq -5(%rsi), %r10"),
+            "{}",
+            out.join("\n")
+        );
+        let out = wide("subq $-2147483648");
+        assert!(
+            out.iter().any(|l| l == "subq $-2147483648, %r10"),
+            "+2^31 is no disp32: the 64-bit SUB must stay:\n{}",
+            out.join("\n")
+        );
+        let out = wide("subq %rdx");
+        assert!(
+            out.iter().any(|l| l == "subq %rdx, %r10"),
+            "a subtracted register has no LEA form:\n{}",
+            out.join("\n")
+        );
+        // Flags still observed after the SUB: LEA would drop them.
+        let out = run(
+            ".cfi_startproc\n    movl %esi, %r10d\n    subl $1, %r10d\n    je .L1\n    ret\n.L1:\n    ret\n.cfi_endproc\n",
+        );
+        assert!(
+            out.iter().any(|l| l == "subl $1, %r10d"),
+            "{}",
             out.join("\n")
         );
     }

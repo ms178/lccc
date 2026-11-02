@@ -1815,7 +1815,8 @@ fn peephole_optimize_inner(
         // substitutions, spill-deref folds); Phase 1's copy before the LEA
         // window fold is the primary site, this is the mop-up. Idempotent.
         if !sk("dead_inplace_ext") {
-            global_changed |= narrow_copy_fold::eliminate_dead_inplace_ext(&mut store, &mut infos);
+            global_changed |=
+                narrow_copy_fold::eliminate_dead_inplace_extensions(&mut store, &mut infos);
         }
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
@@ -2216,8 +2217,15 @@ fn peephole_optimize_inner(
     if !sk("ebb_reuse") && ebb_reuse::reuse_ebb_copies_and_flags(&mut store, &mut infos) {
         retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
     }
-    if !sk("copy_sink") {
-        ebb_reuse::sink_copies_into_fallthrough(&mut store, &mut infos);
+    // A sunk copy opens the fall-through arm, and its reader may sit past the
+    // arm's unmentioned label (`je .LBB3; movq %rcx, %r8; .LBB1: testl %r8d,
+    // %r8d`, sqlite3VdbeUsesBtree): copy propagation reads the source through
+    // such a label, and the retirement drops the copy once nothing reads it.
+    if !sk("copy_sink") && ebb_reuse::sink_copies_into_fallthrough(&mut store, &mut infos) {
+        if !sk("copy_prop") {
+            copy_propagation::propagate_register_copies(&mut store, &mut infos);
+        }
+        retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
     }
 
     // Phase 5: Tail call optimization.

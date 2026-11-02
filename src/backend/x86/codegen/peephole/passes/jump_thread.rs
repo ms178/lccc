@@ -557,14 +557,25 @@ fn conditional_tail_calls_in(
             let Some((mnemonic, label)) = branch(infos[i].trimmed(store.get(i))) else {
                 continue;
             };
-            if mnemonic == "jmp" || duplicate.contains(&label) || count.get(&label) != Some(&1) {
+            if mnemonic == "jmp" || duplicate.contains(&label) {
                 continue;
             }
             let Some(&d) = defs.get(&label) else {
                 continue;
             };
-            if let Some(plan) = relay_plan(store, infos, lo, hi, d) {
+            if count.get(&label) == Some(&1)
+                && let Some(plan) = relay_plan(store, infos, lo, hi, d)
+            {
                 hit = Some((i, mnemonic.to_string(), d, plan));
+                break;
+            }
+            // The mirrored shape: the jcc skips over the sibling call.
+            if let Some(negated) = mnemonic
+                .strip_prefix('j')
+                .and_then(super::flag_peepholes::negate_cc)
+                && let Some(q) = skipped_sibling_call(store, infos, i, d, &count, &duplicate)
+            {
+                hit = Some((i, format!("j{negated}"), q, (q, d)));
                 break;
             }
         }
@@ -606,6 +617,77 @@ fn conditional_tail_calls_in(
         replace_line(store, &mut infos[i], i, text);
         changed = true;
     }
+}
+
+/// The mirrored conditional sibling call: a `jcc` on line `i` whose target
+/// label (line `d`) directly follows a codegen-marked sibling `jmp` on the
+/// fall-through path becomes the negated `jcc` to the callee:
+///
+/// ```text
+///     btl %edi, %ecx                  btl %edi, %ecx
+///     jnc .LBB2                       jc hit@PLT
+/// .LBB1:                      ->      # LCCC_TAIL_CALL
+///     jmp hit@PLT                 .LBB1:
+///     # LCCC_TAIL_CALL            .LBB2:
+/// .LBB2:                              ret
+///     ret
+/// ```
+///
+/// Clang 23.1.4 emits exactly this (`jb hit@PLT` for the dav1d
+/// `wedge_allowed_mask` test); GCC 16.2 keeps the jump over the call.  No
+/// instruction separates the `jcc` from the `jmp`, so registers, flags,
+/// memory and stack depth agree at both; deleting the `jmp` makes the taken
+/// path of the old `jcc` the fall-through of the new one, which reaches the
+/// same label through byteless lines only.  Every label between the two
+/// branches must be unreferenced (nothing else may enter the deleted call),
+/// and the `jmp`'s marker block must end at the target label itself.
+/// Returns the line of the sibling `jmp`.
+fn skipped_sibling_call(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    d: usize,
+    count: &FxHashMap<u32, u32>,
+    duplicate: &FxHashSet<u32>,
+) -> Option<usize> {
+    if d <= i {
+        return None;
+    }
+    let mut q = i + 1;
+    while q < d {
+        if byteless(store, infos, q) {
+            q += 1;
+            continue;
+        }
+        if infos[q].kind != LineKind::Label || infos[q].pinned {
+            break;
+        }
+        let label = local_label(label_text(infos[q].trimmed(store.get(q))))?;
+        if duplicate.contains(&label) || count.get(&label).copied().unwrap_or(0) != 0 {
+            return None;
+        }
+        q += 1;
+    }
+    let info = infos[q];
+    if q >= d || info.pinned || info.kind != LineKind::Jmp {
+        return None;
+    }
+    let mut fields = info.trimmed(store.get(q)).split_whitespace();
+    if fields.next() != Some("jmp") {
+        return None;
+    }
+    let target = fields.next()?;
+    if fields.next().is_some()
+        || target.starts_with('*')
+        || target.starts_with('.')
+        || !super::liveness::tail_call_marked(store, infos, q)
+    {
+        return None;
+    }
+    let end = (q + 1..d)
+        .find(|&k| !byteless(store, infos, k))
+        .unwrap_or(d);
+    (end == d).then_some(q)
 }
 
 /// For the relay label on line `d`: `(jmp_line, block_end)` when the block is
@@ -906,8 +988,11 @@ mod conditional_tail_call_tests {
             // Code after the jump before the next label (SLS int3).
             format!("    jmp slow@PLT\n    {T}\n    int3\n"),
         ] {
-            let (c, out) = apply(&dispatch(&relay));
-            assert!(!c, "{relay}:\n{out}");
+            // The relay itself stays verbatim.  (The `je .LBB2` over the
+            // marked `jmp fast@PLT` may still become `jne fast@PLT` -- the
+            // mirrored fold -- which leaves `.LBB2` and its relay intact.)
+            let (_, out) = apply(&dispatch(&relay));
+            assert!(out.contains(&format!(".LBB2:\n{relay}")), "{relay}:\n{out}");
         }
     }
 
@@ -918,15 +1003,89 @@ mod conditional_tail_call_tests {
             "    testl %edi, %edi\n    je .LBB2\n    call g@PLT\n.LBB2:\n    jmp slow@PLT\n    {T}\n"
         ));
         assert!(!c, "{out}");
-        // Two branches to the relay.
-        let (c, out) = apply(&format!(
+        // Two branches to the relay: the relay stays (the `jne` over the
+        // marked fast call is the mirrored fold's business).
+        let (_, out) = apply(&format!(
             "    testl %edi, %edi\n    je .LBB2\n    testl %esi, %esi\n    jne .LBB2\n    jmp fast@PLT\n    {T}\n.LBB2:\n    jmp slow@PLT\n    {T}\n"
         ));
-        assert!(!c, "{out}");
-        // A jump-table / data mention.
-        let (c, out) = apply(&format!(
+        assert!(
+            out.contains("    je .LBB2\n")
+                && out.contains("    je fast@PLT\n")
+                && out.contains(&format!(".LBB2:\n    jmp slow@PLT\n    {T}\n")),
+            "{out}"
+        );
+        // A jump-table / data mention: the relay stays.
+        let (_, out) = apply(&format!(
             "{}    .quad .LBB2\n",
             dispatch(&format!("    jmp slow@PLT\n    {T}\n"))
+        ));
+        assert!(
+            out.contains(&format!(".LBB2:\n    jmp slow@PLT\n    {T}\n")),
+            "{out}"
+        );
+    }
+
+    fn skip(between: &str, after: &str) -> String {
+        format!(
+            "    movl $244608, %ecx\n    btl %edi, %ecx\n    jnc .LBB2\n{between}    jmp hit@PLT\n    {T}\n    # LCCC_CALL_ARGS 1\n{after}.LBB2:\n    ret\n"
+        )
+    }
+
+    /// dav1d `if (wedge_allowed_mask & (1 << bs)) hit(bs);`: the jcc jumps
+    /// over the sibling call, so the negated jcc IS the call (Clang 23.1.4:
+    /// `jb hit@PLT`).
+    #[test]
+    fn a_jcc_over_a_sibling_call_becomes_the_negated_conditional_call() {
+        let (c, out) = apply(&skip(".LBB1:\n", ""));
+        assert!(c, "{out}");
+        assert!(
+            out.contains("    jb hit@PLT\n    # LCCC_TAIL_CALL\n    # LCCC_CALL_ARGS 1\n"),
+            "{out}"
+        );
+        assert!(!out.contains("jmp hit") && !out.contains("jnc"), "{out}");
+        assert!(out.contains(".LBB2:\n    ret\n"), "{out}");
+        // Every condition code negates exactly.
+        for (cc, neg) in [
+            ("je", "jne"),
+            ("jl", "jge"),
+            ("ja", "jbe"),
+            ("js", "jns"),
+            ("jp", "jnp"),
+        ] {
+            let body = skip("", "").replace("jnc .LBB2", &format!("{cc} .LBB2"));
+            let (c, out) = apply(&body);
+            assert!(
+                c && out.contains(&format!("    {neg} hit@PLT\n")),
+                "{cc}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jcc_over_anything_but_a_lone_marked_sibling_call_stays() {
+        for (between, after) in [
+            // Work on the fall-through path before the call.
+            ("    movl %esi, %edi\n", ""),
+            // Code between the call's markers and the target label.
+            ("", "    int3\n"),
+            // A CFI row between the branches.
+            ("    .cfi_remember_state\n", ""),
+        ] {
+            let (c, out) = apply(&skip(between, after));
+            assert!(!c, "{between:?} {after:?}:\n{out}");
+        }
+        // A referenced label between: another path enters the call.
+        let (c, out) = apply(&format!(
+            "    btl %edi, %ecx\n    jnc .LBB2\n.LBB1:\n    jmp hit@PLT\n    {T}\n.LBB2:\n    ret\n    .quad .LBB1\n"
+        ));
+        assert!(!c, "{out}");
+        // Unmarked `jmp sym`: may be anything.
+        let (c, out) =
+            apply("    btl %edi, %ecx\n    jnc .LBB2\n    jmp hit@PLT\n.LBB2:\n    ret\n");
+        assert!(!c, "{out}");
+        // The target label is not the one right after the call.
+        let (c, out) = apply(&format!(
+            "    btl %edi, %ecx\n    jnc .LBB3\n    jmp hit@PLT\n    {T}\n.LBB2:\n    ret\n.LBB3:\n    ret\n"
         ));
         assert!(!c, "{out}");
     }

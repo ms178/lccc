@@ -4,7 +4,7 @@ use super::emit::{X86Codegen, phys_reg_name, shift_mnemonic};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
-use crate::ir::reexports::{IrBinOp, IrConst, Operand, Value};
+use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrConst, Operand, Value};
 
 impl X86Codegen {
     // ---- Unary ----
@@ -691,11 +691,16 @@ impl X86Codegen {
     }
 
     /// Emit `dest = BT(base, index) & 1` directly to a physical register.
-    /// Returns false only when the result register is BT's fixed count
-    /// register (%rcx) or is not an ordinary GPR; the accumulator fallback
-    /// handles those shapes. SETcc writes an 8-bit GPR directly, and a 32-bit
-    /// result is zero-extended with `movzbl`. For 64-bit results the zero
-    /// extension from 32-bit MOVL is enough.
+    /// Returns false only when the result register is %rcx, which the
+    /// operand staging may need; the accumulator fallback handles that shape.
+    ///
+    /// When the destination is neither the base's nor the index's register,
+    /// it is zeroed right before the test (`xorl` writes the flags, so it
+    /// cannot follow `bt`; staging happens first, so nothing it reads can be
+    /// disturbed) and `setc` completes the boolean: the zero idiom breaks the
+    /// dependency on the register's old value that `setc` + `movzbl` carries
+    /// through the partial-register merge, and drops the extension (GCC 16.2
+    /// and Clang 23.1.4 both emit `xor; bt; setc`).
     fn emit_bit_test_reg_direct(
         &mut self,
         base: &Operand,
@@ -703,109 +708,616 @@ impl X86Codegen {
         dest_phys: PhysReg,
         use_32bit: bool,
     ) -> bool {
-        let dest64 = super::emit::phys_reg_name(dest_phys);
-        if dest64 == "rcx" {
+        if super::emit::phys_reg_name(dest_phys) == "rcx" {
             return false;
         }
         let dest8 = super::emit::typed_phys_reg_name(dest_phys, IrType::U8);
-        let own_idx_reg = match index {
-            Operand::Value(v) => self
-                .reg_assignments
-                .get(&v.0)
-                .copied()
-                .filter(|r| !super::emit::is_xmm_reg(*r)),
-            _ => None,
-        };
-        // BT only reads the base and writes CF. When the base already lives in
-        // a GPR, read it in place without copying into dest_phys first; when
-        // the base is a constant or homeless value and the bit index lives in
-        // dest_phys, stage the base in %rax so the index register stays intact.
-        let base_w: &'static str = match base {
-            Operand::Value(v) => {
-                if let Some(&reg) = self
-                    .reg_assignments
-                    .get(&v.0)
-                    .filter(|r| !super::emit::is_xmm_reg(**r))
-                {
-                    if use_32bit {
-                        super::emit::phys_reg_name_32(reg)
-                    } else {
-                        super::emit::phys_reg_name(reg)
-                    }
-                } else {
-                    self.operand_to_rax(base);
-                    if own_idx_reg == Some(dest_phys) {
-                        if use_32bit { "eax" } else { "rax" }
-                    } else if use_32bit {
-                        let dest32 = super::emit::phys_reg_name_32(dest_phys);
-                        self.state
-                            .emit_fmt(format_args!("    movl %eax, %{dest32}"));
-                        dest32
-                    } else {
-                        self.state
-                            .emit_fmt(format_args!("    movq %rax, %{dest64}"));
-                        dest64
-                    }
-                }
-            }
-            Operand::Const(_) => {
-                if own_idx_reg == Some(dest_phys) {
-                    self.operand_to_rax(base);
-                    if use_32bit { "eax" } else { "rax" }
-                } else {
-                    self.operand_to_reg(base, dest64);
-                    if use_32bit {
-                        super::emit::phys_reg_name_32(dest_phys)
-                    } else {
-                        dest64
-                    }
-                }
-            }
-        };
-        let const_index = match index {
-            Operand::Const(c) => c
-                .to_i64()
-                .filter(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64),
-            _ => None,
-        };
-        if let Some(imm) = const_index {
-            let width = if use_32bit { 32 } else { 64 };
-            let bit = (imm as u32) % width;
-            let bt = if use_32bit { "btl" } else { "btq" };
+        let dest32 = super::emit::phys_reg_name_32(dest_phys);
+        let reads_dest =
+            self.operand_reg(base) == Some(dest_phys) || self.operand_reg(index) == Some(dest_phys);
+        let staged = self.stage_bt_operands(base, index, use_32bit);
+        if !reads_dest {
             self.state
-                .emit_fmt(format_args!("    {bt} ${bit}, %{base_w}"));
-        } else {
-            let bt = if use_32bit { "btl" } else { "btq" };
-            match own_idx_reg {
-                Some(reg) => {
-                    let idx = if use_32bit {
-                        super::emit::phys_reg_name_32(reg)
-                    } else {
-                        super::emit::phys_reg_name(reg)
-                    };
-                    self.state
-                        .emit_fmt(format_args!("    {bt} %{idx}, %{base_w}"));
+                .emit_fmt(format_args!("    xorl %{dest32}, %{dest32}"));
+        }
+        self.emit_staged_bt("bt", &staged, use_32bit);
+        self.state.emit_fmt(format_args!("    setc %{dest8}"));
+        if reads_dest {
+            // SETcc writes one byte: the rest of the register still holds
+            // the input that lived there. A 32-bit MOVZX zero-extends the
+            // full 64-bit register on x86-64, so one form covers both widths.
+            self.state
+                .emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
+        }
+        true
+    }
+
+    /// Stage the operands of a `bt`-family instruction: the base is read in
+    /// place from a FRESH GPR home, the index is an immediate (reduced modulo
+    /// the width) or a fresh GPR home.  Anything else is staged through a
+    /// scratch register: a homeless index through %rcx; a base without a
+    /// usable home through %rcx when the index leaves it free -- keeping %rax
+    /// available for the caller's result (`movl $7936,%ecx; xorl %eax,%eax;
+    /// btl %edi,%ecx; setb %al`, Clang 23.1.4's `b_const_mask`) -- and through
+    /// %rax otherwise.  Neither scratch register is an allocatable home, so
+    /// staging never clobbers a live value; the base goes first, as the fused
+    /// branch always did.
+    fn stage_bt_operands(&mut self, base: &Operand, index: &Operand, use_32bit: bool) -> StagedBt {
+        let width = if use_32bit { 32u32 } else { 64 };
+        let imm = Self::const_as_imm32(index);
+        let idx_home = match imm {
+            Some(_) => None,
+            None => self
+                .operand_reg(index)
+                .filter(|r| !super::emit::is_xmm_reg(*r)),
+        };
+        let index_needs_rcx = imm.is_none() && idx_home.is_none();
+        let name = |reg: PhysReg| {
+            if use_32bit {
+                super::emit::phys_reg_name_32(reg)
+            } else {
+                super::emit::phys_reg_name(reg)
+            }
+        };
+        let (base_name, base_in_rax) = match self
+            .operand_reg(base)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
+            Some(reg) => (name(reg), false),
+            None if !index_needs_rcx => {
+                self.operand_to_rcx(base);
+                (if use_32bit { "ecx" } else { "rcx" }, false)
+            }
+            None => {
+                self.operand_to_rax(base);
+                (if use_32bit { "eax" } else { "rax" }, true)
+            }
+        };
+        let index_text = match (imm, idx_home) {
+            (Some(imm), _) => format!("${}", (imm as u32) % width),
+            (None, Some(reg)) => format!("%{}", name(reg)),
+            (None, None) => {
+                self.operand_to_rcx(index);
+                (if use_32bit { "%ecx" } else { "%rcx" }).to_string()
+            }
+        };
+        StagedBt {
+            base: base_name,
+            index: index_text,
+            base_in_rax,
+        }
+    }
+
+    /// `{mnemonic}{l,q} index, base` over operands [`Self::stage_bt_operands`]
+    /// staged.
+    fn emit_staged_bt(&mut self, mnemonic: &str, staged: &StagedBt, use_32bit: bool) {
+        let sfx = if use_32bit { 'l' } else { 'q' };
+        self.state.emit_fmt(format_args!(
+            "    {mnemonic}{sfx} {}, %{}",
+            staged.index, staged.base
+        ));
+    }
+
+    /// `bt{l,q} index, base` for its flags only: CF = bit `index mod W` of
+    /// `base`, nothing materialized (operand staging as
+    /// [`Self::stage_bt_operands`]).
+    pub(super) fn emit_bt_flags(&mut self, base: &Operand, index: &Operand, use_32bit: bool) {
+        let staged = self.stage_bt_operands(base, index, use_32bit);
+        self.emit_staged_bt("bt", &staged, use_32bit);
+    }
+
+    /// Static admission for [`Self::emit_fused_bit_test_modify_impl`] and the
+    /// branch form.  A register-homed modify needs a GPR home that is neither
+    /// scratch register (%rax/%rcx stage operands) and that does not hold the
+    /// index, because the base is copied there before the index is read.  A
+    /// modify without a home runs in %rax and is stored from there after CF
+    /// was consumed, which only the value form does -- into a GPR home of the
+    /// test.  A test homed in the modify's register is impossible for an
+    /// interference-correct allocation (both are live after the modify) and
+    /// refused defensively.
+    pub(super) fn bit_test_modify_fusable_impl(
+        &self,
+        test_dest: Option<&Value>,
+        modify_dest: &Value,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+    ) -> bool {
+        if std::env::var_os("CCC_NO_BT_MODIFY_FUSION").is_some() {
+            return false;
+        }
+        if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+            return false;
+        }
+        let test_home = test_dest.and_then(|t| self.dest_reg(t));
+        let y = match self.dest_reg(modify_dest) {
+            Some(r) if super::emit::is_xmm_reg(r) => return false,
+            Some(r) => r,
+            None => {
+                return test_home.is_some_and(|t| {
+                    !super::emit::is_xmm_reg(t) && super::emit::phys_reg_name(t) != "rax"
+                }) && self.bit_test_modify_operands_ok(base, index, None);
+            }
+        };
+        if matches!(super::emit::phys_reg_name(y), "rax" | "rcx") {
+            return false;
+        }
+        if !self.bit_test_modify_operands_ok(base, index, Some(y)) {
+            return false;
+        }
+        !test_home.is_some_and(|r| r == y || super::emit::is_xmm_reg(r))
+    }
+
+    /// Operand half of the admission: distinct base and index values, no
+    /// XMM-homed base, and (for a register-homed modify `y`) no index homed
+    /// in `y`.
+    fn bit_test_modify_operands_ok(
+        &self,
+        base: &Operand,
+        index: &Operand,
+        y: Option<PhysReg>,
+    ) -> bool {
+        if let (Operand::Value(b), Operand::Value(i)) = (base, index) {
+            if b == i {
+                return false;
+            }
+        }
+        if let Operand::Value(b) = base {
+            if self
+                .reg_assignments
+                .get(&b.0)
+                .is_some_and(|r| super::emit::is_xmm_reg(*r))
+            {
+                return false;
+            }
+        }
+        if let (Operand::Value(i), Some(y)) = (index, y) {
+            if self.reg_assignments.get(&i.0).copied() == Some(y) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Stage a modify: the base into `y` (or, when `y` is `None`, into %rcx
+    /// if `homeless_in_rcx`, else %rax), then the index (immediate, fresh GPR
+    /// home, or %rcx).  The base goes first, so an index staged through %rcx
+    /// cannot be disturbed by it; a caller asking for an %rcx base proved the
+    /// index needs no %rcx staging.
+    fn stage_bit_modify(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        y: Option<PhysReg>,
+        homeless_in_rcx: bool,
+        use_32bit: bool,
+    ) -> StagedBt {
+        let width = if use_32bit { 32i64 } else { 64 };
+        let base_name = match y {
+            Some(y) => {
+                self.operand_to_callee_reg(base, y);
+                if use_32bit {
+                    super::emit::phys_reg_name_32(y)
+                } else {
+                    super::emit::phys_reg_name(y)
                 }
+            }
+            None if homeless_in_rcx => {
+                self.operand_to_rcx(base);
+                if use_32bit { "ecx" } else { "rcx" }
+            }
+            None => {
+                self.operand_to_rax(base);
+                if use_32bit { "eax" } else { "rax" }
+            }
+        };
+        let index_text = match Self::const_as_imm32(index) {
+            Some(imm) => format!("${}", i64::from(imm as u32 as i32).rem_euclid(width)),
+            None => match self
+                .operand_reg(index)
+                .filter(|r| !super::emit::is_xmm_reg(*r) && Some(*r) != y)
+            {
+                Some(reg) if use_32bit => format!("%{}", super::emit::phys_reg_name_32(reg)),
+                Some(reg) => format!("%{}", super::emit::phys_reg_name(reg)),
                 None => {
                     self.operand_to_rcx(index);
-                    let src = if use_32bit { "ecx" } else { "rcx" };
+                    (if use_32bit { "%ecx" } else { "%rcx" }).to_string()
+                }
+            },
+        };
+        StagedBt {
+            base: base_name,
+            index: index_text,
+            base_in_rax: y.is_none() && !homeless_in_rcx,
+        }
+    }
+
+    /// `test_dest = BitTest(base, index)` and `modify_dest = op(base, index)`
+    /// as ONE `bts`/`btr`/`btc`: the modify leaves the bit's old value in CF,
+    /// which is the test's answer.  `btr %esi,%edi; setc %al` instead of
+    /// `bt %esi,%edi; setc %al; movzbl; btr %esi,%edi` (Clang 23.1.4 emits
+    /// the fused shape for `ff_test_clear`; GCC 16.2 does not).
+    ///
+    /// The test's register is zeroed after the staging and right before the
+    /// modify when it is no input of the modify (the zero idiom writes the
+    /// flags, so it cannot follow it); otherwise `setc` is completed with
+    /// `movzbl`.
+    pub(super) fn emit_fused_bit_test_modify_impl(
+        &mut self,
+        test_dest: &Value,
+        modify_dest: &Value,
+        op: IrBinOp,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+    ) {
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        // `None`: the modify has no home and runs in %rax (admission proved
+        // the test then has a GPR home to take CF first).
+        let y = self
+            .dest_reg(modify_dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r));
+        let t = self
+            .dest_reg(test_dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r));
+        let idx_home = self.operand_reg(index);
+        // A homeless modify runs in %rcx when the index needs no %rcx
+        // staging, leaving %rax untouched until the value is handed over:
+        // the test's `xor`/`setc` window then never overlaps %rax, so the
+        // return-position retarget can move the test into %eax (Clang's
+        // `movl (%rdi),%ecx; xorl %eax,%eax; btrl %esi,%ecx; setb %al;
+        // movl %ecx,(%rdi)` for `ff_test_clear`).
+        let homeless_in_rcx = y.is_none()
+            && (Self::const_as_imm32(index).is_some()
+                || idx_home.is_some_and(|r| !super::emit::is_xmm_reg(r)));
+        let staged = self.stage_bit_modify(base, index, y, homeless_in_rcx, use_32bit);
+        let zero_first = t.is_some_and(|tr| {
+            Some(tr) != y
+                && !matches!(super::emit::phys_reg_name(tr), "rax" | "rcx")
+                && (Self::const_as_imm32(index).is_some() || idx_home != Some(tr))
+        });
+        if let (true, Some(tr)) = (zero_first, t) {
+            let t32 = super::emit::phys_reg_name_32(tr);
+            self.state.emit_fmt(format_args!("    xorl %{t32}, %{t32}"));
+        }
+        self.emit_staged_bt(Self::bit_modify_mnemonic(op), &staged, use_32bit);
+        match t {
+            Some(tr) => {
+                let t8 = super::emit::typed_phys_reg_name(tr, IrType::U8);
+                self.state.emit_fmt(format_args!("    setc %{t8}"));
+                if !zero_first {
+                    let t32 = super::emit::phys_reg_name_32(tr);
                     self.state
-                        .emit_fmt(format_args!("    {bt} %{src}, %{base_w}"));
+                        .emit_fmt(format_args!("    movzbl %{t8}, %{t32}"));
+                }
+                self.note_inplace_compute(tr, test_dest.0);
+            }
+            None => {
+                self.state.emit("    setc %al");
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                self.store_rax_to(test_dest);
+            }
+        }
+        match y {
+            Some(y) => {
+                self.note_inplace_compute(y, modify_dest.0);
+                self.state.reg_cache.invalidate_acc();
+            }
+            None => {
+                // Exactly the accumulator path's postlude for this op: the
+                // store may park the value in the accumulator cache, which
+                // must stay valid for the modify's consumer.
+                if homeless_in_rcx {
+                    self.state.emit(if use_32bit {
+                        "    movl %ecx, %eax"
+                    } else {
+                        "    movq %rcx, %rax"
+                    });
+                }
+                self.state.reg_cache.invalidate_acc();
+                if use_32bit {
+                    self.emit_implicit_sext32_for_value(
+                        "eax",
+                        "rax",
+                        ty.is_unsigned(),
+                        modify_dest.0,
+                    );
+                    self.store_eax_to(modify_dest);
+                } else {
+                    self.store_rax_to(modify_dest);
                 }
             }
         }
-        self.state.emit_fmt(format_args!("    setc %{dest8}"));
-        // ALWAYS zero-extend: SETcc writes one byte only, and the
-        // destination was staged with the BASE (mask) value. Without the
-        // extension the 64-bit result kept mask bits 8..63 and a later
-        // `testq %dest,%dest` was nonzero for every in-range index
-        // (set_membership two-block form: bytes 59..64 classified as XML
-        // name chars). A 32-bit MOVZX zero-extends the full 64-bit
-        // register on x86-64, so one form covers both widths.
-        let dest32 = super::emit::phys_reg_name_32(dest_phys);
-        self.state
-            .emit_fmt(format_args!("    movzbl %{dest8}, %{dest32}"));
+    }
+
+    /// FLAG FUSION: a bit test whose 0/1 answer only feeds the adjacent
+    /// Select or CondBranch (prologue `fused_cmp_dests`; 32/64-bit only)
+    /// emits `bt` alone and hands CF to the consumer as `b` (`cmovb`/`jb`).
+    fn try_emit_bit_test_flags(
+        &mut self,
+        dest: &Value,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) -> bool {
+        let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) else {
+            return false;
+        };
+        self.emit_bt_flags(lhs, rhs, matches!(ty, IrType::I32 | IrType::U32));
+        self.pending_cmp = Some((chain_end, IrCmpOp::Ult));
+        self.state.reg_cache.invalidate_acc();
         true
+    }
+
+    /// Branch form of [`Self::emit_fused_bit_test_modify_impl`]: the modify,
+    /// then `jc`/`jnc` on the old bit.  `btr %esi,%eax; jnc .L` for
+    /// `if (x & m) { x &= ~m; ... }`, where both GCC 16.2 and Clang 23.1.4
+    /// test and clear separately.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_fused_bit_test_modify_branch_impl(
+        &mut self,
+        test_dest: &Value,
+        modify_dest: &Value,
+        op: IrBinOp,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        let Some(y) = self
+            .dest_reg(modify_dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        else {
+            // `bit_test_modify_fusable` admits only a GPR-homed modify, so
+            // this is unreachable today; the unfused sequence (the trait's
+            // default) keeps any future admission drift correct.
+            self.emit_binop(test_dest, IrBinOp::BitTest, base, index, ty);
+            self.emit_binop(modify_dest, op, base, index, ty);
+            self.emit_cond_branch_blocks(&Operand::Value(*test_dest), true_block, false_block);
+            return;
+        };
+        let staged = self.stage_bit_modify(base, index, Some(y), false, use_32bit);
+        self.emit_staged_bt(Self::bit_modify_mnemonic(op), &staged, use_32bit);
+        self.note_inplace_compute(y, modify_dest.0);
+        self.emit_carry_branch(true_block, false_block);
+    }
+
+    /// `jc true` / `jnc false` on a live CF, with the fall-through block
+    /// elided.
+    pub(super) fn emit_carry_branch(&mut self, true_block: BlockId, false_block: BlockId) {
+        if self.state.next_block_label == Some(true_block) {
+            self.state.out.emit_jcc_block("jnc", false_block.0);
+        } else {
+            self.state.out.emit_jcc_block("jc", true_block.0);
+            if self.state.next_block_label != Some(false_block) {
+                self.state.out.emit_jmp_block(false_block.0);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// `dest = BitTest(base, index) == 0` (`bit_clear`) or `!= 0` as `bt`
+    /// plus `setnc`/`setc` (or nothing at all when the comparison's own
+    /// consumer takes the flags: the pending condition is `ae`/`b`).
+    /// Refused when the comparison is a compare-replay or De Morgan
+    /// candidate, whose consumers re-read the comparison's operands -- here
+    /// the never-materialized test.
+    pub(super) fn emit_fused_bit_test_cmp_impl(
+        &mut self,
+        dest: &Value,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+        bit_clear: bool,
+    ) -> bool {
+        if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+            || !super::comparison::bit_test_flag_fusion_enabled()
+            || self.cmp_replay.contains_key(&dest.0)
+            || self.demorgan_skip.contains(&dest.0)
+        {
+            return false;
+        }
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        let cc_op = if bit_clear {
+            IrCmpOp::Uge
+        } else {
+            IrCmpOp::Ult
+        };
+        if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
+            self.emit_bt_flags(base, index, use_32bit);
+            self.pending_cmp = Some((chain_end, cc_op));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        let set = if bit_clear { "setnc" } else { "setc" };
+        match self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
+            Some(d) => {
+                let d8 = super::emit::typed_phys_reg_name(d, IrType::U8);
+                let d32 = super::emit::phys_reg_name_32(d);
+                let zero_first = !matches!(super::emit::phys_reg_name(d), "rax" | "rcx")
+                    && self.operand_reg(base) != Some(d)
+                    && self.operand_reg(index) != Some(d);
+                let staged = self.stage_bt_operands(base, index, use_32bit);
+                if zero_first {
+                    self.state.emit_fmt(format_args!("    xorl %{d32}, %{d32}"));
+                }
+                self.emit_staged_bt("bt", &staged, use_32bit);
+                self.state.emit_fmt(format_args!("    {set} %{d8}"));
+                if !zero_first {
+                    self.state
+                        .emit_fmt(format_args!("    movzbl %{d8}, %{d32}"));
+                }
+                self.note_inplace_compute(d, dest.0);
+                self.state.reg_cache.invalidate_acc();
+            }
+            None => {
+                self.emit_bit_test_into_rax(base, index, use_32bit, set);
+                self.store_rax_to(dest);
+            }
+        }
+        true
+    }
+
+    /// `dest = addend + BitTest(base, index)` -- `addend - BitTest(...)` when
+    /// `sub` -- as `bt` plus `adc $0` / `sbb $0`: CF is the tested bit, so
+    /// the carry-in is the test's 0/1 value and nothing is materialized.
+    /// With `addend2` (an absorbed inner add `addend + addend2`) the second
+    /// addend becomes `adc`'s source operand instead of `$0`: `mov p, d; bt;
+    /// adc q, d` for `p + q + bit`, Clang 23.1.4's `btl; adcl %edx,%eax` in
+    /// `shared_four`.
+    ///
+    /// The test is emitted first and the first addend copied into the
+    /// destination after it with a flag-preserving `mov`: the destination
+    /// may be the register of a test operand, which `bt` must read before it
+    /// is overwritten, and no other register is written in between (the
+    /// staging scratch %rax/%rcx is never a home).  When the destination
+    /// already holds one addend it is the in-place operand (the addends
+    /// commute).  Declined -- the instructions then emit normally -- unless
+    /// the destination has a GPR home and every addend is an immediate or
+    /// sits in a fresh GPR home: any other operand would need a load that may
+    /// write the flags.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_fused_bit_test_add_impl(
+        &mut self,
+        dest: &Value,
+        base: &Operand,
+        index: &Operand,
+        bt_ty: IrType,
+        addend: &Operand,
+        addend2: Option<&Operand>,
+        sub: bool,
+        ty: IrType,
+    ) -> bool {
+        if !matches!(bt_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+            || ty.size() != bt_ty.size()
+            || (sub && addend2.is_some())
+            || !super::comparison::bit_test_adc_fusion_enabled()
+        {
+            return false;
+        }
+        let use_32bit = bt_ty.size() == 4;
+        let Some(d) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) else {
+            return false;
+        };
+        if matches!(super::emit::phys_reg_name(d), "rax" | "rcx") {
+            return false;
+        }
+        let name = |r: PhysReg| {
+            if use_32bit {
+                super::emit::phys_reg_name_32(r)
+            } else {
+                super::emit::phys_reg_name(r)
+            }
+        };
+        // An operand's flag-preserving source text: `%reg` (with its home),
+        // `$imm`, or `None` when it cannot be read without a load.
+        let operand_text = |this: &Self, op: &Operand| -> Option<(String, Option<PhysReg>)> {
+            match op {
+                Operand::Const(c) => {
+                    let v = c.to_i64()?;
+                    if use_32bit {
+                        Some((format!("${}", v as i32), None))
+                    } else {
+                        Some((format!("${v}"), None))
+                    }
+                }
+                Operand::Value(_) => this
+                    .operand_reg(op)
+                    .filter(|r| !super::emit::is_xmm_reg(*r))
+                    .map(|r| (format!("%{}", name(r)), Some(r))),
+            }
+        };
+        let Some(mut first) = operand_text(self, addend) else {
+            return false;
+        };
+        let mut second = match addend2 {
+            Some(q) => match operand_text(self, q) {
+                Some(text) => Some(text),
+                None => return false,
+            },
+            None => None,
+        };
+        // The in-place operand first: no copy, and the other operand is read
+        // by `adc` before the destination changes.
+        if let Some(s) = second.as_mut()
+            && s.1 == Some(d)
+            && first.1 != Some(d)
+        {
+            std::mem::swap(&mut first, s);
+        }
+        // `adc`'s source: `$0`, a register, or an imm32 (64-bit `adc` takes
+        // only a sign-extended imm32).
+        let src = match &second {
+            None => "$0".to_string(),
+            Some((text, _)) => {
+                if !use_32bit && text.starts_with('$') {
+                    let fits = text[1..]
+                        .parse::<i64>()
+                        .is_ok_and(|v| i32::try_from(v).is_ok());
+                    if !fits {
+                        return false;
+                    }
+                }
+                text.clone()
+            }
+        };
+        // 64-bit immediates outside imm32 need `movabs` for the copy.
+        let copy = if first.1 == Some(d) {
+            None
+        } else if first.0.starts_with('$') {
+            let fits32 = first.0[1..]
+                .parse::<i64>()
+                .is_ok_and(|v| i32::try_from(v).is_ok());
+            Some(match (use_32bit, fits32) {
+                (true, _) => "movl",
+                (false, true) => "movq",
+                (false, false) => "movabsq",
+            })
+        } else {
+            Some(if use_32bit { "movl" } else { "movq" })
+        };
+        let staged = self.stage_bt_operands(base, index, use_32bit);
+        self.emit_staged_bt("bt", &staged, use_32bit);
+        let d_name = name(d);
+        if let Some(mov) = copy {
+            self.state
+                .emit_fmt(format_args!("    {mov} {}, %{d_name}", first.0));
+        }
+        let (op, sfx) = (
+            if sub { "sbb" } else { "adc" },
+            if use_32bit { 'l' } else { 'q' },
+        );
+        self.state
+            .emit_fmt(format_args!("    {op}{sfx} {src}, %{d_name}"));
+        self.note_inplace_compute(d, dest.0);
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
+    /// `%rax = BitTest(base, index)` (or its negation with `set == "setnc"`),
+    /// zero-extended.  When the staging leaves %rax free the result is built
+    /// with the zero idiom (`xorl %eax,%eax; bt; setc %al`); a base staged in
+    /// %rax itself keeps `setc %al; movzbl %al,%eax`.
+    fn emit_bit_test_into_rax(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        use_32bit: bool,
+        set: &str,
+    ) {
+        let staged = self.stage_bt_operands(base, index, use_32bit);
+        if !staged.base_in_rax {
+            self.state.emit("    xorl %eax, %eax");
+        }
+        self.emit_staged_bt("bt", &staged, use_32bit);
+        self.state.emit_fmt(format_args!("    {set} %al"));
+        if staged.base_in_rax {
+            self.state.emit("    movzbl %al, %eax");
+        }
+        self.state.reg_cache.invalidate_acc();
     }
 
     // ---- Binop ----
@@ -1134,6 +1646,9 @@ impl X86Codegen {
         // (Only And/Or can be claimed; other BinOps never appear in the
         // skip set, so no opcode check is needed.)
         if self.demorgan_skip.contains(&dest.0) {
+            return;
+        }
+        if op == IrBinOp::BitTest && self.try_emit_bit_test_flags(dest, lhs, rhs, ty) {
             return;
         }
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
@@ -2074,67 +2589,31 @@ impl X86Codegen {
         ty: IrType,
         use_32bit: bool,
     ) {
-        // Use the native BT instruction: base stays in %rax, the index is
-        // consumed from its own register when it has one (BT's index is an
-        // ordinary r/m operand — only variable shifts are pinned to %cl),
-        // SETC materializes CF, and the boolean is stored to the
-        // destination.  This is the cross-cutting canonical lower instead
-        // of patching text peepholes.
-        self.emit_load_operand(lhs);
         let bits = (ty.size() * 8) as u32;
         debug_assert!(matches!(bits, 8 | 16 | 32 | 64));
+        if bits >= 32 {
+            // Native widths: shared staging (fresh homes in place, scratch
+            // otherwise) and the zero idiom whenever %rax stays free.
+            self.emit_bit_test_into_rax(lhs, rhs, use_32bit, "setc");
+            self.store_rax_to(dest);
+            return;
+        }
+        // Subword BT has no native form: the base's low 8/16 bits are the
+        // whole IR value, read through the 32-bit form, with the index
+        // reduced modulo the IR width (staged through %rcx when variable).
+        self.emit_load_operand(lhs);
         if let Some(imm) = Self::const_as_imm32(rhs) {
             let bit = (imm as u32) % bits;
-            let bt_line = if bits <= 32 {
-                format!("    btl ${bit}, %eax")
-            } else {
-                format!("    btq ${bit}, %rax")
-            };
-            self.state.emit(&bt_line);
-        } else if bits < 32 {
-            // Subword BT has no native form. Stage the index through
-            // %rcx, reduce it modulo the IR width, and use the 32-bit BT
-            // form; the base's low 8/16 bits are the whole IR value.
-            self.operand_to_rcx(rhs);
-            self.state.emit(&format!("    andl ${}, %ecx", bits - 1));
-            self.state.emit("    btl %ecx, %eax");
+            self.state.emit_fmt(format_args!("    btl ${bit}, %eax"));
         } else {
-            // %rax is not allocatable on x86-64, so a register-resident
-            // index can never be clobbered by the base load above.  A
-            // value without a home still stages through %rcx.
-            let own_reg = match rhs {
-                Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
-                _ => None,
-            };
-            match own_reg {
-                Some(reg) if !super::emit::is_xmm_reg(reg) => {
-                    let idx = if use_32bit {
-                        super::emit::phys_reg_name_32(reg)
-                    } else {
-                        super::emit::phys_reg_name(reg)
-                    };
-                    let dst = if use_32bit { "eax" } else { "rax" };
-                    let bt = if use_32bit { "btl" } else { "btq" };
-                    self.state.emit_fmt(format_args!("    {bt} %{idx}, %{dst}"));
-                }
-                _ => {
-                    self.operand_to_rcx(rhs);
-                    self.state.emit(if use_32bit {
-                        "    btl %ecx, %eax"
-                    } else {
-                        "    btq %rcx, %rax"
-                    });
-                }
-            }
+            self.operand_to_rcx(rhs);
+            self.state
+                .emit_fmt(format_args!("    andl ${}, %ecx", bits - 1));
+            self.state.emit("    btl %ecx, %eax");
         }
         self.state.emit("    setc %al");
-        self.state.emit(if use_32bit {
-            "    movzbl %al, %eax"
-        } else {
-            "    movzbq %al, %rax"
-        });
+        self.state.emit("    movzbl %al, %eax");
         self.store_rax_to(dest);
-        return;
     }
 
     /// The x86 mnemonic for one of the three bit-modify operations.  `bts`,
@@ -2674,6 +3153,14 @@ impl X86Codegen {
 /// The IR types `Bzhi` is defined on (see `IrBinOp::Bzhi`).
 fn is_bzhi_type(ty: IrType) -> bool {
     matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+}
+
+/// The AT&T spellings of a staged `bt`-family instruction's operands.
+struct StagedBt {
+    base: &'static str,
+    index: String,
+    /// The base sits in %rax, which the caller therefore cannot pre-zero.
+    base_in_rax: bool,
 }
 
 #[cfg(test)]

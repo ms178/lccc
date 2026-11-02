@@ -886,6 +886,60 @@ impl I686Codegen {
         true
     }
 
+    /// 32-bit `BitTest` whose base has a register home: `btl idx, %base;
+    /// setc %al; movzbl %al,%eax` reads the base in place, where the generic
+    /// path stages it into the accumulator first (`movl %base,%eax; btl
+    /// idx,%eax; ...`).  No zero idiom ahead of the test: %eax stays free
+    /// until `setc`, so when the base's producer could have written %eax
+    /// directly the peephole still renames the base's home into it (ICU's
+    /// `U8_IS_VALID_LEAD4_AND_T1`, `movsbl (..),%eax; btl %ebx,%eax`), which
+    /// a pre-zeroed %eax would block and cost a callee-saved register.  The
+    /// index is an immediate (reduced modulo 32), its own register home, or
+    /// staged through %ecx.  Declined for an %eax base (the result register),
+    /// an %ecx base (possibly the index staging register), and a base the
+    /// accumulator still holds: the generic path then stages nothing either,
+    /// and keeping the test on %eax leaves the home's copy dead, so the
+    /// peephole drops the home and with it a callee-saved push/pop pair (ICU
+    /// `U8_IS_VALID_LEAD4_AND_T1` at -m32: 16 instructions, 18 in place).
+    fn try_emit_bit_test_reg_base(
+        &mut self,
+        dest: &Value,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+    ) -> bool {
+        let (Operand::Value(bv), IrType::I32 | IrType::U32) = (base, ty) else {
+            return false;
+        };
+        if self.state.reg_cache.acc_has(bv.0, false) {
+            return false;
+        }
+        let Some(base_ref) = self.direct_reg_src_ref(bv) else {
+            return false;
+        };
+        if base_ref == "%eax" || base_ref == "%ecx" {
+            return false;
+        }
+        let own_reg = match index {
+            Operand::Value(iv) => self.direct_reg_src_ref(iv),
+            Operand::Const(_) => None,
+        };
+        let idx = match (Self::const_as_imm32(index), own_reg) {
+            (Some(imm), _) => format!("${}", (imm as u32) % 32),
+            (None, Some(r)) => r,
+            (None, None) => {
+                self.operand_to_ecx(index);
+                "%ecx".to_string()
+            }
+        };
+        emit!(self.state, "    btl {}, {}", idx, base_ref);
+        self.state.emit("    setc %al");
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_acc();
+        self.store_eax_to(dest);
+        true
+    }
+
     pub(super) fn emit_int_binop_impl(
         &mut self,
         dest: &Value,
@@ -943,6 +997,9 @@ impl I686Codegen {
         // Direct-to-dest path: skip the accumulator entirely when the dest
         // has a register and both operands are register/slot/imm-resident.
         if self.try_emit_int_binop_direct(dest, op, lhs, rhs) {
+            return;
+        }
+        if op == IrBinOp::BitTest && self.try_emit_bit_test_reg_base(dest, lhs, rhs, ty) {
             return;
         }
         // Immediate optimization for ALU ops

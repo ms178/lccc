@@ -3016,6 +3016,27 @@ impl Driver {
         crate::passes::verify::verify_after_pass(module, "phi_relay_fold");
     }
 
+    /// x86/i686: place each `BitTest` next to a `BitSet`/`BitClear`/
+    /// `BitToggle` of the same bit so instruction selection can share the
+    /// modify's CF (`btr; setc` / `btr; jnc`).  Last IR edit before phi
+    /// lowering: every pass that could sink or reorder has already run.
+    fn schedule_bit_test_modify_pairs(&self, module: &mut crate::ir::module::IrModule) {
+        if self.opt_level < 1
+            || crate::passes::pass_disabled(
+                std::env::var("CCC_DISABLE_PASSES").unwrap_or_default(),
+                "bt_modify_pairs",
+            )
+        {
+            return;
+        }
+        for func in module.functions.iter_mut() {
+            if !func.is_declaration && !func.blocks.is_empty() {
+                crate::passes::bit_idioms::schedule_bit_test_modify_pairs(func);
+            }
+        }
+        crate::passes::verify::verify_after_pass(module, "bt_modify_pairs");
+    }
+
     fn split_and_layout_blocks(
         &self,
         mut module: crate::ir::module::IrModule,
@@ -3142,6 +3163,7 @@ impl Driver {
         }
 
         self.fold_phi_relays(&mut module);
+        self.schedule_bit_test_modify_pairs(&mut module);
 
         // Lower SSA phi nodes to copies before codegen
         if std::env::var_os("CCC_VALIDATE_SSA").is_some() {

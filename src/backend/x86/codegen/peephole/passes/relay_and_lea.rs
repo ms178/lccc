@@ -2865,9 +2865,23 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         let prod = infos[i].trimmed(store.get(i));
-        let Some(op) = PURE_PRODUCERS.iter().find(|p| prod.starts_with(**p)) else {
-            i += 1;
-            continue;
+        // An `add{l,q} %S|$imm, %T` reads `T`, so it is no pure producer --
+        // but its flag-free LEA form `lea (%T, %S), %D` is: the LEA reads
+        // `T`'s pre-window value once, at the producer, and writes `D`
+        // (`shared_four`: `addl %esi, %edi; ...; adcl %edx, %edi; movl %edi,
+        // %eax` becomes `leal (%rdi, %rsi), %eax; ...; adcl %edx, %eax`).
+        let (op, is_add) = match PURE_PRODUCERS.iter().find(|p| prod.starts_with(**p)) {
+            Some(op) => (*op, false),
+            None => match ["addl ", "addq "]
+                .into_iter()
+                .find(|p| prod.starts_with(*p))
+            {
+                Some(op) => (op, true),
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
         };
         let Some((prod_src, prod_dst)) = split_two_operands(&prod[op.len()..]) else {
             i += 1;
@@ -2878,6 +2892,21 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
             continue;
         };
         if matches!(t, 4 | 5) || t > REG_GP_MAX || line_refs_family(prod_src, t) {
+            i += 1;
+            continue;
+        }
+        // The LEA form needs an immediate or a same-width plain register
+        // that can serve as an index (never %rsp), and the add's flags dead:
+        // the LEA writes none.
+        let add_addend = if is_add {
+            add_lea_addend(prod_src, prod_w)
+        } else {
+            None
+        };
+        if is_add
+            && (add_addend.is_none()
+                || !super::flag_peepholes::flags_dead_after(store, infos, i + 1))
+        {
             i += 1;
             continue;
         }
@@ -2965,6 +2994,10 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         // 64-bit producer, 32-bit copy: only an exact 32-bit form of a
         // producer that is the window's sole mention of T qualifies.
         let narrowed = if last_w == 64 && copy_w == 32 {
+            if is_add {
+                i += 1;
+                continue;
+            }
             let sole = !window[1..]
                 .iter()
                 .any(|&w| line_refs_family(infos[w].trimmed(store.get(w)), t));
@@ -3005,6 +3038,19 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         }
         for &w in &window {
             let text = infos[w].trimmed(store.get(w));
+            if w == i
+                && let Some(addend) = &add_addend
+            {
+                let base = REG_NAMES[0][t as usize];
+                let dest = REG_NAMES[if prod_w == 64 { 0 } else { 1 }][d as usize];
+                let mnemonic = if prod_w == 64 { "leaq" } else { "leal" };
+                let lea = match *addend {
+                    AddLeaAddend::Imm(k) => format!("    {mnemonic} {k}({base}), {dest}"),
+                    AddLeaAddend::Reg(index) => format!("    {mnemonic} ({base}, {index}), {dest}"),
+                };
+                replace_line(store, &mut infos[w], w, lea);
+                continue;
+            }
             if line_refs_family(text, t) {
                 let renamed = replace_reg_family(text, t, d);
                 // A producer that copies `D` itself (`movq %r13, %rdi; rolq
@@ -3026,6 +3072,39 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         i = j + 1;
     }
     changed
+}
+
+/// The addend of an `add{l,q} SRC, %T` rewritten as a LEA.
+enum AddLeaAddend {
+    /// `$k`: the displacement (a 32-bit `addl` immediate wraps exactly like
+    /// a 32-bit LEA displacement; an `addq` immediate already is a
+    /// sign-extended imm32).
+    Imm(i64),
+    /// A plain register, spelled at 64 bits for the address.
+    Reg(&'static str),
+}
+
+/// `SRC` of `add{l,q} SRC, %T` (width `w`) as a LEA addend: an immediate, or
+/// a plain general register of the same width that may serve as an index
+/// (not %rsp).  `None` for memory sources and anything else.
+fn add_lea_addend(src: &str, w: u8) -> Option<AddLeaAddend> {
+    if let Some(k) = src.strip_prefix('$') {
+        let k: i64 = k.parse().ok()?;
+        let disp = if w == 32 {
+            // `addl` accepts any 32-bit pattern and the 32-bit LEA result
+            // wraps identically, so `$4294967295` is the displacement -1.
+            if !(i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&k) {
+                return None;
+            }
+            i64::from(k as u32 as i32)
+        } else {
+            i64::from(i32::try_from(k).ok()?)
+        };
+        return Some(AddLeaAddend::Imm(disp));
+    }
+    let fam = plain_gp_operand(src)?;
+    (fam != 4 && fam <= REG_GP_MAX && dest_width(src) == Some(w))
+        .then(|| AddLeaAddend::Reg(REG_NAMES[0][fam as usize]))
 }
 
 /// True iff `insn` is `movq %R, %R` for one 64-bit general register.
@@ -3320,10 +3399,17 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
 /// destination from the copy's destination family to its source family
 /// preserves the computed value and the flags. Deliberately minimal: `adc`,
 /// `sbb`, `rol` and `ror` are sound by the same argument but unmeasured —
-/// extend only with census data.
+/// extend only with census data.  The bit-modify forms `bts`/`btr`/`btc`
+/// qualify by the same argument (they read the index and the destination,
+/// then write the destination and CF = the destination's old bit): the
+/// x86 accumulator path stages a dying base into %rax before every one of
+/// them (`movq %rdi,%rax; btsl %esi,%eax` -> `btsl %esi,%edi`, measured on
+/// the Chromium/Firefox bit-idiom probe, where it frees %eax for the test's
+/// `setc`).
 const RMW_CONSUMER_OPS: &[&str] = &[
     "andl ", "orl ", "xorl ", "addl ", "subl ", "shll ", "shrl ", "sarl ", "andq ", "orq ",
-    "xorq ", "addq ", "subq ", "shlq ", "shrq ", "sarq ",
+    "xorq ", "addq ", "subq ", "shlq ", "shrq ", "sarq ", "btsl ", "btrl ", "btcl ", "btsq ",
+    "btrq ", "btcq ",
 ];
 
 /// Coalesce `mov %S, %D` into the read-modify-write consumer that destinations
@@ -3364,9 +3450,11 @@ const RMW_CONSUMER_OPS: &[&str] = &[
 ///    established it; every prior rename preserved it — including
 ///    read-modify-writes of `%D`, which compute the identical result+flags
 ///    from the same values into `%S`). A full redefinition of `%D` ends the
-///    window; ANY mention of `%S` aborts it (a pre-existing read would
-///    observe the new value instead of the old one, a write would clobber
-///    the renamed value); partial writes (`movb`, `setcc`), `cmov`/`xchg`
+///    window; any other mention of `%S` aborts it (a pre-existing read
+///    would observe the new value instead of the old one, a write would
+///    clobber the renamed value) -- except a full write of `%S` reached
+///    after `%D`'s value died, which only ends the window; partial writes
+///    (`movb`, `setcc`), `cmov`/`xchg`
 ///    and memory mentions of `%D` abort, as do pinned lines and lines with
 ///    implicit register traffic; the window ends at barriers, leaving
 ///    downstream paths to the deadness proof.
@@ -4328,6 +4416,84 @@ fn is_rmw_of_family(t: &str, fam: RegId) -> bool {
     last_top_level_comma(s0.as_bytes()).is_none()
 }
 
+/// The read-modify-write consumer candidate of the copy at `li`: the next
+/// line that mentions `%S` or `%D` (implicit operands included).  Up to two
+/// lines mentioning NEITHER family may sit in between (the emitters zero a
+/// boolean's register between a modify's staging copy and the modify: `movq
+/// %rdi,%rax; xorl %r8d,%r8d; btsl %esi,%eax`): they cannot observe the
+/// deleted copy or the retargeted write, and `%S == %D` still holds at the
+/// consumer.  Barriers and pinned lines are never crossed (`None`).
+fn rmw_consumer_line(infos: &[LineInfo], li: usize, s_fam: u8, d_fam: u8) -> Option<usize> {
+    let sd_bits = (1u16 << s_fam) | (1u16 << d_fam);
+    let mut crossed = 0;
+    for (j, info) in infos.iter().enumerate().skip(li + 1) {
+        if info.is_nop() || (info.kind == LineKind::Directive && info.inert_dir) {
+            continue;
+        }
+        if info.pinned || info.is_barrier() {
+            return None;
+        }
+        if crossed < 2 && info.reg_refs & sd_bits == 0 {
+            crossed += 1;
+            continue;
+        }
+        return Some(j);
+    }
+    None
+}
+
+/// How the rename window of [`coalesce_copy_into_rmw`] treats a line `k`
+/// that mentions the copy's SOURCE family.
+enum SourceMention {
+    /// A full write of %S reached after %D's value died: the window ends.
+    EndsWindow,
+    /// A full write of %S whose line also holds %D's LAST read: the read is
+    /// renamed to this text and the window ends.
+    LastRead(String),
+    /// Anything else: the candidate is refused.
+    Abort,
+}
+
+/// Classify line `k` (text `t`) of the window opened by the consumer at
+/// `j`.  Only a full write of the source can end the window:
+///
+/// * When the coalesced value is already dead entering the line, nothing
+///   later reads %D's value (the deadness proof re-checks it on the
+///   rewritten text), and the source's old value was dead at the copy, so
+///   the write clobbers nothing (`shared_four`: `movq %rsi,%r10; btrl
+///   %r9d,%r10d; addl %r10d,%r11d; ...; xorl %esi,%esi` zeroing a later
+///   boolean's home).
+/// * The coalesced value's LAST read may share the line (`btsl %r10d,%esi;
+///   movzbl %sil,%r11d` coalescing %rsi into %r11, the MSB-first byte set):
+///   every source operand is read before the destination is written, so the
+///   renamed read observes the coalesced value, and after the line nothing
+///   reads it (dead) nor %S's old value (overwritten unread: `is_full_write`
+///   refuses a source operand naming %S).
+fn classify_source_mention(
+    lv: &FileLiveness,
+    infos: &[LineInfo],
+    t: &str,
+    j: usize,
+    k: usize,
+    s_fam: u8,
+    d_fam: u8,
+) -> SourceMention {
+    if !is_full_write(&infos[k], t, s_fam) {
+        return SourceMention::Abort;
+    }
+    let before = (j..k).rev().find(|&x| !infos[x].is_nop()).unwrap_or(j);
+    if matches!(lv.live_after(before, d_fam), Some(false)) {
+        return SourceMention::EndsWindow;
+    }
+    if infos[k].reg_refs & (1u16 << d_fam) != 0
+        && matches!(lv.live_after(k, d_fam), Some(false))
+        && let Some(new_t) = rename_plain_family_reads(t, d_fam, s_fam)
+    {
+        return SourceMention::LastRead(new_t);
+    }
+    SourceMention::Abort
+}
+
 pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
@@ -4383,16 +4549,11 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
                 continue;
             }
         }
-        // The consumer: adjacent (NOPs apart) so `%S == %D` still holds, a
-        // two-operand ALU op destinationing exactly `%D` at a width the copy
-        // established.
-        let mut j = li + 1;
-        while j < len && infos[j].is_nop() {
-            j += 1;
-        }
-        if j >= len || infos[j].pinned || infos[j].is_barrier() {
+        // The consumer: a two-operand ALU op destinationing exactly `%D` at
+        // a width the copy established.
+        let Some(j) = rmw_consumer_line(infos, li, s_fam, d_fam) else {
             continue;
-        }
+        };
         let cons = infos[j].trimmed(store.get(j)).to_string();
         if has_implicit_reg_usage(&cons) {
             continue;
@@ -4529,7 +4690,13 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
                 break;
             }
             if line_refs_family(&t, s_fam) {
-                abort = true;
+                match classify_source_mention(&lv, infos, &t, j, k, s_fam, d_fam) {
+                    SourceMention::EndsWindow => {}
+                    SourceMention::LastRead(new_t) => {
+                        rewrites.push((k, store.get(k).to_string(), new_t));
+                    }
+                    SourceMention::Abort => abort = true,
+                }
                 break;
             }
             if infos[k].reg_refs & d_mask == 0 {
@@ -6114,9 +6281,94 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_64bit_consumer_under_32bit_copy() {
-        // The 64-bit shift reads the source's unknown upper half: unsound to
-        // retarget, so the copy must stay (whatever other passes do around
-        // it).
+        // The 64-bit right shift reads the source's unknown upper half (bit
+        // 32 lands in bit 31): unsound to retarget, so the copy must stay
+        // (whatever other passes do around it), even though the source's
+        // later full write ends its lifetime.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %eax, %r9d\n",
+            "    shrq $1, %r9\n",
+            "    movq %r9, (%rsi)\n",
+            "    movl $0, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %eax, %r9d"), "{out}");
+        assert!(out.contains("shrq $1, %r9"), "{out}");
+    }
+
+    /// Chromium/Firefox `shared_four`: the chain starts with an in-place
+    /// `addl` of a live-in register, so its flag-free LEA form writes the
+    /// copy's destination directly (Clang 23.1.4 emits the same sequence).
+    #[test]
+    fn rename_chain_turns_an_add_producer_into_a_lea_into_the_copy() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    btsl %r8d, %edi\n",
+            "    btrl %r8d, %esi\n",
+            "    addl %esi, %edi\n",
+            "    btcl %r8d, %edx\n",
+            "    btl %r8d, %ecx\n",
+            "    adcl %edx, %edi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal (%rdi, %rsi), %eax"), "{out}");
+        assert!(out.contains("adcl %edx, %eax"), "{out}");
+        assert!(!out.contains("movl %edi, %eax"), "{out}");
+        // Immediate addends become displacements; 32-bit patterns wrap.
+        for (imm, disp) in [("$5", "5"), ("$-3", "-3"), ("$4294967295", "-1")] {
+            let out = run(&format!(
+                "foo:\n.cfi_startproc\n    addl {imm}, %edi\n    btl %r8d, %ecx\n    adcl %edx, %edi\n    movl %edi, %eax\n    ret\n.cfi_endproc\n"
+            ));
+            assert!(
+                out.contains(&format!("leal {disp}(%rdi), %eax")),
+                "{imm}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_chain_keeps_an_add_producer_it_cannot_express_as_a_lea() {
+        for (body, keep) in [
+            // The add's CF is read by the `adc`: a LEA writes no flags.
+            (
+                "    addl %esi, %edi\n    adcl %edx, %edi\n    xorl %ecx, %edi\n    movl %edi, %eax\n",
+                "addl %esi, %edi",
+            ),
+            // A memory addend has no LEA form.
+            (
+                "    addl 8(%rsi), %edi\n    btl %r8d, %ecx\n    adcl %edx, %edi\n    movl %edi, %eax\n",
+                "addl 8(%rsi), %edi",
+            ),
+            // The last write is 64-bit under a 32-bit copy.
+            (
+                "    addq %rsi, %rdi\n    btl %r8d, %ecx\n    adcq %rdx, %rdi\n    movl %edi, %eax\n",
+                "addq %rsi, %rdi",
+            ),
+            // The copy's destination is read inside the window.
+            (
+                "    addl %esi, %edi\n    btl %eax, %ecx\n    adcl %edx, %edi\n    movl %edi, %eax\n",
+                "addl %esi, %edi",
+            ),
+        ] {
+            let out = run(&format!(
+                "foo:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n"
+            ));
+            assert!(out.contains(keep), "{body}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn rmw_coalesce_folds_shlq32_up_to_a_late_full_source_write() {
+        // P2.5: `movl %S, %D; shlq $32, %D` computes `%S_lo32 << 32` either
+        // way (the shift discards exactly the bits the zero-extension fixed).
+        // The later `movl $0, %eax` writes `%S` only after `%D`'s value died,
+        // so it ends the window instead of aborting it.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -6127,7 +6379,20 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("movl %eax, %r9d"), "{out}");
+        assert!(!out.contains("%r9"), "{out}");
+        assert!(out.contains("shlq $32, %rax"), "{out}");
+        assert!(out.contains("movq %rax, (%rsi)"), "{out}");
+        // While `%D` is still live the write of `%S` aborts the window.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %eax, %r9d\n",
+            "    shlq $32, %r9\n",
+            "    movl $0, %eax\n",
+            "    movq %r9, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
         assert!(out.contains("shlq $32, %r9"), "{out}");
     }
 
@@ -7098,7 +7363,31 @@ mod tests {
     #[test]
     fn rmw_coalesce_folds_movl_addq64_proven() {
         // P3 is not or-specific: any matched 64-bit RMW folds under the
-        // proof (exact value equality covers every opcode).
+        // proof (exact value equality covers every opcode). The carry is
+        // read afterwards, so the copy and add cannot become one flagless
+        // `leaq` (see the next test) and the RMW form is what remains.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    orl %r11d, %r10d\n",
+            "    movl %r10d, %edi\n",
+            "    addq %rax, %rdi\n",
+            "    movq %rdi, (%rsi)\n",
+            "    setc %al\n",
+            "    movzbl %al, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %r10d"), "{out}");
+        assert!(out.contains("addq %rax, %r10"), "{out}");
+        assert!(out.contains("movq %r10, (%rsi)"), "{out}");
+    }
+
+    /// With the flags dead, the same proven-zero-upper copy and add are one
+    /// `leaq` (`fold_copy_add_into_lea`): as short as the RMW form, with no
+    /// flags write and the source register left intact.
+    #[test]
+    fn movl_addq64_proven_with_dead_flags_is_one_leaq() {
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -7111,8 +7400,8 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(!out.contains("movl %r10d"), "{out}");
-        assert!(out.contains("addq %rax, %r10"), "{out}");
-        assert!(out.contains("movq %r10, (%rsi)"), "{out}");
+        assert!(out.contains("leaq (%r10, %rax), %rdi"), "{out}");
+        assert!(!out.contains("addq"), "{out}");
     }
 
     #[test]

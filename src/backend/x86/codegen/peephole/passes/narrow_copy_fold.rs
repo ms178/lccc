@@ -999,6 +999,103 @@ pub(super) fn eliminate_dead_inplace_ext(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
+/// Both dead in-place extension mop-ups, sign ([`eliminate_dead_inplace_ext`])
+/// then zero ([`eliminate_dead_inplace_zext`]), under one skip key
+/// (`dead_inplace_ext`).  Both always run.
+pub(super) fn eliminate_dead_inplace_extensions(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let sext = eliminate_dead_inplace_ext(store, infos);
+    eliminate_dead_inplace_zext(store, infos) | sext
+}
+
+/// Delete an in-place zero-extension -- `movzbl %Rb, %Rd` or `movzwl %Rw,
+/// %Rd` -- whose cleared bits are never read: every mention of the family up
+/// to its death (or to a full rewrite that does not read it) is a pure READ of
+/// exactly the narrow source spelling.  The extension changes bits 8..63
+/// (16..63) only, which no such reader observes.
+///
+/// The MSB-first byte set leaves exactly this behind once its base copy is
+/// coalesced (`btsl %esi, %r11d; movzbl %r11b, %r11d; movb %r11b, (M)`, the
+/// FreeType `ps_mask_set_bit` shape).  Fail-closed: a barrier, a pinned or
+/// inline-asm line, implicit register traffic, a partial write, any other
+/// spelling of the family (the high byte `%ah` reads bits 8..15 included) or
+/// an unknown liveness answer keeps the extension.
+pub(super) fn eliminate_dead_inplace_zext(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    use super::helpers::HIGH_BYTE_NAMES;
+    use super::relay_and_lea::line_refs_family;
+
+    let len = store.len();
+    let mut lv: Option<FileLiveness> = None;
+    let mut changed = false;
+    for i in 0..len {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let Some((fam, narrow)) = inplace_zext(infos[i].trimmed(store.get(i))) else {
+            continue;
+        };
+        let mut dead = false;
+        let mut j = i + 1;
+        while j < len {
+            if infos[j].is_nop() {
+                j += 1;
+                continue;
+            }
+            if infos[j].is_barrier() || infos[j].pinned || infos[j].kind == LineKind::InlineAsm {
+                break;
+            }
+            let l = infos[j].trimmed(store.get(j));
+            if has_implicit_reg_usage(l)
+                || implicit_reg_refs(l.as_bytes()) & (1u16 << fam) != 0
+                || ((fam as usize) < 4 && l.contains(HIGH_BYTE_NAMES[fam as usize]))
+            {
+                break;
+            }
+            if !line_refs_family(l, fam) {
+                j += 1;
+                continue;
+            }
+            if is_full_write(&infos[j], l, fam) {
+                dead = true;
+                break;
+            }
+            if writes_family(&infos[j], l, fam) || line_refs_family(&l.replace(narrow, ""), fam) {
+                break;
+            }
+            let lv = lv.get_or_insert_with(|| FileLiveness::new(store, infos));
+            if lv.live_after(j, fam) == Some(false) {
+                dead = true;
+                break;
+            }
+            j += 1;
+        }
+        if dead {
+            mark_nop(&mut infos[i]);
+            lv = None;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// `(family, narrow source spelling)` of an in-place `movzbl %Rb, %Rd` /
+/// `movzwl %Rw, %Rd`.
+fn inplace_zext(t: &str) -> Option<(RegId, &'static str)> {
+    let (rest, tier) = if let Some(r) = t.strip_prefix("movzbl ") {
+        (r, 3)
+    } else if let Some(r) = t.strip_prefix("movzwl ") {
+        (r, 2)
+    } else {
+        return None;
+    };
+    let (src, dst) = super::relay_and_lea::split_two_operands(rest)?;
+    let fam = super::relay_and_lea::plain_gp_operand(dst)?;
+    let f = fam as usize;
+    (dst == REG_NAMES[1][f] && src == REG_NAMES[tier][f]).then_some((fam, REG_NAMES[tier][f]))
+}
+
 // ── D. induction copy-back folds ────────────────────────────────────────────
 
 /// The producer whose destination feeds a copy straight back into one of

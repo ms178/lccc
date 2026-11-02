@@ -69,20 +69,6 @@ fn bounds(cx: &Context<'_>, value: Operand, ty: IrType, facts: &Facts) -> Option
     })
 }
 
-fn reverse(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq | IrCmpOp::Ne => op,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-    }
-}
-
 // Unary count `ty` describes the input word. Frontend C builtins may
 // consume its result as I32 even for U64 inputs, without an explicit cast.
 // All admitted carriers preserve 0..=64; keep source width separate.
@@ -115,7 +101,7 @@ pub(super) fn comparison(
     if !scalar(ty) {
         return None;
     }
-    for (value, constant_operand, op) in [(lhs, rhs, op), (rhs, lhs, reverse(op))] {
+    for (value, constant_operand, op) in [(lhs, rhs, op), (rhs, lhs, op.swapped())] {
         let Some(k) = const_in_ring(constant_operand, ty.size() * 8) else {
             continue;
         };

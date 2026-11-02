@@ -456,22 +456,7 @@ fn bounded_progress(
     if bound <= 0 || bound > MAX_TRIP_BOUND || step <= 0 || bound < step {
         return false;
     }
-    let op = if continue_on_true {
-        op
-    } else {
-        match op {
-            IrCmpOp::Eq => IrCmpOp::Ne,
-            IrCmpOp::Ne => IrCmpOp::Eq,
-            IrCmpOp::Slt => IrCmpOp::Sge,
-            IrCmpOp::Sle => IrCmpOp::Sgt,
-            IrCmpOp::Sgt => IrCmpOp::Sle,
-            IrCmpOp::Sge => IrCmpOp::Slt,
-            IrCmpOp::Ult => IrCmpOp::Uge,
-            IrCmpOp::Ule => IrCmpOp::Ugt,
-            IrCmpOp::Ugt => IrCmpOp::Ule,
-            IrCmpOp::Uge => IrCmpOp::Ult,
-        }
-    };
+    let op = if continue_on_true { op } else { op.inverse() };
     // Widening a signed 32-bit index sign-extends it; crossing its sign
     // bit would no longer denote the accumulated positive pointer offset.
     let signed = signed_index || matches!(op, IrCmpOp::Slt | IrCmpOp::Sle);

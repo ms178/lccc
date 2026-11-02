@@ -43,21 +43,6 @@ struct AgainstConstant {
     ty: IrType,
 }
 
-/// Reverse a comparison's operands.
-fn mirror_cmp(op: IrCmpOp) -> IrCmpOp {
-    match op {
-        IrCmpOp::Eq | IrCmpOp::Ne => op,
-        IrCmpOp::Slt => IrCmpOp::Sgt,
-        IrCmpOp::Sle => IrCmpOp::Sge,
-        IrCmpOp::Sgt => IrCmpOp::Slt,
-        IrCmpOp::Sge => IrCmpOp::Sle,
-        IrCmpOp::Ult => IrCmpOp::Ugt,
-        IrCmpOp::Ule => IrCmpOp::Uge,
-        IrCmpOp::Ugt => IrCmpOp::Ult,
-        IrCmpOp::Uge => IrCmpOp::Ule,
-    }
-}
-
 fn against_constant(opnd: Operand, defs: &[Option<Instruction>]) -> Option<AgainstConstant> {
     let Operand::Value(v) = peel(opnd, defs) else {
         return None;
@@ -82,7 +67,7 @@ fn against_constant(opnd: Operand, defs: &[Option<Instruction>]) -> Option<Again
     }
     if let Some(constant) = const_in_ring(*lhs, bits) {
         return Some(AgainstConstant {
-            op: mirror_cmp(*op),
+            op: op.swapped(),
             value: *rhs,
             constant,
             ty: *ty,

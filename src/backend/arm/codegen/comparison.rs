@@ -117,6 +117,111 @@ impl ArmCodegen {
         self.state.reg_cache.invalidate_all();
     }
 
+    /// Fused BitTest -> CondBranch: `tst base, #(1 << k)` for an immediate
+    /// index, `lsr w0, base, index` + `tst w0, #1` for a variable one, then
+    /// the conditional branch -- no 0/1 boolean is materialized.  Narrow
+    /// widths reduce the index modulo their own width first (the base's
+    /// register holds the canonical narrow value, whose low bits are the
+    /// value's bits).  `tbz`/`tbnz` would save the `tst`, but they reach only
+    /// +-32 KiB and this backend has no branch relaxation (the assembler
+    /// rejects an out-of-range branch), so the +-1 MiB `b.cond` that `cbz`
+    /// and every fused compare already rely on is used.
+    pub(super) fn emit_fused_bit_test_branch_blocks_impl(
+        &mut self,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+        true_block: crate::ir::reexports::BlockId,
+        false_block: crate::ir::reexports::BlockId,
+    ) {
+        let width = (ty.size() * 8) as i64;
+        debug_assert!(matches!(width, 8 | 16 | 32 | 64));
+        let r = if width == 64 { 'x' } else { 'w' };
+        let reg_text = |v: &Operand, this: &Self| match v {
+            Operand::Value(v) => this
+                .value_reg_name_pub(v)
+                .map(|(x, w)| if width == 64 { x } else { w }),
+            Operand::Const(_) => None,
+        };
+        let base_src = match reg_text(base, self) {
+            Some(name) => name.to_string(),
+            None => {
+                self.operand_to_x0(base);
+                self.state.emit("    mov x1, x0");
+                format!("{r}1")
+            }
+        };
+        match Self::const_as_imm12(index) {
+            Some(imm) => {
+                let bit = (imm as i64).rem_euclid(width);
+                self.state
+                    .emit_fmt(format_args!("    tst {base_src}, #{:#x}", 1u64 << bit));
+            }
+            None => {
+                let amount = match reg_text(index, self) {
+                    Some(name) if width >= 32 => name.to_string(),
+                    Some(name) => {
+                        self.state
+                            .emit_fmt(format_args!("    and w0, {name}, #{}", width - 1));
+                        "w0".to_string()
+                    }
+                    None => {
+                        self.operand_to_x0(index);
+                        if width < 32 {
+                            self.state
+                                .emit_fmt(format_args!("    and w0, w0, #{}", width - 1));
+                        }
+                        format!("{r}0")
+                    }
+                };
+                self.state
+                    .emit_fmt(format_args!("    lsr {r}0, {base_src}, {amount}"));
+                self.state.emit_fmt(format_args!("    tst {r}0, #1"));
+            }
+        }
+        let skip = self.state.fresh_label("skip");
+        self.state.emit_fmt(format_args!("    b.eq {skip}"));
+        self.state
+            .emit_fmt(format_args!("    b {}", true_block.as_label()));
+        self.state.emit_fmt(format_args!("{skip}:"));
+        self.state
+            .emit_fmt(format_args!("    b {}", false_block.as_label()));
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// `dest = BitTest(base, index) == 0` (`bit_clear`) or `!= 0`, computed
+    /// straight into the destination's GP home: the test itself
+    /// ([`Self::emit_bit_test_into`]) and, for `== 0`, one `eor #1` -- no
+    /// flags, no `cset`, no copy out of x0.  Declined for narrow widths and a
+    /// homeless destination (the caller then emits both instructions).
+    pub(super) fn emit_fused_bit_test_cmp_impl(
+        &mut self,
+        dest: &Value,
+        base: &Operand,
+        index: &Operand,
+        ty: IrType,
+        bit_clear: bool,
+    ) -> bool {
+        if !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+            return false;
+        }
+        let Some(d) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) else {
+            return false;
+        };
+        let use_32bit = ty.size() == 4;
+        if !self.emit_bit_test_into(d, base, index, use_32bit) {
+            return false;
+        }
+        if bit_clear {
+            // The comparison's own result is a 32-bit 0/1 whatever the test's
+            // width, and the `ubfx`/`and #1` above already zeroed the rest.
+            let w = callee_saved_name_32(d);
+            self.state.emit_fmt(format_args!("    eor {w}, {w}, #1"));
+        }
+        self.state.reg_cache.invalidate_acc();
+        true
+    }
+
     pub(super) fn emit_select_impl(
         &mut self,
         dest: &Value,
