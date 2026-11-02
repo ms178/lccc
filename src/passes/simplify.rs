@@ -7830,7 +7830,19 @@ mod tests {
             to_ty: dest_ty,
         };
         try_simplify_with_types(
-            &inst, &cast_defs, &[], &[], &[], &neg_defs, &[], &[], &[], &[], &[], &[], &[],
+            &inst,
+            &cast_defs,
+            &[],
+            &[],
+            &[],
+            &neg_defs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
         )
     }
 
@@ -7849,7 +7861,9 @@ mod tests {
                 assert_eq!(dest, Value(3), "the fold must define the cast's dest");
                 assert_eq!(ty, IrType::I32, "the negate must run at the narrow width");
                 match src {
-                    Operand::Value(v) => assert_eq!(v, Value(0), "it must negate the pre-extension value"),
+                    Operand::Value(v) => {
+                        assert_eq!(v, Value(0), "it must negate the pre-extension value")
+                    }
                     other => panic!("expected the extension's source, got {other:?}"),
                 }
             }

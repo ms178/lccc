@@ -891,11 +891,9 @@ impl Lowerer {
                 then_expr,
                 else_expr,
             ),
-            Expr::GnuConditional(cond, else_expr, _) => self.conditional_value_type(
-                self.get_expr_ctype(expr).as_ref(),
-                cond,
-                else_expr,
-            ),
+            Expr::GnuConditional(cond, else_expr, _) => {
+                self.conditional_value_type(self.get_expr_ctype(expr).as_ref(), cond, else_expr)
+            }
             Expr::Comma(_, rhs, _) => self.infer_expr_type(rhs),
             // All other cases: delegate to get_expr_type (same result)
             _ => self.get_expr_type(expr),

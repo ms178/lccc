@@ -169,7 +169,9 @@ pub fn file_mtime_secs(path: &Path) -> Option<i64> {
         Ok(after) => Some(after.as_secs() as i64),
         // Pre-epoch mtimes are legal (SOURCE_DATE_EPOCH=0 builds, `touch -d`),
         // and rounding *up* to the epoch would misreport them by a second.
-        Err(before) => Some(-(before.duration().as_secs() as i64) - i64::from(before.duration().subsec_nanos() > 0)),
+        Err(before) => Some(
+            -(before.duration().as_secs() as i64) - i64::from(before.duration().subsec_nanos() > 0),
+        ),
     }
 }
 
@@ -364,7 +366,10 @@ mod tests {
 
     #[test]
     fn missing_file_has_no_mtime() {
-        assert_eq!(file_mtime_secs(Path::new("/nonexistent/lccc/no-such-file")), None);
+        assert_eq!(
+            file_mtime_secs(Path::new("/nonexistent/lccc/no-such-file")),
+            None
+        );
         assert_eq!(
             timestamp_body(Some(Path::new("/nonexistent/lccc/no-such-file"))),
             format!("\"{}\"", UNKNOWN_TIMESTAMP)

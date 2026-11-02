@@ -548,7 +548,9 @@ impl MacroTable {
                     return cached.clone();
                 }
                 let body = crate::common::host_time::timestamp_body(Some(&path));
-                self.timestamp_bodies.borrow_mut().insert(path, body.clone());
+                self.timestamp_bodies
+                    .borrow_mut()
+                    .insert(path, body.clone());
                 body
             }
         }
