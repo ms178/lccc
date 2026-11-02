@@ -638,6 +638,28 @@ frame allocation.
 
 ---
 
+## Register-clobber oracle for push/pop elimination
+
+`eliminate_push_pop_pairs` and `eliminate_dead_scratch_saves` decide whether a
+`pushq %R` … `popq %R` pair can go. Both ask
+`types::line_writes_gp_family(info, text, fam)`, which combines three exact
+sources and never a heuristic:
+
+1. the classified destination (`LineKind` pre-parses it once);
+2. `implicit_write_refs` — the write half of the architectural
+   `classify_implicit_operands` table (`cqto` → `%rdx`, `idivq %r11` →
+   `%rax:%rdx`, `cpuid` → four families, `rep stosq` → `%rdi:%rcx`,
+   `pcmpistri` → `%rcx`, …);
+3. `names_a_second_destination` for the `xchg`/`xadd`/`cmpxchg` family, whose
+   *other* destination AT&T's "last operand is the destination" rule hides.
+
+Reading a register is deliberately not a write, and an instruction with no
+implicit operands (the fast-path list) costs one integer compare. The predicate
+is the same one the i686 back end now uses, which is why the two x86 back ends
+cannot drift apart on an instruction's clobbers again.
+
+---
+
 ## Design Decisions and Tradeoffs
 
 ### Text-Based Optimization
