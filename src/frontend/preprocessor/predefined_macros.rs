@@ -563,12 +563,13 @@ impl Preprocessor {
             self.define_simple_macro("__WCHAR_TYPE__", "short unsigned int");
         }
 
-        // Materialised through `set_builtin_body`, which marks them as the
-        // compiler's own definitions (so `-dM` omits them, like both oracles)
-        // and refuses to overwrite a `-D__DATE__=...` the command line supplied.
-        let (date_macro, time_macro) = Self::current_date_time_macros();
-        self.macros.set_builtin_body("__DATE__", &date_macro);
-        self.macros.set_builtin_body("__TIME__", &time_macro);
+        // `__DATE__` and `__TIME__` are *not* materialised here. They are the
+        // only predefined macros whose value can be a diagnostic (a malformed
+        // `SOURCE_DATE_EPOCH`), and they are sampled once per translation unit
+        // anyway, so the macro table produces them on first use -- see
+        // `MacroTable::push_date_time`. That keeps a build that never names them
+        // from paying for a clock read, and lets the diagnostic point at the
+        // token that asked rather than at start-up.
 
         // Note: __builtin_expect is handled as a real builtin (not a macro)
         // to properly evaluate side effects in the second argument.
@@ -607,16 +608,6 @@ impl Preprocessor {
             has_named_variadic: false,
             body: body.to_string(),
         });
-    }
-
-    /// Return C-standard `__DATE__` and `__TIME__` macro replacement lists.
-    ///
-    /// Both macros are sampled in one call so they can never straddle a second
-    /// boundary, and both are rendered by `common::host_time`, which follows the
-    /// host's local zone exactly as GCC and Clang do and switches to UTC when
-    /// `SOURCE_DATE_EPOCH` supplies the instant.
-    fn current_date_time_macros() -> (String, String) {
-        crate::common::host_time::date_time_bodies()
     }
 
     /// Locate the bundled `include/` directory shipped alongside the binary.

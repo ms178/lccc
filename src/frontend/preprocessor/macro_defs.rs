@@ -231,6 +231,17 @@ pub struct MacroTable {
     file_stack: std::cell::RefCell<Vec<std::path::PathBuf>>,
     /// `__TIMESTAMP__` bodies, keyed by physical path (see `file_stack`).
     timestamp_bodies: std::cell::RefCell<FxHashMap<std::path::PathBuf, String>>,
+    /// The `__TIMESTAMP__` body when `SOURCE_DATE_EPOCH` fixes it: one value for
+    /// the whole translation unit, formatted once on first use.
+    sde_timestamp: std::cell::RefCell<Option<String>>,
+    /// `__DATE__` and `__TIME__` as a pair, sampled together on first use.
+    date_time_bodies: std::cell::RefCell<Option<(String, String)>>,
+    /// Set when a `SOURCE_DATE_EPOCH` the compiler rejected was actually
+    /// consulted, so the pipeline can diagnose it at the use site rather than at
+    /// start-up (GCC does not complain about a malformed value that no macro ever
+    /// reads; Clang does, and the permissive timing is the one that cannot fail a
+    /// build that used to work).
+    sde_invalid: Cell<bool>,
     /// Builtins whose definition *this compiler* supplied (bit set) -- see
     /// `BUILTINS`. Those are the ones a `-dM` dump omits, because both
     /// reference compilers keep them in preprocessor state rather than in the
@@ -275,8 +286,8 @@ pub struct MacroTable {
 const BUILTINS: [(&str, bool); 8] = [
     ("__FILE__", true),
     ("__BASE_FILE__", false),
-    ("__DATE__", false),
-    ("__TIME__", false),
+    ("__DATE__", true),
+    ("__TIME__", true),
     ("__LINE__", true),
     ("__COUNTER__", true),
     ("__INCLUDE_LEVEL__", true),
@@ -367,6 +378,9 @@ impl MacroTable {
             user_owned: Cell::new(0),
             file_stack: std::cell::RefCell::new(Vec::new()),
             timestamp_bodies: std::cell::RefCell::new(FxHashMap::default()),
+            sde_timestamp: std::cell::RefCell::new(None),
+            date_time_bodies: std::cell::RefCell::new(None),
+            sde_invalid: Cell::new(false),
         }
     }
 
@@ -578,13 +592,34 @@ impl MacroTable {
         result.push_str(buf.format(level));
     }
 
-    /// Append `__TIMESTAMP__`'s replacement list, computed on first use in a
-    /// file and then cached per physical path.
+    /// Append `__TIMESTAMP__`'s replacement list.
     ///
-    /// Formats into the caller's buffer and reads the cache by reference, so a
-    /// file that names the macro a thousand times still pays one `stat` and one
-    /// `String` for it.
+    /// The value is the current file's modification time in `ctime` form, unless
+    /// `SOURCE_DATE_EPOCH` fixes it to one instant for the whole translation unit
+    /// (Clang's rule, and the one reproducible builds need: GCC leaves
+    /// `__TIMESTAMP__` alone and leaks the mtime into the object file). Both
+    /// cases are cached -- the fixed value once per translation unit, the mtime
+    /// once per physical path -- and read by reference, so a file that names the
+    /// macro a thousand times pays one `stat` and one `String` for all of them.
+    ///
+    /// A `SOURCE_DATE_EPOCH` the compiler rejected is *recorded* here and
+    /// diagnosed by the pipeline at the token that asked for the value; the
+    /// macro still expands, to the sampled value, which is what GCC does.
     fn push_timestamp(&self, result: &mut String) {
+        use crate::common::host_time::{Civil, SourceDateEpoch, push_quoted};
+        match crate::common::host_time::source_date_epoch() {
+            SourceDateEpoch::Valid(secs) => {
+                let mut cache = self.sde_timestamp.borrow_mut();
+                let body = cache.get_or_insert_with(|| {
+                    let mut body = String::new();
+                    push_quoted(&mut body, &Civil::utc(secs).ctime());
+                    body
+                });
+                return result.push_str(body);
+            }
+            SourceDateEpoch::Invalid => self.sde_invalid.set(true),
+            SourceDateEpoch::Unset => {}
+        }
         let Some(path) = self.file_stack.borrow().last().cloned() else {
             // No file at all (a virtual buffer): the documented unknown form.
             return crate::common::host_time::push_unknown_timestamp(result);
@@ -593,9 +628,59 @@ impl MacroTable {
             result.push_str(cached);
             return;
         }
-        let body = crate::common::host_time::timestamp_body(Some(&path));
+        let mut body = String::new();
+        match crate::common::host_time::file_mtime_secs(&path) {
+            Some(secs) => push_quoted(&mut body, &Civil::local(secs).ctime()),
+            None => crate::common::host_time::push_unknown_timestamp(&mut body),
+        }
         result.push_str(&body);
         self.timestamp_bodies.borrow_mut().insert(path, body);
+    }
+
+    /// Append `__DATE__` (or `__TIME__`, with `date` false) as a quoted literal.
+    ///
+    /// Both are sampled in one step on first use and cached as a pair, so a
+    /// translation unit can never see a date from one second and a time from the
+    /// next -- the failure mode a build started at 23:59:59 would otherwise show
+    /// as a timestamp that is a day ahead of itself. The pair is a constant after
+    /// that, like every other predefined macro.
+    fn push_date_time(&self, result: &mut String, date: bool) {
+        use crate::common::host_time::{Civil, SourceDateEpoch, now_secs, push_quoted};
+        // Fast path, and the only one after the first use: read the pair by
+        // reference and copy the wanted half into the caller's buffer.
+        {
+            let bodies = self.date_time_bodies.borrow();
+            if let Some((date_body, time_body)) = bodies.as_ref() {
+                return result.push_str(if date { date_body } else { time_body });
+            }
+        }
+        // First use: sample the clock once for both macros, emit the half that
+        // was asked for, and keep the pair. No branch can leave the cache empty
+        // and no `expect` is needed to say so.
+        let civil = match crate::common::host_time::source_date_epoch() {
+            SourceDateEpoch::Valid(secs) => Civil::utc(secs),
+            SourceDateEpoch::Invalid => {
+                self.sde_invalid.set(true);
+                Civil::local(now_secs())
+            }
+            SourceDateEpoch::Unset => Civil::local(now_secs()),
+        };
+        let mut date_body = String::new();
+        push_quoted(&mut date_body, &civil.date());
+        let mut time_body = String::new();
+        push_quoted(&mut time_body, &civil.time());
+        result.push_str(if date { &date_body } else { &time_body });
+        *self.date_time_bodies.borrow_mut() = Some((date_body, time_body));
+    }
+
+    /// Whether a rejected `SOURCE_DATE_EPOCH` has been consulted since the last
+    /// time the pipeline asked. Draining it means the diagnostic is emitted once,
+    /// at the first use, however many times the macros expand afterwards.
+    pub(super) fn take_invalid_source_date_epoch(&self) -> bool {
+        // Read before writing: the pipeline asks once per line, and the store
+        // has no business running on the lines that are not the one that use the
+        // macro.
+        self.sde_invalid.get() && self.sde_invalid.replace(false)
     }
 
     /// Get the current __FILE__ macro body.
@@ -990,6 +1075,14 @@ impl MacroTable {
             // reason as `__LINE__`: the value depends on which file is being
             // preprocessed, and it must be read at the *use site* (an alias macro
             // must report the expander's file, not the file that wrote the body).
+            if ident == "__DATE__" && self.builtin_expands(ident) {
+                self.push_date_time(result, true);
+                return i;
+            }
+            if ident == "__TIME__" && self.builtin_expands(ident) {
+                self.push_date_time(result, false);
+                return i;
+            }
             if ident == "__INCLUDE_LEVEL__" && self.builtin_expands(ident) {
                 self.push_include_level(result);
                 return i;
@@ -2761,8 +2854,9 @@ mod builtin_table_tests {
                 "{name}"
             );
         }
-        // Five dynamic entries, and the mask says exactly which.
-        assert_eq!(BUILTIN_DYNAMIC_MASK.count_ones(), 5);
+        // Seven dynamic entries (everything but `__BASE_FILE__`, which is
+        // installed once), and the mask says exactly which.
+        assert_eq!(BUILTIN_DYNAMIC_MASK.count_ones(), 7);
         // Names that share no length with a builtin are rejected by one load,
         // and names that look like builtins are rejected by the comparison.
         for ordinary in ["x", "FOO", "__FILE___", "__file__", "__LINE", "_Pragma", ""] {

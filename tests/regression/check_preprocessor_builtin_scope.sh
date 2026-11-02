@@ -40,6 +40,12 @@
 #     and both oracles report level 0 in the `.s` file and level 1 inside the
 #     header it includes.
 #
+#   * `SOURCE_DATE_EPOCH` is validated by GCC's rule -- a non-negative decimal
+#     integer no greater than 253402300799 -- and a value that breaks it is
+#     diagnosed at the token that asked, with the wall clock as the fallback.
+#     lccc used to accept what both oracles reject, and to expand `-1` to the
+#     1969 date and `253402300800` to "Jan  1 10000".
+#
 #   * `-dM` lists feature macros, not the compiler's own builtins: neither gcc-16
 #     nor clang-23 prints `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`,
 #     `__TIMESTAMP__`, `__INCLUDE_LEVEL__`, `__BASE_FILE__` or `__COUNTER__` --
@@ -456,6 +462,75 @@ for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
             || fail "-dM: in-source '$name' listing ($mine_listed) differs from $oracle_bin ($ref_listed)"
     done
 done
+
+# --- 9a. SOURCE_DATE_EPOCH is validated the way GCC validates it -----------
+# Both reference compilers reject a value that is not a non-negative decimal
+# integer no greater than 253402300799 (the last second whose `__DATE__` still
+# fits a four-digit year), and both then fall back to the wall clock. lccc used to
+# accept what they reject -- `-1` expanded to the 1969 date, `253402300800` to
+# "Jan  1 10000", instants no reference compiler produces. It now diagnoses them
+# and keeps GCC's acceptance rule (`+` and leading whitespace allowed, trailing
+# garbage not), which is the permissive one of the two oracles: Clang also rejects
+# the sign and the whitespace, so following GCC cannot fail a build that worked
+# before.
+printf 'const char *d = __DATE__;\nconst char *t = __TIME__;\n' >"$tmp/sde.c"
+printf 'int x;\n' >"$tmp/sde_unused.c"
+printf 'const char *ts = __TIMESTAMP__;\n' >"$tmp/sde_stamp.c"
+
+for value in 0 1700000000 +1700000000 01700000000 253402300799; do
+    if ! out=$(TZ=UTC SOURCE_DATE_EPOCH="$value" "$CCC" -E -P "$tmp/sde.c" 2>"$tmp/sde.err"); then
+        fail "SOURCE_DATE_EPOCH='$value' must be accepted: $(cat "$tmp/sde.err")"
+        continue
+    fi
+    [ -s "$tmp/sde.err" ] && fail "SOURCE_DATE_EPOCH='$value' must be silent: $(cat "$tmp/sde.err")"
+    if [ "$have_gcc" -eq 1 ]; then
+        ref=$(TZ=UTC SOURCE_DATE_EPOCH="$value" "$GCC" -E -P "$tmp/sde.c" 2>/dev/null)
+        [ "$(printf '%s' "$out" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+            || fail "SOURCE_DATE_EPOCH='$value': gcc-16 disagrees: '$ref'"
+    fi
+done
+
+for value in -1 abc 1700000000x 253402300800 99999999999999999999; do
+    if TZ=UTC SOURCE_DATE_EPOCH="$value" "$CCC" -E -P "$tmp/sde.c" \
+            >"$tmp/sde.out" 2>"$tmp/sde.err"; then
+        fail "SOURCE_DATE_EPOCH='$value' must be rejected, but the compile succeeded"
+        continue
+    fi
+    grep -q "SOURCE_DATE_EPOCH" "$tmp/sde.err" \
+        || fail "SOURCE_DATE_EPOCH='$value': the diagnostic must name the variable: $(cat "$tmp/sde.err")"
+    # The macro still expands, to the sampled value, exactly as GCC's does.
+    mine=''; ref=''; settled=0
+    for _ in 1 2 3 4 5; do
+        before=$(date +%s)
+        mine=$(TZ=UTC SOURCE_DATE_EPOCH="$value" "$CCC" -E -P "$tmp/sde.c" 2>/dev/null | norm)
+        if [ "$have_gcc" -eq 0 ]; then settled=1; break; fi
+        ref=$(TZ=UTC SOURCE_DATE_EPOCH="$value" "$GCC" -E -P "$tmp/sde.c" 2>/dev/null | norm)
+        after=$(date +%s)
+        [ "$before" = "$after" ] && { settled=1; break; }
+    done
+    [ "$settled" -eq 1 ] || note "SOURCE_DATE_EPOCH='$value': sampled across a second boundary"
+    if [ "$have_gcc" -eq 1 ]; then
+        [ "$mine" = "$ref" ] \
+            || fail "SOURCE_DATE_EPOCH='$value': the fallback value must match gcc-16: mine='$mine' ref='$ref'"
+    fi
+done
+
+# An empty value is set-but-invalid, which is not the same as unset.
+if TZ=UTC SOURCE_DATE_EPOCH="" "$CCC" -E -P "$tmp/sde.c" >/dev/null 2>"$tmp/sde.err"; then
+    fail "SOURCE_DATE_EPOCH='' must be rejected (Clang and gcc both reject it)"
+fi
+
+# ... but a malformed value that no macro reads is not an error in GCC, and must
+# not be one here: Clang fails such a build, GCC does not, and failing a build
+# that used to work is the worse of the two failures.
+if ! TZ=UTC SOURCE_DATE_EPOCH=abc "$CCC" -E -P "$tmp/sde_unused.c" >/dev/null 2>"$tmp/sde.err"; then
+    fail "an unread malformed SOURCE_DATE_EPOCH must not fail the build: $(cat "$tmp/sde.err")"
+fi
+
+# __TIMESTAMP__ consults the same value and diagnoses it the same way.
+if TZ=UTC SOURCE_DATE_EPOCH=abc "$CCC" -E -P "$tmp/sde_stamp.c" >/dev/null 2>"$tmp/sde.err"; then
+    fail "__TIMESTAMP__ with a malformed SOURCE_DATE_EPOCH must be diagnosed"
+fi
 
 # --- 9. -dM excludes the builtins, and includes the feature macros ----------
 dump=$("$CCC" -dM -E -x c /dev/null)

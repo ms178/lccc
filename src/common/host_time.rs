@@ -152,19 +152,96 @@ impl Civil {
     }
 }
 
+/// The latest instant both reference compilers accept for `SOURCE_DATE_EPOCH`:
+/// 9999-12-31T23:59:59Z, the last second whose `__DATE__` still has a four-digit
+/// year (measured: `253402300799` is accepted by GCC 16.2 and Clang 23.1.4,
+/// `253402300800` is rejected by both).
+pub const MAX_SOURCE_DATE_EPOCH: i64 = 253_402_300_799;
+
+/// What `SOURCE_DATE_EPOCH` says, decided once per process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceDateEpoch {
+    /// Not set at all: sample the wall clock (and, for `__TIMESTAMP__`, the
+    /// file's mtime).
+    Unset,
+    /// Set and valid: this instant, in UTC, replaces the sampled one.
+    Valid(i64),
+    /// Set but not a non-negative decimal integer below
+    /// [`MAX_SOURCE_DATE_EPOCH`]. Both reference compilers reject this; the
+    /// caller is expected to diagnose it and fall back to the sampled value, as
+    /// GCC does.
+    Invalid,
+}
+
 /// `SOURCE_DATE_EPOCH`, parsed once per process.
 ///
-/// A malformed or out-of-range value is ignored rather than diagnosed: GCC
-/// accepts garbage silently, and making the *compiler* fail over an environment
-/// variable that only affects three macros would break builds that set it for
-/// registries rather than for reproducibility.
-pub fn source_date_epoch() -> Option<i64> {
-    static VALUE: OnceLock<Option<i64>> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("SOURCE_DATE_EPOCH")
-            .ok()
-            .and_then(|s| s.trim().parse::<i64>().ok())
+/// The rule is GCC's, because GCC's is the one the reproducible-builds
+/// convention is implemented against: `strtoll` semantics (leading ASCII
+/// whitespace and a `+` sign are accepted), the *whole* remaining string must be
+/// digits, and the value must not exceed [`MAX_SOURCE_DATE_EPOCH`]. Clang is
+/// stricter -- it rejects the leading whitespace and the sign as well -- but the
+/// two only differ on inputs that are already malformed, and the permissive
+/// reading is the one a build that worked under GCC keeps working under.
+///
+/// Unlike the first version of this function there is no `trim`: a value with
+/// trailing garbage is *invalid*, not quietly accepted, so `__DATE__` can never
+/// show an instant no reference compiler would produce (`-1` used to expand to
+/// the 1969 date).
+pub fn source_date_epoch() -> SourceDateEpoch {
+    static VALUE: OnceLock<SourceDateEpoch> = OnceLock::new();
+    *VALUE.get_or_init(|| match std::env::var("SOURCE_DATE_EPOCH") {
+        Ok(raw) => parse_source_date_epoch(&raw),
+        Err(_) => SourceDateEpoch::Unset,
     })
+}
+
+/// Parse one `SOURCE_DATE_EPOCH` value. Pure, so the acceptance rule is a unit
+/// test rather than a comment.
+fn parse_source_date_epoch(raw: &str) -> SourceDateEpoch {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let mut negative = false;
+    if index < bytes.len() && (bytes[index] == b'+' || bytes[index] == b'-') {
+        negative = bytes[index] == b'-';
+        index += 1;
+    }
+    let digits_start = index;
+    let mut value: i64 = 0;
+    let mut overflow = false;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        let digit = i64::from(bytes[index] - b'0');
+        value = match value.checked_mul(10).and_then(|v| v.checked_add(digit)) {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                0
+            }
+        };
+        index += 1;
+    }
+    // Empty, truncated (`12x`), negative, or beyond the four-year range: all
+    // four are rejected by GCC, and an out-of-i64 value is rejected by both.
+    if index != bytes.len() || index == digits_start || negative || overflow {
+        return SourceDateEpoch::Invalid;
+    }
+    if value > MAX_SOURCE_DATE_EPOCH {
+        return SourceDateEpoch::Invalid;
+    }
+    SourceDateEpoch::Valid(value)
+}
+
+/// The current wall clock as Unix seconds, floored the way `stat` reports mtimes
+/// (a clock set before 1970 yields a negative value rather than 0).
+pub fn now_secs() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => after.as_secs() as i64,
+        Err(before) => {
+            -(before.duration().as_secs() as i64) - i64::from(before.duration().subsec_nanos() > 0)
+        }
+    }
 }
 
 /// Modification time of `path` as Unix seconds, or `None` when the file cannot
@@ -176,58 +253,25 @@ pub fn file_mtime_secs(path: &Path) -> Option<i64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     match modified.duration_since(std::time::UNIX_EPOCH) {
         Ok(after) => Some(after.as_secs() as i64),
-        // Pre-epoch mtimes are legal (SOURCE_DATE_EPOCH=0 builds, `touch -d`),
-        // and rounding *up* to the epoch would misreport them by a second.
+        // Pre-epoch mtimes are legal (`touch -d`, a checkout with restored
+        // timestamps), and rounding *up* to the epoch would misreport them by a
+        // second.
         Err(before) => Some(
             -(before.duration().as_secs() as i64) - i64::from(before.duration().subsec_nanos() > 0),
         ),
     }
 }
 
-/// The replacement list for `__TIMESTAMP__`: a **quoted** string literal.
-///
-/// A set `SOURCE_DATE_EPOCH` wins over the file's mtime (Clang's rule; GCC
-/// leaves `__TIMESTAMP__` alone and only makes `__DATE__`/`__TIME__`
-/// reproducible). Reproducible-build tooling is the reason the variable exists,
-/// and a stale mtime leaking into an object file defeats it, so the value that
-/// can be reproduced is the one this compiler prints. `-D__TIMESTAMP__=...`
-/// still overrides the macro outright.
-pub fn timestamp_body(path: Option<&Path>) -> String {
-    if let Some(secs) = source_date_epoch() {
-        return quote(&Civil::utc(secs).ctime());
-    }
-    match path.and_then(file_mtime_secs) {
-        Some(secs) => quote(&Civil::local(secs).ctime()),
-        None => quote(UNKNOWN_TIMESTAMP),
-    }
+/// Append `s` as a C string literal (a **quoted** replacement list).
+pub fn push_quoted(out: &mut String, s: &str) {
+    out.push('"');
+    out.push_str(s);
+    out.push('"');
 }
 
-/// The replacement list for `__DATE__` / `__TIME__` as one step, so the two
-/// macros can never be sampled on opposite sides of a one-second boundary.
-pub fn date_time_bodies() -> (String, String) {
-    let civil = match source_date_epoch() {
-        Some(secs) => Civil::utc(secs),
-        None => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            Civil::local(now)
-        }
-    };
-    (quote(&civil.date()), quote(&civil.time()))
-}
-
-/// Append the quoted "no modification time" form directly, for callers that
-/// already have a buffer (the preprocessor's expansion loop).
+/// Append the quoted "no modification time" form.
 pub fn push_unknown_timestamp(out: &mut String) {
-    out.push('"');
-    out.push_str(UNKNOWN_TIMESTAMP);
-    out.push('"');
-}
-
-fn quote(s: &str) -> String {
-    format!("\"{}\"", s)
+    push_quoted(out, UNKNOWN_TIMESTAMP);
 }
 
 #[cfg(all(target_family = "unix", target_pointer_width = "64"))]
@@ -388,9 +432,62 @@ mod tests {
             file_mtime_secs(Path::new("/nonexistent/lccc/no-such-file")),
             None
         );
-        assert_eq!(
-            timestamp_body(Some(Path::new("/nonexistent/lccc/no-such-file"))),
-            format!("\"{}\"", UNKNOWN_TIMESTAMP)
-        );
+        let mut quoted = String::new();
+        push_unknown_timestamp(&mut quoted);
+        assert_eq!(quoted, format!("\"{}\"", UNKNOWN_TIMESTAMP));
+    }
+
+    /// The acceptance rule for `SOURCE_DATE_EPOCH` is GCC's, and every case in
+    /// this matrix was measured against GCC 16.2 and Clang 23.1.4 first: the
+    /// values both accept are `Valid`, the values both reject are `Invalid`, and
+    /// the two where they disagree (`+1700000000`, ` 1700000000`) follow GCC.
+    #[test]
+    fn source_date_epoch_acceptance_matches_the_reference_rule() {
+        for accepted in [
+            ("0", 0),
+            ("1", 1),
+            ("1700000000", 1_700_000_000),
+            ("01700000000", 1_700_000_000),
+            ("+1700000000", 1_700_000_000),
+            (" 1700000000", 1_700_000_000),
+            ("\t1700000000", 1_700_000_000),
+            ("253402300799", MAX_SOURCE_DATE_EPOCH),
+        ] {
+            assert_eq!(
+                parse_source_date_epoch(accepted.0),
+                SourceDateEpoch::Valid(accepted.1),
+                "{:?}",
+                accepted.0
+            );
+        }
+        for rejected in [
+            "",
+            " ",
+            "abc",
+            "1700000000x",
+            "x1700000000",
+            "1700000000 ",
+            "-1",
+            "+-1",
+            "253402300800",
+            "99999999999999999999",
+            "9223372036854775807",
+        ] {
+            assert_eq!(
+                parse_source_date_epoch(rejected),
+                SourceDateEpoch::Invalid,
+                "{rejected:?}"
+            );
+        }
+        // An unset variable is not the same answer as a malformed one: only the
+        // latter is diagnosable.
+        assert_ne!(parse_source_date_epoch(""), SourceDateEpoch::Unset);
+    }
+
+    #[test]
+    fn the_wall_clock_is_after_the_epoch_it_was_measured_in() {
+        // 2026-01-01T00:00:00Z, a floor rather than a guess: the clock of the
+        // machine running the tests is ahead of the year this file was written.
+        assert!(now_secs() > 1_767_225_600);
     }
 }
