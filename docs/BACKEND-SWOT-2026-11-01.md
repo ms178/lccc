@@ -622,6 +622,151 @@ approximate: `line_references_reg(line, r)` *is* "the text names `r`, or the
 oracle mentions it", so one oracle call plus eight `contains` tests reproduces it
 by construction.
 
+### 5.6 x86-64 ← i686: the in-place byte mask, and two span holes the port exposed
+
+The i686 back end folds `andl $imm, %R` whose only consumer is a condition into
+a `testb`; §6 listed that as an i686-exclusive capability. It is now on x86-64
+too, but the interesting part of the round is what porting it found: the same
+enumerations that had made the i686 pass sound were missing from two x86-64
+scans, in the shape of a directive that lies to the unwinder and a trap that is
+not a branch.
+
+**1. `passes/mask_test.rs` (new).** Two rewrites of one shape, `and{l,q} $imm,
+%R` with `1 <= imm <= 0xFFFF` (rule 1 is byte-only by construction, rule 2 is
+restricted to the masks `movzx` reproduces exactly, a whole byte and a whole
+word):
+
+```text
+    andl $255, %r10          testb %r10b, %r10b
+    testq %r10, %r10   ->    je .L1                 (7+3 bytes -> 3)
+    je .L1
+
+    andl $255, %r10    ->    movzbl %r10b, %r10d    (7 bytes -> 4, flags dead)
+    andl $0xFFFF, %R   ->    movzwl %Rw, %Rl        (6 bytes -> 3, flags dead)
+```
+
+The proof is per flag, and it is the reason the rule cannot be stated as "the
+mask feeds a branch". `and` and `test` both clear CF and OF and both set ZF and
+PF from the AND of their operands, and because `imm <= 255` the mask's own
+result has no bit above bit 7, so a byte-wide test sees exactly the same
+zero-ness. SF is the one flag they disagree on — `andl $255`'s result is at most
+255, so its SF is always 0, while `testb`'s SF is bit 7 of the masked byte — so
+the rewrite requires *both* that the reader's condition does not consult SF
+(`js`/`jns`/`jl`/`jge`/… and their `set` forms are refused) and that every flag
+is dead after it. Without the second half, `andl $255,%R; je; js` would answer
+"not negative" for 0x80..0xFF.
+
+The earlier `flag_peepholes::fold_copy_and_mask_into_test` does not reach this
+shape and does not want to: its consumer must be the very next line, and a
+`test` *writes* flags, so the `and; test %R,%R; jcc` sequence that
+`(uint8_t)x != 0` lowers to stops its scan (the consumer it finds writes the
+flags it needs read). Nor did anything own the single-line encoding rule for the
+`%D == %A` case, which is where the seven-byte form survives: the existing
+`fold_copy_and_mask_into_movz` needs a preceding copy to fire.
+
+Two obligations come from *deleting* the mask rather than from the flags: the
+register's value must be dead after the reader, and nothing between the two lines
+may touch it — adjacency is enforced by `next_non_debug`, which steps over
+deleted lines and debug attribution but not over `.cfi_*`, alignment or an opaque
+directive, since a `.byte 0x9e` in the window is `sahf` and would eat the very
+flags the proof is about. Rule 1 stays byte-only — `testb $imm, %Rb` cannot
+express a mask above `0xFF`, and silently narrowing one would be a miscompile —
+while rule 2 covers exactly the masks whose value `movzx` reproduces bit for bit,
+a whole byte and a whole word (`0xFF`, `0xFFFF`); any narrower mask leaves bits
+`movzx` would keep, and both need the flags dead because `movzx` writes none.
+`CCC_PEEPHOLE_SKIP=mask_test` disables both; the pass is idempotent, so it is
+placed after the phase-1 fixed point rather than inside it.
+
+**2. Neither mask rule survives on a `.loc`.** The rewrite of one line and the
+deletion of another changes what dataflow can conclude about the register
+afterwards, and a solution computed before the rewrite under-reports liveness
+(deleting a definition lets an older value flow further, i.e. *grows* the live
+set — the claim in `eliminate_dead_scratch_saves` that "removals only shrink live
+sets" was false and is now retracted in-code). Both passes keep a per-register
+dirty bit and re-solve the enclosing function on the next query about that
+register, which is what the i686 `GprLiveness` discipline already required.
+
+**3. The x86-64 pair scan spanned a `leave`.** `instruction_modifies_stack`
+matched `%rsp`/`%esp`/`%sp` in the *text*, and `leave`, `enter`, `pushf`, `popf`
+and `iret` name no register. Porting the i686 span proof — which always asked
+the oracle for `%esp` — exposed it: `pushq %rbx; leave; popq %rbx` moved the
+frame-teardown's restore by a slot. The predicate is now two exact halves,
+`line_depends_on_stack_pointer` = textual mention **or**
+`implicit_reg_refs(...) & (1 << REG_RSP)`, so the operand-less family is covered
+by the same ISA table the clobber oracle uses.
+
+**4. A `.loc` between a `pop` and its `.cfi_adjust_cfa_offset` hid the
+adjustment.** Both back ends look past the `pop` for the adjustment that
+describes it, and both stopped at the first non-deleted line — which a `-g` build
+makes a `.loc`. The pair was then deleted with the unwind information still
+claiming the slot, i.e. a debugging build could hand the unwinder a CFA pointing
+at live data. Both scans now step over directives that carry no unwind state
+(`LineInfo::is_unwind_inert_directive` on x86-64, the same predicate inline in the
+i686 monolith) and stop at any `.cfi_*`.
+
+**4a. The untouched-span rule had no `pinned` guard and no CFI guard.** The
+scratch-save rule inspects the span and removes the pair when the register is
+dead; the older untouched-span rule (`push R … pop R` with nothing writing `R`)
+removed it unconditionally. Two lines the pass never consulted say otherwise:
+a pinned line is one the program's own contract owns — a C `volatile` access
+(`pin_volatile_access_regions` pins in place and keeps the kind), a parameter
+pre-store, an inline-asm region — and a `.cfi_` adjustment *after* the `pop`
+describes the slot the pair owns, so removing the pair leaves the unwinder
+pointing at a byte nobody moved. x86-64 now checks `pinned` on both ends of the
+pair and asks `cfi_follows` before removing, which is what the scratch-save
+rule already did. The i686 back end needs no `pinned` field for this: it pins a
+volatile or inline-asm region by reclassifying every line in it as `InlineAsm`,
+so the pair is never classified as one.
+
+**5. Neither scan stopped at a trap or an unnamed control transfer.** `hlt`,
+`ud2`, `int3`, `sysret`, `sysexit` and friends own no `LineKind`, so `is_barrier`
+answers "may step over" and nothing else vetoed them. The pair is unsound there
+for the reason the whole proof exists: `%rsp` at the instant of the trap or of
+the system return is observed *outside* the function — by a signal handler, a
+debugger reading the frame, or user mode — so removing a pair around it changes
+the value that observer sees even though no line in the span names the stack
+pointer. `passes::push_pop::leaves_linear_flow` and the i686 `ends_linear_flow`
+now end the span. `iret`/`popf` needed no entry: the implicit oracle already
+reports their `%rsp`.
+
+**6. The `movzx` encoding went back the other way, to i686.** The i686
+`narrow_dead_and_to_testb` had no counterpart to rule 2, so `andl $0xff, %eax`
+(six bytes, `25 id` for the accumulator) and `andl $0xffff, %eax` stayed
+unencoded. It now carries the same two masks, gated on a new
+`flags_definitely_dead_after` oracle — the strict twin of `flags_live_after`,
+which answers about CF alone and therefore lets `inc` end the liveness of flags
+it does not define; the new one accepts only a full definition (`WritesAll`),
+a `Kills` (`call`/`ret`, with the PIC `get_pc_thunk` deliberately `Neutral`
+because it really does preserve the flags) or a transparent directive, and
+refuses at labels, branches, opaque directives and unmodelled text. Rule 1
+keeps ownership of every shape it can express (a redundant zero test of the
+same register routes there, because `testb` deletes the AND outright), the
+destination must be the full 32-bit register (`andl $255, %ah` is not a mask of
+`%eax`), and the pass now skips `#APP` regions outright — it parses its anchor
+by text, and a user's `andl $254, %eax` must never become a flags-only `testb`.
+
+**Evidence.** `mask_test.rs` carries 18 tests — the fold with and without the
+redundant zero test, the `cmp $0` variant, a `setcc` reader, three SF readers
+refused, a later SF reader refused, a live value refused, a word mask refused by
+rule 1, an unrepresentable mask (`256`/`0x10000`/`-1`) refused by both, both
+encoding cases and their word twins, a memory destination refused, an
+intervening store refused, a narrow mask refused by rule 2, live flags refusing
+it, idempotence, and every GP family reachable. `push_pop.rs` gains the
+in-span `leave`/`enter`/`iretq`/`sysretq` cases, the `.loc`-before-CFI case, the
+pinned-pair cases and the CFI-after-`pop` cases;
+the i686 module gains the `ud2`/`hlt`/`int3` span cases and the same `.loc` case.
+`tests/regression/check_mask_test_fold.sh` is the gate: it asserts the emission
+law (a mask whose only consumer is a condition must not survive), it stays quiet
+if the emitter already folds the consumer, and it runs the discriminating probes
+— `(signed char)x < 0` and `(unsigned char)x > 127` must stay sign tests — under
+GCC's oracle at `-O0/-O1/-O2/-O3/-Os` in both 32- and 64-bit mode. The
+must-not-survive law covers the two functions that *compare*; a function that
+returns `x & 1` materializes the mask as its value — GCC emits the same
+`andl $1, %edi; movl %edi, %eax` — so that case is pinned by the execution
+oracle, not by a grep. The i686 module gains the same three cases (both `movzx`
+forms, live flags refused, rule 1's priority) plus an assembler round-trip on
+the rewritten text.
+
 ## 6. Ranked cross-pollination backlog
 
 Ordered by (correctness impact × reach) / risk. Every item names donor, recipient
@@ -639,6 +784,9 @@ and the mechanism.
 | 8 | ~~`instruction_modifies_reg_id` precision~~ (§5.5) | new | **done** — exact implicit-write oracle + two-destination forms; `TODO` deleted | medium | x86-only; the same oracle also re-enabled the i686 scratch-save pass |
 | 9 | pass manifest for the x86-64 tree | x86-64 → tree-wide | reviewability, generator-friendly | low | precondition for #10 |
 | 10 | split the i686/ARM/RISC-V monoliths along the x86-64 pass-file pattern | x86-64 → i686, ARM, RISC-V | bisectability, per-pass tests | high (mechanical churn) | do pass-by-pass, never as one commit |
+| 11 | `narrow_dead_and_to_testb` | i686 → x86-64 | **done** (§5.6) — `mask_test`; mask+zero-test and the `movzx` encoding are one instruction shorter per site | medium | the flag window is restated against `flags_dead_after` instead of a hand-written reader class |
+| 12 | span-ending predicates (`leaves_linear_flow`, unwind-inert directives) | i686 ↔ x86-64 | **done** (§5.6) — both back ends now refuse a trap, an unnamed transfer or a `.cfi_*` between a `save` and its `restore` | low | the same two holes existed independently in each back end |
+| 13 | `mask_test` rule 2 (`movzx` encoding) | x86-64 → i686 | **done** (§5.6) — `andl $0xff/$0xffff, %R` becomes a three-byte `movzbl`/`movzwl` where the flags are dead | medium | needed a strict whole-flags-dead oracle (`flags_definitely_dead_after`); rule 1 keeps priority because `testb` deletes the AND |
 
 ## 7. Threats to the plan
 

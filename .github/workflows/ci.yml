@@ -2119,6 +2119,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_clz_zero_sentinel.sh
+    - name: Verify in-place byte-mask folds (x86-64 and i686)
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_mask_test_fold.sh
     - name: Verify basic-block SLP v6 contracts
       env:
         CCC: target/fastbuild/lccc

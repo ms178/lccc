@@ -3536,8 +3536,13 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("andl $1, %esi"), "{out}");
+        // The self-test itself never survives. What the final text looks like
+        // depends on `mask_test` (phase 8d-1), which then folds the remaining
+        // `andl $1, %esi; je` into one `testb $1, %sil`: `%esi` is dead after
+        // the branch, so the AND's only consumer disappears with it.
         assert!(!out.contains("testq %rsi, %rsi"), "{out}");
+        assert!(!out.contains("andl $1, %esi"), "{out}");
+        assert!(out.contains("testb $1, %sil"), "{out}");
     }
 
     #[test]
@@ -4521,17 +4526,22 @@ mod tests {
     fn copy_and_mask_narrow_copy_wide_mask_is_left_alone() {
         // movl zero-extends; a 64-bit and afterwards tests bits the original
         // %rbx may have set — no fold.
+        //
+        // The mask is `0xFF00`, not `0xFF`: a whole-byte mask of a register
+        // that is dead after the branch is `mask_test`'s shape (it would
+        // rewrite the AND to a `testb`), and this test is about the copy/AND
+        // fold refusing a wide AND behind a narrow copy.
         let asm = concat!(
             ".cfi_startproc\n",
             "    movl %ebx, %esi\n",
-            "    andq $255, %rsi\n",
+            "    andq $0xFF00, %rsi\n",
             "    jne .LBB5\n",
             ".LBB5:\n",
             "    ret\n",
             ".cfi_endproc\n",
         );
         let out = peephole_optimize(asm.to_string());
-        assert!(out.contains("andq $255, %rsi"), "{out}");
+        assert!(out.contains("andq $0xFF00, %rsi"), "{out}");
     }
 
     #[test]

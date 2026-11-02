@@ -46,6 +46,7 @@ mod load_mask_test;
 mod load_op_fuse;
 mod local_patterns;
 mod loop_trampoline;
+mod mask_test;
 mod memory_fold;
 mod narrow_copy_fold;
 mod pow2_cmov;
@@ -2350,6 +2351,21 @@ fn peephole_optimize_inner(
     // disables it for bisection.
     if !sk("pow2_cmov") {
         pow2_cmov::run(&mut store, &mut infos);
+    }
+
+    // Phase 8d-1: an in-place byte mask whose only consumer is a condition —
+    // `andl $255, %r10; testq %r10, %r10; je` becomes `testb %r10b, %r10b; je`,
+    // and a mask whose value is wanted but whose flags are dead becomes the
+    // four-byte `movzbl` form.  Cross-pollinated from the i686 back end's
+    // `narrow_dead_and_to_testb`, restated against this back end's per-flag
+    // oracle (`flags_dead_after`), which is what lets it fire on the whole
+    // ZF/CF/OF/PF reader class instead of a hand-written window.
+    // `CCC_PEEPHOLE_SKIP=mask_test` disables it for bisection.  It sits after
+    // the phase-1 fixed point (it is idempotent, so it needs no loop) and
+    // before the boolean-shaping passes, so `return_bool`/`sign_test` see the
+    // shortened text rather than a mask they would have to look through.
+    if !sk("mask_test") {
+        mask_test::fold_inplace_mask_test(&mut store, &mut infos);
     }
 
     if !sk("return_bool") {
