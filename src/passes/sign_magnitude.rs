@@ -4,8 +4,9 @@
 //! `x < 0 ? -x : x` is what a C programmer writes, and what the frontend hands
 //! over: a signed compare, a negation and a select.  On x86-64 that shape
 //! lowers to a test, a second register copy and a conditional move — six
-//! instructions where GCC and Clang both produce four.  The branch-free
-//! arithmetic identity costs no compare at all:
+//! instructions where GCC and Clang both produce four — and on RISC-V, where
+//! there is no conditional move, to a branch.  The branch-free arithmetic
+//! identity costs no compare at all:
 //!
 //! ```text
 //! s = x >>s (W-1)      // all ones when x is negative, zero otherwise
@@ -27,6 +28,11 @@
 //! r = (d ^ s) - s
 //! ```
 //!
+//! The compare may test the sign with or without zero (`x < 0`, `x <= 0`,
+//! `x > 0`, `x >= 0`, and their `-1`/`1` spellings): at zero both arms are 0,
+//! so every one of them selects `|x|`.  GCC 16.2 and Clang 23.1.4 emit the
+//! same `neg; cmovs` for all eight.
+//!
 //! Both rewrites are admitted only for the 32-bit and 64-bit signed integer
 //! types the C frontend uses for `int` and `long`, only for a select whose
 //! arms are exactly `Neg(x)` and `x` (or the two subtractions of the same
@@ -34,6 +40,11 @@
 //! the arms operate on.  A narrow type is refused: the frontend promotes
 //! arithmetic to `int`, so a narrow select is a different program, and a
 //! 8-bit `AShr` mask is not the abstraction the backend expects here.
+//!
+//! The identity is what GCC 16.2 and Clang 23.1.4 emit on RISC-V (`sraiw;
+//! xor; subw`), and it stays the final shape on i686, whose baseline has no
+//! `cmov`; on x86-64 the peephole `abs_cmov` turns it into the shorter
+//! `mov; neg; cmovs` both oracles emit there.
 //!
 //! Nothing is deleted: the pattern's own compare and negation stay in place
 //! for any other reader, and DCE retires them when this select was their last
@@ -78,44 +89,43 @@ fn const_is(operand: &Operand, value: i64) -> bool {
     matches!(operand, Operand::Const(c) if c.to_i64() == Some(value))
 }
 
-/// The compare proving `x` negative, in either spelling the frontend emits.
+/// The compare selecting the `-x` arm: true for every negative `x`, false
+/// for every positive one.  At `x == 0` the two arms agree (`-0 == 0`), so
+/// the compare may go either way there: `x < 0` and `x <= -1` exclude zero,
+/// `x <= 0` and `x < 1` include it, and all four select `|x|`.
 fn proves_negative(inst: Option<&Instruction>, x: Value, ty: IrType) -> bool {
     match inst {
         Some(Instruction::Cmp {
-            op: IrCmpOp::Slt,
+            op,
             lhs: Operand::Value(v),
             rhs,
             ty: t,
             ..
-        }) if *v == x && *t == ty => const_is(rhs, 0),
-        Some(Instruction::Cmp {
-            op: IrCmpOp::Sle,
-            lhs: Operand::Value(v),
-            rhs,
-            ty: t,
-            ..
-        }) if *v == x && *t == ty => const_is(rhs, -1),
+        }) if *v == x && *t == ty => match op {
+            IrCmpOp::Slt => const_is(rhs, 0) || const_is(rhs, 1),
+            IrCmpOp::Sle => const_is(rhs, -1) || const_is(rhs, 0),
+            _ => false,
+        },
         _ => false,
     }
 }
 
-/// The compare proving `x` non-negative.
+/// The compare selecting the `x` arm: true for every positive `x`, false for
+/// every negative one, either way at zero (`x >= 0`, `x > -1`, `x > 0`,
+/// `x >= 1`) -- the mirror of [`proves_negative`].
 fn proves_nonneg(inst: Option<&Instruction>, x: Value, ty: IrType) -> bool {
     match inst {
         Some(Instruction::Cmp {
-            op: IrCmpOp::Sge,
+            op,
             lhs: Operand::Value(v),
             rhs,
             ty: t,
             ..
-        }) if *v == x && *t == ty => const_is(rhs, 0),
-        Some(Instruction::Cmp {
-            op: IrCmpOp::Sgt,
-            lhs: Operand::Value(v),
-            rhs,
-            ty: t,
-            ..
-        }) if *v == x && *t == ty => const_is(rhs, -1),
+        }) if *v == x && *t == ty => match op {
+            IrCmpOp::Sge => const_is(rhs, 0) || const_is(rhs, 1),
+            IrCmpOp::Sgt => const_is(rhs, -1) || const_is(rhs, 0),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -394,9 +404,14 @@ mod tests {
             (IrCmpOp::Sle, -1, true),
             (IrCmpOp::Sge, 0, false),
             (IrCmpOp::Sgt, -1, false),
+            // Zero-inclusive spellings: at `x == 0` both arms are 0.
+            (IrCmpOp::Sle, 0, true),
+            (IrCmpOp::Slt, 1, true),
+            (IrCmpOp::Sgt, 0, false),
+            (IrCmpOp::Sge, 1, false),
         ] {
             let mut func = abs_function(op, c, neg_true);
-            assert_eq!(run(&mut func), 1, "{op:?}");
+            assert_eq!(run(&mut func), 1, "{op:?} {c}");
             let body: Vec<_> = func.blocks[0]
                 .instructions
                 .iter()
@@ -426,6 +441,68 @@ mod tests {
                     ..
                 }
             ));
+        }
+    }
+
+    #[test]
+    fn a_threshold_off_zero_or_a_swapped_arm_is_not_an_absolute_value() {
+        // One step past each accepted constant the arms disagree on a nonzero
+        // input (`x < 2 ? -x : x` is -1 at 1), and the mirrored arm order
+        // computes -|x|; none of them may fold.
+        for (op, c, neg_true) in [
+            (IrCmpOp::Slt, 2, true),
+            (IrCmpOp::Slt, -1, true),
+            (IrCmpOp::Sle, 1, true),
+            (IrCmpOp::Sle, -2, true),
+            (IrCmpOp::Sgt, 1, false),
+            (IrCmpOp::Sgt, -2, false),
+            (IrCmpOp::Sge, 2, false),
+            (IrCmpOp::Sge, -1, false),
+            (IrCmpOp::Slt, 0, false),
+            (IrCmpOp::Sle, 0, false),
+            (IrCmpOp::Sgt, 0, true),
+            (IrCmpOp::Sge, 0, true),
+            (IrCmpOp::Ult, 1, true),
+            (IrCmpOp::Eq, 0, true),
+        ] {
+            let mut func = abs_function(op, c, neg_true);
+            assert_eq!(run(&mut func), 0, "{op:?} {c} neg_true={neg_true}");
+        }
+    }
+
+    #[test]
+    fn every_accepted_spelling_is_the_magnitude_on_every_boundary_input() {
+        // The rule behind the accepted list, checked by evaluation: the
+        // select and the identity agree on the extrema, around zero and at
+        // the accepted thresholds themselves.
+        let accepted = [
+            (IrCmpOp::Slt, 0, true),
+            (IrCmpOp::Sle, -1, true),
+            (IrCmpOp::Sle, 0, true),
+            (IrCmpOp::Slt, 1, true),
+            (IrCmpOp::Sge, 0, false),
+            (IrCmpOp::Sgt, -1, false),
+            (IrCmpOp::Sgt, 0, false),
+            (IrCmpOp::Sge, 1, false),
+        ];
+        let identity = |x: i32| (x ^ (x >> 31)).wrapping_sub(x >> 31);
+        for (op, c, neg_true) in accepted {
+            for x in [i32::MIN, i32::MIN + 1, -2, -1, 0, 1, 2, i32::MAX] {
+                let cond = match op {
+                    IrCmpOp::Slt => x < c,
+                    IrCmpOp::Sle => x <= c,
+                    IrCmpOp::Sgt => x > c,
+                    IrCmpOp::Sge => x >= c,
+                    _ => unreachable!(),
+                };
+                let (t, f) = if neg_true {
+                    (x.wrapping_neg(), x)
+                } else {
+                    (x, x.wrapping_neg())
+                };
+                let select = if cond { t } else { f };
+                assert_eq!(select, identity(x), "{op:?} {c} at {x}");
+            }
         }
     }
 
