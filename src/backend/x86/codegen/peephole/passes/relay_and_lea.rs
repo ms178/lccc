@@ -8378,6 +8378,12 @@ mod tests {
     fn rmw_coalesce_folds_word_zext_copy_under_masked_consumer() {
         // The 16-bit form: `movswl %dx, %r11d` agrees with %edx on the low
         // 16 bits, and `$65535` clears the rest.
+        //
+        // `mask_test` then re-encodes the `andl $65535` it produces as
+        // `movzwl %dx, %edx`, which is the same value in fewer bytes; the
+        // coalesce has already happened by then, but this test asserts its
+        // exact output, so the encoding rule is skipped here.
+        let _skip = super::super::test_skips::skip_passes(&["mask_test"]);
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",

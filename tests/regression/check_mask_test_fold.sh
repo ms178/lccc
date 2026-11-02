@@ -112,7 +112,11 @@ total_tests=0
 for asm in "$work/mask64.s" "$work/mask32.s"; do
     mode=x86-64
     [[ $asm == *32.s ]] && mode=i686
-    for fn in nonzero_u8 zero_u8 bit0_set; do
+    # Only the two functions whose mask feeds nothing but a condition: their
+    # mask must never survive as an `and`. `bit0_set` *returns* `x & 1`, so the
+    # mask is the value there and GCC keeps it too (`andl $1, %edi; movl %edi,
+    # %eax`); the execution oracle below is what pins that case.
+    for fn in nonzero_u8 zero_u8; do
         body "$fn" "$asm" > "$work/one.s"
         # A mask whose only consumer is a condition must not survive, in
         # either spelling of the immediate (the emitter prints decimal today;

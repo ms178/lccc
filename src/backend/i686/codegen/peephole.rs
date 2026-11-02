@@ -24209,7 +24209,11 @@ f:
         // `movzx` writes no flags, so any later reader of the AND's flags
         // vetoes the shortening; only the redundant-test shape (rule 1, which
         // deletes the AND outright) may consume them.
-        let asm = pair_fn("    andl $255, %eax\n    movl %eax, 4(%esp)\n    je .Lok\n.Lok:\n");
+        // The `je` must not be trivial (`je` to the very next line is removed as
+        // such, together with the only flag read that vetoes the shortening).
+        let asm = pair_fn(
+            "    andl $255, %eax\n    movl %eax, 4(%esp)\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
         let out = peephole_optimize(asm);
         assert!(out.contains("andl $255"), "live flags keep the AND:\n{out}");
     }

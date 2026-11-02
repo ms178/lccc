@@ -577,15 +577,15 @@ mod mask_test_tests {
         // shape any emitter produces, and liveness correctly refuses to call
         // them dead, so they are out of scope rather than special-cased.
         //
-        // The `pop` is what makes the masked value dead: `RET_LIVE` keeps the
-        // callee-saved families live at a `ret` (the function must have
-        // restored them), so a fold on a bare `ret` could only ever fire for
-        // the caller-saved ones.  The void marker drops `%rax` for the same
+        // The trailing write is what makes the masked value dead: `RET_LIVE`
+        // keeps the callee-saved families live at a `ret` (the function must
+        // have restored them), so a fold on a bare `ret` could only ever fire
+        // for the caller-saved ones.  The void marker drops `%rax` for the same
         // reason -- a fixture without it is read as "this `ret` reads `%rax`".
         for fam in (0..16usize).filter(|f| *f != 4 && *f != 5) {
             let q = REG_NAMES[0][fam];
             let out = run_void(&format!(
-                "    andq $255, {q}\n    je .Ld\n.Ld:\n    pop {q}\n    ret\n"
+                "    andq $255, {q}\n    je .Ld\n.Ld:\n    movq $0, {q}\n    ret\n"
             ));
             assert!(
                 out.contains(&format!("testb {}", REG_NAMES[3][fam])),
