@@ -704,6 +704,39 @@ fn fold_constant_terminators(func: &mut IrFunction) -> usize {
 /// compare and cast that replace the branch read only values the branch read
 /// (or that dominate the compare it read), so the rewrite is sound on every
 /// path, at every width, for every target.
+/// Whether `block` ends in the shape the backend fuses with an asm-goto's own
+/// flags (`collect_asm_goto_cc_branch_values`): `asm goto(... : "=@cc<cc>"(obj)
+/// ...)`, then `cond = load obj`, then the branch on `cond`. The branch costs
+/// no `setcc` and no memory round trip there; turning it into a returned value
+/// would force the flag through the output object (`sete` to the stack, a
+/// reload, a compare and a second `setcc`), so the boolean-return fold leaves
+/// it alone.
+fn branches_on_asm_goto_flag_output(block: &BasicBlock, cond: Value) -> bool {
+    let n = block.instructions.len();
+    let (
+        Some(Instruction::InlineAsm {
+            outputs,
+            goto_labels,
+            ..
+        }),
+        Some(Instruction::Load { dest, ptr, .. }),
+    ) = (
+        n.checked_sub(2).and_then(|i| block.instructions.get(i)),
+        block.instructions.last(),
+    )
+    else {
+        return false;
+    };
+    *dest == cond
+        && !goto_labels.is_empty()
+        && outputs.len() == 1
+        && outputs[0].1 == *ptr
+        && outputs[0]
+            .0
+            .trim_start_matches(['=', '+', '&', '%'])
+            .starts_with("@cc")
+}
+
 fn fold_boolean_return_branches(
     func: &mut IrFunction,
     label_to_idx: &FxHashMap<BlockId, usize>,
@@ -747,6 +780,7 @@ fn fold_boolean_return_branches(
         };
         if let (Some(on_true), Some(on_false)) = (returned_bit(t), returned_bit(f))
             && on_true != on_false
+            && !branches_on_asm_goto_flag_output(block, *cond)
         {
             plans.push((bi, *cond, on_true));
         }
