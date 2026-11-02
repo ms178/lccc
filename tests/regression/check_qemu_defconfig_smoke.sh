@@ -51,6 +51,11 @@ esac
 [[ ${FAKE_QEMU_CASE:-pass} != runtime-warning ]] || echo 'WARNING: synthetic kernel warning' >> "$log"
 [[ ${FAKE_QEMU_CASE:-pass} != missing-workload ]] || sed -i '/LCCC_DEFCFG_MEMORY_IO_PASS/d' "$log"
 [[ ${FAKE_QEMU_CASE:-pass} != console ]] || echo 'Warning: unable to open an initial console.' >> "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != worker-failure ]] || echo 'LCCC_SMOKE_FAIL_WORKER' >> "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != wrong-cpus ]] || sed -i 's/CPUS=2/CPUS=1/' "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != wrong-serial ]] || sed -i 's/quick brown fox/quick brown dog/' "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != no-powerdown ]] || sed -i '/reboot: Power down/d' "$log"
+[[ ${FAKE_QEMU_CASE:-pass} != empty-log ]] || : > "$log"
 [[ ${FAKE_QEMU_CASE:-pass} != exit ]] || exit 1
 FAKE
 chmod +x "$work/qemu"
@@ -82,7 +87,8 @@ for failure in none a b; do
     [[ $failure != none ]] || { echo 'FAIL: successful workers rejected' >&2; exit 1; }
   fi
 done
-for case in missing no-log panic exit wrong-compiler runtime-warning missing-workload console; do
+for case in missing no-log empty-log panic exit wrong-compiler runtime-warning \
+  missing-workload console worker-failure wrong-cpus wrong-serial no-powerdown; do
   if FAKE_QEMU_CASE=$case "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >"$work/out" 2>&1; then
     echo "FAIL: QEMU smoke accepted $case" >&2; cat "$work/out" >&2; exit 1
   fi
@@ -101,6 +107,15 @@ fi
 mkdir -p "$work/tmp with spaces"
 TMPDIR="$work/tmp with spaces" FAKE_QEMU_CASE=pass \
   "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/null
+# Exercise default host-tool discovery, not only the explicit test override.
+mkdir -p "$work/kernel/arch/x86/boot" "$work/kernel/usr"
+: > "$work/kernel/arch/x86/boot/bzImage"
+ln -s "$work/bin/gen_init_cpio" "$work/kernel/usr/gen_init_cpio"
+( cd "$work/kernel" && GEN_INIT_CPIO= FAKE_QEMU_CASE=pass \
+    "$root/scripts/qemu_defconfig_smoke.sh" arch/x86/boot/bzImage >/dev/null )
+ln -s "$work/kernel/arch/x86/boot/bzImage" "$work/image-symlink"
+GEN_INIT_CPIO= FAKE_QEMU_CASE=pass \
+  "$root/scripts/qemu_defconfig_smoke.sh" "$work/image-symlink" >/dev/null
 # Exercise the real staging helper against hermetic Debian split directories.
 # Nothing from the machine's own /usr/share or /usr/lib may satisfy these tests.
 source "$root/scripts/qemu_firmware.sh"
