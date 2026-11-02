@@ -892,6 +892,44 @@ impl X86Codegen {
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
 
+    /// Materialize a far slot's address into `%rcx`.
+    ///
+    /// The paths below write a slot operand straight into the text buffer
+    /// instead of going through a fold, so the operand splitter's anchor
+    /// choice is all they get. When neither `%rbp` nor the `%rsp` anchor
+    /// leaves an imm32 displacement -- frames past 4 GiB with a frame
+    /// pointer, or any frame past 2 GiB in `-fomit-frame-pointer` mode -- the
+    /// address has to be formed first:
+    ///
+    ///     movq $D, %rcx           # D = the slot's displacement from the base
+    ///     leaq (%rsp,%rcx), %rcx
+    ///
+    /// `%rcx` is this backend's secondary scratch register, and `reg_cache` is
+    /// invalidated so no later path reuses a value it believed was live there.
+    /// Returns `Some("(%rcx)")` when it materialized, `None` (emitting nothing)
+    /// for the ordinary encodable case.
+    fn slot_operand_via_rcx_if_far(&mut self, slot: StackSlot) -> Option<&'static str> {
+        let out = &mut self.state.out;
+        if out.slot_disp_encodable(slot.0) {
+            return None;
+        }
+        let (disp, base) = if out.use_rsp_addressing {
+            (out.rsp_frame_size.checked_add(slot.0)?, "rsp")
+        } else {
+            (slot.0, "rbp")
+        };
+        out.write_str("    movq $");
+        out.write_i64(disp);
+        out.write_str(", %rcx");
+        out.newline();
+        out.write_str("    leaq (%");
+        out.write_str(base);
+        out.write_str(",%rcx), %rcx");
+        out.newline();
+        self.state.reg_cache.invalidate_all();
+        Some("(%rcx)")
+    }
+
     /// Try to emit a constant-immediate store: `movX $IMM, ADDR`.
     /// Bypasses the accumulator entirely, saving 1-3 instructions.
     /// `imm` is the print value already validated by [`direct_store_imm`]:
@@ -903,18 +941,16 @@ impl X86Codegen {
         match addr {
             Some(SlotAddr::Direct(slot)) => {
                 // Store constant directly to stack slot: movX $IMM, N(%rsp/%rbp)
+                let far = self.slot_operand_via_rcx_if_far(slot);
                 let out = &mut self.state.out;
                 out.write_str("    ");
                 out.write_str(store_instr);
                 out.write_str(" $");
                 out.write_i64(imm);
                 out.write_str(", ");
-                if out.use_rsp_addressing {
-                    out.write_i64(out.rsp_frame_size + slot.0);
-                    out.write_str("(%rsp)");
-                } else {
-                    out.write_i64(slot.0);
-                    out.write_str("(%rbp)");
+                match far {
+                    Some(operand) => out.write_str(operand),
+                    None => out.write_slot_operand(slot.0),
                 }
                 out.newline();
                 self.state.reg_cache.invalidate_all();
@@ -1428,18 +1464,16 @@ impl X86Codegen {
                         match addr {
                             Some(SlotAddr::Direct(slot)) => {
                                 let folded_slot = StackSlot(slot.0 + offset);
+                                let far = self.slot_operand_via_rcx_if_far(folded_slot);
                                 let out = &mut self.state.out;
                                 out.write_str("    ");
                                 out.write_str(store_instr);
                                 out.write_str(" $");
                                 out.write_i64(imm_print);
                                 out.write_str(", ");
-                                if out.use_rsp_addressing {
-                                    out.write_i64(out.rsp_frame_size + folded_slot.0);
-                                    out.write_str("(%rsp)");
-                                } else {
-                                    out.write_i64(folded_slot.0);
-                                    out.write_str("(%rbp)");
+                                match far {
+                                    Some(operand) => out.write_str(operand),
+                                    None => out.write_slot_operand(folded_slot.0),
                                 }
                                 out.newline();
                                 self.state.reg_cache.invalidate_all();
@@ -2734,18 +2768,16 @@ impl X86Codegen {
             "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "eax",
             _ => Self::reg_for_type("rax", ty),
         };
+        let far = self.slot_operand_via_rcx_if_far(slot);
         let out = &mut self.state.out;
         out.write_str("    ");
         out.write_str(instr);
         out.write_str(" %");
         out.write_str(reg);
         out.write_str(", ");
-        if out.use_rsp_addressing {
-            out.write_i64(out.rsp_frame_size + slot.0);
-            out.write_str("(%rsp)");
-        } else {
-            out.write_i64(slot.0);
-            out.write_str("(%rbp)");
+        match far {
+            Some(operand) => out.write_str(operand),
+            None => out.write_slot_operand(slot.0),
         }
         out.newline();
     }
@@ -2761,17 +2793,16 @@ impl X86Codegen {
             "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "%eax",
             _ => "%rax",
         };
+        let far = self.slot_operand_via_rcx_if_far(slot);
         let out = &mut self.state.out;
         out.write_str("    ");
         out.write_str(instr);
         out.write_str(" ");
-        if out.use_rsp_addressing {
-            out.write_i64(out.rsp_frame_size + slot.0);
-            out.write_str("(%rsp), ");
-        } else {
-            out.write_i64(slot.0);
-            out.write_str("(%rbp), ");
+        match far {
+            Some(operand) => out.write_str(operand),
+            None => out.write_slot_operand(slot.0),
         }
+        out.write_str(", ");
         out.write_str(dest_reg);
         out.newline();
     }

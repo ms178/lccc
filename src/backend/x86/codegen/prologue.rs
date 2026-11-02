@@ -3266,6 +3266,9 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
+        // The document buffer is shared by every function in the module, so the
+        // huge-frame anchor is re-decided here rather than inherited.
+        self.state.out.x86_rsp_anchor = None;
         self.current_return_type = func.return_type;
         self.func_ret_classes = func.ret_eightbyte_classes.clone();
         self.func_set_second_ret = false;
@@ -3332,6 +3335,16 @@ impl X86Codegen {
             // CFI for this frame comes from backend::cfi_synth.
             self.state.emit("    pushq %rbp");
             self.state.emit("    movq %rsp, %rbp");
+            // A frame above 2 GiB has slot offsets with no imm32 `%rbp`
+            // displacement. Every access to such a slot can still be encoded
+            // from `%rsp`, which the prologue leaves exactly `frame_size` below
+            // `%rbp` -- but only when nothing moves `%rsp` behind the
+            // allocator's back. A dynamic alloca does exactly that, so the
+            // anchor is withheld there and those accesses materialise their
+            // address instead.
+            if frame_size > i32::MAX as i64 && !self.state.has_dyn_alloca {
+                self.state.out.x86_rsp_anchor = Some(frame_size);
+            }
 
             // Classic mcount site (-pg without -mfentry/-mnop-mcount): the
             // call belongs AFTER the frame is established — the mcount ABI
@@ -3393,13 +3406,16 @@ impl X86Codegen {
         volatile_ids.sort_unstable();
         for id in volatile_ids {
             if let Some(slot) = self.state.get_slot(id) {
-                if self.state.out.use_rsp_addressing {
-                    let off = self.state.out.rsp_frame_size + slot.0;
+                // The marker must name the slot exactly as the access
+                // instructions spell it, so it goes through the same operand
+                // splitter: `%rbp` normally, the `%rsp` anchor for a frame past
+                // imm32, `%rsp` directly when the frame pointer is omitted.
+                // A slot no anchor can name is reached through `(%rcx)`, which
+                // the peephole cannot mistake for a direct slot, so it needs
+                // no marker.
+                if let Some((disp, base)) = self.state.out.slot_operand_parts_opt(slot.0) {
                     self.state
-                        .emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rsp)", off));
-                } else {
-                    self.state
-                        .emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}(%rbp)", slot.0));
+                        .emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}{}", disp, base));
                 }
             }
         }

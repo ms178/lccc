@@ -2014,11 +2014,11 @@ impl X86Codegen {
     /// on whether the frame pointer is omitted. Used by format! strings throughout
     /// the codegen that need to reference stack slots directly.
     pub(super) fn slot_ref(&self, rbp_offset: i64) -> String {
-        if self.state.out.use_rsp_addressing {
-            format!("{}(%rsp)", self.state.out.rsp_frame_size + rbp_offset)
-        } else {
-            format!("{}(%rbp)", rbp_offset)
-        }
+        // One resolver for every spelling of a slot operand, so a frame too
+        // large for an imm32 `%rbp` displacement can never be addressed
+        // differently here than it is by the `AsmOutput` sinks.
+        let (disp, base) = self.state.out.slot_operand_parts(rbp_offset);
+        format!("{}{}", disp, base)
     }
 
     // --- x86 helper methods ---
@@ -6953,13 +6953,36 @@ fn resolve_reg_or_slot(
 /// Treating `ra.contains_key(id)` as resolution allowed `%vregN` to reach the
 /// assembler and caused SQLite's MachInst build to fail on unary operations.
 fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, PhysReg>) -> bool {
+    machinst_needs_text_fallback(inst, None)
+}
+
+/// Whether a MachInst window must be replayed through the accumulator path.
+///
+/// Two conditions force the replay:
+///
+/// * a `MachReg::Vreg` survived allocation (see the note above);
+/// * the instruction addresses a frame slot that the current frame mode cannot
+///   encode as an imm32 displacement -- a frame past 4 GiB with a frame
+///   pointer, or any frame past 2 GiB in `-fomit-frame-pointer` mode. A
+///   MachInst memory operand embeds the slot displacement in the instruction
+///   (`StackSlot(off)`, `LeaSlot`), so it has no way to materialise an address;
+///   the accumulator path does (`leaq slot` splits into `movq $disp` +
+///   `leaq (%base,%reg), %reg`, and the direct slot writers stage through
+///   `%rcx`). Replaying is semantically identical and this can only trigger for
+///   frames larger than the imm32 window, where the replay is free.
+fn machinst_needs_text_fallback(
+    inst: &super::machinst::MachInst,
+    out: Option<&crate::backend::common::AsmOutput>,
+) -> bool {
     use super::machinst::{MachInst, MachOperand, MachReg};
     let check_reg = |r: &MachReg| -> bool { matches!(r, MachReg::Vreg(_)) };
+    let far_slot = |off: i64| -> bool { out.is_some_and(|o| !o.slot_disp_encodable(off)) };
     let check_op = |o: &MachOperand| -> bool {
         match o {
             MachOperand::Reg(r) => check_reg(r),
             MachOperand::Mem { base, .. } => check_reg(base),
             MachOperand::MemIndex { base, index, .. } => check_reg(base) || check_reg(index),
+            MachOperand::StackSlot(off) => far_slot(*off),
             // AllocaAddr is resolved to a Raw leaq only when a slot exists;
             // without one the emitter prints an error comment and the address
             // computation silently vanishes. Fall back instead.
@@ -6967,8 +6990,15 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
             _ => false,
         }
     };
+    // Exhaustive on purpose, with no `_` arm: a MachInst variant carrying a
+    // `MachOperand` that this match forgets would emit an unencoded frame
+    // displacement instead of falling back (the `Mov128` case: a 128-bit slot
+    // copy in a frame past 4 GiB reached the emitter and tripped its
+    // `unreachable!`). Adding a variant must be a compile error here.
     match inst {
-        MachInst::Mov { src, dst, .. } => check_op(src) || check_op(dst),
+        MachInst::Mov { src, dst, .. } | MachInst::Mov128 { src, dst } => {
+            check_op(src) || check_op(dst)
+        }
         MachInst::FMov { src, dst, .. } => check_op(src) || check_op(dst),
         MachInst::FAlu {
             src2, src1, dst, ..
@@ -6980,6 +7010,7 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
         MachInst::ShiftX {
             count, src, dst, ..
         } => check_reg(count) || check_reg(src) || check_reg(dst),
+        MachInst::Rorx { src, dst, .. } => check_reg(src) || check_reg(dst),
         MachInst::Lea {
             base, index, dst, ..
         } => check_reg(base) || index.as_ref().is_some_and(|(r, _)| check_reg(r)) || check_reg(dst),
@@ -6988,12 +7019,33 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
             check_op(lhs) || check_op(rhs)
         }
         MachInst::SetCC { dst, .. } => check_reg(dst),
-        MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => check_reg(dst),
+        MachInst::LeaSym { dst, .. } => check_reg(dst),
+        MachInst::LeaSlot { slot, dst } => check_reg(dst) || far_slot(*slot),
         MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
             check_op(src) || check_reg(dst)
         }
         MachInst::Cmov { src, dst, .. } => check_op(src) || check_reg(dst),
-        _ => false,
+        // A typed call synthesises its spill and argument moves at emission
+        // time, so those slot operands are invisible to a scan of the
+        // instruction's own fields unless they are inspected here: the
+        // caller-save slots and the argument sources are the two places a
+        // `StackSlot` can appear.
+        MachInst::CallTyped {
+            caller_saves, args, ..
+        } => {
+            caller_saves.iter().any(|&(_, slot)| far_slot(slot))
+                || args.iter().any(|m| check_op(&m.src))
+        }
+        // No operand can name a frame slot: control flow and accumulator-only
+        // helpers.
+        MachInst::Cqto { .. }
+        | MachInst::XorRdx
+        | MachInst::Jcc { .. }
+        | MachInst::Jmp { .. }
+        | MachInst::Call { .. }
+        | MachInst::Label(_)
+        | MachInst::Raw(_)
+        | MachInst::Ret => false,
     }
 }
 
@@ -9405,7 +9457,7 @@ impl ArchCodegen for X86Codegen {
 
         let has_bad = final_insts
             .iter()
-            .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
+            .any(|mi| machinst_needs_text_fallback(mi, Some(&self.state.out)));
         if has_bad {
             if self.state.ra_config.mi_debug {
                 eprintln!(

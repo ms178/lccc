@@ -383,6 +383,9 @@ pub fn calculate_stack_space_common(
     let mut non_local_space = initial_offset;
     slot_assignment::place_stack_guard_early(state, func, &assign_slot, &mut non_local_space);
     let mut deferred_slots: Vec<DeferredSlot> = Vec::new();
+    // Giant allocas (one object past 2 GiB) are placed at the very end of the
+    // frame so every ordinary slot stays inside the imm32 window.
+    let mut deferred_giant_allocas: Vec<(u32, i64, i64)> = Vec::new();
     let mut multi_block_values: Vec<MultiBlockValue> = Vec::new();
     let mut block_local_values: Vec<BlockLocalValue> = Vec::new();
     let mut block_space: FxHashMap<usize, i64> = FxHashMap::default();
@@ -400,6 +403,7 @@ pub fn calculate_stack_space_common(
         &mut block_local_values,
         &mut block_space,
         &mut max_block_local_space,
+        &mut deferred_giant_allocas,
     );
 
     // Phase 3: Tier 3 — block-local greedy slot reuse.
@@ -463,6 +467,12 @@ pub fn calculate_stack_space_common(
     );
     let total_space =
         slot_assignment::place_stack_guard_late(state, func, &assign_slot, total_space);
+    let total_space = slot_assignment::place_giant_allocas_late(
+        state,
+        &mut deferred_giant_allocas,
+        &assign_slot,
+        total_space,
+    );
 
     // Phase 6: Resolve copy aliases (propagate slots from root to aliased values).
     // Uses liveness information to avoid sharing slots between values with

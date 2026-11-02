@@ -169,6 +169,7 @@ pub(super) fn classify_instructions(
     block_local_values: &mut Vec<BlockLocalValue>,
     block_space: &mut FxHashMap<usize, i64>,
     max_block_local_space: &mut i64,
+    defer_giant: &mut Vec<(u32, i64, i64)>,
 ) {
     let mut collected_values: FxHashSet<u32> = FxHashSet::default();
 
@@ -409,6 +410,7 @@ pub(super) fn classify_instructions(
             deferred_slots,
             block_space,
             max_block_local_space,
+            defer_giant,
         );
     }
 
@@ -443,6 +445,7 @@ pub(super) fn classify_instructions(
                     deferred_slots,
                     block_space,
                     max_block_local_space,
+                    defer_giant,
                 );
             } else if let Instruction::InlineAsm {
                 outputs,
@@ -640,6 +643,7 @@ fn classify_ssp_allocas(
     deferred_slots: &mut Vec<DeferredSlot>,
     block_space: &mut FxHashMap<usize, i64>,
     max_block_local_space: &mut i64,
+    defer_giant: &mut Vec<(u32, i64, i64)>,
 ) {
     let param_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
     let mut addr_taken: FxHashSet<u32> = FxHashSet::default();
@@ -668,7 +672,11 @@ fn classify_ssp_allocas(
     }
     let ptr_size = crate::common::types::target_ptr_size();
     let downward = assign_slot(0, 8, 8).0 < 0;
-    let pass_order = if downward {
+    // Two passes order buffer and non-buffer allocas. Giant objects are not
+    // placed here at all -- they are deferred to the end of the frame (see the
+    // deferral note in `classify_alloca`), so the pass shape is the same for
+    // every function.
+    let pass_order: [bool; 2] = if downward {
         [true, false]
     } else {
         [false, true]
@@ -714,6 +722,7 @@ fn classify_ssp_allocas(
                     deferred_slots,
                     block_space,
                     max_block_local_space,
+                    defer_giant,
                 );
             }
         }
@@ -739,6 +748,7 @@ fn classify_alloca(
     deferred_slots: &mut Vec<DeferredSlot>,
     block_space: &mut FxHashMap<usize, i64>,
     max_block_local_space: &mut i64,
+    defer_giant: &mut Vec<(u32, i64, i64)>,
 ) {
     // `Alloca.align` is authoritative, for parameter allocas too: the
     // lowering homes a parameter alloca at `max(struct_align, param_align)`
@@ -798,6 +808,20 @@ fn classify_alloca(
                 dest.0
             );
         }
+        return;
+    }
+
+    // A giant object -- one that on its own forces the frame past the imm32
+    // window -- is placed LAST, at the deepest address in the frame, by
+    // `place_giant_allocas_late`. Its own accesses materialise the address
+    // (its base is far from the frame register by construction), while
+    // parameter homes, spill slots and temporaries then stay within a few
+    // kilobytes of the frame register. That is what keeps their displacements
+    // encodable in `-fomit-frame-pointer` mode -- where no second anchor
+    // exists -- and in a function with a dynamic alloca, which moves `%rsp`
+    // behind the allocator's back. Ordinary frames never reach this branch.
+    if size > i32::MAX as usize {
+        defer_giant.push((dest.0, raw_size + extra as i64, align as i64));
         return;
     }
 
@@ -2108,4 +2132,27 @@ mod scalar_lane_slot_tests {
             assert_eq!(&memory[lo..hi], &patterns[i].to_le_bytes()[..hi - lo]);
         }
     }
+}
+
+/// Place deferred giant objects at the deepest addresses of the frame.
+///
+/// A giant object forces the frame past the imm32 displacement window, so its
+/// own base cannot be named by a frame-relative memory operand; every access
+/// to it materialises the address instead. Placing it after every other slot
+/// keeps the ordinary slots (parameters, spills, temporaries) inside the
+/// window, which is what makes their displacements encodable when no second
+/// anchor exists. Alignment is honoured exactly as `assign_slot` does
+/// elsewhere, and the returned total space covers the objects.
+pub(super) fn place_giant_allocas_late(
+    state: &mut crate::backend::state::CodegenState,
+    deferred: &mut Vec<(u32, i64, i64)>,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    mut total_space: i64,
+) -> i64 {
+    for (dest_id, size, align) in deferred.drain(..) {
+        let (slot, new_space) = assign_slot(total_space, size, align);
+        state.value_locations.insert(dest_id, StackSlot(slot));
+        total_space = new_space;
+    }
+    total_space
 }
