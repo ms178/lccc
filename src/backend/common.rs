@@ -1399,6 +1399,41 @@ fn link_builtin_native(
     Ok(())
 }
 
+/// The register an x86 stack slot's memory operand is anchored on.
+///
+/// A frame has two anchors: `%rbp`, which the prologue establishes, and
+/// `%rsp`, which sits exactly one frame below it. Which one can name a given
+/// slot depends on the displacement each can encode, so the choice is made once
+/// -- by [`AsmOutput::slot_operand_parts_opt`] -- and carried upwards in this
+/// type rather than in a string. Callers that add an index register (the
+/// indexed-GEP emitters) read the register back with [`SlotBase::name`];
+/// callers that write a whole operand use [`SlotBase::spelling`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SlotBase {
+    FramePointer,
+    StackPointer,
+}
+
+impl SlotBase {
+    /// The register name without the `%` prefix, for `disp(%base, %index)`.
+    #[inline]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            SlotBase::FramePointer => "rbp",
+            SlotBase::StackPointer => "rsp",
+        }
+    }
+
+    /// The complete `(%reg)` suffix of a one-register memory operand.
+    #[inline]
+    pub(crate) fn spelling(self) -> &'static str {
+        match self {
+            SlotBase::FramePointer => "(%rbp)",
+            SlotBase::StackPointer => "(%rsp)",
+        }
+    }
+}
+
 /// Assembly output buffer with helpers for emitting text.
 ///
 /// Besides the generic `emit` and `emit_fmt` methods, this provides specialized
@@ -2432,23 +2467,6 @@ impl AsmOutput {
         self.debug_scan_tail();
     }
 
-    /// Resolve an x86 RBP-relative slot offset to `(displacement, base)`.
-    ///
-    /// Three anchors are possible, in order of preference:
-    ///
-    /// * `%rsp` directly, when the frame pointer is omitted (the long-standing
-    ///   `-fomit-frame-pointer` mode, where `rsp_frame_size` models the live
-    ///   `%rsp` delta);
-    /// * `%rbp`, whenever the offset is an `imm32` -- the encoding every
-    ///   ordinary frame uses, and the only one that costs nothing;
-    /// * `%rsp` again, for an offset that `%rbp` cannot encode but `%rsp` can,
-    ///   which is exactly what `x86_rsp_anchor` authorises.
-    ///
-    /// The last arm keeps the `%rbp` spelling for a slot that neither anchor
-    /// can reach. That case cannot be folded into a memory operand at all, so
-    /// the folds decline it and the address is materialised into a register
-    /// instead (`memory::emit_slot_addr_to_secondary_impl`); reaching it here
-    /// means a fold failed to ask, and the debug assertion says so.
     /// Whether a folded memory operand can name this slot at all.
     ///
     /// A fold embeds the displacement in the instruction, so it needs an
@@ -2463,27 +2481,45 @@ impl AsmOutput {
     /// The `(disp, base)` spelling of a slot's memory operand, or `None` when no
     /// anchor can encode the displacement.
     ///
+    /// Three anchors are possible, in order of preference:
+    ///
+    /// * `%rsp` directly, when the frame pointer is omitted (the long-standing
+    ///   `-fomit-frame-pointer` mode, where `rsp_frame_size` models the live
+    ///   `%rsp` delta);
+    /// * `%rbp`, whenever the offset is an `imm32` -- the encoding every
+    ///   ordinary frame uses, and the only one that costs nothing;
+    /// * `%rsp` again, for an offset that `%rbp` cannot encode but `%rsp` can,
+    ///   which is exactly what `x86_rsp_anchor` authorises. The anchor is the
+    ///   frame size and `rsp_frame_size` is the live displacement of the
+    ///   temporaries pushed below the frame base (see `emit_prologue_impl`), so
+    ///   adding both keeps the spelling exact inside a call-staging window too.
+    ///
     /// `None` is not an error: a caller that forms the address in a register
     /// (`leaq slot`, `movq $disp, %r; leaq (%base,%r), %r`) still reaches the
     /// slot. Only a fold -- which embeds the displacement in the instruction --
     /// cannot, and it asks [`Self::slot_disp_encodable`] first.
     #[inline]
-    pub(crate) fn slot_operand_parts_opt(&self, offset: i64) -> Option<(i64, &'static str)> {
+    pub(crate) fn slot_operand_parts_opt(&self, offset: i64) -> Option<(i64, SlotBase)> {
         if self.use_rsp_addressing {
             let disp = self.rsp_frame_size.checked_add(offset)?;
-            return i32::try_from(disp).is_ok().then_some((disp, "(%rsp)"));
+            return i32::try_from(disp)
+                .is_ok()
+                .then_some((disp, SlotBase::StackPointer));
         }
         if i32::try_from(offset).is_ok() {
-            return Some((offset, "(%rbp)"));
+            return Some((offset, SlotBase::FramePointer));
         }
-        let via_rsp = self.x86_rsp_anchor?.checked_add(offset)?;
+        let via_rsp = self
+            .x86_rsp_anchor?
+            .checked_add(self.rsp_frame_size)?
+            .checked_add(offset)?;
         i32::try_from(via_rsp)
             .is_ok()
-            .then_some((via_rsp, "(%rsp)"))
+            .then_some((via_rsp, SlotBase::StackPointer))
     }
 
     #[inline]
-    pub(crate) fn slot_operand_parts(&self, offset: i64) -> (i64, &'static str) {
+    pub(crate) fn slot_operand_parts(&self, offset: i64) -> (i64, SlotBase) {
         if let Some(parts) = self.slot_operand_parts_opt(offset) {
             return parts;
         }
@@ -2510,7 +2546,7 @@ impl AsmOutput {
     pub(crate) fn write_slot_operand(&mut self, offset: i64) {
         let (disp, base) = self.slot_operand_parts(offset);
         write_i64_fast(&mut self.buf, disp);
-        self.buf.push_str(base);
+        self.buf.push_str(base.spelling());
     }
 
     /// Emit: `    {mnemonic} {offset}(%rbp), %{reg}`
@@ -2542,10 +2578,11 @@ impl AsmOutput {
             };
             if let Some(disp) = disp {
                 let base = if self.use_rsp_addressing {
-                    "rsp"
+                    SlotBase::StackPointer
                 } else {
-                    "rbp"
-                };
+                    SlotBase::FramePointer
+                }
+                .name();
                 self.buf.push_str("    movq $");
                 write_i64_fast(&mut self.buf, disp);
                 self.buf.push_str(", %");
@@ -5013,7 +5050,7 @@ mod rcx_epoch_analyzer_tests {
 /// does not exist in release builds.
 #[cfg(all(test, debug_assertions))]
 mod rcx_epoch_sink_coverage_tests {
-    use super::AsmOutput;
+    use super::{AsmOutput, SlotBase};
 
     /// Both shadow epochs ride the SAME line walk: a %rcx write moves only
     /// the %rcx epoch, a %rax write only the %rax epoch, and a
@@ -5087,7 +5124,7 @@ mod gcc_version_discovery_tests {
 
 #[cfg(test)]
 mod slot_operand_split_tests {
-    use super::AsmOutput;
+    use super::{AsmOutput, SlotBase};
 
     fn out(rsp_mode: bool, rsp_frame: i64, anchor: Option<i64>) -> AsmOutput {
         let mut o = AsmOutput::new();
@@ -5100,15 +5137,24 @@ mod slot_operand_split_tests {
     #[test]
     fn frame_pointer_displacement_wins_when_it_fits() {
         let o = out(false, 0, None);
-        assert_eq!(o.slot_operand_parts_opt(-8), Some((-8, "(%rbp)")));
+        assert_eq!(
+            o.slot_operand_parts_opt(-8),
+            Some((-8, SlotBase::FramePointer))
+        );
         let top = i32::MIN as i64;
-        assert_eq!(o.slot_operand_parts_opt(top), Some((top, "(%rbp)")));
+        assert_eq!(
+            o.slot_operand_parts_opt(top),
+            Some((top, SlotBase::FramePointer))
+        );
     }
 
     #[test]
     fn rsp_mode_adds_the_frame_size() {
         let o = out(true, 4096, None);
-        assert_eq!(o.slot_operand_parts_opt(-8), Some((4088, "(%rsp)")));
+        assert_eq!(
+            o.slot_operand_parts_opt(-8),
+            Some((4088, SlotBase::StackPointer))
+        );
         // A slot the frame size cannot bring into range stays unreachable.
         assert_eq!(o.slot_operand_parts_opt(-(1i64 << 40)), None);
     }
@@ -5118,10 +5164,16 @@ mod slot_operand_split_tests {
         let frame = 1i64 << 32;
         let o = out(false, 0, Some(frame));
         // Below the imm32 window from %rbp, but `frame + offset` is small.
-        assert_eq!(o.slot_operand_parts_opt(-frame + 48), Some((48, "(%rsp)")));
+        assert_eq!(
+            o.slot_operand_parts_opt(-frame + 48),
+            Some((48, SlotBase::StackPointer))
+        );
         // Fits %rbp: the frame register must win (shorter encoding, no anchor
         // dependency at the use site).
-        assert_eq!(o.slot_operand_parts_opt(-16), Some((-16, "(%rbp)")));
+        assert_eq!(
+            o.slot_operand_parts_opt(-16),
+            Some((-16, SlotBase::FramePointer))
+        );
     }
 
     #[test]

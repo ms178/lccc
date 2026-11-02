@@ -3332,6 +3332,15 @@ impl X86Codegen {
             // Reset RSP-relative addressing flag: a previous FPO function may have
             // set it, and the AsmOutput is shared across all functions in the module.
             self.state.out.use_rsp_addressing = false;
+            // `rsp_frame_size` is the live %rsp displacement below the frame
+            // base in *both* modes (the FPO path sets it to the whole frame at
+            // the end of this function; here the base is the post-prologue
+            // %rsp, so it starts at zero and tracks only the temporaries that
+            // call staging and the atomic loops push). A previous function's
+            // value must not leak into this one: the shared AsmOutput outlives
+            // the function, and a stale non-zero base would make every
+            // `%rsp`-anchored slot access of a >2 GiB frame off by that much.
+            self.state.out.rsp_frame_size = 0;
             // CFI for this frame comes from backend::cfi_synth.
             self.state.emit("    pushq %rbp");
             self.state.emit("    movq %rsp, %rbp");
@@ -3367,33 +3376,7 @@ impl X86Codegen {
 
             // Allocate remaining stack space for local variables
             let local_size = frame_size - (used_regs.len() as i64 * 8);
-            if local_size > 0 {
-                const PAGE_SIZE: i64 = 4096;
-                if local_size > PAGE_SIZE {
-                    let probe_label = self.state.fresh_label("stack_probe");
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    movq", local_size, "r11");
-                    self.state.out.emit_named_label(&probe_label);
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
-                    self.state.emit("    orl $0, (%rsp)");
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
-                    self.state.out.emit_jcc_label("    ja", &probe_label);
-                    self.state.emit("    subq %r11, %rsp");
-                    self.state.emit("    orl $0, (%rsp)");
-                } else {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    subq", local_size, "rsp");
-                }
-            }
+            emit_fp_stack_alloc_x86(&mut self.state, local_size);
         }
 
         // Preserve source-level volatile semantics through the late text
@@ -3414,8 +3397,11 @@ impl X86Codegen {
                 // the peephole cannot mistake for a direct slot, so it needs
                 // no marker.
                 if let Some((disp, base)) = self.state.out.slot_operand_parts_opt(slot.0) {
-                    self.state
-                        .emit_fmt(format_args!("    # LCCC_VOLATILE_SLOT {}{}", disp, base));
+                    self.state.emit_fmt(format_args!(
+                        "    # LCCC_VOLATILE_SLOT {}{}",
+                        disp,
+                        base.spelling()
+                    ));
                 }
             }
         }
@@ -5308,6 +5294,74 @@ fn emit_stack_adjust_x86(
         state.out.emit_instr_imm_reg("    movq", amount, "r11");
         state.emit(direction.register_form());
     }
+}
+
+/// Allocate `size` bytes below `%rsp` in a function whose frame pointer is
+/// already established.
+///
+/// This is the frame-pointer twin of [`emit_fpo_stack_alloc_x86`], and it
+/// differs from it for two reasons -- both of which used to be an ad-hoc copy
+/// of the probe loop inline in `emit_prologue_impl`, which cost correctness in
+/// one direction and code size in the other:
+///
+/// * **The stack-clash probe obeys its flag.** The inline copy probed
+///   unconditionally, so `-fno-stack-clash-protection` (the default, and what
+///   GCC 16 does for the same source) was silently ignored: a 3 GiB frame paid
+///   786 432 page faults and faulted in 3 GiB of stack before the first
+///   statement ran, and a giant frame could not execute on a machine without
+///   that much memory. The probe now runs exactly when it is asked for.
+/// * **The probe is a loop, not an unrolled sequence.** With `%rbp`
+///   established the CFA comes from `%rbp` (`cfi_synth`), so `%rsp` never has
+///   to be statically known and one 8-instruction loop serves any size. The
+///   FPO form must unroll because there the CFA is tracked through `%rsp` at
+///   every PC; unrolling here would emit 786 432 `subq`/`orl` pairs for a
+///   3 GiB frame. Small frames keep the unrolled form: it needs no scratch
+///   register, no branch, and stays inside the instruction cache.
+///
+/// The net movement is recorded with the same `# LCCC_STACK_ADJUST` marker
+/// `emit_stack_adjust_x86` uses, so the text-level audits track `%rsp` through
+/// the prologue without understanding the loop.
+fn emit_fp_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, size: i64) {
+    if size <= 0 {
+        return;
+    }
+    const PAGE_SIZE: i64 = 4096;
+    /// Below this many pages the unrolled probe is smaller than the loop and
+    /// strictly faster; above it the loop bounds the prologue at a dozen
+    /// instructions. 16 pages = 64 KiB, one sixteenth of a typical 1 MiB
+    /// L2 line budget for `.text`.
+    const UNROLL_LIMIT: i64 = 16 * PAGE_SIZE;
+
+    if !state.stack_clash_protection || size <= PAGE_SIZE {
+        emit_stack_adjust_x86(state, StackAdjust::Allocate, size);
+        return;
+    }
+    if size <= UNROLL_LIMIT {
+        let mut left = size;
+        while left > PAGE_SIZE {
+            state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+            state.emit("    orl $0, (%rsp)");
+            left -= PAGE_SIZE;
+        }
+        state.out.emit_instr_imm_reg("    subq", left, "rsp");
+        state.emit("    orl $0, (%rsp)");
+        return;
+    }
+    // `%r11` is the loop counter and is dead at this point: the prologue has
+    // not emitted anything that reads it, and the register allocator never
+    // allocates it across the prologue.
+    let probe_label = state.fresh_label("stack_probe");
+    state.out.emit_instr_imm_reg("    movq", size, "r11");
+    state.out.emit_named_label(&probe_label);
+    state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+    state.emit("    orl $0, (%rsp)");
+    state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "r11");
+    state.out.emit_instr_imm_reg("    cmpq", PAGE_SIZE, "r11");
+    state.out.emit_jcc_label("    ja", &probe_label);
+    // Tail: `size % PAGE_SIZE`, or a full page when `size` is a multiple of it.
+    state.emit("    subq %r11, %rsp");
+    state.emit("    orl $0, (%rsp)");
+    state.emit_fmt(format_args!("    # LCCC_STACK_ADJUST {size}"));
 }
 
 /// Allocate `size` bytes on `%rsp` in an FPO prologue. When

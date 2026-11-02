@@ -2018,7 +2018,7 @@ impl X86Codegen {
         // large for an imm32 `%rbp` displacement can never be addressed
         // differently here than it is by the `AsmOutput` sinks.
         let (disp, base) = self.state.out.slot_operand_parts(rbp_offset);
-        format!("{}{}", disp, base)
+        format!("{}{}", disp, base.spelling())
     }
 
     // --- x86 helper methods ---
@@ -5270,17 +5270,13 @@ impl X86Codegen {
         self.operand_to_rax_rdx(lhs);
         self.state.emit("    pushq %rdx");
         self.state.emit("    pushq %rax");
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size += 16;
-        }
+        self.state.out.rsp_frame_size += 16;
         self.operand_to_rax_rdx(rhs);
         self.state.emit("    movq %rax, %rcx");
         self.state.emit("    movq %rdx, %rsi");
         self.state.emit("    popq %rax");
         self.state.emit("    popq %rdx");
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size -= 16;
-        }
+        self.state.out.rsp_frame_size -= 16;
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
