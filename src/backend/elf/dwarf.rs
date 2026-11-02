@@ -1026,7 +1026,13 @@ pub(crate) fn build_dwarf_line_section(
             // version 3 opcodes, and `set_discriminator` is a version 4
             // extended opcode: a unit of an older version cannot express them,
             // so the state is dropped rather than written in a vocabulary its
-            // consumer does not have (GCC drops them the same way).
+            // consumer does not have.  GAS writes the opcode into a version 2
+            // or 3 unit anyway (measured on 2.47: `-gdwarf-2` assembly with
+            // `.loc ... discriminator 1` comes back with a `DW_LNE_`
+            // discriminator record), which leaves that unit describing an
+            // opcode its own dialect never defined; a consumer that trusts the
+            // header cannot decode it.  Dropping the state keeps the program
+            // readable by the consumer the header announces.
             if isa != current_isa && config.version >= 3 {
                 unit.push(12); // DW_LNS_set_isa
                 write_uleb128(isa, &mut unit);
