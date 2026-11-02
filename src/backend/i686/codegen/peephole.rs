@@ -14030,6 +14030,12 @@ fn scan_push_pop_span(
                 if text.contains("%esp") || line_writes_reg_implicitly(text, REG_ESP) {
                     return None;
                 }
+                // A trap or an unnamed transfer ends the span: it does not fall
+                // through, and the `%esp` it runs with is observable outside
+                // this function.
+                if ends_linear_flow(text) {
+                    return None;
+                }
                 if line_writes_family(store, infos, k, r) {
                     writes_r = true;
                 }
@@ -14039,11 +14045,54 @@ fn scan_push_pop_span(
     None
 }
 
+/// Instructions that leave the linear flow but own no [`LineKind`] on this
+/// back end: `hlt`, the `ud2` trap the codegen emits for unreachable code,
+/// `int3`, and the system-entry/exit pair.
+///
+/// [`scan_push_pop_span`] may not step over one, for the same two reasons the
+/// x86-64 pass refuses `sysret`/`hlt`/`int3` there. None of them falls through,
+/// so "the lines between the `push` and its `pop`" is not a straight-line
+/// sequence; and the `%esp` one of them runs with is visible outside the
+/// function — a trap handler and the debugger that reads a frame both see the
+/// pushed slot, and `sysenter`/`sysexit` hand the stack finger to the kernel.
+/// `leave`/`enter`/`iret`/`popf`/`pushf` need no entry here: the implicit
+/// oracle that [`line_writes_reg_implicitly`] consults already reports their
+/// `%esp`, and `pushf`/`popf` classify as `Push`/`Pop` with no register.
+///
+/// `syscall`/`sysret` never appear in 32-bit object code we emit, but they are
+/// valid in the assembly a pass is handed, and refusing them costs nothing.
+fn ends_linear_flow(s: &str) -> bool {
+    const HEADS: &[&str] = &[
+        "hlt", "ud0", "ud1", "ud2", "int1", "int3", "into", "icebp", "rsm", "syscall", "sysenter",
+        "sysexit", "sysret", "xbegin", "xabort", "bound", "lret", "lcall",
+    ];
+    let mut mn = s.split_whitespace().next().unwrap_or("");
+    // See through the `lock`/`rep` prefix words, as the other scans do.
+    if matches!(mn, "lock" | "rep" | "repe" | "repz" | "repne" | "repnz") {
+        mn = s.split_ascii_whitespace().nth(1).unwrap_or("");
+    }
+    HEADS
+        .iter()
+        .any(|h| mn.get(..h.len()).is_some_and(|w| w.eq_ignore_ascii_case(h)))
+}
+
 /// Whether the first real line after `j` is a CFI directive other than
 /// `.cfi_endproc`: the frame adjustment that pairs with an annotated pop.
+///
+/// Debug attribution and alignment hints between the `pop` and its adjustment
+/// are stepped over — they emit nothing, so the adjustment still describes the
+/// byte the `pop` moved. Stopping at a `.loc` (or any other inert directive
+/// that carries no unwind state) would hide the adjustment and let the pair be
+/// deleted out from under the unwinder. `.cfi_*` itself is never stepped over:
+/// that is what the scan is looking for.
 fn cfi_follows_line(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
     (j + 1..infos.len())
-        .find(|&k| !infos[k].is_nop())
+        .find(|&k| {
+            !infos[k].is_nop()
+                && !(infos[k].kind == LineKind::Directive
+                    && infos[k].inert_dir
+                    && !trimmed(store, &infos[k], k).starts_with(".cfi_"))
+        })
         .map(|k| trimmed(store, &infos[k], k))
         .is_some_and(|t| t.starts_with(".cfi_") && !t.starts_with(".cfi_endproc"))
 }
@@ -19449,6 +19498,38 @@ mod tests {
             push_pop_asm("    pushl %ecx\n    movl %eax, %ecx\n    shrl $1, %ecx\n    popl %ecx\n");
         assert!(!out.contains("pushl"), "{out}");
         assert!(out.contains("shrl $1, %ecx"), "{out}");
+    }
+
+    #[test]
+    fn a_trap_inside_the_span_keeps_the_pair() {
+        // `ud2` is the codegen's unreachable marker and does not fall through;
+        // the `%esp` it traps with is what a handler (and a debugger reading
+        // the frame) observes, so the pair may not be removed around it. Same
+        // for `hlt` and a literal `int3`.
+        for body in [
+            "    pushl %ecx\n    ud2\n    popl %ecx\n",
+            "    pushl %ecx\n    hlt\n    popl %ecx\n",
+            "    pushl %ecx\n    int3\n    popl %ecx\n",
+        ] {
+            let out = push_pop_asm(body);
+            // Only the `push` is asserted: whether an unreachable-code sweep
+            // later drops the `pop` is another pass's business, while the
+            // `push` can only disappear here by the pair being eliminated.
+            assert!(out.contains("pushl %ecx"), "{body} -> {out}");
+        }
+    }
+
+    #[test]
+    fn a_debug_line_between_the_pop_and_its_cfi_adjustment_hides_nothing() {
+        // The adjustment describes the byte the `pop` moved; a `.loc` between
+        // them emits nothing, so the scan must step over it and still see the
+        // adjustment -- otherwise the pair is deleted out from under the
+        // unwinder.
+        let out = push_pop_asm(
+            "    pushl %ecx\n    movl %eax, %ecx\n    popl %ecx\n    .loc 1 9 1\n    \
+             .cfi_adjust_cfa_offset 4\n",
+        );
+        assert!(out.contains("pushl %ecx"), "{out}");
     }
 
     #[test]

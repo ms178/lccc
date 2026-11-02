@@ -2756,6 +2756,15 @@ gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
     bash tests/regression/check_scratch_save_elimination.sh
 
+# The in-place byte-mask rewrite changes which instruction produces EFLAGS, so
+# its failure mode is a wrong branch, not a build error.  The gate asserts the
+# emission law (a mask whose only consumer is a condition must not survive) and
+# executes the discriminating probes -- `(signed char)x < 0` and
+# `(unsigned char)x > 127` must stay sign tests -- against GCC at every level in
+# both modes.
+gate "mask-test-fold" fast \
+    bash tests/regression/check_mask_test_fold.sh
+
 # The unsigned reading of a sign extension is two halves, and a constant
 # between them is a sign test.  The gate checks the emission on every backend
 # (the rule once made an AArch64 byte compare two instructions longer, which is
