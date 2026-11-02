@@ -1005,6 +1005,116 @@ and every single-bit operand, against a longhand reference at `-O0`/`-O1`/`-O2`/
 the shapes (including that the defined-zero diamond must *not* reappear on paths
 where the guard has been folded away).
 
+### 20. A count's width is the width of what it counts — `count_width`
+
+§18 made parity a first-class operation, and §19 made the zero-guarded count a
+sentinel, but both left the *width* of a count as the frontend had spelled it.
+Two shapes showed that this is not always the width the count should run at, and
+neither is expressible in the per-instruction simplifier for the same reason:
+`UnaryOp` carries a single `ty`, which is both the width of the operand and the
+width of the result, so a count that should *read* eight bits and *produce*
+thirty-two has nowhere to say so, and the simplifier cannot allocate the second
+value such a rewrite needs.
+
+**Shape 1, the cross-width mask.** `__builtin_popcountll(x) & 1` reaches the
+optimiser as a 64-bit `Popcount` masked by an `and` whose right operand is the
+C `int` literal 1 — narrowed by the frontend to 32 bits, legitimately, since a
+mask below 2^32 only reads the low half.  So the count is `U64`, the `and` is
+`I32`, and `fold_popcount_mask_to_parity` — which compares sizes and rightly
+insists they match — cannot fire.  The whole 64-bit scan plus `andl $1` is
+emitted: 22 instructions on x86-64 where the *same* question spelled
+`__builtin_parityll` costs 11.  It is the same question: the low bit of a count
+is the parity of the operand *at the operand's width*, and a mask of 1 does not
+care what width it was spelled at.
+
+**Shape 2, the promoted narrow count.** `__builtin_parity(uchar)` promotes its
+argument, so the IR counts `zext(x)` at 32 bits.  Popcount and parity are
+invariant under zero extension, so the count can run at the byte's own width —
+and at that width the parity is one `xorb %ah, %al` (8 → 5), while a byte's
+*count* is five instructions with no scratch register and no 24-bit scan:
+
+```asm
+        imull   $0x08040201, %eax, %eax   # spread the eight bits into nibbles
+        shrl    $3, %eax                  # three bits of shift: align them
+        andl    $0x11111111, %eax         # one bit per nibble
+        imull   $0x11111111, %eax, %eax   # sum the nibbles into the top one
+        shrl    $28, %eax                 # the count
+```
+
+(17 → 8 on x86-64, 19 → 11 on i686; exact for all 256 inputs, checked
+exhaustively.  On RISC-V and AArch64 there is no gain: a byte's count there is
+already the same three-step SWAR over a zero-extended byte.)
+
+So `count_width` folds both shapes, and only both: each rewrite keeps the value
+bit for bit, replaces one scan with a cheaper one, and emits at most one new
+temporary — `UnaryOp` at the narrow width into the fresh id, then a `Cast` back
+to the consumer's type.  The properties it needs, and refuses without:
+
+* **The count is private** (`uses == 1`).  Replacing one use of a shared count
+  would put a second scan beside it.
+* **The narrowing chain is zero extensions only.**  `narrow_source` walks
+  `Cast`s and stops unless every `from_ty` is unsigned and strictly narrower —
+  in this IR a cast from an unsigned type widens by zero extension, so every
+  value on the path holds the same bit pattern with leading zeros added, which
+  no count can see.  A sign extension would add ones and is refused.
+* **The mask is exactly 1**, read through the copies and constant casts the
+  frontend leaves behind (the literal arrives as a `Cast` of an `i64`).
+* **Same-width shapes stay with the simplifier.**  `masked_count` declines when
+  the narrowed width equals the consumer's width, comparing *sizes* — an
+  `unsigned` count masked by an `int` literal is still same-width, and
+  `fold_popcount_mask_to_parity` owns it.  One instruction, one owner; the gate
+  below pins both halves through `CCC_SIMPLIFY_SKIP=parity`.
+
+Narrowing is also a cost decision, and the cost is not the same everywhere.  On
+x86 the value already sits in a 32-bit register, so the extension back to the
+consumer's width is free; on AArch64 and RISC-V the emitters mask and copy
+(`mov`/`and`/`mov` on AArch64), and their narrow count paths still run the
+full-width sequence — narrowing there pays for the extension and buys nothing.
+So the rule is gated exactly where it was measured to win, the way
+`fold_shared_bit_select` is gated to the targets that rebuild one-hot masks, and
+a unit test pins that a non-x86 target keeps the promoted form.  Within x86 the
+widths are filtered once more: a parity is shorter at any narrower width, a
+popcount only where the *algorithm* changes (a byte's multiplier form, or 32
+bits instead of 64) — a 16-bit count over an already-promoted value would still
+run the 32-bit scan, so it is left alone.
+
+`-O2`, instructions inside the function body including `ret`, `ccc` before this
+round (`origin/main`, `d2e6814`) against after:
+
+| shape | x86-64 | i686 | AArch64 | RISC-V | GCC 16.2 | Clang 23.1.4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `popcountll(x) & 1` | 22 → **11** | 27 → **16** | 15 → **14** | 29 → **18** | 10 | 10 |
+| `__builtin_parity(u8)` | 8 → **5** | 10 → **6** | 14 = 14 | 16 = 16 | 4 | 4 |
+| `__builtin_parity(u16)` | 8 → **5** | 10 → **7** | 14 = 14 | 18 = 18 | 5 | 5 |
+| `__builtin_popcount(u8)` | 17 → **8** | 19 → **11** | 13 = 13 | 24 = 24 | 5* | 6 |
+| `__builtin_popcount(u16)` | 17 = 17 | 19 = 19 | 13 = 13 | 26 = 26 | 5* | 18 |
+| `__builtin_popcount(x) & 1` (all 32-bit) | 8 = 8 | 13 = 13 | 13 = 13 | 16 = 16 | 7 | 7 |
+| `1u << (32 - __builtin_clz(x-1))` | 9 = 9 | 17 = 17 | 16 = 16 | 31 = 31 | 6 | 7 |
+
+\* GCC calls libgcc's `__popcountdi2` for the width-promoted cases, which is the
+linking decision §18 already documents; LCCC keeps the count inline.
+
+The first row is now the same body as `__builtin_parityll` (11 = 11), which is
+the point: `popcount(x) & 1` and `parity(x)` are one question, and the two
+spellings have to converge before the width they were written at can stop
+mattering.
+
+Verified: `count_width`'s own tests evaluate every replacement with an
+independent IR evaluator (binop at its type, cast by the source's signedness,
+count over its `ty` bits) exhaustively — every `u8` for every width pair, every
+`u16` for the narrowing chains, `0..=0xffff` for the composed
+mask-over-zero-extension shape — plus the refusals (sign extension, shared
+count, mask ≠ 1, same width) and the fresh-id contract (one temporary, in the
+`fresh` slot the driver hands out).  `check_parity_and_popcount.sh` grew from
+six parts to eight: the byte count must be the two-multiplier form with no
+`push`/`pop` and no `0x55555555`, the cross-width shape must land on the 64-bit
+parity body, `CCC_SIMPLIFY_SKIP=parity` must still fold it (proving which rule
+owns it), AArch64's and RISC-V's narrow shapes must equal their pre-round pins
+(no silent regression from the gate), and
+`tests/regression/parity_and_popcount.c` still prints
+`failures=0 hash=09dc4aea9979cf33` at `-O0`/`-O1`/`-O2`/`-O3`/`-Os` and
+against GCC 16.2.
+
 ## What the LLVM tracker already knows about these shapes
 
 The round started from a differential probe, and the gaps it found have
@@ -1282,6 +1392,17 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
   cannot assume, so the baseline stays inline. Parity is the same story from the
   other side: it used to be 18 instructions (the count plus `andl $1`) and is
   now 8 (§18) — what remains here is the linking decision for the count.
+* **Narrow counts on AArch64 and RISC-V** — `count_width` (§20) narrows a count
+  only where the extension back to the consumer's width is free, which today is
+  x86-64 and i686.  The AArch64 and RISC-V emitters mask and copy for a
+  zero-extension (`mov`/`and`/`mov`) and their narrow `Popcount`/`Parity` paths
+  still run the full-width sequence, so `__builtin_popcount(u8)` there is 13 and
+  24 versus the 8 and 11 the x86 back ends now reach.  Two changes lift the
+  gate: a narrow-aware parity/popcount fold (a byte's parity is three `eor`s on
+  AArch64, and there is a three-step byte SWAR for both), and a cast emitter
+  that knows the value's high bits are already clean — which is what
+  `bitop_nonneg_values` already proves for the `sxtw` case on AArch64, so it is
+  a widening of an existing fact, not a new mechanism.
 * **`1u << __builtin_ctz(y)` (no complement)** — refused on purpose: with the
   exact `Ctz(0) == width` arm it is no shorter than the count path (5/6 vs 8/8
   with the arm), and Clang's four-instruction form depends on `ctz(0)` being
