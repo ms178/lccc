@@ -4828,7 +4828,6 @@ pub(crate) fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>
         Instruction::Store { .. }
         | Instruction::Memcpy { .. }
         | Instruction::VaArgStruct { .. }
-        | Instruction::VaArgVector { .. }
         | Instruction::VaStart { .. }
         | Instruction::VaEnd { .. }
         | Instruction::VaCopy { .. }
