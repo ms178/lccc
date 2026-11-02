@@ -867,6 +867,32 @@ impl Lowerer {
         if matches!(expr, Expr::UnaryOp(UnaryOp::LogicalNot, _, _)) {
             return IrType::I32;
         }
+        // Unary `-`, `~` and `+` materialise a value of the operand's PROMOTED
+        // type (C11 6.5.3.3p1/p4), which is exactly the width lower_unary_op
+        // computes at (see expr_ops.rs). Fall through to get_expr_type reported
+        // the widened STORAGE type (I64 for an int literal on LP64) and every
+        // consumer that extends the value — an enclosing cast, an assignment —
+        // then treated a 32-bit result as already 64-bit: the extension was
+        // dropped and the sign of the narrow result leaked into the wide one
+        // (`(long long)(-(u + 1))`, expression fuzzer seed 11000088). `+` is
+        // included because it returns its operand's value unchanged, so its
+        // value type is the same promoted width.
+        if let Expr::UnaryOp(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Plus, inner, _) = expr {
+            let inner_ty = self.value_ir_type(inner);
+            if inner_ty.is_integer() {
+                return Self::integer_promote(inner_ty);
+            }
+        }
+        // A comma expression's value IS its right operand's value (C11
+        // 6.5.17p3), so its value type must be the right operand's VALUE type.
+        // Delegating to get_expr_type(rhs) reported the right operand's storage
+        // carrier (I64 for `-((-7 != 1))`, whose real type is `int`) and the
+        // enclosing `(unsigned long long)` conversion then skipped the sign
+        // extension: 18446744073709551615 printed as 4294967295 (expression
+        // fuzzer seed 12000106).
+        if let Expr::Comma(_, rhs, _) = expr {
+            return self.value_ir_type(rhs);
+        }
         // Pointer-valued expressions always materialise a full target pointer.
         // Prefer the semantic CType before the storage-oriented fallback:
         // member expressions in very large TUs can have a conservative I32

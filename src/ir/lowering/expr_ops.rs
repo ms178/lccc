@@ -911,11 +911,24 @@ impl Lowerer {
                     return Operand::Value(dest);
                 }
                 let ty = self.get_expr_type(inner);
-                let inner_ty = self.infer_expr_type(inner);
+                // Compute the negation at the C result type of `-x` — the
+                // PROMOTED type of the operand (C11 6.5.3.3p1) — not at the
+                // operand's 64-bit IR carrier. The carrier is a storage
+                // artefact on LP64 (`12 * 0xFFFFu` is `unsigned int`, but
+                // get_expr_type reports I64 because the int literal's carrier
+                // is 64-bit); negating at that width computes `-x` mod 2^64
+                // instead of mod 2^32, so an unsigned result silently became a
+                // negative 64-bit number: `(long long)(-(u + 1))` for
+                // `unsigned u = 0xFFFFFFF0u` printed -4294967281 instead of the
+                // wrapped 15 (expression fuzzer, seed 11000088). The value type
+                // (`value_ir_type`) is the operand's real C type, so the
+                // wrapping width is exact, and `value_ir_type` of the result
+                // reports the same type (see expr_types.rs).
+                let inner_ty = self.value_ir_type(inner);
                 let neg_ty = if ty.is_float() || ty.is_128bit() {
                     ty
                 } else {
-                    widened_op_type(ty)
+                    widened_op_type(Self::integer_promote(inner_ty))
                 };
                 let val = self.lower_expr(inner);
                 // C integer promotion (C11 6.3.1.1): sign-extend (or zero-extend
@@ -963,12 +976,16 @@ impl Lowerer {
                 if inner_ct.is_complex() {
                     return self.lower_complex_conj(inner);
                 }
-                let inner_ty = self.infer_expr_type(inner);
+                let inner_ty = self.value_ir_type(inner);
                 let ty = self.get_expr_type(inner);
+                // Same rule as `-x` above: `~x` has the operand's PROMOTED
+                // type (C11 6.5.3.3p4), so the complement is computed — and
+                // wraps — at that width, never at the 64-bit IR carrier
+                // (`(long long)(~(u + 1))` printed -4294967282 instead of 14).
                 let not_ty = if ty.is_128bit() {
                     ty
                 } else {
-                    widened_op_type(ty)
+                    widened_op_type(Self::integer_promote(inner_ty))
                 };
                 let val = self.lower_expr(inner);
                 // C integer promotion: widen sub-int types before bitwise NOT,
