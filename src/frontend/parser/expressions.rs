@@ -15,7 +15,7 @@
 use super::ast::*;
 use super::parse::Parser;
 use crate::common::source::Span;
-use crate::common::types::AddressSpace;
+use crate::common::types::{AddressSpace, CType};
 use crate::frontend::lexer::token::{TokenKind, UnicodeCharKind};
 
 /// Build the AST node for an `L"..."` literal, honouring `-fshort-wchar`.
@@ -35,6 +35,22 @@ fn wide_string_expr(text: String, span: Span) -> Expr {
         Expr::Char16StringLiteral(text, span)
     } else {
         Expr::WideStringLiteral(text, span)
+    }
+}
+
+/// The type of a prefixed character constant: `u8'x'`, `u'x'` and `U'x'` have
+/// their code unit's unsigned type, `L'x'` has `wchar_t`'s, so `L'\xffffffff'`
+/// is the `int` -1 on x86 and the `unsigned int` 4294967295 on AArch64.
+fn prefixed_char_type(kind: UnicodeCharKind) -> TypeSpecifier {
+    match kind {
+        UnicodeCharKind::Utf8 => TypeSpecifier::UnsignedChar,
+        UnicodeCharKind::Utf16 => TypeSpecifier::UnsignedShort,
+        UnicodeCharKind::Utf32 => TypeSpecifier::UnsignedInt,
+        UnicodeCharKind::Wide => match crate::common::types::wchar_ctype() {
+            CType::UShort => TypeSpecifier::UnsignedShort,
+            CType::UInt => TypeSpecifier::UnsignedInt,
+            _ => TypeSpecifier::Int,
+        },
     }
 }
 
@@ -1070,13 +1086,9 @@ impl Parser {
                     CastQualifiers::default(),
                 )
             }
-            // `u8'x'`, `u'x'`, `U'x'`: the code unit in its unsigned type.
+            // `u8'x'`, `u'x'`, `U'x'`, `L'x'`: the code unit in its type.
             TokenKind::UnicodeCharLiteral(value, kind) => {
-                let ty = match kind {
-                    UnicodeCharKind::Utf8 => TypeSpecifier::UnsignedChar,
-                    UnicodeCharKind::Utf16 => TypeSpecifier::UnsignedShort,
-                    UnicodeCharKind::Utf32 => TypeSpecifier::UnsignedInt,
-                };
+                let ty = prefixed_char_type(*kind);
                 let value = i64::from(*value);
                 let span = self.peek_span();
                 self.advance();

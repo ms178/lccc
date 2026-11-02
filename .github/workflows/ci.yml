@@ -933,7 +933,7 @@ jobs:
       run: python3 tests/linker/check_riscv_shared_binding.py --lccc target/fastbuild/lccc-riscv
     - name: Vector arguments and returns at the compiler boundary
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_boundary.sh
-    - name: Preprocessor rescanning, conditional comma and pragma rendering
+    - name: Preprocessor rescanning, conditional comma, character constants, wchar_t and pragma rendering
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_frontend_preprocessor_rules.sh
     - name: RISC-V shared-binding mutation controls
       run: python3 tests/linker/test_riscv_shared_binding.py

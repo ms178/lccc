@@ -69,7 +69,6 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__LONG_LONG_MAX__", "9223372036854775807LL");
     def(macros, "__SHRT_MAX__", "32767");
     def(macros, "__SCHAR_MAX__", "127");
-    def(macros, "__WCHAR_MAX__", crate::common::types::wchar_max());
     def(macros, "__SIZE_MAX__", "18446744073709551615UL");
 
     // Type width macros (GCC/Clang extension)
@@ -81,11 +80,6 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__LONG_LONG_WIDTH__", "64");
     def(macros, "__PTRDIFF_WIDTH__", "64");
     def(macros, "__SIZE_WIDTH__", "64");
-    def(
-        macros,
-        "__WCHAR_WIDTH__",
-        crate::common::types::wchar_width(),
-    );
     def(macros, "__WINT_WIDTH__", "32");
     def(macros, "__INTMAX_WIDTH__", "64");
     def(macros, "__INTPTR_WIDTH__", "64");
@@ -99,11 +93,6 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__INT_FAST16_WIDTH__", "64");
     def(macros, "__INT_FAST32_WIDTH__", "64");
     def(macros, "__INT_FAST64_WIDTH__", "64");
-    def(
-        macros,
-        "__SIZEOF_WCHAR_T__",
-        crate::common::types::wchar_sizeof(),
-    );
 
     // Byte order
     def(macros, "__BYTE_ORDER__", "1234");
@@ -120,8 +109,9 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     if crate::common::types::char_is_unsigned() {
         def(macros, "__CHAR_UNSIGNED__", "1");
     }
-    // __WCHAR_UNSIGNED__: wchar_t is signed on Linux (unlike Windows).
-    // Do not define it (it would be detected as "defined" by #ifdef).
+    // __WCHAR_UNSIGNED__ is not defined even where `wchar_t` is unsigned
+    // (AArch64, `-fshort-wchar`): GCC predefines it for C++ only, and C code
+    // sees the signedness through `__WCHAR_MIN__` / `__WCHAR_MAX__`.
 
     // Additional GCC version macros
     def(macros, "__GNUC_PATCHLEVEL__", "0");

@@ -74,6 +74,33 @@ pub fn bytes_to_str(bytes: &[u8], start: usize, end: usize) -> &str {
     std::str::from_utf8(&bytes[start..end]).expect("bytes_to_str: input is not valid UTF-8")
 }
 
+/// Whether `ident`, met directly before a quote, is an encoding prefix and so
+/// the first part of a character or string literal token (`L'x'`, `u'x'`,
+/// `U'x'`, `u8'x'` and their string forms) rather than an identifier: such a
+/// prefix is never macro-expanded and never replaced by 0 in `#if`.
+pub(super) fn is_literal_prefix(ident: &str, next: Option<u8>) -> bool {
+    matches!(next, Some(b'\'' | b'"')) && matches!(ident, "L" | "u" | "U" | "u8")
+}
+
+/// Append the character that starts at byte `i` of `text` to `out` and return
+/// the index after it.
+///
+/// The byte scanners in this module walk `text.as_bytes()` but build `String`
+/// output; copying a non-ASCII character there one `b as char` per byte
+/// re-encodes every byte as its own Latin-1 character (`é`, C3 A9, becomes
+/// `Ã©`, C3 83 C2 A9), which changes string literals and character constants.
+/// `i` is a character boundary at every call site (the scanners only stop on
+/// ASCII bytes); if it ever is not, the byte is skipped rather than mangled.
+pub(super) fn push_char_at(out: &mut String, text: &str, i: usize) -> usize {
+    match text.get(i..).and_then(|rest| rest.chars().next()) {
+        Some(ch) => {
+            out.push(ch);
+            i + ch.len_utf8()
+        }
+        None => i + 1,
+    }
+}
+
 /// Skip past a string or character literal in a byte slice, starting at position `i`.
 /// Returns the position after the closing quote. Handles backslash escapes.
 /// Byte-oriented version for code that processes `&[u8]` directly.

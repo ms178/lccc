@@ -2060,8 +2060,7 @@ impl MacroTable {
                         result.push(PASTE_PROTECT_END as char);
                     }
                 } else if i < len {
-                    result.push(bytes[i] as char);
-                    i += 1;
+                    i = super::utils::push_char_at(&mut result, body, i);
                 }
                 continue;
             }

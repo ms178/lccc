@@ -15,6 +15,27 @@
 #     missing, so lccc tested `A`.
 #  4. `-E` output must be a valid translation unit: the synthetic pragma tokens
 #     the lexer consumes are rendered back as `#pragma` directives.
+#  5. A character constant in `#if` has the value it has in C, and its type's
+#     signedness decides the comparison: `L'\400'` is 256, not the identifier
+#     `L` (0) followed by the truncated narrow `'\400'` (0) -- the shape
+#     gcc.c-torture/execute/widechar-1.c pins -- and `'\377'`, `u'a'`,
+#     `L'\xffffffff'` and `'ab'` follow the target's `char` and `wchar_t`.
+#     The expected rows are gcc-16.2's `-E` answers (x86-64 and `-m32`, with
+#     and without `-funsigned-char` and `-fshort-wchar`); the AArch64 and
+#     RISC-V rows apply the same rules to those ABIs.
+#  6. `wchar_t` is the psABI's: `int` on x86 and RISC-V, `unsigned int` on
+#     AArch64 (GCC and Clang predefine `__WCHAR_TYPE__ unsigned int` there),
+#     `unsigned short` under `-fshort-wchar`; `L'x'` has that type, so
+#     `L'\xffffffff'` is the int -1 on x86-64 (it used to be the long
+#     4294967295), and `L"..."` decays to a pointer to it.
+#  7. The byte scanners that rewrite a line copy non-ASCII text whole: a code
+#     line holding both `__has_builtin(...)` and the string "é" kept the
+#     string as "Ã©" (strlen 4 instead of 2), because each UTF-8 byte was
+#     re-encoded as its own Latin-1 character; `#if defined(X) && 'é' == ...`
+#     had the same defect in the `defined` resolver.
+#
+# Sections 5 and 6 also run the sibling compilers next to $CCC (lccc-i686,
+# lccc-arm, lccc-riscv; override with CCC_I686/CCC_ARM/CCC_RISCV) when present.
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 tmp=${TMPDIR:-/tmp}/lccc-frontend-pp.$$
@@ -144,6 +165,191 @@ C
 "$CCC" "$tmp/pack_size.c" -o "$tmp/pack_size"
 out=$("$tmp/pack_size")
 [ "$out" = "5 8" ] || fail "#pragma pack changed meaning: got '$out', want '5 8'"
+
+# --- 5. character constants in #if ----------------------------------------
+bindir=$(dirname "$CCC")
+CCC_I686=${CCC_I686:-$bindir/lccc-i686}
+CCC_ARM=${CCC_ARM:-$bindir/lccc-arm}
+CCC_RISCV=${CCC_RISCV:-$bindir/lccc-riscv}
+
+# One `#if` per row; the answers form a bit string, row 1 first.
+rows=(
+    "L'\400'"
+    "L'\400' == 256"
+    "L'\xffffffff' < 0"
+    "L'\xffffffff' > -1"
+    "u'\xffff' == 65535"
+    "u'a' > -1"
+    "U'\xffffffff' > 0"
+    "U'a' > -1"
+    "'\377' < 0"
+    "'a' > -1"
+    "'\377' > -1"
+    "'ab' == 24930"
+    "'\377\377\377\377' == -1"
+    "'ab' > -1"
+    "L'ab' == 'b'"
+    "L'a' > -1"
+    "'\x41' == 65 && '\101' == 65 && '\n' == 10 && '\\\\' == 92 && '\\'' == 39"
+    "L'\x10FFFF' == 0x10FFFF && U'\U0010FFFF' == 0x10FFFF && u'\u00e9' == 0xe9"
+    "'\x80' == -128"
+    "L'\u00e9' == 233"
+    "'abcd' == 0x61626364"
+    "'\0' == 0 && !'\0'"
+    "(L'\xffffffff' >> 31) == -1"
+    "L'\x80000000' == -2147483647 - 1"
+    "u8'a' == 97"
+    "u8'a' > -1"
+    "L'\U0001F600' == 0xDE00"
+    "'é' == 0xC3A9 && L'é' == 0xE9"
+)
+: >"$tmp/charconst.c"
+for i in "${!rows[@]}"; do
+    printf '#if %s\nrow%d=1\n#else\nrow%d=0\n#endif\n' "${rows[$i]}" "$i" "$i" >>"$tmp/charconst.c"
+done
+#                  1   5    10   15   20   25
+want_x86=1110101011011111111111111001       # x86-64, i686
+want_uchar=1110101000011111110111111001     # RISC-V, -funsigned-char
+want_short=1100101011011110101111001011     # -fshort-wchar
+want_aarch64=1100101000011110110111001001   # AArch64
+charconst_bits() { # $@ = compiler and flags
+    "$@" -E -P -w "$tmp/charconst.c" | sed -n 's/^row[0-9]*=\([01]\)$/\1/p' | tr -d '\n'
+}
+check_charconst() { # $1 = label, $2 = expected bits, rest = compiler and flags
+    local label=$1 want=$2 got
+    shift 2
+    got=$(charconst_bits "$@")
+    if [ "$got" != "$want" ]; then
+        fail "#if character constants under $label" "got:  $got" "want: $want" \
+             "(row N is bit N of ${#rows[@]}; see the rows array)"
+    fi
+}
+check_charconst "x86-64" "$want_x86" "$CCC"
+check_charconst "x86-64 -funsigned-char" "$want_uchar" "$CCC" -funsigned-char
+check_charconst "x86-64 -fshort-wchar" "$want_short" "$CCC" -fshort-wchar
+for pair in "i686:$CCC_I686:$want_x86" "aarch64:$CCC_ARM:$want_aarch64" \
+            "riscv64:$CCC_RISCV:$want_uchar"; do
+    IFS=: read -r label bin want <<<"$pair"
+    if [ -x "$bin" ]; then
+        check_charconst "$label" "$want" "$bin"
+    else
+        echo "note: $bin not built; skipping the $label rows" >&2
+    fi
+done
+
+# An encoding prefix is part of its literal, never a macro, while the same
+# spellings alone are still ordinary identifiers.
+cat >"$tmp/prefix.c" <<'C'
+#define L 0
+#define u 7
+#define U 9
+#define u8 3
+#if L'\400' == 256 && u'a' == 97 && U'b' == 98 && u8'c' == 99
+prefixes_are_literals
+#endif
+#if L + u + U + u8 == 19
+identifiers_still_expand
+#endif
+#define WIDE(x) L ## x
+#if WIDE('\400') == 256
+pasted_prefix
+#endif
+C
+got=$("$CCC" -E -P -w "$tmp/prefix.c" | compact)
+[ "$got" = "prefixes_are_literalsidentifiers_still_expandpasted_prefix" ] ||
+    fail "encoding prefixes in #if" "got: $got" \
+         "want: prefixes_are_literalsidentifiers_still_expandpasted_prefix"
+
+# torture/execute/widechar-1.c, which aborted at every optimization level.
+cat >"$tmp/widechar.c" <<'C'
+void abort(void);
+#define C L'\400'
+#if C
+#define zero (!C)
+#else
+#define zero C
+#endif
+int main(void) { if (zero != 0) abort(); return 0; }
+C
+"$CCC" -O2 "$tmp/widechar.c" -o "$tmp/widechar"
+"$tmp/widechar" || fail "widechar-1: #if L'\\400' was not taken"
+
+# --- 6. wchar_t follows the psABI ------------------------------------------
+cat >"$tmp/wchar.c" <<'C'
+typedef __WCHAR_TYPE__ wchar_t;
+#ifdef WCHAR_UNSIGNED
+_Static_assert(L'\xffffffff' == 0xffffffffu && L'\xffffffff' > 0, "unsigned value");
+_Static_assert(_Generic(L'a', unsigned int: 1, default: 0), "L'a' is unsigned int");
+_Static_assert(_Generic(&L"x"[0], unsigned int *: 1, default: 0), "L\"x\" is unsigned int[]");
+_Static_assert((wchar_t)-1 > 0, "wchar_t is unsigned");
+_Static_assert(__WCHAR_MAX__ == 0xffffffffu && __WCHAR_MIN__ == 0, "limits");
+#else
+_Static_assert(L'\xffffffff' == -1 && L'\x80000000' == -2147483647 - 1, "signed value");
+_Static_assert(_Generic(L'a', int: 1, default: 0), "L'a' is int");
+_Static_assert(_Generic(&L"x"[0], int *: 1, default: 0), "L\"x\" is int[]");
+_Static_assert((wchar_t)-1 < 0, "wchar_t is signed");
+_Static_assert(__WCHAR_MAX__ == 2147483647 && __WCHAR_MIN__ == -2147483647 - 1, "limits");
+#endif
+_Static_assert(sizeof(L'a') == sizeof(wchar_t) && sizeof(L'a') == 4, "L'a' is a wchar_t");
+_Static_assert(sizeof(L"ab") == 12 && L'\u00e9' == 0xe9 && L'\400' == 256, "32-bit units");
+const wchar_t *p = L"wide";
+wchar_t arr[] = L"abc";
+_Static_assert(sizeof(arr) == 16, "array of wchar_t");
+C
+cat >"$tmp/wchar16.c" <<'C'
+typedef __WCHAR_TYPE__ wchar_t;
+_Static_assert(sizeof(L'a') == 2 && sizeof(wchar_t) == 2 && sizeof(L"ab") == 6, "16-bit");
+_Static_assert(_Generic(L'a', unsigned short: 1, default: 0), "L'a' is unsigned short");
+_Static_assert(L'\xffff' == 65535 && L'\U0001F600' == 0xDE00, "UTF-16 units");
+_Static_assert(__WCHAR_MAX__ == 0xffff && __WCHAR_MIN__ == 0, "limits");
+C
+for pair in "x86-64:$CCC:" "i686:$CCC_I686:" "aarch64:$CCC_ARM:-DWCHAR_UNSIGNED" \
+            "riscv64:$CCC_RISCV:"; do
+    IFS=: read -r label bin define <<<"$pair"
+    [ -x "$bin" ] || continue
+    # shellcheck disable=SC2086 # $define is empty or one word
+    "$bin" -Wall -Wextra -Werror -fsyntax-only $define "$tmp/wchar.c" 2>"$tmp/wchar.err" ||
+        fail "wchar_t is not the $label psABI's" "$(cat "$tmp/wchar.err")"
+    "$bin" -w -fshort-wchar -fsyntax-only "$tmp/wchar16.c" 2>"$tmp/wchar16.err" ||
+        fail "-fshort-wchar on $label" "$(cat "$tmp/wchar16.err")"
+done
+
+# The same constants at run time, against gcc-16.2's output.
+cat >"$tmp/wchar_run.c" <<'C'
+#include <stdio.h>
+int main(void) {
+    printf("%d %zu %lld\n", L'\xffffffff' < 0, sizeof(L'\xffffffff'), (long long)L'\xffffffff');
+    printf("%d %zu %lld\n", L'\x80000000' < 0, sizeof(L'\x80000000'), (long long)L'\x80000000');
+    printf("%d %zu %lld\n", u'\xffff' > -1, sizeof(u'\xffff'), (long long)u'\xffff');
+    printf("%d %zu %lld\n", U'\xffffffff' > 0, sizeof(U'\xffffffff'), (long long)U'\xffffffff');
+    printf("%d %zu %lld\n", '\377' < 0, sizeof('\377'), (long long)'\377');
+    printf("%lld %lld %lld\n", (long long)'ab', (long long)'\377\377\377\377', (long long)'abcde');
+    return 0;
+}
+C
+"$CCC" -w "$tmp/wchar_run.c" -o "$tmp/wchar_run"
+got=$("$tmp/wchar_run" | tr '\n' '|')
+want='1 4 -1|1 4 -2147483648|1 2 65535|1 4 4294967295|1 4 -1|24930 -1 1650680933|'
+[ "$got" = "$want" ] || fail "character constants at run time" "got:  $got" "want: $want"
+
+# --- 7. line rewriters keep UTF-8 intact -----------------------------------
+cat >"$tmp/utf8_line.c" <<'C'
+#include <stdio.h>
+#define X 1
+#if defined(X) && 'é' == 0xC3A9 && L'é' == 0xE9
+static const int pp_utf8 = 1;
+#else
+static const int pp_utf8 = 0;
+#endif
+int main(void) {
+    const char *s = "é"; int h = __has_builtin(__builtin_expect);
+    printf("%zu %d %d\n", __builtin_strlen(s), h, pp_utf8);
+    return 0;
+}
+C
+"$CCC" "$tmp/utf8_line.c" -o "$tmp/utf8_line"
+got=$("$tmp/utf8_line")
+[ "$got" = "2 1 1" ] || fail "UTF-8 text on a rewritten line" "got: $got" "want: 2 1 1"
 
 [ "$status" -eq 0 ] && echo "frontend-preprocessor: ok"
 exit "$status"
