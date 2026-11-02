@@ -713,6 +713,64 @@ predicate moves). The *values* are covered by `three_way_boolean_compare.c`'s
 `zext_uchar_*` shapes, which is also the shape that caught the cast-peel
 miscompile in §14.
 
+### 16. The operand's interval, not one comparison of it — `cmprange`
+
+```c
+int le_max(int x) { return (unsigned char)x <= 255; }   /* 4 -> 1, gcc 1, clang 1 */
+int gt_max(int x) { return (unsigned char)x > 255; }    /* 4 -> 1, gcc 1, clang 1 */
+int schar_lt(int x) { return (signed char)x < 128; }    /* 4 -> 1, gcc 1, clang 1 */
+int imax(int x)     { return x > INT_MAX; }            /* 3 -> 1, gcc 1, clang 1 */
+```
+
+§15 answered four questions about a zero-extension because they were asked
+against *zero*. The same argument answers every other constant: the operand of a
+comparison can only hold an interval, and when the interval decides the question
+the answer is a constant. The interval comes from one of two places:
+
+* a widening cast's source type -- a zero-extension is in `[0, 2^n - 1]`, a
+  sign-extension in `[-2^(n-1), 2^(n-1) - 1]`;
+* the compare width's own domain -- `[0, 2^w - 1]` read unsigned,
+  `[-2^(w-1), 2^(w-1) - 1]` read signed. The predicate says which reading the
+  width's bits get; `Eq`/`Ne` read a number the bits alone do not determine, so
+  without a cast they get no interval at all.
+
+The four orderings are monotone in that operand, so the interval's endpoints
+settle them: when both ends answer the same, every value between them answers
+the same. `Eq`/`Ne` are not monotone and are decided by membership instead --
+a constant outside the interval can never be equal, one inside can. That is one
+rule for all ten predicates, and the interval carries its reading so the rule
+never has to guess: the classical unsigned-bias fold
+(`x - lo >u hi - lo`) is the same reasoning done by hand, and done by hand it
+once wrapped a span and miscompiled (§14's cast peel).
+
+Two things this rule has to get right, both of which the unit test now pins:
+
+* **The constant may be wider than the compare.** A constant keeps its own type
+  in the IR, so `x >=s 4294967295` on a 32-bit operand asks about the pattern
+  `0xffffffff`, which is `-1` *signed*; a rule that read the 4294967295 answers
+  "false for every x" and miscompiles. The first version of this fold did
+  exactly that, and the interval test caught it before the fold was ever pushed
+  (`c_signed` is now the low `ty` bits sign-extended, `c_unsigned` the same bits
+  zero-extended).
+* **It has to run before narrowing.** `Cmp(op, Cast(x, T->W), C, W)` narrows to
+  the narrow width when every reader narrows (§`narrow_cast_cmp`), and a
+  narrowed full-domain compare is a compare no later rule can fold on its own:
+  `(unsigned char)x <= 255` became `cmpb $255, %dil; setbe`. That shape also
+  explains why the fold is not a micro-optimization of an existing one: before
+  it, `(unsigned char)x >= 0 && (unsigned char)x <= 255` folded as a *pair* --
+  `range_fold_branch`'s "narrowed full-domain" case -- and folding one half to a
+  constant (which §15 does) left the other half unfolded. The pair was never the
+  reason; the interval is.
+
+`CCC_SIMPLIFY_SKIP=cmprange` attributes it. The corpus sweep over the same 3,128
+files as §13's (`evidence/2026-11-02-compare-intervals/sweep-cmprange.json`)
+is 13 files shorter, **0 longer**, 2,320 unchanged with the rule on, net −545
+bytes: `range_fold_branch.c` (1093 -> 1011) and `three_way_boolean_compare.c`
+(2162 -> 2092) carry most of it, plus `ivw_wrapv_range.c`,
+`range_fold_edges.c`, `vec_range_mask_fusion{,_sse2}.c` and
+`vec_u16_saturating_sub.c`. No file grows, which is what a fold that replaces a
+compare with a constant should look like.
+
 ## What the LLVM tracker already knows about these shapes
 
 The round started from a differential probe, and the gaps it found have

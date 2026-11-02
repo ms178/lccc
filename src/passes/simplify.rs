@@ -2819,7 +2819,7 @@ struct BinOpDef {
 /// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`,
 /// `negneg`, `addneg`, `cast_narrow`, `cast_widen`, `cast_same`, `cast_mix`,
 /// `pack_extract`, `rotate_chain`, `widened_cond`, `zeroneg`, `negcast`,
-/// `notcast`, `booldiff`.
+/// `notcast`, `booldiff`, `cmprange`.
 /// `zeroneg` (`0 - x` => `Neg`), `negcast` (a truncation distributes over a
 /// negate) and `notcast` (a truncation distributes over a complement) are the
 /// pieces of a narrow unary op; each is measured on its own by
@@ -3901,6 +3901,138 @@ fn narrow_cast_cmp(op: IrCmpOp, c: i64, cast: &CastDef, ty: IrType) -> Option<(I
     Some((int_const_of_type(narrow_ty, c)?, narrow_ty))
 }
 
+/// The closed interval of numbers a `Cmp` operand can hold, when something
+/// narrower than "any bit pattern of the compare width" pins it down: the
+/// source type of a widening cast, or the compare width's own domain.
+///
+/// Two views, because the same bits are two different numbers.  `NonNegative`
+/// is an interval whose members are the same number under either reading, so a
+/// fold over it needs no view of the predicate.  `Signed` has negative members
+/// and is an interval only under the signed reading -- the unsigned reading of
+/// `[-128, 127]` is `[0xffffff80, 0x7f]`, not an interval at all -- so only the
+/// signed predicates (and equality, which reads the number) may use it.
+///
+/// Which view is available is decided by what establishes the interval, and
+/// that is also what fixes the constant's reading:
+///
+/// * a zero-extending cast's result is non-negative (the extension puts zeros
+///   above the source's bits), so `[0, 2^bits - 1]` holds under both readings;
+/// * a sign-extending cast's result is `[-2^(bits-1), 2^(bits-1) - 1]`, so only
+///   the signed predicates and equality can use it;
+/// * without a cast, the operand's domain is the compare width's, and the
+///   predicate says which reading that width's bits get: the unsigned
+///   predicates read `[0, 2^bits - 1]`, the signed ones
+///   `[-2^(bits-1), 2^(bits-1) - 1]`.  `Eq`/`Ne` read the number, which the
+///   bits alone never determine, so they get no interval this way.
+#[derive(Clone, Copy)]
+enum CmpRange {
+    /// `[0, hi]`, the same numbers under either reading.
+    NonNegative(u64),
+    /// `[lo, hi]` with `lo < 0`: signed reading only.
+    Signed(i64, i64),
+}
+
+/// The interval [`CmpRange`] for `ty`'s operand `cast` (`None` when the operand
+/// is not a cast), under the reading `op` implies.
+///
+/// A 128-bit operand gets no interval: its endpoints do not fit the `i64` the
+/// fold reasons in, and the extra width buys nothing -- the bounds that fold
+/// compares are the 8..64-bit ones C can spell as a constant.
+fn cmp_operand_range(ty: IrType, cast: Option<&CastDef>, op: IrCmpOp) -> Option<CmpRange> {
+    let unsigned_op = matches!(
+        op,
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+    );
+    let widening =
+        cast.filter(|c| c.to_ty == ty && c.from_ty.is_integer() && c.from_ty.size() < ty.size());
+    if let Some(cdef) = widening {
+        let bits = cdef.from_ty.size() * 8;
+        if bits == 0 || bits >= 64 {
+            return None;
+        }
+        if cdef.from_ty.is_unsigned() {
+            return Some(CmpRange::NonNegative((1u64 << bits) - 1));
+        }
+        if unsigned_op {
+            return None;
+        }
+        let hi = (1i64 << (bits - 1)) - 1;
+        return Some(CmpRange::Signed(-hi - 1, hi));
+    }
+    let bits = ty.size() * 8;
+    if bits == 0 || bits > 64 {
+        return None;
+    }
+    if unsigned_op {
+        return Some(CmpRange::NonNegative(if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        }));
+    }
+    if bits < 64 {
+        let hi = (1i64 << (bits - 1)) - 1;
+        return Some(CmpRange::Signed(-hi - 1, hi));
+    }
+    None
+}
+
+/// The constant answer to `op` over `range`, when the interval decides it.
+///
+/// `Eq`/`Ne` are not monotone, so they are decided by membership: a constant
+/// outside the interval can never be equal, one inside can.  The four orderings
+/// are monotone in that operand, so the endpoints settle them -- when both ends
+/// answer the same, every value between them answers the same.  That is one
+/// rule for every predicate and both readings, and it is why the interval has
+/// to carry its view: the classical unsigned-bias fold (`x - lo >u hi - lo`)
+/// is exactly this reasoning done by hand, and hand-done it once wrapped a
+/// span and miscompiled.
+fn cmp_range_decides(op: IrCmpOp, ty: IrType, range: CmpRange, c: i64) -> Option<i8> {
+    let width = ty.size() * 8;
+    // The constant as the compare reads it: its low `ty` bits, under BOTH
+    // readings.  A constant keeps its own type in the IR
+    // (`IrConst::from_i64(v, U32)` stores `v` zero-extended), so it can hold a
+    // value the compare width cannot: `x >=s 4294967295` on a 32-bit operand
+    // asks about the 32-bit pattern `0xffffffff`, which is -1 signed, and a
+    // rule that read the 4294967295 would answer "false for every x" -- this
+    // exact case was caught by the interval unit test.  `-1` on a 32-bit
+    // unsigned comparison is likewise the 4294967295 the same bits denote.
+    let (c_unsigned, c_signed) = if width >= 64 {
+        (c as u64, c)
+    } else {
+        let bits = (c as u64) & ((1u64 << width) - 1);
+        (bits, ((bits << (64 - width)) as i64) >> (64 - width))
+    };
+    if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+        let inside = match range {
+            CmpRange::NonNegative(hi) => i128::from(c_unsigned) <= i128::from(hi),
+            CmpRange::Signed(lo, hi) => (lo..=hi).contains(&c_signed),
+        };
+        return (!inside).then(|| i8::from(op == IrCmpOp::Ne));
+    }
+    let unsigned_op = matches!(
+        op,
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+    );
+    // The two readings differ only in the *values* handed to the ordering, so
+    // the endpoints and the constant are converted together and the same
+    // monotone rule runs for both.  The comparison is in `i128` so the whole
+    // `u64` domain fits as well: `x <=u 0xffffffffffffffff` is true, and that
+    // is the same rule as `x <=u 0xffffffff` for a 32-bit operand.
+    let (lo, hi, c) = match range {
+        CmpRange::NonNegative(hi) if unsigned_op => (0i128, i128::from(hi), i128::from(c_unsigned)),
+        CmpRange::NonNegative(hi) => (0i128, i128::from(hi), i128::from(c_signed)),
+        CmpRange::Signed(lo, hi) => {
+            if unsigned_op {
+                return None;
+            }
+            (i128::from(lo), i128::from(hi), i128::from(c_signed))
+        }
+    };
+    let at_lo = op.eval_i128(lo, c);
+    (at_lo == op.eval_i128(hi, c)).then(|| i8::from(at_lo))
+}
+
 /// For each value, whether it is a widening cast EVERY live reader of which is
 /// a rewrite that reads the cast's narrow source instead: a compare against a
 /// constant that [`narrow_cast_cmp`] accepts, or -- when the widened-condition
@@ -4252,6 +4384,36 @@ fn simplify_cmp(
     let is_zero_const = const_i64 == Some(0);
     let is_one_const = const_i64 == Some(1);
 
+    // A comparison whose operand cannot reach the constant is a constant, and
+    // so is one whose operand cannot escape it: `(int)(unsigned char)c <= 255`
+    // is true, `(int)(unsigned char)c > 255` is false, `(int)(signed char)c <
+    // 128` is true.  The interval comes from the operand ([`CmpRange`]): a
+    // widening cast's source type, or the compare width's own domain, which
+    // also answers `x > INT_MAX` and `u <=u 0xffffffff`.
+    //
+    // This runs BEFORE the narrowing below, and that order is the point.  A
+    // full-domain question has a constant answer, and narrowing would turn it
+    // into a compare at the narrow width that no later rule can fold on its own
+    // (`cmpb $255, %dil; setbe` for `c <= 255`): it was `range_fold_branch`'s
+    // paired-half "narrowed full-domain" case that caught the shape, where the
+    // two halves of `(zext c >= 0) && (zext c <= 255)` used to fold as a pair
+    // and the single half did not.
+    if !simplify_skip("cmprange")
+        && ty.size() <= 8
+        && let Some(c) = const_i64
+        && let Some(range) = cmp_operand_range(
+            ty,
+            cast_defs.get(val.0 as usize).and_then(|d| d.as_ref()),
+            effective_op,
+        )
+        && let Some(answer) = cmp_range_decides(effective_op, ty, range, c)
+    {
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::I8(answer)),
+        });
+    }
+
     if simplify_skip("cmp") {
         return None;
     }
@@ -4376,6 +4538,10 @@ fn simplify_cmp(
     // Clang 23.1.4 fold both spellings; LCCC knew only the unsigned-typed
     // operand, which is why `unsigned u; return u < 0;` was two instructions and
     // `unsigned char c; return (int)c < 0;` was four.
+    //
+    // The two ordering answers are constants and come from the interval rule
+    // above; what is left here is the pair that is not a constant -- `<= 0` and
+    // `> 0` ask the narrow operand a question of its own, at its own width.
     if is_zero_const
         && let Some(Some(cdef)) = cast_defs.get(idx)
         && cdef.to_ty == ty
@@ -4384,13 +4550,6 @@ fn simplify_cmp(
         && cdef.from_ty.size() < cdef.to_ty.size()
     {
         match effective_op {
-            IrCmpOp::Slt | IrCmpOp::Sge => {
-                let value = i8::from(effective_op == IrCmpOp::Sge);
-                return Some(Instruction::Copy {
-                    dest,
-                    src: Operand::Const(IrConst::I8(value)),
-                });
-            }
             IrCmpOp::Sle | IrCmpOp::Sgt => {
                 return Some(Instruction::Cmp {
                     dest,
@@ -11538,6 +11697,140 @@ mod exact_product_half_tests {
                         }
                     ),
                     "{from_ty:?} {to_ty:?} {op:?} folded: {inst:?}"
+                ),
+            }
+        }
+    }
+
+    /// A compare is decided by the interval its operand can hold, wherever that
+    /// interval is narrower than the compare width's full domain: a widening
+    /// cast's source type, or the width's own domain.  Every constant case here
+    /// is what GCC 16.2 and Clang 23.1.4 emit for the C spelling (they agree on
+    /// all of them), and every `Unchanged` case is one where the interval does
+    /// NOT decide -- the fold must leave them alone.
+    #[test]
+    fn operand_intervals_decide_comparisons() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+        #[derive(Clone, Copy)]
+        enum Want {
+            Constant(i8),
+            Unchanged,
+        }
+        #[derive(Clone, Copy, Debug)]
+        enum Shape {
+            /// `(to_ty)(from_ty)x <op> c`: the operand is a widening cast.
+            Cast(IrType, IrType),
+            /// `x <op> c` with `x` of the compare width: no cast.
+            Plain,
+        }
+        use Shape::{Cast, Plain};
+        // (shape, compare ty, predicate, constant, want)
+        #[rustfmt::skip]
+        let cases = [
+            // A zero-extension cannot leave [0, 2^n-1], under either reading.
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Sle, 255, Want::Constant(1)),
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Sgt, 255, Want::Constant(0)),
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Slt, 256, Want::Constant(1)),
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Ule, 255, Want::Constant(1)),
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Ugt, 255, Want::Constant(0)),
+            (Cast(IrType::U16, IrType::I64), IrType::I64, IrCmpOp::Ule, 65535, Want::Constant(1)),
+            (Cast(IrType::U32, IrType::I64), IrType::I64, IrCmpOp::Sle, 4294967295, Want::Constant(1)),
+            // Equality reads the number, so the same interval rules it out.
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Eq, 300, Want::Constant(0)),
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Ne, 300, Want::Constant(1)),
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Eq, 200, Want::Unchanged),
+            // A sign-extension cannot leave [-2^(n-1), 2^(n-1)-1].
+            (Cast(IrType::I8, IrType::I32), IrType::I32, IrCmpOp::Slt, 128, Want::Constant(1)),
+            (Cast(IrType::I8, IrType::I32), IrType::I32, IrCmpOp::Sgt, 127, Want::Constant(0)),
+            (Cast(IrType::I8, IrType::I32), IrType::I32, IrCmpOp::Sge, -128, Want::Constant(1)),
+            (Cast(IrType::I8, IrType::I32), IrType::I32, IrCmpOp::Slt, -129, Want::Constant(0)),
+            (Cast(IrType::I8, IrType::I32), IrType::I32, IrCmpOp::Eq, -200, Want::Constant(0)),
+            (Cast(IrType::I16, IrType::I32), IrType::I32, IrCmpOp::Sle, 40000, Want::Constant(1)),
+            // The unsigned reading of a sign-extended interval is not an
+            // interval, so the unsigned predicates must not fold through it.
+            (Cast(IrType::I8, IrType::I32), IrType::I32, IrCmpOp::Ult, 5, Want::Unchanged),
+            // Inside the interval nothing is decided.
+            (Cast(IrType::U8, IrType::I32), IrType::I32, IrCmpOp::Slt, 100, Want::Unchanged),
+            (Cast(IrType::I8, IrType::I32), IrType::I32, IrCmpOp::Sgt, -100, Want::Unchanged),
+            // Without a cast the compare width's domain decides, in the reading
+            // the predicate implies -- and `Eq`/`Ne` get nothing, because the
+            // bits alone are not one number.
+            (Plain, IrType::I32, IrCmpOp::Sgt, 2147483647, Want::Constant(0)),
+            (Plain, IrType::I32, IrCmpOp::Slt, -2147483648, Want::Constant(0)),
+            (Plain, IrType::U32, IrCmpOp::Ule, 4294967295, Want::Constant(1)),
+            (Plain, IrType::U32, IrCmpOp::Ugt, 4294967295, Want::Constant(0)),
+            (Plain, IrType::U32, IrCmpOp::Sge, 4294967295, Want::Unchanged),
+            // `-1` on a 32-bit unsigned compare is 0xffffffff, and every
+            // 32-bit pattern is at or below it.
+            (Plain, IrType::I32, IrCmpOp::Ule, -1, Want::Constant(1)),
+            (Plain, IrType::I32, IrCmpOp::Ult, -1, Want::Unchanged),
+            (Plain, IrType::I32, IrCmpOp::Eq, 5, Want::Unchanged),
+            // A constant wider than the compare: `x >=s 4294967295` on a
+            // 32-bit operand asks about the pattern 0xffffffff, i.e. -1
+            // signed, so it is NOT false for every x; read unsigned, the same
+            // question puts every x at or below it.
+            (Plain, IrType::U32, IrCmpOp::Sge, 4294967295, Want::Unchanged),
+            (Plain, IrType::I32, IrCmpOp::Ule, 4294967295, Want::Constant(1)),
+            (Plain, IrType::I32, IrCmpOp::Slt, 4294967295, Want::Unchanged),
+        ];
+        for (shape, ty, op, c, want) in cases {
+            let operand = match shape {
+                Plain => Operand::Value(Value(0)),
+                Cast(_, to_ty) => {
+                    assert_eq!(to_ty, ty, "a cast case compares at its own width");
+                    Operand::Value(Value(1))
+                }
+            };
+            let mut instructions = vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: match shape {
+                    Plain => ty,
+                    Cast(from_ty, _) => from_ty,
+                },
+            }];
+            if let Cast(from_ty, to_ty) = shape {
+                instructions.push(Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty,
+                    to_ty,
+                });
+            }
+            instructions.push(Instruction::Cmp {
+                dest: Value(2),
+                op,
+                lhs: operand,
+                rhs: Operand::Const(IrConst::from_i64(c, ty)),
+                ty,
+            });
+            let mut func = IrFunction::new("interval".to_string(), IrType::I32, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions,
+                terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = 3;
+            simplify_function(&mut func);
+            let inst = func.blocks[0]
+                .instructions
+                .iter()
+                .find(|i| i.dest() == Some(Value(2)))
+                .expect("the comparison survives");
+            let label = format!("{shape:?} {ty:?} {op:?} {c}");
+            match want {
+                Want::Constant(v) => match inst {
+                    Instruction::Copy {
+                        src: Operand::Const(got),
+                        ..
+                    } => assert_eq!(got.to_i64(), Some(i64::from(v)), "{label}"),
+                    other => panic!("{label}: expected a constant, got {other:?}"),
+                },
+                Want::Unchanged => assert!(
+                    matches!(inst, Instruction::Cmp { .. }),
+                    "{label} folded: {inst:?}"
                 ),
             }
         }

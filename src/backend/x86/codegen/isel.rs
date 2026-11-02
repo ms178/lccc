@@ -164,6 +164,26 @@ fn const_as_imm32_size(op: &Operand, size: OpSize) -> Option<i64> {
     }
 }
 
+/// The immediate a compare may encode directly, `None` when it needs a
+/// register.  This is [`const_as_imm32_size`]'s rule stated for the compare,
+/// which is where it was missing: a 32-bit compare encodes any `u32` bit
+/// pattern verbatim (`cmpl $0xffffffff` is `cmpl $-1`, and `2654435761u` is
+/// `$-1640531535`), while a 64-bit one sign-extends imm32 and can only take the
+/// signed range.  Without this, `x == 4294967295u` -- and every compare
+/// against a hash constant with the top bit set -- spent a `movl $imm, %ecx`
+/// shuttle that GCC and Clang do not, three instructions where they spend two.
+fn cmp_imm_for_size(value: i64, size: OpSize) -> Option<i64> {
+    if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+        return Some(value);
+    }
+    if size == OpSize::S32 && value > i32::MAX as i64 && value <= u32::MAX as i64 {
+        // The sign-extended spelling of the same 32 bits: what both the text
+        // (`cmpl $-1`) and the encoder expect.
+        return Some(value as i32 as i64);
+    }
+    None
+}
+
 /// Emit a move from an IR Operand to a register, using physical registers
 /// for values already allocated by the main register allocator.
 fn emit_mov_operand_r(
@@ -1000,13 +1020,16 @@ pub fn lower_cmp(
         lhs_op = MachOperand::Reg(MachReg::Phys(RAX));
     }
     if let MachOperand::Imm(value) = rhs_op {
-        if value < i32::MIN as i64 || value > i32::MAX as i64 {
-            out.push(MachInst::Mov {
-                src: MachOperand::Imm(value),
-                dst: MachOperand::Reg(MachReg::Phys(RCX)),
-                size,
-            });
-            rhs_op = MachOperand::Reg(MachReg::Phys(RCX));
+        match cmp_imm_for_size(value, size) {
+            Some(imm) => rhs_op = MachOperand::Imm(imm),
+            None => {
+                out.push(MachInst::Mov {
+                    src: MachOperand::Imm(value),
+                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                    size,
+                });
+                rhs_op = MachOperand::Reg(MachReg::Phys(RCX));
+            }
         }
     }
     // `cmp $0, %reg` ≡ `test %reg, %reg` for the integer condition codes we
@@ -3113,6 +3136,79 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// A 32-bit compare against a constant with the top bit set encodes as an
+    /// imm32: the bit pattern is the whole operand, so `4294967295` is
+    /// `cmpl $-1` and `2654435761` (the golden-ratio hash constant) is
+    /// `$-1640531535`. The shuttled form -- `movl $4294967295, %ecx; cmpl
+    /// %ecx, %edi` -- is one instruction longer and was what LCCC emitted for
+    /// every hash compare whose constant has the top bit set.
+    ///
+    /// The control is the 64-bit compare: it only has a *sign-extended* imm32,
+    /// so the same constant there must still stage through a register, and a
+    /// 64-bit-pattern constant (`0x123456789ab`) cannot be an immediate at any
+    /// width.
+    #[test]
+    fn compare_against_wide_constant_uses_the_imm32_pattern() {
+        let assignments = FxHashMap::default();
+        let cmp_rhs = |c: IrConst, ty: IrType| {
+            let mut out = Vec::new();
+            lower_cmp(
+                &Value(9),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Const(c),
+                ty,
+                &assignments,
+                &mut out,
+            );
+            out
+        };
+        for (constant, size, want) in [
+            // 32-bit compares: the full u32 range is an imm32 bit pattern.
+            (4294967295i64, OpSize::S32, -1i64),
+            (2654435761, OpSize::S32, -1640531535),
+            (2147483648, OpSize::S32, i32::MIN as i64),
+            // ...and the signed range stays as it was.
+            (i32::MAX as i64, OpSize::S32, i32::MAX as i64),
+            (-1, OpSize::S32, -1),
+        ] {
+            let out = cmp_rhs(IrConst::I64(constant), IrType::U32);
+            assert!(
+                !out.iter().any(|i| matches!(i, MachInst::Mov { .. })),
+                "{constant}: staged instead of encoding {want}: {out:?}"
+            );
+            assert!(
+                out.iter().any(|i| matches!(
+                    i,
+                    MachInst::Cmp {
+                        rhs: MachOperand::Imm(v),
+                        size: s,
+                        ..
+                    } if *v == want && *s == size
+                )),
+                "{constant}: no Cmp against {want}: {out:?}"
+            );
+        }
+        // A 64-bit compare has only the sign-extended imm32.
+        let out = cmp_rhs(IrConst::I64(4294967295), IrType::I64);
+        assert!(
+            out.iter().any(|i| matches!(
+                i,
+                MachInst::Mov {
+                    dst: MachOperand::Reg(MachReg::Phys(RCX)),
+                    ..
+                }
+            )),
+            "64-bit compare must stage the wide constant: {out:?}"
+        );
+        // A 64-bit *pattern* is never an immediate.
+        let out = cmp_rhs(IrConst::I64(0x123456789ab), IrType::I64);
+        assert!(
+            out.iter().any(|i| matches!(i, MachInst::Mov { .. })),
+            "0x123456789ab must be staged: {out:?}"
+        );
     }
 
     #[test]
