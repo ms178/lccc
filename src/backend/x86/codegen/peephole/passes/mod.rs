@@ -22,6 +22,7 @@ use super::types::*;
 use crate::backend::regalloc::RaConfig;
 
 // Submodule pass implementations
+mod abs_cmov;
 mod bmi2_mask;
 mod callee_saves;
 mod compare_branch;
@@ -2359,6 +2360,15 @@ fn peephole_optimize_inner(
     // disables it for bisection.
     if !sk("pow2_cmov") {
         pow2_cmov::run(&mut store, &mut infos);
+    }
+
+    // Phase 8d'': the sign-magnitude identity (`mov; sar $31; xor; sub`, from
+    // `abs` and `x < 0 ? -x : x`) into GCC's and Clang's `mov; neg; cmovs` --
+    // one instruction (two when the result is then copied out) and one cycle
+    // of latency shorter.  After `return_home` for the same reason as
+    // `pow2_cmov`.  `CCC_PEEPHOLE_SKIP=abs_cmov` disables it for bisection.
+    if !sk("abs_cmov") {
+        abs_cmov::run(&mut store, &mut infos);
     }
 
     // Phase 8d-1: an in-place byte mask whose only consumer is a condition —
