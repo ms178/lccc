@@ -2787,12 +2787,36 @@ gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
     bash tests/regression/check_scratch_save_elimination.sh
 
+# The in-place byte-mask rewrite changes which instruction produces EFLAGS, so
+# its failure mode is a wrong branch, not a build error.  The gate asserts the
+# emission law (a mask whose only consumer is a condition must not survive) and
+# executes the discriminating probes -- `(signed char)x < 0` and
+# `(unsigned char)x > 127` must stay sign tests -- against GCC at every level in
+# both modes.
+gate "mask-test-fold" fast \
+    bash tests/regression/check_mask_test_fold.sh
+
 # The unsigned reading of a sign extension is two halves, and a constant
 # between them is a sign test.  The gate checks the emission on every backend
 # (the rule once made an AArch64 byte compare two instructions longer, which is
 # an assertion now), the attribution and the values at five levels.
 gate "cross-domain-sext-cmp" fast \
     bash tests/regression/check_cross_domain_sext_cmp.sh
+
+# Parity is the population count modulo two, and every backend answers it
+# shorter than the count (x86 reads PF after an XOR fold, the RISCs index the
+# 0x6996 table).  The same round made RISC-V's count branch-free; the gate pins
+# the emission on all four backends, the attribution, the pinned counts and the
+# values at five levels.
+gate "parity-and-popcount" fast \
+    bash tests/regression/check_parity_and_popcount.sh
+
+# The defined-zero leading-zero count is a sentinel (`mov $63; bsr; xor $31`),
+# not the diamond it used to be: no branch, no label, three instructions -- what
+# Clang emits for the guarded question.  The gate pins the shape on both x86
+# backends and the values, `clz(0)` included, at five levels.
+gate "clz-zero-sentinel" fast \
+    bash tests/regression/check_clz_zero_sentinel.sh
 
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not

@@ -407,6 +407,56 @@ impl ArmCodegen {
         self.state.emit("    fmov w0, s0");
     }
 
+    /// PARITY: the XOR of every bit, as 0 or 1.
+    ///
+    /// AArch64 has no parity flag, so the reduction has to end in a value.  Two
+    /// shapes, by what the target has:
+    ///
+    /// * With SIMD, the population count is four instructions (`fmov`, `cnt`,
+    ///   `uaddlv`, `fmov`) and `and #1` is the fifth -- shorter than any fold,
+    ///   so parity stays the count's low bit there.
+    /// * Without SIMD (the general-registers-only mode the kernel and
+    ///   freestanding targets use) folding to a byte and then reading a table is
+    ///   the short form.  Four `eor`s with successive shifts fold 64/32 bits
+    ///   down to a nibble (`x ^ x>>k` preserves parity), the nibble indexes the
+    ///   16-bit parity table (bit *n* of 0x6996 is the parity of *n*), and the
+    ///   result is masked to the 0/1 the builtin returns.  That is seven
+    ///   instructions where the SWAR count plus `and #1` is fourteen.
+    ///
+    /// x1 is the reserved emitter scratch in both shapes, as in the count above.
+    pub(super) fn emit_int_parity_impl(&mut self, ty: IrType) {
+        let narrow_32 = matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        );
+        if !self.general_regs_only {
+            self.emit_int_popcount_impl(ty);
+            self.state.emit("    and w0, w0, #1");
+            return;
+        }
+        if narrow_32 {
+            self.state.emit("    eor w1, w0, w0, lsr #16");
+        } else {
+            // Fold the high word into the low one first; from here on the
+            // reduction is 32 bits wide and w-register arithmetic is right.
+            self.state.emit("    eor x1, x0, x0, lsr #32");
+            self.state.emit("    eor w1, w1, w1, lsr #16");
+        }
+        self.state.emit("    eor w1, w1, w1, lsr #8");
+        self.state.emit("    eor w1, w1, w1, lsr #4");
+        // AArch64 folds both halves of an `eor` in one instruction (the second
+        // operand can be shifted), so continuing to bit 0 costs two
+        // instructions where the table needs `and #0xf`, a `mov` of 0x6996 and
+        // a variable `lsr` -- three.  Six instructions for 32 bits, seven for
+        // 64, which is one fewer than the table on both (and one fewer than
+        // Clang's 64-bit form).
+        self.state.emit("    eor w1, w1, w1, lsr #2");
+        self.state.emit("    eor w1, w1, w1, lsr #1");
+        // Writing w0 clears the rest of x0, so the 0/1 answer is normalized
+        // for both the 32- and the 64-bit result types.
+        self.state.emit("    and w0, w1, #1");
+    }
+
     pub(super) fn emit_int_binop_impl(
         &mut self,
         dest: &Value,

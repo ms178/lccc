@@ -10923,6 +10923,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_int_ctz_nonzero(&mut self, ty: IrType) => emit_int_ctz_nonzero_impl;
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
+        fn emit_int_parity(&mut self, ty: IrType) => emit_int_parity_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
         fn emit_fused_mul_add(&mut self, mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand, acc: &Operand, add_dest: &Value, ty: IrType) => emit_fused_mul_add_impl;
         fn emit_fused_fma(&mut self, mul_lhs: &Operand, mul_rhs: &Operand, acc: &Operand, dest: &Value, ty: IrType, negate_product: bool, negate_addend: bool) => emit_fused_fma_impl;

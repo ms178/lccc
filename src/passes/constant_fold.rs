@@ -1246,6 +1246,7 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
         IrUnaryOp::Bswap => (v.swap_bytes() >> unused) as i64,
         IrUnaryOp::BitReverse => (v.reverse_bits() >> unused) as i64,
         IrUnaryOp::Popcount => i64::from(v.count_ones()),
+        IrUnaryOp::Parity => i64::from(v.count_ones() & 1),
         IrUnaryOp::IsConstant => {
             // If we got here, the operand was already constant
             1
@@ -1679,6 +1680,43 @@ mod tests {
             fold_unaryop(IrUnaryOp::BitReverse, 0x0123_4567_89ab_cdef, IrType::U64),
             Some(0xf7b3_d591_e6a2_c480u64 as i64)
         );
+        // Parity is the count modulo two, evaluated at the operand's width:
+        // the sign bits of a narrow signed operand are not part of the value,
+        // and a 64-bit operand's high half is.
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, 0, IrType::U32), Some(0));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, 1, IrType::U32), Some(1));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, 3, IrType::U32), Some(0));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, 7, IrType::U32), Some(1));
+        // All-ones is an even number of set bits at 8, 16 and 32 bits.
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, -1, IrType::U8), Some(0));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, -1, IrType::I8), Some(0));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, -1, IrType::I16), Some(0));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, -1, IrType::U32), Some(0));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, -1, IrType::U64), Some(0));
+        // A single set bit is odd, and it is odd at the width's own bit
+        // position for both signednesses.
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::Parity, 0x0000_0000_8000_0000, IrType::U32),
+            Some(1)
+        );
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::Parity, 0x8000_0000u64 as i64, IrType::U32),
+            Some(1)
+        );
+        assert_eq!(
+            fold_unaryop(
+                IrUnaryOp::Parity,
+                0x8000_0000_0000_0000u64 as i64,
+                IrType::U64
+            ),
+            Some(1)
+        );
+        // An operand that only looks odd in the bits above its width is not:
+        // the fold masks to the width first (0xff80 has one set bit at 16
+        // bits, but as a U8 it is 0x80 -- still one, so use a value where the
+        // narrow view is even).
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, 0xff80, IrType::U8), Some(1));
+        assert_eq!(fold_unaryop(IrUnaryOp::Parity, 0xffff, IrType::U8), Some(0));
     }
 
     #[test]
@@ -2089,6 +2127,11 @@ mod narrow_bit_op_tests {
                     Some(i64::from(x.count_ones())),
                     "{ty:?} {x}"
                 );
+                assert_eq!(
+                    f(IrUnaryOp::Parity),
+                    Some(i64::from(x.count_ones() & 1)),
+                    "{ty:?} {x}"
+                );
                 assert_eq!(f(IrUnaryOp::Bswap), Some(i64::from(x)), "{ty:?} {x}");
                 assert_eq!(
                     f(IrUnaryOp::BitReverse),
@@ -2118,6 +2161,11 @@ mod narrow_bit_op_tests {
                 assert_eq!(
                     f(IrUnaryOp::Popcount),
                     Some(i64::from(x.count_ones())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(
+                    f(IrUnaryOp::Parity),
+                    Some(i64::from(x.count_ones() & 1)),
                     "{ty:?} {x}"
                 );
                 assert_eq!(

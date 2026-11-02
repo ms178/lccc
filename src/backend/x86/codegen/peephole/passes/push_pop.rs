@@ -17,6 +17,12 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
     let len = store.len();
 
     for i in 0..len.saturating_sub(2) {
+        // A pinned line is one the program's own contract owns -- a C
+        // `volatile` access, a parameter pre-store, an inline-asm region -- so
+        // no pass may delete it, whatever the span proves.
+        if infos[i].pinned {
+            continue;
+        }
         let push_reg_id = match infos[i].kind {
             LineKind::Push { reg } if reg != REG_NONE => reg,
             _ => continue,
@@ -27,7 +33,13 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
                 continue;
             }
             if let LineKind::Pop { reg: pop_reg_id } = infos[j].kind {
-                if pop_reg_id == push_reg_id {
+                // The `pop` that ends the span is a `Pop` either way, so the
+                // scan breaks below whether or not it is the one being
+                // removed; only removal needs it unpinned. A `.cfi_` adjustment
+                // hanging off the `pop` describes the slot the pair owns, so
+                // that keeps it too -- deleting the pair would leave the
+                // unwinder pointing at a byte nobody moved.
+                if pop_reg_id == push_reg_id && !infos[j].pinned && !cfi_follows(store, infos, j) {
                     let mut safe = true;
                     for k in (i + 1)..j {
                         if infos[k].is_nop() {
@@ -66,8 +78,11 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
             //   * opaque inline asm and non-inert directives may move `%rsp`,
             //     write through it or carry a jump table.
             // The hand-rolled `Call | Jmp | JmpIndirect | Ret` list this
-            // replaces silently spanned the first three.
-            if infos[j].is_barrier() {
+            // replaces silently spanned the first three.  A trap or a transfer
+            // with no kind of its own (`sysret`, `hlt`, `int3`) ends the window
+            // for the same reason and one more: the `%rsp` it executes with is
+            // observable outside the function (see [`leaves_linear_flow`]).
+            if infos[j].is_barrier() || leaves_linear_flow(infos[j].trimmed(store.get(j))) {
                 break;
             }
         }
@@ -75,34 +90,66 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
     changed
 }
 
-/// Check if an instruction implicitly modifies the stack pointer or accesses
-/// the stack in ways that would make push/pop elimination incorrect.
-/// This catches instructions like pushfq, popfq, pushfl, popfl, etc. that
-/// read/write stack memory without being classified as Push/Pop.
+/// Does the instruction at this line read or write the stack pointer?
+///
+/// Removing a `push`/`pop` pair moves every byte below the old `%rsp` down by
+/// eight and changes `%rsp`'s value by exactly that amount across the span, so
+/// a line may only be spanned when it is blind to both facts. Two exact halves,
+/// in the same shape as the register oracle:
+///
+///  * **textual** — the operand text names the stack pointer in any of its
+///    spellings. All three are listed deliberately: `%rsp` does not contain
+///    `%sp` (the `r` intervenes), so a single `%sp` test would miss every
+///    64-bit mention. This is what covers `subq $N, %rsp`/`addq $N, %rsp` (frame
+///    adjustments), `movq %rax, %rsp` and `leaq -8(%rbp), %rsp` (epilogue
+///    restores) and every `%rsp`-relative operand (a spill, an inline-asm store
+///    through `(%rsp)`);
+///  * **architectural** — the ISA table says the instruction touches the `%rsp`
+///    family without naming it: `leave`/`enter` restore and build the frame,
+///    `pushf`/`popf` own the very slot a save creates, `iret`/`sysret` leave the
+///    function through it. These have no operand text to match, and the previous
+///    text-only version of this predicate therefore stepped straight over a
+///    `leave` inside a span. The i686 back end's `scan_push_pop_span` always
+///    asked the oracle for `%esp`; this is the missing x86-64 half of the same
+///    rule, so both back ends now answer the question the same way.
+#[inline]
+fn line_depends_on_stack_pointer(text: &str) -> bool {
+    text.contains("%rsp")
+        || text.contains("%esp")
+        || text.contains("%sp")
+        || implicit_reg_refs(text.as_bytes()) & (1u16 << REG_RSP) != 0
+}
+
+/// An instruction that transfers control or traps without owning a
+/// `LineKind` of its own: `sysret`, `sysexit`, `syscall`, `hlt`, `ud2`,
+/// `int3`, `rsm`, and the rest of [`is_control_transfer_mnemonic`].
+///
+/// A save/restore pair may not span one, for two independent reasons. First,
+/// none of them falls through, so "the lines between the `push` and its `pop`"
+/// is not a straight-line sequence at all. Second — the reason that matters for
+/// the stack proof — `syscall`/`sysret`/`hlt` all leave the *current* `%rsp` to
+/// be observed by something outside the function, so removing a pair around
+/// them changes the value that observer sees even though no line in the span
+/// names `%rsp`. `is_barrier` cannot answer this: it is a property of the
+/// classified kind, and these lines classify as `Other`. `iret`/`popf` need no
+/// help here — the implicit-oracle half of
+/// [`line_depends_on_stack_pointer`] already sees their `%rsp`.
+#[inline]
+fn leaves_linear_flow(text: &str) -> bool {
+    matches!(
+        mnemonic_after_prefixes(text),
+        (_, Some(m)) if is_control_transfer_mnemonic(m)
+    )
+}
+
+/// Check whether a line makes push/pop elimination incorrect because it
+/// depends on the stack depth (see [`line_depends_on_stack_pointer`]).
 fn instruction_modifies_stack(line: &str, info: &LineInfo) -> bool {
     if info.is_nop() {
         return false;
     }
     let s = info.trimmed(line);
-    if s.is_empty() {
-        return false;
-    }
-    // pushfq, pushfl, pushf, popfq, popfl, popf -- these modify %rsp and read
-    // and write the very slot a surrounding pair would own, and they name no
-    // register, so nothing else in this scan sees them.
-    if s.starts_with("pushf") || s.starts_with("popf") {
-        return true;
-    }
-    // ANY textual mention of the stack pointer, in any of its spellings.
-    // Spelling them out is deliberate: `%rsp` does NOT contain `%sp` (the `r`
-    // intervenes), so a single `%sp` test would miss every 64-bit mention --
-    // the exact shape this predicate exists for. This is what makes the check
-    // exact instead of a list of forms: `subq $N, %rsp`/`addq $N, %rsp` (frame
-    // adjustments), `movq %rax, %rsp` and `leaq -8(%rbp), %rsp` (epilogue
-    // restores the shape list missed entirely) and every `%rsp`-relative
-    // memory operand (an inline-asm output store through `(%rsp)`, a spill)
-    // all depend on the depth that the pair creates.
-    s.contains("%rsp") || s.contains("%esp") || s.contains("%sp")
+    !s.is_empty() && line_depends_on_stack_pointer(s)
 }
 
 /// Fast check whether a line's instruction modifies a register identified by RegId.
@@ -266,6 +313,19 @@ pub(super) fn eliminate_dead_scratch_saves(store: &LineStore, infos: &mut [LineI
     let len = store.len();
     let mut liveness: Option<super::liveness::FileLiveness> = None;
     let mut changed = false;
+    // Registers whose cached dataflow answer is no longer trustworthy. A `pop R`
+    // is a DEFINITION of `R`, so a solution computed before a removal no longer
+    // describes the text: deleting a definition lets the value defined before
+    // the pair flow further, which *grows* the live set (a removal can never
+    // shrink it), and a cached "R is dead here" answer that grew would be
+    // unsound rather than merely stale. Liveness is a backwards problem, so the
+    // growth propagates backwards and -- through a loop's backedge -- forwards
+    // again. Each register whose pair was actually removed is therefore marked
+    // dirty, and its next query re-solves the enclosing function: one re-solve
+    // per register between two removals of that register. This is the same
+    // discipline the i686 pass (`GprLiveness`) uses, so the two back ends reason
+    // about a shrinking program identically.
+    let mut dirty = 0u16;
     for i in 0..len {
         let r = match infos[i].kind {
             LineKind::Push { reg } if reg <= REG_GP_MAX && reg != REG_RSP && reg != REG_RBP => reg,
@@ -277,9 +337,12 @@ pub(super) fn eliminate_dead_scratch_saves(store: &LineStore, infos: &mut [LineI
         let Some(j) = matching_scratch_pop(store, infos, i, r, WINDOW) else {
             continue;
         };
+        let bit = 1u16 << r;
+        if dirty & bit != 0 {
+            dirty &= !bit;
+            liveness = Some(super::liveness::FileLiveness::new(store, infos));
+        }
         let lv = liveness.get_or_insert_with(|| super::liveness::FileLiveness::new(store, infos));
-        // Removals only shrink live sets, so the solution computed before
-        // them stays a conservative answer for every later query.
         if !lv.same_function(i, j) {
             continue;
         }
@@ -289,7 +352,7 @@ pub(super) fn eliminate_dead_scratch_saves(store: &LineStore, infos: &mut [LineI
         // span before any write there still keeps the save, because the
         // next iteration would see the span's value instead of the
         // restored one).
-        let mask = 1u16 << r;
+        let mask = bit;
         let dead = match lv.live_after(j, r) {
             Some(false) => true,
             Some(true) => lv
@@ -300,6 +363,7 @@ pub(super) fn eliminate_dead_scratch_saves(store: &LineStore, infos: &mut [LineI
         if dead {
             mark_nop(&mut infos[i]);
             mark_nop(&mut infos[j]);
+            dirty |= bit;
             changed = true;
         }
     }
@@ -346,7 +410,16 @@ fn matching_scratch_pop(
             // adjustment inside the span describes the push being removed.
             LineKind::Directive if !infos[k].inert_dir || t.starts_with(".cfi_") => return None,
             _ => {
-                if t.contains("%rsp") || t.contains("%esp") {
+                // Any stack-pointer dependence, textual or architectural --
+                // `leave`/`enter`/`pushf` name no register, so a text-only test
+                // would step over them exactly as the pair scan used to.
+                if line_depends_on_stack_pointer(t) {
+                    return None;
+                }
+                // And any trap or unnamed control transfer: it does not fall
+                // through, and the `%rsp` it runs with is visible outside the
+                // function ([`leaves_linear_flow`]).
+                if leaves_linear_flow(t) {
                     return None;
                 }
             }
@@ -357,9 +430,17 @@ fn matching_scratch_pop(
 
 /// Whether the first real line after `j` is a CFI directive other than
 /// `.cfi_endproc` (the `-8` adjustment that pairs with an annotated push).
+///
+/// Debug attribution and alignment hints between the `pop` and its adjustment
+/// are stepped over: they emit nothing, so the adjustment still describes the
+/// byte the `pop` moved. Stopping at the `.loc` instead would hide the
+/// adjustment and let the pair be deleted out from under the unwinder.
 fn cfi_follows(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
     (j + 1..store.len())
-        .find(|&k| !infos[k].is_nop())
+        .find(|&k| {
+            !infos[k].is_nop()
+                && !infos[k].is_unwind_inert_directive(infos[k].trimmed(store.get(k)))
+        })
         .map(|k| infos[k].trimmed(store.get(k)))
         .is_some_and(|t| t.starts_with(".cfi_") && !t.starts_with(".cfi_endproc"))
 }
@@ -478,6 +559,18 @@ mod dead_scratch_save_tests {
         let out =
             run("    pushq %rcx\n    .loc 1 7 3\n    movl %eax, %ecx\n    popq %rcx\n    ret\n");
         assert!(!out.contains("pushq %rcx"), "{out}");
+        // A frame teardown inside is not: `leave` restores %rsp with no
+        // operand text, so the architectural half of the stack-pointer
+        // predicate has to see it.
+        let out = run("    pushq %rcx\n    leave\n    movl %eax, %ecx\n    popq %rcx\n    ret\n");
+        assert!(out.contains("pushq %rcx"), "{out}");
+        // A debug line between the pop and its CFI adjustment must not hide
+        // the adjustment from the scan.
+        let out = run(
+            "    pushq %rcx\n    movl %eax, %ecx\n    popq %rcx\n    .loc 1 9 1\n    \
+             .cfi_adjust_cfa_offset -8\n    ret\n",
+        );
+        assert!(out.contains("pushq %rcx"), "{out}");
     }
 }
 
@@ -562,6 +655,62 @@ mod pair_scan_tests {
             "    pushq %rbx\n    movq 8(%rsp), %rax\n    popq %rbx\n",
             "    pushq %rbx\n    subq $16, %rsp\n    popq %rbx\n",
             "    pushq %rbx\n    pushfq\n    popfq\n    popq %rbx\n",
+        ] {
+            let out = run(body);
+            assert!(out.contains("pushq %rbx"), "{body} -> {out}");
+        }
+    }
+
+    /// The stack-pointer test is not only textual: `leave` restores `%rsp` from
+    /// `%rbp` and names neither, so a text-only test stepped over it and moved
+    /// the restored pointer by a whole slot. Same for `enter`.
+    #[test]
+    fn a_frame_teardown_inside_the_span_keeps_the_pair() {
+        for body in [
+            "    pushq %rbx\n    leave\n    popq %rbx\n",
+            "    pushq %rbx\n    enter $16, $0\n    popq %rbx\n",
+            "    pushq %rbx\n    iretq\n    popq %rbx\n",
+            "    pushq %rbx\n    sysretq\n    popq %rbx\n",
+        ] {
+            let out = run(body);
+            assert!(out.contains("pushq %rbx"), "{body} -> {out}");
+        }
+    }
+
+    /// A pinned line belongs to the program's own contract (a C `volatile`
+    /// access, an inline-asm region, a parameter pre-store). Removing the pair
+    /// would remove it, so the proof is irrelevant.
+    #[test]
+    fn a_pinned_pair_is_never_deleted() {
+        // Line indices: 0 `f:`, 1 `.cfi_startproc`, 2 `pushq`, 3 `addq`,
+        // 4 `popq`, 5 `.cfi_endproc`.
+        for pinned in [2usize, 4] {
+            let store = LineStore::new(
+                "f:\n    .cfi_startproc\n    pushq %rbx\n    addq %rcx, %rdx\n    \
+                 popq %rbx\n    .cfi_endproc\n"
+                    .to_string(),
+            );
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            infos[pinned].pinned = true;
+            eliminate_push_pop_pairs(&store, &mut infos);
+            let out = store.build_result(|i| infos[i].is_nop());
+            assert!(out.contains("pushq %rbx"), "{pinned} -> {out}");
+            assert!(out.contains("popq %rbx"), "{pinned} -> {out}");
+        }
+    }
+
+    /// The unwinder is told about the slot the pair owns by the CFI directive
+    /// that follows the `pop`; deleting the pair would leave it pointing at a
+    /// byte nobody moved. A `.loc` between the two emits nothing and must not
+    /// hide the adjustment.
+    #[test]
+    fn a_cfi_adjustment_after_the_pop_keeps_the_pair() {
+        for body in [
+            "    pushq %rbx\n    addq %rcx, %rdx\n    popq %rbx\n    .cfi_adjust_cfa_offset -8\n",
+            "    pushq %rbx\n    addq %rcx, %rdx\n    popq %rbx\n    .loc 1 9 1\n    \
+             .cfi_adjust_cfa_offset -8\n",
         ] {
             let out = run(body);
             assert!(out.contains("pushq %rbx"), "{body} -> {out}");

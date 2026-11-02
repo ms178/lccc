@@ -56,6 +56,22 @@ def body(text, name):
     ]
 
 
+def mask_materialized(joined, mask):
+    """Whether the function still materializes the masked value.
+
+    Two spellings are equivalent: the `and` with the immediate, and -- for a
+    whole byte or word -- the `movzx` that zero-extends exactly the bits the
+    mask keeps and clears the rest, which is what the peephole's encoding rule
+    emits because it has no immediate to decode and is three bytes shorter.
+    """
+    if re.search(r"\band[a-z]*\b[^\n]*\$" + re.escape(mask), joined):
+        return True
+    form = {"255": "movzbl", "65535": "movzwl"}.get(mask)
+    if form is None:
+        return False
+    return re.search(r"\b" + form + r"\b[^\n]*,", joined) is not None
+
+
 def asm(cc, path, env=None, extra=()):
     return run([cc, "-O2", "-S", "-o", "-", path, *extra], env=env).decode()
 
@@ -90,7 +106,7 @@ def main():
         for name, (mask, amount) in folded.items():
             lines = body(text, name)
             joined = "\n".join(lines)
-            if not re.search(r"\band[a-z]*\b[^\n]*\$" + re.escape(mask), joined):
+            if not mask_materialized(joined, mask):
                 problems.append(f"{name}: mask ${mask} not materialized: {lines}")
             if re.search(r"\b(shr|sar)[a-z]*\b[^\n]*\$" + re.escape(str(amount)), joined):
                 problems.append(f"{name}: shift by {amount} survived the fold: {lines}")

@@ -2424,6 +2424,10 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
         panic!("bit-reverse IR reached a backend without native lowering")
     }
     fn emit_int_popcount(&mut self, ty: IrType);
+    /// XOR of every bit of the operand, as 0 or 1 (the `__builtin_parity`
+    /// contract).  Distinct from `Popcount` on purpose: only the low bit of the
+    /// count is wanted, and every architecture computes that one shorter.
+    fn emit_int_parity(&mut self, ty: IrType);
 
     // --- Control flow primitives ---
 
@@ -3576,6 +3580,7 @@ pub fn emit_unaryop_default(
             IrUnaryOp::Bswap => cg.emit_int_bswap(ty),
             IrUnaryOp::BitReverse => cg.emit_int_bitreverse(ty),
             IrUnaryOp::Popcount => cg.emit_int_popcount(ty),
+            IrUnaryOp::Parity => cg.emit_int_parity(ty),
             IrUnaryOp::IsConstant => unreachable!("IsConstant handled above"),
         }
     }

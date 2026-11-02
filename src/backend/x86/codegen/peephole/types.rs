@@ -261,6 +261,20 @@ impl LineInfo {
         self.is_nop() || (self.kind == LineKind::Directive && self.inert_dir)
     }
 
+    /// An inert directive that carries no unwind state: debug attribution
+    /// (`.loc`/`.file`/`.line`), symbol bookkeeping (`.size`/`.type`/`.globl`)
+    /// and fill-less alignment hints.
+    ///
+    /// The push/pop scans use this to find the `.cfi_` adjustment that
+    /// annotates a `pop`: the adjustment may sit one *debug* line further down,
+    /// and stopping at the `.loc` instead would hide it. Every `.cfi_*`
+    /// directive is excluded, because those are exactly what the scan is
+    /// looking for.
+    #[inline]
+    pub(super) fn is_unwind_inert_directive(self, text: &str) -> bool {
+        self.kind == LineKind::Directive && self.inert_dir && !text.starts_with(".cfi_")
+    }
+
     #[inline]
     pub(super) fn is_barrier(self) -> bool {
         // A directive blocks a window unless it emits and references nothing

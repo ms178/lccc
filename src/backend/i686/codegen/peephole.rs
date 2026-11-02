@@ -1451,6 +1451,57 @@ fn flags_live_after(store: &LineStore, infos: &[LineInfo], start: usize, cf_only
     flags_live_from(store, infos, start, cf_only, &mut follows)
 }
 
+/// Whether every EFLAGS bit an instruction defined is dead at `at`: on the
+/// straight-line continuation, another full definition comes before any flag
+/// read, or the function returns.  `flag_use` classifies `ret` and a real
+/// `call` as `Kills` (EFLAGS are caller-saved, and the caller does not expect
+/// them back), so either ends the scan as "dead"; the PIC `get_pc_thunk` call
+/// is `Neutral` there -- its `movl (%esp), %reg; ret` really does preserve
+/// flags -- and therefore keeps the scan going instead of ending it.
+///
+/// Deliberately stricter than [`flags_live_after`], which answers a question
+/// about ONE flag (CF) and therefore lets a partial writer such as `inc` end
+/// the liveness of the rest.  Here a partial writer does not help at all --
+/// `inc` leaves CF holding the value the caller is asking about -- so only a
+/// definition of the whole register is accepted.  Labels, branches, opaque
+/// directives and unmodelled instructions answer "still live", because another
+/// path reaches the same code with its own flags.
+fn flags_definitely_dead_after(store: &LineStore, infos: &[LineInfo], at: usize) -> bool {
+    for j in (at + 1)..infos.len() {
+        if infos[j].is_nop() {
+            continue;
+        }
+        let s = trimmed(store, &infos[j], j);
+        // Blank line, comment, or a directive that emits nothing (`.loc`,
+        // `.cfi_*`, alignment padding): the scan steps over it exactly as
+        // `next_instruction` does.
+        if s.is_empty() || s.starts_with('#') || s.starts_with("//") {
+            continue;
+        }
+        match infos[j].kind {
+            LineKind::Directive if directive_is_transparent(s) => {}
+            LineKind::Label
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::InlineAsm
+            | LineKind::Directive => return false,
+            _ => match flag_use(s) {
+                FlagUse::WritesAll | FlagUse::Kills => return true,
+                FlagUse::Neutral => {}
+                _ => return false,
+            },
+        }
+    }
+    false
+}
+
+/// Is `t` the redundant zero test this pass may delete with its `AND`:
+/// `testl %r, %r` or `cmpl $0, %r`?  Both set ZF from the same value.
+fn is_zero_test_of(t: &str, reg: &str) -> bool {
+    t == format!("testl {reg}, {reg}") || t == format!("cmpl $0, {reg}")
+}
+
 /// The scan behind [`flags_live_after`]. A direct `jmp` continues at its
 /// target label. A reader that never consults CF ends the scan as "live"
 /// unless only CF matters; then a non-jump reader (setne, cmovl) is
@@ -10066,6 +10117,20 @@ fn fold_copy_subreg_extend(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
 /// A fully dead AND with NO flags reader in the window at all is deleted
 /// outright (the selC oracle shape: gcc16.2 drops the dead `orl`).
 ///
+/// ## The encoding-only sibling (rule 2)
+///
+/// The same value can be produced without an immediate: `andl $255, %R` is
+/// `81 /4 id` (six bytes, `25 id` for `%eax`) and `movzbl %Rb, %R` is three;
+/// `andl $65535, %R` is six and `movzwl %Rx, %R` is three.  `movzx` zero-fills
+/// the upper half exactly as the mask does, so the VALUE is bit-for-bit
+/// identical and no liveness question arises -- only the flags differ (`and`
+/// defines all six, `movzx` defines none), which is what
+/// [`flags_definitely_dead_after`] proves.  This is the x86-64 `mask_test`
+/// pass's rule 2, ported back the other way; it fires exactly where rule 1
+/// declines because the value is still wanted (`(uint8_t)x` stored somewhere).
+/// A redundant zero test of the same register is left to rule 1, whose
+/// `testb` deletes the AND entirely and is strictly shorter.
+///
 /// Kill switch: CCC_NO_DEAD_AND_TESTB_NARROW.
 fn narrow_dead_and_to_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var_os("CCC_NO_DEAD_AND_TESTB_NARROW").is_some() {
@@ -10076,7 +10141,12 @@ fn narrow_dead_and_to_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
     let mut liveness_cache: Option<GprLiveness> = None;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() {
+        // User-authored assembly is opaque: `pin_inline_asm_regions` marks every
+        // line of an `#APP` region (and of a `volatile` access) `InlineAsm`, and
+        // this pass parses its anchor by TEXT -- without this check a user's
+        // `andl $254, %eax` would become a flags-only `testb`, silently dropping
+        // the write.  Same guard for the sibling text-parsing folds.
+        if infos[i].is_nop() || infos[i].kind == LineKind::InlineAsm {
             i += 1;
             continue;
         }
@@ -10099,13 +10169,50 @@ fn narrow_dead_and_to_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
             i += 1;
             continue;
         };
-        if !(1..=255).contains(&imm) {
+        let dst_text = dst_str.trim();
+        let fam = register_family(dst_text);
+        if fam == REG_NONE || fam > REG_GP_MAX || fam == REG_ESP {
             i += 1;
             continue;
         }
-        let dst_text = dst_str.trim();
-        let fam = register_family(dst_text);
-        if fam == REG_NONE || fam > REG_GP_MAX {
+        // Rule 2 (encoding only, ported from the x86-64 `mask_test` pass):
+        // `andl $255, %R` is six bytes of `81 /4 id` (`25 id` for `%eax`) while
+        // `movzbl %Rb, %R` is three, and `andl $65535, %R` likewise becomes
+        // `movzwl %Rx, %R`.  The VALUE is bit-for-bit identical -- `movzx`
+        // zero-fills the upper half exactly as the mask does -- so no liveness
+        // question arises; the only difference is that `movzx` writes no flags,
+        // which is why this needs every flag the `and` defined to be dead.
+        // No mask other than a whole byte or word qualifies (any narrower mask
+        // would leave bits that `movzx` keeps), and neither does a sub-register
+        // destination (`andl $255, %ah` is not a mask of `%eax`).
+        //
+        // Rule 1 owns every shape it can express, so a redundant zero test of
+        // the same register routes there instead: `testb` deletes the `AND`
+        // entirely, which is strictly shorter than any `movzx` form.
+        let redundant_test = match next_instruction(store, infos, i + 1) {
+            Some(k) => is_zero_test_of(trimmed(store, &infos[k], k), dst_text),
+            None => false,
+        };
+        if !redundant_test
+            && (imm == 255 || imm == 65535)
+            && dst_text == reg32_name(fam)
+            && flags_definitely_dead_after(store, infos, i)
+        {
+            let (size, ext) = if imm == 255 {
+                (MoveSize::B, "movzbl")
+            } else {
+                (MoveSize::W, "movzwl")
+            };
+            if let Some(narrow) = narrow_reg_name(fam, size) {
+                store.replace(i, format!("    {ext} {narrow}, {}", reg32_name(fam)));
+                infos[i] = classify_line_ctx(store.get(i), infos[i].ebp_gpr);
+                liveness_cache = None;
+                changed = true;
+                i += 1;
+                continue;
+            }
+        }
+        if !(1..=255).contains(&imm) {
             i += 1;
             continue;
         }
@@ -14032,6 +14139,12 @@ fn scan_push_pop_span(
                 if text.contains("%esp") || line_writes_reg_implicitly(text, REG_ESP) {
                     return None;
                 }
+                // A trap or an unnamed transfer ends the span: it does not fall
+                // through, and the `%esp` it runs with is observable outside
+                // this function.
+                if ends_linear_flow(text) {
+                    return None;
+                }
                 if line_writes_family(store, infos, k, r) {
                     writes_r = true;
                 }
@@ -14041,11 +14154,54 @@ fn scan_push_pop_span(
     None
 }
 
+/// Instructions that leave the linear flow but own no [`LineKind`] on this
+/// back end: `hlt`, the `ud2` trap the codegen emits for unreachable code,
+/// `int3`, and the system-entry/exit pair.
+///
+/// [`scan_push_pop_span`] may not step over one, for the same two reasons the
+/// x86-64 pass refuses `sysret`/`hlt`/`int3` there. None of them falls through,
+/// so "the lines between the `push` and its `pop`" is not a straight-line
+/// sequence; and the `%esp` one of them runs with is visible outside the
+/// function — a trap handler and the debugger that reads a frame both see the
+/// pushed slot, and `sysenter`/`sysexit` hand the stack finger to the kernel.
+/// `leave`/`enter`/`iret`/`popf`/`pushf` need no entry here: the implicit
+/// oracle that [`line_writes_reg_implicitly`] consults already reports their
+/// `%esp`, and `pushf`/`popf` classify as `Push`/`Pop` with no register.
+///
+/// `syscall`/`sysret` never appear in 32-bit object code we emit, but they are
+/// valid in the assembly a pass is handed, and refusing them costs nothing.
+fn ends_linear_flow(s: &str) -> bool {
+    const HEADS: &[&str] = &[
+        "hlt", "ud0", "ud1", "ud2", "int1", "int3", "into", "icebp", "rsm", "syscall", "sysenter",
+        "sysexit", "sysret", "xbegin", "xabort", "bound", "lret", "lcall",
+    ];
+    let mut mn = s.split_whitespace().next().unwrap_or("");
+    // See through the `lock`/`rep` prefix words, as the other scans do.
+    if matches!(mn, "lock" | "rep" | "repe" | "repz" | "repne" | "repnz") {
+        mn = s.split_ascii_whitespace().nth(1).unwrap_or("");
+    }
+    HEADS
+        .iter()
+        .any(|h| mn.get(..h.len()).is_some_and(|w| w.eq_ignore_ascii_case(h)))
+}
+
 /// Whether the first real line after `j` is a CFI directive other than
 /// `.cfi_endproc`: the frame adjustment that pairs with an annotated pop.
+///
+/// Debug attribution and alignment hints between the `pop` and its adjustment
+/// are stepped over — they emit nothing, so the adjustment still describes the
+/// byte the `pop` moved. Stopping at a `.loc` (or any other inert directive
+/// that carries no unwind state) would hide the adjustment and let the pair be
+/// deleted out from under the unwinder. `.cfi_*` itself is never stepped over:
+/// that is what the scan is looking for.
 fn cfi_follows_line(store: &LineStore, infos: &[LineInfo], j: usize) -> bool {
     (j + 1..infos.len())
-        .find(|&k| !infos[k].is_nop())
+        .find(|&k| {
+            !infos[k].is_nop()
+                && !(infos[k].kind == LineKind::Directive
+                    && infos[k].inert_dir
+                    && !trimmed(store, &infos[k], k).starts_with(".cfi_"))
+        })
         .map(|k| trimmed(store, &infos[k], k))
         .is_some_and(|t| t.starts_with(".cfi_") && !t.starts_with(".cfi_endproc"))
 }
@@ -19454,6 +19610,38 @@ mod tests {
     }
 
     #[test]
+    fn a_trap_inside_the_span_keeps_the_pair() {
+        // `ud2` is the codegen's unreachable marker and does not fall through;
+        // the `%esp` it traps with is what a handler (and a debugger reading
+        // the frame) observes, so the pair may not be removed around it. Same
+        // for `hlt` and a literal `int3`.
+        for body in [
+            "    pushl %ecx\n    ud2\n    popl %ecx\n",
+            "    pushl %ecx\n    hlt\n    popl %ecx\n",
+            "    pushl %ecx\n    int3\n    popl %ecx\n",
+        ] {
+            let out = push_pop_asm(body);
+            // Only the `push` is asserted: whether an unreachable-code sweep
+            // later drops the `pop` is another pass's business, while the
+            // `push` can only disappear here by the pair being eliminated.
+            assert!(out.contains("pushl %ecx"), "{body} -> {out}");
+        }
+    }
+
+    #[test]
+    fn a_debug_line_between_the_pop_and_its_cfi_adjustment_hides_nothing() {
+        // The adjustment describes the byte the `pop` moved; a `.loc` between
+        // them emits nothing, so the scan must step over it and still see the
+        // adjustment -- otherwise the pair is deleted out from under the
+        // unwinder.
+        let out = push_pop_asm(
+            "    pushl %ecx\n    movl %eax, %ecx\n    popl %ecx\n    .loc 1 9 1\n    \
+             .cfi_adjust_cfa_offset 4\n",
+        );
+        assert!(out.contains("pushl %ecx"), "{out}");
+    }
+
+    #[test]
     fn a_live_restored_value_keeps_the_pair() {
         // `imull %esi, %ecx` is a genuine read-modify-write, so the span cannot
         // be copy-propagated into an untouched one; the restored value is read
@@ -23989,6 +24177,70 @@ f:
         );
         let out = peephole_optimize(asm);
         assert!(out.contains("andl $256"), "256 does not fit u8:\n{out}");
+    }
+
+    #[test]
+    fn dead_and_byte_mask_becomes_movzbl() {
+        // Rule 2: the value is wanted (`(uint8_t)` stored somewhere), the flags
+        // are not.  `movzbl %al, %eax` is three bytes where `andl $255, %eax`
+        // is six, and it produces the identical 32-bit value.
+        // The store goes through a pointer argument, not a frame slot: a slot
+        // store here is dead (nothing reads `4(%esp)` before the return), and a
+        // dead-store pass would delete the only consumer of the masked value
+        // and leave the AND to be deleted for an unrelated reason.
+        let asm = pair_fn("    andl $255, %eax\n    movl %eax, (%edi)\n");
+        let out = peephole_optimize(asm);
+        assert!(!out.contains("andl $255"), "byte mask shortened:\n{out}");
+        assert!(out.contains("movzbl %al, %eax"), "zero extension:\n{out}");
+        // The emitted text must still be what the i686 assembler accepts.
+        let obj = std::env::temp_dir().join("lccc_movzbl_mask.o");
+        let path = obj.to_string_lossy().into_owned();
+        crate::backend::i686::assembler::assemble(&out, &path, None).unwrap_or_else(|e| {
+            panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dead_and_word_mask_becomes_movzwl() {
+        let asm = pair_fn("    andl $65535, %eax\n    movl %eax, (%edi)\n");
+        let out = peephole_optimize(asm);
+        assert!(!out.contains("andl $65535"), "word mask shortened:\n{out}");
+        assert!(
+            out.contains("movzwl %ax, %eax"),
+            "word zero extension:\n{out}"
+        );
+        let wide = pair_fn("    andl $65535, %ebx\n    movl %ebx, (%edi)\n");
+        let out = peephole_optimize(wide);
+        assert!(!out.contains("andl $65535"), "word mask on %ebx:\n{out}");
+    }
+
+    #[test]
+    fn dead_and_movzx_refuses_live_flags() {
+        // `movzx` writes no flags, so any later reader of the AND's flags
+        // vetoes the shortening; only the redundant-test shape (rule 1, which
+        // deletes the AND outright) may consume them.
+        // The `je` sits *directly* after the AND and consumes the flags the AND
+        // defined -- the licence `movzx` does not have. The value stays live on
+        // the fall-through (a store through a pointer argument, which no
+        // dead-store pass may remove), so rule 1's value-deadness check refuses
+        // the `testb` fold as well and the AND must survive untouched.
+        let asm = pair_fn("    andl $255, %eax\n    je .Lok\n    movl %eax, (%edi)\n.Lok:\n");
+        let out = peephole_optimize(asm);
+        assert!(out.contains("andl $255"), "live flags keep the AND:\n{out}");
+        assert!(!out.contains("movzbl %al"), "no zero extension:\n{out}");
+    }
+
+    #[test]
+    fn dead_and_movzx_leaves_a_redundant_test_to_rule_one() {
+        // Rule 1 is strictly better here: `testb` drops the AND entirely, so a
+        // zero test of the same register must never be answered with `movzx`.
+        let asm = pair_fn(
+            "    andl $255, %eax\n    testl %eax, %eax\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+        );
+        let out = peephole_optimize(asm);
+        assert!(out.contains("testb $255, %al"), "rule 1 wins:\n{out}");
+        assert!(!out.contains("movzbl %al"), "no movzx here:\n{out}");
     }
 
     #[test]

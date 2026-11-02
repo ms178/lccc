@@ -428,29 +428,89 @@ impl RiscvCodegen {
         }
     }
 
-    /// Software POPCOUNT (population count / count set bits). Input in t0, result in t0.
-    /// Uses Brian Kernighan's algorithm: repeatedly clear the lowest set bit.
+    /// POPCOUNT: the number of set bits.  Input in t0, result in t0.
+    ///
+    /// The previous lowering was Kernighan's bit-clearing loop -- five
+    /// instructions *per set bit* behind a data-dependent branch, so up to 64
+    /// iterations and an unpredictable one per trip.  That is the defect the
+    /// x86 backend shed when it moved to a branch-free sequence, and it costs
+    /// more here because nothing in the loop lets the machine see the trip count
+    /// ahead of time.
+    ///
+    /// This is the SWAR "count within lanes, then add the lanes" form: pairwise
+    /// sums fit in two bits, nibble sums in three and byte sums in four, so the
+    /// three mask/add stages never carry between lanes.  Past the byte stage
+    /// every lane holds a value of at most 8 and the total is at most 64, so the
+    /// remaining stages are plain shift/add pairs with no masks -- no `mul`, and
+    /// therefore no dependence on the M extension either.
     pub(super) fn emit_popcount(&mut self, ty: IrType) {
-        let loop_label = self.state.fresh_label("popcnt_loop");
-        let done_label = self.state.fresh_label("popcnt_done");
-
-        if ty == IrType::I32 || ty == IrType::U32 {
-            // Mask to 32 bits
+        let wide = ty == IrType::I64 || ty == IrType::U64;
+        let (pairs, nibbles, bytes) = if wide {
+            (
+                "0x5555555555555555",
+                "0x3333333333333333",
+                "0x0f0f0f0f0f0f0f0f",
+            )
+        } else {
+            // 32-bit operands: a sign-extended value must not count its sign
+            // bits, so the low word is zero-extended first.
             self.state.emit("    slli t0, t0, 32");
             self.state.emit("    srli t0, t0, 32");
+            ("0x55555555", "0x33333333", "0x0f0f0f0f")
+        };
+        self.state.emit("    srli t1, t0, 1");
+        self.state.emit_fmt(format_args!("    li t2, {pairs}"));
+        self.state.emit("    and t1, t1, t2");
+        self.state.emit("    sub t1, t0, t1"); // t1 = pair counts
+        self.state.emit_fmt(format_args!("    li t2, {nibbles}"));
+        self.state.emit("    srli t3, t1, 2");
+        self.state.emit("    and t3, t3, t2");
+        self.state.emit("    and t1, t1, t2");
+        self.state.emit("    add t1, t1, t3"); // nibble counts
+        self.state.emit("    srli t3, t1, 4");
+        self.state.emit("    add t1, t1, t3");
+        self.state.emit_fmt(format_args!("    li t2, {bytes}"));
+        self.state.emit("    and t1, t1, t2"); // byte counts
+        let stages: &[u32] = if wide { &[8, 16, 32] } else { &[8, 16] };
+        for &shift in stages {
+            self.state
+                .emit_fmt(format_args!("    srli t3, t1, {shift}"));
+            self.state.emit("    add t1, t1, t3");
         }
+        self.state.emit("    andi t0, t1, 0x7f");
+    }
 
-        // t1 = count
-        self.state.emit("    li t1, 0");
-        self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state
-            .emit_fmt(format_args!("    beqz t0, {}", done_label));
-        self.state.emit("    addi t2, t0, -1"); // t2 = n - 1
-        self.state.emit("    and t0, t0, t2"); // n &= n - 1 (clear lowest set bit)
-        self.state.emit("    addi t1, t1, 1");
-        self.state.emit_fmt(format_args!("    j {}", loop_label));
-        self.state.emit_fmt(format_args!("{}:", done_label));
-        self.state.emit("    mv t0, t1");
+    /// PARITY: the XOR of every bit, as 0 or 1.  Input in t0, result in t0.
+    ///
+    /// Parity is the count modulo two, so the SWAR count above is overkill: a
+    /// chain of XOR folds (`x ^ x>>k` preserves parity) squeezes the operand
+    /// down to a nibble, and bit *n* of 0x6996 is exactly the parity of *n*, so
+    /// one variable shift reads the answer out of the constant.  That is eleven
+    /// instructions on 32 bits where the `popcount & 1` form was twenty-three
+    /// (and, before the count was made branch-free, up to sixty-four trips).
+    pub(super) fn emit_parity(&mut self, ty: IrType) {
+        let wide = ty == IrType::I64 || ty == IrType::U64;
+        if wide {
+            self.state.emit("    srli t1, t0, 32");
+            self.state.emit("    xor t1, t0, t1");
+        } else {
+            self.state.emit("    srli t1, t0, 16");
+            self.state.emit("    xor t1, t0, t1");
+        }
+        if wide {
+            // 64 -> 32 above, 32 -> 16 here; the 32-bit operand started at the
+            // 16-bit fold, so this pair is only needed for the wide case.
+            self.state.emit("    srli t2, t1, 16");
+            self.state.emit("    xor t1, t1, t2");
+        }
+        self.state.emit("    srli t2, t1, 8");
+        self.state.emit("    xor t1, t1, t2");
+        self.state.emit("    srli t2, t1, 4");
+        self.state.emit("    xor t1, t1, t2");
+        self.state.emit("    andi t1, t1, 0xf");
+        self.state.emit("    li t2, 0x6996");
+        self.state.emit("    srl t2, t2, t1");
+        self.state.emit("    andi t0, t2, 1");
     }
 
     // ---- Trait-level atomic operations (delegated from ArchCodegen) ----

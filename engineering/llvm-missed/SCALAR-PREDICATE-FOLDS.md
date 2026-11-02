@@ -838,6 +838,173 @@ backends' "extend per declared type" rule forbids.  So that case stays 5 vs
 GCC's 4, refused for the same reason `keep_schar_ult` refused before: a proof,
 not a guess.
 
+### 18. Parity is a flag, not a count — `simplify` + four backends
+
+`__builtin_parity` was lowered as `popcount(x) & 1`: 18 instructions on x86-64
+without `-mpopcnt`, and on RISC-V it pulled in the *looping* 64-bit count, so a
+parity question became a jump-and-multiply dance (29 instructions).  All three
+oracles answer it in 7 or 8, because parity is the population count modulo two
+and every ISA in scope can compute *that* far more cheaply than the count:
+
+| ISA | cheapest form | cost |
+| --- | --- | --- |
+| x86-64 / i686 | `shr; xor` fold down to 8 bits, then `xorb %ah, %al` + `setnp` + `movzbl` | 6 |
+| AArch64 | `eor w, w, w, lsr` fold to bit 0, then `and #1` (one instruction per fold) | 6 / 7 (64-bit) |
+| RISC-V | `srli; xor` fold to a nibble, then the 0x6996 table indexed by it | 10 |
+
+The x86 line leans on x86's own answer to the question: `xorb %ah, %al` sets PF
+from the parity of the low byte, which is what `setnp` (PF clear = odd) reads.
+AArch64 has a shifted operand in `eor`, so a 32-bit fold costs a single
+instruction (6) where RISC-V's fold costs two (`srli` + `xor`) — which is
+exactly why the table wins on RISC-V (10 against the fold-to-bit form's 11)
+while AArch64 prefers folding all the way to bit 0 (6 against the table's 7).
+Clang picks the fold form on both, which costs it one instruction on RISC-V.
+
+Three pieces:
+
+1. **`IrUnaryOp::Parity`** is a first-class unary op, not a pattern.  It is what
+   the frontend lowers `__builtin_parity{,l}` to, and it constant-folds
+   exhaustively: every 8- and 16-bit value at both signednesses (the same width
+   loops the other narrow unary ops use, so a width-dependent answer cannot slip
+   through), plus explicit 32- and 64-bit edges, including the ones that
+   distinguish widths (`0x8000_0000` is odd as a `U32` and odd only in its high
+   half as a `U64`, and all-ones is even at every width).
+2. **`popcount(x) & 1` is parity** (`fold_popcount_mask_to_parity`).  The rule
+   is exact on purpose: the count must be the same width as the `and` (no cast
+   between them), the mask must be exactly `1`, and the operation must be
+   `And`.  Anything else is a different question — `popcount(x) & 3`, or
+   `popcountll(x) & 1` where the frontend narrows the mask to 32 bits while the
+   operand stays 64, a shape the unary op's single type field cannot express.
+   That last case stays unfolded and is the remaining gap: `cnt1_64` is still
+   22 on x86-64 where `par64` is 11.  The alternative design — carrying a
+   separate source width on `UnaryDef` — was rejected: every `UnaryDef` reader
+   would have to learn a field that exists for one pattern.
+3. **RISC-V's `Popcount` became branch-free.**  It was a loop over the operand
+   (bit test, `jal` back, 64-bit multiply at the end).  It is now the SWAR
+   sequence the other backends already had — `lsr;and;sub`, `and;lsr;and;add`,
+   `add;lsr;and`, `lui;addi;mul` — with the final multiply's shift taken as a
+   *variable* shift, because RISC-V has no `srliwi`: the amount comes from
+   `resolved_fast_popcount` (56 for a 64-bit operand, 24 for a 32-bit one), so a
+   `Popcount` at `U32` cannot answer in the 64-bit frame's top byte.
+
+Measured, `-O2`, total instruction lines of the function including `ret`:
+
+| probe | before | **now** | GCC 16.2 | Clang 23.1.4 |
+| --- | --- | --- | --- | --- |
+| `__builtin_parity(u32)` x86-64 | 18 | **8** | 7 | 7 |
+| `__builtin_parityll(u64)` x86-64 | 22 | **11** | 10 | 10 |
+| `__builtin_parity(u32)` i686 | 23 | **13** | 14 | 14 |
+| `__builtin_parityll(u64)` i686 | 27 | **16** | 17 | 17 |
+| `__builtin_parity(u32)` AArch64 | 15 | **13** | 14 | 8 |
+| `__builtin_parityll(u64)` AArch64 | 15 | **13** | 15 | 10 |
+| `__builtin_parity(u32)` RISC-V | 29 | **17** | 15 | 14 |
+| `__builtin_parityll(u64)` RISC-V | 29 | **17** | 16 | 14 |
+
+(The "before" column is `-O2` with `CCC_SIMPLIFY_SKIP=parity`, which turns the
+`&1` function back into a count plus `andl $1`; the oracles are the same probe
+under the same flag-free `-O2`.)
+
+The narrow forms are cheaper still, because neither needs the mask the count
+does: `testb %al, %al` reads PF off a byte directly (a byte has nothing to
+fold), and `xorb %ah, %al` touches only bits 8-15, which a load's sign
+extension cannot reach.  They are only reachable when the IR carries a count at
+a narrow type, though -- `__builtin_parity(uchar)` promotes its argument, so the
+shape that actually arrives is the 32-bit one over a zero-extended byte (8
+instructions where GCC, which tracks known-zero bits, spends 4).  Closing that
+needs a known-bits fact in the IR or a second width on `UnaryDef`; the `Parity`
+op fixes the *question*, not the promotion.
+
+The residual instruction on x86-64 is the argument copy the backend makes for
+a return value (`movl %edi, %eax`; the oracles fold the first shift into the
+copy).  AArch64's lead for Clang is its absent frame: LCCC emits `stp x29, x30`
+/ `mov x29, sp` / `str x19` / `mov x19, x0` / `mov x0, x19` / `ldr` / `ldp`
+around a 6-instruction body while Clang emits the body and `ret`.  RISC-V's is
+the same argument copy plus the `slli/srli` zero-extension pair an incoming
+`u32` argument gets.  The algorithm itself is 6 instructions (8/16/32-bit) and
+6/7/10 (64-bit) — at or below every oracle on every backend.
+
+Verification.  `check_parity_and_popcount.sh` pins the emission on all four
+ISAs: the `setnp` shape, the absence of `imul` and of any branch on x86-64,
+`popcntl` under `-mpopcnt`, the `#0x6996` table on AArch64-without-SIMD and
+RISC-V, `cnt` on AArch64's SIMD path, RISC-V's count being straight-line with
+no `jal`/`call` and its `0x55555555` mask present, the attribution
+(`CCC_SIMPLIFY_SKIP=parity` brings the count back in the `&1` function and
+leaves `__builtin_parity` folded), the instruction counts above, and value
+agreement with an independent model at `-O0`/`-O1`/`-O2`/`-O3`/`-Os`, paired
+with GCC 16.2 at `-O2`.  The value oracle
+(`tests/regression/parity_and_popcount.c`) walks every `u8` and `u16` (65536
+values), 4096 arithmetic `u32`/`u64` operands, the edges and every single-bit
+operand at both widths, and hashes its findings: `failures=0
+hash=09dc4aea9979cf33`, identical under LCCC, GCC 16.2 and Clang 23.1.4.  The
+emitted sequences were independently cross-checked against bit-exact C models
+of the flag fold and of the table lookup
+([evidence](../../engineering/evidence/2026-11-02-parity-and-popcount/)), 0
+mismatches over the same domain, because LCCC's static cross-target binaries do
+not run under qemu-user in this sandbox; `clang --target=aarch64`/`riscv64`
+assembles every dump, which catches register-field and immediate mistakes.
+
+What this does *not* do: `__builtin_popcountll(x) & 1` still unfolds (width
+mismatch above), and a promoted narrow argument pays for the promotion (above).
+The scratch pair the fold brackets its staging register with is elided on both
+x86 backends by the scratch-save peephole -- but only when the liveness proof
+holds: `-mregparm=3` can keep an argument live in `%ecx`, and then the pair is
+real work, which is why it is emitted rather than assumed away.
+
+### 19. The zero-guarded count is a sentinel, not a diamond — `x86`/`i686` `clz`
+
+`Clz` in this IR is defined at zero (`clz(0) == width`, which is also what the
+constant folder answers), so the baseline x86 lowering -- no `LZCNT` -- used a
+diamond: `test; jnz; mov $32; jmp; .Lclz_nz: bsr; xor $31`.  On the common path
+that is `test; jnz` in place of nothing, and on the zero path a taken `jmp`;
+statically it is six instructions and two branches for a three-instruction
+answer, and every one of those labels is a branch target the front end pays for
+in the instruction cache.
+
+`bsr` leaves its destination untouched when its source is zero -- the same
+architectural guarantee this backend already leans on for `bsf` in
+`emit_ctz32_rax_baseline` ("32-bit `bsf` zero fixup" in *What is not done*
+below), and exactly what Clang emits for a `clz` that has to answer 32 at zero:
+
+```asm
+        movl    $63, %eax       # 63 ^ 31 == 32: the zero answer, preloaded
+        bsrl    %edi, %eax      # untouched when %edi is 0
+        xorl    $31, %eax       # 31 - bsr(x), or 32
+```
+
+So the result register is preloaded with `63` and the zero case falls out of the
+same `xor`, with no branch and no second copy of the answer.  The operand has to
+be staged when the source and the result are the same register (`%eax` here, as
+in every accumulator path), which is what the `%rcx` bracketing pair is for --
+the dead-scratch peephole removes it whenever no live value holds that register,
+so the emitted body is four instructions, none of them a branch.  The 64-bit
+form is the same sentinel one width up (`127 ^ 63 == 64`), and i686's
+`emit_clz32_baseline` takes the sentinel too, including the source-equals-
+destination staging and a direct `bsr %src, %dst` when they differ.
+
+| (`-O2`, x86-64) | before | **now** | GCC 16.2 | Clang 23.1.4 |
+| --- | --- | --- | --- | --- |
+| defined-zero `clz32`: instructions (no `ret`) | 6 | **4** (3 when the operand is already staged) | 5 | 3 |
+| defined-zero `clz32`: branches | 2 | **0** | 1 | 0 |
+| `1u << (32 - __builtin_clz(x-1))` | 12 | **9** | 6 | 7 |
+
+The comparison is the guarded question in all four columns: GCC's five are
+`mov $32; test; je; bsr; xor` -- the diamond, kept because `__builtin_clz(0)` is
+undefined for it and the guard is the *source's* -- and Clang's three are this
+sentinel.  LCCC now emits Clang's three, plus the one staging copy when the
+operand is not already in a second register.  The remaining `next_pow2` gap is
+not the count: it is `1 << (32 - clz(v))` against `1 << (bsr(v) + 1)`, a
+shift-amount rewrite the IR does not have, plus the `$1` materialization.
+
+Verified: every value of the 32-bit domain (16 M multiplicative strides) and 2 M
+`u64` strides, both with and without the complementary operand, plus the edges
+and every single-bit operand, against a longhand reference at `-O0`/`-O1`/`-O2`/
+`-O3`/`-Os` (`clz failures=0`); the in-tree `clz_zero_guard.c`,
+`guarded_clz_ctz_ternary.c`, `clz_safe_guards.c` differentials pass, and
+`check_clz_ctz_target_isa.sh`, `check_clz_zero_guard_fold.sh`,
+`check_ptr_iv_collapse_codegen.sh` and `check_vectorize_isa_gate.sh` still pin
+the shapes (including that the defined-zero diamond must *not* reappear on paths
+where the guard has been folded away).
+
 ## What the LLVM tracker already knows about these shapes
 
 The round started from a differential probe, and the gaps it found have
@@ -1113,9 +1280,8 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
   (5) and Clang inlines 16; taking GCC's route would make every LCCC object
   depend on `libgcc` for one builtin, which the kernel and freestanding targets
   cannot assume, so the baseline stays inline. Parity is the same story from the
-  other side: without `popcnt` GCC's `shr/xor/xorb/setnp` chain is 7 and LCCC's
-  SWAR plus `andl $1` is 18 — worth revisiting only together with the popcount
-  decision.
+  other side: it used to be 18 instructions (the count plus `andl $1`) and is
+  now 8 (§18) — what remains here is the linking decision for the count.
 * **`1u << __builtin_ctz(y)` (no complement)** — refused on purpose: with the
   exact `Ctz(0) == width` arm it is no shorter than the count path (5/6 vs 8/8
   with the arm), and Clang's four-instruction form depends on `ctz(0)` being

@@ -232,6 +232,89 @@ impl I686Codegen {
         self.state.emit("    popl %ecx");
     }
 
+    /// PARITY: the XOR of every bit, as 0 or 1.
+    ///
+    /// The population count is not needed -- only the low bit of it -- and the
+    /// 8086 already pins that bit down: PF reports the parity of the low byte
+    /// of the last result.  Folding the operand down to one byte with XOR
+    /// preserves parity, so `xor %ah, %al; setnp` finishes the reduction and
+    /// the 32-bit form needs no more than a shift and a XOR before it.  Both
+    /// oracles emit this shape; the count-and-`and` form this replaces was
+    /// eighteen instructions.
+    pub(super) fn emit_int_parity_impl(&mut self, ty: IrType) {
+        let narrow = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
+        let byte = matches!(ty, IrType::I8 | IrType::U8);
+        if self.popcnt_enabled {
+            // The count is over the whole register, so it needs the mask the
+            // load's extension may not have given it.
+            if narrow {
+                if byte {
+                    self.state.emit("    andl $0xff, %eax");
+                } else {
+                    self.state.emit("    andl $0xffff, %eax");
+                }
+            }
+            self.state.emit("    popcntl %eax, %eax");
+            self.state.emit("    andl $1, %eax");
+            return;
+        }
+        if narrow {
+            // PF is the parity of the low byte of the flag-setting result, and
+            // both forms read only bits 0-15 of %eax -- which the load's
+            // extension (zero for unsigned, all-ones for signed) cannot reach
+            // -- so neither needs a mask.  A byte has nothing to fold.
+            if byte {
+                self.state.emit("    testb %al, %al");
+            } else {
+                self.state.emit("    xorb %ah, %al");
+            }
+            self.state.emit("    setnp %al");
+            self.state.emit("    movzbl %al, %eax");
+            return;
+        }
+        // %ecx is staged the same way the SWAR count above stages it:
+        // -mregparm=3 may hold a live argument there, so the pair brackets the
+        // sequence and the dead-scratch peephole removes it when the register is
+        // free.  (The 8086 backend has no such peephole -- see the follow-up
+        // note in `alu.rs` of the x86 backend -- so the pair stays here.  A
+        // scratch-free form exists on paper, folding with `xorb %ah, %al` and
+        // `roll`s, but it counts one byte twice: the fold lands in bits 24-31
+        // after the rotate, not in the byte the next XOR reads.)
+        self.state.emit("    pushl %ecx");
+        self.state.emit("    movl %eax, %ecx");
+        self.state.emit("    shrl $16, %ecx");
+        self.state.emit("    xorl %ecx, %eax");
+        self.state.emit("    xorb %ah, %al");
+        self.state.emit("    setnp %al");
+        self.state.emit("    movzbl %al, %eax");
+        self.state.emit("    popl %ecx");
+    }
+
+    /// PARITY of a 64-bit value held in %eax:%edx.
+    ///
+    /// The high half XORs into the low half first -- parity of the concatenation
+    /// is the XOR of the halves' parities -- and the 32-bit sequence above then
+    /// finishes it, so the whole 64-bit reduction is one instruction longer than
+    /// the 32-bit one and still shorter than half of the 64-bit count.
+    pub(super) fn emit_i64_parity_impl(&mut self) {
+        if self.popcnt_enabled {
+            self.state.emit("    popcntl %eax, %eax");
+            self.state.emit("    popcntl %edx, %edx");
+            self.state.emit("    addl %edx, %eax");
+            self.state.emit("    andl $1, %eax");
+            return;
+        }
+        self.state.emit("    xorl %edx, %eax");
+        self.state.emit("    pushl %ecx");
+        self.state.emit("    movl %eax, %ecx");
+        self.state.emit("    shrl $16, %ecx");
+        self.state.emit("    xorl %ecx, %eax");
+        self.state.emit("    xorb %ah, %al");
+        self.state.emit("    setnp %al");
+        self.state.emit("    movzbl %al, %eax");
+        self.state.emit("    popl %ecx");
+    }
+
     /// Operand location for the direct-to-dest ALU path.
     fn binop_loc(&self, op: &Operand) -> Option<BinopLoc> {
         match op {

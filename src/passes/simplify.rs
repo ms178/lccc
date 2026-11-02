@@ -315,7 +315,8 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     IrUnaryOp::Clz
                     | IrUnaryOp::ClzNonZero
                     | IrUnaryOp::Ctz
-                    | IrUnaryOp::CtzNonZero => {
+                    | IrUnaryOp::CtzNonZero
+                    | IrUnaryOp::Popcount => {
                         set_def(
                             &mut unary_defs,
                             dest.0,
@@ -2855,9 +2856,11 @@ fn try_simplify_with_types(
             lhs,
             rhs,
             ty,
-        } => simplify_binop(
-            *dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs, use_counts,
-        ),
+        } => fold_popcount_mask_to_parity(*dest, *op, lhs, rhs, *ty, unary_defs).or_else(|| {
+            simplify_binop(
+                *dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs, use_counts,
+            )
+        }),
         Instruction::Cast {
             dest,
             src,
@@ -5117,6 +5120,61 @@ fn simplify_bzhi(
     })
 }
 
+/// `popcount(v) & 1` is parity, and parity is what the backends compute in a
+/// fraction of the count (x86: two XORs and the hardware parity flag; the RISCs:
+/// an XOR fold into a nibble and a 16-bit table).
+///
+/// `__builtin_parity` lowers to `IrUnaryOp::Parity` directly, so this is the
+/// rule for source that spells the idiom out.  `__builtin_popcount(x) & 1` is a
+/// portable stand-in for a parity flag and appears in bit-counting code that
+/// wants both answers, and every compiler that knows the identity folds it.
+///
+/// The table this reads (`unary_defs`) records `Popcount` for exactly this
+/// rule; the clz/ctz folds match their own operations explicitly, so an entry
+/// for another operation is invisible to them.
+///
+/// The shape is exact on purpose: the count must be the same width as the
+/// `and`, so that no cast sits between the two.  A count of a wider value
+/// masked to one is still parity, but reaching through the cast is a different
+/// rule with its own type question (the narrow count and the wide count are not
+/// the same operation), and it is not required for the idiom.
+fn fold_popcount_mask_to_parity(
+    dest: Value,
+    op: IrBinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    unary_defs: &[Option<UnaryDef>],
+) -> Option<Instruction> {
+    if op != IrBinOp::And || !ty.is_integer() || simplify_skip("parity") {
+        return None;
+    }
+    let lhs_one = is_one(lhs);
+    if !lhs_one && !is_one(rhs) {
+        return None;
+    }
+    let Operand::Value(v) = (if lhs_one { rhs } else { lhs }) else {
+        return None;
+    };
+    let Some(UnaryDef {
+        op: IrUnaryOp::Popcount,
+        src,
+        ty: pop_ty,
+    }) = unary_defs.get(v.0 as usize).and_then(|d| d.as_ref())
+    else {
+        return None;
+    };
+    if pop_ty.size() != ty.size() {
+        return None;
+    }
+    Some(Instruction::UnaryOp {
+        dest,
+        op: IrUnaryOp::Parity,
+        src: *src,
+        ty,
+    })
+}
+
 fn simplify_binop(
     dest: Value,
     op: IrBinOp,
@@ -7191,6 +7249,74 @@ mod tests {
     }
 
     // === clz/ctz guarded-ternary zero-guard elimination ===
+
+    /// `popcount(v) & 1` is parity: the mask asks for the low bit of the count,
+    /// which is the one thing a parity lowering computes without the rest.
+    /// The rule is exact on purpose, so every near miss has to be refused.
+    #[test]
+    fn parity_folds_popcount_masked_to_one() {
+        let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; 8];
+        unary_defs[3] = Some(UnaryDef {
+            op: IrUnaryOp::Popcount,
+            src: Operand::Value(Value(1)),
+            ty: IrType::U32,
+        });
+        let fold = |op, lhs: Operand, rhs: Operand, ty, defs: &[Option<UnaryDef>]| {
+            fold_popcount_mask_to_parity(Value(4), op, &lhs, &rhs, ty, defs)
+        };
+        let one = Operand::Const(IrConst::I32(1));
+        let count = Operand::Value(Value(3));
+
+        // Both operand orders fold, and the source and width are carried over.
+        for (lhs, rhs) in [(count, one), (one, count)] {
+            match fold(IrBinOp::And, lhs, rhs, IrType::U32, &unary_defs) {
+                Some(Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Parity,
+                    src,
+                    ty,
+                }) => {
+                    assert_eq!(dest, Value(4));
+                    assert_eq!(src, Operand::Value(Value(1)));
+                    assert_eq!(ty, IrType::U32);
+                }
+                other => panic!("expected Parity, got {other:?}"),
+            }
+        }
+
+        // A mask that is not exactly one is not parity.
+        assert!(
+            fold(
+                IrBinOp::And,
+                count,
+                Operand::Const(IrConst::I32(3)),
+                IrType::U32,
+                &unary_defs
+            )
+            .is_none()
+        );
+        // Neither is another bit operation on the count.
+        assert!(fold(IrBinOp::Or, count, one, IrType::U32, &unary_defs).is_none());
+        // The count has to be at the mask's width: a truncated count is a
+        // different shape (the frontend narrows `popcountll(x) & 1` this way),
+        // and the unary op's single type field cannot carry both widths.
+        assert!(fold(IrBinOp::And, count, one, IrType::U32, &[None; 8]).is_none());
+        let mut narrow = unary_defs.clone();
+        narrow[3] = Some(UnaryDef {
+            op: IrUnaryOp::Popcount,
+            src: Operand::Value(Value(1)),
+            ty: IrType::U64,
+        });
+        assert!(fold(IrBinOp::And, count, one, IrType::U32, &narrow).is_none());
+        // A count that is not a count is not parity either.
+        let mut clz = unary_defs.clone();
+        clz[3] = Some(UnaryDef {
+            op: IrUnaryOp::Clz,
+            src: Operand::Value(Value(1)),
+            ty: IrType::U32,
+        });
+        assert!(fold(IrBinOp::And, count, one, IrType::U32, &clz).is_none());
+    }
 
     #[test]
     fn test_select_clz_guard_elimination() {
