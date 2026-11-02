@@ -632,7 +632,9 @@ scans, in the shape of a directive that lies to the unwinder and a trap that is
 not a branch.
 
 **1. `passes/mask_test.rs` (new).** Two rewrites of one shape, `and{l,q} $imm,
-%R` with `1 <= imm <= 255`:
+%R` with `1 <= imm <= 0xFFFF` (rule 1 is byte-only by construction, rule 2 is
+restricted to the masks `movzx` reproduces exactly, a whole byte and a whole
+word):
 
 ```text
     andl $255, %r10          testb %r10b, %r10b
@@ -640,6 +642,7 @@ not a branch.
     je .L1
 
     andl $255, %r10    ->    movzbl %r10b, %r10d    (7 bytes -> 4, flags dead)
+    andl $0xFFFF, %R   ->    movzwl %Rw, %Rl        (6 bytes -> 3, flags dead)
 ```
 
 The proof is per flag, and it is the reason the rule cannot be stated as "the
@@ -666,10 +669,13 @@ register's value must be dead after the reader, and nothing between the two line
 may touch it — adjacency is enforced by `next_non_debug`, which steps over
 deleted lines and debug attribution but not over `.cfi_*`, alignment or an opaque
 directive, since a `.byte 0x9e` in the window is `sahf` and would eat the very
-flags the proof is about. Rule 2 freezes out any mask but `0xFF` (`movzx`
-reproduces exactly a full-byte mask) and needs the flags dead, because `movzx`
-writes none. `CCC_PEEPHOLE_SKIP=mask_test` disables both; the pass is idempotent,
-so it is placed after the phase-1 fixed point rather than inside it.
+flags the proof is about. Rule 1 stays byte-only — `testb $imm, %Rb` cannot
+express a mask above `0xFF`, and silently narrowing one would be a miscompile —
+while rule 2 covers exactly the masks whose value `movzx` reproduces bit for bit,
+a whole byte and a whole word (`0xFF`, `0xFFFF`); any narrower mask leaves bits
+`movzx` would keep, and both need the flags dead because `movzx` writes none.
+`CCC_PEEPHOLE_SKIP=mask_test` disables both; the pass is idempotent, so it is
+placed after the phase-1 fixed point rather than inside it.
 
 **2. Neither mask rule survives on a `.loc`.** The rewrite of one line and the
 deletion of another changes what dataflow can conclude about the register
@@ -723,12 +729,29 @@ pointer. `passes::push_pop::leaves_linear_flow` and the i686 `ends_linear_flow`
 now end the span. `iret`/`popf` needed no entry: the implicit oracle already
 reports their `%rsp`.
 
-**Evidence.** `mask_test.rs` carries 16 tests — the fold with and without the
+**6. The `movzx` encoding went back the other way, to i686.** The i686
+`narrow_dead_and_to_testb` had no counterpart to rule 2, so `andl $0xff, %eax`
+(six bytes, `25 id` for the accumulator) and `andl $0xffff, %eax` stayed
+unencoded. It now carries the same two masks, gated on a new
+`flags_definitely_dead_after` oracle — the strict twin of `flags_live_after`,
+which answers about CF alone and therefore lets `inc` end the liveness of flags
+it does not define; the new one accepts only a full definition (`WritesAll`),
+a `Kills` (`call`/`ret`, with the PIC `get_pc_thunk` deliberately `Neutral`
+because it really does preserve the flags) or a transparent directive, and
+refuses at labels, branches, opaque directives and unmodelled text. Rule 1
+keeps ownership of every shape it can express (a redundant zero test of the
+same register routes there, because `testb` deletes the AND outright), the
+destination must be the full 32-bit register (`andl $255, %ah` is not a mask of
+`%eax`), and the pass now skips `#APP` regions outright — it parses its anchor
+by text, and a user's `andl $254, %eax` must never become a flags-only `testb`.
+
+**Evidence.** `mask_test.rs` carries 18 tests — the fold with and without the
 redundant zero test, the `cmp $0` variant, a `setcc` reader, three SF readers
-refused, a later SF reader refused, a live value refused, wide masks
-(`256`/`65535`/`-1`) refused, a memory destination refused, an intervening store
-refused, both encoding cases, a narrow mask refused by rule 2, live flags
-refusing it, idempotence, and every GP family reachable. `push_pop.rs` gains the
+refused, a later SF reader refused, a live value refused, a word mask refused by
+rule 1, an unrepresentable mask (`256`/`0x10000`/`-1`) refused by both, both
+encoding cases and their word twins, a memory destination refused, an
+intervening store refused, a narrow mask refused by rule 2, live flags refusing
+it, idempotence, and every GP family reachable. `push_pop.rs` gains the
 in-span `leave`/`enter`/`iretq`/`sysretq` cases, the `.loc`-before-CFI case, the
 pinned-pair cases and the CFI-after-`pop` cases;
 the i686 module gains the `ud2`/`hlt`/`int3` span cases and the same `.loc` case.
@@ -736,7 +759,13 @@ the i686 module gains the `ud2`/`hlt`/`int3` span cases and the same `.loc` case
 law (a mask whose only consumer is a condition must not survive), it stays quiet
 if the emitter already folds the consumer, and it runs the discriminating probes
 — `(signed char)x < 0` and `(unsigned char)x > 127` must stay sign tests — under
-GCC's oracle at `-O0/-O1/-O2/-O3/-Os` in both 32- and 64-bit mode.
+GCC's oracle at `-O0/-O1/-O2/-O3/-Os` in both 32- and 64-bit mode. The
+must-not-survive law covers the two functions that *compare*; a function that
+returns `x & 1` materializes the mask as its value — GCC emits the same
+`andl $1, %edi; movl %edi, %eax` — so that case is pinned by the execution
+oracle, not by a grep. The i686 module gains the same three cases (both `movzx`
+forms, live flags refused, rule 1's priority) plus an assembler round-trip on
+the rewritten text.
 
 ## 6. Ranked cross-pollination backlog
 
@@ -757,6 +786,7 @@ and the mechanism.
 | 10 | split the i686/ARM/RISC-V monoliths along the x86-64 pass-file pattern | x86-64 → i686, ARM, RISC-V | bisectability, per-pass tests | high (mechanical churn) | do pass-by-pass, never as one commit |
 | 11 | `narrow_dead_and_to_testb` | i686 → x86-64 | **done** (§5.6) — `mask_test`; mask+zero-test and the `movzx` encoding are one instruction shorter per site | medium | the flag window is restated against `flags_dead_after` instead of a hand-written reader class |
 | 12 | span-ending predicates (`leaves_linear_flow`, unwind-inert directives) | i686 ↔ x86-64 | **done** (§5.6) — both back ends now refuse a trap, an unnamed transfer or a `.cfi_*` between a `save` and its `restore` | low | the same two holes existed independently in each back end |
+| 13 | `mask_test` rule 2 (`movzx` encoding) | x86-64 → i686 | **done** (§5.6) — `andl $0xff/$0xffff, %R` becomes a three-byte `movzbl`/`movzwl` where the flags are dead | medium | needed a strict whole-flags-dead oracle (`flags_definitely_dead_after`); rule 1 keeps priority because `testb` deletes the AND |
 
 ## 7. Threats to the plan
 

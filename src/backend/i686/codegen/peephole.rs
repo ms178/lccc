@@ -24209,13 +24209,17 @@ f:
         // `movzx` writes no flags, so any later reader of the AND's flags
         // vetoes the shortening; only the redundant-test shape (rule 1, which
         // deletes the AND outright) may consume them.
-        // The `je` must not be trivial (`je` to the very next line is removed as
-        // such, together with the only flag read that vetoes the shortening).
+        // The reader sits *directly* after the AND: anywhere later and a
+        // store-narrowing pass can make the AND itself dead (`andl` + a word
+        // store becomes a byte store, and then nothing reads the masked value
+        // and rule 1 is entitled to delete it). Here the `je` consumes the
+        // flags the AND defined, which is the licence `movzx` does not have.
         let asm = pair_fn(
-            "    andl $255, %eax\n    movl %eax, 4(%esp)\n    je .Lok\n    movl %ebx, 8(%esp)\n.Lok:\n",
+            "    andl $255, %eax\n    je .Lok\n    movl %eax, 4(%esp)\n.Lok:\n",
         );
         let out = peephole_optimize(asm);
         assert!(out.contains("andl $255"), "live flags keep the AND:\n{out}");
+        assert!(!out.contains("movzbl %al"), "no zero extension:\n{out}");
     }
 
     #[test]
