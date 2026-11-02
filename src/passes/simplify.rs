@@ -4504,44 +4504,27 @@ fn simplify_cmp(
     // paired-half "narrowed full-domain" case that caught the shape, where the
     // two halves of `(zext c >= 0) && (zext c <= 255)` used to fold as a pair
     // and the single half did not.
+    //
+    // The same guards carry the second question one interval cannot reach: an
+    // unsigned question about a sign-extended value is a question about its
+    // sign bit ([`cross_domain_sext_cmp`]), and the fold is tried first.
     if !simplify_skip("cmprange")
         && ty.size() <= 8
         && let Some(c) = const_i64
-        && let Some(range) = cmp_operand_range(
-            ty,
-            cast_defs.get(val.0 as usize).and_then(|d| d.as_ref()),
-            effective_op,
-        )
-        && let Some(answer) = cmp_range_decides(effective_op, ty, range, c)
     {
-        return Some(Instruction::Copy {
-            dest,
-            src: Operand::Const(IrConst::I8(answer)),
-        });
-    }
-
-    // The same reasoning where one interval cannot reach: an unsigned question
-    // about a sign-extended value is a question about its sign bit
-    // ([`cross_domain_sext_cmp`]).  It runs here, beside the fold, because
-    // narrowing the rewritten sign test is what makes it one instruction, and
-    // the narrowing below is the pass that does it.
-    if !simplify_skip("cmprange")
-        && ty.size() <= 8
-        && let Some(c) = const_i64
-        && let Some(sign_test) = cross_domain_sext_cmp(
-            dest,
-            effective_op,
-            ty,
-            *val,
-            cast_defs.get(val.0 as usize).and_then(|d| d.as_ref()),
-            cast_dies_if_narrowed
-                .get(val.0 as usize)
-                .copied()
-                .unwrap_or(false),
-            c,
-        )
-    {
-        return Some(sign_test);
+        let cdef = cast_defs.get(val.0 as usize).and_then(|d| d.as_ref());
+        if let Some(range) = cmp_operand_range(ty, cdef, effective_op)
+            && let Some(answer) = cmp_range_decides(effective_op, ty, range, c)
+        {
+            return Some(Instruction::Copy {
+                dest,
+                src: Operand::Const(IrConst::I8(answer)),
+            });
+        }
+        let dies = cast_dies_if_narrowed.get(val.0 as usize).copied().unwrap_or(false);
+        if let Some(test) = cross_domain_sext_cmp(dest, effective_op, ty, *val, cdef, dies, c) {
+            return Some(test);
+        }
     }
 
     if simplify_skip("cmp") {
