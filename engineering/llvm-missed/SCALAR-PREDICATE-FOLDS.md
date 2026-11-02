@@ -769,7 +769,10 @@ bytes: `range_fold_branch.c` (1093 -> 1011) and `three_way_boolean_compare.c`
 (2162 -> 2092) carry most of it, plus `ivw_wrapv_range.c`,
 `range_fold_edges.c`, `vec_range_mask_fusion{,_sse2}.c` and
 `vec_u16_saturating_sub.c`. No file grows, which is what a fold that replaces a
-compare with a constant should look like.
+compare with a constant should look like. The one file the sweep times out on,
+`tests/corpus/clang-c/Sema/many-logical-ops.c` (2,016 lines, 2,000 logical
+operators), is a pre-existing compile-time outlier, not a regression: 81.9 s
+with the rule and 80.7 s with `CCC_SIMPLIFY_SKIP=cmprange`, i.e. 1.2 s of 81.
 
 ## What the LLVM tracker already knows about these shapes
 

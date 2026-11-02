@@ -53,8 +53,12 @@ cross-domain rule this fold does not implement yet.
 ## Corpus A/B
 
 `sweep.py --knob CCC_SIMPLIFY_SKIP --knob-value cmprange`, `-O2`, 3,128 files
-(`tests` + `engineering`), plus the pre-existing `many-logical-ops.c` timeout
-asymmetry the sibling evidence directory documents:
+(`tests` + `engineering`). The sweep's timeout has one client,
+`tests/corpus/clang-c/Sema/many-logical-ops.c`: 2,016 lines, 2,000 `&&`/`||`
+terms, and ~81 s of compile time with the rule on *and* ~81 s with it off
+(81.9 s / 80.7 s, fastbuild `-S`), so the rule costs it 1.2 s of 81 and the
+outlier is the front end's, as the sibling evidence directory already recorded
+for the materialization knob:
 
 | with the rule | files |
 | --- | --- |
