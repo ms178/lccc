@@ -110,7 +110,14 @@ MARKER='FIX''ME'
 #        resolved once next to the three above in src/passes/bit_idioms_facts.rs
 #        so the matcher pays one read per process, not one per block.  Raised to
 #        the measurement, exactly.
-ENV_READ_BUDGET=146
+#   147  2026-11-02: the predicate-materialization kill switch
+#        (CCC_NO_PREDICATE_MATERIALIZE, which turns `c ? 1 : 0` into the compare
+#        it is), resolved once in a `LazyLock` in
+#        src/passes/predicate_materialize.rs next to the pass it gates, so the
+#        pass pays one read per process.  Raised to the measurement, exactly:
+#        the count below is what `grep -rn 'env::var' src/passes` reports with
+#        src/passes/mod.rs excluded.
+ENV_READ_BUDGET=147
 
 fail=0
 report() { # report <label> <offending lines>

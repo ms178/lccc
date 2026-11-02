@@ -205,7 +205,7 @@ fn missing_byte_network(g: &mut Graph, x: Operand) -> Operand {
 fn recognize(f: &mut IrFunction) -> usize {
     // Bit reversal off (x86-64), rotate bounds as the pass sets them for the
     // same target, scalar ANDN unavailable, and a native byte swap.
-    recognize_function(f, false, 64, 8, false, true)
+    recognize_function(f, false, 64, 8, false, true, true)
 }
 
 #[test]
@@ -439,7 +439,7 @@ fn missing_byte_is_kept_without_a_native_swap() {
     let mut f = g.function(IrType::U64, root);
     // Boolean cleanup may remove the zero initializer, but a target without
     // native Bswap must still retain the portable byte-routing network.
-    recognize_function(&mut f, false, 64, 8, false, false);
+    recognize_function(&mut f, false, 64, 8, false, false, true);
     assert_eq!(sole_bswap(&f), None);
 }
 

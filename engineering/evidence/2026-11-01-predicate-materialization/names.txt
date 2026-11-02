@@ -1,0 +1,17 @@
+from_cmp
+from_cmp_neg
+from_lt
+from_lt_neg
+zero_or_one
+one_or_zero
+mask_of_sign
+zero_or_one64
+or_or
+and_eq
+or3
+keep_and_ne
+keep_or_eq
+keep_xor
+keep_three_two
+keep_one_two
+keep_shared

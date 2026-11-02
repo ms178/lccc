@@ -186,6 +186,52 @@ check_present "narrowed full-domain: the folded constant" "$tmp/span_u8-body.s" 
 "$ccc" -O2 "$tmp/span.c" -o "$tmp/span.bin" && "$tmp/span.bin"
 check_eq "span-overflow: execution" "$?" "0"
 
+# --- 4b. the SAME questions asked one compare at a time ---------------------
+# A fold that needs a sibling compare to fire is a fold that silently
+# regresses when the sibling is folded first: `(unsigned char)x <= 255` used
+# to fold only inside the `>= 0 && ...` pair, so once the pair's first half
+# became a constant the second half compiled to `cmpb $255, %dil; setbe`.
+# Every comparison below is therefore answered on its own, with no compare in
+# the body, and the answers are executed as well as inspected -- (unsigned
+# char)(-1) is 255, so the <= / < spellings are true for every int, while a
+# value the interval cannot reach makes the == spelling false.
+cat > "$tmp/single.c" <<'EOF'
+#include <limits.h>
+int single_le(int x) { return (unsigned char)x <= 255; }
+int single_lt(int x) { return (unsigned char)x < 256; }
+int single_gt(int x) { return (unsigned char)x > 255; }
+int single_eq(int x) { return (unsigned char)x == 300; }
+int single_slt(int x) { return (signed char)x < 128; }
+int single_sgt(int x) { return (signed char)x > 127; }
+int single_sge(int x) { return (signed char)x >= -128; }
+int single_imax(int x) { return x > INT_MAX; }
+int single_umax(unsigned x) { return x <= 4294967295u; }
+int main(void) {
+    int ok = 1;
+    for (int i = -300; i <= 300; i++) {
+        ok &= single_le(i) == 1 && single_lt(i) == 1 && single_gt(i) == 0 &&
+              single_eq(i) == 0 && single_slt(i) == 1 && single_sgt(i) == 0 &&
+              single_sge(i) == 1 && single_imax(i) == 0 && single_umax((unsigned)i) == 1;
+    }
+    ok &= single_le(INT_MIN) == 1 && single_lt(INT_MAX) == 1 &&
+          single_eq(44) == 0 && single_umax(4294967295u) == 1;
+    return ok ? 0 : 1;
+}
+EOF
+"$ccc" -O2 -S "$tmp/single.c" -o "$tmp/single.s"
+for fn in single_le single_lt single_slt single_sge single_umax; do
+    sed -n "/^$fn:/,/^\\.size/p" "$tmp/single.s" > "$tmp/$fn.s"
+    check_absent "single compare: $fn is constant" "$tmp/$fn.s" 'cmp|test'
+    check_present "single compare: $fn answers 1" "$tmp/$fn.s" 'mov[a-z]*\s+\$1,'
+done
+for fn in single_gt single_eq single_sgt single_imax; do
+    sed -n "/^$fn:/,/^\\.size/p" "$tmp/single.s" > "$tmp/$fn.s"
+    check_absent "single compare: $fn is constant" "$tmp/$fn.s" 'cmp|test'
+    check_present "single compare: $fn answers 0" "$tmp/$fn.s" 'xor[a-z]*\s+%e[a-z]+,'
+done
+"$ccc" -O2 "$tmp/single.c" -o "$tmp/single.bin" && "$tmp/single.bin"
+check_eq "single compare: execution" "$?" "0"
+
 # --- 5. the full battery, differential across optimization levels -----------
 for opt in -O0 -O1 -O2 -O3 -Os; do
     "$ccc" "$opt" "$src" -o "$tmp/battery$opt.bin"

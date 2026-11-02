@@ -10018,6 +10018,27 @@ fn analyze_map_pattern(
         Some(bits) => fold_unsigned_range_masks(&expr, bits),
         None => expr,
     };
+    // A stored mask is not a stored boolean.  In the packed world a compare
+    // (and anything closed over masks: `MaskConj`, `&`/`|` of compares) is
+    // 0/-1 per lane, while the scalar world -- the remainder loop built from
+    // THIS tree, and the source it must reproduce -- carries the `setcc`
+    // value 0/1.  A root of that shape therefore needs the same `& 1`
+    // materialisation `rewrite_zero_one_selects` gives a `m ? 1 : 0` select;
+    // without it a fused range classifier (`d[i] = lo <= c && c <= hi`)
+    // stores -1 where the C program stores 1.  Range fusion runs first
+    // because it is what turns a two-compare conjunction into the single
+    // fused compare that reaches the store.
+    let expr = if map_lane_bits(&elem_ty).is_some() && packed_is_lane_mask(&expr) {
+        MapExpr::BinOp(
+            IrBinOp::And,
+            Box::new(expr),
+            Box::new(MapExpr::Invariant(Operand::Const(IrConst::from_i64(
+                1, elem_ty,
+            )))),
+        )
+    } else {
+        expr
+    };
     // 20 admits the recovered `&&`/`||` mask shapes (a two-compare
     // range-fold ternary parses to exactly 12 nodes; a three-condition
     // conditional-store chain — the casefold-with-exception idiom

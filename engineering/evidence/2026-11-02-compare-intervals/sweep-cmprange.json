@@ -1,0 +1,90 @@
+{
+ "level": "-O2",
+ "files": 3128,
+ "shorter": [
+  [
+   "../../../tests/corpus/clang-c/Sema/compare.c",
+   551,
+   633
+  ],
+  [
+   "../../../tests/corpus/clang-c/Sema/outof-range-constant-compare.c",
+   3,
+   197
+  ],
+  [
+   "../../../tests/regression/bb_slp_v7.c",
+   2993,
+   3031
+  ],
+  [
+   "../../../tests/regression/count_zero_intermediate_casts.c",
+   232,
+   239
+  ],
+  [
+   "../../../tests/regression/cross_pr_redteam2.c",
+   527,
+   530
+  ],
+  [
+   "../../../tests/regression/ivw_paired_counter.c",
+   177,
+   179
+  ],
+  [
+   "../../../tests/regression/ivw_wrapv_range.c",
+   259,
+   277
+  ],
+  [
+   "../../../tests/regression/range_fold_branch.c",
+   1011,
+   1093
+  ],
+  [
+   "../../../tests/regression/range_fold_edges.c",
+   165,
+   169
+  ],
+  [
+   "../../../tests/regression/three_way_boolean_compare.c",
+   2092,
+   2162
+  ],
+  [
+   "../../../tests/regression/vec_range_mask_fusion.c",
+   623,
+   638
+  ],
+  [
+   "../../../tests/regression/vec_range_mask_fusion_sse2.c",
+   637,
+   657
+  ],
+  [
+   "../../../tests/regression/vec_u16_saturating_sub.c",
+   1371,
+   1381
+  ]
+ ],
+ "same": 2320,
+ "longer": [],
+ "both_reject": 794,
+ "verdict": [
+  [
+   "../../../tests/corpus/clang-c/Sema/many-logical-ops.c",
+   [
+    false,
+    0,
+    "timeout"
+   ],
+   [
+    true,
+    6,
+    ""
+   ]
+  ]
+ ],
+ "net_delta": -545
+}
