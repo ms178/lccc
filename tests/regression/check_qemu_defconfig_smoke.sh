@@ -30,9 +30,16 @@ cat > "$work/qemu" <<'FAKE'
 set -euo pipefail
 log=
 while (($#)); do
-  if [[ $1 == -serial ]]; then log=${2#file:}; shift 2; else shift; fi
+  case $1 in
+    -serial) log=${2#file:}; shift 2 ;;
+    -append) append=$2; shift 2 ;;
+    *) shift ;;
+  esac
 done
 [[ -n "$log" ]]
+expected='console=ttyS0,115200 nokaslr panic=-1 vga=normal'
+[[ ${EXPECT_INITCALL_TRACE:-0} == 0 ]] || expected+=' initcall_debug ignore_loglevel'
+[[ $append == "$expected" ]]
 case ${FAKE_QEMU_CASE:-pass} in
   no-log) exit 1 ;;
   missing) echo 'LCCC_DEFCFG_BOOT_BEGIN' > "$log" ;;
@@ -68,6 +75,18 @@ FAKE_QEMU_CASE=pass "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/
 [[ ! -L "$BOOT_LOG" && $(cat "$work/victim") == 'do not overwrite' ]] || {
   echo 'FAIL: output symlink followed' >&2; exit 1;
 }
+# Trace mode adds observability only; CPU count, workload and verdict stay strict.
+BOOT_TRACE_INITCALLS=1 EXPECT_INITCALL_TRACE=1 FAKE_QEMU_CASE=pass \
+  "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/null
+for invalid_trace in "" invalid 2 -1 01; do
+  if BOOT_TRACE_INITCALLS=$invalid_trace "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/null 2>&1; then
+    echo "FAIL: invalid initcall trace switch accepted: $invalid_trace" >&2; exit 1
+  fi
+done
+if BOOT_TRACE_INITCALLS=1 EXPECT_INITCALL_TRACE=1 FAKE_QEMU_CASE=wrong-cpus \
+  "$root/scripts/qemu_defconfig_smoke.sh" "$work/image" >/dev/null 2>&1; then
+  echo 'FAIL: trace mode weakened the CPU-count contract' >&2; exit 1
+fi
 # Check the actual embedded guest script's syntax, not just the fake verdict.
 bash -n "$CAPTURE_INIT"
 # Execute the generated worker/join logic with isolated command stubs. In

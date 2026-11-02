@@ -9,6 +9,15 @@ BUSYBOX=${BUSYBOX:-/usr/bin/busybox}
 QEMU_CPU=${QEMU_CPU:-qemu64}
 BOOT_LOG=${BOOT_LOG:-/tmp/lccc-defconfig-qemu.log}
 BOOT_TIMEOUT=${BOOT_TIMEOUT:-240}
+BOOT_TRACE_INITCALLS=${BOOT_TRACE_INITCALLS-0}
+case $BOOT_TRACE_INITCALLS in
+  0|1) ;;
+  *) echo 'BOOT_TRACE_INITCALLS must be 0 or 1' >&2; exit 1 ;;
+esac
+kernel_cmdline='console=ttyS0,115200 nokaslr panic=-1 vga=normal'
+if [[ $BOOT_TRACE_INITCALLS == 1 ]]; then
+  kernel_cmdline+=' initcall_debug ignore_loglevel'
+fi
 [[ -f "$image" ]] || { echo "missing kernel image: $image" >&2; exit 1; }
 command -v "$QEMU" >/dev/null || { echo "missing QEMU: $QEMU" >&2; exit 1; }
 [[ -x "$BUSYBOX" ]] && file "$BUSYBOX" | grep -q 'statically linked' || {
@@ -92,7 +101,7 @@ set +e
 timeout "$BOOT_TIMEOUT" "$QEMU" -L "$work/firmware" -machine pc -cpu "$QEMU_CPU" -m 768 -smp 2 \
   -kernel "$image" -initrd "$work/initramfs.cpio.gz" -display none -serial "file:$serial" \
   -no-reboot -accel tcg,thread=multi \
-  -append 'console=ttyS0,115200 nokaslr panic=-1 vga=normal' 2>"$work/qemu.err"
+  -append "$kernel_cmdline" 2>"$work/qemu.err"
 rc=$?
 set -e
 publish() { # publish <private-source> <requested-output>

@@ -143,7 +143,7 @@ jobs:
       - name: Boot the full defconfig image in QEMU
         run: |
           K=$(bash scripts/kernel_version.sh --default-dir)
-          BOOT_LOG="$RUNNER_TEMP/kernel-qemu.log" bash scripts/qemu_defconfig_smoke.sh "$K/arch/x86/boot/bzImage"
+          BOOT_TRACE_INITCALLS=1 BOOT_LOG="$RUNNER_TEMP/kernel-qemu.log" bash scripts/qemu_defconfig_smoke.sh "$K/arch/x86/boot/bzImage"
       - name: Surface kernel diagnostics in the Checks API
         if: failure()
         run: |

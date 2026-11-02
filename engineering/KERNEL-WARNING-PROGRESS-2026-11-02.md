@@ -353,3 +353,47 @@ The build still prints unsupported option/warning families. All-13-family
 completion, zero kernel warnings, all-architecture/default-link orphan support,
 local ICX, measured runtime/code-size gains and green CI for this revision remain
 open. This is a pending checkpoint, not the requested production-ready delivery.
+
+
+## Latest-main integration and traced-boot investigation
+
+Integrated upstream `bfdcd13e0` by merge `96e41d467`. An attempted historical
+rebase was aborted: replaying the old CI reorganizations repeatedly created
+misassigned/duplicated gates. This is a merge, not a completed rebase. The final
+workflow retains the full named-gate union from both parents without duplicates.
+The repository splitter predicts backend shard costs of 520.9 / 521.2 seconds
+(84 / 118 gates); these are estimates, not measured CI speedups. Lane-plan and
+CI/local parity checks pass (506 commands, 27 contracts).
+
+Post-integration validation with the reviewed toolchain:
+
+* Normal optimized fastbuild compiler/linker: successful build confirmed.
+* Clippy, fastbuild binaries, debug info off, `-D warnings`: PASS, 43.15 seconds.
+* Full linker RWX suite: PASS, including 80 script-permission, 128 orphan-policy
+  and 16 discard-none GNU-oracle cases, and cross-target runtime checks.
+* Kernel codegen contracts: PASS, 83 object/runtime contracts.
+* DWARF 2/3/4/5 suite: PASS against GCC 16.2 across C89 through C23, all four
+  targets, consumer round trips and multi-object relocation.
+* Fresh actual patched Linux 6.18.58 defconfig/prepare: PASS. Boot-first gate:
+  **31024 / 32768 bytes**, 1744 bytes headroom, GNU flat-image parity and all
+  24 ISA scans PASS. SHA256:
+  `aba4f14ae04d5f9bd5f4acdb70a19d21dc19a05a2fc426124be550b4deeb7391`.
+  This is not a controlled performance or code-size improvement measurement.
+
+The previous hosted kernel run timed out in QEMU without the guest smoke
+marker. `BOOT_TRACE_INITCALLS=1` now adds only `initcall_debug ignore_loglevel`
+to the existing command line, and the kernel workflow enables it. Default mode
+preserves the exact previous command line. Invalid values fail before boot.
+Hermetic regression tests check both exact command lines and verify that trace
+mode still rejects a wrong guest CPU count; the existing workload, log/security,
+verdict and firmware-dependency tests remain enabled and pass. Workflow shell
+checks also pass. These fake-QEMU tests are not an actual guest boot.
+
+A fresh full local build followed by traced system-QEMU is running with the
+private verified host tools, two build jobs and active 4 GiB swap. Kernel target
+code uses LCCC exclusively. Logs are `/home/user/kernel-full-current.log` and,
+only after a successful build, `/home/user/kernel-qemu-current{,-result}.log`.
+There is no successful full-link/guest result at this checkpoint. Unsupported
+option warnings remain visible; all thirteen families/options, zero warnings,
+full objtool/guest validation, ICX 2026.2, measured gains and green hosted CI
+remain unresolved. This autosave is PENDING, not a readiness declaration.
