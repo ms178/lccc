@@ -2023,6 +2023,8 @@ impl Lowerer {
         ret_abi: &AggregateReturn,
     ) -> IrType {
         let calling_convention = self.callee_calling_convention(func);
+        let typed_fastcall =
+            calling_convention == crate::common::types::CallingConvention::I686Fastcall;
         if calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
             self.copy_ms_record_arguments(&mut arg_vals, &struct_arg_sizes);
         }
@@ -2038,8 +2040,6 @@ impl Lowerer {
                 if self.is_func_ptr_variable(name) {
                     // Function pointer variable: load pointer and call indirect
                     let func_ptr = self.load_func_ptr_variable(name);
-                    // TODO: Support fastcall through function pointers (requires tracking
-                    // calling convention in function pointer types)
                     self.emit(Instruction::CallIndirect {
                         func_ptr: Operand::Value(func_ptr),
                         info: CallInfo {
@@ -2056,7 +2056,7 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,
-                            is_fastcall: false,
+                            is_fastcall: typed_fastcall,
                             regparm: None,
                             is_pure: false,
                             is_const: false,
@@ -2090,7 +2090,8 @@ impl Lowerer {
                             }
                         }
                     }
-                    let callee_is_fastcall = self.fastcall_functions.contains(name.as_str());
+                    let callee_is_fastcall =
+                        typed_fastcall || self.fastcall_functions.contains(name.as_str());
                     let mut callee_regparm = self.regparm_functions.get(name.as_str()).copied();
                     if callee_is_fastcall {
                         callee_regparm = None;
@@ -2173,7 +2174,7 @@ impl Lowerer {
                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                         is_sret: ret_abi.sret_size.is_some(),
                         calling_convention,
-                        is_fastcall: false,
+                        is_fastcall: typed_fastcall,
                         regparm: None,
                         is_pure: false,
                         is_const: false,
@@ -2236,7 +2237,8 @@ impl Lowerer {
                             }
                         }
                     }
-                    let callee_is_fastcall = self.fastcall_functions.contains(call_name.as_str());
+                    let callee_is_fastcall =
+                        typed_fastcall || self.fastcall_functions.contains(call_name.as_str());
                     let mut callee_regparm =
                         self.regparm_functions.get(call_name.as_str()).copied();
                     if callee_is_fastcall {
@@ -2290,7 +2292,7 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: ret_abi.sret_size.is_some(),
                             calling_convention,
-                            is_fastcall: false,
+                            is_fastcall: typed_fastcall,
                             regparm: None,
                             is_pure: false,
                             is_const: false,

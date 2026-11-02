@@ -97,3 +97,15 @@ pointer-spill hook while its later reload/cleanup assumes a four-byte spill;
 that path requires a separate regression after typed ABI propagation is fixed.
 Neither defect is claimed fixed. The current checkpoint is not a production
 acceptance delivery and does not claim every callable ABI path is correct.
+
+## Subsequent i386 ABI repair and hosted result
+
+The typed fastcall and missing-spill defects above have a validated repair
+cohort: 7643 library passes/10 existing ignores, 281 contracts, all-target
+Clippy, expanded DWARF and strict authentic usercopy PASS. The new dedicated
+I686-FASTCALL-REPAIR-2026-11-02.md records exact scope, independent assembly
+and cross-TU tests, GNU/Clang ABI differences, and a separate still-failing
+optimized Microsoft nested-capture reproducer. It does not claim universal
+calling-convention coverage. Hosted kernel job 125464215626 has since passed
+full link and QEMU on source 86b0b1a57 (boot _end=31040); the retained API
+receipts do not inspect its artifact warnings or validate the newer source.

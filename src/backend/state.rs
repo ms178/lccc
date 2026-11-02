@@ -489,6 +489,8 @@ pub struct CodegenState {
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
+    /// Canonical IR fastcall definitions, used by i386 trampoline templates.
+    pub i686_fastcall_symbols: FxHashSet<String>,
     /// Set of symbol names defined in this translation unit (functions, globals,
     /// aliases, IFUNCs) — non-preemptible in `-fPIE` / `-fno-pic` executables.
     pub defined_symbols: FxHashSet<String>,
@@ -970,6 +972,7 @@ impl CodegenState {
             pie_mode: false,
             no_plt: false,
             local_symbols: FxHashSet::default(),
+            i686_fastcall_symbols: FxHashSet::default(),
             defined_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),
             noplt_symbols: FxHashSet::default(),

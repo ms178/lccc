@@ -993,6 +993,8 @@ pub enum CallingConvention {
     #[default]
     Default,
     MicrosoftX64,
+    /// GNU i386 fastcall: ECX/EDX arguments and callee stack cleanup.
+    I686Fastcall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -605,6 +605,7 @@ impl I686Codegen {
         if self.state.dirty_upper_ymm && !self.state.call_passes_wide_vector {
             self.state.emit("    vzeroupper");
         }
+        self.emit_pending_static_chain("ecx");
         if let Some(name) = direct_name {
             if self.state.needs_got_call(name) {
                 let n = name.split('@').next().unwrap_or(name);

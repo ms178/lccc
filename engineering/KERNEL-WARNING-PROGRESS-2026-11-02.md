@@ -560,3 +560,17 @@ all-target Clippy and strict usercopy checks pass. New red-team i686 evidence
 finds fastcall function-pointer ABI loss (wrong O0 result, O2/Os crashes;
 GCC16.2/Clang23.1.4 pass), plus an indirect fastcall spill-hook mismatch.
 These are added to the open follow-up work, not hidden or marked passing.
+
+The next i386 repair cohort now passes 7643 lib units (10 existing ignores),
+281 object/runtime contracts, all-target warnings-denied Clippy, the expanded
+DWARF gate and strict authentic usercopy validation. Typed fastcall, target
+spilling/alignment, sret cleanup and nested static chains are repaired; see
+I686-FASTCALL-REPAIR-2026-11-02.md for the tested cases and GCC/Clang ABI
+incompatibilities, not just the passing totals. A separate optimized x86-64
+Microsoft nested-capture witness remains open and is preserved explicitly.
+
+Hosted source 86b0b1a57 now has all 26 listed PR checks passing, including the
+full kernel/QEMU job. Its boot annotation is 31040/32768 bytes. This does not
+establish zero kernel diagnostics or boot the newer local source. A fresh
+fetch advanced main from 27ae9f4c6 to ac28d3a24; integration and repeat validation
+of that new main are the next checkpoint, not already counted above.

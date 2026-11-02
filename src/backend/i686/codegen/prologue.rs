@@ -639,6 +639,29 @@ impl I686Codegen {
                 .insert(param_idx, StackSlot(offset));
         }
         let mut space = space + conflict_params.len() as i64 * 4;
+        self.incoming_chain_slot = None;
+        self.outgoing_chain_slot = None;
+        self.pending_static_chain = false;
+        for incoming in [true, false] {
+            let needed = func.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    if incoming {
+                        matches!(inst, Instruction::GetStaticChain { .. })
+                    } else {
+                        matches!(inst, Instruction::SetStaticChain { .. })
+                    }
+                })
+            });
+            if needed {
+                space += 4;
+                let slot = Some(StackSlot(-space));
+                if incoming {
+                    self.incoming_chain_slot = slot;
+                } else {
+                    self.outgoing_chain_slot = slot;
+                }
+            }
+        }
         self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
             func.uses_sret,
             &func.ret_eightbyte_classes,
@@ -791,6 +814,13 @@ impl I686Codegen {
             let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
             self.frame_base_offset = callee_saved_bytes + frame_size;
             self.esp_adjust = 0;
+        }
+        // Save before parameter homes or instrumentation can use scratch
+        // registers. Stack allocation preserves EAX even during probing.
+        if let Some(slot) = self.incoming_chain_slot {
+            let reg = if self.is_fastcall { "eax" } else { "ecx" };
+            let home = self.slot_ref(slot);
+            emit!(self.state, "    movl %{}, {}", reg, home);
         }
     }
 
@@ -1949,18 +1979,18 @@ impl I686Codegen {
             self.state.emit("    vzeroupper");
         }
         self.emit_epilogue(frame_size);
-        let cleanup =
-            if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
-                // i386 SysV sret: callee pops the hidden pointer.
-                // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
-                // function_value semantics) — nothing is on the stack to pop.
-                4
-            } else if self.is_fastcall && !self.is_variadic {
-                // Variadic fastcall is caller-cleaned cdecl.
-                self.fastcall_stack_cleanup
-            } else {
-                0
-            };
+        let cleanup = if self.is_fastcall && !self.is_variadic {
+            // Fastcall owns the whole compacted argument area, including
+            // sret calls whose hidden pointer is in ECX, not on the stack.
+            self.fastcall_stack_cleanup
+        } else if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
+            // i386 SysV sret: callee pops the hidden pointer.
+            // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
+            // function_value semantics) — nothing is on the stack to pop.
+            4
+        } else {
+            0
+        };
         if self.state.function_return_thunk {
             if cleanup == 0 {
                 self.state.emit("    jmp __x86_return_thunk");

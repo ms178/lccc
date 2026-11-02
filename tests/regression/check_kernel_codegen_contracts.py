@@ -147,6 +147,55 @@ def main():
                          start, thunk_source, '-o', output])
                     run(([emulator] if emulator else []) + [output])
                     checks += 2
+            if name == 'i686':
+                # Actual i386 execution: x86-64 ignores fastcall attributes and
+                # cannot validate typed indirect calls or callee stack cleanup.
+                for opt in ('-O0', '-O2', '-Os'):
+                    for frame in ('-fomit-frame-pointer', '-fno-omit-frame-pointer'):
+                        for fixture in ('i686_fastcall_indirect.c', 'i686_fastcall_nested.c'):
+                            output = work / fixture.removesuffix('.c')
+                            run([compiler, opt, frame, '-fno-pie', '-nostdlib', '-static',
+                                 start, HERE/fixture, '-o', output])
+                            run([emulator, output])
+                            checks += 1
+                # GNU i386 vector ABI: caller owns trailing alignment padding.
+                # Clang 23 instead includes that padding in fastcall cleanup;
+                # do not pretend these vendor variants are interoperable.
+                for opt in ('-O0', '-O2', '-Os'):
+                    for frame in ('-fomit-frame-pointer', '-fno-omit-frame-pointer'):
+                        output = work/'fastcall-vector'
+                        run([compiler, opt, frame, '-Werror', '-mavx2', '-fno-pie',
+                             '-nostdlib', '-static', start,
+                             HERE/'fixtures/i686_fastcall_indirect_vector.c', '-o', output])
+                        run([emulator, '-cpu', 'max', output])
+                        checks += 1
+                # Cross-compiler caller/callee pairs, not matching-bug tests.
+                source = HERE/'fixtures/i686_fastcall_cross_tu.c'
+                for oracle in (args.gcc, args.clang):
+                    for opt in ('-O0', '-O2', '-Os'):
+                        for oracle_callee in (True, False):
+                            caller, callee = ((compiler, oracle) if oracle_callee
+                                              else (oracle, compiler))
+                            caller_flags = ['-m32'] if caller == oracle else []
+                            callee_flags = ['-m32'] if callee == oracle else []
+                            # Clang's record-result pointer is stack-passed,
+                            # unlike GNU fastcall's ECX hidden parameter.
+                            # Keep record-result interop in BOTH GCC directions;
+                            # Clang pairs cover the common scalar/by-value ABI.
+                            variant = (['-DCLANG_FASTCALL_VARIANT']
+                                       if oracle == args.clang else [])
+                            run([callee, *callee_flags, *variant, opt, '-Werror', '-fno-pie',
+                                 '-DABI_CALLEE', '-c', source, '-o', work/'callee.o'])
+                            run([caller, *caller_flags, *variant, opt, '-Werror', '-fno-pie',
+                                 '-c', source, '-o', work/'caller.o'])
+                            output = work/'fastcall-cross-tu'
+                            run([compiler, '-fno-pie', '-nostdlib', '-static', start,
+                                 work/'caller.o', work/'callee.o', '-o', output])
+                            try:
+                                run([emulator, output])
+                            except AssertionError as error:
+                                raise AssertionError((oracle, opt, oracle_callee, error)) from error
+                            checks += 1
             # Mutable global callback cells used to bypass retpolines through
             # the RIP-relative load/call fold. Inspect object code (not just
             # assembly spelling) and execute stack-argument calls through real

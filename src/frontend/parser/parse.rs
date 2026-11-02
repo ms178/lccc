@@ -2881,6 +2881,8 @@ impl Parser {
             "fastcall" | "__fastcall__" => {
                 let span = self.peek_span();
                 self.attrs.set_fastcall(true);
+                self.attrs.parsing_calling_convention =
+                    Some(crate::common::types::CallingConvention::I686Fastcall);
                 self.advance();
                 // GCC: "fastcall and regparm attributes are not compatible"
                 if self.attrs.parsing_regparm.is_some() {

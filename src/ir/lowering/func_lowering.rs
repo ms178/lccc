@@ -1314,6 +1314,13 @@ impl Lowerer {
             .unwrap_or_else(|| func.name.clone());
         let is_retain = func.attrs.is_retain() || self.retained_function_decls.contains(&func.name);
 
+        let calling_convention = func.calling_convention.unwrap_or_else(|| {
+            self.sema_functions
+                .get(&func.name)
+                .map(|f| f.calling_convention)
+                .unwrap_or_default()
+        });
+
         let ir_func = IrFunction {
             pass_policy: Default::default(),
             // GCC __asm__("symbol") asm labels: a function DEFINITION must be
@@ -1367,13 +1374,9 @@ impl Lowerer {
             has_inlined_calls: false,
             param_alloca_values: param_alloca_vals,
             uses_sret,
-            calling_convention: func.calling_convention.unwrap_or_else(|| {
-                self.sema_functions
-                    .get(&func.name)
-                    .map(|f| f.calling_convention)
-                    .unwrap_or_default()
-            }),
-            is_fastcall: func.attrs.is_fastcall(),
+            calling_convention,
+            is_fastcall: func.attrs.is_fastcall()
+                || calling_convention == crate::common::types::CallingConvention::I686Fastcall,
             regparm: func.attrs.regparm,
             is_naked: func.attrs.is_naked(),
             no_instrument: func.attrs.is_no_instrument(),

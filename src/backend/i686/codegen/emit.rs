@@ -181,6 +181,11 @@ pub struct I686Codegen {
     pub(super) asm_xmm_scratch_idx: usize,
     /// Whether the current function uses the fastcall calling convention.
     pub(super) is_fastcall: bool,
+    /// Dedicated homes keep the static chain safe through parameter capture
+    /// and outgoing argument staging (ECX/EDX belong to fastcall arguments).
+    pub(super) incoming_chain_slot: Option<StackSlot>,
+    pub(super) outgoing_chain_slot: Option<StackSlot>,
+    pub(super) pending_static_chain: bool,
     /// For fastcall functions, the number of bytes of stack args the callee must pop on return.
     pub(super) fastcall_stack_cleanup: usize,
     /// Per-parameter fastcall slots from `fastcall_layout` (empty for cdecl).
@@ -713,6 +718,9 @@ impl I686Codegen {
             asm_scratch_idx: 0,
             asm_xmm_scratch_idx: 0,
             is_fastcall: false,
+            incoming_chain_slot: None,
+            outgoing_chain_slot: None,
+            pending_static_chain: false,
             fastcall_stack_cleanup: 0,
             fastcall_slots: Vec::new(),
             conflict_param_slots: FxHashMap::default(),
@@ -2081,7 +2089,7 @@ impl I686Codegen {
     /// i386 fastcall rules): the first two eligible integer/pointer args
     /// take %ecx/%edx, float/decimal scalars are skipped, aggregates and
     /// wide integers break the chain, and variadic callees receive every
-    /// argument on the stack and pop nothing.
+    /// argument on the stack (only a hidden SysV sret pointer is callee-popped).
     pub(super) fn emit_fastcall(
         &mut self,
         args: &[Operand],
@@ -2095,6 +2103,7 @@ impl I686Codegen {
         dest: Option<Value>,
         return_type: IrType,
         is_variadic: bool,
+        variadic_sret: bool,
     ) {
         let indirect = func_ptr.is_some() && direct_name.is_none();
 
@@ -2138,12 +2147,24 @@ impl I686Codegen {
         // The callee pops exactly `stack_bytes`; alignment padding is
         // caller-owned. Wide vectors additionally require an absolute ESP
         // boundary, just like the cdecl path.
-        let stack_arg_space = (stack_bytes + dyn_align_a - 1) & !(dyn_align_a - 1);
+        let spill_bytes = if indirect { 4 } else { 0 };
+        let stack_arg_space = if dyn_align {
+            (stack_bytes + dyn_align_a - 1) & !(dyn_align_a - 1)
+        } else {
+            // The spill is outside the argument area but inside the outgoing
+            // alignment budget. Rounding arguments alone misaligns every
+            // indirect call by four bytes.
+            ((stack_bytes + spill_bytes + dyn_align_a - 1) & !(dyn_align_a - 1)) - spill_bytes
+        };
         self.dyn_align_cleanup = false;
 
-        // Spill indirect function pointer before stack manipulation.
+        // Capture the target before argument staging can overwrite its home.
+        // The generic spill hook is intentionally a no-op on i686; its cdecl
+        // layout must not be changed to implement this fastcall-only slot.
         if indirect {
-            self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
+            self.emit_load_operand(func_ptr.expect("indirect call requires func_ptr"));
+            self.state.emit("    pushl %eax");
+            self.esp_adjust += 4;
         }
 
         // Phase 1: Allocate stack space and write stack args at their
@@ -2234,7 +2255,9 @@ impl I686Codegen {
             }
         }
 
-        // Phase 3: Emit the call.
+        // Phase 3: Emit the call. GNU fastcall reserves EAX for a nested
+        // function's static chain, independently of ECX/EDX user arguments.
+        self.emit_pending_static_chain("eax");
         if indirect {
             // Reload the function pointer from the spill slot. With dynamic
             // realignment the save word holds the pre-realignment ESP, which
@@ -2266,7 +2289,13 @@ impl I686Codegen {
             }
         }
 
-        let pops = if is_variadic { 0 } else { stack_bytes as u32 };
+        // Variadic fastcall falls back to SysV cdecl, including its hidden
+        // record-result pointer rule: the callee still pops that one word.
+        let pops = if is_variadic {
+            if variadic_sret { 4 } else { 0 }
+        } else {
+            stack_bytes as u32
+        };
         if indirect {
             self.state.record_call_pop(None, Some(pops));
         } else if direct_name.is_some() {
@@ -2286,20 +2315,11 @@ impl I686Codegen {
             self.state.emit("    movl (%esp), %esp");
             self.esp_adjust -= (stack_arg_space + 4) as i64;
         } else {
-            if is_variadic {
-                if stack_bytes != 0 {
-                    emit!(self.state, "    addl ${}, %esp", stack_bytes);
-                    self.esp_adjust -= stack_bytes as i64;
-                }
-            } else {
-                // Callee popped stack_bytes, so esp_adjust drops by that amount.
-                self.esp_adjust -= stack_bytes as i64;
-            }
-            // Clean up alignment padding (the difference between actual stack bytes and aligned)
-            let padding = stack_arg_space - stack_bytes;
-            if padding > 0 {
-                emit!(self.state, "    addl ${}, %esp", padding);
-                self.esp_adjust -= padding as i64;
+            self.esp_adjust -= pops as i64;
+            let caller_bytes = stack_arg_space - pops as usize;
+            if caller_bytes > 0 {
+                emit!(self.state, "    addl ${}, %esp", caller_bytes);
+                self.esp_adjust -= caller_bytes as i64;
             }
         }
         if indirect {
@@ -3571,6 +3591,7 @@ impl ArchCodegen for I686Codegen {
                 fc_dest,
                 return_type,
                 is_variadic,
+                is_sret && hidden_vector_return_bytes(is_sret, ret_eightbyte_classes).is_none(),
             );
             if let Some(dest) = gp3_dest {
                 self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);

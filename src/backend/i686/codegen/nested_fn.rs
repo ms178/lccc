@@ -1,110 +1,64 @@
-//! i686 lowering of the GNU C nested-function support instructions:
-//! static chain, trampolines, and non-local goto.
+//! i686 GNU nested-function static chains, trampolines and non-local goto.
 //!
-//! ## Static chain
+//! GCC 16.2 ix86_static_chain uses ECX for cdecl and EAX for fastcall,
+//! leaving ECX/EDX available for fastcall user arguments. Capture incoming
+//! chains in a dedicated frame home before parameter materialization; stage
+//! outgoing chains in another home and reload AFTER outgoing arguments.
 //!
-//! The i686 convention mirrors GCC's historical i386 choice: the static
-//! chain travels in `%ecx` (GCC: STATIC_CHAIN_REGNUM == ECX). The callee
-//! reads it with `GetStaticChain` (placed at function entry by the lowerer,
-//! before anything else can clobber %ecx); direct callers load it with
-//! `SetStaticChain` immediately before the call.
+//! Trampolines copy an 11-byte relocated template to the stack: MOV imm32
+//! to the convention's chain register, followed by JMP through a relocated
+//! target slot. Both the template and target slot live in .data.rel.ro until
+//! copied, avoiding a relocation into read-only text under PIC/PIE. Taking a
+//! capturing nested function's address requires an executable stack, as in
+//! GNU C; the module explicitly marks .note.GNU-stack executable.
 //!
-//! Safety of `%ecx` at call sites relies on two properties of the shared
-//! framework:
-//!   * Call emission never stages through %ecx in the default (-mregparm=0)
-//!     convention: direct calls are a bare `call rel32`, indirect calls stage
-//!     through %eax (`call *%eax`). See `calls.rs::emit_call_instruction_impl`.
-//!   * The i686 scratch-hazard classifier treats every one of these nested-
-//!     function instructions as dirty for BOTH caller-saved registers
-//!     (regalloc catch-all arm), so no allocator-owned value can sit in
-//!     %ecx across them.
-//! A nested call from a `-mregparm` context shares %ecx with argument 3;
-//! that combination behaves like upstream GCC's own static-chain/regparm
-//! conflict and is intentionally out of scope here (documented ABI limit).
-//!
-//! ## Trampoline (address-taken nested function)
-//!
-//! Older GCC release notes and GCC's own ix86 lowering both key off a run-
-//! time-initialized stack template; modern reality adds ASLR/PIE, which makes
-//! baked absolute addresses wrong. LCCC therefore uses a **statically
-//! relocated template** rather than computing any address at emission time:
-//!
-//! ```text
-//!     .section .rodata
-//! .LCT<N>:                          ;; 11-byte code template (RO, shared per site)
-//!     .byte 0xB9                    ;; opcode: movl $imm32, %ecx
-//!     .long 0                       ;; chain slot — patched AFTER copy (offset 1..5)
-//!     .byte 0xFF, 0x25              ;; opcode: jmp *disp32
-//!     .long .LTS<N>                 ;; disp32 -> slot address (R_386_32, load-resolved)
-//!     .section .data.rel.ro,"aw"    ;; relocation-writable, RELRO-protected afterwards
-//! .LTS<N>:
-//!     .long <func>                  ;; absolute target (R_386_32, load-resolved)
-//! ```
-//!
-//! Both disp32 fields carry ordinary `R_386_32` symbol relocations, so under
-//! `-fPIE`/`-fPIC` the program loader resolves them together with the rest of
-//! the image — no GOT dance, no %-ebx dependency, and identical machinery for
-//! the non-PIC case. Execution model (15 -> 11-byte form):
-//!
-//!   1. `InitTrampoline` copies the 11 template bytes to the caller-provided
-//!      stack buffer (the lowerer allocates 32 bytes @ align 16);
-//!   2. patches the captured current-frame chain value over the placeholder
-//!      (`movl %edx, -10(%edi)` after an 11-byte rep movsb);
-//!   3. marks the module's stack executable (`.note.GNU-stack,"x"`), exactly
-//!      like x86-64.
-//!
-//! When the trampoline later runs, `%ecx` already holds the initializing
-//! frame's chain when control enters the callee prologue, matching every
-//! `GetStaticChain` reader.
-//!
-//! Notes:
-//!   * Only ebx/esi/edi-width register discipline matters for correctness:
-//!     inputs are staged into %edx/%eax/%esi BEFORE any callee-saved register
-//!     is pushed, and %esi/%edi are restored bit-exactly afterwards.
-//!   * Deep-consistency note: upstream keeps save areas with 8-byte words;
-//!     i686 frames consume 4-byte pointers but stay byte-compatible because
-//!     save/restore read the very offsets the lowerer handed down.
+//! Regparm-3 nested functions require GCC's separate ESI/stack-chain entry
+//! convention and remain a separate, unsupported ABI combination here.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::emit;
 use crate::ir::reexports::{Operand, Value};
 
-use crate::backend::i686::codegen::emit::{I686Codegen, phys_reg_name};
+use crate::backend::i686::codegen::emit::I686Codegen;
 
 /// Site-unique suffix generator for the static template/slot label pairs.
 static TRAMPOLINE_SITES: AtomicU32 = AtomicU32::new(0);
 
 impl I686Codegen {
-    /// `GetStaticChain`: move the incoming %ecx into the dest's home.
+    /// Read the chain captured before incoming parameter materialization.
     pub(super) fn emit_get_static_chain_impl(&mut self, dest: &Value) {
-        if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
-            let d_name = phys_reg_name(d_reg);
-            if d_name != "ecx" {
-                emit!(self.state, "    movl %ecx, %{}", d_name);
-                self.state.reg_cache.invalidate_all();
-            }
-            // Already homed in %ecx: nothing to do (and the cached mapping
-            // still holds, so no invalidation either).
-            return;
-        }
-        // Dead chain value (no register home, no slot): the function never
-        // reads its static chain. Emitting the read would be wasted code.
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            // Direct reg->memory store; no accumulator staging needed.
-            let sr = self.slot_ref(slot);
-            emit!(self.state, "    movl %ecx, {}", sr);
-            self.state.reg_cache.invalidate_all();
-        }
+        let slot = self
+            .incoming_chain_slot
+            .expect("GetStaticChain needs a home");
+        let home = self.slot_ref(slot);
+        emit!(self.state, "    movl {}, %eax", home);
+        self.state.reg_cache.invalidate_acc();
+        self.store_eax_to(dest);
     }
 
-    /// `SetStaticChain`: load `src` into %ecx right before the call.
+    /// Preserve the chain until AFTER argument materialization. In particular,
+    /// fastcall ECX/EDX parameters must never overwrite it.
     pub(super) fn emit_set_static_chain_impl(&mut self, src: &Operand) {
-        self.operand_to_ecx(src);
-        // %ecx now holds the chain; the immediately following Call must not
-        // reload it. invalidate_all() is deliberately NOT called: the chain
-        // register is outside the accumulator-cache contract and the very
-        // next instruction is the call.
+        let slot = self
+            .outgoing_chain_slot
+            .expect("SetStaticChain needs a home");
+        self.operand_to_eax(src);
+        let home = self.slot_ref(slot);
+        emit!(self.state, "    movl %eax, {}", home);
+        self.pending_static_chain = true;
+    }
+
+    pub(super) fn emit_pending_static_chain(&mut self, register: &str) {
+        if self.pending_static_chain {
+            let slot = self
+                .outgoing_chain_slot
+                .expect("pending static chain needs a home");
+            let home = self.slot_ref(slot);
+            emit!(self.state, "    movl {}, %{}", home, register);
+            self.state.reg_cache.invalidate_all();
+            self.pending_static_chain = false;
+        }
     }
 
     /// `InitTrampoline`: materialise the per-site template into `buffer`.
@@ -130,10 +84,15 @@ impl I686Codegen {
         // constant (writable before relocation, RELRO afterwards). The
         // template itself is never executed from here; only its copied
         // image on the stack runs. ──────────────────────────────────────
+        let chain_opcode = if self.state.i686_fastcall_symbols.contains(func) {
+            "0xB8" // mov imm32, EAX (GNU fastcall static chain)
+        } else {
+            "0xB9" // mov imm32, ECX (cdecl static chain)
+        };
         self.state.trampoline_data_blocks.push(format!(
-            "\n    .section .data.rel.ro,\"aw\"\n{}:\n    .byte 0xB9\n    .long 0\n\
+            "\n    .section .data.rel.ro,\"aw\"\n{}:\n    .byte {}\n    .long 0\n\
                  \x20    .byte 0xFF, 0x25\n    .long {}\n{}:\n    .long {}\n    .text",
-            tpl, slot, slot, func,
+            tpl, chain_opcode, slot, slot, func,
         ));
 
         // ── Stage inputs with STRICT caller-saved-only discipline ────────

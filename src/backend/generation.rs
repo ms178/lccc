@@ -4764,6 +4764,9 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
         .noplt_symbols
         .extend(module.noplt_symbols.iter().cloned());
     for func in &module.functions {
+        if func.is_fastcall {
+            state.i686_fastcall_symbols.insert(func.name.clone());
+        }
         if !func.is_declaration {
             state.defined_symbols.insert(func.name.clone());
         }
