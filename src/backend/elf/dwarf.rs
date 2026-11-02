@@ -588,6 +588,28 @@ fn debug_file_table(files: &[(u32, String)]) -> Result<Vec<(u32, &str)>, String>
             table.push((*number, filename));
         }
     }
+    // Both tables are addressed by number -- a version 5 table's slot *i* is
+    // `.file i`, and versions 2..4 number their slots from 1 -- so the numbers
+    // have to run `0, 1, 2, ...` or `1, 2, 3, ...` in declaration order.  A
+    // skipped or reordered number would silently renumber every file after it
+    // and point every `DW_AT_decl_file` an input unit carries at the wrong
+    // name; GAS refuses such input ("unassigned file number 2", measured).
+    let starts_at_zero = table.first().is_some_and(|(number, _)| *number == 0);
+    if let Some((_, (number, _))) = table
+        .iter()
+        .enumerate()
+        .find(|(position, (number, _))| *number != *position as u32 + u32::from(!starts_at_zero))
+    {
+        return Err(format!(
+            "DWARF .file {number} is out of order: the numbers must run \
+             {} (a gap would renumber every file after it)",
+            if starts_at_zero {
+                "0, 1, 2, ...".to_string()
+            } else {
+                "1, 2, 3, ...".to_string()
+            }
+        ));
+    }
     Ok(table)
 }
 
@@ -613,6 +635,10 @@ struct LineTables<'a> {
     directories: Vec<&'a str>,
     /// `(directory index, base name)` per recorded file, in `.file` order.
     files: Vec<(u64, &'a str)>,
+    /// Whether the first recorded file is `.file 0`, which GCC's version-5
+    /// assembly declares (`.file 0 "dir" "unit.c"`): a version-5 table then
+    /// starts at that entry instead of repeating it.
+    primary_is_zero: bool,
 }
 
 /// Split every recorded file name into the directory index it resolves through
@@ -638,7 +664,45 @@ fn line_tables<'a>(file_table: &[(u32, &'a str)], comp_dir: &str) -> LineTables<
         };
         files.push((index, base));
     }
-    LineTables { directories, files }
+    LineTables {
+        directories,
+        files,
+        primary_is_zero: file_table.first().is_some_and(|(number, _)| *number == 0),
+    }
+}
+
+/// A version-5 file table is addressed by number: slot *i* holds `.file i`.
+///
+/// The file register a row sets and the `DW_AT_decl_file` a unit records are
+/// indexes into this table, and GAS builds it as "slot = number" in every
+/// dialect -- `as -g` on `.file 0 "d" "p.c"` / `.file 1 "a.c"` / `.loc 1 ...`
+/// resolves the row to `a.c` and keeps `p.c` in slot 0.  A table that renumbers
+/// the files one slot higher (a duplicate primary at 0 and the files after it)
+/// stays self-consistent for the rows it writes itself, but it rewrites the
+/// meaning of every `DW_AT_decl_file` an *input* unit already carries.  Measured
+/// on `gcc -gdwarf-5 -S` assembly of a unit that includes a header --
+/// `.file 0 "dir" "t.c"`, `.file 1 "h.h"`, `.file 2 "t.c"`, with the inlined
+/// helper recorded as `DW_AT_decl_file 1`: the renumbered table resolved that to
+/// `t.c`, GAS and this table to `h.h`.
+///
+/// Slot 0 is the primary file: `.file 0` itself when the input declares one
+/// (GCC does), and otherwise a repeat of the first declared file -- GCC's own
+/// tables repeat the unit's file there, and the default file register 1 has to
+/// name something.
+fn version_5_file_slots<'a>(tables: &LineTables<'a>) -> Vec<(u64, &'a str)> {
+    let Some(&primary) = tables.files.first() else {
+        return Vec::new();
+    };
+    if tables.primary_is_zero {
+        // `.file 0` is the primary, so the list already starts at slot 0.
+        return tables.files.clone();
+    }
+    // Slot 0 repeats the first file and the files follow it, so slot *i* is
+    // `.file i` here too.
+    let mut slots = Vec::with_capacity(tables.files.len() + 1);
+    slots.push(primary);
+    slots.extend(tables.files.iter().copied());
+    slots
 }
 
 /// The fixed fields of a line-program prologue, up to but not including the
@@ -698,18 +762,18 @@ fn append_line_prologue_tables(
             let offset = line_strings.intern(directory)?;
             push_strp(unit, &mut relocs, 0, abs32, ".debug_line_str", offset);
         }
-        // File name table: `DW_LNCT_directory_index` then `DW_LNCT_path`. Entry
-        // 0 repeats the first file, because the line-program file register
-        // starts at 1: index *i* of the table is file *i*, and nothing may fall
-        // off the front.
+        // File name table: `DW_LNCT_directory_index` then `DW_LNCT_path`, one
+        // entry per file with entry *i* being `.file i` (see
+        // [`version_5_file_slots`] for why the numbering is the index).
         unit.push(2); // file_name_entry_format_count
         write_uleb128(DW_LNCT_DIRECTORY_INDEX, unit);
         write_uleb128(DW_FORM_UDATA, unit);
         write_uleb128(DW_LNCT_PATH, unit);
         write_uleb128(DW_FORM_LINE_STRP, unit);
-        write_uleb128(tables.files.len() as u64 + 1, unit);
-        for (index, base) in std::iter::once(&tables.files[0]).chain(tables.files.iter()) {
-            write_uleb128(*index, unit);
+        let slots = version_5_file_slots(tables);
+        write_uleb128(slots.len() as u64, unit);
+        for (index, base) in slots {
+            write_uleb128(index, unit);
             let offset = line_strings.intern(base)?;
             push_strp(unit, &mut relocs, 0, abs32, ".debug_line_str", offset);
         }
@@ -772,11 +836,23 @@ pub(crate) fn build_dwarf_line_section(
     }
 
     let file_table = debug_file_table(files)?;
+    // Version 5 addresses its file table by number: slot 0 is the primary file,
+    // slot *i* is `.file i`.  Versions 2..4 number their entries from 1, so the
+    // register is the entry's position in that table -- which the contiguity
+    // rule in [`debug_file_table`] makes equal to the number as well.
+    let five = config.version >= 5;
     let file_index = |number: u32| -> Option<u64> {
-        file_table
+        if five && number == 0 {
+            return Some(0); // the primary file, always slot 0
+        }
+        let position = file_table
             .iter()
-            .position(|(candidate, _)| *candidate == number)
-            .map(|i| i as u64 + 1)
+            .position(|(candidate, _)| *candidate == number)?;
+        Some(if five {
+            u64::from(number)
+        } else {
+            position as u64 + 1
+        })
     };
 
     // GAS carries is_stmt and ISA across section switches. Resolve those
@@ -1197,6 +1273,52 @@ fn declare_unit_abbrevs(
     subprogram_code
 }
 
+/// The code sections a unit describes, in section order.
+///
+/// That is every section its line program has a sequence for, plus every
+/// section that holds a sized function symbol without a row: a function that
+/// optimization folded to nothing still has an address a debugger may search
+/// for, and a range list has to cover every address the unit's DIEs name.
+/// A section neither list names is not this unit's code.  One pass over the
+/// section table and one over the symbols; a name that does not resolve is a
+/// writer bug, not input, because both lists are built from this same table.
+///
+/// Returns the coverage as a bitmap indexed by section (the subprogram walk
+/// asks it again) and the covered sections in section order (the unit's address
+/// map walks those).
+fn covered_code_sections<'a, 's>(
+    sections: &'s [DwarfSectionInfo<'a>],
+    code_sections: &[usize],
+    functions: &[DwarfFunction<'a>],
+) -> Result<(Vec<bool>, Vec<&'s DwarfSectionInfo<'a>>), String> {
+    let mut covered = vec![false; sections.len()];
+    for &index in code_sections {
+        let slot = covered
+            .get_mut(index)
+            .ok_or_else(|| format!("internal: DWARF line build names missing section {index}"))?;
+        *slot = true;
+    }
+    for function in functions {
+        if function.size == 0 {
+            continue;
+        }
+        let slot = covered.get_mut(function.section_index).ok_or_else(|| {
+            format!(
+                "internal: DWARF function '{}' names missing section {}",
+                function.name, function.section_index
+            )
+        })?;
+        *slot = true;
+    }
+    let listed: Vec<&DwarfSectionInfo<'a>> = covered
+        .iter()
+        .enumerate()
+        .filter(|&(_, inside)| *inside)
+        .map(|(index, _)| &sections[index])
+        .collect();
+    Ok((covered, listed))
+}
+
 /// Build `.debug_info` and `.debug_abbrev` for the line programs `units`.
 ///
 /// Each unit gets one `DW_TAG_compile_unit` spanning its code section, with a
@@ -1292,39 +1414,18 @@ pub(crate) fn build_dwarf_info_sections(
         if row_offset >= end || line == 0 || file_number == 0 {
             return None;
         }
-        let file = file_table.iter().position(|(n, _)| *n == file_number)? + 1;
-        Some((file as u64, u64::from(line)))
+        // The same numbering the line program uses (see `file_index`): the
+        // number itself for version 5, the 1-based slot before it.
+        let position = file_table.iter().position(|(n, _)| *n == file_number)?;
+        let file = if config.version >= 5 {
+            u64::from(file_number)
+        } else {
+            position as u64 + 1
+        };
+        Some((file, u64::from(line)))
     };
 
-    // Every code section the unit describes: the ones the line program has
-    // sequences for, plus any that hold a sized function symbol but no row.
-    // A range list has to cover every address the unit's DIEs name, and the
-    // walk is one pass over the section table and one over the symbols.
-    let mut covered = vec![false; sections.len()];
-    for &index in code_sections {
-        let slot = covered
-            .get_mut(index)
-            .ok_or_else(|| format!("internal: DWARF line build names missing section {index}"))?;
-        *slot = true;
-    }
-    for function in functions {
-        if function.size == 0 {
-            continue;
-        }
-        let slot = covered.get_mut(function.section_index).ok_or_else(|| {
-            format!(
-                "internal: DWARF function '{}' names missing section {}",
-                function.name, function.section_index
-            )
-        })?;
-        *slot = true;
-    }
-    let code: Vec<&DwarfSectionInfo<'_>> = covered
-        .iter()
-        .enumerate()
-        .filter(|&(_, inside)| *inside)
-        .map(|(index, _)| &sections[index])
-        .collect();
+    let (covered, code) = covered_code_sections(sections, code_sections, functions)?;
     let Some(first) = code.first() else {
         return Ok(None);
     };

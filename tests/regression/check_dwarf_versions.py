@@ -718,6 +718,110 @@ def check_gas_assembly_input(
     )
 
 
+def file_table_entries(readelf: str, path: Path) -> list[str]:
+    """The file names of the line program's file table, in slot order.
+
+    readelf prints one row per file: ``N``, the directory index, then either the
+    inline ``time``/``size``/name of versions 2..4 or a ``DW_FORM_line_strp``
+    reference for version 5.  The name is the last tab-separated field either
+    way, and the reference is spelled out as ``(indirect line string, ...): x``.
+    """
+    entries: list[str] = []
+    in_table = False
+    for line in readelf_dump(readelf, path, "--debug-dump=rawline").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("The File Name Table"):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if not stripped:
+            break
+        if stripped.startswith("Entry") or "\t" not in line:
+            continue
+        name = line.split("\t")[-1].strip()
+        if name.startswith("(indirect"):
+            _, _, name = name.partition("): ")
+        entries.append(name)
+    return entries
+
+
+def check_file_table_numbering(
+    directory: Path, lccc: str, gcc: str, readelf: str, addr2line: str, nm: str
+) -> None:
+    """The file table is addressed by number, and an input unit depends on that.
+
+    A `DW_AT_decl_file` records an *index into the line program's file table*,
+    so the table lccc writes has to number its files exactly the way the
+    assembler that produced the unit did.  GCC's version-5 assembly declares
+    `.file 0 "dir" "t.c"` as well as `.file 1 "h.h"`, and the inlined helper
+    from the header is recorded as `DW_AT_decl_file 1`: a table that keeps an
+    extra entry in front of the files resolves that declaration to `t.c`.
+
+    GNU as is the oracle: the same assembly assembled by `as` must yield the same
+    names in the same slots, and the objects must agree on every recorded file
+    number.  `addr2line` then has to name the header for the inlined code.
+    """
+    header = directory / "decl.h"
+    header.write_text(
+        "static inline int helper_fn(int value)\n"
+        "{\n"
+        "    return value + 7;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    source = directory / "decl.c"
+    source.write_text(
+        '#include "decl.h"\nint caller(void)\n{\n    return helper_fn(3);\n}\n',
+        encoding="utf-8",
+    )
+    for version in (2, 3, 4, 5):
+        label = f"file table v{version}"
+        assembly = directory / f"decl-{version}.s"
+        run_ok(
+            [gcc, "-g", f"-gdwarf-{version}", "-O0", "-S", str(source), "-o", str(assembly)]
+        )
+        ours = directory / f"decl-{version}-lccc.o"
+        reference = directory / f"decl-{version}-as.o"
+        run_ok([lccc, "-c", str(assembly), "-o", str(ours)])
+        run_ok([resolve_command("as"), "--64", "-g", f"-gdwarf-{version}",
+                "-o", str(reference), str(assembly)])
+        entries = file_table_entries(readelf, ours)
+        expected = file_table_entries(readelf, reference)
+        require(expected.count("decl.h") >= 1, f"{label}: the oracle lost the header")
+        require(
+            entries == expected,
+            f"{label}: file table is {entries}, GNU as numbers it {expected}",
+        )
+        ours_dump = require_clean_readelf(readelf, ours, label)
+        reference_dump = require_clean_readelf(readelf, reference, label)
+        recorded = sorted(set(re.findall(r"DW_AT_decl_file\s*:\s*(\d+)", ours_dump)))
+        expected_recorded = sorted(
+            set(re.findall(r"DW_AT_decl_file\s*:\s*(\d+)", reference_dump))
+        )
+        require(
+            recorded == expected_recorded,
+            f"{label}: declarations record file numbers {recorded}, the oracle "
+            f"{expected_recorded}",
+        )
+        # The header's inline body lives in the header, and a consumer has to
+        # say so: this is the assertion a shifted table cannot pass.
+        image = directory / f"decl-{version}.elf"
+        run_ok([lccc, "-nostartfiles", "-o", str(image), str(ours)])
+        addresses = symbol_addresses(nm, image)
+        require("caller" in addresses, f"{label}: caller missing from the link")
+        found, resolved, _line = addr2line_resolve(addr2line, image, addresses["caller"])
+        require(found == "caller", f"{label}: addr2line named {found!r}")
+        require(
+            Path(resolved).name in ("decl.c", "decl.h"),
+            f"{label}: caller resolves to {resolved}",
+        )
+    print(
+        "PASS file table numbering: every dialect numbers its files exactly as "
+        "GNU as does, so an input unit's DW_AT_decl_file keeps its meaning"
+    )
+
+
 def link_image(
     compiler: str, source: Path, output: Path, version: int | None, extra: list[str]
 ) -> None:
@@ -873,6 +977,10 @@ def main() -> int:
                 "PASS multi-object links: both translation units resolve at every "
                 "version (string tables are relocated, not baked in)"
             )
+
+            # The file table is addressed by number; an input unit's
+            # `DW_AT_decl_file` is only meaningful if that numbering is GAS's.
+            check_file_table_numbering(directory, lccc, gcc, readelf, addr2line, nm)
 
             # GCC's own assembly input: the sections it declares are continued,
             # not replaced or duplicated, and its units still resolve.
