@@ -27,8 +27,13 @@ def parse_run_ids(text):
     return ids
 
 
-def gh(path, payload=None):
+def gh(path, payload=None, *, allow_binary=False):
     args = ['gh', 'api', path]
+    if allow_binary:
+        # Logs may contain ANSI escapes, and ZIP bytes are arbitrary. These
+        # responses are captured, compressed and blob-exported, NEVER displayed
+        # on a terminal. Keep gh's default protection for normal JSON requests.
+        args.append('--allow-escape-sequences')
     if payload is not None:
         args += ['--method', 'POST', '--input', '-']
     try:
@@ -101,13 +106,13 @@ def main():
         for job in pages('jobs', 'jobs'):
             if job['conclusion'] != 'failure':
                 continue
-            data = gh(f'repos/{repo}/actions/jobs/{int(job["id"])}/logs')
+            data = gh(f'repos/{repo}/actions/jobs/{int(job["id"])}/logs', allow_binary=True)
             manifest += export_file(repo, f'run{run_id}-job{job["id"]}.log.gz',
                                     gzip.compress(data, mtime=0))
         for artifact in pages('artifacts', 'artifacts'):
             if artifact['expired'] or not artifact['name'].startswith('kernel-61858-'):
                 continue
-            data = gh(f'repos/{repo}/actions/artifacts/{int(artifact["id"])}/zip')
+            data = gh(f'repos/{repo}/actions/artifacts/{int(artifact["id"])}/zip', allow_binary=True)
             manifest += export_file(repo, f'run{run_id}-artifact{artifact["id"]}.zip', data)
         for offset in range(0, len(manifest), 12):
             text = '\n'.join(manifest[offset:offset+12])

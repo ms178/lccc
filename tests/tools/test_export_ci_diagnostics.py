@@ -1,4 +1,5 @@
 import hashlib
+import gzip
 import io
 import subprocess
 import importlib.util
@@ -49,6 +50,46 @@ class TransportTests(unittest.TestCase):
                 transport.run_cli()
         self.assertIn('::error title=CI diagnostic transport failed::bad%25%0Aline%0D',
                       output.getvalue())
+
+    def test_binary_opt_in_preserves_bytes_without_terminal_output(self):
+        raw = b'PK\x03\x04\x1b[31m\x00\xff'
+        result = subprocess.CompletedProcess([], 0, stdout=raw)
+        for binary in (False, True):
+            with self.subTest(binary=binary), \
+                    patch.object(transport.subprocess, 'run', return_value=result) as run:
+                self.assertEqual(transport.gh('endpoint', allow_binary=binary), raw)
+                self.assertEqual('--allow-escape-sequences' in run.call_args.args[0], binary)
+                self.assertIs(run.call_args.kwargs['capture_output'], True)
+
+    def test_only_evidence_downloads_opt_in_to_binary(self):
+        log = b'compiler: \x1b[31merror\x1b[0m\n'
+        archive = b'PK\x03\x04\x1b\x00\xff'
+        def api(path, payload=None, *, allow_binary=False):
+            if path.endswith('/logs'):
+                self.assertTrue(allow_binary)
+                return log
+            if path.endswith('/zip'):
+                self.assertTrue(allow_binary)
+                return archive
+            self.assertFalse(allow_binary)
+            if '/jobs?' in path:
+                result = {'jobs': [{'id': 7, 'conclusion': 'failure'}]}
+            elif '/artifacts?' in path:
+                result = {'artifacts': [{'id': 8, 'expired': False,
+                                        'name': 'kernel-61858-test'}]}
+            else:
+                result = {'repository': {'full_name': 'a/b'}, 'status': 'completed',
+                          'head_sha': 'abc', 'conclusion': 'failure'}
+            return json.dumps(result).encode()
+        output = io.StringIO()
+        with patch.dict(transport.os.environ, {'GITHUB_REPOSITORY': 'a/b', 'SOURCE_RUN_IDS': '42'}), \
+                patch.object(transport, 'gh', api), \
+                patch.object(transport, 'export_file', return_value=[]) as export, \
+                patch('sys.stdout', output):
+            transport.main()
+        self.assertEqual(gzip.decompress(export.call_args_list[0].args[2]), log)
+        self.assertEqual(export.call_args_list[1].args[2], archive)
+        self.assertNotIn('\x1b', output.getvalue())
 
     def test_ids(self):
         self.assertEqual(transport.parse_run_ids('1,42'), [1, 42])
