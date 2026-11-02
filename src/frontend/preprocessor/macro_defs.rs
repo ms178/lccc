@@ -297,18 +297,45 @@ const BUILTIN_NAMES: [&str; 8] = [
     "__TIMESTAMP__",
 ];
 
+/// Bit `i` is set when `BUILTIN_NAMES[i]` is exactly this many bytes long.
+///
+/// A name whose length has no bits set cannot be a builtin, so the scan below is
+/// skipped after one indexed load -- which is what keeps the ownership bookkeeping
+/// free on the `#define` path, where every macro in the translation unit passes
+/// through here. It is derived from `BUILTIN_NAMES` at compile time, so the two
+/// cannot drift; the assert fails the build, not the run, if a longer name is
+/// ever added.
+const BUILTIN_LEN_MASKS: [u8; 24] = {
+    let mut masks = [0u8; 24];
+    let mut index = 0;
+    while index < BUILTIN_NAMES.len() {
+        let len = BUILTIN_NAMES[index].len();
+        assert!(
+            len < masks.len(),
+            "raise BUILTIN_LEN_MASKS for the new builtin"
+        );
+        masks[len] |= 1 << index;
+        index += 1;
+    }
+    masks
+};
+
 /// Bit for `name` in the ownership masks, or `None` for an ordinary macro.
+///
+/// Only names that share a length with a builtin are compared at all, and those
+/// share it with at most two of them, so the cost is one array load for the
+/// macros this is called on and at most two `memcmp`s for the odd lookalike.
 #[inline]
 fn builtin_bit(name: &str) -> Option<u8> {
-    // A length check rejects every non-builtin in one comparison, so this costs
-    // the same as the `matches!` it replaces on the hot path.
-    match name.len() {
-        6..=17 => BUILTIN_NAMES
-            .iter()
-            .position(|candidate| *candidate == name)
-            .map(|index| 1u8 << index),
-        _ => None,
+    let mut pending = *BUILTIN_LEN_MASKS.get(name.len())?;
+    while pending != 0 {
+        let index = pending.trailing_zeros() as usize;
+        pending &= pending - 1;
+        if name.as_bytes() == BUILTIN_NAMES[index].as_bytes() {
+            return Some(1 << index);
+        }
     }
+    None
 }
 
 impl MacroTable {
@@ -920,83 +947,90 @@ impl MacroTable {
             return i;
         }
 
-        // Handle _Pragma("string") operator (C99 §6.10.9): queue the
-        // de-escaped string content as a pragma for the pipeline to execute
-        // (`_Pragma("foo")` is equivalent to `#pragma foo`).
-        if ident == "_Pragma" {
-            return self.handle_pragma_operator(bytes, i, ident, result, expanding);
-        }
+        // Every name handled below begins with an underscore: `_Pragma`, the
+        // four dynamic builtins and GCC's `__builtin_LINE` family. One byte
+        // test therefore rules out the overwhelmingly common case -- an
+        // ordinary identifier -- before any of the name comparisons run, so
+        // adding a builtin here costs tokens that are not builtins nothing.
+        if bytes[start] == b'_' {
+            // Handle _Pragma("string") operator (C99 §6.10.9): queue the
+            // de-escaped string content as a pragma for the pipeline to execute
+            // (`_Pragma("foo")` is equivalent to `#pragma foo`).
+            if ident == "_Pragma" {
+                return self.handle_pragma_operator(bytes, i, ident, result, expanding);
+            }
 
-        // Handle __COUNTER__ built-in. `builtin_expands` is what makes
-        // `#undef __COUNTER__` and a user `#define __COUNTER__` behave: the
-        // builtin value applies only while the name is still the compiler's.
-        if ident == "__COUNTER__" && self.builtin_expands(ident) {
-            let val = self.counter.get();
-            self.counter.set(val + 1);
-            let mut buf = itoa::Buffer::new();
-            result.push_str(buf.format(val));
-            return i;
-        }
+            // Handle __COUNTER__ built-in. `builtin_expands` is what makes
+            // `#undef __COUNTER__` and a user `#define __COUNTER__` behave: the
+            // builtin value applies only while the name is still the compiler's.
+            if ident == "__COUNTER__" && self.builtin_expands(ident) {
+                let val = self.counter.get();
+                self.counter.set(val + 1);
+                let mut buf = itoa::Buffer::new();
+                result.push_str(buf.format(val));
+                return i;
+            }
 
-        // `__INCLUDE_LEVEL__` and `__TIMESTAMP__` are produced here for the same
-        // reason as `__LINE__`: the value depends on which file is being
-        // preprocessed, and it must be read at the *use site* (an alias macro
-        // must report the expander's file, not the file that wrote the body).
-        if ident == "__INCLUDE_LEVEL__" && self.builtin_expands(ident) {
-            result.push_str(&self.include_level_body());
-            return i;
-        }
-        if ident == "__TIMESTAMP__" && self.builtin_expands(ident) {
-            result.push_str(&self.timestamp_body());
-            return i;
-        }
+            // `__INCLUDE_LEVEL__` and `__TIMESTAMP__` are produced here for the same
+            // reason as `__LINE__`: the value depends on which file is being
+            // preprocessed, and it must be read at the *use site* (an alias macro
+            // must report the expander's file, not the file that wrote the body).
+            if ident == "__INCLUDE_LEVEL__" && self.builtin_expands(ident) {
+                result.push_str(&self.include_level_body());
+                return i;
+            }
+            if ident == "__TIMESTAMP__" && self.builtin_expands(ident) {
+                result.push_str(&self.timestamp_body());
+                return i;
+            }
 
-        // Handle __LINE__ built-in: inside a macro expansion the value is
-        // pinned to the invocation line; at top level it is the physical
-        // line of this very token (per-offset resolution).
-        if ident == "__LINE__" && self.builtin_expands(ident) {
-            let val = match self.line_pinned.get() {
-                Some(v) => v,
-                None => self.resolve_line(start),
-            };
-            let mut buf = itoa::Buffer::new();
-            result.push_str(buf.format(val));
-            return i;
-        }
+            // Handle __LINE__ built-in: inside a macro expansion the value is
+            // pinned to the invocation line; at top level it is the physical
+            // line of this very token (per-offset resolution).
+            if ident == "__LINE__" && self.builtin_expands(ident) {
+                let val = match self.line_pinned.get() {
+                    Some(v) => v,
+                    None => self.resolve_line(start),
+                };
+                let mut buf = itoa::Buffer::new();
+                result.push_str(buf.format(val));
+                return i;
+            }
 
-        // GCC's source-location builtins, `__builtin_LINE()`,
-        // `__builtin_FILE()` and `__builtin_FUNCTION()`: the line (pinned to
-        // the invocation inside a macro, like `__LINE__`), the presumed file
-        // name (`#line` applies, like `__FILE__`) and the enclosing
-        // function's name (`""` at file scope), as an `int` constant and two
-        // `const char *` (GCC 16.2: `static int a[__builtin_LINE()];` is
-        // valid, `sizeof __builtin_FILE()` is a pointer's size).
-        if matches!(
-            ident,
-            "__builtin_LINE" | "__builtin_FILE" | "__builtin_FUNCTION"
-        ) && !self.macros.contains_key(ident)
-        {
-            if let Some(after) = empty_call_parens(bytes, i) {
-                match ident {
-                    "__builtin_LINE" => {
-                        let val = match self.line_pinned.get() {
-                            Some(v) => v,
-                            None => self.resolve_line(start),
-                        };
-                        let mut buf = itoa::Buffer::new();
-                        result.push_str(buf.format(val));
-                    }
-                    "__builtin_FILE" => {
-                        result.push_str("((const char *)");
-                        match self.macros.get("__FILE__") {
-                            Some(file) => result.push_str(&file.body),
-                            None => result.push_str("\"\""),
+            // GCC's source-location builtins, `__builtin_LINE()`,
+            // `__builtin_FILE()` and `__builtin_FUNCTION()`: the line (pinned to
+            // the invocation inside a macro, like `__LINE__`), the presumed file
+            // name (`#line` applies, like `__FILE__`) and the enclosing
+            // function's name (`""` at file scope), as an `int` constant and two
+            // `const char *` (GCC 16.2: `static int a[__builtin_LINE()];` is
+            // valid, `sizeof __builtin_FILE()` is a pointer's size).
+            if matches!(
+                ident,
+                "__builtin_LINE" | "__builtin_FILE" | "__builtin_FUNCTION"
+            ) && !self.macros.contains_key(ident)
+            {
+                if let Some(after) = empty_call_parens(bytes, i) {
+                    match ident {
+                        "__builtin_LINE" => {
+                            let val = match self.line_pinned.get() {
+                                Some(v) => v,
+                                None => self.resolve_line(start),
+                            };
+                            let mut buf = itoa::Buffer::new();
+                            result.push_str(buf.format(val));
                         }
-                        result.push(')');
+                        "__builtin_FILE" => {
+                            result.push_str("((const char *)");
+                            match self.macros.get("__FILE__") {
+                                Some(file) => result.push_str(&file.body),
+                                None => result.push_str("\"\""),
+                            }
+                            result.push(')');
+                        }
+                        _ => result.push_str("((const char *)__FUNCTION__)"),
                     }
-                    _ => result.push_str("((const char *)__FUNCTION__)"),
+                    return after;
                 }
-                return after;
             }
         }
 
