@@ -774,6 +774,70 @@ compare with a constant should look like. The one file the sweep times out on,
 operators), is a pre-existing compile-time outlier, not a regression: 81.9 s
 with the rule and 80.7 s with `CCC_SIMPLIFY_SKIP=cmprange`, i.e. 1.2 s of 81.
 
+### 17. The unsigned reading of a sign extension is two halves — `cmprange`
+
+§16's one refusal was `keep_schar_ult`:
+
+```c
+int f(int x) { return (unsigned)(signed char)x < 300; }
+```
+
+The unsigned reading of `[-128, 127]` is `[0, 127] u [0xffffff80, 0xffffffff]`,
+which is not an interval, so the interval rule said nothing and LCCC kept
+`movsbl; xorl; cmpl $300; setb` (5 instructions) while GCC 16.2 emitted
+`movsbl; notl; shrl $31` (4) and Clang 23.1.4 the same.
+
+A constant *between the halves* makes the question the sign bit.  Write
+`U = 2^width`, `lo' = 2^(w-1)`; the negative half is `[U - lo', U - 1]`.  Each
+half is monotone under a comparison ordering, so its extreme settles it, and
+"both halves settled, in opposite directions" is a sign test:
+
+| predicate | non-negative half `[0, hi]` | negative half `[U-lo', U-1]` | rewritten to |
+| --- | --- | --- | --- |
+| `<u C` | all true when `hi < C` | all false when `C <= U-lo'` | `v >=s 0` |
+| `<=u C` | all true when `hi <= C` | all false when `C < U-lo'` | `v >=s 0` |
+| `>=u C` | all false when `hi < C` | all true when `C <= U-lo'` | `v <s 0` |
+| `>u C` | all false when `hi <= C` | all true when `C < U-lo'` | `v <s 0` |
+
+The strictness differs by predicate, and that is not decoration: with `<=u C`
+reading the negative half's first member as still "settled false" at
+`C == U - lo'`, `(unsigned)(signed char)-128 <= 0xffffff80` answers false where
+C says true -- a miscompile at exactly one value per source width.  The
+whole-domain unit test (`cross_domain_sign_tests_agree_with_the_whole_domain`,
+every value of the 8- and 16-bit domains, a prime stride over the 32-bit one,
+both readings of every constant) caught it; the C battery did not, because its
+boundary probe used `<= 300` rather than the boundary itself, and now uses both.
+
+The rewrite pays twice.  It is a sign test, so `narrow_cast_cmp` takes it to the
+source's own width once the extension's only reader is this compare -- the
+`casts_dying_under_narrowing` census had to learn that a cross-domain reader is
+a narrowing reader, or the extension stayed live and the compare stayed wide.
+And the sign test is what the backends select best: `testb`/`setns` on a byte.
+
+| probe (`-O2`) | LCCC before | LCCC now | GCC 16.2 | Clang 23.1.4 | AArch64 | RISC-V |
+| --- | --- | --- | --- | --- | --- | --- |
+| `(unsigned)(signed char)x < 300` | 5 | **4** | 4 | 4 | 12 -> **12** | 16 -> **16** |
+| `(unsigned)(signed char)x >= 300` | 5 | **3** | 3 | 3 | 12 -> **12** | 16 -> **15** |
+| `(unsigned)(short)x >= 70000` | 5 | **3** | 3 | 3 | 15 -> **13** | 17 -> **15** |
+| `(unsigned long long)(int)x >= 2^64-2^31` | 5 | **3** | 3 | 3 | 14 -> **12** | 11 -> **9** |
+
+AArch64 kept its instruction count on the byte shapes only after the narrow
+compare learned to take its constant as an immediate (`cmp w1, #imm` / `cmn w1,
+#imm` instead of materializing the constant through `x0` and extending it
+again): the same rule had made a byte compare two instructions *longer* there,
+which the per-backend length check in `check_cross_domain_sext_cmp.sh` is there
+to catch.  That immediate path is a win for every narrow compare against a
+constant, not only for this rewrite.
+
+What this does *not* do: a constant inside the non-negative half (`<u 5` on a
+byte, `<u 300` on a short) still needs the compare.  The oracles narrow it to a
+byte compare (`cmpb $4, %dil; setb`) by reading the low bits unsigned, which
+LCCC's IR cannot express without a zero-extending reinterpretation of a signed
+narrow value -- an unsigned compare of a signed-typed value is exactly what the
+backends' "extend per declared type" rule forbids.  So that case stays 5 vs
+GCC's 4, refused for the same reason `keep_schar_ult` refused before: a proof,
+not a guess.
+
 ## What the LLVM tracker already knows about these shapes
 
 The round started from a differential probe, and the gaps it found have
@@ -1013,6 +1077,26 @@ sweep can check whether it disappears when narrow `Neg` selection improves.
 
 ## What is not done
 
+* **The measured queue from §17's sweep** (2026-11-02, x86-64 `-O2`, `ret`
+  counted, GCC 12.2 / Clang 22.1.8 in this sandbox; the shapes are
+  `__builtin`-heavy and come from browser code -- Firefox's `mfbt/CheckedInt.h`
+  is built on `__builtin_{add,sub,mul}_overflow`, `mfbt/MathAlgorithms.h` on
+  `__builtin_{clz,ctz,popcount}`, Chromium's `base/numerics/clamped_math_impl.h`
+  on `< 0 ? -v : v`):
+  `__builtin_add_overflow` 10 vs 5 (both oracles: `add; seto` -- the IR's
+  widen-add-truncate-sext-compare shape cannot reach the flag, so this needs an
+  IR instruction that *is* a flag, and a target without flags needs the widened
+  form as a fallback: a cross-backend design, not a peephole);
+  `abs(x)` 6 vs 4 (`xor/sar/sub` where `neg; cmovs` reuses the negation's flags);
+  `if (0 == (i >> 3))` 6 vs 4 (two `ret`s instead of one `cmov`);
+  `x / 7u` 9 vs 8 (64-bit magic arithmetic where 32-bit suffices, plus a copy);
+  `ctz32`/`clz32` 3/4 vs 3/3 (LCCC defines `ctz(0)`/`clz(0)` as the width; the
+  oracles emit `rep bsf`/`bsr;xor` and leave zero undefined -- equal on ctz,
+  one worse on clz, and both are 2 where `tzcnt`/`lzcnt` exist);
+  `-x` at 8/16 bits 4 vs 3 (the narrow return convention: the upper half of a
+  narrow return is dead, LCCC extends on both sides);
+  `pop32` 17 vs 5/2 (libgcc call vs inlined SWAR vs `popcnt`, the linking
+  decision this list already describes).
 * **`(x ^ 1 << n) ^ 1 << n` as a *fold* rather than a copy** — handled at 2
   instructions (see §12), but only when the two masks are the same value. A
   spelling whose two `1u << n` are not CSE'd produces two `BitToggle`s that the

@@ -852,6 +852,27 @@ impl ArmCodegen {
                 self.operand_to_x0(lhs);
                 self.state.emit_fmt(format_args!("    {} w1, w0", ext));
             }
+            // A narrow compare against a constant needs no register for the
+            // constant: the extended value in w1 and an imm12 (or its negation,
+            // through `cmn`) are the whole compare.  Materializing the constant
+            // through x0 and extending it again cost two instructions of the
+            // six this shape used to spend.  Only the (value, const) order is
+            // folded here; an ordering predicate with the constant on the left
+            // needs a swapped condition code, which the caller owns.
+            if let Operand::Const(c) = rhs {
+                if let Some((imm, sh)) = Self::const_as_cmp_imm12(c, ty) {
+                    let suffix = if sh == 12 { ", lsl #12" } else { "" };
+                    self.state
+                        .emit_fmt(format_args!("    cmp w1, #{}{}", imm, suffix));
+                    return;
+                }
+                if let Some((imm, sh)) = Self::const_as_cmn_imm12(c, ty) {
+                    let suffix = if sh == 12 { ", lsl #12" } else { "" };
+                    self.state
+                        .emit_fmt(format_args!("    cmn w1, #{}{}", imm, suffix));
+                    return;
+                }
+            }
             if let Operand::Value(rv) = rhs {
                 if let Some((_x, w)) = self.value_reg_name(rv) {
                     self.state.emit_fmt(format_args!("    {} w0, {}", ext, w));

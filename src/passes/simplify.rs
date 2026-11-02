@@ -4033,6 +4033,104 @@ fn cmp_range_decides(op: IrCmpOp, ty: IrType, range: CmpRange, c: i64) -> Option
     (at_lo == op.eval_i128(hi, c)).then(|| i8::from(at_lo))
 }
 
+/// Whether `(unsigned)sext(x) <op> C` separates the sign-extension's two
+/// unsigned halves, so that the answer depends on `x`'s sign bit alone.
+///
+/// [`CmpRange`] is one interval, and the unsigned reading of `[-2^(w-1),
+/// 2^(w-1)-1]` is not one: it is the union `[0, 2^(w-1)-1] u [U - 2^(w-1),
+/// U - 1]`, with `U = 2^width`.  A constant between the halves decides each
+/// half on its own, and the two answers are opposite -- which is exactly a sign
+/// test:
+///
+/// | predicate | non-negative half `[0, hi]` | negative half `[U-lo', U-1]` | so |
+/// | --- | --- | --- | --- |
+/// | `<u C` | all `< C` when `hi < C` | all `>= C` when `C <= U-lo'` | `x >=s 0` |
+/// | `<=u C` | all `<= C` when `hi <= C` | all `> C` when `C < U-lo'` | `x >=s 0` |
+/// | `>=u C` | all `< C` when `hi < C` | all `>= C` when `C <= U-lo'` | `x <s 0` |
+/// | `>u C` | all `<= C` when `hi <= C` | all `> C` when `C < U-lo'` | `x <s 0` |
+///
+/// with `lo' = 2^(w-1)` the negative half's distance from `U`.  Each half is
+/// settled by its extreme, because a comparison ordering is monotone in the
+/// value; both halves are settled, so every member of the union is.
+///
+/// The rewrite is a *sign test*, not a constant: it is GCC 16.2's
+/// `notl; shrl $31` for `(unsigned)(signed char)x < 300`, and once narrowed to
+/// `x`'s own width it is `test`/`setns` on the byte -- one instruction less
+/// than GCC's three.  It is the rule `keep_schar_ult` in
+/// `evidence/2026-11-02-compare-intervals` recorded as refused.
+fn cross_domain_sign_test(
+    op: IrCmpOp,
+    ty: IrType,
+    cast: Option<&CastDef>,
+    c: i64,
+) -> Option<IrCmpOp> {
+    let cdef = cast.filter(|c| {
+        c.to_ty == ty
+            && c.from_ty.is_integer()
+            && c.from_ty.is_signed()
+            && c.from_ty.size() < ty.size()
+    })?;
+    let width = u32::try_from(ty.size()).ok()? * 8;
+    let bits = u32::try_from(cdef.from_ty.size()).ok()? * 8;
+    if width > 64 || bits == 0 || bits >= width {
+        return None;
+    }
+    // 2^width, then the two halves of the sign-extension's unsigned image.
+    let modulus = 1i128 << width;
+    let hi = (1i128 << (bits - 1)) - 1;
+    let negative_lo = modulus - (1i128 << (bits - 1));
+    // The constant as the compare reads it: the low `width` bits.
+    let c_unsigned = if width >= 64 {
+        i128::from(c as u64)
+    } else {
+        i128::from((c as u64) & ((1u64 << width) - 1))
+    };
+    match op {
+        // The non-negative half answers "true" through its highest member and
+        // the negative half "false" through its lowest: `hi < C` settles the
+        // first, `C <= U-lo'` the second.  The strictness differs per
+        // predicate -- `<=u C` is settled by `hi <= C`, `>u C` by `C < C` on
+        // the negative side -- and getting one of the four wrong is exactly a
+        // miscompile at the boundary (`(unsigned)(signed char)-128 <=
+        // 0xffffff80` is true, while the sign test would say false), which is
+        // what `cross_domain_sign_tests_agree_with_the_whole_domain` caught.
+        IrCmpOp::Ult if hi < c_unsigned && c_unsigned <= negative_lo => Some(IrCmpOp::Sge),
+        IrCmpOp::Ule if hi <= c_unsigned && c_unsigned < negative_lo => Some(IrCmpOp::Sge),
+        IrCmpOp::Uge if hi < c_unsigned && c_unsigned <= negative_lo => Some(IrCmpOp::Slt),
+        IrCmpOp::Ugt if hi <= c_unsigned && c_unsigned < negative_lo => Some(IrCmpOp::Slt),
+        _ => None,
+    }
+}
+
+/// The sign test [`cross_domain_sign_test`] proves, at the narrow width of the
+/// value's source when the cast dies (so the extension -- and its register --
+/// leaves with it) and at the compare's own width otherwise, where the compare
+/// still reads the extension the cast produces.
+fn cross_domain_sext_cmp(
+    dest: Value,
+    op: IrCmpOp,
+    ty: IrType,
+    val: Value,
+    cast: Option<&CastDef>,
+    cast_dies: bool,
+    c: i64,
+) -> Option<Instruction> {
+    let sign_op = cross_domain_sign_test(op, ty, cast, c)?;
+    let cdef = cast?;
+    let (lhs, rhs_ty) = if cast_dies {
+        (cdef.src, cdef.from_ty)
+    } else {
+        (Operand::Value(val), ty)
+    };
+    Some(Instruction::Cmp {
+        dest,
+        op: sign_op,
+        lhs,
+        rhs: Operand::Const(int_const_of_type(rhs_ty, 0)?),
+        ty: rhs_ty,
+    })
+}
+
 /// For each value, whether it is a widening cast EVERY live reader of which is
 /// a rewrite that reads the cast's narrow source instead: a compare against a
 /// constant that [`narrow_cast_cmp`] accepts, or -- when the widened-condition
@@ -4084,9 +4182,17 @@ fn casts_dying_under_narrowing(
             let Some((v, c, op)) = cmp_against_const(lhs, rhs, *op).filter(|_| cmp_live) else {
                 continue;
             };
-            let narrows = cast_of(v)
-                .zip(c.to_i64())
-                .is_some_and(|(cast, c)| narrow_cast_cmp(op, c, cast, *ty).is_some());
+            // The cross-domain rewrite is a narrowing reader only while it is
+            // enabled: with `CCC_SIMPLIFY_SKIP=cmprange` nothing rewrites that
+            // compare, and a census that still counted it would report the
+            // cast as dying while the compare kept reading it -- harmless for
+            // correctness (the gate only guards rewrites that are applied) but
+            // a lie about why the cast stays live.
+            let narrows = cast_of(v).zip(c.to_i64()).is_some_and(|(cast, c)| {
+                narrow_cast_cmp(op, c, cast, *ty).is_some()
+                    || (!simplify_skip("cmprange")
+                        && cross_domain_sign_test(op, *ty, Some(cast), c).is_some())
+            });
             if narrows {
                 narrowable[v.0 as usize] += 1;
             }
@@ -4386,32 +4492,39 @@ fn simplify_cmp(
 
     // A comparison whose operand cannot reach the constant is a constant, and
     // so is one whose operand cannot escape it: `(int)(unsigned char)c <= 255`
-    // is true, `(int)(unsigned char)c > 255` is false, `(int)(signed char)c <
-    // 128` is true.  The interval comes from the operand ([`CmpRange`]): a
-    // widening cast's source type, or the compare width's own domain, which
-    // also answers `x > INT_MAX` and `u <=u 0xffffffff`.
+    // is true, `(int)(unsigned char)c > 255` is false.  The interval comes from
+    // the operand ([`CmpRange`]): a widening cast's source type, or the compare
+    // width's own domain, which also answers `u <=u 0xffffffff`.
     //
-    // This runs BEFORE the narrowing below, and that order is the point.  A
-    // full-domain question has a constant answer, and narrowing would turn it
-    // into a compare at the narrow width that no later rule can fold on its own
-    // (`cmpb $255, %dil; setbe` for `c <= 255`): it was `range_fold_branch`'s
-    // paired-half "narrowed full-domain" case that caught the shape, where the
+    // This runs BEFORE the narrowing below: a full-domain question has a
+    // constant answer, and narrowing would turn it into a compare at the narrow
+    // width that no later rule can fold on its own (`cmpb $255, %dil; setbe`
+    // for `c <= 255`), which is `range_fold_branch`'s paired-half case -- the
     // two halves of `(zext c >= 0) && (zext c <= 255)` used to fold as a pair
     // and the single half did not.
+    //
+    // The same guards carry an unsigned question about a sign-extended value:
+    // it is a question about the sign bit ([`cross_domain_sext_cmp`]).
     if !simplify_skip("cmprange")
         && ty.size() <= 8
         && let Some(c) = const_i64
-        && let Some(range) = cmp_operand_range(
-            ty,
-            cast_defs.get(val.0 as usize).and_then(|d| d.as_ref()),
-            effective_op,
-        )
-        && let Some(answer) = cmp_range_decides(effective_op, ty, range, c)
     {
-        return Some(Instruction::Copy {
-            dest,
-            src: Operand::Const(IrConst::I8(answer)),
-        });
+        let cdef = cast_defs.get(val.0 as usize).and_then(|d| d.as_ref());
+        if let Some(range) = cmp_operand_range(ty, cdef, effective_op)
+            && let Some(answer) = cmp_range_decides(effective_op, ty, range, c)
+        {
+            return Some(Instruction::Copy {
+                dest,
+                src: Operand::Const(IrConst::I8(answer)),
+            });
+        }
+        let dies = cast_dies_if_narrowed
+            .get(val.0 as usize)
+            .copied()
+            .unwrap_or(false);
+        if let Some(test) = cross_domain_sext_cmp(dest, effective_op, ty, *val, cdef, dies, c) {
+            return Some(test);
+        }
     }
 
     if simplify_skip("cmp") {
@@ -11834,6 +11947,146 @@ mod exact_product_half_tests {
                 ),
             }
         }
+    }
+
+    /// Every decision `cross_domain_sign_test` makes is checked against the
+    /// whole source domain, not a sample: for each width, predicate and a
+    /// sweep of constants around both halves' boundaries, a `Some` iy must
+    /// agree with the original comparison on EVERY value of the narrow type.
+    ///
+    /// The model is arithmetic, in the same spirit as
+    /// `cross_domain_sext_cmp.c`: the operand is the sign-extended value read
+    /// as the compare width's bit pattern, the constant the same, and the
+    /// predicates are evaluated on those patterns with `IrCmpOp::eval_i64`.
+    /// A rule that mixed the two halves, used one half's bound for the other,
+    /// or forgot to mask the constant to the compare width fails here.
+    #[test]
+    fn cross_domain_sign_tests_agree_with_the_whole_domain() {
+        // The narrow signed source types C promotes from.
+        let sources = [
+            (IrType::I8, 8u32),
+            (IrType::I16, 16u32),
+            (IrType::I32, 32u32),
+        ];
+        let widths = [IrType::I32, IrType::U64];
+        let predicates = [
+            IrCmpOp::Ult,
+            IrCmpOp::Ule,
+            IrCmpOp::Ugt,
+            IrCmpOp::Uge,
+            IrCmpOp::Eq,
+            IrCmpOp::Ne,
+            IrCmpOp::Slt,
+            IrCmpOp::Sle,
+            IrCmpOp::Sgt,
+            IrCmpOp::Sge,
+        ];
+        let mut decided = 0usize;
+        for (from_ty, bits) in sources {
+            for ty in widths {
+                let cmp_bits = (ty.size() * 8) as u32;
+                if bits >= cmp_bits {
+                    continue;
+                }
+                // The constants worth asking about: both halves' boundaries,
+                // one step either side, and values inside each half.
+                let half = 1i128 << (bits - 1);
+                let modulus = 1i128 << cmp_bits;
+                let interesting = [
+                    0i128,
+                    1,
+                    half - 1,
+                    half,
+                    half + 1,
+                    modulus - half,
+                    modulus - half - 1,
+                    modulus - half + 1,
+                    modulus - 1,
+                    i128::from(i64::MIN),
+                ];
+                let cast = CastDef {
+                    src: Operand::Value(Value(0)),
+                    from_ty,
+                    to_ty: ty,
+                };
+                for op in predicates {
+                    for c in interesting {
+                        let sign = cross_domain_sign_test(op, ty, Some(&cast), c as i64);
+                        let Some(sign_op) = sign else { continue };
+                        decided += 1;
+                        // The two readings of a compare width's bits: the
+                        // unsigned predicates read the zero-extended pattern,
+                        // the signed ones the sign-extended one.  A model that
+                        // used one for both would "pass" a rule that mixed
+                        // them -- `-128 <u 128` is false while the same bits
+                        // as a *signed* -128 are also false, and it is the
+                        // agreement that has to be checked, not the shape.
+                        let pattern = |v: i128| -> i128 {
+                            if cmp_bits >= 64 {
+                                v
+                            } else {
+                                ((v as u128) & ((1u128 << cmp_bits) - 1)) as i128
+                            }
+                        };
+                        let unsigned_of = |v: i128| -> i64 { pattern(v) as u64 as i64 };
+                        let signed_of = |v: i128| -> i64 {
+                            if cmp_bits >= 64 {
+                                v as i64
+                            } else {
+                                let p = pattern(v) as u64;
+                                ((p << (64 - cmp_bits)) as i64) >> (64 - cmp_bits)
+                            }
+                        };
+                        // The reading belongs to the predicate being evaluated,
+                        // not to the predicate the rewrite started from: the
+                        // sign test is a *signed* question.
+                        let eval = |op: IrCmpOp, x: i128, c: i128| -> bool {
+                            if matches!(
+                                op,
+                                IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+                            ) {
+                                op.eval_i64(unsigned_of(x), unsigned_of(c))
+                            } else {
+                                op.eval_i64(signed_of(x), signed_of(c))
+                            }
+                        };
+                        // Exhaustive over the 8- and 16-bit domains; for a
+                        // 32-bit source the boundaries, the neighbourhoods of
+                        // zero and a prime stride over the whole range.
+                        let candidates: Vec<i64> = match bits {
+                            8 => (-128..=127).map(|v| v as i64).collect(),
+                            16 => (-32768..=32767).map(|v| v as i64).collect(),
+                            _ => {
+                                let mut v: Vec<i64> = (-64..64)
+                                    .chain(-(half as i64)..-(half as i64) + 64)
+                                    .chain((half as i64) - 64..half as i64)
+                                    .collect();
+                                let mut x = -(half as i64);
+                                while x < half as i64 {
+                                    v.push(x);
+                                    x += 104_729; // prime: visits every residue class
+                                }
+                                v
+                            }
+                        };
+                        for &x in &candidates {
+                            let want = eval(op, i128::from(x), c);
+                            let got = eval(sign_op, i128::from(x), 0);
+                            assert_eq!(
+                                want, got,
+                                "from={from_ty:?} ty={ty:?} {op:?} c={c} x={x}: \
+                                 the sign test answers {got}, the compare {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The sweep must reach decisions, or the assertions above prove nothing.
+        assert!(
+            decided >= 12,
+            "only {decided} cross-domain decisions in the sweep"
+        );
     }
 
     /// A widening cast is transparent only when it sign-extends: `-1` survives

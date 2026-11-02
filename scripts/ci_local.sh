@@ -2755,6 +2755,13 @@ gate "range-fold-branch" fast \
 gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
 
+# The unsigned reading of a sign extension is two halves, and a constant
+# between them is a sign test.  The gate checks the emission on every backend
+# (the rule once made an AArch64 byte compare two instructions longer, which is
+# an assertion now), the attribution and the values at five levels.
+gate "cross-domain-sext-cmp" fast \
+    bash tests/regression/check_cross_domain_sext_cmp.sh
+
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
 # need a kernel tree: executable bytes must be summed by section FLAG (the boot

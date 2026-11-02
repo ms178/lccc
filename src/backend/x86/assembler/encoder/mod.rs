@@ -47,7 +47,7 @@ pub struct Relocation {
 }
 
 // ELF x86-64 relocation types (standard constants; not all emitted by assembler yet)
-#[expect(dead_code)] // ELF standard constant, defined for reference/future use
+// ELF standard constant, defined for reference/future use.
 pub const R_X86_64_NONE: u32 = 0;
 pub const R_X86_64_64: u32 = 1;
 pub const R_X86_64_PC32: u32 = 2;
@@ -55,7 +55,9 @@ pub const R_X86_64_PC32: u32 = 2;
 /// `.quad sym - .`; the kernel's __jump_table and static_call sites rely
 /// on the full-width delta (no ±2 GiB truncation like PC32).
 pub const R_X86_64_PC64: u32 = 24;
-#[expect(dead_code)] // ELF standard constant, defined for reference/future use
+// ELF standard constant, defined for reference/future use; the crate allows
+// `dead_code`, so no per-item expectation is asserted (it would be unfulfilled
+// in any build that reads it).
 pub const R_X86_64_GOT32: u32 = 3;
 pub const R_X86_64_PLT32: u32 = 4;
 /// 16-bit PC-relative (S + A - P, 2-byte patch). The `data16` branch law

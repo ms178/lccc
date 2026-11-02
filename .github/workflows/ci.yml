@@ -2089,6 +2089,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_cmp_imm32_pattern.sh
+    - name: Verify cross-domain comparison rewrites
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_cross_domain_sext_cmp.sh
     - name: Verify basic-block SLP v6 contracts
       env:
         CCC: target/fastbuild/lccc
