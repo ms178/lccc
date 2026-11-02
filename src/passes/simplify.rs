@@ -4177,9 +4177,16 @@ fn casts_dying_under_narrowing(
             let Some((v, c, op)) = cmp_against_const(lhs, rhs, *op).filter(|_| cmp_live) else {
                 continue;
             };
+            // The cross-domain rewrite is a narrowing reader only while it is
+            // enabled: with `CCC_SIMPLIFY_SKIP=cmprange` nothing rewrites that
+            // compare, and a census that still counted it would report the
+            // cast as dying while the compare kept reading it -- harmless for
+            // correctness (the gate only guards rewrites that are applied) but
+            // a lie about why the cast stays live.
             let narrows = cast_of(v).zip(c.to_i64()).is_some_and(|(cast, c)| {
                 narrow_cast_cmp(op, c, cast, *ty).is_some()
-                    || cross_domain_sign_test(op, *ty, Some(cast), c).is_some()
+                    || (!simplify_skip("cmprange")
+                        && cross_domain_sign_test(op, *ty, Some(cast), c).is_some())
             });
             if narrows {
                 narrowable[v.0 as usize] += 1;
