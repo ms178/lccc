@@ -291,7 +291,7 @@ fn plain_source_is_left_alone() {
     // and the program must still answer exactly.
     for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
         let mut f = fixture(ty, false);
-        recognize_function(&mut f, false, 0, 0, false, false);
+        recognize_function(&mut f, false, 0, 0, false, false, true);
         assert!(
             f.blocks[0].instructions.iter().any(|i| matches!(
                 i,
@@ -330,7 +330,7 @@ fn lowest_set_bit_matches_reference_for_complemented_source() {
     for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
         let mut f = fixture(ty, true);
         assert!(
-            recognize_function(&mut f, false, 0, 0, false, false) > 0,
+            recognize_function(&mut f, false, 0, 0, false, false, true) > 0,
             "{ty:?}: 1 << Ctz(~x) was not rewritten"
         );
         // The complement identity is only sound if `-~x` really became
@@ -411,11 +411,11 @@ fn zero_operand_yields_one_not_zero() {
     // regression cannot hide inside the sweep.
     for ty in [IrType::U32, IrType::U64] {
         let mut f = fixture(ty, false);
-        recognize_function(&mut f, false, 0, 0, false, false);
+        recognize_function(&mut f, false, 0, 0, false, false, true);
         assert_eq!(evaluate(&f, 0), 1, "{ty:?}: 1 << Ctz(0) must be 1");
         let bits = ty.size() as u32 * 8;
         let mut f = fixture(ty, true);
-        recognize_function(&mut f, false, 0, 0, false, false);
+        recognize_function(&mut f, false, 0, 0, false, false, true);
         let all_ones = if bits == 64 {
             u64::MAX
         } else {
@@ -433,7 +433,7 @@ fn zero_operand_yields_one_not_zero() {
 fn mismatched_count_width_is_not_rewritten() {
     let mut f = width_mismatch_fixture();
     assert_eq!(
-        recognize_function(&mut f, false, 0, 0, false, false),
+        recognize_function(&mut f, false, 0, 0, false, false, true),
         0,
         "a 32-bit count feeding a 64-bit shift must not become `y & -y`"
     );

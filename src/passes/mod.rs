@@ -3148,6 +3148,7 @@ pub(crate) fn run_passes(
                             min_rotate_bits,
                             has_scalar_andn,
                             native_bswap,
+                            false,
                         )
                     })
                 )
@@ -3445,6 +3446,7 @@ pub(crate) fn run_passes(
                         min_rotate_bits,
                         has_scalar_andn,
                         native_bswap,
+                        true,
                     )
                 })
             );

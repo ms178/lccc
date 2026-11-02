@@ -1,0 +1,19 @@
+function        before   after   gcc  clang
+-------------------------------------------
+from_cmp             5       4     4      4
+from_cmp_neg         5       4     4      4
+from_lt              5       4     4      4
+from_lt_neg          5       4     4      4
+zero_or_one          5       4     4      4
+one_or_zero          5       4     4      4
+mask_of_sign         5       4     4      4
+zero_or_one64        5       4     4      4
+or_or                9       4     4      4
+and_eq               9       4     4      4
+or3                 13       5     5      5
+keep_and_ne          9       9     7      7
+keep_or_eq           9       9     7      7
+keep_xor             9       9     7      7
+keep_three_two       5       5     4      4
+keep_one_two         5       5     4      4
+keep_shared          9       9     7      7

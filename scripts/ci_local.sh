@@ -1920,6 +1920,15 @@ gate "compare-dominance-fold" fast \
 gate "bit-select-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_bit_select_fold.sh
 
+# `c ? 1 : 0` is `c != 0` and `c ? 0 : 1` is `c == 0` (5 -> 4), and
+# `(a != 0) | (b != 0)` is `(a | b) != 0` (9 -> 4).  Pins the folded shapes
+# and their missing `cmov`, the refusals, the CCC_NO_PREDICATE_MATERIALIZE
+# ownership, the i686/AArch64/RISC-V lengths, -O0..-O3 agreement against GCC,
+# and the vectorizer's mask store (a stored comparison is 0/1, a stored lane
+# mask is 0/-1).
+gate "predicate-materialize" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_predicate_materialize.sh
+
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
 # so by mutation (reintroducing the guard deletion in licm.rs):
@@ -2731,6 +2740,14 @@ gate "const-array-promote" fast \
 # sub+unsigned compare and the adversarial rejections.
 gate "range-fold-branch" fast \
     bash tests/regression/check_range_fold_branch.sh
+
+# A 32-bit compare against a constant whose top bit is set encodes as an imm32
+# bit pattern (`cmpl $-1` for 4294967295, `$-1640531535` for the golden-ratio
+# hash constant); staging it through a register is one instruction more than
+# GCC and Clang spend, and it is invisible in a semantics test.  The 64-bit
+# controls in the same gate keep the sign-extended rule honest.
+gate "cmp-imm32-pattern" fast \
+    bash tests/regression/check_cmp_imm32_pattern.sh
 
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
