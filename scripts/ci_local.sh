@@ -261,6 +261,14 @@ gate "frontend-differential-family" fast \
     env CCC="$LCCC" bash tests/regression/check_frontend_differential.sh
 gate "frontend-promotion-sweep" fast \
     python3 tests/regression/check_frontend_promotion_sweep.py --lccc "$LCCC"
+gate "frontend-preprocessor-builtins" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" CLANG="${CLANG23:-clang-23}" \
+    bash tests/regression/check_preprocessor_builtin_scope.sh
+gate "conditional-carrier-families" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_conditional_carrier.sh
+gate "host-time-zones" fast \
+    python3 tests/regression/check_host_time_zones.py "$LCCC"
 gate "asm-flag-outputs" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \

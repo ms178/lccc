@@ -7927,6 +7927,103 @@ mod tests {
 
     // === Cast tests ===
 
+    // === negcast: `trunc32(neg64(ext64(v)))` => `neg32(v)` ===
+    //
+    // The rule has no producer in the C frontend today (measured: disabling it
+    // changes none of the 761 corpus files that compile standalone, and
+    // `check_narrow_negate_fold.sh` pins that agreement), so the corpus cannot
+    // keep it honest. These two tests can: they build the shape at the IR level
+    // and require the fold to fire on it, and require it to refuse the two width
+    // pairs whose measurement showed a pessimisation.
+
+    /// Build `dest = Cast(Neg(Cast(v0, I32 -> I64)), I64 -> dest_ty)` and run the
+    /// simplifier over the outer cast.
+    fn negcast_shape(dest_ty: IrType, inner_ty: IrType) -> Option<Instruction> {
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 4];
+        cast_defs[1] = Some(CastDef {
+            src: Operand::Value(Value(0)),
+            from_ty: IrType::I32,
+            to_ty: inner_ty,
+        });
+        let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
+        let inst = Instruction::Cast {
+            dest: Value(3),
+            src: Operand::Value(Value(2)),
+            from_ty: inner_ty,
+            to_ty: dest_ty,
+        };
+        try_simplify_with_types(
+            &inst,
+            &cast_defs,
+            &[],
+            &[],
+            &[],
+            &neg_defs,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+    }
+
+    #[test]
+    fn negcast_folds_a_truncated_wide_negate() {
+        // -(ext32->64 v) truncated to 32 bits IS the 32-bit negation: modular
+        // truncation commutes with negation, so the fold cannot change a value.
+        let result = negcast_shape(IrType::I32, IrType::I64).expect("pos + zero fold");
+        match result {
+            Instruction::UnaryOp {
+                dest,
+                op: IrUnaryOp::Neg,
+                src,
+                ty,
+            } => {
+                assert_eq!(dest, Value(3), "the fold must define the cast's dest");
+                assert_eq!(ty, IrType::I32, "the negate must run at the narrow width");
+                match src {
+                    Operand::Value(v) => {
+                        assert_eq!(v, Value(0), "it must negate the pre-extension value")
+                    }
+                    other => panic!("expected the extension's source, got {other:?}"),
+                }
+            }
+            other => panic!("expected UnaryOp::Neg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negcast_refuses_widths_it_measured_as_a_pessimisation() {
+        // A 16-bit destination costs a partial-register negate the consumers
+        // must re-extend (measured: +3 instructions in `bb_slp_unary_demote.c`,
+        // +1 in `sib_index_narrow_sext.c`, both spills), and a 32-bit source
+        // flips the vectorizer's decision in `packed_mask_shifts.c`. Neither may
+        // fold, whatever the destination width.
+        for (dest_ty, inner_ty) in [
+            (IrType::I16, IrType::I64),
+            (IrType::I8, IrType::I64),
+            (IrType::I16, IrType::I32),
+            (IrType::I32, IrType::I32),
+        ] {
+            if let Some(Instruction::UnaryOp {
+                op: IrUnaryOp::Neg,
+                ty,
+                ..
+            }) = negcast_shape(dest_ty, inner_ty)
+            {
+                assert_ne!(
+                    ty, dest_ty,
+                    "negcast must not narrow a negate into {dest_ty:?} from {inner_ty:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_cast_same_type() {
         let inst = Instruction::Cast {

@@ -1038,20 +1038,15 @@ impl Preprocessor {
         self.macros.set_file(format!("\"{}\"", filename));
         // __BASE_FILE__ always expands to the main input file name,
         // unlike __FILE__ which changes during #include processing.
-        self.macros.define(MacroDef {
-            name: "__BASE_FILE__".to_string(),
-            is_function_like: false,
-            params: Vec::new(),
-            is_variadic: false,
-            has_named_variadic: false,
-            body: format!("\"{}\"", filename),
-        });
+        self.macros
+            .set_builtin_body("__BASE_FILE__", &format!("\"{}\"", filename));
         // Push the file path onto the include stack for relative includes.
         // Use make_absolute (not canonicalize) to preserve symlinks, matching GCC
         // behavior: #include "..." searches relative to the directory where the
         // including file was found (through symlinks), not the symlink target.
         let path = PathBuf::from(filename);
         let abs = super::includes::make_absolute(&path);
+        self.macros.push_file_scope(&abs);
         self.include_stack.push(abs);
         self.include_origins.push(None);
     }
@@ -1096,10 +1091,21 @@ impl Preprocessor {
     /// macro, sorted alphabetically. Function-like macros include their parameter
     /// lists. This output is used by build systems like Meson to detect compiler
     /// features via preprocessor defines (e.g., `__GNUC__`, `__GNUC_MINOR__`).
+    ///
+    /// The compiler's own builtin definitions are omitted, exactly as
+    /// `gcc-16 -dM -E` and `clang-23 -dM -E` omit them: `__FILE__`, `__LINE__`,
+    /// `__DATE__`, `__TIME__`, `__TIMESTAMP__`, `__INCLUDE_LEVEL__`,
+    /// `__BASE_FILE__` and `__COUNTER__` are preprocessor state in both
+    /// references, so listing them made a `-dM` diff report seven lines that
+    /// exist only here. A definition the *source* supplied is still listed --
+    /// both oracles print `-D__DATE__="x"` -- which is why the filter asks
+    /// whether the entry is the compiler's rather than whether its name is on a
+    /// list.
     pub fn dump_defines(&self) -> String {
         let mut defs: Vec<String> = self
             .macros
             .iter()
+            .filter(|def| !self.macros.builtin_is_compiler_owned(&def.name))
             .map(|def| {
                 if def.is_function_like {
                     let params = def.params.join(",");
@@ -1230,6 +1236,7 @@ impl Preprocessor {
         // Save and set __FILE__ (uses set_file to avoid full MacroDef allocation)
         let old_file = self.macros.get_file_body().map(|s| s.to_string());
         self.macros.set_file(format!("\"{}\"", resolved.display()));
+        self.macros.push_file_scope(&resolved);
 
         // Preprocess the included content (macros persist; any pragma synthetic tokens
         // like __ccc_visibility_push_hidden are collected and prepended to main output)
@@ -1243,14 +1250,16 @@ impl Preprocessor {
             self.force_include_output.push('\n');
         }
 
-        // Restore __FILE__
+        // Pop include stack and its matching search provenance first: both
+        // restored builtins are derived from the stack, so the parent's values
+        // can only be computed once the child is gone.
+        self.include_stack.pop();
+        self.include_origins.pop();
+        self.macros.pop_file_scope();
+
         if let Some(old) = old_file {
             self.macros.set_file(old);
         }
-
-        // Pop include stack and its matching search provenance.
-        self.include_stack.pop();
-        self.include_origins.pop();
     }
 
     /// Process a preprocessor directive line.

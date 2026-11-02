@@ -1196,17 +1196,62 @@ impl Lowerer {
 
     // expr_is_const_qualified is defined in expr.rs as pub(super)
     /// Get the IR type for an expression (best-effort, based on locals/globals info).
+    /// IR value type of `then ?: else` (C11 6.5.15p5-6).
+    ///
+    /// The C composite type of the two arms *is* the type of the resulting
+    /// value, and `get_expr_type` has already asked for it (the pointer probe
+    /// needs the same query), so it is used directly whenever the arms are
+    /// arithmetic — which includes the imaginary/complex, decimal and
+    /// `_Float16`/`_Float128` cases.
+    ///
+    /// `common_type`'s IR rank ladder reproduces the same answer for plain
+    /// integers and binary floats, but it has no case for the decimal carriers
+    /// and none for `_Float16`, so it reported I32 for a value whose carrier is
+    /// D32/D64/U16 — a type lie that every consumer extends or converts from.
+    /// The compiler survived it only because `lower_conditional` re-derives the
+    /// carrier from the arms' C types before emitting; anything that trusted
+    /// `get_expr_type` (an enclosing assignment, a return, a cast) was one
+    /// conversion away from a raw integer cast over a BID carrier.
+    ///
+    /// Non-arithmetic arms (void, struct, union, vector) keep the historical
+    /// reconstruction: those are the cases where the lowering merges by
+    /// address, and `common_type`'s pointer-as-target-int mapping is what the
+    /// merge slot expects.
+    pub(super) fn conditional_value_type(
+        &self,
+        ctype: Option<&CType>,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> IrType {
+        match ctype {
+            Some(ct) if ct.is_arithmetic() || ct.is_decimal() => IrType::from_ctype(ct),
+            _ => Self::common_type(
+                self.ternary_arm_type(then_expr),
+                self.ternary_arm_type(else_expr),
+            ),
+        }
+    }
+
     pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
         use crate::common::types::target_is_32bit;
         let is_32bit = target_is_32bit();
+        // Exactly one C-type query per call. It answers the pointer probe below
+        // and, for a `?:`, the value type as well; running
+        // `get_expr_ctype`/`ternary_arm_type`/`common_type` separately made every
+        // conditional ask for its arms' C types three times (once through the
+        // composite type, once per arm through `ternary_arm_type`), which is
+        // three memoised-but-still-hashed lookups plus a full IR recursion per
+        // query.
+        //
         // CType is authoritative for pointer width. The case-by-case IR
         // fallback below is intentionally best-effort and may return I32 for
         // an unresolved member/subscript in a very large translation unit;
         // allowing that fallback to type pointer-valued phis/copies narrows
         // their spill stores and leaves stale upper pointer bits.
-        if self
-            .get_expr_ctype(expr)
-            .is_some_and(|ctype| matches!(ctype, CType::Pointer(..) | CType::Array(..)))
+        let ctype = self.get_expr_ctype(expr);
+        if ctype
+            .as_ref()
+            .is_some_and(|ct| matches!(ct, CType::Pointer(..) | CType::Array(..)))
         {
             return IrType::Ptr;
         }
@@ -1319,21 +1364,17 @@ impl Lowerer {
             }
             Expr::BinaryOp(op, lhs, rhs, _) => self.get_binop_type(op, lhs, rhs),
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => self.get_expr_type(lhs),
+            // The conditional's result is a value of its C composite type —
+            // not a storage type — so the arms' C semantics decide it. Using
+            // raw storage types here makes an int conditional with a constant
+            // arm (born I64) report I64 and forces a spurious widen/narrow cast
+            // pair around the (now natural-width) merge.
             Expr::Conditional(_, then_expr, else_expr, _) => {
-                // The conditional's result is a value of its C common type —
-                // not a storage type — so type the arms by C semantics. Using
-                // raw storage types here makes an int conditional with a
-                // constant arm (born I64) report I64 and forces a spurious
-                // widen/narrow cast pair around the (now natural-width) merge.
-                Self::common_type(
-                    self.ternary_arm_type(then_expr),
-                    self.ternary_arm_type(else_expr),
-                )
+                self.conditional_value_type(ctype.as_ref(), then_expr, else_expr)
             }
-            Expr::GnuConditional(cond, else_expr, _) => Self::common_type(
-                self.ternary_arm_type(cond),
-                self.ternary_arm_type(else_expr),
-            ),
+            Expr::GnuConditional(cond, else_expr, _) => {
+                self.conditional_value_type(ctype.as_ref(), cond, else_expr)
+            }
             Expr::Comma(_, rhs, _) => self.get_expr_type(rhs),
             Expr::PostfixOp(_, inner, _) => self.get_expr_type(inner),
             Expr::AddressOf(_, _) => IrType::Ptr,

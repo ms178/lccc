@@ -880,12 +880,19 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.infer_expr_type(lhs)
             }
-            Expr::Conditional(_, then_expr, else_expr, _) => Self::common_type(
-                self.infer_expr_type(then_expr),
-                self.infer_expr_type(else_expr),
+            // The composite type of the arms, from the same single source of
+            // truth as `get_expr_type`: this function reports *C semantic*
+            // types everywhere else (I32 for an `int` literal), and the
+            // composite type is exactly that for a `?:`. Deriving it here as
+            // well keeps constant folding from disagreeing with lowering about
+            // a conditional that mixes decimal, `_Float16` or complex arms.
+            Expr::Conditional(_, then_expr, else_expr, _) => self.conditional_value_type(
+                self.get_expr_ctype(expr).as_ref(),
+                then_expr,
+                else_expr,
             ),
             Expr::GnuConditional(cond, else_expr, _) => {
-                Self::common_type(self.infer_expr_type(cond), self.infer_expr_type(else_expr))
+                self.conditional_value_type(self.get_expr_ctype(expr).as_ref(), cond, else_expr)
             }
             Expr::Comma(_, rhs, _) => self.infer_expr_type(rhs),
             // All other cases: delegate to get_expr_type (same result)
