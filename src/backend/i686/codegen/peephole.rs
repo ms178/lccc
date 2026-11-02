@@ -6455,12 +6455,7 @@ impl GprLiveness {
         // so an empty live-out at EOF is sound here. Without this fallback
         // every fold would be refused on uncovered lines (conservative ALL).
         if extents.is_empty() && len > 0 {
-            let return_uses_edx = (0..len).any(|i| {
-                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
-            });
-            let return_uses_ecx = (0..len).any(|i| {
-                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-ecx"
-            });
+            let (return_uses_edx, return_uses_ecx) = return_use_markers(store, infos, 0, len);
             let lo = compute_gpr_live_out(store, infos, 0, len, return_uses_edx, return_uses_ecx);
             for i in 0..len {
                 lv.live_out[i] = lo[i];
@@ -7277,10 +7272,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 let has_ret = (fs..fe).any(|k| {
                     matches!(infos[k].kind, LineKind::Ret | LineKind::RetN) && !infos[k].is_nop()
                 });
-                let ret_uses_ecx = (fs..fe).any(|k| {
-                    !infos[k].is_nop()
-                        && trimmed(store, &infos[k], k) == "# lccc-i686-return-uses-ecx"
-                });
+                let (_, ret_uses_ecx) = return_use_markers(store, infos, fs, fe);
                 let ret_observes = has_ret
                     && (matches!(dst_reg, REG_EAX | REG_EDX)
                         || (dst_reg == REG_ECX && ret_uses_ecx));
@@ -14122,6 +14114,17 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let mut liveness: Option<GprLiveness> = None;
     let mut reanalyses = 0usize;
+    // Registers whose cached dataflow answer is no longer trustworthy. A `pop R`
+    // is a DEFINITION of `R`: deleting one lets the value defined before the
+    // pair flow further, so removing a dead store *decreases* liveness while
+    // removing a dead definition can *increase* it. Liveness is a backwards
+    // problem, so that increase propagates backwards -- and, through a loop's
+    // backedge, forwards again, which is exactly where a cached "R is dead after
+    // that later pop" answer would be unsound rather than merely stale. So each
+    // register whose pair was actually removed is marked dirty and its next
+    // rule-2 query re-solves the CFG -- one re-solve per register between two
+    // removals of that register, instead of one per deleted pair.
+    let mut dirty = 0u16;
     for i in 0..len {
         if infos[i].is_nop() {
             continue;
@@ -14140,6 +14143,11 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
         } else if is_callee_saved_reg(r) {
             false
         } else {
+            let bit = 1u16 << r;
+            if dirty & bit != 0 {
+                dirty &= !bit;
+                liveness = Some(GprLiveness::compute(store, infos));
+            }
             let lv = liveness.get_or_insert_with(|| GprLiveness::compute(store, infos));
             if lv.dead_after(span.pop, r) {
                 true
@@ -14149,7 +14157,7 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 // read; a read of `R` inside the span before any write still
                 // keeps the pair, because the next iteration would then see the
                 // span's value instead of the restored one.
-                let mask = 1u16 << r;
+                let mask = bit;
                 if reanalyses >= REANALYSIS_BUDGET {
                     false
                 } else {
@@ -14162,6 +14170,7 @@ fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
         if removable {
             infos[i].kind = LineKind::Nop;
             infos[span.pop].kind = LineKind::Nop;
+            dirty |= 1u16 << r;
             changed = true;
         }
     }
