@@ -103,6 +103,70 @@ pub enum Constness {
     Unknown,
 }
 
+/// The target whose `asm` grammar the validator is applying.
+///
+/// Only the operand classes that this compiler implements are enumerated; the
+/// enumeration exists because `=@cc<cond>` is the one operand class whose
+/// *accepted spelling set* differs per target and whose back ends implement it
+/// independently. Three states are enough:
+///
+/// * [`AsmTarget::X86`] — x86-64 and i686. The suffix is an x86 condition
+///   suffix (`e`, `z`, `ne`, `nbe`, ...) validated against
+///   [`crate::common::asm_constraints::CONDITION_CODES`], and the back ends
+///   materialise the flag with `SETcc`.
+/// * [`AsmTarget::Aarch64`] — the suffix is an ARM `ConditionHolds` condition
+///   (`eq`, `cs`, `hi`, `le`, ...) validated against
+///   [`crate::common::asm_constraints::AARCH64_FLAG_CONDITIONS`], and the back
+///   end materialises it with `CSET`. The two spellings mean the same thing
+///   only where they coincide (`ne`, `ge`, `le`): `"z"` names "zero clear" on
+///   x86 and is not an AArch64 condition at all, `"cs"` the other way round.
+/// * [`AsmTarget::Other`] — no flag-output support at all (RISC-V has no
+///   condition register), so `@cc` is refused rather than ignored.
+///
+/// Before this type existed the validator carried a bare `is_x86: bool` and
+/// every non-x86 target inherited the x86 decision to "leave `@cc` alone": the
+/// AArch64 back end then stored an uninitialised GP register as the result of
+/// `asm("cmp %1,%2" : "=@cceq"(r) ...)` and the RISC-V back end classified the
+/// constraint as a plain `"r"`, both silent miscompiles of programs GCC accepts
+/// (AArch64) or rejects (RISC-V).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsmTarget {
+    X86,
+    Aarch64,
+    Other,
+}
+
+impl AsmTarget {
+    /// Classify an ELF `e_machine` value the way `target_elf_machine()` reports
+    /// it: `EM_386` (3), `EM_X86_64` (62), `EM_AARCH64` (183). Every other
+    /// machine — RISC-V (`EM_RISCV` 243) included — has no flag outputs.
+    pub const fn from_elf_machine(machine: u16) -> Self {
+        match machine {
+            3 | 62 => Self::X86,
+            183 => Self::Aarch64,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether the back ends of this target can snapshot the condition
+    /// register after the template (`SETcc` on x86, `CSET` on AArch64).
+    pub const fn supports_flag_outputs(self) -> bool {
+        matches!(self, Self::X86 | Self::Aarch64)
+    }
+
+    /// The condition-suffix rule of this target, as a predicate so that
+    /// `check_constraint` stays a flat sequence of `else if` arms.
+    fn accepts_flag_condition(self, suffix: &str) -> bool {
+        match self {
+            Self::X86 => crate::common::asm_constraints::cond_code(suffix).is_some(),
+            Self::Aarch64 => {
+                crate::common::asm_constraints::aarch64_flag_condition(suffix).is_some()
+            }
+            Self::Other => false,
+        }
+    }
+}
+
 /// One operand of an `asm` statement, as the validator sees it.
 #[derive(Debug, Clone, Copy)]
 pub struct Operand<'a> {
@@ -380,7 +444,7 @@ fn check_constraint(
     operand: &Operand<'_>,
     index: usize,
     is_output: bool,
-    is_x86: bool,
+    target: AsmTarget,
     problems: &mut Vec<Diagnostic>,
 ) {
     let constraint = operand.constraint;
@@ -423,25 +487,42 @@ fn check_constraint(
         }
         return;
     }
-    // Condition-code operands (`=@cc<suffix>`). Measured against gcc 16.2: every
-    // suffix in the shared `asm_constraints::CONDITION_CODES` table is accepted,
-    // and everything else -- a missing suffix, `pe`/`po`, or junk -- is rejected
-    // with `unknown 'asm' flag output '<constraint>'`; an `@cc` on an input is
-    // rejected with `invalid punctuation '@' in constraint` everywhere.
+    // Condition-code operands (`=@cc<suffix>`). Measured against gcc 16.2 on
+    // x86-64: every suffix in the shared `asm_constraints::CONDITION_CODES`
+    // table is accepted, and everything else -- a missing suffix, `pe`/`po`, or
+    // junk -- is rejected with `unknown 'asm' flag output '<constraint>'`; an
+    // `@cc` on an input is rejected with `invalid punctuation '@' in
+    // constraint` everywhere.
     //
     // This check is what makes `gcc_cc_to_x86` total. Before it, an unknown
     // suffix was silently reclassified as `equal`, so `=@ccqq` compiled to
     // `sete` -- a miscompile of a program no other compiler accepts.
+    //
+    // The accepted *suffix set* is target-specific, and AArch64 does not
+    // inherit the x86 one: GCC's AArch64 flag outputs spell the same condition
+    // with the ARM `ConditionHolds` names (`eq`, `cs`, `hi`, ...), so `=@ccz`
+    // -- the x86 spelling of "zero" -- is not a condition AArch64 accepts, and
+    // `=@cceq` is not a condition x86 accepts. Validating the union, or
+    // skipping the check on non-x86 targets as this function used to, turns a
+    // user typo into a back-end `CSET`/`SETcc` with an unknown condition field
+    // (an assembler error at best) or into a silently wrong register class.
+    //
+    // RISC-V is not a flag-output target at all: it has no condition register,
+    // GCC's manual lists only ARM/AArch64, x86 and s390, and clang rejects the
+    // constraint outright. The RISC-V back end used to classify `"=@ccz"` as
+    // `"=r"` and hand back whatever the template left in a general register --
+    // a silent miscompile -- so the operand is now refused while parsing.
     if let Some(suffix) = body.strip_prefix("@cc") {
         if !is_output {
             problems.push(Diagnostic::error(
                 "invalid punctuation '@' in constraint",
                 Some(index),
             ));
-        } else if is_x86 && crate::common::asm_constraints::cond_code(suffix).is_none() {
-            // Non-x86 targets are left alone for the reason in the module
-            // header: their condition-code support is not measured here and
-            // must not be second-guessed.
+        } else if !target.supports_flag_outputs() {
+            let message =
+                format!("'{constraint}' flag output constraint is not supported on this target");
+            problems.push(Diagnostic::error(message, Some(index)));
+        } else if !target.accepts_flag_condition(suffix) {
             problems.push(Diagnostic::error(
                 format!("unknown 'asm' flag output '{constraint}'"),
                 Some(index),
@@ -458,7 +539,7 @@ fn check_constraint(
     if body == "t" || body == "u" {
         return;
     }
-    if !is_x86 {
+    if target != AsmTarget::X86 {
         // Other targets validate the `=`/`+` rule only: their constraint
         // letters are not measured here and must not be second-guessed.
         return;
@@ -637,7 +718,7 @@ pub fn validate(
     outputs: &[Operand<'_>],
     inputs: &[Operand<'_>],
     label_count: usize,
-    is_x86: bool,
+    target: AsmTarget,
 ) -> Vec<Diagnostic> {
     let mut problems = Vec::new();
     // `: [sum] "=r"(v) : "[sum]"(x)` ties by name.  A tie naming an operand
@@ -658,15 +739,15 @@ pub fn validate(
         }
     }
     for (i, op) in outputs.iter().enumerate() {
-        check_constraint(op, i, true, is_x86, &mut problems);
+        check_constraint(op, i, true, target, &mut problems);
     }
     for (i, op) in inputs.iter().enumerate() {
-        check_constraint(op, outputs.len() + i, false, is_x86, &mut problems);
+        check_constraint(op, outputs.len() + i, false, target, &mut problems);
     }
     // The `%`-code set is measured on x86 only: other back ends map operands
     // through their own substitution pass, so a valid aarch64/RISC-V template
     // must not be second-guessed here.
-    if is_x86 && problems.iter().all(|p| !p.is_error) {
+    if target == AsmTarget::X86 && problems.iter().all(|p| !p.is_error) {
         let readwrite_count = outputs
             .iter()
             .filter(|output| output.constraint.contains('+'))
@@ -714,7 +795,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("=r", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(messages(&p), ["input operand constraint contains '='"]);
         assert!(p[0].is_error);
@@ -728,14 +809,14 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("+r", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(messages(&p), ["input operand constraint contains '+'"]);
     }
 
     #[test]
     fn plus_modifier_on_output_is_fine() {
-        let p = validate("", &[op("+r", Constness::Unknown)], &[], 0, true);
+        let p = validate("", &[op("+r", Constness::Unknown)], &[], 0, AsmTarget::X86);
         assert!(p.is_empty());
     }
 
@@ -750,7 +831,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op(letter, Constness::Unknown)],
                 0,
-                true,
+                AsmTarget::X86,
             );
             assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "{letter}");
         }
@@ -799,7 +880,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("I", Constness::NonConstant)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(
             messages(&p),
@@ -827,7 +908,7 @@ mod tests {
                     &[op("=r", Constness::Unknown)],
                     &[op(c, ok(good))],
                     0,
-                    true
+                    AsmTarget::X86,
                 )
                 .is_empty(),
                 "{c}({good}) is in range"
@@ -837,7 +918,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op(c, ok(bad))],
                 0,
-                true,
+                AsmTarget::X86,
             );
             assert_eq!(p.len(), 2, "{c}({bad}) is out of range");
         }
@@ -858,7 +939,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op(c, Constness::NonConstant)],
                 0,
-                true,
+                AsmTarget::X86,
             );
             assert_eq!(strict.len(), 2, "\"{c}\" in a plain body must be an error");
             let deferred = validate(
@@ -866,7 +947,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op(c, Constness::Unknown)],
                 0,
-                true,
+                AsmTarget::X86,
             );
             assert!(
                 deferred.is_empty(),
@@ -893,7 +974,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op(c, Constness::Symbolic)],
                 0,
-                true,
+                AsmTarget::X86,
             );
             assert!(
                 p.is_empty(),
@@ -913,7 +994,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op(c, Constness::Symbolic)],
                 0,
-                true,
+                AsmTarget::X86,
             );
             assert_eq!(
                 messages(&p),
@@ -936,7 +1017,7 @@ mod tests {
                     &[op("=r", Constness::Unknown)],
                     &[op(c, ok(300))],
                     0,
-                    true
+                    AsmTarget::X86,
                 )
                 .is_empty(),
                 "{c}(300) is legal"
@@ -953,7 +1034,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("Ir", Constness::NonConstant)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert!(p.is_empty(), "{p:?}");
         let p = validate(
@@ -961,7 +1042,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("I", Constness::NonConstant)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(p.len(), 2);
     }
@@ -973,7 +1054,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("I", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert!(p.is_empty());
     }
@@ -986,7 +1067,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op("r", Constness::Unknown)],
                 0,
-                true
+                AsmTarget::X86,
             )
             .is_empty()
         );
@@ -995,13 +1076,26 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("r", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
         // `%b1` names operand 1 through the `b` modifier.
-        let p = validate("%b1", &[op("=r", Constness::Unknown)], &[], 0, true);
+        let p = validate(
+            "%b1",
+            &[op("=r", Constness::Unknown)],
+            &[],
+            0,
+            AsmTarget::X86,
+        );
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
-        assert!(validate("%b0", &[op("=r", Constness::Unknown)], &[], 0, true).is_empty());
+        let p = validate(
+            "%b0",
+            &[op("=r", Constness::Unknown)],
+            &[],
+            0,
+            AsmTarget::X86,
+        );
+        assert!(p.is_empty());
     }
 
     #[test]
@@ -1014,7 +1108,7 @@ mod tests {
                 &[op("+r", Constness::Unknown)],
                 &[op("r", Constness::Unknown)],
                 1,
-                true,
+                AsmTarget::X86,
             )
             .is_empty()
         );
@@ -1023,7 +1117,7 @@ mod tests {
             &[op("+r", Constness::Unknown)],
             &[op("r", Constness::Unknown)],
             1,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
     }
@@ -1031,15 +1125,30 @@ mod tests {
     #[test]
     fn asm_goto_labels_are_not_operands() {
         // `asm goto("jmp %l0" :::: done)` names label 0, not operand 0.
-        assert!(validate("jmp %l0", &[], &[], 1, true).is_empty());
-        assert!(validate("jmp %l1", &[], &[], 2, true).is_empty());
-        let p = validate("jmp %l0", &[op("=r", Constness::Unknown)], &[], 1, true);
+        let p = validate("jmp %l0", &[], &[], 1, AsmTarget::X86);
+        assert!(p.is_empty());
+        let p = validate("jmp %l1", &[], &[], 2, AsmTarget::X86);
+        assert!(p.is_empty());
+        let p = validate(
+            "jmp %l0",
+            &[op("=r", Constness::Unknown)],
+            &[],
+            1,
+            AsmTarget::X86,
+        );
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
-        assert!(validate("jmp %l1", &[op("=r", Constness::Unknown)], &[], 1, true).is_empty());
-        let p = validate("jmp %l1", &[], &[], 1, true);
+        let p = validate(
+            "jmp %l1",
+            &[op("=r", Constness::Unknown)],
+            &[],
+            1,
+            AsmTarget::X86,
+        );
+        assert!(p.is_empty());
+        let p = validate("jmp %l1", &[], &[], 1, AsmTarget::X86);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
         // A plain `asm` labels nothing, so the same template is out of range.
-        let p = validate("jmp %l0", &[], &[], 0, true);
+        let p = validate("jmp %l0", &[], &[], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
     }
 
@@ -1051,17 +1160,20 @@ mod tests {
         // that takes a goto label's address did not compile.
         let outputs = [op("=@ccne", Constness::Unknown)];
         let inputs = [op("r", Constness::Unknown), op("r", Constness::Unknown)];
-        assert!(validate("cmpl %1, %2; jmp %3", &outputs, &inputs, 1, true).is_empty());
-        assert!(validate("cmpl %1, %2; jmp %l3", &outputs, &inputs, 1, true).is_empty());
-        let p = validate("jmp %4", &outputs, &inputs, 1, true);
+        let p = validate("cmpl %1, %2; jmp %3", &outputs, &inputs, 1, AsmTarget::X86);
+        assert!(p.is_empty());
+        let p = validate("cmpl %1, %2; jmp %l3", &outputs, &inputs, 1, AsmTarget::X86);
+        assert!(p.is_empty());
+        let p = validate("jmp %4", &outputs, &inputs, 1, AsmTarget::X86);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
         // Both spellings skip the read-write slot: `"+r"(v) : "r"(x)` has
         // operands 0/1 and its label is 3, never 2 (measured: gcc prints
         // `plain=$.L3 named=.L3` and answers `%2` with "out of range").
         let outputs = [op("+r", Constness::Unknown)];
         let inputs = [op("r", Constness::Unknown)];
-        assert!(validate("jmp %3", &outputs, &inputs, 1, true).is_empty());
-        let p = validate("jmp %2", &outputs, &inputs, 1, true);
+        let p = validate("jmp %3", &outputs, &inputs, 1, AsmTarget::X86);
+        assert!(p.is_empty());
+        let p = validate("jmp %2", &outputs, &inputs, 1, AsmTarget::X86);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
     }
 
@@ -1072,10 +1184,11 @@ mod tests {
         // would invert both answers and false-reject valid `asm goto` code that
         // names a label with a two-digit index.
         let inputs: Vec<Operand<'_>> = (0..13).map(|_| op("r", Constness::Unknown)).collect();
-        assert!(validate("jmp %l13", &[], &inputs, 1, true).is_empty());
-        let p = validate("jmp %l12", &[], &inputs, 1, true);
+        let p = validate("jmp %l13", &[], &inputs, 1, AsmTarget::X86);
+        assert!(p.is_empty());
+        let p = validate("jmp %l12", &[], &inputs, 1, AsmTarget::X86);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
-        let p = validate("jmp %l14", &[], &inputs, 1, true);
+        let p = validate("jmp %l14", &[], &inputs, 1, AsmTarget::X86);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
     }
 
@@ -1089,7 +1202,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("r", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert!(p.is_empty());
         let p = validate(
@@ -1097,7 +1210,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("r", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
     }
@@ -1112,12 +1225,18 @@ mod tests {
             "nae", "be", "na", "g", "nle", "ge", "nl", "l", "nge", "le", "ng", "p", "np",
         ] {
             let constraint = format!("=@cc{suffix}");
-            let p = validate("", &[op(&constraint, Constness::Unknown)], &[], 0, true);
+            let p = validate(
+                "",
+                &[op(&constraint, Constness::Unknown)],
+                &[],
+                0,
+                AsmTarget::X86,
+            );
             assert!(p.is_empty(), "{constraint} must be accepted");
         }
         // gcc: `unknown 'asm' flag output '<constraint>'` for all four.
         for bad in ["=@cc", "=@ccxx", "=@ccpe", "=@ccpo"] {
-            let p = validate("", &[op(bad, Constness::Unknown)], &[], 0, true);
+            let p = validate("", &[op(bad, Constness::Unknown)], &[], 0, AsmTarget::X86);
             let want = format!("unknown 'asm' flag output '{bad}'");
             assert_eq!(messages(&p), [want.as_str()], "{bad}");
         }
@@ -1127,9 +1246,85 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("@ccz", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(messages(&p), ["invalid punctuation '@' in constraint"]);
+    }
+
+    /// `validate` for a lone output operand with no labels, bound to one
+    /// target. The per-target flag-output table below is a set of one-line
+    /// cases, and spelling out five arguments per case would bury it.
+    fn check(target: AsmTarget, constraint: &str) -> Vec<Diagnostic> {
+        validate("", &[op(constraint, Constness::Unknown)], &[], 0, target)
+    }
+
+    /// The accepted `=@cc` suffix set is a property of the target, not of the
+    /// constraint grammar: x86 spells "zero clear" as `z`, AArch64 as `eq`, and
+    /// neither spelling may be reinterpreted on the other target. Before
+    /// `AsmTarget` existed the validator skipped the check entirely off x86, so
+    /// `=@ccz` on AArch64 -- or on RISC-V, which has no flag output at all --
+    /// reached a back end that stored an uninitialised register as the result.
+    #[test]
+    fn flag_output_suffix_set_is_per_target() {
+        // Every ARM `ConditionHolds` condition GCC accepts in this position.
+        for cond in [
+            "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt",
+            "gt", "le",
+        ] {
+            let c = format!("=@cc{cond}");
+            let p = check(AsmTarget::Aarch64, &c);
+            assert!(p.is_empty(), "{c} must be accepted on aarch64");
+        }
+        // A spelling from the other target's table is not a condition here.
+        for (c, target) in [
+            ("=@ccz", AsmTarget::Aarch64),
+            ("=@ccnz", AsmTarget::Aarch64),
+            ("=@cceq", AsmTarget::X86),
+            ("=@cchs", AsmTarget::X86),
+        ] {
+            let p = check(target, c);
+            let want = format!("unknown 'asm' flag output '{c}'");
+            assert_eq!(messages(&p), [want.as_str()], "{c}");
+        }
+        // `al`/`nv` are ARM `ConditionHolds` conditions but not flag tests, and
+        // GCC rejects both; a `cset` for either would be meaningless.
+        for c in ["=@ccal", "=@ccnv"] {
+            let p = check(AsmTarget::Aarch64, c);
+            let want = format!("unknown 'asm' flag output '{c}'");
+            assert_eq!(messages(&p), [want.as_str()], "{c}");
+        }
+        // RISC-V: the operand is refused for being a flag output at all, so the
+        // message names the class rather than the suffix.
+        for c in ["=@ccz", "=@cceq", "=@cc"] {
+            let p = check(AsmTarget::Other, c);
+            let want = format!("'{c}' flag output constraint is not supported on this target");
+            assert_eq!(messages(&p), [want.as_str()], "{c}");
+        }
+        // `@` on an input is refused on every target, including the two with
+        // flag outputs.
+        let outputs = [op("=r", Constness::Unknown)];
+        let inputs = [op("@cceq", Constness::Unknown)];
+        for target in [AsmTarget::X86, AsmTarget::Aarch64, AsmTarget::Other] {
+            let p = validate("", &outputs, &inputs, 0, target);
+            assert_eq!(messages(&p), ["invalid punctuation '@' in constraint"]);
+        }
+    }
+
+    /// `AsmTarget::from_elf_machine` is the only place the mapping from an ELF
+    /// machine number to an `asm` grammar is written down, so pin it.
+    #[test]
+    fn asm_target_mapping_is_elf_machine_driven() {
+        // EM_386, EM_X86_64, EM_AARCH64.
+        assert_eq!(AsmTarget::from_elf_machine(3), AsmTarget::X86);
+        assert_eq!(AsmTarget::from_elf_machine(62), AsmTarget::X86);
+        assert_eq!(AsmTarget::from_elf_machine(183), AsmTarget::Aarch64);
+        // EM_ARM, EM_RISCV, EM_NONE, EM_PPC, EM_PPC64.
+        for m in [40u16, 243, 0, 20, 21] {
+            assert_eq!(AsmTarget::from_elf_machine(m), AsmTarget::Other, "{m}");
+        }
+        assert!(!AsmTarget::Other.supports_flag_outputs());
+        assert!(AsmTarget::X86.supports_flag_outputs());
+        assert!(AsmTarget::Aarch64.supports_flag_outputs());
     }
 
     #[test]
@@ -1147,7 +1342,7 @@ mod tests {
                 &[op(out, Constness::Unknown)],
                 &[op(c, Constness::Unknown)],
                 0,
-                true,
+                AsmTarget::X86,
             );
             assert!(
                 p.iter()
@@ -1161,7 +1356,7 @@ mod tests {
     fn template_passes_through_what_it_cannot_judge() {
         for t in ["%%eax", "%{mov|jmp%} %0", "nop %"] {
             assert!(
-                validate(t, &[op("=r", Constness::Unknown)], &[], 0, true).is_empty(),
+                validate(t, &[op("=r", Constness::Unknown)], &[], 0, AsmTarget::X86).is_empty(),
                 "{t}"
             );
         }
@@ -1173,7 +1368,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(
             messages(&p),
@@ -1193,14 +1388,14 @@ mod tests {
         // itself, not about `%c`).
         let outputs = [named("=r", Constness::Unknown, "s")];
         let inputs = [op("[s]", Constness::Unknown)];
-        let p = validate("mov %c1, %0", &outputs, &inputs, 0, true);
+        let p = validate("mov %c1, %0", &outputs, &inputs, 0, AsmTarget::X86);
         assert_eq!(
             messages(&p),
             ["invalid 'asm': operand is not a condition code, invalid operand code 'c'"]
         );
         let outputs = [named("=n", Constness::Unknown, "s")];
         let inputs = [op("[s]", Constness::Unknown)];
-        let p = validate("mov %c1, %0", &outputs, &inputs, 0, true);
+        let p = validate("mov %c1, %0", &outputs, &inputs, 0, AsmTarget::X86);
         assert!(
             p.iter()
                 .all(|d| !d.message.contains("not a condition code")),
@@ -1214,7 +1409,7 @@ mod tests {
             "r", "m", "g", "rm", "=r", "+r", "&r", "Yz", "x", "v", "Q", "A", "X", "t", "u",
             "{rax}", "@ccz", "0", "i", "f",
         ] {
-            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, true);
+            let p = validate("", &[op(c, Constness::Unknown)], &[], 0, AsmTarget::X86);
             assert!(p.is_empty(), "{c}: {p:?}");
         }
     }
@@ -1227,7 +1422,7 @@ mod tests {
                 &[op("=r", Constness::Unknown)],
                 &[op("w", Constness::Unknown)],
                 0,
-                false
+                AsmTarget::Other,
             )
             .is_empty()
         );
@@ -1236,7 +1431,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("=r", Constness::Unknown)],
             0,
-            false,
+            AsmTarget::Other,
         );
         assert_eq!(messages(&p), ["input operand constraint contains '='"]);
     }
@@ -1254,7 +1449,7 @@ mod tests {
                 op("r", Constness::Unknown),
             ],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert!(p.is_empty(), "{p:?}");
     }
@@ -1267,7 +1462,7 @@ mod tests {
             &[op("=r", Constness::Unknown)],
             &[op("[zz]", Constness::Unknown)],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(messages(&p), ["undefined named operand 'zz'"]);
     }
@@ -1301,7 +1496,7 @@ mod tests {
                 name: None,
             }],
             0,
-            true,
+            AsmTarget::X86,
         );
         assert_eq!(
             messages(&p),
@@ -1341,38 +1536,38 @@ mod named_matching_tests {
     fn suffixed_and_repeated_named_ties_resolve_every_name() {
         let outputs = [named("=r", "sum")];
         for constraint in ["[sum]", "[sum]r", "[sum][sum]", "[sum]r[sum]"] {
-            let p = validate("", &outputs, &[input(constraint)], 0, true);
+            let p = validate("", &outputs, &[input(constraint)], 0, AsmTarget::X86);
             assert!(p.is_empty(), "{constraint}: {p:?}");
         }
-        let p = validate("", &outputs, &[input("[zz]r")], 0, true);
+        let p = validate("", &outputs, &[input("[zz]r")], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["undefined named operand 'zz'"]);
-        let p = validate("", &outputs, &[input("[sum][zz]")], 0, true);
+        let p = validate("", &outputs, &[input("[sum][zz]")], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["undefined named operand 'zz'"]);
     }
 
     #[test]
     fn malformed_named_ties_are_diagnosed_not_classified_as_letters() {
         let outputs = [named("=r", "sum")];
-        let p = validate("", &outputs, &[input("[sum")], 0, true);
+        let p = validate("", &outputs, &[input("[sum")], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["missing close brace for named operand"]);
-        let p = validate("", &outputs, &[input("[sum]@")], 0, true);
+        let p = validate("", &outputs, &[input("[sum]@")], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["invalid punctuation '@' in constraint"]);
-        let p = validate("", &outputs, &[input("[]")], 0, true);
+        let p = validate("", &outputs, &[input("[]")], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["undefined named operand ''"]);
     }
 
     #[test]
     fn early_clobber_modifier_on_input_is_an_error() {
         let outputs = [named("=r", "sum")];
-        let p = validate("", &outputs, &[input("&r")], 0, true);
+        let p = validate("", &outputs, &[input("&r")], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["input operand constraint contains '&'"]);
-        let p = validate("", &outputs, &[input("&[sum]")], 0, true);
+        let p = validate("", &outputs, &[input("&[sum]")], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["input operand constraint contains '&'"]);
     }
 
     #[test]
     fn named_matching_constraint_is_not_an_output_constraint() {
-        let p = validate("", &[input("[sum]")], &[], 0, true);
+        let p = validate("", &[input("[sum]")], &[], 0, AsmTarget::X86);
         assert_eq!(messages(&p), ["output operand constraint lacks '='"]);
     }
 }

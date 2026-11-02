@@ -68,8 +68,12 @@ impl InlineAsmEmitter for RiscvCodegen {
     }
 
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
-        // TODO: RISC-V =@cc not fully implemented — needs SLTU/SEQZ/etc. in store_output_from_reg.
-        // Currently stores incorrect results (just a GP register value, no condition capture).
+        // `=@cc<cond>` never reaches this back end: RISC-V has no condition
+        // register, GCC does not accept the constraint on this target either,
+        // and the parser (`AsmTarget::Other`) rejects the operand while parsing.
+        // The arm below therefore only decodes the constraint into the shared
+        // `ConditionCode` shape; materialising it would need the flag value
+        // itself, which the architecture does not expose.
         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint from register variable: {regname}
         if c.starts_with('{') && c.ends_with('}') {
@@ -471,8 +475,12 @@ impl InlineAsmEmitter for RiscvCodegen {
                 AsmOperandKind::ZeroOrReg => RvConstraintKind::ZeroOrReg,
                 AsmOperandKind::Specific(r) => RvConstraintKind::Specific(r.clone()),
                 AsmOperandKind::Tied(n) => RvConstraintKind::Tied(*n),
-                // TODO: RISC-V =@cc not fully implemented — needs SLTU/SEQZ/etc. instead of SETcc.
-                // Currently maps to GpReg which will store incorrect results.
+                // RISC-V has no condition-code register, so `=@cc<cond>` is not
+                // a constraint GCC accepts on this target and the parser
+                // (`AsmTarget::Other`) rejects the operand before it can reach
+                // the back end. Were it ever to arrive here, the best this
+                // classifier can do is treat it as a general register; the
+                // store path then writes whatever the template left there.
                 AsmOperandKind::ConditionCode(_) => RvConstraintKind::GpReg,
                 // x86-only constraint kinds; map to GpReg as fallback (should never occur on RISC-V)
                 AsmOperandKind::X87St0 | AsmOperandKind::X87St1 | AsmOperandKind::QReg => {

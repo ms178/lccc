@@ -86,3 +86,21 @@ u64 bit_toggle_checksum(void){
   }
   return h;
 }
+
+u64 bit_shared_checksum(void){
+  h = 1469598103934665603ull;
+  static const u32 pat[]={0u,0xffffffffu,0x80000000u,0x7fffffffu,0xaaaaaaaau,0x55555555u,0xdeadbeefu,1u};
+  for(unsigned p=0;p<8;p++){
+    u32 x=pat[p];
+    for(u32 n=0;n<32;n++){
+      u32 m=1u<<n;
+      mix(x|m); mix(x&~m); mix(x^m); mix((x&m)!=0);
+    }
+    u64 xx=((u64)x<<32)|pat[(p+3)&7];
+    for(u64 n=0;n<64;n++){
+      u64 m=1ull<<n;
+      mix(xx|m); mix(xx&~m); mix(xx^m); mix((xx&m)!=0);
+    }
+  }
+  return h;
+}

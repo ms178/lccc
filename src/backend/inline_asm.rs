@@ -51,6 +51,125 @@ pub enum AsmOperandKind {
     QReg,
 }
 
+/// The register width an `asm` template prints an operand through.
+///
+/// Almost every operand is printed in its natural width, and then any register
+/// of its class will do. Two x86 modifiers ask for a *narrower* view of the
+/// register file, and the set of registers that can answer is target-dependent:
+///
+/// * `%b<n>` prints the low byte (`al`, `bl`, `cl`, `dl`, `sil`, `dil`, `r8b`,
+///   ...). Every x86-64 register has one, because the `sil`/`dil`/`bpl`/`spl`
+///   and `r8b`-`r15b` encodings are REX-only. On IA-32 those encodings do not
+///   exist: only `al`, `bl`, `cl`, `dl` are byte-addressable, and the other
+///   three allocatable registers (`esi`, `edi`, `ebp`) have no 8-bit form at
+///   all. Printing `%esi` for `%b3` is not a worse register choice, it is a
+///   syntax error in the assembler -- and the operand's byte value is not
+///   addressable at any other name either.
+/// * `%h<n>` prints the *high* byte (`ah`, `bh`, `ch`, `dh`), which exists only
+///   for the four legacy accumulator-family registers on both x86 targets.
+///
+/// The AArch64 and RISC-V modifiers are size suffixes on the same register
+/// (`%w0`/`%x0`), so both targets treat every view as [`RegView::Full`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegView {
+    /// Natural width: any register of the operand's class.
+    Full,
+    /// Low byte, i.e. `%b<n>`.
+    Byte,
+    /// High byte, i.e. `%h<n>`: the four legacy `a`/`b`/`c`/`d` registers only.
+    HighByte,
+}
+
+/// Which operands the template prints through a byte view, and which of those
+/// need the *high* byte.
+///
+/// Computed once per `asm` statement from the expanded template, before any
+/// register is assigned. The scan is deliberately total and conservative: a
+/// reference it fails to recognise leaves the operand at [`RegView::Full`],
+/// which is exactly what the back ends did before this existed, and an extra
+/// restriction (a false positive) only costs a register choice.
+///
+/// Why the allocation decision needs this at all: the constraint string says
+/// nothing about `%b`/`%h`, so `assign_scratch_reg` used to hand a byte-printed
+/// operand any free register -- including, on i686, `esi`/`edi`, which have no
+/// byte view. The template is the only place that fact is written down.
+pub(crate) fn operand_reg_views(template: &str, operands: &[AsmOperand]) -> Vec<RegView> {
+    let mut views = vec![RegView::Full; operands.len()];
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        // `%%` is a literal percent sign, not an operand reference.
+        if i < bytes.len() && bytes[i] == b'%' {
+            i += 1;
+            continue;
+        }
+        let view = match bytes.get(i).copied() {
+            Some(b'b') => RegView::Byte,
+            Some(b'h') => RegView::HighByte,
+            _ => {
+                // Any other modifier or a bare operand index: the view is the
+                // natural one. Skipping a single byte is safe -- a modifier is
+                // exactly one character, and an operand index is not a `%`.
+                i += 1;
+                continue;
+            }
+        };
+        i += 1;
+        let (index, next) = parse_operand_ref(template, i, operands);
+        if let Some(slot) = index.and_then(|index| views.get_mut(index)) {
+            // A high-byte use dominates a low-byte use of the same operand:
+            // `%h3` is the strictest requirement the template can state.
+            if *slot != RegView::HighByte {
+                *slot = view;
+            }
+        }
+        i = next;
+    }
+    views
+}
+
+/// Parse the operand reference that follows a `%`-modifier: `0`, `10`, or
+/// `[name]` (optionally followed by another modifier, which the caller does not
+/// care about). Returns the operand index and the position after the reference.
+fn parse_operand_ref(
+    template: &str,
+    start: usize,
+    operands: &[AsmOperand],
+) -> (Option<usize>, usize) {
+    let bytes = template.as_bytes();
+    let mut i = start;
+    if bytes.get(i) == Some(&b'[') {
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j] != b']' {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            // Unterminated `[`: the substitution pass diagnoses it; nothing to
+            // attribute here.
+            return (None, j);
+        }
+        let name = &template[i + 1..j];
+        let index = operands
+            .iter()
+            .position(|op| op.name.as_deref() == Some(name));
+        return (index, j + 1);
+    }
+    let begin = i;
+    let mut value: usize = 0;
+    while let Some(digit) = bytes.get(i).and_then(|b| (*b as char).to_digit(10)) {
+        // Saturate instead of wrapping: a template this long is nonsense, and
+        // an out-of-range index simply attributes no view.
+        value = value.saturating_mul(10).saturating_add(digit as usize);
+        i += 1;
+    }
+    ((i > begin).then_some(value), i)
+}
+
 /// Per-operand state tracked by the shared inline asm framework.
 /// Backends populate arch-specific fields (mem_addr, mem_offset, imm_value)
 /// during constraint classification.
@@ -132,6 +251,42 @@ pub trait InlineAsmEmitter {
     /// `excluded` contains register names that are already claimed by specific-register
     /// constraints (e.g., "rcx" from "c" constraint) and must not be reused.
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String;
+
+    /// Assign a scratch register for an operand that the template prints
+    /// through `view` and whose IR type is `operand_type`.
+    ///
+    /// The default forwards to [`Self::assign_scratch_reg`], ignoring both extra
+    /// arguments: AArch64 and RISC-V have a uniform general register file and
+    /// no byte views, so the natural-width answer is always right there. The
+    /// x86 back ends override it, because IA-32 cannot print `%esi`/`%edi` as a
+    /// byte and only four registers have a high byte.
+    ///
+    /// `operand_type` matters independently of the template: i686 prints an
+    /// `I8`/`U8` operand in its byte form by default (see
+    /// `i686_default_modifier_for_type`), so a `char` operand needs a byte view
+    /// even when the template says nothing about it.
+    fn assign_scratch_reg_for_view(
+        &mut self,
+        kind: &AsmOperandKind,
+        _operand_type: IrType,
+        _view: RegView,
+        excluded: &[String],
+    ) -> String {
+        self.assign_scratch_reg(kind, excluded)
+    }
+
+    /// Whether the register named `home` -- which already holds an input
+    /// operand's value -- can be used for that operand directly, given the view
+    /// the template prints it through and the operand's IR type.
+    ///
+    /// Reusing a fresh home avoids a copy, so it is worth checking rather than
+    /// refusing outright; but a home that cannot be printed the way the
+    /// template asks is not a saving, it is invalid assembly. When this returns
+    /// false the shared code copies the value into a scratch register that
+    /// `assign_scratch_reg_for_view` chose.
+    fn home_reg_usable_for_view(&self, _home: &str, _view: RegView, _operand_type: IrType) -> bool {
+        true
+    }
 
     /// The asm name of the register that currently HOLDS `value`, when this
     /// backend models register homes.
@@ -638,6 +793,11 @@ pub fn emit_inline_asm_common_impl(
     }
     resolve_symbols_and_immediates(&mut operands, outputs, input_symbols);
     let specific_regs = collect_excluded_registers(&operands, clobbers);
+    // Which operands the template prints through a byte view. Computed from the
+    // dialect-expanded text, before any register is assigned, because `%b`/`%h`
+    // are the only place that requirement is written down -- the constraint
+    // string does not carry it.
+    let views = operand_reg_views(&dialect_expanded, &operands);
     assign_scratch_registers(
         emitter,
         &mut operands,
@@ -645,6 +805,7 @@ pub fn emit_inline_asm_common_impl(
         &specific_regs,
         outputs,
         inputs,
+        &views,
     );
     // An empty template assembles to nothing, so it stages nothing either: no
     // operand address to resolve into a scratch register, no input to load, no
@@ -1070,6 +1231,7 @@ fn assign_scratch_registers(
     specific_regs: &[String],
     outputs: &[(String, Value, Option<String>)],
     inputs: &[(String, Operand, Option<String>)],
+    views: &[RegView],
 ) {
     let total_operands = outputs.len() + inputs.len();
 
@@ -1092,6 +1254,7 @@ fn assign_scratch_registers(
             &output_excluded,
             outputs,
             inputs,
+            views,
             i,
             num_plus,
         );
@@ -1155,6 +1318,7 @@ fn assign_scratch_registers(
             &input_excluded,
             outputs,
             inputs,
+            views,
             i,
             num_plus,
         );
@@ -1181,6 +1345,7 @@ fn assign_one_scratch(
     excluded: &[String],
     outputs: &[(String, Value, Option<String>)],
     inputs: &[(String, Operand, Option<String>)],
+    views: &[RegView],
     i: usize,
     num_plus: usize,
 ) {
@@ -1246,7 +1411,14 @@ fn assign_one_scratch(
                                     _ => false,
                                 }
                         });
-                        if compatible && !conflicts {
+                        if compatible
+                            && !conflicts
+                            && emitter.home_reg_usable_for_view(
+                                &home,
+                                views[i],
+                                operands[i].operand_type,
+                            )
+                        {
                             // An already-fresh home is a valid register input.
                             // Reuse it rather than copying the value to a
                             // second scratch register.
@@ -1257,7 +1429,12 @@ fn assign_one_scratch(
                 }
             }
             let kind_clone = kind.clone();
-            let reg = emitter.assign_scratch_reg(&kind_clone, excluded);
+            let reg = emitter.assign_scratch_reg_for_view(
+                &kind_clone,
+                operands[i].operand_type,
+                views[i],
+                excluded,
+            );
             if reg.is_empty() && constraint_has_memory_alt(&operands[i].constraint) {
                 if i < outputs.len() {
                     let val = Operand::Value(outputs[i].1);
@@ -1775,6 +1952,76 @@ mod tests {
         assert_eq!(operands[1].reg, "rcx");
         assert_eq!(operands[1].operand_type, IrType::I64);
         assert_eq!(operands[1].constraint, "[sum]");
+    }
+
+    /// Build the operand list `operand_reg_views` needs: `names` holds one
+    /// entry per operand, where the empty string means "unnamed".
+    fn views_for(template: &str, names: &[&str]) -> Vec<RegView> {
+        let operands: Vec<AsmOperand> = names
+            .iter()
+            .map(|name| {
+                let name = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+                AsmOperand::new(AsmOperandKind::GpReg, name)
+            })
+            .collect();
+        operand_reg_views(template, &operands)
+    }
+
+    #[test]
+    fn reg_views_flag_the_byte_and_high_byte_modifiers() {
+        let mv = views_for("movb %b0, %h1", &["", ""]);
+        assert_eq!(mv, vec![RegView::Byte, RegView::HighByte]);
+        // Unmodified, other-width and non-register modifiers impose nothing:
+        // `%w`/`%k`/`%q` are same-register width names, `%c`/`%P`/`%a`/`%n`
+        // print constants, and a bare `%0` is the natural width.
+        assert_eq!(
+            views_for("%0 %w1 %k2 %q3 %c4 %P5 %a6 %n7 %l8", &[""; 9]),
+            vec![RegView::Full; 9]
+        );
+    }
+
+    #[test]
+    fn reg_views_ignore_literal_percent_signs() {
+        // `%%al` is the text "al", not an operand reference to operand 0.
+        assert_eq!(views_for("andb $1, %%al", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("movb %b0, %%b1", &[""]), vec![RegView::Byte]);
+    }
+
+    #[test]
+    fn reg_views_resolve_named_and_multi_digit_references() {
+        assert_eq!(
+            views_for("mov %b[byte_in], %0", &["", "byte_in"]),
+            vec![RegView::Full, RegView::Byte]
+        );
+        // Operand 10 is printed by `%b10`; the digits are one index, not
+        // operand 1 followed by a stray "0".
+        assert_eq!(views_for("%b10", &[""; 11])[10], RegView::Byte);
+        assert_eq!(views_for("%h0", &[""]), vec![RegView::HighByte]);
+    }
+
+    #[test]
+    fn reg_views_take_the_strictest_use_of_an_operand() {
+        // `%h` needs one of four legacy registers; `%b` is satisfied by all of
+        // them, so a template that uses both must ask for the high byte.
+        assert_eq!(views_for("%b0 %h0", &[""]), vec![RegView::HighByte]);
+        assert_eq!(views_for("%h0 %b0", &[""]), vec![RegView::HighByte]);
+    }
+
+    #[test]
+    fn reg_views_are_total_on_malformed_and_out_of_range_input() {
+        // No panic and no invented restriction: the substitution pass is what
+        // diagnoses these templates.
+        assert_eq!(views_for("%b7", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%b[unterminated", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%b[unknown]", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%", &[""]), vec![RegView::Full]);
+        assert_eq!(views_for("%b", &[""]), vec![RegView::Full]);
+        let saturated = views_for("%b99999999999999999999999", &[""]);
+        assert_eq!(saturated, vec![RegView::Full]);
     }
 
     #[test]

@@ -628,7 +628,11 @@ impl Parser {
         if outputs.is_empty() && inputs.is_empty() && label_count == 0 && !template.contains('%') {
             return;
         }
-        let is_x86 = matches!(crate::common::types::target_elf_machine(), 3 | 62);
+        // The `asm` grammar is per target: x86 spells conditions with its own
+        // suffixes, AArch64 with the ARM `ConditionHolds` names, and the
+        // remaining back ends have no flag outputs at all.
+        let asm_target =
+            asm_validate::AsmTarget::from_elf_machine(crate::common::types::target_elf_machine());
         // Fold the operand expressions first: the fold borrows the parser's
         // name tables immutably, and the diagnostics below need `&mut self`.
         // Block-scope integer constants participate in the same fold as
@@ -677,7 +681,9 @@ impl Parser {
                 name: op.name.as_deref(),
             })
             .collect();
-        for problem in asm_validate::validate(template, &out_view, &in_view, label_count, is_x86) {
+        for problem in
+            asm_validate::validate(template, &out_view, &in_view, label_count, asm_target)
+        {
             let at = problem
                 .operand
                 .and_then(|i| outputs.iter().chain(inputs.iter()).nth(i))

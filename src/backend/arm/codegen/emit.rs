@@ -2997,11 +2997,18 @@ impl ArchCodegen for ArmCodegen {
         )
     }
 
+    /// Branch to `label` when the accumulator (x0) is non-zero.
+    ///
+    /// This is the AArch64 analogue of the x86 `test` + `jcc` fusion: a single
+    /// `cbnz` instead of the former `cbz .Lskip; b label; .Lskip` triple.  The
+    /// compare-and-branch forms reach the same ±1 MB window as `b.cond`, so the
+    /// direct form is what the assembler would have produced after relaxation
+    /// anyway, without the two extra instructions and the extra taken branch.
+    /// Any three-instruction survivors of this shape (from other emitters) are
+    /// still folded by `peephole::fuse_branch_over_branch`, which recognises
+    /// `cbz`/`cbnz`/`tbz`/`tbnz` heads as well as `b.cc` heads.
     fn emit_branch_nonzero(&mut self, label: &str) {
-        let skip = self.state.fresh_label("skip");
-        self.state.emit_fmt(format_args!("    cbz x0, {}", skip));
-        self.state.emit_fmt(format_args!("    b {}", label));
-        self.state.emit_fmt(format_args!("{}:", skip));
+        self.state.emit_fmt(format_args!("    cbnz x0, {}", label));
     }
 
     fn emit_jump_indirect(&mut self) {

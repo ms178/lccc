@@ -95,13 +95,16 @@ CI wiring added a separate step and the lane-plan audit correctly rejected it;
 the test now runs in the already planned benchmark step, and both lane-plan
 and local/hosted invocation parity checks pass.
 
-A later partial fast CI run exposed a pre-existing mixed-GCC include failure:
-when GCC 14 is the default `gcc` and LCCC auto-discovers GCC 16 headers, the
-`-m32 -I<gcc14 include>` IVSR test alternates GCC 14 and 16 `stdint.h` through
-`#include_next` instead of reaching glibc; `UINT32_C` and limits then remain
-unexpanded. Using the *actual* GCC 16 binary as the default `gcc` makes the
-entire IVSR domain gate pass. This is an environment workaround, not a fix:
-reduce and repair include-next search provenance, add a regression with two
-different GCC include directories and verify GCC/Clang parity, including
-quotes, `-isystem`, duplicate directories, and target-specific paths. Do not
-hide the issue by claiming the mismatched-GCC configuration passed.
+A partial fast-CI run previously exposed a mixed-GCC `#include_next` failure:
+with an older system GCC and GCC 16 internal headers, wrapper traversal could
+fail to reach the libc endpoint. The earlier workaround of putting GCC 16 first
+in `PATH` was not treated as a fix. On the current tree, include resolution
+carries the search-chain origin with each opened file and resumes at the next
+slot. The focused gate now adds a cross-version regression using the installed
+GCC 12 and GCC 16.2 `stdint.h`/`limits.h` wrappers plus a minimal libc endpoint;
+it checks both path orders, `-m64`/`-m32`, macro expansion and visited-header
+line markers against LCCC, GCC 16.2 and Clang 23.1.4. All 12 compiler/target/
+order cells passed locally. This validates the current implementation for
+those measured wrappers; it is not an exhaustive proof for every GCC header
+layout. GCC 14 headers and ICX were unavailable in this sandbox, and the full
+hosted CI run remains the acceptance gate for the change.

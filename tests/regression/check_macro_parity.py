@@ -35,6 +35,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 
 GCC_ONLY = (
+    # `__GCC_ASM_FLAG_OUTPUTS__` used to be pinned here. It left the budget
+    # when lccc implemented `=@cc<cond>` flag outputs on x86-64, i686 and
+    # AArch64 and defined the macro on exactly those targets (GCC defines it
+    # on the same set, and its value is `1` on both sides), which is the only
+    # direction this ratchet allows a pin to move without a code change.
     '__ATOMIC_HLE_ACQUIRE',
     '__ATOMIC_HLE_RELEASE',
     '__DEC64X_EPSILON__',
@@ -44,7 +49,6 @@ GCC_ONLY = (
     '__DEC64X_MIN_EXP__',
     '__DEC64X_MIN__',
     '__DEC64X_SUBNORMAL_MIN__',
-    '__GCC_ASM_FLAG_OUTPUTS__',
     '__GCC_CONSTRUCTIVE_SIZE',
     '__GCC_DESTRUCTIVE_SIZE',
     '__HAVE_SPECULATION_SAFE_VALUE',

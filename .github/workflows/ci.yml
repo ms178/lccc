@@ -1299,6 +1299,19 @@ jobs:
         python3 scripts/ci_annotate_log.py --title "vector-ext codegen" "$RUNNER_TEMP/vector-ext-codegen.log"
     needs:
     - build
+    - name: Flag-output operands (=@cc) are per-target and materialised, not stored stale
+      # The hosted job log is not reachable from the Checks API, so a bare
+      # `exit 1` from this gate names none of its assertions. Tee the whole
+      # log into a file and annotate it on failure: the annotation is the only
+      # readable copy of which target or which operand spelling disagreed.
+      run: |
+        set -o pipefail
+        log="${RUNNER_TEMP:-/tmp}/asm-flag-outputs.log"
+        if env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv GCC=gcc-16 bash tests/regression/check_asm_flag_outputs.sh 2>&1 | tee "$log"; then
+          exit 0
+        fi
+        python3 scripts/ci_annotate_log.py --title "asm flag outputs" "$log"
+        exit 1
   codegen-a:
     name: Codegen and runtime contracts (shard a of 2)
     runs-on: ubuntu-24.04

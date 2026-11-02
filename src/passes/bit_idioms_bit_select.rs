@@ -320,3 +320,392 @@ pub(super) fn fold_bit_select(
         _ => None,
     }
 }
+
+/// Target-aware shared-mask selection.
+///
+/// The single-use matcher above deliberately refuses a one-hot mask that has
+/// several readers: rewriting just one reader can leave the mask live and turn
+/// a cheap logic op into a bit instruction without a net win.  On x86, however,
+/// `bts`/`btr`/`btc`/`bt` consume the index directly.  If *every* reader of the
+/// mask (through copies, complements, and test-ands) is a member of this family,
+/// the whole group can be rewritten atomically: the mask and its internal
+/// producers die, and no reader is left paying for a materialized mask.
+///
+/// This is intentionally not done on AArch64/RISC-V: their lowerings rebuild a
+/// one-hot mask for each bit operation, so sharing the mask is the better shape.
+/// The pass is all-or-nothing per mask.  One escaping store, call, phi, inline
+/// asm, or non-bit reader refuses the entire group rather than duplicating work.
+pub(super) fn fold_shared_bit_select(func: &mut IrFunction) -> usize {
+    use crate::common::types::target_arch_name;
+
+    if !matches!(target_arch_name(), "x86-64" | "i686") {
+        return 0;
+    }
+    let max_id = func.max_value_id();
+    if func.next_value_id == u32::MAX || max_id > 1_000_000 {
+        return 0;
+    }
+    let len = max_id as usize + 1;
+    let mut def_loc = vec![None; len];
+    let mut ambiguous = vec![false; len];
+    let mut uses = vec![Vec::new(); len];
+    let mut candidates = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let loc = SharedLoc {
+                block: bi,
+                inst: Some(ii),
+            };
+            if let Some(dest) = inst.dest() {
+                let id = dest.0 as usize;
+                if def_loc[id].is_some() {
+                    ambiguous[id] = true;
+                } else {
+                    def_loc[id] = Some(loc);
+                }
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    uses[v.0 as usize].push(loc);
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                uses[v.0 as usize].push(loc);
+            });
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Shl,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
+                if native_bit_width(*ty)
+                    && const_in_ring(*lhs, ty.size() * 8) == Some(1)
+                    && !ambiguous[dest.0 as usize]
+                {
+                    let index = forward_shared_index(*rhs, func, &def_loc);
+                    candidates.push(SharedCandidate {
+                        value: dest.0,
+                        index,
+                        ty: *ty,
+                    });
+                }
+            }
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                uses[v.0 as usize].push(SharedLoc {
+                    block: bi,
+                    inst: None,
+                });
+            }
+        });
+    }
+
+    let mut changes = 0;
+    for cand in candidates {
+        if ambiguous[cand.value as usize] {
+            continue;
+        }
+        let Some(rewrites) = analyze_shared_candidate(func, &uses, &ambiguous, &cand) else {
+            continue;
+        };
+        for (loc, inst) in rewrites {
+            let Some(ii) = loc.inst else { continue };
+            func.blocks[loc.block].instructions[ii] = inst;
+            changes += 1;
+        }
+    }
+    changes
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SharedLoc {
+    block: usize,
+    inst: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct SharedCandidate {
+    value: u32,
+    index: Operand,
+    ty: IrType,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedKind {
+    Mask,
+    Complement,
+    TestAnd,
+}
+
+fn forward_shared_index(
+    mut op: Operand,
+    func: &IrFunction,
+    def_loc: &[Option<SharedLoc>],
+) -> Operand {
+    for _ in 0..32 {
+        let Operand::Value(v) = op else { break };
+        let next = def_loc.get(v.0 as usize).and_then(|o| *o).and_then(|l| {
+            let ii = l.inst?;
+            match &func.blocks[l.block].instructions[ii] {
+                Instruction::Cast {
+                    src,
+                    from_ty,
+                    to_ty,
+                    ..
+                } if from_ty.is_integer() && to_ty.is_integer() => Some(*src),
+                Instruction::Copy { src, .. } => Some(*src),
+                _ => None,
+            }
+        });
+        match next {
+            Some(src) => op = src,
+            None => break,
+        }
+    }
+    op
+}
+
+fn shared_group_operand(op: Operand, kind: &[Option<SharedKind>]) -> bool {
+    match op {
+        Operand::Value(v) => kind.get(v.0 as usize).and_then(|k| *k).is_some(),
+        Operand::Const(_) => false,
+    }
+}
+
+/// Prove that every reader of `cand` is a bit-family consumer, and return the
+/// consumer rewrites.  Internal copies/complements/test-ands are closed over;
+/// any escaping or non-bit reader returns `None` for the whole group.
+fn analyze_shared_candidate(
+    func: &IrFunction,
+    uses: &[Vec<SharedLoc>],
+    ambiguous: &[bool],
+    cand: &SharedCandidate,
+) -> Option<Vec<(SharedLoc, Instruction)>> {
+    use crate::common::fx_hash::FxHashMap;
+
+    let len = ambiguous.len();
+    let bits = cand.ty.size() * 8;
+    let all_ones = u64::MAX >> (64 - bits);
+    let mut kind = vec![None; len];
+    let mut testand_base = vec![None; len];
+    let mut queue = vec![cand.value];
+    kind[cand.value as usize] = Some(SharedKind::Mask);
+    let mut rewrites: FxHashMap<SharedLoc, Instruction> = FxHashMap::default();
+
+    while let Some(v) = queue.pop() {
+        let k = kind[v as usize]?;
+        for &loc in &uses[v as usize] {
+            let ii = loc.inst?;
+            let inst = &func.blocks[loc.block].instructions[ii];
+            if rewrites.contains_key(&loc) {
+                return None;
+            }
+            macro_rules! enqueue {
+                ($dest:expr, $new_kind:expr, $base:expr) => {{
+                    let dest: Value = $dest;
+                    let new_kind: SharedKind = $new_kind;
+                    let base: Option<Operand> = $base;
+                    let id = dest.0 as usize;
+                    if ambiguous[id] {
+                        return None;
+                    }
+                    match kind[id] {
+                        Some(existing) if existing != new_kind => return None,
+                        Some(_) => {}
+                        None => {
+                            kind[id] = Some(new_kind);
+                            if new_kind == SharedKind::TestAnd {
+                                testand_base[id] = base;
+                            }
+                            queue.push(dest.0);
+                        }
+                    }
+                }};
+            }
+            match (k, inst) {
+                (SharedKind::Mask, Instruction::Copy { dest, src }) if matches!(src, Operand::Value(x) if x.0 == v) =>
+                {
+                    enqueue!(*dest, SharedKind::Mask, None);
+                }
+                (SharedKind::Complement, Instruction::Copy { dest, src }) if matches!(src, Operand::Value(x) if x.0 == v) =>
+                {
+                    enqueue!(*dest, SharedKind::Complement, None);
+                }
+                (SharedKind::TestAnd, Instruction::Copy { dest, src }) if matches!(src, Operand::Value(x) if x.0 == v) =>
+                {
+                    let base = testand_base[v as usize];
+                    enqueue!(*dest, SharedKind::TestAnd, base);
+                }
+                (
+                    SharedKind::Mask,
+                    Instruction::UnaryOp {
+                        dest,
+                        op: IrUnaryOp::Not,
+                        src,
+                        ty,
+                    },
+                ) if *ty == cand.ty && matches!(src, Operand::Value(x) if x.0 == v) => {
+                    enqueue!(*dest, SharedKind::Complement, None);
+                }
+                (
+                    SharedKind::Mask,
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Xor,
+                        lhs,
+                        rhs,
+                        ty,
+                    },
+                ) if *ty == cand.ty => {
+                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
+                        rhs
+                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
+                        lhs
+                    } else {
+                        return None;
+                    };
+                    if const_in_ring(*other, bits) == Some(all_ones) {
+                        enqueue!(*dest, SharedKind::Complement, None);
+                    } else if !shared_group_operand(*other, &kind) {
+                        rewrites.insert(
+                            loc,
+                            Instruction::BinOp {
+                                dest: *dest,
+                                op: IrBinOp::BitToggle,
+                                lhs: *other,
+                                rhs: cand.index,
+                                ty: cand.ty,
+                            },
+                        );
+                    } else {
+                        return None;
+                    }
+                }
+                (
+                    SharedKind::Mask,
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::And,
+                        lhs,
+                        rhs,
+                        ty,
+                    },
+                ) if *ty == cand.ty => {
+                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
+                        rhs
+                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
+                        lhs
+                    } else {
+                        return None;
+                    };
+                    if shared_group_operand(*other, &kind) {
+                        return None;
+                    }
+                    enqueue!(*dest, SharedKind::TestAnd, Some(*other));
+                }
+                (
+                    SharedKind::Mask,
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Or,
+                        lhs,
+                        rhs,
+                        ty,
+                    },
+                ) if *ty == cand.ty => {
+                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
+                        rhs
+                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
+                        lhs
+                    } else {
+                        return None;
+                    };
+                    if shared_group_operand(*other, &kind) {
+                        return None;
+                    }
+                    rewrites.insert(
+                        loc,
+                        Instruction::BinOp {
+                            dest: *dest,
+                            op: IrBinOp::BitSet,
+                            lhs: *other,
+                            rhs: cand.index,
+                            ty: cand.ty,
+                        },
+                    );
+                }
+                (
+                    SharedKind::Complement,
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::And,
+                        lhs,
+                        rhs,
+                        ty,
+                    },
+                ) if *ty == cand.ty => {
+                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
+                        rhs
+                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
+                        lhs
+                    } else {
+                        return None;
+                    };
+                    if shared_group_operand(*other, &kind) {
+                        return None;
+                    }
+                    rewrites.insert(
+                        loc,
+                        Instruction::BinOp {
+                            dest: *dest,
+                            op: IrBinOp::BitClear,
+                            lhs: *other,
+                            rhs: cand.index,
+                            ty: cand.ty,
+                        },
+                    );
+                }
+                (
+                    SharedKind::TestAnd,
+                    Instruction::Cmp {
+                        dest,
+                        op: IrCmpOp::Ne,
+                        lhs,
+                        rhs,
+                        ty,
+                    },
+                ) if *ty == cand.ty => {
+                    let other = if matches!(lhs, Operand::Value(x) if x.0 == v) {
+                        rhs
+                    } else if matches!(rhs, Operand::Value(x) if x.0 == v) {
+                        lhs
+                    } else {
+                        return None;
+                    };
+                    if const_in_ring(*other, bits) != Some(0) {
+                        return None;
+                    }
+                    let base = testand_base[v as usize]?;
+                    rewrites.insert(
+                        loc,
+                        Instruction::BinOp {
+                            dest: *dest,
+                            op: IrBinOp::BitTest,
+                            lhs: base,
+                            rhs: cand.index,
+                            ty: cand.ty,
+                        },
+                    );
+                }
+                _ => return None,
+            }
+        }
+    }
+    if rewrites.len() < 2 {
+        return None;
+    }
+    Some(rewrites.into_iter().collect())
+}

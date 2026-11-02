@@ -5,6 +5,7 @@ use super::emit::{ArmCodegen, is_arm_fp_reg};
 use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::CodegenState;
+use crate::common::asm_constraints::aarch64_flag_condition;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
 
@@ -71,8 +72,13 @@ impl InlineAsmEmitter for ArmCodegen {
             let normalized = normalize_aarch64_register(reg_name);
             return AsmOperandKind::Specific(normalized);
         }
-        // TODO: ARM =@cc not fully implemented — needs CSET/CSINC in store_output_from_reg.
-        // Currently stores incorrect results (just a GP register value, no condition capture).
+        // `=@cc<cond>` flag outputs: a `ConditionCode` operand owns a GP scratch
+        // register that the template is not allowed to name, and
+        // `store_output_from_reg` materialises the condition into it with
+        // `CSET` before storing. The suffix is validated while parsing against
+        // `asm_constraints::AARCH64_FLAG_CONDITIONS` (the ARM `ConditionHolds`
+        // names GCC accepts here), so every `cond` that reaches this point has
+        // a `CSET` spelling.
         if let Some(cond) = c.strip_prefix("@cc") {
             return AsmOperandKind::ConditionCode(cond.to_string());
         }
@@ -554,6 +560,34 @@ impl InlineAsmEmitter for ArmCodegen {
         if matches!(op.kind, AsmOperandKind::Memory) {
             return;
         }
+        // `=@cc<cond>` flag output: the template left the condition in NZCV and
+        // the operand's own value is that condition, not a register. GCC builds
+        // it with `CSET w<n>, <cond>` (the architectural alias for
+        // `CSINC Wd, WZR, WZR, invert(cond)`), which is why the constraint
+        // carries an ARM `ConditionHolds` name rather than an x86 suffix.
+        //
+        // Nothing can have written NZCV between the template and this call:
+        // phase 4 stores outputs in operand order and every other store is a
+        // `str`/`fmov`/`ldr`+`str` sequence, none of which touch the flag bank,
+        // so the first flag output still reads the flags the template produced.
+        // `CSET` leaves NZCV alone in turn, so a second flag output in the same
+        // statement reads the same condition.
+        //
+        // The register name is used in its `w` form: `CSET` has no 64-bit form,
+        // and writing `w<n>` zero-extends into `x<n>`, so the generic output
+        // store below (which stores the whole x-register) writes a clean 0/1.
+        if let AsmOperandKind::ConditionCode(ref cond) = op.kind {
+            let Some(arm_cond) = aarch64_flag_condition(cond) else {
+                // Unreachable: the parser rejects every suffix this table
+                // does not contain. Emitting nothing is still strictly better
+                // than storing a stale register as the result of the asm, so
+                // the branch stays as the fail-closed form.
+                return;
+            };
+            let w_reg = Self::to_w_reg(&op.reg);
+            self.state
+                .emit_fmt(format_args!("    cset {}, {}", w_reg, arm_cond));
+        }
         let reg = &op.reg;
         let is_fp = is_arm_fp_reg(reg);
         if let Some(slot) = self.state.get_slot(ptr.0) {
@@ -760,4 +794,83 @@ fn has_contiguous_ones(element: u64, size: u32) -> bool {
     let rotated = ((val >> 1) | ((val & 1) << (size - 1))) & mask;
     let transitions = val ^ rotated;
     transitions.count_ones() == 2
+}
+
+#[cfg(test)]
+mod flag_output_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    /// Build the operand shape `classify_constraint` produces for `=@cc<cond>`
+    /// and the register `assign_scratch_reg` hands it.
+    fn cc_operand(cond: &str, reg: &str, ty: IrType) -> AsmOperand {
+        let mut op = AsmOperand::new(AsmOperandKind::ConditionCode(cond.to_string()), None);
+        op.reg = reg.to_string();
+        op.operand_type = ty;
+        op
+    }
+
+    /// The operand's value is the CONDITION, not whatever the template left in
+    /// the scratch register: `CSET` must be emitted, in its `w` form, before
+    /// the ordinary store.
+    #[test]
+    fn flag_output_materialises_the_condition_with_cset() {
+        let mut cg = ArmCodegen::new();
+        cg.state.value_locations.insert(7, StackSlot(-16));
+        cg.state.asm_output_values.insert(7);
+        let op = cc_operand("eq", "x9", IrType::I32);
+        cg.store_output_from_reg(&op, &Value(7), "=@cceq", &["x9"]);
+        let buf = cg.state.out.buf.clone();
+        let cset = buf
+            .find("cset w9, eq")
+            .unwrap_or_else(|| panic!("no `cset w9, eq` in: {buf}"));
+        let str_at = buf
+            .find("str x9, [sp")
+            .or_else(|| buf.find("str x9,"))
+            .unwrap_or_else(|| panic!("flag output was not stored: {buf}"));
+        assert!(cset < str_at, "CSET must precede the store: {buf}");
+    }
+
+    /// Every accepted suffix is spelled the way `CSET` expects: no translation
+    /// table, no `hs`→`cs` rewriting.
+    #[test]
+    fn every_accepted_condition_is_emitted_verbatim() {
+        for cond in crate::common::asm_constraints::AARCH64_FLAG_CONDITIONS {
+            let mut cg = ArmCodegen::new();
+            cg.state.value_locations.insert(1, StackSlot(-8));
+            let op = cc_operand(cond, "x10", IrType::I32);
+            cg.store_output_from_reg(&op, &Value(1), "=@cc", &["x10"]);
+            let buf = &cg.state.out.buf;
+            assert!(
+                buf.contains(&format!("cset w10, {cond}")),
+                "{cond} must be emitted verbatim: {buf}"
+            );
+        }
+    }
+
+    /// A suffix the table does not contain cannot have passed the parser; the
+    /// store must then emit nothing rather than store a stale register.
+    #[test]
+    fn unknown_condition_emits_nothing() {
+        let mut cg = ArmCodegen::new();
+        cg.state.value_locations.insert(3, StackSlot(-8));
+        let op = cc_operand("z", "x9", IrType::I32);
+        cg.store_output_from_reg(&op, &Value(3), "=@ccz", &["x9"]);
+        assert!(cg.state.out.buf.is_empty(), "got: {}", cg.state.out.buf);
+    }
+
+    /// `x`-form to `w`-form, and nothing else.
+    #[test]
+    fn to_w_reg_covers_the_register_forms_the_allocator_returns() {
+        for (from, want) in [
+            ("x0", "w0"),
+            ("x9", "w9"),
+            ("x30", "w30"),
+            ("w9", "w9"),
+            ("v16", "v16"),
+            ("sp", "sp"),
+        ] {
+            assert_eq!(ArmCodegen::to_w_reg(from), want, "{from}");
+        }
+    }
 }

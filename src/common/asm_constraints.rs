@@ -179,6 +179,44 @@ pub fn cond_code(gcc_suffix: &str) -> Option<&'static CondCode> {
     CONDITION_CODES.iter().find(|c| c.gcc == gcc_suffix)
 }
 
+/// AArch64 condition suffixes accepted after `@cc` in a flag output.
+///
+/// GCC documents the AArch64 flag outputs as "the standard conditions defined
+/// in the ARM ARM for `ConditionHolds`", and the set it actually accepts is the
+/// sixteen orderable conditions below: the four NZCV tests (`eq`, `ne`, `mi`,
+/// `pl`), the two carry tests with both of their architectural spellings
+/// (`cs`/`hs` for "carry set", `cc`/`lo` for "carry clear"), the two overflow
+/// tests (`vs`, `vc`), and the six unsigned/signed relation pairs
+/// (`hi`/`ls`, `ge`/`lt`, `gt`/`le`).
+///
+/// `al` and `nv` are deliberately absent. They are ARM `ConditionHolds`
+/// conditions, but they are not *flag tests* -- `al` is "always" and `nv` is a
+/// behavioural `udf` -- so a `cset`-based materialisation of either is
+/// meaningless. GCC rejects both in this position, which keeps the rule this
+/// table encodes simple: every suffix that passes the parser has a `CSET`
+/// spelling, and every suffix the parser rejects is one GCC rejects too.
+///
+/// Unlike `CONDITION_CODES` (the x86 table) the entries carry no `setcc`/`jcc`
+/// spelling: AArch64 has no condition-code *register* to snapshot, so a flag
+/// output there is a `CSET` reading NZCV directly, and the suffix itself *is*
+/// the instruction's condition field.
+pub const AARCH64_FLAG_CONDITIONS: [&str; 16] = [
+    "eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le",
+];
+
+/// Look up an AArch64 `@cc` suffix.
+///
+/// Returns the suffix unchanged (it is already the `CSET` condition field) when
+/// the target accepts it, `None` otherwise. Linear scan over sixteen `&str`
+/// comparisons, executed once per flag-output operand: cheaper than building a
+/// match with sixteen arms and identical in effect.
+pub fn aarch64_flag_condition(suffix: &str) -> Option<&'static str> {
+    AARCH64_FLAG_CONDITIONS
+        .iter()
+        .find(|c| **c == suffix)
+        .copied()
+}
+
 /// Invert a full `jcc` mnemonic (`"je"` -> `"jne"`, `"jc"` -> `"jnc"`, ...).
 pub fn inverse_jcc(jcc: &str) -> Option<&'static str> {
     CONDITION_CODES
@@ -190,6 +228,47 @@ pub fn inverse_jcc(jcc: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AArch64 flag-output table is a closed set: every entry maps to
+    /// itself (the suffix *is* the `CSET` condition field), nothing else is
+    /// accepted, and the x86 spellings (`z`, `nz`, `nbe`, ...) deliberately do
+    /// not appear in it.
+    #[test]
+    fn aarch64_flag_conditions_are_the_cset_set() {
+        for c in AARCH64_FLAG_CONDITIONS {
+            assert_eq!(aarch64_flag_condition(c), Some(c), "{c}");
+        }
+        for bad in [
+            "", "z", "nz", "e", "nbe", "nae", "al", "nv", "pe", "po", "EQ", "eqq", "eq ",
+        ] {
+            assert_eq!(aarch64_flag_condition(bad), None, "{bad:?}");
+        }
+        // The two tables overlap on purpose (`ne`, `ge`, `le` are the same
+        // words on both targets) but never on a spelling that means something
+        // *different* on the other target; each aarch64 entry is exactly the
+        // `ConditionHolds` name, so the value returned is the input.
+        for (suffix, cset) in [
+            ("ne", "ne"),
+            ("ge", "ge"),
+            ("le", "le"),
+            ("hs", "hs"),
+            ("lo", "lo"),
+        ] {
+            assert_eq!(aarch64_flag_condition(suffix), Some(cset));
+        }
+        // Conversely, the x86-only spellings are not ARM conditions, so a
+        // program that says `=@ccz` is rejected on AArch64 and one that says
+        // `=@cchs` is rejected on x86 -- neither is silently reinterpreted.
+        // (`ne`, `ge` and `le` are shared words; `z`, `nz`, `nbe`, `nae`,
+        // `nl`, `nle`, `ng`, `np` are x86-only.)
+        for x86_only in ["z", "nz", "nbe", "nae", "nl", "nle", "ng", "np"] {
+            assert_eq!(aarch64_flag_condition(x86_only), None, "{x86_only}");
+            assert!(
+                cond_code(x86_only).is_some(),
+                "{x86_only} must stay an x86 suffix"
+            );
+        }
+    }
 
     #[test]
     fn named_matching_names_cover_the_measured_gcc_spellings() {
