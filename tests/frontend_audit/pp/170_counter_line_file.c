@@ -8,4 +8,7 @@ __LINE__ L
 #line 600 "renamed.c"
 __FILE__ __LINE__
 __STDC_VERSION__ __STDC_HOSTED__
-__DATE__ __TIME__
+/* __DATE__ / __TIME__ expand to the wall clock, so a case that compared
+   them would fail whenever the three compilers ran in different seconds.
+   Their contents are covered by the predefined-macro unit tests. */
+__STDC_HOSTED__
