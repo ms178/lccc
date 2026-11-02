@@ -194,7 +194,7 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
             // "assembler rejects a legal frame, or worse encodes it relative to
             // the wrong anchor" failure mode. Fail loudly instead.
             match out.slot_operand_parts_opt(*slot_offset) {
-                Some((disp, base)) => format!("{}{}", disp, base),
+                Some((disp, base)) => format!("{}{}", disp, base.spelling()),
                 None => unreachable!(
                     "MachInst stack slot {slot_offset} has no imm32 displacement; \
                      flush_machinst must replay this window through the accumulator path"
@@ -1323,7 +1323,7 @@ pub fn emit_machinst_with_tune(
                 Some((disp, base)) => out.emit_fmt(format_args!(
                     "    leaq {}{}, {}",
                     disp,
-                    base,
+                    base.spelling(),
                     fmt_reg(dst, OpSize::S64)
                 )),
                 None => {

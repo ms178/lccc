@@ -1,6 +1,7 @@
 //! X86Codegen: memory operations (load, store, memcpy, GEP, stack).
 
 use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+use crate::backend::common::SlotBase;
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
@@ -2455,31 +2456,32 @@ impl X86Codegen {
         true
     }
 
-    /// SIB memory operand anchored at the frame register with an alloca slot
-    /// offset: `slot+disp(%rbp/%rsp,%idx,scale)`. Mirrors `slot_ref`'s
-    /// rsp-frame-size adjustment for `use_rsp_addressing` functions. When
-    /// the final displacement is zero on an rbp frame, "0" is kept: a bare
-    /// `(%rbp,%idx,s)` with no displacement is ambiguous in the encoder.
-    fn sib_mem64_frame(&self, slot_off: i64, index_reg: &str, shift: u8, disp: i64) -> String {
+    /// SIB memory operand anchored at a frame register:
+    /// `disp(%rbp/%rsp, %idx, scale)`, with the base and displacement already
+    /// resolved by `AsmOutput::slot_operand_parts_opt`.
+    ///
+    /// `disp` must be an `imm32`: the SIB encoding has no other form. The
+    /// caller enforces that before building the operand, which is what keeps a
+    /// >2 GiB frame from emitting `-3221225544(%rbp, %r11)` -- a displacement
+    /// the assembler rejects outright. `huge_frame_runtime.c` produces exactly
+    /// that at -O1, where the pointer walk over a 3 GiB object folds into one
+    /// SIB access.
+    ///
+    /// A zero displacement is spelled out on an `%rbp` base: a bare
+    /// `(%rbp,%idx,s)` with mod=00 relocates the base to RIP. On an `%rsp` base
+    /// SIB is unambiguous, so `0` is omitted.
+    fn sib_mem64_frame(disp: i64, base: SlotBase, index_reg: &str, shift: u8) -> String {
+        debug_assert!(
+            i32::try_from(disp).is_ok(),
+            "SIB frame displacement {disp} does not fit imm32"
+        );
         // NOTE: no leading '%' — the format literals below supply it
         // (`%{}`), matching phys_reg_name's no-prefix convention.
-        let frame = if self.state.out.use_rsp_addressing {
-            "rsp"
-        } else {
-            "rbp"
-        };
-        let off = if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size + slot_off
-        } else {
-            slot_off
-        } + disp;
-        // On an rbp frame the displacement is always materialised: a bare
-        // `(%rbp,%idx,s)` with mod=00 would relocate the base to RIP. On an
-        // rsp frame SIB base=rsp is unambiguous, so 0 can be omitted.
-        let d = if off == 0 && frame == "rsp" {
+        let frame = base.name();
+        let d = if disp == 0 && base == SlotBase::StackPointer {
             String::new()
         } else {
-            format!("{}", off)
+            format!("{}", disp)
         };
         if shift == 0 {
             format!("{}(%{}, %{})", d, frame, index_reg)
@@ -2489,8 +2491,16 @@ impl X86Codegen {
     }
 
     /// Alloca-base arm for indexed addressing: the base is a frame slot
-    /// (Direct), the SIB anchors at %rbp/%rsp. Returns None when the base is
-    /// not a plain Direct alloca slot (register-held, Indirect, OverAligned).
+    /// (Direct), the SIB anchors at `%rbp` or `%rsp`. Returns None when the
+    /// base is not a plain Direct alloca slot (register-held, Indirect,
+    /// OverAligned) or when no `imm32` displacement can name the slot.
+    ///
+    /// The displacement comes from the *same* splitter the plain slot operands
+    /// use, so the omitted frame pointer, the `%rsp` anchor of a >2 GiB frame
+    /// and the live push delta all apply here for free, and the imm32 rule is
+    /// stated exactly once. Refusing is the supported answer: the caller
+    /// rematerialises the skipped GEP (`IndexedGepInfo::orig_offset`) and the
+    /// access goes through a computed address instead.
     fn frame_sib_for_alloca_base(
         &self,
         base: &Value,
@@ -2504,7 +2514,15 @@ impl X86Codegen {
         }
         match self.state.resolve_slot_addr(base.0) {
             Some(SlotAddr::Direct(slot)) => {
-                Some(self.sib_mem64_frame(slot.0 as i64, phys_reg_name(idx_reg), shift, disp))
+                let (off, anchor) = self.state.out.slot_operand_parts_opt(slot.0 as i64)?;
+                let off = off.checked_add(disp)?;
+                i32::try_from(off).ok()?;
+                Some(Self::sib_mem64_frame(
+                    off,
+                    anchor,
+                    phys_reg_name(idx_reg),
+                    shift,
+                ))
             }
             _ => None,
         }
@@ -2524,12 +2542,13 @@ impl X86Codegen {
     ) -> Option<String> {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
             // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            // Resolve the operand FIRST: `ensure_sib_index_form` emits a fixup
+            // instruction, and a refusal must not leave half an access behind.
+            let mem = self.frame_sib_for_alloca_base(base, index, shift, disp)?;
             if !self.ensure_sib_index_form(index) {
                 return None;
             }
-            return self
-                .frame_sib_for_alloca_base(base, index, shift, disp)
-                .map(|mem| format!("{seg}{mem}"));
+            return Some(format!("{seg}{mem}"));
         };
         if is_xmm_reg(b)
             || self
