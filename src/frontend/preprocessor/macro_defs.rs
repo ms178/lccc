@@ -677,7 +677,10 @@ impl MacroTable {
     /// time the pipeline asked. Draining it means the diagnostic is emitted once,
     /// at the first use, however many times the macros expand afterwards.
     pub(super) fn take_invalid_source_date_epoch(&self) -> bool {
-        self.sde_invalid.replace(false)
+        // Read before writing: the pipeline asks once per line, and the store
+        // has no business running on the lines that are not the one that use the
+        // macro.
+        self.sde_invalid.get() && self.sde_invalid.replace(false)
     }
 
     /// Get the current __FILE__ macro body.
