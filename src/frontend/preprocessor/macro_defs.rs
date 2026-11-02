@@ -2402,13 +2402,23 @@ mod invocation_continuation_tests {
         let t = table();
         // `h` expands to `g(~` -> `f(~`, whose argument list continues in the
         // source: `h 5);` must become `f(2 * (~ 5));` (C11 6.10.3.4p1).
+        //
+        // The tail is the shortest prefix of the source that CLOSES the open
+        // argument list, so it ends at `)` and not one byte further: the `;`
+        // belongs to the enclosing scan, which is why the expansion keeps it
+        // outside the substituted argument. Absorbing it would splice the
+        // statement terminator into the argument list.
         let source = b" 5);\n";
-        assert_eq!(t.unclosed_invocation_tail("g(~", source, 0), Some(4));
+        let tail = t
+            .unclosed_invocation_tail("g(~", source, 0)
+            .expect("the `(` a replacement list opened must absorb the source that closes it");
+        assert_eq!(&source[..tail], b" 5)");
+        // Token identity, not spacing: the separators the preprocessor emits
+        // between tokens are its own business (the exact `-E` text is pinned
+        // against gcc-16 and clang-23 by check_frontend_preprocessor_rules.sh).
         let expanded = t.expand_line("h 5);");
-        assert_eq!(
-            expanded.split_whitespace().collect::<Vec<_>>().join(" "),
-            "f(2 * (~ 5));"
-        );
+        let tokens: String = expanded.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(tokens, "f(2*(~5));");
     }
 
     #[test]

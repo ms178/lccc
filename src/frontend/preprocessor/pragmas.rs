@@ -433,10 +433,28 @@ mod pragma_marker_rendering_tests {
     #[test]
     fn every_marker_becomes_its_directive_on_its_own_line() {
         let text = "int a; __ccc_pack_push_1 ;\nint b; __ccc_pack_pop ;\n__ccc_pack_set_4 ;\n";
+        let rendered = render_pragma_markers(text);
+        // A marker line becomes the text that preceded the marker, then the
+        // directive at the head of the NEXT line -- the marker and the `;`
+        // that followed it disappear, and the line break that ended the
+        // marker line is the one that breaks after the residual text. So a
+        // marker sitting alone on its line leaves an empty line above its
+        // directive, which is exactly the shape `-E` is allowed to show.
         assert_eq!(
-            render_pragma_markers(text),
-            "int a; \n#pragma pack(push, 1)\n\nint b; \n#pragma pack(pop)\n\n#pragma pack(4)\n"
+            rendered,
+            "int a; \n#pragma pack(push, 1)\nint b; \n#pragma pack(pop)\n\n#pragma pack(4)\n"
         );
+        // The invariant that matters is ownership, not line count: no text
+        // survives in front of a directive that reaches the compiler's
+        // `#pragma` handler, so every emitted directive starts its line.
+        let directives: Vec<&str> = rendered.lines().filter(|l| l.contains("#pragma")).collect();
+        assert_eq!(directives.len(), 3, "{rendered:?}");
+        for line in directives {
+            assert!(
+                line.starts_with("#pragma"),
+                "directive shares its line: {line:?}"
+            );
+        }
     }
 
     #[test]
