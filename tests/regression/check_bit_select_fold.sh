@@ -263,7 +263,7 @@ guarded_set 3 11
 select_clear 3 12
 msb_test 9 11
 not_test 4 8
-keep_sext_mask 9 9
+keep_sext_mask 8 8
 ROWS
 want rows-on.s test_clear 'btr[lq][[:space:]]'
 want rows-on.s test_set 'bts[lq][[:space:]]'
