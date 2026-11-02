@@ -80,48 +80,51 @@ fn push_u8_decimal(out: &mut String, b: u8) {
     }
 }
 
-/// Read only the prefix of `path` that `#embed` can possibly emit:
-/// `offset + limit` bytes when a limit is present (the expansion skips
-/// `offset` and takes at most `limit`), the whole file otherwise. This is
-/// the bounded-I/O contract of the directive — embedding a 16-byte header
-/// of a multi-megabyte blob must not slurp the blob — while leaving the
-/// offset/limit slicing to `expand_embed_bytes` (exactly one owner of that
-/// arithmetic; a second offset here double-skipped and truncated output).
-/// The read loop tolerates short reads and EINTR per POSIX.
+/// Read exactly the byte range `#embed` can emit, starting at `offset` and
+/// stopping at `limit` or EOF. Seeking to the offset avoids reading and
+/// retaining a potentially huge prefix just to discard it during expansion;
+/// it also avoids `offset + limit` overflow turning a huge offset into a
+/// whole-file read. The open file's size bounds allocation, and the read loop
+/// tolerates short reads and EINTR.
 fn read_embed_bounded(
     path: &std::path::Path,
     offset: usize,
     limit: Option<usize>,
 ) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
-    let Some(n) = limit.map(|l| offset.saturating_add(l)) else {
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        return Ok(buf);
-    };
-    // CLAMP BEFORE ALLOCATING: `limit` is user-controlled and may be
-    // u64::MAX; `offset.saturating_add(limit)` only protects the
-    // arithmetic, not the allocation. An unclamped `vec![0u8; n]`
-    // turns one line of hostile C into a capacity-overflow ICE or an
-    // uncapturable allocator abort — the exact crash class this
-    // compiler exists to eliminate. The file can never deliver more
-    // than its size, so cap the buffer there (fstat on the open fd:
-    // one syscall, no extra path walk).
-    let size = usize::try_from(f.metadata()?.len()).unwrap_or(usize::MAX);
-    let n = n.min(size);
-    let mut buf = vec![0u8; n];
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let offset = u64::try_from(offset).unwrap_or(u64::MAX);
+    let available = file_size.saturating_sub(offset);
+    let limit = limit.map_or(available, |n| {
+        available.min(u64::try_from(n).unwrap_or(u64::MAX))
+    });
+    let len = usize::try_from(limit).map_err(|e| {
+        std::io::Error::other(format!("#embed range does not fit address space: {e}"))
+    })?;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|e| std::io::Error::other(format!("unable to allocate #embed range: {e}")))?;
+    bytes.resize(len, 0);
+
     let mut filled = 0usize;
-    while filled < n {
-        match f.read(&mut buf[filled..]) {
+    while filled < len {
+        match file.read(&mut bytes[filled..]) {
             Ok(0) => break,
-            Ok(k) => filled += k,
+            Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
-    buf.truncate(filled);
-    Ok(buf)
+    bytes.truncate(filled);
+    Ok(bytes)
 }
 
 /// Parse a C integer preprocessing number or character literal as used in
@@ -1184,11 +1187,11 @@ impl Preprocessor {
         Some((text, remainder))
     }
 
-    /// Resolve and read an `#embed` resource, bounded by the parameters:
-    /// with `limit(N)` only the needed prefix is read from disk (large
-    /// binary resources must not pay O(file) I/O for a small slice); with
-    /// `clang::offset(K)` the read starts at K. Missing or unreadable
-    /// resources diagnose `'FILE' file not found` and yield None.
+    /// Resolve and read an `#embed` resource, bounded by its parameters:
+    /// `clang::offset(K)` seeks directly to K and `limit(N)` caps the bytes
+    /// read there, so a small slice of a large resource does not pay O(offset)
+    /// I/O or allocate the discarded prefix. Missing resources report
+    /// `'FILE' file not found`; other read failures retain their error context.
     fn read_embed_resource(
         &mut self,
         filename: &str,
@@ -1217,30 +1220,28 @@ impl Preprocessor {
         };
         match read_embed_bounded(&resolved, params.offset.unwrap_or(0), params.limit) {
             Ok(b) => Some(b),
-            Err(_) => {
+            Err(error) => {
+                let message = if error.kind() == std::io::ErrorKind::NotFound {
+                    format!("'{}' file not found", filename)
+                } else {
+                    format!("unable to read embedded file '{}': {}", filename, error)
+                };
                 self.errors.push(super::pipeline::PreprocessorDiagnostic {
                     file: self.current_file(),
                     line: line_num,
                     col,
-                    message: format!("'{}' file not found", filename),
+                    message,
                 });
                 None
             }
         }
     }
 
-    /// Shared byte-list builder: clang::offset(N) skips the first N bytes;
-    /// limit bounds the count of what remains; prefix/suffix/if_empty
-    /// applied per C23 6.10.15.
+    /// Shared byte-list builder. `read_embed_bounded` has already applied
+    /// clang::offset(N) and limit(N); prefix/suffix/if_empty are applied here
+    /// per C23 6.10.15.
     fn expand_embed_bytes(&self, bytes: &[u8], params: EmbedParams) -> Option<String> {
-        // clang::offset(N) skips the first N bytes; limit bounds the count
-        // of what remains.
-        let skip = params.offset.unwrap_or(0).min(bytes.len());
-        let remaining = &bytes[skip..];
-        let take = match params.limit {
-            Some(n) if n < remaining.len() => n,
-            _ => remaining.len(),
-        };
+        let take = params.limit.map_or(bytes.len(), |n| n.min(bytes.len()));
         if take == 0 {
             // Empty resource (or limit(0)): the if_empty token sequence,
             // which may itself be empty.
@@ -1254,7 +1255,7 @@ impl Preprocessor {
             out.push_str(p);
         }
         let mut first = true;
-        for &b in &remaining[..take] {
+        for &b in &bytes[..take] {
             if !first {
                 out.push_str(", ");
             }
@@ -1919,18 +1920,51 @@ mod embed_unit_tests {
         let data: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
         std::fs::write(&path, &data).unwrap();
 
-        // Unbounded: whole file.
-        assert_eq!(read_embed_bounded(&path, 0, None).unwrap().len(), 10_000);
-        // Prefix slice: limit bounds the read.
+        // Unbounded: from offset zero through EOF.
+        assert_eq!(read_embed_bounded(&path, 0, None).unwrap(), data);
+        // A limit reads only the requested prefix.
         assert_eq!(read_embed_bounded(&path, 0, Some(4)).unwrap(), data[..4]);
-        // Offset + limit: reads exactly the offset+limit prefix; the
-        // offset slice itself is owned by expand_embed_bytes.
+        // Offset and limit select only the bytes that expansion emits.
         assert_eq!(
             read_embed_bounded(&path, 250, Some(16)).unwrap(),
-            data[..266]
+            data[250..266]
         );
-        // Offset+limit beyond EOF truncates to what exists.
-        assert_eq!(read_embed_bounded(&path, 9_998, Some(16)).unwrap(), data);
+        // An offset past EOF returns no bytes, even when adding the limit
+        // would overflow usize. It must not fall back to reading the file.
+        assert!(
+            read_embed_bounded(&path, usize::MAX, Some(1))
+                .unwrap()
+                .is_empty()
+        );
+        // Offset+limit beyond EOF truncates to the available suffix.
+        assert_eq!(
+            read_embed_bounded(&path, 9_998, Some(16)).unwrap(),
+            data[9_998..]
+        );
+        assert_eq!(
+            read_embed_bounded(&path, 9_998, None).unwrap(),
+            data[9_998..]
+        );
+
+        // A large sparse prefix must not be materialized when only its final
+        // byte is selected. This also catches the old saturating
+        // `offset + limit` path, which returned the entire prefix.
+        use std::io::{Seek, SeekFrom, Write};
+        let sparse_path = dir.join("sparse.bin");
+        let mut sparse = std::fs::File::create(&sparse_path).unwrap();
+        let sparse_len = 8 * 1024 * 1024u64;
+        sparse.set_len(sparse_len).unwrap();
+        sparse.seek(SeekFrom::Start(sparse_len - 1)).unwrap();
+        sparse.write_all(&[0xa5]).unwrap();
+        drop(sparse);
+        assert_eq!(
+            read_embed_bounded(&sparse_path, (sparse_len - 1) as usize, Some(1)).unwrap(),
+            [0xa5]
+        );
+        assert_eq!(
+            read_embed_bounded(&sparse_path, (sparse_len - 1) as usize, None).unwrap(),
+            [0xa5]
+        );
         // Missing file is an error.
         assert!(read_embed_bounded(&dir.join("nope.bin"), 0, Some(1)).is_err());
         std::fs::remove_dir_all(&dir).ok();
