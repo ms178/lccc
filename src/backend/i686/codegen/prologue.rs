@@ -639,6 +639,23 @@ impl I686Codegen {
                 .insert(param_idx, StackSlot(offset));
         }
         let mut space = space + conflict_params.len() as i64 * 4;
+        space = self.allocate_static_chain_homes(func, space);
+        self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
+            func.uses_sret,
+            &func.ret_eightbyte_classes,
+        )
+        .unwrap_or(0);
+        if self.vector_ret_buffer_bytes > 0 {
+            space += self.vector_ret_buffer_bytes as i64;
+            self.vector_ret_buffer_offset = -space;
+        }
+        space
+    }
+
+    // ---- aligned_frame_size ----
+
+    /// Keep chain storage layout separate from general value-slot allocation.
+    fn allocate_static_chain_homes(&mut self, func: &IrFunction, mut space: i64) -> i64 {
         self.incoming_chain_slot = None;
         self.outgoing_chain_slot = None;
         self.pending_static_chain = false;
@@ -662,19 +679,8 @@ impl I686Codegen {
                 }
             }
         }
-        self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
-            func.uses_sret,
-            &func.ret_eightbyte_classes,
-        )
-        .unwrap_or(0);
-        if self.vector_ret_buffer_bytes > 0 {
-            space += self.vector_ret_buffer_bytes as i64;
-            self.vector_ret_buffer_offset = -space;
-        }
         space
     }
-
-    // ---- aligned_frame_size ----
 
     /// Incoming register parameters (fastcall %ecx/%edx slots, or regparm
     /// %eax/%edx/%ecx classes) whose ParamRef destinations share one

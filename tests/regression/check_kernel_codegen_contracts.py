@@ -34,6 +34,20 @@ def run(argv):
     return result.stdout
 
 
+def run_nested_build(argv):
+    # GNU capturing trampolines require executable stack memory. Assert the
+    # security notice if the linker emits one; do NOT suppress it globally or
+    # relax run()'s no-diagnostics contract for any other fixture.
+    result = subprocess.run(list(map(str, argv)), capture_output=True, text=True, timeout=90)
+    assert result.returncode == 0, (argv, result.returncode, result.stdout, result.stderr)
+    assert not result.stdout, (argv, result.stdout)
+    if result.stderr:
+        assert re.fullmatch(
+            r"[^\n]*: warning: [^\n]*: requires executable stack "
+            r"\(because the \.note\.GNU-stack section is executable\)\n?",
+            result.stderr), (argv, result.stderr)
+
+
 def return_thunk_flags(compiler):
     """Request the same return-thunk contract through each vendor's driver.
 
@@ -104,6 +118,52 @@ def main():
                     assert re.search(r'\b2026\.2(?:\.\d+)?\b', version), ('expected reviewed ICX 2026.2', version)
                 if name == 'clang':
                     assert re.search(r'clang version 23\.1\.4\b', version), ('expected reviewed Clang 23.1.4', version)
+            # Incoming parameters must survive trampoline scratch staging.
+            # Two enclosing calls prevent constant specialization masking the
+            # original O2/Os wrong-code witness. Clang/ICX do not implement GNU
+            # nested functions; GCC 16.2 is the standalone native oracle.
+            if name in STARTS or name == 'gcc':
+                variants = [[]]
+                if architecture == 'x86':
+                    variants.append(['-DTEST_MS_ABI'])
+                elif architecture == 'i686':
+                    variants.append(['-DTEST_FASTCALL'])
+                for variant in variants:
+                    for opt in ('-O0', '-O2', '-Os'):
+                        for frame in ('-fomit-frame-pointer', '-fno-omit-frame-pointer'):
+                            output = work/'nested-live-parameter'
+                            run_nested_build([compiler, opt, frame, *variant, '-Werror',
+                                              '-fno-pie', '-nostdlib', '-static', start,
+                                              HERE/'fixtures/nested_trampoline_live_parameter.c',
+                                              '-o', output])
+                            run(([emulator] if emulator else []) + [output])
+                            checks += 1
+            if name == 'x86':
+                leaf = work/'ms-nonvolatile-leaf.c'
+                leaf.write_text('__attribute__((ms_abi,noinline)) int preserve_leaf(int x) { '
+                                '__asm__ volatile("pxor %%xmm6,%%xmm6" ::: "xmm6"); '
+                                'return x+1; }\n')
+                for opt in ('-O0', '-O2', '-Os'):
+                    assembly = work/'ms-nonvolatile-leaf.s'
+                    run([compiler, opt, '-fno-pie', '-S', leaf, '-o', assembly])
+                    body = assembly.read_text().split('preserve_leaf:', 1)[1]
+                    body = body.split('.size', 1)[0]
+                    depth, established, saved = 0, False, set()
+                    for line in body.splitlines():
+                        if re.search(r'movq\s+%rsp,\s*%rbp', line):
+                            depth, established = 0, True
+                        elif established and re.search(r'pushq\s+%', line):
+                            depth += 8
+                        elif established and (m := re.search(r'subq\s+\$(\d+),\s*%rsp', line)):
+                            depth += int(m[1])
+                        elif established and (m := re.search(r'leaq\s+(-?\d+)\(%rbp\),\s*%rsp', line)):
+                            depth = -int(m[1])
+                        if m := re.search(r'movdqu\s+%xmm(\d+),\s*(-?\d+)\(%rbp\)', line):
+                            reg, displacement = int(m[1]), int(m[2])
+                            assert established and -depth <= displacement and displacement+16 <= 0, (opt, depth, line)
+                            saved.add(reg)
+                    assert 6 in saved, (opt, body)
+                    checks += 1
             # Standalone return-transfer ABI fixture, not Linux kernel code.
             # Linux's runtime patcher requires JMP sites, not Jcc-to-thunk.
             if architecture in ('x86', 'i686'):

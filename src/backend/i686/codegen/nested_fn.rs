@@ -17,6 +17,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::backend::state::StackSlot;
 use crate::emit;
 use crate::ir::reexports::{Operand, Value};
 
@@ -26,11 +27,19 @@ use crate::backend::i686::codegen::emit::I686Codegen;
 static TRAMPOLINE_SITES: AtomicU32 = AtomicU32::new(0);
 
 impl I686Codegen {
+    /// One checked accessor for the homes allocated by the frame-layout pass.
+    fn static_chain_home(&self, incoming: bool) -> StackSlot {
+        let home = if incoming {
+            self.incoming_chain_slot
+        } else {
+            self.outgoing_chain_slot
+        };
+        home.expect("static-chain instructions require an allocated frame home")
+    }
+
     /// Read the chain captured before incoming parameter materialization.
     pub(super) fn emit_get_static_chain_impl(&mut self, dest: &Value) {
-        let slot = self
-            .incoming_chain_slot
-            .expect("GetStaticChain needs a home");
+        let slot = self.static_chain_home(true);
         let home = self.slot_ref(slot);
         emit!(self.state, "    movl {}, %eax", home);
         self.state.reg_cache.invalidate_acc();
@@ -40,9 +49,7 @@ impl I686Codegen {
     /// Preserve the chain until AFTER argument materialization. In particular,
     /// fastcall ECX/EDX parameters must never overwrite it.
     pub(super) fn emit_set_static_chain_impl(&mut self, src: &Operand) {
-        let slot = self
-            .outgoing_chain_slot
-            .expect("SetStaticChain needs a home");
+        let slot = self.static_chain_home(false);
         self.operand_to_eax(src);
         let home = self.slot_ref(slot);
         emit!(self.state, "    movl %eax, {}", home);
@@ -51,9 +58,7 @@ impl I686Codegen {
 
     pub(super) fn emit_pending_static_chain(&mut self, register: &str) {
         if self.pending_static_chain {
-            let slot = self
-                .outgoing_chain_slot
-                .expect("pending static chain needs a home");
+            let slot = self.static_chain_home(false);
             let home = self.slot_ref(slot);
             emit!(self.state, "    movl {}, %{}", home, register);
             self.state.reg_cache.invalidate_all();

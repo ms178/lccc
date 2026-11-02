@@ -574,3 +574,13 @@ full kernel/QEMU job. Its boot annotation is 31040/32768 bytes. This does not
 establish zero kernel diagnostics or boot the newer local source. A fresh
 fetch advanced main from 27ae9f4c6 to ac28d3a24; integration and repeat validation
 of that new main are the next checkpoint, not already counted above.
+
+The supplementary x86-64 nested-capture failure is now repaired (also affected
+SysV): trampoline staging lacked caller-saved liveness clobbers. A further
+Microsoft leaf-frame defect wrote XMM saves below allocated RSP; its new
+assembly contract fails before the repair and passes after. The follow-up
+passes 7672 library tests/10 existing ignores, 332 contracts, the mandatory
+32/64-bit mask gate, parity, CLZ, DWARF, Clippy and strict usercopy. The hosted
+fast-shard census regression is fixed without increasing its baseline. See
+NESTED-TRAMPOLINE-AND-MS-FRAME-REPAIR-2026-11-02.md. A new fetch found main
+1dd907def; that next merge needs its own validation, not borrowed ac28 totals.

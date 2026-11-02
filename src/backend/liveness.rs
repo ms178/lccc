@@ -978,6 +978,10 @@ pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
     let is_32bit = crate::common::types::target_is_32bit();
     match inst {
         Instruction::Call { .. } | Instruction::CallIndirect { .. } => true,
+        // Trampoline construction is not a machine CALL, but its emitters
+        // stage through caller-saved ABI argument registers. An incoming
+        // parameter live past construction must not remain in those homes.
+        Instruction::InitTrampoline { .. } => true,
         // A dynamic-model TLS address that the backend emits as a real call
         // (`common::tls::set_call_sequence_symbols`).
         Instruction::GlobalAddr { name, .. } => crate::common::tls::address_is_call_sequence(name),
@@ -4217,5 +4221,23 @@ mod program_point_capacity_tests {
             None
         );
         assert_eq!(checked_program_point_count([usize::MAX]), None);
+    }
+}
+
+#[cfg(test)]
+mod trampoline_clobber_tests {
+    use super::instruction_is_call_point;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    #[test]
+    fn trampoline_staging_clobbers_but_reading_a_chain_does_not() {
+        assert!(instruction_is_call_point(&Instruction::InitTrampoline {
+            buffer: Value(1),
+            chain: Operand::Value(Value(2)),
+            func: "nested".into(),
+        }));
+        assert!(!instruction_is_call_point(&Instruction::GetStaticChain {
+            dest: Value(3),
+        }));
     }
 }

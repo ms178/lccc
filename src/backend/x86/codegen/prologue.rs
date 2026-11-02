@@ -3121,6 +3121,9 @@ impl X86Codegen {
         if !func.is_variadic
             && !self.func_has_non_tail_calls
             && space == callee_save_reserve
+            // Only GP saves are represented by pushes. Microsoft XMM6-15
+            // homes still require real stack allocation, even in a leaf.
+            && callee_save_reserve == n_callee * 8
             && !self.state.ra_config.no_empty_local_frame_elision
         {
             0

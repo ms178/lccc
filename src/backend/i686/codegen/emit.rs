@@ -2161,8 +2161,8 @@ impl I686Codegen {
         // Capture the target before argument staging can overwrite its home.
         // The generic spill hook is intentionally a no-op on i686; its cdecl
         // layout must not be changed to implement this fastcall-only slot.
-        if indirect {
-            self.emit_load_operand(func_ptr.expect("indirect call requires func_ptr"));
+        if let (Some(pointer), None) = (func_ptr, direct_name) {
+            self.emit_load_operand(pointer);
             self.state.emit("    pushl %eax");
             self.esp_adjust += 4;
         }

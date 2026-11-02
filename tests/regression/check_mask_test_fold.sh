@@ -51,7 +51,29 @@ body() { # <function> <asm file> -> that function's body
 }
 
 cat > "$work/mask.c" <<'EOF'
-#include <stdio.h>
+/* Freestanding output keeps BOTH execution modes independent of host libc
+ * headers/start files. It does not shrink the hash or the probe matrix. */
+static int print_hash(unsigned long hash) {
+    char output[12];
+    int n=0;
+    hash %= 1000000007ul;
+    do { output[n++]=(char)('0'+hash%10); hash/=10; } while(hash);
+    for(int a=0,b=n-1;a<b;++a,--b) {
+        char t=output[a]; output[a]=output[b]; output[b]=t;
+    }
+    output[n++]='\n';
+#if defined(__i386__)
+    long result=4;
+    __asm__ volatile("int $0x80" : "+a"(result)
+                     : "b"(1), "c"(output), "d"(n) : "memory", "cc");
+#else
+    long result=1;
+    __asm__ volatile("syscall" : "+a"(result)
+                     : "D"(1), "S"(output), "d"((long)n)
+                     : "rcx", "r11", "memory", "cc");
+#endif
+    return result!=n;
+}
 
 #define NOINLINE __attribute__((noinline))
 
@@ -97,8 +119,7 @@ int main(void) {
         hash = hash * 131u + (unsigned)negative_i8(x);
         hash = hash * 131u + (unsigned)nonzero_u8(x);
     }
-    printf("%lu\n", hash % 1000000007ul);
-    return 0;
+    return print_hash(hash);
 }
 EOF
 
@@ -147,51 +168,67 @@ if [[ $total_tests -eq 0 ]]; then
         "already fold these consumers. Execution checks below remain authoritative." >&2
 fi
 
-# ── execution: GCC is the oracle in both modes and every level ─────────────
-if timeout 120 "$gcc" -O2 "$work/mask.c" -o "$work/ref64" 2>/dev/null; then
-    expected=$(timeout 60 "$work/ref64")
+# ── execution: mandatory GCC oracle, both modes, every level ───────────────
+# These are user-space, non-kernel fixtures. No multilib libc or dynamic
+# loader is needed; unavailable execution is an error, never a passing skip.
+cat > "$work/start64.S" <<'EOF'
+.text
+.globl _start
+_start:
+call main
+mov %eax,%edi
+mov $60,%eax
+syscall
+.section .note.GNU-stack,"",%progbits
+EOF
+cat > "$work/start32.S" <<'EOF'
+.text
+.globl _start
+_start:
+call main
+mov %eax,%ebx
+mov $1,%eax
+int $0x80
+.section .note.GNU-stack,"",%progbits
+EOF
+run32() {
+    if [[ -n ${LCCC_I686_RUNNER:-} ]]; then
+        timeout 60 "$LCCC_I686_RUNNER" "$1"
+    elif command -v qemu-i386 >/dev/null 2>&1; then
+        timeout 60 qemu-i386 "$1"
+    else
+        timeout 60 "$1"
+    fi
+}
+for mode in 64 32; do
+    flags=(-fno-pie -nostdlib -static)
+    [[ $mode == 64 ]] || flags+=(-m32)
+    timeout 120 "$gcc" "${flags[@]}" -O2 "$work/start$mode.S" "$work/mask.c" -o "$work/ref$mode"
+    if [[ $mode == 64 ]]; then
+        expected=$(timeout 60 "$work/ref$mode")
+    else
+        expected=$(run32 "$work/ref$mode")
+    fi
+    [[ $expected =~ ^[0-9]+$ ]] || { echo "FAIL: invalid $mode-bit oracle output" >&2; exit 1; }
+    arch=x86-64
+    [[ $mode == 64 ]] || arch=i686
     for opt in -O0 -O1 -O2 -O3 -Os; do
-        if ! timeout 120 "$ccc" -march=x86-64 "$opt" "$work/mask.c" -o "$work/chk64" 2>/dev/null; then
-            echo "FAIL: x86-64 build failed at $opt" >&2
-            fail=1
-            continue
+        timeout 120 "$ccc" "${flags[@]}" -march="$arch" "$opt" \
+            "$work/start$mode.S" "$work/mask.c" -o "$work/chk$mode"
+        if [[ $mode == 64 ]]; then
+            actual=$(timeout 60 "$work/chk$mode")
+        else
+            actual=$(run32 "$work/chk$mode")
         fi
-        actual=$(timeout 60 "$work/chk64")
         if [[ $actual != "$expected" ]]; then
-            echo "FAIL: x86-64 $opt -- got '$actual', want '$expected'" >&2
+            echo "FAIL: $mode-bit $opt -- got '$actual', want '$expected'" >&2
             fail=1
         fi
     done
-else
-    echo "check_mask_test_fold: note: no 64-bit GCC oracle available" >&2
-fi
-
-source "$here/i386_exec.sh"
-if i386_run_or_skip "$gcc"; then
-    if timeout 120 "$gcc" -m32 -O2 "$work/mask.c" -o "$work/ref32"; then
-        expected32=$(timeout 60 "$work/ref32")
-        for opt in -O0 -O1 -O2 -O3 -Os; do
-            if ! timeout 120 "$ccc" -m32 -march=i686 "$opt" "$work/mask.c" \
-                -o "$work/chk32" 2>/dev/null; then
-                echo "FAIL: i686 build failed at $opt" >&2
-                fail=1
-                continue
-            fi
-            actual32=$(timeout 60 "$work/chk32")
-            if [[ $actual32 != "$expected32" ]]; then
-                echo "FAIL: i686 $opt -- got '$actual32', want '$expected32'" >&2
-                fail=1
-            fi
-        done
-    fi
-else
-    rc=$?
-    [[ $rc == 77 ]] || exit "$rc"
-fi
-
+done
 if [[ $fail -ne 0 ]]; then
     echo "check_mask_test_fold: FAILED" >&2
     exit 1
 fi
 echo "check_mask_test_fold: OK (test-only byte masks folded, sign readers kept," \
-    "GCC-identical results at -O0/-O1/-O2/-O3/-Os in 32- and 64-bit mode)"
+    "GCC-identical full hashes at -O0/-O1/-O2/-O3/-Os in mandatory 32- and 64-bit execution)"

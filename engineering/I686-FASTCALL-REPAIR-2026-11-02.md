@@ -46,7 +46,7 @@ identifies the non-interoperable record-result case. The vector assembly oracle
 uses GNU cleanup and independently verifies 32-byte entry alignment and
 register/stack argument values. No warning suppression was added.
 
-## Executed validation
+## Executed validation (a53 cohort before the subsequent main refresh)
 
 All binaries were built with `fastbuild`, Rust 1.99.1, two jobs and active 4 GiB
 swap. GCC/Clang compiled **only standalone non-kernel ABI fixtures**.
@@ -97,16 +97,13 @@ this local repair.
 
 ## Open findings — do not label the PR ready
 
-* A supplementary x86-64 Microsoft-ABI nested-function stress witness fails at
-  `-O2/-Os` when its enclosing function is called twice; the standalone GCC 16.2
-  build returns zero. The original compound test passes at `-O0`; splitting its
-  checks and using only one invocation can mask the failure. The minimized
-  investigation is **not complete**. Preserve
-  `engineering/reproducers/msabi-nested-capture-pending.c` and
-  `native-freestanding-start.S`; they are a recorded failing witness, **not** a
-  passing/disabled CI test. Reproduce with `lccc -O2 -fno-pie -nostdlib -static`
-  and those two files. GNU nested trampolines require an executable stack; both
-  native linkers report that expected property without suppression.
+* The supplementary x86-64 nested-capture witness discovered here was
+  subsequently reproduced with SysV too and repaired by modeling trampoline
+  scratch clobbers. The follow-up also repairs Microsoft leaf XMM-save frame
+  allocation and gates the original witness on all four targets. See
+  `NESTED-TRAMPOLINE-AND-MS-FRAME-REPAIR-2026-11-02.md` for the before/after
+  evidence, historical reproducer identity, 332-contract cohort and exact
+  validation revision boundaries. This is no longer listed as an open defect.
 * Nested regparm-3 requires GCC's different ESI/stack-chain entry mechanism and
   is not established by this repair. Typed regparm pointer propagation remains
   a separate audit.

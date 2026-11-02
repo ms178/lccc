@@ -2005,6 +2005,17 @@ impl Lowerer {
         }
     }
 
+    /// Resolve the register representation of an indirect call's result.
+    fn indirect_call_return_type(&self, func: &Expr, ret_abi: &AggregateReturn) -> IrType {
+        let mut ty = self.get_func_ptr_return_ir_type(func);
+        if ret_abi.two_reg_size.is_some() {
+            ty = IrType::I128;
+        } else if ret_abi.x87 || ret_abi.x87_pair {
+            ty = IrType::F128;
+        }
+        ty
+    }
+
     /// Emit the actual call instruction (direct, indirect via fptr, or general indirect).
     /// Returns the effective return type for narrowing.
     fn emit_call_instruction(
@@ -2028,12 +2039,7 @@ impl Lowerer {
         if calling_convention == crate::common::types::CallingConvention::MicrosoftX64 {
             self.copy_ms_record_arguments(&mut arg_vals, &struct_arg_sizes);
         }
-        let mut indirect_ret_ty = self.get_func_ptr_return_ir_type(func);
-        if ret_abi.two_reg_size.is_some() {
-            indirect_ret_ty = IrType::I128;
-        } else if ret_abi.x87 || ret_abi.x87_pair {
-            indirect_ret_ty = IrType::F128;
-        }
+        let indirect_ret_ty = self.indirect_call_return_type(func, ret_abi);
 
         match func {
             Expr::Identifier(name, _) => {
