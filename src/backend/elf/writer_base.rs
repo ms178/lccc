@@ -707,7 +707,7 @@ impl ElfWriterBase {
                 && !self.sections.contains_key(".debug_abbrev")
             {
                 if let Some(info) = build_dwarf_info_sections(
-                    &line.units,
+                    &line.code_sections,
                     &self.debug_files,
                     &locations,
                     &section_info,
@@ -725,6 +725,7 @@ impl ElfWriterBase {
                 )? {
                     built.extend([info.info, info.abbrev]);
                     built.extend(info.aranges);
+                    built.extend(info.ranges);
                 }
             }
             built.push(line.line);

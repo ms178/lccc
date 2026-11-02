@@ -4123,7 +4123,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Materialize the `.file`/`.loc` records emitted by `-g` as a
         // relocatable DWARF v4 line table. The section/offset relocations are
         // resolved by the final linker, after code layout is fixed.
-        let mut debug_line_units: Vec<elf_mod::DwarfLineUnit> = Vec::new();
+        // The code sections the single line program describes, in sequence order.
+        let mut debug_line_units: Vec<usize> = Vec::new();
         // Two string tables per object, as DWARF 5 splits them: paths in
         // `.debug_line_str`, names in `.debug_str` (see `elf::dwarf`).
         let mut debug_strings = elf_mod::DwarfStrings::new();
@@ -4155,7 +4156,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 None,
             )?;
             if let Some(built) = built {
-                let elf_mod::DwarfLineBuild { mut line, units } = built;
+                let elf_mod::DwarfLineBuild {
+                    mut line,
+                    code_sections: units,
+                } = built;
                 if A::uses_rel_format() {
                     fold_rel_addends(&mut line)?;
                 }
@@ -4376,6 +4380,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if let Some(info) = built {
                 let mut sections = vec![info.info, info.abbrev];
                 sections.extend(info.aranges);
+                sections.extend(info.ranges);
                 sections.extend(debug_strings.into_section(".debug_str"));
                 sections.extend(debug_line_strings.into_section(".debug_line_str"));
                 for mut section in sections {
