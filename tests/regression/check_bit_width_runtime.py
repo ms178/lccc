@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Mandatory four-target execution gate for single-bit selection and testing.
+"""Mandatory four-target execution gate for single-bit selection and testing,
+boolean returns and vector lane conversions.
 
 Unlike the assembly-count gate, this links freestanding objects with LCCC's own
 assembler/linker and executes them: natively for x86-64, under QEMU for i686,
@@ -7,7 +8,7 @@ AArch64 and RISC-V.  Missing cross binaries or emulators are failures under
 ``--run``, not silent skips: the point is to certify every backend that the
 bit folds reach, including the x86 flag fusions and the i686 register paths.
 
-Three programs, all pinned to GCC 16.2 / Clang 23.1.4 checksums:
+Every program is pinned to a checksum GCC 16.2 and Clang 23.1.4 agree on:
 
 * ``check.c`` (one TU over ``runtime.c``): signed narrow results observed
   before any truncating return can mask a canonical-form bug.
@@ -20,6 +21,10 @@ Three programs, all pinned to GCC 16.2 / Clang 23.1.4 checksums:
   predicate (float NaN rows included), bit tests, zero tests and every return
   width, plus the narrow-extension-then-``long`` chains the x86 peephole
   collapses.
+* ``convertvector.c`` with ``convertvector_check.c``: ``__builtin_convertvector``
+  over every lane-type pair (signed, unsigned, 8/16/32/64-bit integer, float,
+  double) at 8-, 16- and 32-byte widths, including the x86-64 packed pair and
+  the per-lane conversions every other pair and target take.
 
 Every program runs at every optimization level with the folds on, with
 ``CCC_NO_BIT_SELECT`` (the IR folds off), and on the x86 targets also with
@@ -53,6 +58,7 @@ PROGRAMS = {
     "browser": ["browser_bits.c", "browser_driver.c", "browser_check.c"],
     "browser_combined": ["browser_combined.c"],
     "bool_return": ["bool_return.c", "bool_return_check.c"],
+    "convertvector": ["convertvector.c", "convertvector_check.c"],
 }
 BIT_TEST_FUSIONS_OFF = {
     "CCC_NO_BT_FLAG_FUSION": "1",

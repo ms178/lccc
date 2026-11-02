@@ -1592,67 +1592,94 @@ impl Lowerer {
     // va_arg
     // -----------------------------------------------------------------------
 
-    /// __builtin_convertvector(expr, TYPE): element-wise conversion between
-    /// 4-lane 32-bit vectors (v4si <-> v4sf), the only combination kernel
-    /// code uses (NAP governor fast_log2f_sse). int->float = cvtdq2ps,
-    /// float->int = cvttps2dq (C cast semantics = truncation). The result is
-    /// returned as the ALLOCA POINTER, matching every other vector
-    /// expression convention (a raw-builtin caller then loads through it).
+    /// `__builtin_convertvector(src, T)`: every lane of `src` converted to
+    /// the element type of `T` by the C scalar conversion rules. Sema has
+    /// proven both operands are vectors with the same lane count and has
+    /// refused `_Bool` lanes. Each lane converts as by assignment
+    /// (`convert_assign_value`), so the C types decide where the IR carrier
+    /// does not: a `_Float16`, `__bf16` or `_Float128` lane is a value
+    /// conversion, never a reinterpretation of its integer carrier.
+    ///
+    /// The result is a fresh `T`-sized, `T`-aligned temporary: a vector
+    /// rvalue is its address in LCCC IR, and a raw-builtin caller loads
+    /// through it. The source goes through `vector_operand_ptr`, so a small
+    /// vector returned in a register is spilled to an address first.
+    ///
+    /// x86-64 converts the one pair with a single SSE2 equivalent, signed
+    /// 4 x i32 <-> 4 x f32: `cvtdq2ps` rounds as the scalar conversion does,
+    /// and `cvttps2dq` truncates as C does (its out-of-range result is the
+    /// conversion's undefined case). Unsigned lanes, every other shape, and
+    /// every other target convert lane by lane; i686 included, because its
+    /// scalar casts honour a TU without SSE2 and a packed form would not.
     pub(super) fn lower_convertvector(
         &mut self,
         src_expr: &Expr,
         type_spec: &TypeSpecifier,
     ) -> Operand {
-        use crate::ir::intrinsics::IntrinsicOp;
         let dst_ct = self.type_spec_to_ctype(type_spec);
         let src_ct = self.expr_ctype(src_expr);
-        let (src_is_float, dst_is_float) = (
-            matches!(&src_ct, CType::Vector(elem, _) | CType::ExtVector(elem, _) if elem.is_floating()),
-            matches!(&dst_ct, CType::Vector(elem, _) | CType::ExtVector(elem, _) if elem.is_floating()),
-        );
-        let src_size = if src_ct.is_vector() {
-            src_ct.size()
-        } else {
-            16
+        let (Some((src_elem, lanes)), Some((dst_elem, _))) =
+            (src_ct.vector_info(), dst_ct.vector_info())
+        else {
+            // Sema has already rejected a non-vector operand.
+            return Operand::Const(IrConst::I64(0));
         };
-        let dst_size = if dst_ct.is_vector() {
-            dst_ct.size()
-        } else {
-            16
-        };
-        if src_size != 16 || dst_size != 16 {
-            panic!(
-                "__builtin_convertvector: only 16-byte vectors are supported (got {} -> {})",
-                src_size, dst_size
-            );
+        let (from, to) = (IrType::from_ctype(src_elem), IrType::from_ctype(dst_elem));
+        let (src_stride, dst_stride) = (src_elem.size(), dst_elem.size());
+        let src_ptr = self.vector_operand_ptr(src_expr, &src_ct);
+        let dst_size = self.ctype_size(&dst_ct);
+        let dst_align = self.ctype_align(&dst_ct);
+        let result = self.emit_entry_alloca(IrType::Ptr, dst_size, dst_align, false);
+        if let Some(op) = self.packed_lane_conversion(lanes, from, to) {
+            let dest_val = self.fresh_value();
+            self.emit(Instruction::Intrinsic {
+                dest: Some(dest_val),
+                op,
+                dest_ptr: Some(result),
+                args: vec![Operand::Value(src_ptr)],
+            });
+            return Operand::Value(result);
         }
-        let src_ptr_op = self.lower_expr(src_expr);
-        let src_ptr = self.operand_to_value(src_ptr_op);
-        let result = self.fresh_value();
-        self.emit(Instruction::Alloca {
-            dest: result,
-            ty: IrType::Ptr,
-            size: 16,
-            align: 0,
-            volatile: false,
-            semantic_volatile: false,
-        });
-        let op = match (src_is_float, dst_is_float) {
-            (false, true) => IntrinsicOp::CvtEp32ToPs128, // cvtdq2ps
-            (true, false) => IntrinsicOp::CvttPs2Ep32_128, // cvttps2dq (truncate)
-            other => panic!(
-                "__builtin_convertvector: unsupported lane conversion {:?} (only int<->float 32-bit lanes)",
-                other
-            ),
-        };
-        let dest_val = self.fresh_value();
-        self.emit(Instruction::Intrinsic {
-            dest: Some(dest_val),
-            op,
-            dest_ptr: Some(result),
-            args: vec![Operand::Value(src_ptr)],
-        });
+        for lane in 0..lanes {
+            let src_lane = self.emit_gep_offset(src_ptr, lane * src_stride, from);
+            let loaded = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: src_lane,
+                ty: from,
+                seg_override: AddressSpace::Default,
+            });
+            let converted = self.convert_assign_value(
+                Operand::Value(loaded),
+                from,
+                Some(src_elem),
+                dst_elem,
+                to,
+            );
+            self.emit_store_at_offset(result, lane * dst_stride, converted, to);
+        }
         Operand::Value(result)
+    }
+
+    /// The single-instruction x86-64 form of a `__builtin_convertvector`
+    /// lane conversion, if there is one (see `lower_convertvector`).
+    fn packed_lane_conversion(
+        &self,
+        lanes: usize,
+        from: IrType,
+        to: IrType,
+    ) -> Option<crate::ir::intrinsics::IntrinsicOp> {
+        use crate::backend::Target;
+        use crate::ir::intrinsics::IntrinsicOp;
+        if lanes != 4 || self.target != Target::X86_64 {
+            return None;
+        }
+        match (from, to) {
+            (IrType::I32, IrType::F32) => Some(IntrinsicOp::CvtEp32ToPs128),
+            (IrType::F32, IrType::I32) => Some(IntrinsicOp::CvttPs2Ep32_128),
+            _ => None,
+        }
     }
 
     pub(super) fn lower_va_arg(&mut self, ap_expr: &Expr, type_spec: &TypeSpecifier) -> Operand {
