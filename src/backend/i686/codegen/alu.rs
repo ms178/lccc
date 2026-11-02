@@ -201,6 +201,20 @@ impl I686Codegen {
             self.state.emit("    popcntl %eax, %eax");
             return;
         }
+        // A byte needs no 24-bit scan and no scratch: `x * 0x08040201` spreads
+        // the eight bits into separate nibbles, `>> 3` aligns them,
+        // `& 0x11111111` isolates one per nibble, and the second multiplier
+        // sums them into the top nibble.  Five instructions, exact for every
+        // byte, no push/pop of %ecx (see the x86-64 backend for the same
+        // shape).
+        if matches!(ty, IrType::I8 | IrType::U8) {
+            self.state.emit("    imull $0x08040201, %eax, %eax");
+            self.state.emit("    shrl $3, %eax");
+            self.state.emit("    andl $0x11111111, %eax");
+            self.state.emit("    imull $0x11111111, %eax, %eax");
+            self.state.emit("    shrl $28, %eax");
+            return;
+        }
         // POPCNT (0F B8) is #UD on CPUs without the feature (Nehalem/
         // Barcelona era). Baseline fallback: the classic O(1) SWAR
         // Hamming-weight sequence (what GCC emits for `__builtin_popcount`
