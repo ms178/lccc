@@ -12,6 +12,10 @@ on:
       - 'tests/regression/check_qemu_defconfig_smoke.sh'
   workflow_dispatch:
     inputs:
+      source_run_ids:
+        description: 'Optional completed run IDs to export as diagnostic Git blobs (comma separated)'
+        type: string
+        default: ''
       export_host_prerequisites:
         description: Export Debian host tools for a GitHub-only development sandbox
         type: boolean
@@ -25,6 +29,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  diagnostic-transport:
+    if: github.event_name == 'workflow_dispatch' && inputs.source_run_ids != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Export existing evidence without changing refs or check results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_IDS: ${{ inputs.source_run_ids }}
+        run: python3 scripts/export_ci_diagnostics.py
   host-prerequisites:
     # A GitHub-only transport for network-restricted development sandboxes.
     # Unreferenced, content-addressed Git blobs never change a branch or tag;
