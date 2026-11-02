@@ -109,3 +109,11 @@ optimized Microsoft nested-capture reproducer. It does not claim universal
 calling-convention coverage. Hosted kernel job 125464215626 has since passed
 full link and QEMU on source 86b0b1a57 (boot _end=31040); the retained API
 receipts do not inspect its artifact warnings or validate the newer source.
+
+Follow-up: the historical pending nested-capture witness is fixed, as is the
+subsequently proved Microsoft leaf XMM-frame allocation defect. See
+NESTED-TRAMPOLINE-AND-MS-FRAME-REPAIR-2026-11-02.md. Main was then refreshed to
+1dd907def and independently validated (7679 library passes/10 ignores, 332
+contracts, 688 time/origin checks), including a proved builtin push/pop
+restoration interaction; see MAIN-1DD-BUILTIN-INTEGRATION-2026-11-02.md. These
+cohorts do not waive current full-kernel/QEMU or remaining warning/option gates.

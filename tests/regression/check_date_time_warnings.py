@@ -28,7 +28,7 @@ FIXTURES = [
 ]
 
 
-def run(lccc: list[str], gcc: list[str]) -> None:
+def run(lccc: list[str], gcc: list[str], clang: list[str]) -> None:
     env = {**os.environ, 'SOURCE_DATE_EPOCH': '0', 'TZ': 'UTC', 'LC_ALL': 'C'}
     flags = [([], None), (['-Wall', '-Wextra'], None), (['-Wdate-time'], 'warning'),
              (['-Werror=date-time'], 'error'), (['-Werror=date-time', '-Wno-error=date-time'], 'warning'),
@@ -56,14 +56,75 @@ def run(lccc: list[str], gcc: list[str]) -> None:
             if proc.returncode or proc.stderr.count('[-Wdate-time]') != 1:
                 raise RuntimeError(f'{label} same-line source ordering: {proc.stderr}')
         checks += 1
-        # Physical file mtime, not SOURCE_DATE_EPOCH or a presumed #line name.
+        # With no reproducibility epoch, physical mtime ignores a #line name.
         source.write_text('#line 800 "invented.c"\nconst char *x = __TIMESTAMP__;\n')
         os.utime(source, (86400, 86400))
+        physical_env = {key: value for key, value in env.items() if key != 'SOURCE_DATE_EPOCH'}
+        for label, compiler in [('GCC', gcc), ('LCCC', lccc), ('Clang', clang)]:
+            proc = subprocess.run(compiler + ['-E', '-P', str(source)],
+                text=True, capture_output=True, env=physical_env, timeout=30)
+            if proc.returncode or '"Fri Jan  2 00:00:00 1970"' not in proc.stdout:
+                raise RuntimeError(f'{label} physical timestamp: {proc.stdout}\n{proc.stderr}')
+        checks += 1
+        # Upstream adopts Clang's reproducible timestamp rule; GCC deliberately
+        # ignores the epoch for this macro and remains the no-epoch oracle above.
+        for label, compiler in [('LCCC', lccc), ('Clang', clang)]:
+            proc = subprocess.run(compiler + ['-E', '-P', str(source)],
+                text=True, capture_output=True, env=env, timeout=30)
+            if proc.returncode or '"Thu Jan  1 00:00:00 1970"' not in proc.stdout:
+                raise RuntimeError(f'{label} reproducible timestamp: {proc.stdout}\n{proc.stderr}')
+        checks += 1
+        # Every builtin, across compiler-owned, undefined and user-owned states.
+        names = ['__FILE__', '__BASE_FILE__', '__DATE__', '__TIME__', '__LINE__',
+                 '__COUNTER__', '__INCLUDE_LEVEL__', '__TIMESTAMP__']
+        for name in names:
+            for state in ['compiler', 'undefined', 'user']:
+                prefix = '' if state == 'compiler' else f'#undef {name}\n'
+                if state == 'user':
+                    prefix += f'#define {name} "original user body"\n'
+                source.write_text(prefix + f'#pragma push_macro("{name}")\n'
+                    f'#undef {name}\n#define {name} "temporary body"\n'
+                    f'#pragma pop_macro("{name}")\n#ifdef {name}\nint available=1;\n#endif\n')
+                for label, compiler in [('GCC', gcc), ('LCCC', lccc)]:
+                    for mode in [['-P'], ['-dM']]:
+                        proc = subprocess.run(compiler + ['-E', *mode, str(source)],
+                            text=True, capture_output=True, env=env, timeout=30)
+                        present = (bool(re.search(r'^#define ' + name + r'\b', proc.stdout, re.M))
+                                   if mode == ['-dM'] else 'int available=1;' in proc.stdout.replace(' = ', '='))
+                        expected = state == 'user' if mode == ['-dM'] else state != 'undefined'
+                        wrong_body = state == 'user' and mode == ['-dM'] and not re.search(
+                            r'^#define ' + name + r'\s+"original user body"$', proc.stdout, re.M)
+                        if proc.returncode or present != expected or wrong_body:
+                            raise RuntimeError(f'{label} restore {name}/{state}/{mode}: {proc.stdout}\n{proc.stderr}')
+                checks += 2
+        source.write_text('__COUNTER__\n#pragma push_macro("__COUNTER__")\n'
+            '#undef __COUNTER__\n#define __COUNTER__ 88\n#pragma push_macro("__COUNTER__")\n'
+            '#undef __COUNTER__\n#pragma pop_macro("__COUNTER__")\n__COUNTER__\n'
+            '#pragma pop_macro("__COUNTER__")\n__COUNTER__\n')
         for label, compiler in [('GCC', gcc), ('LCCC', lccc)]:
             proc = subprocess.run(compiler + ['-E', '-P', str(source)],
                 text=True, capture_output=True, env=env, timeout=30)
-            if proc.returncode or '"Fri Jan  2 00:00:00 1970"' not in proc.stdout:
-                raise RuntimeError(f'{label} physical timestamp: {proc.stdout}\n{proc.stderr}')
+            if proc.returncode or proc.stdout.split() != ['0', '88', '1']:
+                raise RuntimeError(f'{label} nested counter restoration: {proc.stdout}\n{proc.stderr}')
+        checks += 1
+        source.write_text('#undef __FILE__\n#define __FILE__ "not-the-diagnostic-file"\n'
+            'const char *x = __DATE__;\n')
+        for label, compiler in [('GCC', gcc), ('LCCC', lccc)]:
+            proc = subprocess.run(compiler + ['-E', '-Wdate-time', str(source)],
+                text=True, capture_output=True, env=env, timeout=30)
+            if proc.returncode or f'{source}:3:' not in proc.stderr:
+                raise RuntimeError(f'{label} independent diagnostic provenance: {proc.stderr}')
+        checks += 1
+        # Restoring the compiler FILE inside a header must use the header's path.
+        header = root / 'restore.h'
+        header.write_text('#pragma pop_macro("__FILE__")\nconst char *inside = __FILE__;\n')
+        source.write_text('#pragma push_macro("__FILE__")\n#undef __FILE__\n'
+            '#define __FILE__ "temporary"\n#include "restore.h"\n')
+        for label, compiler in [('GCC', gcc), ('LCCC', lccc)]:
+            proc = subprocess.run(compiler + ['-E', '-P', str(source)],
+                text=True, capture_output=True, env=env, timeout=30)
+            if proc.returncode or f'"{header}"' not in proc.stdout:
+                raise RuntimeError(f'{label} restored FILE use site: {proc.stdout}\n{proc.stderr}')
         checks += 1
         for text, listed in [('', False), ('#undef __DATE__\n#define __DATE__ "stable"\n', True),
             ('#pragma push_macro("__DATE__")\n#undef __DATE__\n#define __DATE__ "stable"\n#pragma pop_macro("__DATE__")\n', False)]:
@@ -82,12 +143,13 @@ def run(lccc: list[str], gcc: list[str]) -> None:
             if proc.returncode or tokens != expected:
                 raise RuntimeError(f'{label} argument prescan side effects: {tokens}\n{proc.stderr}')
         checks += 1
-    print(f'date/time diagnostics: PASS ({checks} checks against non-kernel GCC)')
+    print(f'date/time diagnostics: PASS ({checks} checks against non-kernel GCC; Clang timestamp controls)')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--lccc', default='target/fastbuild/lccc')
     parser.add_argument('--gcc', default='gcc-16')
+    parser.add_argument('--clang', default='clang-23')
     args = parser.parse_args()
-    run(shlex.split(args.lccc), shlex.split(args.gcc))
+    run(shlex.split(args.lccc), shlex.split(args.gcc), shlex.split(args.clang))

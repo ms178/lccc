@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use super::builtin_macros::define_builtin_macros;
 use super::conditionals::{ConditionalStack, evaluate_condition};
-use super::macro_defs::{MacroDef, MacroTable, parse_define};
+use super::macro_defs::{MacroDef, MacroTable, SavedMacroDefinition, parse_define};
 use super::text_processing::{
     CommentSegments, LineResolver, LineResolverData, LineSegments, split_first_word,
     strip_line_comment,
@@ -97,8 +97,8 @@ pub struct Preprocessor {
     /// Declarations to inject into the output (from #include processing).
     pub(super) pending_injections: Vec<String>,
     /// Stack for #pragma push_macro / pop_macro.
-    /// Maps macro name -> stack of saved definitions (None = was undefined).
-    pub(super) macro_save_stack: FxHashMap<String, Vec<Option<MacroDef>>>,
+    /// Includes ownership/suppression of lazy builtins with no stored body.
+    pub(super) macro_save_stack: FxHashMap<String, Vec<SavedMacroDefinition>>,
     /// Line offset set by #line directive: effective_line = line_offset + (source_line - line_offset_base)
     /// When None, no #line has been issued and __LINE__ uses the source line directly.
     line_override: Option<(usize, usize)>, // (target_line, source_line_at_directive)
@@ -251,10 +251,6 @@ impl Preprocessor {
     /// - Does not emit pending_injections (those only apply to top-level)
     /// - Only processes directives when no multi-line accumulation is pending
     fn preprocess_source(&mut self, source: &str, is_include: bool) -> String {
-        // Timestamp uses the physical input's mtime, not #line/__FILE__ spelling
-        // and not SOURCE_DATE_EPOCH (matching GCC's nonstandard builtin).
-        let timestamp = self.current_file_timestamp();
-        let saved_timestamp = std::mem::replace(&mut self.macros.timestamp_body, timestamp);
         // Per C standard (C11 5.1.1.2), translation phases are:
         // Phase 2: Line splicing (backslash-newline removal)
         // Phase 3: Comment replacement
@@ -703,7 +699,6 @@ impl Preprocessor {
             self.line_marker_due = saved_line_marker_due;
         }
 
-        self.macros.timestamp_body = saved_timestamp;
         output
     }
 
@@ -1049,21 +1044,15 @@ impl Preprocessor {
         self.macros.set_file(format!("\"{}\"", filename));
         // __BASE_FILE__ always expands to the main input file name,
         // unlike __FILE__ which changes during #include processing.
-        self.macros.define(MacroDef {
-            is_time_builtin: false,
-            name: "__BASE_FILE__".to_string(),
-            is_function_like: false,
-            params: Vec::new(),
-            is_variadic: false,
-            has_named_variadic: false,
-            body: format!("\"{}\"", filename),
-        });
+        self.macros
+            .set_builtin_body("__BASE_FILE__", &format!("\"{}\"", filename));
         // Push the file path onto the include stack for relative includes.
         // Use make_absolute (not canonicalize) to preserve symlinks, matching GCC
         // behavior: #include "..." searches relative to the directory where the
         // including file was found (through symlinks), not the symlink target.
         let path = PathBuf::from(filename);
         let abs = super::includes::make_absolute(&path);
+        self.macros.push_file_scope(&abs);
         self.include_stack.push(abs);
         self.include_origins.push(None);
     }
@@ -1122,13 +1111,21 @@ impl Preprocessor {
     /// macro, sorted alphabetically. Function-like macros include their parameter
     /// lists. This output is used by build systems like Meson to detect compiler
     /// features via preprocessor defines (e.g., `__GNUC__`, `__GNUC_MINOR__`).
+    ///
+    /// The compiler's own builtin definitions are omitted, exactly as
+    /// `gcc-16 -dM -E` and `clang-23 -dM -E` omit them: `__FILE__`, `__LINE__`,
+    /// `__DATE__`, `__TIME__`, `__TIMESTAMP__`, `__INCLUDE_LEVEL__`,
+    /// `__BASE_FILE__` and `__COUNTER__` are preprocessor state in both
+    /// references, so listing them made a `-dM` diff report seven lines that
+    /// exist only here. A definition the *source* supplied is still listed --
+    /// both oracles print `-D__DATE__="x"` -- which is why the filter asks
+    /// whether the entry is the compiler's rather than whether its name is on a
+    /// list.
     pub fn dump_defines(&self) -> String {
         let mut defs: Vec<String> = self
             .macros
             .iter()
-            // GCC does not list volatile builtin macros in -dM, but does
-            // list ordinary user redefinitions of those same names.
-            .filter(|def| !def.is_time_builtin)
+            .filter(|def| !self.macros.builtin_is_compiler_owned(&def.name))
             .map(|def| {
                 if def.is_function_like {
                     let params = def.params.join(",");
@@ -1261,6 +1258,7 @@ impl Preprocessor {
         let old_source_filename = self.macros.source_filename.clone();
         let old_file = self.macros.get_file_body().map(|s| s.to_string());
         self.macros.set_file(format!("\"{}\"", resolved.display()));
+        self.macros.push_file_scope(&resolved);
 
         // Preprocess the included content (macros persist; any pragma synthetic tokens
         // like __ccc_visibility_push_hidden are collected and prepended to main output)
@@ -1274,15 +1272,17 @@ impl Preprocessor {
             self.force_include_output.push('\n');
         }
 
-        // Restore __FILE__
+        // Pop include stack and its matching search provenance first: both
+        // restored builtins are derived from the stack, so the parent's values
+        // can only be computed once the child is gone.
+        self.include_stack.pop();
+        self.include_origins.pop();
+        self.macros.pop_file_scope();
+
         if let Some(old) = old_file {
             self.macros.set_file(old);
         }
         self.macros.source_filename = old_source_filename;
-
-        // Pop include stack and its matching search provenance.
-        self.include_stack.pop();
-        self.include_origins.pop();
     }
 
     /// Process a preprocessor directive line.

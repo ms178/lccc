@@ -126,3 +126,9 @@ builtins and conditional-carrier changes). The ac28 results above are not
 silently attributed to that newer source: integrate it and repeat the relevant
 gates before claiming a post-merge pass. Full current local kernel and QEMU,
 all warning/option families and current-head hosted CI remain acceptance gates.
+
+The subsequent 1dd907def integration has now passed its own cohort: 7679 library
+passes/10 ignores, 332 contracts, 688 date/time checks, 420 host-zone observations,
+all upstream new gates, census, Clippy and strict usercopy. The merge interaction,
+negative baseline and preserved CI coverage are recorded in
+MAIN-1DD-BUILTIN-INTEGRATION-2026-11-02.md. Whole-kernel acceptance remains open.

@@ -676,6 +676,7 @@ impl Preprocessor {
                     let old_source_filename = self.macros.source_filename.clone();
                     let old_file = self.macros.get_file_body().map(|s| s.to_string());
                     self.macros.set_file(format!("\"{}\"", display_path));
+                    self.macros.push_file_scope(&resolved_path);
 
                     // Emit line marker for entering the included file
                     // Flag 1 indicates entering a new include file (GCC convention)
@@ -751,15 +752,14 @@ impl Preprocessor {
                         }
                     }
 
-                    // Restore __FILE__
+                    self.include_stack.pop();
+                    self.include_origins.pop();
+                    self.macros.pop_file_scope();
+
                     if let Some(old) = old_file {
                         self.macros.set_file(old);
                     }
                     self.macros.source_filename = old_source_filename;
-
-                    // Pop include stack and its search provenance.
-                    self.include_stack.pop();
-                    self.include_origins.pop();
 
                     // Register the include guard for future fast-path skipping.
                     // We do this after preprocessing so that the guard macro is
@@ -887,6 +887,7 @@ impl Preprocessor {
                     let old_source_filename = self.macros.source_filename.clone();
                     let old_file = self.macros.get_file_body().map(|s| s.to_string());
                     self.macros.set_file(format!("\"{}\"", display_path));
+                    self.macros.push_file_scope(&resolved_path);
 
                     // Emit line marker for entering the included file
                     // Flag 1 indicates entering a new include file (GCC convention)
@@ -894,13 +895,14 @@ impl Preprocessor {
 
                     result.push_str(&self.preprocess_included(&content));
 
+                    self.include_stack.pop();
+                    self.include_origins.pop();
+                    self.macros.pop_file_scope();
+
                     if let Some(old) = old_file {
                         self.macros.set_file(old);
                     }
                     self.macros.source_filename = old_source_filename;
-
-                    self.include_stack.pop();
-                    self.include_origins.pop();
 
                     if let Some(guard) = detected_guard {
                         self.include_guard_macros.insert(resolved_path, guard);

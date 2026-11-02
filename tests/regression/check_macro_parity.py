@@ -12,10 +12,8 @@ individually-justified budgets:
                     C++ ABI identity).
 * ``LCCC_ONLY``   - names LCCC predefines and GCC does not: keyword-vs-macro
                     mechanisms GCC spells differently (`__extension__`,
-                    `offsetof`, `__int8` ...), `-dM`-listing quirks
-                    (`__FILE__` is expanded by GCC but not
-                    listed), the documented PIC/PIE and C23 decimal/width
-                    claims, and `_FloatN` spellings.
+                    `offsetof`, `__int8` ...), the documented PIC/PIE and C23
+                    decimal/width claims, and `_FloatN` spellings.
 * ``VALUE_DIFFS`` - common names whose replacement bodies differ (GCC's
                     cast/suffix spellings versus LCCC's literals; the
                     pinned set is measured-stable).
@@ -56,16 +54,21 @@ GCC_ONLY = (
 )
 
 LCCC_ONLY = (
+    # `__BASE_FILE__`, `__DATE__`, `__FILE__` and `__TIME__` used to be pinned
+    # here. They were never a real divergence: both compilers expand those four,
+    # GCC simply keeps them out of `-dM` because it holds them in preprocessor
+    # state rather than in the macro table, and lccc listed them because it held
+    # them as ordinary entries. lccc now omits what it owns as well (the `-dM`
+    # filter asks who supplied a definition, not what it is called), so the
+    # direction improved and the pins left the budget.
     '_Float32',
     '_Float32x',
     '_Float64',
     '_Float64x',
-    '__BASE_FILE__',
     '__CHAR_WIDTH__',
     '__DEC128_DIG__',
     '__DEC32_DIG__',
     '__DEC64_DIG__',
-    '__FILE__',
     '__FLT128_TRUE_MIN__',
     '__GNUC_VA_LIST',
     '__LEAF',

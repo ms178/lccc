@@ -226,7 +226,7 @@ impl Preprocessor {
     /// Handle #pragma push_macro("name") - save the current definition of macro.
     fn handle_pragma_push_macro(&mut self, content: &str) {
         if let Some(name) = Self::extract_pragma_macro_name(content) {
-            let saved = self.macros.get(&name).cloned();
+            let saved = self.macros.snapshot_definition(&name);
             self.macro_save_stack.entry(name).or_default().push(saved);
         }
     }
@@ -236,10 +236,7 @@ impl Preprocessor {
         if let Some(name) = Self::extract_pragma_macro_name(content) {
             if let Some(stack) = self.macro_save_stack.get_mut(&name) {
                 if let Some(saved) = stack.pop() {
-                    match saved {
-                        Some(def) => self.macros.define(def),
-                        None => self.macros.undefine(&name),
-                    }
+                    self.macros.restore_definition(&name, saved);
                 }
             }
         }
