@@ -267,6 +267,8 @@ gate "frontend-preprocessor-builtins" fast \
 gate "conditional-carrier-families" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" \
     bash tests/regression/check_conditional_carrier.sh
+gate "host-time-zones" fast \
+    python3 tests/regression/check_host_time_zones.py "$LCCC"
 gate "asm-flag-outputs" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \
