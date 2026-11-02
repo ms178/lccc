@@ -1941,6 +1941,14 @@ gate "narrow-negate-fold" fast \
 gate "compare-dominance-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_compare_dominance_fold.sh
 
+# Constant-operand ALU forms and sign-magnitude selects, executed on x86-64,
+# i686, RISC-V and AArch64 (qemu-user) from one freestanding source that must
+# print GCC's digest; pins RISC-V I-type selection, the sign-magnitude identity
+# on every target, x86-64 `mov; neg; cmovs` and the AArch64 inline-asm
+# quarantine.
+gate "cross-alu-abs-runtime" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_cross_alu_abs_runtime.sh
+
 # Single-bit selection: `x | 1 << n` is `bts`, `x & ~(1 << n)` is `btr` and
 # `(x & 1 << n) != 0` is `bt` (6/8/7 -> 3/3/4 instructions), selected by the
 # new `BitSet`/`BitClear` IR operations.  Pins the shapes and the dead

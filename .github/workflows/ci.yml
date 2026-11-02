@@ -2944,6 +2944,14 @@ jobs:
         # agreement against GCC.  Mirrored in scripts/ci_local.sh
         # (parity-checked).
         bash tests/regression/check_compare_dominance_fold.sh
+        # Constant-operand ALU forms and sign-magnitude selects, executed on
+        # x86-64, i686, RISC-V and AArch64 (qemu-user) from one freestanding
+        # source that must print GCC's digest: RISC-V I-type selection and
+        # its sext32-producer table, the sign-magnitude identity on every
+        # target, x86-64 `mov; neg; cmovs`, and the AArch64 peephole's
+        # inline-asm quarantine (it deleted the operands of an `svc 0`).
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_cross_alu_abs_runtime.sh
         # Predicate materialization: `c ? 1 : 0` is `c != 0` and `c ? 0 : 1`
         # is `c == 0` (5 -> 4), and `(a != 0) | (b != 0)` is `(a | b) != 0`
         # (9 -> 4).  Pins the folded shapes and their missing `cmov`, the

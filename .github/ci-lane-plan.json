@@ -344,7 +344,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 517.27,
+      "predicted_gate_seconds": 524.83,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -535,6 +535,10 @@
         {
           "measured_s": 0.89,
           "name": "bash tests/regression/check_compare_dominance_fold.sh"
+        },
+        {
+          "measured_s": 7.56,
+          "name": "bash tests/regression/check_cross_alu_abs_runtime.sh"
         },
         {
           "measured_s": 2.36,
