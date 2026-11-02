@@ -97,7 +97,15 @@ fn_body() {
 }
 count_of() { fn_body "$1" "$2" | wc -l | tr -d ' '; }
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+# Also a check annotation: the Actions log download endpoint is not always
+# reachable from API clients, but the Checks API is, so a red lane here stays
+# diagnosable (the message is flattened to one line -- a workflow command
+# cannot carry newlines).
+fail() {
+    echo "FAIL: $*" >&2
+    printf '::error title=check_parity_and_popcount::%s\n' "${*//$'\n'/ | }"
+    exit 1
+}
 
 # ---- 1/2/3. x86-64 --------------------------------------------------------
 x86=$bindir/lccc
