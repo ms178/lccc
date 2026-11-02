@@ -4850,8 +4850,18 @@ fn build_and_emit_dwarf_file_table(
         return FxHashMap::default();
     };
 
+    // The unit's own file is always entry 1: a function that folds away at
+    // -O2 carries no instruction spans, and a table built from spans alone
+    // would then name no file at all -- taking every `.loc`, the line program
+    // and the compile unit with it, which is how `-g` used to produce an
+    // object with no debug sections whenever a translation unit optimized to
+    // nothing. GCC lists the primary file unconditionally for the same reason.
     let mut table: FxHashMap<String, u32> = FxHashMap::default();
     let mut next_id: u32 = 1;
+    if let Some(name) = sm.primary_file_name() {
+        table.insert(name.to_string(), 1);
+        next_id = 2;
+    }
     for func in &module.functions {
         if func.is_declaration {
             continue;

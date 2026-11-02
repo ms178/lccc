@@ -67,10 +67,12 @@ pub use parse_string::parse_string_literal;
 // object_writer
 pub use object_writer::{ElfConfig, ObjReloc, ObjSection, write_relocatable_object};
 
-// DWARF line tables
+// DWARF debug information
 pub(crate) use dwarf::{
-    DwarfFunction, DwarfLineLocation, DwarfLineUnit, DwarfLocOptions, DwarfSectionInfo,
-    build_dwarf_info_sections, build_dwarf_line_section, parse_file_directive, parse_loc_directive,
+    DWARF_DEFAULT_VERSION, DWARF_MAX_VERSION, DWARF_MIN_VERSION, DwarfConfig, DwarfFunction,
+    DwarfInfoBuild, DwarfLineBuild, DwarfLineLocation, DwarfLineUnit, DwarfLocOptions,
+    DwarfSectionInfo, DwarfStrings, build_dwarf_info_sections, build_dwarf_line_section,
+    parse_file_directive, parse_loc_directive,
 };
 
 // numeric_labels

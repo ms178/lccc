@@ -132,6 +132,10 @@ pub struct Driver {
     pub(super) verbose: bool,
     pub(super) mode: CompileMode,
     pub(super) debug_info: bool,
+    /// The DWARF dialect `-gdwarf-<N>` selected (2..=5).  The default is the
+    /// version GCC 16.2 emits for a bare `-g`, so the same command line
+    /// produces the same dialect from both compilers.
+    pub(super) dwarf_version: u8,
     pub(super) defines: Vec<CliDefine>,
     pub(super) include_paths: Vec<String>,
     /// Quote-only include paths (from -iquote flags).
@@ -654,6 +658,7 @@ impl Driver {
             verbose: false,
             mode: CompileMode::Full,
             debug_info: false,
+            dwarf_version: crate::backend::elf::DWARF_DEFAULT_VERSION,
             defines: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
@@ -1581,6 +1586,26 @@ impl Driver {
         Ok(())
     }
 
+    /// The DWARF dialect the assembler should write, or `None` when `-g` is off.
+    ///
+    /// `assembly` selects GAS's assembler language for a `.s`/`.S` input;
+    /// otherwise the unit declares the C dialect `-std=` selected, so a
+    /// debugger reports the language the source was actually compiled as.
+    /// Both facts travel to the writer as one [`crate::backend::elf::DwarfConfig`]
+    /// because the language answer depends on the version (`DWARF 4` has no
+    /// C11 code).
+    pub(super) fn dwarf_config(&self, assembly: bool) -> Option<crate::backend::elf::DwarfConfig> {
+        use crate::backend::elf::DwarfConfig;
+        if !self.debug_info {
+            return None;
+        }
+        Some(if assembly {
+            DwarfConfig::assembler(self.dwarf_version)
+        } else {
+            DwarfConfig::for_c(self.dwarf_version, self.stdc_version)
+        })
+    }
+
     fn run_object_only(&self) -> Result<(), String> {
         for input_file in &self.input_files {
             let out_path = self.output_for_input(input_file);
@@ -1602,7 +1627,12 @@ impl Driver {
                 // Default path: compile with internal codegen
                 let asm = self.compile_to_assembly(input_file)?;
                 let extra = self.build_asm_extra_args();
-                self.target.assemble_with_extra(&asm, &out_path, &extra)?;
+                self.target.assemble_with_extra(
+                    &asm,
+                    &out_path,
+                    &extra,
+                    self.dwarf_config(false),
+                )?;
             }
             self.write_dep_file_gcc_semantics(input_file, &out_path)?;
             if self.verbose {
@@ -1675,6 +1705,7 @@ impl Driver {
                     &asm,
                     tmp.to_str().map_err(|error| error.to_string())?,
                     &extra,
+                    self.dwarf_config(false),
                 )?;
                 // Write dependency file for this source file. When compiling and
                 // linking in one step, GCC's -Wp,-MMD uses the .o name as the
@@ -1701,6 +1732,7 @@ impl Driver {
                 &asm,
                 tmp.to_str().map_err(|error| error.to_string())?,
                 &extra,
+                self.dwarf_config(false),
             )?;
             temp_guards.push(tmp);
         }
@@ -3750,19 +3782,23 @@ impl Driver {
             }
         }
         // Debug-info honesty law: `-g` must never be silently dropped.
-        // lccc's debug support today is line tables (.file/.loc →
-        // .debug_line); it does not emit .debug_info (DIEs/types), and
-        // optimization may erase every source span a TU was lowered with,
-        // leaving objects with NO debug sections while -g was requested.
+        // The debug sections are synthesized by the assembler from the
+        // `.file`/`.loc` rows this lowering emits (`elf::dwarf`: line
+        // programs, compile units, subprograms with their declaration
+        // locations, as DWARF 2..5).  Optimization may erase every source
+        // span a TU was lowered with, leaving objects with NO debug sections
+        // while -g was requested, and type DIEs (DW_TAG_base_type,
+        // composite types, variables) are still not emitted at all.
         // Downstream consumers (the kernel build's pahole/BTF step,
         // debuggers, addr2line) must be able to trust the toolchain to say
         // so instead of failing later with an unrelated error — the same
         // never-silently-wrong law that guards port-I/O and SSE lowering.
-        if self.debug_info && !asm_contains_debug_records(asm) {
+        let defines_code = module.functions.iter().any(|func| !func.is_declaration);
+        if self.debug_info && defines_code && !asm_contains_debug_records(asm) {
             eprintln!(
                 "{}: warning: -g requested but no debug information was \
-                 generated for this translation unit (lccc emits line tables \
-                 only; .debug_info/type info is not implemented)",
+                 generated for this translation unit (lccc emits line tables, \
+                 compile units and subprograms; type DIEs are not implemented)",
                 input_file
             );
         }
@@ -4575,8 +4611,11 @@ impl Driver {
 /// (GAS lowers them to `.debug_line`); either directive present means the
 /// TU got some debug information, neither means `-g` was effectively
 /// dropped and the honesty warning in the pipeline must fire.
+/// Whether the assembly carries any line row. The file table alone is not
+/// enough: the primary file is listed unconditionally, so only `.loc` proves
+/// that the rows a consumer needs actually exist.
 fn asm_contains_debug_records(asm: &str) -> bool {
-    asm.contains(".file ") || asm.contains(".loc ")
+    asm.contains(".loc ")
 }
 
 /// Check compiler-generated AArch64 instructions, not data, comments, symbol

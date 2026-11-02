@@ -20,10 +20,20 @@ use parser::parse_asm;
 /// Assemble AT&T syntax x86-64 assembly text into an ELF object file.
 ///
 /// This is the default assembler (used when the `gcc_assembler` feature is disabled).
-pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
+/// `debug` selects the DWARF dialect for the `.loc` rows the source carries;
+/// `None` keeps the writer's default (version 5, assembler language), which is
+/// what an input without `-g` gets.
+pub fn assemble(
+    asm_text: &str,
+    output_path: &str,
+    debug: Option<crate::backend::elf::DwarfConfig>,
+) -> Result<(), String> {
     let items = parse_asm(asm_text)?;
     let items = cfi::lower_cfi(items, cfi::CfiArch::X86_64)?;
-    let obj = ElfWriter::new();
+    let mut obj = ElfWriter::new();
+    if let Some(debug) = debug {
+        obj.set_debug_config(debug);
+    }
     let elf_bytes = obj.build(&items)?;
     std::fs::write(output_path, &elf_bytes)
         .map_err(|e| format!("Failed to write object file: {}", e))?;

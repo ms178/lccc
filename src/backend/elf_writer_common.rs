@@ -1347,7 +1347,10 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// remove drops the plain symbol and rebinds intra-object references to
     /// the versioned alias).
     symver_flags: FxHashMap<String, (String, crate::backend::x86::assembler::parser::SymverFlag)>,
-    /// Source files and `.loc` rows for the generated DWARF v4 line table.
+    /// The DWARF dialect the `.loc` rows are written in, and the language the
+    /// compile units declare (`-gdwarf-<N>`, `-std=`).
+    debug_config: elf_mod::DwarfConfig,
+    /// Source files and `.loc` rows for the generated DWARF line table.
     debug_files: Vec<(u32, String)>,
     debug_line_locations: Vec<elf_mod::DwarfLineLocation>,
     section_stack: Vec<(Option<usize>, Option<usize>)>,
@@ -1407,6 +1410,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             set_exprs: FxHashMap::default(),
             symver_refs: FxHashMap::default(),
             symver_flags: FxHashMap::default(),
+            debug_config: elf_mod::DwarfConfig::assembler(elf_mod::DWARF_DEFAULT_VERSION),
             debug_files: Vec::new(),
             debug_line_locations: Vec::new(),
             section_stack: Vec::new(),
@@ -1422,6 +1426,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             numeric_label_seq: FxHashMap::default(),
             _arch: std::marker::PhantomData,
         }
+    }
+
+    /// Select the DWARF dialect for the `.loc` rows this writer will emit
+    /// (`-gdwarf-<N>` and the language `-std=` implies).
+    pub fn set_debug_config(&mut self, config: elf_mod::DwarfConfig) {
+        self.debug_config = config;
     }
 
     /// Build the ELF object file from parsed assembly items.
@@ -4114,6 +4124,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // relocatable DWARF v4 line table. The section/offset relocations are
         // resolved by the final linker, after code layout is fixed.
         let mut debug_line_units: Vec<elf_mod::DwarfLineUnit> = Vec::new();
+        // Two string tables per object, as DWARF 5 splits them: paths in
+        // `.debug_line_str`, names in `.debug_str` (see `elf::dwarf`).
+        let mut debug_strings = elf_mod::DwarfStrings::new();
+        let mut debug_line_strings = elf_mod::DwarfStrings::new();
         if !shared_sections.contains_key(".debug_line") {
             let section_info: Vec<elf_mod::DwarfSectionInfo<'_>> = self
                 .sections
@@ -4125,21 +4139,29 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 })
                 .collect();
             let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
-            if let Some(debug_line) = elf_mod::build_dwarf_line_section(
+            let comp_dir = std::env::current_dir()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let built = elf_mod::build_dwarf_line_section(
                 &self.debug_files,
                 &self.debug_line_locations,
                 &section_info,
                 address_size,
                 A::reloc_abs(address_size),
+                A::reloc_abs(4),
+                &comp_dir,
+                self.debug_config,
+                &mut debug_line_strings,
                 None,
-            )? {
-                let (mut debug_line, units) = debug_line;
+            )?;
+            if let Some(built) = built {
+                let elf_mod::DwarfLineBuild { mut line, units } = built;
                 if A::uses_rel_format() {
-                    fold_rel_addends(&mut debug_line)?;
+                    fold_rel_addends(&mut line)?;
                 }
                 debug_line_units = units;
-                section_names.push(debug_line.name.clone());
-                shared_sections.insert(debug_line.name.clone(), debug_line);
+                section_names.push(line.name.clone());
+                shared_sections.insert(line.name.clone(), line);
             }
         }
 
@@ -4334,8 +4356,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .map(|dir| dir.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
-            if let Some((info, abbrev)) = elf_mod::build_dwarf_info_sections(
+            let built = elf_mod::build_dwarf_info_sections(
                 &debug_line_units,
+                &self.debug_files,
+                &self.debug_line_locations,
                 &section_info,
                 &functions,
                 primary_file,
@@ -4344,9 +4368,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 address_size,
                 A::reloc_abs(4),
                 A::reloc_abs(address_size),
+                self.debug_config,
+                &mut debug_strings,
+                &mut debug_line_strings,
                 None,
-            )? {
-                for mut section in [info, abbrev] {
+            )?;
+            if let Some(info) = built {
+                let mut sections = vec![info.info, info.abbrev];
+                sections.extend(info.aranges);
+                sections.extend(debug_strings.into_section(".debug_str"));
+                sections.extend(debug_line_strings.into_section(".debug_line_str"));
+                for mut section in sections {
                     if A::uses_rel_format() {
                         fold_rel_addends(&mut section)?;
                     }
@@ -6545,7 +6577,7 @@ mod tests {
             ".Lstr0:\n",
             "    .byte 65, 0\n",
         );
-        assemble(asm, out.to_str().unwrap()).unwrap();
+        assemble(asm, out.to_str().unwrap(), None).unwrap();
         let data = std::fs::read(&out).unwrap();
         assert_eq!(sec_type_of(&data, ".data"), Some(1 /* SHT_PROGBITS */));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6617,7 +6649,7 @@ mod tests {
             "common:\n",
             "    ret\n",
         );
-        assemble(asm, out.to_str().unwrap()).expect("assemble early_idt shape");
+        assemble(asm, out.to_str().unwrap(), None).expect("assemble early_idt shape");
         let obj = std::fs::read(&out).unwrap();
         let text = section_bytes(&obj, ".text").expect(".text");
         const SIZE: usize = 13;
@@ -6688,7 +6720,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _scratch = ScratchDir(dir.clone());
         let out = dir.join("m.o");
-        assemble(asm, out.to_str().unwrap()).unwrap();
+        assemble(asm, out.to_str().unwrap(), None).unwrap();
         std::fs::read(&out).unwrap()
     }
 
@@ -7075,7 +7107,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("t.o");
-        assemble(asm, out.to_str().unwrap()).unwrap();
+        assemble(asm, out.to_str().unwrap(), None).unwrap();
         let data = std::fs::read(&out).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         section_bytes(&data, name).expect("section present")
@@ -7112,6 +7144,7 @@ mod tests {
         let err = assemble(
             ".section .foo,\"a\",@progbits\n.byte 1\n.section .foo,\"aw\",@progbits\n",
             out.to_str().unwrap(),
+            None,
         )
         .expect_err("contradicting flags must be rejected");
         assert!(err.contains("changed section attributes"), "{err}");
@@ -7540,9 +7573,9 @@ ret
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("t.o");
         let res = if arch32 {
-            assemble32(asm, out.to_str().unwrap())
+            assemble32(asm, out.to_str().unwrap(), None)
         } else {
-            assemble(asm, out.to_str().unwrap())
+            assemble(asm, out.to_str().unwrap(), None)
         };
         let _ = std::fs::remove_dir_all(&dir);
         res.unwrap_or_else(|e| panic!("input must assemble: {e}"));
@@ -7562,9 +7595,9 @@ ret
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("t.o");
         let res = if arch32 {
-            assemble32(asm, out.to_str().unwrap())
+            assemble32(asm, out.to_str().unwrap(), None)
         } else {
-            assemble(asm, out.to_str().unwrap())
+            assemble(asm, out.to_str().unwrap(), None)
         };
         let _ = std::fs::remove_dir_all(&dir);
         res.expect_err("input must be rejected")
@@ -7985,9 +8018,9 @@ mod batched_edit_differential_tests {
         SEQUENTIAL_EDITS.set(mode == Mode::Sequential);
         PAD_QUEUE_FORCE_FALLBACK.set(mode == Mode::BatchedForcedFallback);
         let res = if arch32 {
-            assemble32(asm, out.to_str().unwrap())
+            assemble32(asm, out.to_str().unwrap(), None)
         } else {
-            assemble64(asm, out.to_str().unwrap())
+            assemble64(asm, out.to_str().unwrap(), None)
         };
         SEQUENTIAL_EDITS.set(false);
         PAD_QUEUE_FORCE_FALLBACK.set(false);

@@ -1514,7 +1514,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("vex_golden.o");
-        assemble(asm, out.to_str().unwrap()).expect("i686 assemble failed");
+        assemble(asm, out.to_str().unwrap(), None).expect("i686 assemble failed");
         let bytes = std::fs::read(&out).unwrap();
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_dir(&dir);

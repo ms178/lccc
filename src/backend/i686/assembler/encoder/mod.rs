@@ -4119,7 +4119,7 @@ mod split_label_offset_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let obj = dir.join("t.o");
         let asm = "    .data\nca: .long 1,2,3,4,5,6,7,8\n    .text\nf:\n    movl ca+16+4, %edx\n    movl 4+ca, %eax\n    movl ca+8-4, %ecx\n    ret\n";
-        crate::backend::i686::assembler::assemble(asm, obj.to_str().unwrap()).unwrap();
+        crate::backend::i686::assembler::assemble(asm, obj.to_str().unwrap(), None).unwrap();
         let bytes = std::fs::read(&obj).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         // No symbol name may carry the arithmetic.
