@@ -64,3 +64,45 @@ full kernel link/objtool, kernel QEMU boot, refreshed hosted CI and measured gai
 Kernel preparation continues to report the unimplemented options; those warnings
 have not been suppressed. The boot size above is not a performance improvement
 claim or a replacement for the full default-config kernel acceptance gate.
+
+## Post-merge follow-up (working progress)
+
+Integrated main `abb7708da`. The frontend CI lane merge was checked against the
+exact named-step union from both parents, with all 145 gates preserved; recorded
+costs rebalance to 291.1 / 291.2 / 291.2 seconds. Workflow shell and lane-plan
+structural checks pass. Post-merge compiler build (`--bins`) passed in 3m09s.
+The complete integrated warning gate, all-target linker gate and Microsoft
+scalar/wide, record and variadic ABI scripts pass after integration. Malformed
+negative numeric-warning rejection also passes six strict/non-strict GCC
+comparisons. Post-merge actual boot-only gate remains 31,088 bytes with the same
+setup image hash, GNU-linker byte parity and 24-object ISA pass.
+
+The focused unit gate found two stale expected-registry assertions introduced
+when adding warning families (Wextra membership, then trailing `=` labels).
+Both expectations are now explicit and corrected, without removing assertions.
+Final diagnostic units: **17 passed / 0 failed**; symbol-table units: **2 passed /
+0 failed**. These final focused units used fastbuild with opt-level 0 and debug 0
+to avoid repeatedly spending 6+ minutes optimizing the unit-test harness under
+swap pressure. The actual compiler binaries and kernel gates use the normal
+optimized fastbuild binaries, unchanged by the lib-only unit command.
+
+The real full kernel build is now running serially (`LCCC_JOBS=1`), with real
+host-built objtool and the package configuration. At the latest observation it
+was compiling `init/do_mounts.o`; no full-link result exists yet. Its log still
+contains unimplemented-option warnings, so this is **not** a zero-warning pass.
+Latest source fixes are pushed as `bf51dd9f2` to draft PR1065. Hosted checks for
+that revision are still running; the previous revision's assertion-unit check
+failed on the stale suffix expectation, so hosted-green readiness is not claimed.
+
+## Current sandbox follow-up: nominal enum identity
+
+The preceding local-process observations belong to the previous sandbox; that
+process and its log did not survive the wipe, so its completion is unknown.
+Hosted kernel run 41382248854 did complete with a verified enum-conversion
+failure in kernel/irq/manage.c. This is repaired in f21c59e9c with declaration
+identity rather than snapshot/name equality. See
+`engineering/ENUM-IDENTITY-REDTEAM-2026-11-02.md` for the root cause, alternatives,
+720 differential checks, 54 native/cross-target callback executions, focused unit
+results, and the separate prototype-scope defect found by the audit. Final Clippy
+also passed with `-D warnings` (52.36 seconds). Refreshed hosted kernel and ICX
+checks are pending; the PR remains draft and not ready for delivery.
