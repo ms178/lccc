@@ -1,0 +1,88 @@
+{
+  "scope": "unprivileged kernel-function replay, not whole-kernel runtime",
+  "compiler": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 16.2.0",
+  "compiler_sha256": "70eedd1b1b1daf8576729af00fcd1893c1d5d323474057e6c40613416943734b",
+  "object_sha256": {
+    "before": "8875de802d57934fc5746402dd9429ffe983849aa0021a6cf94cad24828c9dff",
+    "after": "42b1d483aa2b182d84375fe97e40d248809cfbc52aa7e557b22f88a40ca8c27b"
+  },
+  "cpu": 0,
+  "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "harness_sha256": {
+    "kernel_usercopy_replay.c": "beecb31dcba846f5cf558fd49ab63ef2c043e3a899ff0ae41ec805099e9ad8e5",
+    "kernel_usercopy_replay_start.S": "d8428bf77b8bdb91faa122c34f4564efa8a719d6c7fb057c62ffeff54976144c"
+  },
+  "warmup_pairs": 3,
+  "sample_pairs": 21,
+  "iterations_per_run": 10000000,
+  "correctness_cases_per_run": 4488,
+  "samples_ns": {
+    "before": [
+      79768296,
+      79990140,
+      79617181,
+      80020404,
+      79426880,
+      79453757,
+      79616837,
+      105587095,
+      79498009,
+      79328704,
+      79897933,
+      79475777,
+      79516991,
+      80066544,
+      79236773,
+      79411515,
+      79520174,
+      79254038,
+      79790749,
+      78836993,
+      80080202
+    ],
+    "after": [
+      78190722,
+      81988045,
+      78198361,
+      78340942,
+      80899094,
+      77972673,
+      78381430,
+      78357599,
+      78260485,
+      78143785,
+      80135527,
+      78017063,
+      78275324,
+      78463241,
+      77963424,
+      78064214,
+      78049225,
+      78110254,
+      79266854,
+      78748461,
+      78632808
+    ]
+  },
+  "median_ns": {
+    "before": 79520174,
+    "after": 78275324
+  },
+  "ratio_of_medians": 0.9843454819402181,
+  "paired_median_ratio": 0.9839298225837643,
+  "faster_pairs": 18,
+  "exploratory_bootstrap_paired_ratio_95pct": [
+    0.9816458038529148,
+    0.9850631746107941
+  ],
+  "limits": [
+    "no privileged SMAP patching or fault recovery",
+    "VM scheduling/frequency noise remains; bootstrap assumes independent pairs",
+    "object provenance must be recorded separately; no other compiler is invoked"
+  ],
+  "function_bytes": {
+    "before": 611,
+    "after": 591
+  }
+}

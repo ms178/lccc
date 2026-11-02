@@ -206,6 +206,11 @@ def main():
                      '-o', section_runtime])
                 run(([emulator] if emulator else []) + [section_runtime])
                 checks += 1
+                bool_runtime = work / f'{name}-{opt}-boolean-phi-cast'
+                run([compiler, opt, '-fno-pie', '-nostdlib', '-static', start,
+                     HERE / 'boolean_phi_cast_branch.c', '-o', bool_runtime])
+                run(([emulator] if emulator else []) + [bool_runtime])
+                checks += 1
                 modes = ('none', 'branch', 'full') if architecture in ('x86', 'i686') else (None,)
                 for mode in modes:
                     output = work/f'{name}-runtime'

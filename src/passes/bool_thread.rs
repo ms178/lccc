@@ -115,9 +115,9 @@ use crate::passes::round_cap;
 const MAX_ROUNDS: usize = 512;
 
 /// Thread bool-phi merge diamonds. Returns the number of threaded
-/// predecessor edges.
+/// predecessor edges plus removed truth-preserving merge casts.
 pub(crate) fn run(func: &mut IrFunction) -> usize {
-    let mut total = 0usize;
+    let mut total = remove_boolean_phi_branch_casts(func);
     let mut converged = false;
     for _ in 0..MAX_ROUNDS {
         let n = thread_round(func);
@@ -131,6 +131,87 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         round_cap::note_cap_hit(round_cap::Site::BoolThread);
     }
     total
+}
+
+/// Canonicalize a branch-only integer cast of a local {0,1} phi. Narrowing
+/// arbitrary integers is NOT truth-preserving (256 -> u8 is zero), so require
+/// every incoming arm to be an exact integer zero or one. No instruction is
+/// cloned or moved across asm: removing the cast exposes the existing phi-only
+/// threader, including constant edges following SMAP-style state changes.
+/// Count uses once for the function, rather than rescanning it per candidate.
+fn remove_boolean_phi_branch_casts(func: &mut IrFunction) -> usize {
+    let mut candidates = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let Terminator::CondBranch {
+            cond: Operand::Value(cond),
+            ..
+        } = &block.terminator
+        else {
+            continue;
+        };
+        let Some((position, source)) =
+            block
+                .instructions
+                .iter()
+                .enumerate()
+                .find_map(|(i, inst)| match inst {
+                    Instruction::Cast {
+                        dest,
+                        src: Operand::Value(src),
+                        from_ty,
+                        to_ty,
+                    } if dest == cond && from_ty.is_integer() && to_ty.is_integer() => {
+                        Some((i, *src))
+                    }
+                    _ => None,
+                })
+        else {
+            continue;
+        };
+        let boolean_phi = block.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::Phi { dest, incoming, ty }
+            if ty.is_integer() && *dest == source && !incoming.is_empty() && incoming.iter().all(|(op, _)| {
+                match op {
+                    Operand::Const(c) => matches!(const_to_i64(c), Some(0 | 1))
+                        || matches!(c, IrConst::I128(0 | 1)),
+                    Operand::Value(_) => false,
+                }
+            }))
+        });
+        if boolean_phi {
+            candidates.push((bi, position, source, *cond));
+        }
+    }
+    if candidates.is_empty() {
+        return 0;
+    }
+    let mut uses: FxHashMap<u32, u8> = FxHashMap::default();
+    for block in &func.blocks {
+        let mut count = |id| {
+            let n = uses.entry(id).or_default();
+            *n = (*n + 1).min(2);
+        };
+        for inst in &block.instructions {
+            inst.for_each_used_value(&mut count);
+        }
+        block.terminator.for_each_used_value(&mut count);
+    }
+    let mut removed = 0;
+    for (bi, position, source, cond) in candidates {
+        if uses.get(&cond.0) != Some(&1) {
+            continue;
+        }
+        let block = &mut func.blocks[bi];
+        if let Terminator::CondBranch { cond, .. } = &mut block.terminator {
+            *cond = Operand::Value(source);
+        }
+        block.instructions.remove(position);
+        if position < block.source_spans.len() {
+            block.source_spans.remove(position);
+        }
+        removed += 1;
+    }
+    removed
 }
 
 /// Structural successors of a terminator (labels only, no operand reads).
@@ -1063,6 +1144,162 @@ mod tests {
             });
         }
         ok
+    }
+
+    fn cast_boolean_merge(from_ty: IrType, to_ty: IrType) -> IrFunction {
+        let mut f = IrFunction::new("cast_phi".into(), IrType::I32, vec![], false);
+        f.next_value_id = 10;
+        let entry = empty_block(
+            0,
+            Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        );
+        let mut merge = empty_block(
+            3,
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(9)),
+                true_label: BlockId(4),
+                false_label: BlockId(5),
+            },
+        );
+        merge.instructions = vec![
+            Instruction::Phi {
+                dest: Value(6),
+                ty: from_ty,
+                incoming: vec![
+                    (Operand::Const(IrConst::I64(0)), BlockId(1)),
+                    (Operand::Const(IrConst::I64(1)), BlockId(2)),
+                ],
+            },
+            Instruction::Cast {
+                dest: Value(9),
+                src: Operand::Value(Value(6)),
+                from_ty,
+                to_ty,
+            },
+        ];
+        merge.source_spans = vec![
+            crate::common::source::Span::new(1, 2, 0),
+            crate::common::source::Span::new(2, 3, 0),
+        ];
+        f.blocks = vec![
+            entry,
+            empty_block(1, Terminator::Branch(BlockId(3))),
+            empty_block(2, Terminator::Branch(BlockId(3))),
+            merge,
+            empty_block(4, Terminator::Return(Some(Operand::Const(IrConst::I32(1))))),
+            empty_block(5, Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+        ];
+        f
+    }
+
+    #[test]
+    fn exact_boolean_phi_casts_preserve_truth_for_every_integer_width() {
+        let types = [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::I128,
+            IrType::U128,
+        ];
+        for from in types {
+            for to in types {
+                let mut f = cast_boolean_merge(from, to);
+                assert_eq!(
+                    remove_boolean_phi_branch_casts(&mut f),
+                    1,
+                    "{from:?} -> {to:?}"
+                );
+                assert_eq!(f.blocks[3].instructions.len(), 1);
+                assert_eq!(
+                    f.blocks[3].source_spans,
+                    [crate::common::source::Span::new(1, 2, 0)]
+                );
+                assert!(matches!(
+                    f.blocks[3].terminator,
+                    Terminator::CondBranch {
+                        cond: Operand::Value(Value(6)),
+                        ..
+                    }
+                ));
+                assert!(all_uses_resolved(&f));
+            }
+        }
+    }
+
+    #[test]
+    fn promoted_cast_metadata_still_requires_an_integer_phi() {
+        // Real promoted return-value shape: an u8 phi feeds an i32->u8 cast.
+        let mut f = cast_boolean_merge(IrType::I32, IrType::U8);
+        if let Instruction::Phi { ty, .. } = &mut f.blocks[3].instructions[0] {
+            *ty = IrType::U8;
+        }
+        assert_eq!(remove_boolean_phi_branch_casts(&mut f), 1);
+        // Fail closed on contradictory floating-point phi metadata.
+        let mut f = cast_boolean_merge(IrType::I32, IrType::U8);
+        if let Instruction::Phi { ty, .. } = &mut f.blocks[3].instructions[0] {
+            *ty = IrType::F64;
+        }
+        assert_eq!(remove_boolean_phi_branch_casts(&mut f), 0);
+    }
+
+    #[test]
+    fn boolean_cast_removal_exposes_both_constant_thread_edges() {
+        let mut f = cast_boolean_merge(IrType::I32, IrType::U8);
+        assert_eq!(run(&mut f), 3); // cast + both incoming branches
+        assert!(is_branch_to(&f.blocks[1].terminator, 5));
+        assert!(is_branch_to(&f.blocks[2].terminator, 4));
+        assert!(all_uses_resolved(&f));
+    }
+
+    #[test]
+    fn narrowing_non_booleans_and_unknown_phi_arms_are_not_rewritten() {
+        for value in [
+            Operand::Const(IrConst::I64(256)),
+            Operand::Const(IrConst::I64(-256)),
+            Operand::Const(IrConst::I64(2)),
+            Operand::Const(IrConst::I128(1i128 << 64)),
+            Operand::Value(Value(0)),
+        ] {
+            let from = if matches!(value, Operand::Const(IrConst::I128(_))) {
+                IrType::I128
+            } else {
+                IrType::I64
+            };
+            let mut f = cast_boolean_merge(from, IrType::U8);
+            f.blocks[0].instructions.push(Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(256)),
+            });
+            if let Instruction::Phi { incoming, .. } = &mut f.blocks[3].instructions[0] {
+                incoming[1].0 = value;
+            }
+            assert_eq!(remove_boolean_phi_branch_casts(&mut f), 0);
+            assert_eq!(f.blocks[3].instructions.len(), 2);
+        }
+    }
+
+    #[test]
+    fn live_cast_results_and_noninteger_casts_are_preserved() {
+        let mut f = cast_boolean_merge(IrType::I32, IrType::U8);
+        f.blocks[5].terminator = Terminator::Return(Some(Operand::Value(Value(9))));
+        assert_eq!(remove_boolean_phi_branch_casts(&mut f), 0);
+        for (from, to) in [
+            (IrType::I32, IrType::F32),
+            (IrType::F64, IrType::U8),
+            (IrType::Ptr, IrType::U8),
+        ] {
+            let mut f = cast_boolean_merge(from, to);
+            assert_eq!(remove_boolean_phi_branch_casts(&mut f), 0);
+        }
     }
 
     #[test]

@@ -514,3 +514,15 @@ requires it for these same native contracts. Hosted results are pending.
 All remaining warning families/options, zero build warnings, complete strict
 objtool validation and measured kernel performance gains remain open. No
 production-ready or universal-performance claim is made.
+
+## Boolean merge follow-up
+
+The casted 0/1 merge in actual check_zeroed_user now has a narrowly proved
+canonicalization rather than a validator annotation. Final 13 IR tests, 233
+four-target/oracle object/runtime contracts and all-target Clippy pass. Its
+kernel function shrinks 611->591 bytes; a bounded native userspace replay shows
+about 1.57% lower median workload time, not a whole-kernel speedup. The actual
+object still fails strict objtool on two dead stac/clac helper findings.
+See `BOOLEAN-MERGE-UACCESS-AUDIT-2026-11-02.md` and its raw measurement JSON.
+Newly confirmed target-specific hardening-option omissions are explicitly
+listed there and remain unfinished. All-13/zero-warning readiness is not claimed.
