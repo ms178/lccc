@@ -260,8 +260,8 @@ mod tests {
         ));
         let p = path.to_str().unwrap();
         match arch {
-            CfiArch::X86_64 => crate::backend::x86::assembler::assemble(asm, p),
-            CfiArch::I386 => crate::backend::i686::assembler::assemble(asm, p),
+            CfiArch::X86_64 => crate::backend::x86::assembler::assemble(asm, p, None),
+            CfiArch::I386 => crate::backend::i686::assembler::assemble(asm, p, None),
         }
         .expect("assembles");
         let elf = std::fs::read(&path).unwrap();

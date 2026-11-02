@@ -21,9 +21,16 @@ use parser::{AsmDirective, AsmStatement, DataValue, Operand, parse_asm};
 /// Assemble AArch64 assembly text into an ELF object file.
 ///
 /// This is the default assembler (used when the `gcc_assembler` feature is disabled).
-pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
+pub fn assemble(
+    asm_text: &str,
+    output_path: &str,
+    debug: Option<crate::backend::elf::DwarfConfig>,
+) -> Result<(), String> {
     let statements = prepare_statements(asm_text)?;
     let mut writer = ElfWriter::new();
+    if let Some(debug) = debug {
+        writer.base.set_debug_config(debug);
+    }
     writer.process_statements(&statements)?;
     writer.write_elf(output_path)?;
     Ok(())

@@ -3175,13 +3175,31 @@ mod debug_line_tests {
     fn relaxable_code_is_addressed_through_labels() {
         let w = assembled(SOURCE);
         let line = &w.base.sections[".debug_line"];
-        assert_eq!(line.relocs.len(), 3, "first row, second row, sequence end");
+        // Version 5 also relocates every path offset against `.debug_line_str`,
+        // so the code addresses are the label relocations alone.
+        let code: Vec<_> = line
+            .relocs
+            .iter()
+            .filter(|r| r.symbol_name.starts_with(".Lloc"))
+            .collect();
+        assert_eq!(code.len(), 3, "first row, second row, sequence end");
         assert!(
-            line.relocs
-                .iter()
-                .all(|r| r.reloc_type == 2 && r.addend == 0 && r.symbol_name.starts_with(".Lloc")),
+            code.iter().all(|r| r.reloc_type == 2 && r.addend == 0),
             "{:?}",
-            line.relocs
+            code.iter()
+                .map(|r| (r.reloc_type, r.symbol_name.as_str(), r.addend))
+                .collect::<Vec<_>>()
+        );
+        let paths: Vec<_> = line
+            .relocs
+            .iter()
+            .filter(|r| r.symbol_name == ".debug_line_str")
+            .collect();
+        assert!(!paths.is_empty(), "the prologue names its paths");
+        assert!(
+            paths.iter().all(|r| r.reloc_type == 1),
+            "path offsets are 32-bit relocations: {:?}",
+            paths
                 .iter()
                 .map(|r| (r.reloc_type, r.symbol_name.as_str(), r.addend))
                 .collect::<Vec<_>>()
@@ -3229,6 +3247,7 @@ mod debug_line_tests {
         let targets: Vec<_> = line
             .relocs
             .iter()
+            .filter(|r| r.symbol_name != ".debug_line_str")
             .map(|r| (r.symbol_name.as_str(), r.addend))
             .collect();
         assert_eq!(targets, [(".text", 0)]);

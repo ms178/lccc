@@ -836,16 +836,26 @@ impl Target {
     ///
     /// When the `gcc_assembler` Cargo feature is enabled, uses GCC for assembling
     /// (with a warning). When disabled (default), uses the built-in assembler.
+    /// `debug` selects the DWARF dialect for the `.loc` rows in `asm_text`
+    /// (`-gdwarf-<N>` plus the language `-std=` implies); `None` means the
+    /// driver emitted no debug records and the writer's default applies.
     pub(crate) fn assemble_with_extra(
         &self,
         asm_text: &str,
         output_path: &str,
         extra_args: &[String],
+        debug: Option<elf::DwarfConfig>,
     ) -> Result<(), String> {
-        // When gcc_assembler feature is enabled, use GCC for assembling
+        // When gcc_assembler feature is enabled, GCC assembles the text and
+        // produces its own debug sections; tell it which dialect to write and
+        // let it keep its default (v5) when debugging is off.
         #[cfg(feature = "gcc_assembler")]
         {
-            common::assemble_with_extra(&self.assembler_config(), asm_text, output_path, extra_args)
+            let mut args = extra_args.to_vec();
+            if let Some(debug) = debug {
+                args.push(format!("-gdwarf-{}", debug.version));
+            }
+            common::assemble_with_extra(&self.assembler_config(), asm_text, output_path, &args)
         }
 
         // Default (gcc_assembler disabled): use the built-in assembler
@@ -859,12 +869,12 @@ impl Target {
             }
 
             match self {
-                Target::Aarch64 => arm::assembler::assemble(asm_text, output_path),
-                Target::X86_64 => x86::assembler::assemble(asm_text, output_path),
+                Target::Aarch64 => arm::assembler::assemble(asm_text, output_path, debug),
+                Target::X86_64 => x86::assembler::assemble(asm_text, output_path, debug),
                 Target::Riscv64 => {
-                    riscv::assembler::assemble_with_args(asm_text, output_path, extra_args)
+                    riscv::assembler::assemble_with_args(asm_text, output_path, extra_args, debug)
                 }
-                Target::I686 => i686::assembler::assemble(asm_text, output_path),
+                Target::I686 => i686::assembler::assemble(asm_text, output_path, debug),
             }
         }
     }

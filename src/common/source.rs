@@ -151,6 +151,17 @@ impl SourceManager {
         &self.files[file_id as usize].content
     }
 
+    /// The name of the translation unit's own source file -- the first file
+    /// added, from which every include's line markers hang.
+    ///
+    /// Debug-info producers need it even when no surviving instruction carries
+    /// a span (a function that folds to nothing has no instructions to carry
+    /// one), because the file table must still name the file the line program
+    /// describes.
+    pub fn primary_file_name(&self) -> Option<&str> {
+        self.files.first().map(|file| file.name.as_str())
+    }
+
     /// Build a line map from GCC-style line markers in preprocessed output.
     ///
     /// Scans the stored file content (files[0]) for lines matching

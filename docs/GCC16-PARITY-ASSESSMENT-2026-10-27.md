@@ -343,7 +343,7 @@ environment artifact and is excluded — lccc ships its own header and passes it
 | Warning options (`-W…` positive) | 549 | 18 accepted | 12 live `WarningKind`s; 535 options tolerated-not-implemented |
 | Driver options overall | 1 389 | 157 accepted, 1 051 tolerated, 171 refused, 10 unrecognized | 11 % effect, 87 % no-op-or-refused |
 | ISA options (`-m…`) | 234 | 77 accepted | 153 refused (honest errors) |
-| Debug info | DWARF 5: types, variables, inline, dir/file tables | `.debug_line` only, DWARF 4, empty directory table | gdb cannot show types, locals or arguments |
+| Debug info | DWARF 5: types, variables, inline, dir/file tables | DWARF **2/3/4/5** line programs, compile units, subprograms with `decl_file`/`decl_line`, directory and file tables in both encodings, and the `.debug_aranges` address map; every field the dialect pins uses the form GCC 16.2 uses (compared per field); no type or variable DIEs | `addr2line`/`objdump`/`readelf` parity with GCC 16.2; gdb cannot show types, locals or arguments |
 | Coverage (`-ftest-coverage`, `-fprofile-arcs`) | `.gcno`/`.gcda` + gcov | flags accepted and **re-routed to the PGO path**: emits a `lccc-*.profraw` and prints the PGO instrumentation banner, but **no `.gcno`/`.gcda`** | wrong artifact, mislabelled |
 | PGO | `.gcda` (`-fprofile-generate/use`) | own `.profraw` scheme, works, format-incompatible | functional, not interchangeable |
 | LTO | works | refused with an error | honest gap |
@@ -564,9 +564,11 @@ while `-Os`/`-Oz` do produce distinct (smaller) output. `-fshort-wchar`, `-fwrap
 
 | Feature | Measurement | Status |
 |---|---|---|
-| `-g` | `.debug_line` only; **no `.debug_info`, `.debug_abbrev`, `.debug_str`**; DWARF **v4**; directory table empty | line-level `addr2line` only; gdb shows no types/locals/params |
+| `-g` | `.debug_line`, `.debug_info`, `.debug_abbrev`, `.debug_str`/`.debug_line_str`, `.debug_aranges`; DWARF selected by `-gdwarf-N` (default 5); directory and file tables populated for every version | line-level `addr2line`/`objdump --dwarf` parity; the compile unit and one `DW_TAG_subprogram` per function carry `low_pc`/`high_pc`/`decl_file`/`decl_line`, and the address map makes the unit searchable without decoding it; gdb shows no types/locals/params |
 | `-gsplit-dwarf` | warns "not supported; emitting non-split debug info" | honest |
-| `-gz=`, `-gdwarf-N`, `-gprune-btf` | unrecognized hard errors | absent |
+| `-gdwarf-2..5`, `-gdwarf`, `-gdwarf32` | implemented; `-gdwarf-N` alone enables debug info like GCC, `-g0` after it disables it, last one wins | parity with GCC 16.2, checked cell by cell by `tests/regression/check_dwarf_versions.py` |
+| `-gdwarf64`, `-gz=`, `-gz` | one specific warning each, fatal under `LCCC_STRICT_OPTIONS=1` | honest: 64-bit units and compression are not written |
+| `-gprune-btf` | unrecognized hard error | absent |
 | `-ftest-coverage` (alone) and `-fprofile-arcs` (alone) | both accepted; **each one alone** triggers `lccc: PGO: instrumented N functions … into ./lccc-*.profraw`; **no `.gcno`, no `.gcda`, no `__gcov_*`** | not silent, but the wrong artifact: a coverage job gets a PGO profile instead of gcov data |
 | `-fprofile-generate` | works: emits `lccc-*.profraw`, `-fprofile-use` consumes it | functional, GCC-incompatible format |
 | `-fauto-profile`, `-fprofile-update=` | accepted (the latter refused for unknown values) | partial |
@@ -630,7 +632,7 @@ and the CI benchmark lanes). Two compatibility-relevant facts were measured anyw
 | R6 | `-pedantic`, `-Ofast`, `-Og`, `-static-pie` accepted with no effect | silent no-op | §3.6 |
 | R7 | Uninitialized/switch/shadow diagnostics absent | missed bugs, not miscompiles | §3.5 |
 | R8 | `__STDC_NO_ATOMICS__` denies a capability lccc has | degraded build (fallback code) | §3.2 |
-| R9 | No DWARF DIEs | debugger unusable for variables/types | §3.7 |
+| R9 | No type or variable DIEs (no `DW_TAG_base_type`/pointer/composite types, no locals, no formals) | a debugger cannot show or evaluate anything typed | §3.7 |
 | R10 | `_BitInt`, digraphs, UCN identifiers | compile failure on conforming code | §3.1 |
 | R11 | No sanitizer runtimes, no LTO, no gcov | CI/security tooling cannot adopt lccc | §3.7 |
 

@@ -22445,7 +22445,7 @@ f:
         );
         let obj = std::env::temp_dir().join("lccc_fold_copy_ext_parseable.o");
         let path = obj.to_string_lossy().into_owned();
-        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
+        crate::backend::i686::assembler::assemble(&out, &path, None).unwrap_or_else(|e| {
             panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
         });
         let _ = std::fs::remove_file(&path);
@@ -23624,7 +23624,7 @@ f:
         assert!(!out.contains("testl %eax, %eax"), "{out}");
         let obj = std::env::temp_dir().join("lccc_logical_zero_test.o");
         let path = obj.to_string_lossy().into_owned();
-        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
+        crate::backend::i686::assembler::assemble(&out, &path, None).unwrap_or_else(|e| {
             panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
         });
         let _ = std::fs::remove_file(&path);
@@ -24148,7 +24148,7 @@ f:
         assert!(out.contains("cmpw 24(%esi), %bx"), "{out}");
         let obj = std::env::temp_dir().join("lccc_pair_cmp_assembles.o");
         let path = obj.to_string_lossy().into_owned();
-        crate::backend::i686::assembler::assemble(&out, &path).unwrap_or_else(|e| {
+        crate::backend::i686::assembler::assemble(&out, &path, None).unwrap_or_else(|e| {
             panic!("peephole emitted assembly the i686 assembler rejects: {e}\n{out}")
         });
         let _ = std::fs::remove_file(&path);

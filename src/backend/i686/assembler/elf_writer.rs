@@ -406,7 +406,7 @@ mod tests {
             "start_of_setup:\n",
             "\t.byte 0x90\n",
         );
-        assemble(asm, out.to_str().unwrap()).unwrap();
+        assemble(asm, out.to_str().unwrap(), None).unwrap();
         let data = std::fs::read(&out).unwrap();
         // The 1-byte addend (-1 = 0xff) must sit in the field, with the
         // string "HdrS" intact immediately after it.
@@ -453,7 +453,7 @@ mod tests {
             ".code64\ncall ext\ncall ext@PLT\n.code32\n",
             ".section .text.unlikely,\"ax\",@progbits\nlcold: ret\n",
         );
-        assemble(asm, out.to_str().unwrap()).unwrap();
+        assemble(asm, out.to_str().unwrap(), None).unwrap();
         let data = std::fs::read(&out).unwrap();
         let mut rel: Vec<(u32, u8)> = section32(&data, ".rel.text")
             .expect(".rel.text present")
@@ -489,7 +489,7 @@ mod tests {
         let out = dir.join("n.o");
         let text_of = |filler: &str| {
             let asm = format!(".text\nf:\njmp .Lt\n{filler}.p2align 4\n.Lt:\nret\n.code16\nnop\n");
-            assemble(&asm, out.to_str().unwrap()).unwrap();
+            assemble(&asm, out.to_str().unwrap(), None).unwrap();
             let data = std::fs::read(&out).unwrap();
             section32(&data, ".text").expect(".text present")
         };
@@ -522,7 +522,7 @@ mod tests {
             "ext_sym:\n",
             "\t.byte 0xbb\n",
         );
-        assemble(asm, out.to_str().unwrap()).unwrap();
+        assemble(asm, out.to_str().unwrap(), None).unwrap();
         let data = std::fs::read(&out).unwrap();
         // `.word ext_sym` is an R_386_16 with addend 0: the 2-byte patch must
         // write 00 00 into the field and leave the 0xaa marker byte intact.
