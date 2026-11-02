@@ -20,7 +20,8 @@ class TransportTests(unittest.TestCase):
         block = re.search(r'(?m)^    permissions:\n((?:      [^\n]*\n)+)', job)
         self.assertIsNotNone(block)
         permissions = dict(line.strip().split(': ', 1)
-                           for line in block.group(1).splitlines())
+                           for line in block.group(1).splitlines()
+                           if not line.strip().startswith('#'))
         # Job-level permissions reset every omitted scope to none. Downloading
         # Actions logs/artifacts needs read; publishing blobs needs contents write.
         self.assertEqual(permissions, {'actions': 'read', 'contents': 'write'})
