@@ -39,10 +39,7 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
                 // hanging off the `pop` describes the slot the pair owns, so
                 // that keeps it too -- deleting the pair would leave the
                 // unwinder pointing at a byte nobody moved.
-                if pop_reg_id == push_reg_id
-                    && !infos[j].pinned
-                    && !cfi_follows(store, infos, j)
-                {
+                if pop_reg_id == push_reg_id && !infos[j].pinned && !cfi_follows(store, infos, j) {
                     let mut safe = true;
                     for k in (i + 1)..j {
                         if infos[k].is_nop() {

@@ -170,8 +170,7 @@ fn condition_ignores_sf(t: &str) -> bool {
     };
     matches!(
         cond,
-        "e"
-            | "z"
+        "e" | "z"
             | "ne"
             | "nz"
             | "b"
@@ -394,9 +393,8 @@ mod mask_test_tests {
         // The branch target is defined on purpose: a jump to an unknown label
         // leaves the whole function unanalysable (`classify` refuses it), and
         // then no liveness-gated rewrite of this pass can fire.
-        let out = run(
-            "    andl $255, %r10\n    testq %r10, %r10\n    je .L1\n    ret\n.L1:\n    ret\n",
-        );
+        let out =
+            run("    andl $255, %r10\n    testq %r10, %r10\n    je .L1\n    ret\n.L1:\n    ret\n");
         assert!(out.contains("testb %r10b, %r10b"), "{out}");
         assert!(!out.contains("andl $255"), "{out}");
         assert!(!out.contains("testq"), "{out}");
@@ -418,9 +416,8 @@ mod mask_test_tests {
     /// A `cmp $0` zero test is the same question as `test`.
     #[test]
     fn a_cmp_zero_test_is_deleted_too() {
-        let out = run(
-            "    andl $3, %r8d\n    cmpl $0, %r8d\n    jne .L3\n    ret\n.L3:\n    ret\n",
-        );
+        let out =
+            run("    andl $3, %r8d\n    cmpl $0, %r8d\n    jne .L3\n    ret\n.L3:\n    ret\n");
         assert!(out.contains("testb $3, %r8b"), "{out}");
         assert!(!out.contains("cmpl $0"), "{out}");
     }
@@ -458,7 +455,8 @@ mod mask_test_tests {
     /// A whole-flags reader after the branch would see the SF difference.
     #[test]
     fn a_later_sf_reader_keeps_the_mask() {
-        let out = run("    andl $255, %r10\n    je .L5\n    js .L6\n.L5:\n    ret\n.L6:\n    ret\n");
+        let out =
+            run("    andl $255, %r10\n    je .L5\n    js .L6\n.L5:\n    ret\n.L6:\n    ret\n");
         assert!(out.contains("andl $255, %r10"), "{out}");
     }
 
@@ -467,9 +465,8 @@ mod mask_test_tests {
     fn a_value_live_after_the_reader_keeps_the_mask() {
         // A bare `je` is the reader: it writes no flags, so rule 2 cannot
         // re-encode the mask and the only question left is value liveness.
-        let out = run(
-            "    andl $255, %r10\n    je .L7\n    addq %r10, %rax\n    ret\n.L7:\n    ret\n",
-        );
+        let out =
+            run("    andl $255, %r10\n    je .L7\n    addq %r10, %rax\n    ret\n.L7:\n    ret\n");
         assert!(out.contains("andl $255, %r10"), "{out}");
         assert!(out.contains("addq %r10, %rax"), "{out}");
     }
@@ -562,9 +559,8 @@ mod mask_test_tests {
     /// Running the pass on its own output changes nothing.
     #[test]
     fn the_rewrite_is_idempotent() {
-        let once = run(
-            "    andl $255, %r10\n    testq %r10, %r10\n    je .Lc\n    ret\n.Lc:\n    ret\n",
-        );
+        let once =
+            run("    andl $255, %r10\n    testq %r10, %r10\n    je .Lc\n    ret\n.Lc:\n    ret\n");
         let mut store = LineStore::new(once.clone());
         let mut infos: Vec<LineInfo> = (0..store.len())
             .map(|i| classify_line(store.get(i)))
