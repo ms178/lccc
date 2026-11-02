@@ -508,6 +508,54 @@ for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
     done
 done
 
+# --- 10. Degenerate and shadowing definitions of the builtins --------------
+# Three shapes that a name-first implementation gets wrong and a table-first one
+# gets right for free. Each is cross-checked against both oracles.
+
+# (a) `__TIMESTAMP__` is the *physical* file's mtime even after `#line` rewrites
+# the presumed name: the macro asks about a file, and `#line` only lies about
+# which one the diagnostics should name.
+printf '#line 1 "virt.c"\nconst char *ts = __TIMESTAMP__;\n' >"$tmp/stamp_virt.c"
+touch -d '2029-03-04 05:06:07 UTC' "$tmp/stamp_virt.c"
+mine=$(TZ=UTC preprocess "$CCC" "$tmp/stamp_virt.c")
+expect_line "$mine" "#line timestamp" 'const char *ts = "Sun Mar  4 05:06:07 2029";'
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    ref=$(TZ=UTC preprocess "$oracle_bin" "$tmp/stamp_virt.c")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "#line timestamp: $oracle_bin disagrees: '$ref'"
+done
+
+# (b) An empty user definition wins, so the builtin expands to nothing -- and the
+# surrounding tokens are not swallowed with it.
+printf '#define __INCLUDE_LEVEL__\nint empty = __INCLUDE_LEVEL__ ;\n' >"$tmp/empty_def.c"
+mine=$(preprocess "$CCC" "$tmp/empty_def.c")
+[ "$(printf '%s' "$mine" | norm)" = "int empty = ;" ] \
+    || fail "empty definition: expected 'int empty = ;', got '$mine'"
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    ref=$(preprocess "$oracle_bin" "$tmp/empty_def.c")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "empty definition: $oracle_bin disagrees: '$ref'"
+done
+
+# (c) A *function-like* user definition leaves a bare mention alone (it is not an
+# invocation) and expands when called: both oracles do exactly that, which is why
+# `builtin_expands` consults the table instead of the name.
+printf '#define __LINE__(x) (x)\nint bare = __LINE__;\nint call_ = __LINE__(7);\n' >"$tmp/fnlike.c"
+mine=$(preprocess "$CCC" "$tmp/fnlike.c")
+expect_line "$mine" "function-like shadow" "int bare = __LINE__;"
+expect_line "$mine" "function-like shadow" "int call_ = (7);"
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    ref=$(preprocess "$oracle_bin" "$tmp/fnlike.c")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "function-like shadow: $oracle_bin disagrees: '$ref'"
+done
+
 if [ "$have_gcc" -eq 1 ]; then
     ref=$("$GCC" -dM -E -x c /dev/null)
     for name in __FILE__ __LINE__ __DATE__ __TIME__ __TIMESTAMP__ __INCLUDE_LEVEL__ \

@@ -232,7 +232,7 @@ pub struct MacroTable {
     /// `__TIMESTAMP__` bodies, keyed by physical path (see `file_stack`).
     timestamp_bodies: std::cell::RefCell<FxHashMap<std::path::PathBuf, String>>,
     /// Builtins whose definition *this compiler* supplied (bit set) -- see
-    /// `BUILTIN_NAMES`. Those are the ones a `-dM` dump omits, because both
+    /// `BUILTINS`. Those are the ones a `-dM` dump omits, because both
     /// reference compilers keep them in preprocessor state rather than in the
     /// macro table and therefore never print them (measured on gcc-16 and
     /// clang-23: all eight are absent). A definition the *source* supplied is
@@ -257,59 +257,56 @@ pub struct MacroTable {
     suppressed: FxHashSet<String>,
 }
 
-/// Preprocessor builtins that are not plain replacement lists.
+/// Every builtin the preprocessor owns a definition for, in bit order, with the
+/// one property that differs between them: whether it is *dynamic*.
 ///
-/// Members are recognised by `#ifdef`/`defined()` whether or not they are
-/// currently in the table, they can be removed for the rest of the translation
-/// unit with `#undef`, and a user `#define` of one of them wins over the
-/// builtin value.
-pub(super) const DYNAMIC_BUILTINS: [&str; 5] = [
-    "__LINE__",
-    "__COUNTER__",
-    "__FILE__",
-    "__INCLUDE_LEVEL__",
-    "__TIMESTAMP__",
+/// A dynamic builtin is recognised by `#ifdef`/`defined()` whether or not it is
+/// currently in the table, it can be removed for the rest of the translation unit
+/// with `#undef`, and a user `#define` of it wins over the builtin value. The five
+/// dynamic ones are the five whose value lccc produces itself (`__FILE__`,
+/// `__LINE__`, `__COUNTER__`, `__INCLUDE_LEVEL__`, `__TIMESTAMP__`); the other
+/// three are installed once and then behave like ordinary macros.
+///
+/// One list, both facts. Keeping the dynamic set in a second table is how the two
+/// drift apart -- a name added to the ownership list but not to the dynamic one is
+/// a silent hole (`-dM` omits it while `#ifdef` does not see it) and nothing
+/// fails. Every mask below is derived from this list by the compiler, so none of
+/// them can describe something the list does not contain.
+const BUILTINS: [(&str, bool); 8] = [
+    ("__FILE__", true),
+    ("__BASE_FILE__", false),
+    ("__DATE__", false),
+    ("__TIME__", false),
+    ("__LINE__", true),
+    ("__COUNTER__", true),
+    ("__INCLUDE_LEVEL__", true),
+    ("__TIMESTAMP__", true),
 ];
 
-/// True when `name` is one of the five builtins above. A linear scan over five
-/// short strings beats hashing for the callers, all of which run per token or
-/// per directive.
-#[inline]
-pub(super) fn is_dynamic_builtin(name: &str) -> bool {
-    DYNAMIC_BUILTINS.contains(&name)
-}
+/// Bits of the entries in [`BUILTINS`] marked dynamic.
+const BUILTIN_DYNAMIC_MASK: u8 = {
+    let mut mask = 0u8;
+    let mut index = 0;
+    while index < BUILTINS.len() {
+        if BUILTINS[index].1 {
+            mask |= 1 << index;
+        }
+        index += 1;
+    }
+    mask
+};
 
-/// Every builtin the preprocessor owns a definition for, in bit order.
-///
-/// The first four are *materialised* (their body is a table entry, updated by
-/// `set_builtin_body`); the last four are computed at expansion or carry no
-/// body of their own. Both facts are tracked as bitmasks over this list rather
-/// than as hash sets: there are eight of them, the checks run per directive and
-/// per dump line, and a `u8` test cannot allocate.
-const BUILTIN_NAMES: [&str; 8] = [
-    "__FILE__",
-    "__BASE_FILE__",
-    "__DATE__",
-    "__TIME__",
-    "__LINE__",
-    "__COUNTER__",
-    "__INCLUDE_LEVEL__",
-    "__TIMESTAMP__",
-];
-
-/// Bit `i` is set when `BUILTIN_NAMES[i]` is exactly this many bytes long.
+/// Bit `i` is set when `BUILTINS[i]`'s name is exactly this many bytes long.
 ///
 /// A name whose length has no bits set cannot be a builtin, so the scan below is
-/// skipped after one indexed load -- which is what keeps the ownership bookkeeping
-/// free on the `#define` path, where every macro in the translation unit passes
-/// through here. It is derived from `BUILTIN_NAMES` at compile time, so the two
-/// cannot drift; the assert fails the build, not the run, if a longer name is
-/// ever added.
+/// skipped after one indexed load -- which is what keeps the ownership
+/// bookkeeping free on the `#define` path, where every macro in the translation
+/// unit passes through here, and on `#ifdef`, where every feature probe does.
 const BUILTIN_LEN_MASKS: [u8; 24] = {
     let mut masks = [0u8; 24];
     let mut index = 0;
-    while index < BUILTIN_NAMES.len() {
-        let len = BUILTIN_NAMES[index].len();
+    while index < BUILTINS.len() {
+        let len = BUILTINS[index].0.len();
         assert!(
             len < masks.len(),
             "raise BUILTIN_LEN_MASKS for the new builtin"
@@ -320,7 +317,8 @@ const BUILTIN_LEN_MASKS: [u8; 24] = {
     masks
 };
 
-/// Bit for `name` in the ownership masks, or `None` for an ordinary macro.
+/// Bit for `name` in the ownership and dynamic masks, or `None` for an ordinary
+/// macro.
 ///
 /// Only names that share a length with a builtin are compared at all, and those
 /// share it with at most two of them, so the cost is one array load for the
@@ -331,11 +329,23 @@ fn builtin_bit(name: &str) -> Option<u8> {
     while pending != 0 {
         let index = pending.trailing_zeros() as usize;
         pending &= pending - 1;
-        if name.as_bytes() == BUILTIN_NAMES[index].as_bytes() {
+        if name.as_bytes() == BUILTINS[index].0.as_bytes() {
             return Some(1 << index);
         }
     }
     None
+}
+
+/// True when `name` is one of the dynamic builtins.
+///
+/// Same cost as [`builtin_bit`] -- the dynamic bit and the ownership bits are
+/// answerable from one lookup -- rather than a compare against each name in turn.
+#[inline]
+pub(super) fn is_dynamic_builtin(name: &str) -> bool {
+    match builtin_bit(name) {
+        Some(bit) => BUILTIN_DYNAMIC_MASK & bit != 0,
+        None => false,
+    }
 }
 
 impl MacroTable {
@@ -2721,5 +2731,48 @@ mod invocation_continuation_tests {
         // No closing `)` anywhere: leave the text alone rather than inventing
         // one (the enclosing scan will diagnose or pass it on verbatim).
         assert_eq!(t.unclosed_invocation_tail("g(~", b" 5", 0), None);
+    }
+}
+
+#[cfg(test)]
+mod builtin_table_tests {
+    use super::*;
+
+    /// The builtin table is the only place a builtin is declared, and every mask
+    /// the preprocessor consults is derived from it. These assertions are what
+    /// makes that derivation trustworthy: a name that does not follow the
+    /// `__NAME__` convention, or a length that outgrows the mask array, would
+    /// make one mask silently disagree with the table.
+    #[test]
+    fn the_builtin_table_describes_itself_consistently() {
+        assert_eq!(
+            BUILTINS.len(),
+            8,
+            "bump BUILTIN_DYNAMIC_MASK's type if more"
+        );
+        for (index, (name, dynamic)) in BUILTINS.iter().enumerate() {
+            assert!(name.starts_with("__") && name.ends_with("__"), "{name}");
+            assert!(name.len() < 24, "{name} must fit BUILTIN_LEN_MASKS");
+            assert_eq!(builtin_bit(name), Some(1 << index), "{name}");
+            assert_eq!(is_dynamic_builtin(name), *dynamic, "{name}");
+            assert_eq!(
+                BUILTIN_LEN_MASKS[name.len()] & (1 << index),
+                1 << index,
+                "{name}"
+            );
+        }
+        // Five dynamic entries, and the mask says exactly which.
+        assert_eq!(BUILTIN_DYNAMIC_MASK.count_ones(), 5);
+        // Names that share no length with a builtin are rejected by one load,
+        // and names that look like builtins are rejected by the comparison.
+        for ordinary in ["x", "FOO", "__FILE___", "__file__", "__LINE", "_Pragma", ""] {
+            assert_eq!(builtin_bit(ordinary), None, "{ordinary}");
+            assert!(!is_dynamic_builtin(ordinary), "{ordinary}");
+        }
+        // `__BASE_FILE__` is a builtin that is *not* dynamic: it is installed
+        // once, so it has no per-token value to expand and no `#undef` to
+        // defend against.
+        assert_eq!(builtin_bit("__BASE_FILE__"), Some(1 << 1));
+        assert!(!is_dynamic_builtin("__BASE_FILE__"));
     }
 }
