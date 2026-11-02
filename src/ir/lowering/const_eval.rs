@@ -403,25 +403,60 @@ impl Lowerer {
                 Some(IrConst::I64(align as i64))
             }
             Expr::Conditional(cond, then_e, else_e, _) => {
-                // A literal's array address is non-null, even though it has no
-                // numeric IrConst. Keep this in sync with sema's selection.
                 if shared_const_eval::string_literal_condition(cond) {
                     return self.eval_const_expr(then_e);
                 }
                 let cond_val = self.eval_const_expr(cond)?;
-                if self.const_truth(&cond_val, cond) {
-                    self.eval_const_expr(then_e)
+                let live = if self.const_truth(&cond_val, cond) {
+                    then_e
                 } else {
-                    self.eval_const_expr(else_e)
-                }
+                    else_e
+                };
+                let value = self.eval_const_expr(live)?;
+                // The result is a value of the operator's C common type (C11
+                // 6.5.15p5), so the live arm's constant must be reinterpreted at
+                // that width: folding `1 ? -1 : 1u` to a bare -1 loses the
+                // `unsigned int` value 4294967295, and every enclosing conversion
+                // then sign-extends it instead of zero-extending it.
+                Some(
+                    match (
+                        self.expr_ctype(then_e),
+                        self.expr_ctype(else_e),
+                        value.to_i64(),
+                    ) {
+                        (then_ct, else_ct, Some(bits))
+                            if then_ct.is_integer() && else_ct.is_integer() =>
+                        {
+                            IrConst::I64(CType::ternary_value_as_i64(&then_ct, &else_ct, bits))
+                        }
+                        _ => value,
+                    },
+                )
             }
             Expr::GnuConditional(cond, else_e, _) => {
+                // `a ?: b` is `a ? a : b` evaluated once, so it obeys the same
+                // common-type rule: `-1 ?: 1u` is an `unsigned int` holding
+                // 4294967295, not an `int` holding -1.
                 let cond_val = self.eval_const_expr(cond)?;
-                if self.const_truth(&cond_val, cond) {
-                    Some(cond_val) // condition value is used as result
+                let value = if self.const_truth(&cond_val, cond) {
+                    cond_val // the condition value is the result
                 } else {
-                    self.eval_const_expr(else_e)
-                }
+                    self.eval_const_expr(else_e)?
+                };
+                Some(
+                    match (
+                        self.expr_ctype(cond),
+                        self.expr_ctype(else_e),
+                        value.to_i64(),
+                    ) {
+                        (then_ct, else_ct, Some(bits))
+                            if then_ct.is_integer() && else_ct.is_integer() =>
+                        {
+                            IrConst::I64(CType::ternary_value_as_i64(&then_ct, &else_ct, bits))
+                        }
+                        _ => value,
+                    },
+                )
             }
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
                 if let Some(val) = self.eval_const_expr(inner) {

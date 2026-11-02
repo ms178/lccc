@@ -1045,7 +1045,22 @@ impl MacroTable {
         }
         let outermost = !self.in_invocation.replace(true);
         let _guard = Guard2(&self.in_invocation, outermost);
-        let expanded = self.expand_text(&mac.body, expanding);
+        // A replacement list may leave a function-like invocation open; the
+        // rescan then continues with the following source tokens (C11
+        // 6.10.3.4p1), so join them before expanding. `i` becomes the offset
+        // the caller resumes at -- the joined tokens are expanded here, exactly
+        // once, and must not be seen again by the enclosing scan.
+        let completed;
+        let mut body: &str = &mac.body;
+        let mut i = i;
+        if let Some(tail_end) = self.unclosed_invocation_tail(&mac.body, bytes, i) {
+            if let Ok(tail) = std::str::from_utf8(&bytes[i..tail_end]) {
+                completed = format!("{}{}", mac.body, tail);
+                body = &completed;
+                i = tail_end;
+            }
+        }
+        let expanded = self.expand_text(body, expanding);
         expanding.remove(ident);
 
         if let Some((func_expanded, end_pos)) =
@@ -1075,6 +1090,123 @@ impl MacroTable {
         }
         self.line_pinned.set(prev_pinned);
         i
+    }
+
+    /// Offset just past the source text that closes the argument list a
+    /// replacement list leaves open, or `None` when it leaves none open.
+    ///
+    /// C11 6.10.3.4p1 rescans a replacement list *together with the rest of the
+    /// source file*, so an invocation begun inside a replacement list may take its
+    /// arguments from the tokens that follow the macro name:
+    ///
+    /// ```c
+    /// #define g f
+    /// #define h g(~
+    /// h 5);        /* f(2 * (~ 5)), never f(2 * (~)) 5) */
+    /// ```
+    ///
+    /// Only an *invocation* may absorb following source tokens. A replacement list
+    /// that merely opens a token-level paren (`#define LP (`) must not: the caller
+    /// emits the following tokens itself, so absorbing them would duplicate them.
+    /// The distinction is exact -- an unmatched `(` counts only when the token
+    /// before it is an identifier that is currently a macro.
+    ///
+    /// `body` is the raw replacement list and `start` is the source offset just
+    /// past the macro name; the returned offset indexes the source the caller is
+    /// scanning, so it can resume there after the joined expansion.
+    fn unclosed_invocation_tail(&self, body: &str, bytes: &[u8], start: usize) -> Option<usize> {
+        let body = body.as_bytes();
+        // Innermost unmatched `(` of the replacement list, if any.
+        let mut opens: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            match body[i] {
+                quote @ (b'"' | b'\'') => {
+                    i += skip_literal_bytes(body, i, quote);
+                    continue;
+                }
+                b'/' if body.get(i + 1) == Some(&b'*') => {
+                    let mut j = i + 2;
+                    while j + 1 < body.len() && !(body[j] == b'*' && body[j + 1] == b'/') {
+                        j += 1;
+                    }
+                    i = (j + 2).min(body.len());
+                    continue;
+                }
+                b'/' if body.get(i + 1) == Some(&b'/') => {
+                    while i < body.len() && body[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'(' => opens.push(i),
+                b')' => {
+                    opens.pop();
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        // Walk outwards: the invocation in progress is the innermost open paren
+        // whose preceding token names a macro.
+        let mut opens_is_macro = false;
+        for &open in opens.iter().rev() {
+            let mut k = open;
+            while k > 0 && body[k - 1].is_ascii_whitespace() {
+                k -= 1;
+            }
+            let end = k;
+            while k > 0 && is_ident_cont_byte(body[k - 1]) {
+                k -= 1;
+            }
+            if k == end || !is_ident_start_byte(body[k]) {
+                continue;
+            }
+            if self.macros.contains_key(bytes_to_str(body, k, end)) {
+                opens_is_macro = true;
+                break;
+            }
+        }
+        if !opens_is_macro {
+            return None;
+        }
+        // Consume source tokens up to (and including) the `)` that closes that
+        // argument list, skipping literals and comments so their parens do not
+        // count.
+        let mut depth = 1usize;
+        let mut j = start;
+        while j < bytes.len() {
+            match bytes[j] {
+                quote @ (b'"' | b'\'') => {
+                    j += skip_literal_bytes(bytes, j, quote);
+                    continue;
+                }
+                b'/' if bytes.get(j + 1) == Some(&b'*') => {
+                    let mut k = j + 2;
+                    while k + 1 < bytes.len() && !(bytes[k] == b'*' && bytes[k + 1] == b'/') {
+                        k += 1;
+                    }
+                    j = (k + 2).min(bytes.len());
+                    continue;
+                }
+                b'/' if bytes.get(j + 1) == Some(&b'/') => {
+                    while j < bytes.len() && bytes[j] != b'\n' {
+                        j += 1;
+                    }
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j + 1);
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        None
     }
 
     /// Expand `text`, the source slice at offset `start` of the text being
@@ -2235,5 +2367,70 @@ mod token_boundary_tests {
         assert_eq!(t.expand_line("PLUS+"), "+ +");
         assert_eq!(t.expand_line("MAJOR.2"), "1 .2");
         assert_eq!(t.expand_line("F(MAJOR)"), "1 . 5 . 7");
+    }
+}
+
+#[cfg(test)]
+mod invocation_continuation_tests {
+    use super::{MacroDef, MacroTable};
+
+    fn table() -> MacroTable {
+        let mut t = MacroTable::new();
+        for (name, params, body) in [
+            ("f", Some("a"), "f(2 * (a))"),
+            ("g", None, "f"),
+            ("h", None, "g(~"),
+            ("LP", None, "("),
+            ("twice", Some("a"), "a + a"),
+        ] {
+            t.define(MacroDef {
+                name: name.into(),
+                is_function_like: params.is_some(),
+                params: params
+                    .map(|p| p.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+                is_variadic: false,
+                has_named_variadic: false,
+                body: body.into(),
+            });
+        }
+        t
+    }
+
+    #[test]
+    fn a_replacement_list_that_opens_an_invocation_is_completed_from_the_source() {
+        let t = table();
+        // `h` expands to `g(~` -> `f(~`, whose argument list continues in the
+        // source: `h 5);` must become `f(2 * (~ 5));` (C11 6.10.3.4p1).
+        let source = b" 5);\n";
+        assert_eq!(t.unclosed_invocation_tail("g(~", source, 0), Some(4));
+        let expanded = t.expand_line("h 5);");
+        assert_eq!(
+            expanded.split_whitespace().collect::<Vec<_>>().join(" "),
+            "f(2 * (~ 5));"
+        );
+    }
+
+    #[test]
+    fn a_bare_token_paren_is_not_an_invocation() {
+        let t = table();
+        // `LP` opens a paren but names no macro before it, so nothing is
+        // absorbed: the following tokens still belong to the enclosing scan.
+        assert_eq!(t.unclosed_invocation_tail("(", b" twice(3))\n", 0), None);
+        assert_eq!(t.expand_line("LP twice(3))").trim(), "( 3 + 3)");
+    }
+
+    #[test]
+    fn a_balanced_replacement_list_absorbs_nothing() {
+        let t = table();
+        assert_eq!(t.unclosed_invocation_tail("f(2 * (a))", b" 5)", 0), None);
+    }
+
+    #[test]
+    fn an_unterminated_argument_list_at_end_of_input_is_not_absorbed() {
+        let t = table();
+        // No closing `)` anywhere: leave the text alone rather than inventing
+        // one (the enclosing scan will diagnose or pass it on verbatim).
+        assert_eq!(t.unclosed_invocation_tail("g(~", b" 5", 0), None);
     }
 }
