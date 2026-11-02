@@ -2754,6 +2754,7 @@ gate "range-fold-branch" fast \
 # controls in the same gate keep the sign-extended rule honest.
 gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
+    bash tests/regression/check_scratch_save_elimination.sh
 
 # The unsigned reading of a sign extension is two halves, and a constant
 # between them is a sign test.  The gate checks the emission on every backend

@@ -5,6 +5,13 @@
 
 use super::super::types::*;
 
+/// Longest span a save/restore pair may cover. A span may only be searched for
+/// a matching `pop` while every line in it is steppable (`LineInfo::is_barrier`
+/// says otherwise), so widening the window cannot change the proof obligations:
+/// it only lets the scan reach pairs that a longer provably-straight-line span
+/// hides.
+const PUSH_POP_WINDOW: usize = 8;
+
 pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
@@ -15,7 +22,7 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
             _ => continue,
         };
 
-        for j in (i + 1)..std::cmp::min(i + 4, len) {
+        for j in (i + 1)..std::cmp::min(i + 1 + PUSH_POP_WINDOW, len) {
             if infos[j].is_nop() {
                 continue;
             }
@@ -26,7 +33,7 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
                         if infos[k].is_nop() {
                             continue;
                         }
-                        if instruction_modifies_reg_id(&infos[k], push_reg_id) {
+                        if instruction_modifies_reg_id(store.get(k), &infos[k], push_reg_id) {
                             safe = false;
                             break;
                         }
@@ -47,13 +54,20 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
                 }
                 break;
             }
-            if infos[j].is_push() {
-                break;
-            }
-            if matches!(
-                infos[j].kind,
-                LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
-            ) {
+            // Any line a locality window may not step over also ends this
+            // scan, and asking `is_barrier` instead of re-listing the kinds is
+            // what makes the answer complete:
+            //   * a `Label` is a second entry point into the span, so the `pop`
+            //     is reachable without the `push` having run -- deleting the
+            //     pair then pops a return address on that path;
+            //   * a `CondJmp` leaves the pair unbalanced on one side;
+            //   * a nested `Push`/`Pop` (including `pushfq`/`popfq`, which
+            //     classify with `REG_NONE`) re-points the slot being restored;
+            //   * opaque inline asm and non-inert directives may move `%rsp`,
+            //     write through it or carry a jump table.
+            // The hand-rolled `Call | Jmp | JmpIndirect | Ret` list this
+            // replaces silently spanned the first three.
+            if infos[j].is_barrier() {
                 break;
             }
         }
@@ -70,67 +84,66 @@ fn instruction_modifies_stack(line: &str, info: &LineInfo) -> bool {
         return false;
     }
     let s = info.trimmed(line);
-    let b = s.as_bytes();
-    if b.is_empty() {
+    if s.is_empty() {
         return false;
     }
-    // pushfq, pushfl, pushf, popfq, popfl, popf -- these modify %rsp and
-    // read/write the stack, making it unsafe to eliminate surrounding push/pop
-    if b[0] == b'p' && (s.starts_with("pushf") || s.starts_with("popf")) {
+    // pushfq, pushfl, pushf, popfq, popfl, popf -- these modify %rsp and read
+    // and write the very slot a surrounding pair would own, and they name no
+    // register, so nothing else in this scan sees them.
+    if s.starts_with("pushf") || s.starts_with("popf") {
         return true;
     }
-    // subq/addq to %rsp
-    if (s.starts_with("subq ") || s.starts_with("addq ")) && s.ends_with("%rsp") {
-        return true;
-    }
-    // ANY memory operand addressed via %rsp (e.g. "(%rsp)", "8(%rsp)",
-    // "(%rsp,%rax,4)") depends on the pushed value sitting at the stack top:
-    // eliminating the surrounding push/pop pair would leave the access
-    // pointing at a different (wrong) location. This matters for inline-asm
-    // output stores, which materialize the destination pointer, push it, and
-    // store through "(%rsp)".
-    if s.contains("%rsp)") || s.contains("%rsp,") {
-        return true;
-    }
-    false
+    // ANY textual mention of the stack pointer, in any of its spellings.
+    // Spelling them out is deliberate: `%rsp` does NOT contain `%sp` (the `r`
+    // intervenes), so a single `%sp` test would miss every 64-bit mention --
+    // the exact shape this predicate exists for. This is what makes the check
+    // exact instead of a list of forms: `subq $N, %rsp`/`addq $N, %rsp` (frame
+    // adjustments), `movq %rax, %rsp` and `leaq -8(%rbp), %rsp` (epilogue
+    // restores the shape list missed entirely) and every `%rsp`-relative
+    // memory operand (an inline-asm output store through `(%rsp)`, a spill)
+    // all depend on the depth that the pair creates.
+    s.contains("%rsp") || s.contains("%esp") || s.contains("%sp")
 }
 
 /// Fast check whether a line's instruction modifies a register identified by RegId.
-/// Uses pre-parsed `LineInfo` fields to avoid string parsing in the hot path.
+///
+/// Two exact halves, because a register can be written without being named:
+///
+///  * **Architectural implicit writes** — [`implicit_write_refs`] answers from
+///    the single ISA table in `types.rs`: `divq`/`mulq`/one-operand `imulq`
+///    write `%rax:%rdx`, `cqto`/`cdq` write `%rdx`, `cpuid` writes
+///    `%rax:%rbx:%rcx:%rdx`, `rep stosq` writes `%rdi:%rcx`, `syscall` writes
+///    `%rax:%rcx:%r11`, `pcmpistri` writes `%rcx`, and so on.
+///  * **The classified destination** — `LineKind` already pre-parses it, plus
+///    the two-destination spellings the AT&T "last operand is the destination"
+///    rule cannot represent: `xchg` swaps both operands, `xadd` returns the old
+///    value in its register operand, and `cmpxchg` reloads the accumulator the
+///    table already covers.
+///
+/// This used to be `dest_reg == 0 && reg_id == 2` ("a `%rax` writer might also
+/// write `%rdx`", carrying a `TODO: could be more precise`). That guess is
+/// wrong in both directions: it refused `pushq %rdx` around an `%rax`-only span
+/// (`addq %rax, %rax`, `movq $imm, %rax`), i.e. it lost real eliminations, and
+/// it still missed every implicit writer whose *classified* destination is not
+/// `%rax` — `cpuid`, `rdtsc`, `rep stosq`, `xchg`, all of which classify as
+/// `Other { dest_reg: REG_NONE }`. Consulting the table fixes both.
 #[inline]
-fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
+fn instruction_modifies_reg_id(line: &str, info: &LineInfo, reg_id: RegId) -> bool {
+    if info.is_nop() {
+        return false;
+    }
+    let text = info.trimmed(line);
+    // Exact architectural implicit writes and the two-destination forms.
+    if line_writes_gp_family(info, text, reg_id) {
+        return true;
+    }
     match info.kind {
-        LineKind::StoreRbp { .. }
-        | LineKind::StoreXmmRbp { .. }
-        | LineKind::LoadXmmRbp { .. }
-        | LineKind::Cmp
-        | LineKind::Nop
-        | LineKind::Empty
-        | LineKind::Label
-        | LineKind::Directive
-        | LineKind::Jmp
-        | LineKind::JmpIndirect
-        | LineKind::CondJmp
-        | LineKind::SelfMove => false,
-        LineKind::LoadRbp { reg, .. } => reg == reg_id,
-        LineKind::Pop { reg } => reg == reg_id,
-        LineKind::Push { .. } => false, // push reads, doesn't modify the source reg
-        LineKind::SetCC { reg } => reg_id == reg, // setCC writes to the byte register's family
+        // Barrier kinds: their clobber set is a property of the instruction
+        // class, not of one family, so the caller's window decides.
         LineKind::Call => matches!(reg_id, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11),
-        LineKind::Ret => false,
-        // Inline asm is opaque: assume it modifies every register.
         LineKind::InlineAsm => true,
-        LineKind::Other { dest_reg } => {
-            if dest_reg == reg_id {
-                return true;
-            }
-            // div/idiv also clobber rdx (family 2), and rax (family 0)
-            // mul also clobbers rdx
-            if dest_reg == 0 && reg_id == 2 {
-                return true; // TODO: could be more precise
-            }
-            false
-        }
+        LineKind::JmpIndirect => true,
+        _ => false,
     }
 }
 
@@ -453,5 +466,146 @@ mod dead_scratch_save_tests {
         let out =
             run("    pushq %rcx\n    .loc 1 7 3\n    movl %eax, %ecx\n    popq %rcx\n    ret\n");
         assert!(!out.contains("pushq %rcx"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod pair_scan_tests {
+    use super::super::super::types::*;
+    use super::eliminate_push_pop_pairs;
+
+    fn run(body: &str) -> String {
+        let store = LineStore::new(format!("f:\n    .cfi_startproc\n{body}    .cfi_endproc\n"));
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_push_pop_pairs(&store, &mut infos);
+        store.build_result(|i| infos[i].is_nop())
+    }
+
+    #[test]
+    fn an_untouched_span_drops_the_pair() {
+        let out = run("    pushq %rbx\n    addq %rcx, %rdx\n    popq %rbx\n");
+        assert!(!out.contains("pushq"), "{out}");
+        assert!(!out.contains("popq"), "{out}");
+    }
+
+    /// A label inside the span is a second entry point: the `pop` is reachable
+    /// without the `push` having run, so deleting the pair would pop a return
+    /// address on that path. The scan must stop at it.
+    #[test]
+    fn a_label_inside_the_span_keeps_the_pair() {
+        let out = run("    pushq %rbx\n.L7:\n    popq %rbx\n    ret\n");
+        assert!(out.contains("pushq %rbx"), "{out}");
+        assert!(out.contains("popq %rbx"), "{out}");
+    }
+
+    /// A conditional branch leaves the pair unbalanced on the taken side.
+    #[test]
+    fn a_conditional_branch_inside_the_span_keeps_the_pair() {
+        let out = run("    pushq %rbx\n    jne .L8\n    popq %rbx\n.L8:\n    ret\n");
+        assert!(out.contains("pushq %rbx"), "{out}");
+    }
+
+    /// The stack-pointer mention test has to see 64-bit spellings: `%rsp` does
+    /// not contain the substring `%sp`.
+    #[test]
+    fn a_stack_pointer_restore_inside_the_span_keeps_the_pair() {
+        for body in [
+            "    pushq %rbx\n    movq %rax, %rsp\n    popq %rbx\n",
+            "    pushq %rbx\n    movq 8(%rsp), %rax\n    popq %rbx\n",
+            "    pushq %rbx\n    subq $16, %rsp\n    popq %rbx\n",
+            "    pushq %rbx\n    pushfq\n    popfq\n    popq %rbx\n",
+        ] {
+            let out = run(body);
+            assert!(out.contains("pushq %rbx"), "{body} -> {out}");
+        }
+    }
+
+    /// The window is wider than the three lines the pass started with, so a
+    /// longer straight-line span still reaches its `pop`.
+    #[test]
+    fn the_window_reaches_a_longer_untouched_span() {
+        let out = run(
+            "    pushq %rbx\n    addq %rcx, %rdx\n    subq %rsi, %rdi\n    \
+             xorq %r8, %r9\n    andq %r10, %r11\n    popq %rbx\n",
+        );
+        assert!(!out.contains("pushq"), "{out}");
+        assert!(!out.contains("popq"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod register_clobber_tests {
+    use super::super::super::types::*;
+    use super::instruction_modifies_reg_id;
+
+    fn modifies(text: &str, fam: RegId) -> bool {
+        let info = classify_line(text);
+        instruction_modifies_reg_id(text, &info, fam)
+    }
+
+    /// `%rdx` saved across a span that only touches `%rax` used to be refused
+    /// by the `dest_reg == 0 && reg_id == 2` guess.
+    #[test]
+    fn an_rax_only_span_does_not_clobber_rdx() {
+        assert!(!modifies("addq %rax, %rax", 2));
+        assert!(!modifies("movabsq $1, %rax", 2));
+        assert!(modifies("addq %rax, %rax", 0));
+    }
+
+    /// The architectural implicit writers must be seen even when the
+    /// classified destination names another family (or none at all).
+    #[test]
+    fn implicit_writers_are_seen() {
+        // `cqto` writes %rdx and only READS %rax. Answering "no write to
+        // %rax" here is the whole point of the read guard in
+        // `line_writes_gp_family`: `parse_dest_reg_fast` calls %rax its primary
+        // destination because it returns one family, and taking that at face
+        // value would keep `pushq %rax; cqto; popq %rax` alive forever.
+        assert!(modifies("cqto", 2));
+        assert!(!modifies("cqto", 0));
+        // cltq writes %rax only.
+        assert!(modifies("cltq", 0));
+        assert!(!modifies("cltq", 2));
+        // cpuid rewrites four families at once.
+        for fam in [0u8, 1, 2, 3] {
+            assert!(modifies("cpuid", fam), "cpuid must clobber family {fam}");
+        }
+        // rep stosq writes %rdi:%rcx.
+        assert!(modifies("rep stosq", 7));
+        assert!(modifies("rep stosq", 1));
+        // One-operand imulq writes %rax:%rdx; the two-operand form writes only
+        // its named destination and reads the other operand.
+        assert!(modifies("imulq %r11", 2));
+        assert!(modifies("imulq %r11", 0));
+        assert!(!modifies("imulq %r11, %rax", 2));
+        assert!(modifies("imulq %r11, %rax", 0));
+        // A `mulx` READS %rdx and writes only its explicit destinations.
+        assert!(!modifies("mulxq %r11, %rax, %rcx", 2));
+        // The SSE4.2 string compare returns its index in %rcx.
+        assert!(modifies("pcmpistri $0, %xmm1, %xmm2", 1));
+    }
+
+    /// Both operands of the two-destination forms are writes.
+    #[test]
+    fn two_destination_forms_write_both_operands() {
+        assert!(modifies("xchgq %rbx, %rcx", 3));
+        assert!(modifies("xchgq %rbx, %rcx", 1));
+        assert!(!modifies("xchgq %rbx, %rcx", 0));
+        assert!(modifies("xaddq %r8, %r9", 8));
+        assert!(modifies("lock xaddl %eax, %ebx", 0));
+        // cmpxchg reloads the accumulator and stores into its explicit operand.
+        assert!(modifies("cmpxchgq %rbx, (%rdi)", 0));
+        assert!(modifies("lock cmpxchgq %rbx, (%rdi)", 3));
+    }
+
+    /// An unknown destination stays conservative: the caller's window proof,
+    /// not this predicate, decides what `REG_NONE` means.
+    #[test]
+    fn barrier_kinds_answer_for_their_class() {
+        assert!(modifies("callq g", 0));
+        assert!(modifies("callq g", 8));
+        assert!(!modifies("callq g", 3), "callee-saved survive a call");
     }
 }

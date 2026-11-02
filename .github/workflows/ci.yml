@@ -2093,6 +2093,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_cross_domain_sext_cmp.sh
+    - name: Verify scratch-save pair elimination (x86-64 and i686)
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_scratch_save_elimination.sh
     - name: Verify basic-block SLP v6 contracts
       env:
         CCC: target/fastbuild/lccc

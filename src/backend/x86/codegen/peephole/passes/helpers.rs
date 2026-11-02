@@ -541,14 +541,18 @@ pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool 
         return true;
     }
     let bit = 1u16 << fam;
+    // One classification supplies both halves: this predicate runs on every
+    // copy/graph edge of every pass, and asking the oracle twice for its two
+    // projections doubled the dominant cost.
+    let (implicit_reads, implicit_writes) = classify_implicit_operands(trimmed.as_bytes());
     // 1. Architectural implicit writes: exact.
-    if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
+    if implicit_writes & bit != 0 {
         return true;
     }
     // 2. The classified destination (explicit AT&T destination or the primary
     //    implicit one), suppressed when the instruction implicitly reads the
     //    family without writing it (the `cqto`-family %rax misclassification).
-    get_dest_reg(info) == fam && implicit_read_refs(trimmed.as_bytes()) & bit == 0
+    get_dest_reg(info) == fam && implicit_reads & bit == 0
 }
 
 /// Does the line fully REDEFINE GP family `fam` at ≥32 bits (a 32-bit write
@@ -1141,6 +1145,47 @@ mod writes_family_tests {
         // is the implicit INPUT; the only family written is %rdx.
         assert!(writes_family(&info, "cqto", 2));
         assert!(!writes_family(&info, "cqto", 0));
+    }
+
+    /// `line_writes_gp_family` (in `types.rs`, so the passes that cannot reach
+    /// this module can still ask) must never be NARROWER than this acceptance
+    /// predicate: a family this one calls written and the other does not would
+    /// split "does this line clobber the family" between the push/pop pass and
+    /// every fold. It is deliberately WIDER in two documented ways — the
+    /// two-destination forms (`xchg`/`xadd`/`cmpxchg` write an operand the AT&T
+    /// destination rule does not name) and the barrier kinds (`Call`,
+    /// `InlineAsm`, `JmpIndirect`), whose clobber set belongs to the caller's
+    /// window proof.
+    #[test]
+    fn agrees_with_the_shared_oracle() {
+        for text in [
+            "cqto",
+            "cltq",
+            "cltd",
+            "cpuid",
+            "rdtsc",
+            "rep stosq",
+            "idivq %r11",
+            "imulq %r11",
+            "imulq %r11, %rax",
+            "mulxq %r11, %rax, %rcx",
+            "xchgq %rbx, %rcx",
+            "lock xaddl %eax, %ebx",
+            "cmpxchgq %rbx, (%rdi)",
+            "pcmpistri $0, %xmm1, %xmm2",
+            "addq %rax, %rax",
+            "movq %rdi, %rcx",
+            "movq %rdi, (%rsp)",
+            "shlq %cl, %rax",
+        ] {
+            let info = classify_line(text);
+            for fam in 0u8..=7 {
+                assert!(
+                    !writes_family(&info, text, fam) || line_writes_gp_family(&info, text, fam),
+                    "{text} family {fam}: writes_family says yes, the shared oracle says no"
+                );
+            }
+        }
     }
 
     #[test]
