@@ -30,6 +30,15 @@
 //! the `struct tm` is declared with the layout glibc, musl and macOS all use.
 //! Failure to link at all is impossible — these are libc symbols the Rust
 //! runtime already depends on.
+//!
+//! It is compiled for 64-bit Unix hosts only. A 32-bit host would need `time_t`
+//! declared as `c_long` for glibc and as `long long` for musl — which differ,
+//! and neither can be detected from `cfg` without also pinning the libc — and a
+//! `struct tm` whose trailing `tm_gmtoff`/`tm_zone` pair differs between them
+//! too; guessing wrong there is undefined behaviour of the worst kind, writing
+//! past the object. Those hosts take the documented UTC fallback instead. Every
+//! host this compiler is built and tested on is 64-bit, and the gate that checks
+//! this module against the zone database runs on them.
 
 use std::path::Path;
 use std::sync::OnceLock;
