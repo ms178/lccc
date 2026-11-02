@@ -37,7 +37,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/kernel-host-debs"
           docker run --rm -v "$RUNNER_TEMP/kernel-host-debs:/out" debian:bookworm bash -euc '
             apt-get update -qq
-            apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 busybox-static file
+            # ipxe-qemu supplies efi-e1000.rom; it is otherwise only a
+            # recommendation and is omitted by --no-install-recommends.
+            apt-get -y --no-install-recommends --download-only install flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file
             cp /var/cache/apt/archives/*.deb /out/
           '
           cd "$RUNNER_TEMP/kernel-host-debs"
@@ -95,7 +97,7 @@ jobs:
       - name: Provision host tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 busybox-static file
+          sudo apt-get install -y flex bison bc libelf-dev libssl-dev cpio zstd pkg-config qemu-system-x86 ipxe-qemu busybox-static file
           bash scripts/ci_provision_toolchain.sh --multilib
           echo "HOSTCC=$(command -v gcc-16)" >> "$GITHUB_ENV"
       - name: Build LCCC and lccc-ld (fastbuild)

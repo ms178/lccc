@@ -106,3 +106,64 @@ identity rather than snapshot/name equality. See
 results, and the separate prototype-scope defect found by the audit. Final Clippy
 also passed with `-D warnings` (52.36 seconds). Refreshed hosted kernel and ICX
 checks are pending; the PR remains draft and not ready for delivery.
+
+## Fresh local recovery and firmware dependency repair
+
+Recovered the actual Debian bookworm host-tool export from hosted check
+125244349590. All six Git blobs were verified against their Git object IDs and
+per-part SHA256s, the reconstructed archive against SHA256
+`316dc021c5cbf04d94534ce82bc784b6271000a68ac8b742fd9265bb110dbcff`,
+and all 93 Debian packages against the archive's SHA256SUMS before extraction.
+The private installation is in the excluded cache, not vendored into Git.
+Bison 3.8.2, flex 2.6.4, m4 1.4.19 and genuine QEMU system emulator 7.2.22
+run from that prefix. Host tools use GCC 16.2; kernel objects use only LCCC.
+The 4 GiB swap is active. Private system headers must use `-isystem`, not `-I`:
+the latter incorrectly shadows kernel tools' own linux/types.h and classifies
+glibc headers as project headers under GCC's redundant-declaration warnings.
+No warning flag or real objtool validation was disabled to correct that setup.
+
+The export's `--no-install-recommends` exposed a missing dependency:
+`qemu-system-x86` alone omitted `ipxe-qemu`, which provides the smoke test's
+required `efi-e1000.rom`. Both workflow install paths now request it explicitly.
+The smoke regression checks both install paths, retains its original verdict
+and symlink-security checks, and passes. A separate temporary fixture with
+`ipxe-qemu` removed fails with the expected missing-dependency diagnostic.
+Workflow shell validation (13 files, 2 rules) and `git diff --check` pass.
+These fixture checks do **not** claim a guest boot.
+
+For this already-exported local host environment, the missing EFI ROM was
+retrieved from upstream `qemu/qemu`, tag `v7.2.0`, path
+`pc-bios/efi-e1000.rom`, Git blob
+`6312b11c2f5868bb6e5f0f15dfa31ad7dbda0a02` (159232 bytes), verified against
+its Git object ID and SHA256
+`f37222fcdf0481bfbaf7a16d9aaf740aeb41d3d24c187801eb6e9a628cec0fc8`.
+The real QEMU 7.2.22 executable starts successfully with this private firmware
+prefix. This is host firmware, not substituted kernel code or a fake validator.
+
+Fresh preparation applied all 29 package patches to Linux tag v6.18.58,
+commit `2926d88bb7fc4608fd942453d929c39e4e5ec006`, package commit
+`df9c917272d816361e0da61bb951b5732cb1c662`. Tag signature verification remains
+**not established** and is recorded as `gpg-verified=no` by the preparation
+script. Preparation and x86-64 defconfig/prepare passed using LCCC.
+
+Fresh boot-only gate: **31024 / 32768 bytes, 1744 bytes headroom**;
+GNU ld flat-image parity PASS; ISA scan PASS on 24 objects. Image SHA256:
+`aba4f14ae04d5f9bd5f4acdb70a19d21dc19a05a2fc426124be550b4deeb7391`.
+This is not a controlled optimization comparison against the previous differently
+configured sandbox and is not a runtime/performance claim. The boot link still
+reports its existing RWX segment warning; zero-warning acceptance is unmet.
+
+The real full local defconfig build is running with actual objtool,
+CONFIG_STACKPROTECTOR=y, CONFIG_UNWINDER_ORC=y, CONFIG_OBJTOOL=y and
+CONFIG_MITIGATION_RETPOLINE=y. `kernel/irq/manage.o` has compiled without the
+previous enum errors. Unsupported-option warnings are still emitted, not hidden.
+Full link and system-QEMU boot have **no result yet**. Logs are
+`/home/user/kernel-current-{prepare2,defconfig,boot,full}.log`.
+
+Separately, hosted check **125247359597** for 4a1fc85a0 completed successfully:
+the authenticated ICX 2026.2 lane includes the mandatory enum callback ABI step
+(`--require-icx`) against exact GCC 16.2 / Clang 23.1.4 and the other vendor ABI,
+SIMD and qualifier gates. This closes the previously unmeasured *hosted* ICX
+lane for that revision, not the local ICX provisioning limitation. The hosted
+kernel job is now building full bzImage; no hosted kernel boot result exists.
+No PR readiness or all-CI-green claim is made.

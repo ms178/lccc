@@ -56,4 +56,20 @@ done
 if "$root/scripts/qemu_defconfig_smoke.sh" "$work/absent" >/dev/null 2>&1; then
   echo 'FAIL: missing image accepted' >&2; exit 1
 fi
-echo 'qemu defconfig smoke verdict: PASS (fake QEMU; not a guest boot)'
+# The Debian transport deliberately excludes recommendations. qemu-system-x86
+# alone does not then install ipxe-qemu, which owns the mandatory EFI NIC ROM.
+# Keep both hosted installation paths explicit rather than depending on the
+# runner's preinstalled firmware. This is dependency coverage, not a guest boot.
+install_paths=0
+while IFS= read -r install; do
+  [[ " $install " == *' ipxe-qemu '* ]] || {
+    echo 'FAIL: kernel QEMU installation omits explicit ipxe-qemu firmware' >&2
+    exit 1
+  }
+  install_paths=$((install_paths + 1))
+done < <(grep -E 'apt-get .*install .*qemu-system-x86' "$root/.github/workflows/kernel-61858.yml")
+[[ $install_paths -eq 2 ]] || {
+  echo "FAIL: expected both kernel QEMU installation paths, found $install_paths" >&2
+  exit 1
+}
+echo 'qemu defconfig smoke verdict and explicit firmware dependencies: PASS (fake QEMU; not a guest boot)'
