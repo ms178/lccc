@@ -136,6 +136,12 @@ pub struct Driver {
     /// version GCC 16.2 emits for a bare `-g`, so the same command line
     /// produces the same dialect from both compilers.
     pub(super) dwarf_version: u8,
+    /// Whether `-gdwarf-<N>` pinned [`Self::dwarf_version`].  Unpinned, the
+    /// line program generated for an input that brings its own `.debug_info`
+    /// adopts that unit's dialect; a pinned version always wins (the caller
+    /// asked for a dialect, and the program is the only DWARF an assembler
+    /// emits for such an input).
+    pub(super) dwarf_version_explicit: bool,
     pub(super) defines: Vec<CliDefine>,
     pub(super) include_paths: Vec<String>,
     /// Quote-only include paths (from -iquote flags).
@@ -659,6 +665,7 @@ impl Driver {
             mode: CompileMode::Full,
             debug_info: false,
             dwarf_version: crate::backend::elf::DWARF_DEFAULT_VERSION,
+            dwarf_version_explicit: false,
             defines: Vec::new(),
             include_paths: Vec::new(),
             quote_include_paths: Vec::new(),
@@ -1127,10 +1134,15 @@ impl Driver {
                 // output before exiting non-zero, and many configure scripts
                 // (e.g., privoxy) rely on grepping this output while ignoring
                 // the exit code.
+                // `-E` is a product, not an internal channel: translate the
+                // synthetic pragma tokens back into `#pragma` directives so the
+                // text is a valid C translation unit for every other consumer.
+                let preprocessed =
+                    crate::frontend::preprocessor::pragmas::render_pragma_markers(&preprocessed);
                 let output = if self.suppress_line_markers {
                     Self::strip_line_markers(&preprocessed)
                 } else {
-                    preprocessed
+                    preprocessed.into_owned()
                 };
 
                 if self.output_path_set {
@@ -1344,6 +1356,7 @@ impl Driver {
             let mut sema = SemanticAnalyzer::new();
             sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_pre_c99_dialect(self.pre_c99_dialect());
+            sema.set_gnu89_inline(self.gnu89_inline);
             sema.set_weak_pragma_names(
                 preprocessor
                     .weak_pragmas
@@ -1600,7 +1613,9 @@ impl Driver {
             return None;
         }
         Some(if assembly {
-            DwarfConfig::assembler(self.dwarf_version)
+            let mut config = DwarfConfig::assembler(self.dwarf_version);
+            config.version_pinned = self.dwarf_version_explicit;
+            config
         } else {
             DwarfConfig::for_c(self.dwarf_version, self.stdc_version)
         })
@@ -2408,6 +2423,7 @@ impl Driver {
         let mut sema = SemanticAnalyzer::new();
         sema.set_builtin_policy(self.builtin_policy.clone());
         sema.set_pre_c99_dialect(self.pre_c99_dialect());
+        sema.set_gnu89_inline(self.gnu89_inline);
         sema.set_weak_pragma_names(
             preprocessor
                 .weak_pragmas
@@ -4270,16 +4286,24 @@ impl Driver {
         }
     }
 
-    /// Whether the target has a direct hardware population-count lowering
-    /// (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
-    /// registers are permitted). Used by `loop_idiom` so `while (x) { x &= x - 1; n++; }`
-    /// folds to `IrUnaryOp::Popcount` only when the backend lowers `Popcount`
-    /// without a software bit-count loop (GCC 16 / Clang 23 / ICX 2026 parity).
+    /// Whether the target lowers `Popcount` in constant time -- a hardware
+    /// count (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
+    /// registers are permitted) or the branch-free SWAR sequence RISC-V now
+    /// emits.  Used by `loop_idiom` so `while (x) { x &= x - 1; n++; }` folds to
+    /// `IrUnaryOp::Popcount` only when the result is at least as cheap as the
+    /// loop it replaces (GCC 16 / Clang 23 / ICX 2026 parity).
+    ///
+    /// RISC-V answered `false` while its `Popcount` was Kernighan's loop -- five
+    /// instructions per set bit behind a data-dependent branch -- because the
+    /// fold would have replaced one loop with another.  The SWAR lowering is
+    /// straight-line, so the fold is now the cheaper of the two for every input
+    /// with more than a couple of bits set, which is every input a bit-counting
+    /// idiom is written for.
     pub(crate) fn resolved_fast_popcount(&self) -> bool {
         match self.target {
             Target::X86_64 | Target::I686 => self.resolved_popcnt(),
             Target::Aarch64 => !self.general_regs_only,
-            Target::Riscv64 => false,
+            Target::Riscv64 => true,
         }
     }
 
@@ -5432,7 +5456,13 @@ mod loop_idiom_capability_tests {
         assert!(!driver.resolved_fast_popcount());
         driver.target = Target::Riscv64;
         driver.general_regs_only = false;
-        assert!(!driver.resolved_fast_popcount());
+        // RISC-V has no scalar population count, and this predicate used to be
+        // false for it: `Popcount` lowered to Kernighan's loop, so folding the
+        // loop idiom into it traded a straight-line loop for a worse one.  The
+        // backend now emits the branch-free SWAR sequence it shares with the
+        // other targets (`0x55555555`/`0x33333333`/`0x0f0f0f0f` masks, one
+        // `mul`), which is what makes the fold profitable there too.
+        assert!(driver.resolved_fast_popcount());
     }
 }
 

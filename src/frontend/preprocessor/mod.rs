@@ -4,7 +4,7 @@ mod expr_eval;
 mod includes;
 pub(crate) mod macro_defs;
 pub(crate) mod pipeline;
-mod pragmas;
+pub(crate) mod pragmas;
 pub(crate) mod predefined_macros;
 mod text_processing;
 pub(crate) mod utils;

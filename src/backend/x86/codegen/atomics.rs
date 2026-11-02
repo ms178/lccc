@@ -139,9 +139,7 @@ impl X86Codegen {
                     self.operand_to_rax(val);
                     self.prepare_atomic_side_effect();
                     self.state.emit("    pushq %rax");
-                    if self.state.out.use_rsp_addressing {
-                        self.state.out.rsp_frame_size += 8;
-                    }
+                    self.state.out.rsp_frame_size += 8;
                     ("(%rsp)".to_string(), true)
                 }
             };
@@ -150,9 +148,7 @@ impl X86Codegen {
                 // %rdx is the loop's own scratch: popping into it frees the
                 // slot without touching a register the allocator owns.
                 self.state.emit("    popq %rdx");
-                if self.state.out.use_rsp_addressing {
-                    self.state.out.rsp_frame_size -= 8;
-                }
+                self.state.out.rsp_frame_size -= 8;
             }
             self.canonicalize_atomic_rax_result(ty);
             self.store_rax_to(dest);
@@ -280,9 +276,7 @@ impl X86Codegen {
     /// for code that has pushed `bias` bytes of temporaries.
     fn with_rsp_bias(&mut self, bias: i64, f: impl FnOnce(&mut Self)) {
         let saved = self.state.out.rsp_frame_size;
-        if self.state.out.use_rsp_addressing {
-            self.state.out.rsp_frame_size += bias;
-        }
+        self.state.out.rsp_frame_size += bias;
         f(self);
         self.state.out.rsp_frame_size = saved;
     }

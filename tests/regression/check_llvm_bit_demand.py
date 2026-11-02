@@ -128,16 +128,39 @@ def check_source(args, source, cases):
                     raise ValueError(f"prefix incorrectly disables pass: {name}")
                 # These masks were already eliminated by backend rules. They
                 # exercise demanded-bit reconstruction, not new asm wins.
-                if name not in ("d_xor", "d_or"):
-                    if name in ("parity_add", "parity_sub", "parity_xor"):
-                        if (
-                            sum("popcnt" in x for x in yes) != 1
-                            or sum("popcnt" in x for x in no) != 2
-                        ):
-                            raise ValueError(
-                                f"missing count fusion: {name}: {yes} / {no}"
-                            )
-                    elif len(yes) >= len(no):
+                if name in ("parity_add", "parity_sub", "parity_xor"):
+                    # `(popcount(x) op popcount(y)) & 1`: the `&1` sits on a
+                    # binop, so demanded bits fuses the two counts into one
+                    # count of `x ^ y` (the parity of a sum, a difference and
+                    # an xor are all the parity of the xor).
+                    if (
+                        sum("popcnt" in x for x in yes) != 1
+                        or sum("popcnt" in x for x in no) != 2
+                    ):
+                        raise ValueError(
+                            f"missing count fusion: {name}: {yes} / {no}"
+                        )
+                elif name in ("parity_not", "parity_even_xor"):
+                    # `popcount(one operand) & 1` is folded to `Parity` by the
+                    # simplify pass before demanded bits runs, on every target
+                    # and with or without `-mpopcnt` -- so this pass has no
+                    # count left to remove and both configurations must agree:
+                    # the end state is the parity shape, which is the cheapest
+                    # answer either way.  Attribution for the fold itself (and
+                    # the `CCC_SIMPLIFY_SKIP=parity` restore) lives in
+                    # check_parity_and_popcount.sh.
+                    # At 32 bits the mask reaches the count before demanded
+                    # bits does, so the two configurations agree; at 64 bits the
+                    # frontend narrows the mask and the fold cannot fire (see §18
+                    # of SCALAR-PREDICATE-FOLDS.md), so demanded bits still
+                    # removes the complement.  Both are acceptable end states --
+                    # what is not acceptable is growth, or a second count.
+                    if len(yes) > len(no):
+                        raise ValueError(f"parity got longer: {name}: {yes} / {no}")
+                    if sum("popcnt" in x for x in yes) > 1:
+                        raise ValueError(f"parity kept a second count: {name}: {yes}")
+                elif name not in ("d_xor", "d_or"):
+                    if len(yes) >= len(no):
                         raise ValueError(f"missing mechanism: {name}: {yes} / {no}")
                 if "old" in texts:
                     old = body(texts["old"], name)

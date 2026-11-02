@@ -186,11 +186,19 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
             }
         }
         MachOperand::StackSlot(slot_offset) => {
-            if out.use_rsp_addressing {
-                let rsp_off = out.rsp_frame_size + slot_offset;
-                format!("{}(%rsp)", rsp_off)
-            } else {
-                format!("{}(%rbp)", slot_offset)
+            // A MachInst embeds the displacement, so the frame mode must be able
+            // to encode it. `flush_machinst` refuses far slots through
+            // `machinst_needs_text_fallback` before any of this text is
+            // produced; reaching here would mean the guard missed an
+            // instruction shape, and emitting the operand anyway is exactly the
+            // "assembler rejects a legal frame, or worse encodes it relative to
+            // the wrong anchor" failure mode. Fail loudly instead.
+            match out.slot_operand_parts_opt(*slot_offset) {
+                Some((disp, base)) => format!("{}{}", disp, base.spelling()),
+                None => unreachable!(
+                    "MachInst stack slot {slot_offset} has no imm32 displacement; \
+                     flush_machinst must replay this window through the accumulator path"
+                ),
             }
         }
         MachOperand::RipRel(sym) => format!("{}(%rip)", sym),
@@ -1305,18 +1313,43 @@ pub fn emit_machinst_with_tune(
         MachInst::LeaSlot { slot, dst } => {
             // The address of a frame slot, in the emitter's frame mode — the
             // same addressing every StackSlot operand formatting applies, so
-            // rsp-mode functions stay self-consistent.
-            let (off, base) = if out.use_rsp_addressing {
-                (out.rsp_frame_size + slot, "%rsp")
-            } else {
-                (*slot, "%rbp")
-            };
-            out.emit_fmt(format_args!(
-                "    leaq {}({}), {}",
-                off,
-                base,
-                fmt_reg(dst, OpSize::S64)
-            ));
+            // rsp-mode functions stay self-consistent. `LeaSlot` is also the
+            // one MachInst that can name a slot no anchor reaches, because it
+            // owns a destination register: `movq $disp, %dst` + `leaq
+            // (%base,%dst), %dst` forms the address with no scratch register
+            // (`lea` is defined not to write flags, so the pair is
+            // flag-neutral for a pending fused-Cmp handshake).
+            match out.slot_operand_parts_opt(*slot) {
+                Some((disp, base)) => out.emit_fmt(format_args!(
+                    "    leaq {}{}, {}",
+                    disp,
+                    base.spelling(),
+                    fmt_reg(dst, OpSize::S64)
+                )),
+                None => {
+                    // A slot no anchor can name is materialised here, and the
+                    // materialised form takes the displacement the anchor would
+                    // have used, unfiltered: `movq $disp, %reg` has no imm32
+                    // limit, which is the whole reason this arm exists.
+                    //
+                    // The sum cannot overflow i64: it is the slot's distance
+                    // from the live `%rsp`, and both endpoints are inside one
+                    // process's stack, which is far below isize::MAX. So the
+                    // plain add is exact and the invariant is stated rather
+                    // than paid for -- a checked add plus `expect` on this path
+                    // would be a contract check masquerading as error handling.
+                    let disp = if out.use_rsp_addressing {
+                        debug_assert!(out.rsp_frame_size.checked_add(*slot).is_some());
+                        out.rsp_frame_size + *slot
+                    } else {
+                        *slot
+                    };
+                    let base = if out.use_rsp_addressing { "rsp" } else { "rbp" };
+                    let d = fmt_reg(dst, OpSize::S64);
+                    out.emit_fmt(format_args!("    movq ${}, {}", disp, d));
+                    out.emit_fmt(format_args!("    leaq (%{},{}), {}", base, d, d));
+                }
+            }
         }
 
         MachInst::Ret => {

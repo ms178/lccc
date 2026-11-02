@@ -578,27 +578,61 @@ impl<'a> SemaConstEval<'a> {
 
             // Ternary conditional
             Expr::Conditional(cond, then_e, else_e, _) => {
-                // The array behind a string literal has a non-null address;
-                // retain the selected expression's value, not the address.
                 if shared_const_eval::string_literal_condition(cond) {
                     return self.eval_const_expr(then_e);
                 }
                 let cond_val = self.eval_const_expr(cond)?;
-                if self.const_truth(&cond_val, cond) {
-                    self.eval_const_expr(then_e)
+                let live = if self.const_truth(&cond_val, cond) {
+                    then_e
                 } else {
-                    self.eval_const_expr(else_e)
-                }
+                    else_e
+                };
+                let value = self.eval_const_expr(live)?;
+                // The result is a value of the operator's C common type (C11
+                // 6.5.15p5), so the live arm's constant must be reinterpreted at
+                // that width: folding `1 ? -1 : 1u` to a bare -1 loses the
+                // `unsigned int` value 4294967295, and every enclosing conversion
+                // then sign-extends it instead of zero-extending it.
+                Some(
+                    match (
+                        self.infer_expr_ctype(then_e),
+                        self.infer_expr_ctype(else_e),
+                        value.to_i64(),
+                    ) {
+                        (Some(then_ct), Some(else_ct), Some(bits))
+                            if then_ct.is_integer() && else_ct.is_integer() =>
+                        {
+                            IrConst::I64(CType::ternary_value_as_i64(&then_ct, &else_ct, bits))
+                        }
+                        _ => value,
+                    },
+                )
             }
 
             // GNU conditional (a ?: b)
             Expr::GnuConditional(cond, else_e, _) => {
+                // `a ?: b` obeys the same common-type rule as `a ? a : b`:
+                // `-1 ?: 1u` is an `unsigned int` holding 4294967295.
                 let cond_val = self.eval_const_expr(cond)?;
-                if self.const_truth(&cond_val, cond) {
-                    Some(cond_val)
+                let value = if self.const_truth(&cond_val, cond) {
+                    cond_val
                 } else {
-                    self.eval_const_expr(else_e)
-                }
+                    self.eval_const_expr(else_e)?
+                };
+                Some(
+                    match (
+                        self.infer_expr_ctype(cond),
+                        self.infer_expr_ctype(else_e),
+                        value.to_i64(),
+                    ) {
+                        (Some(then_ct), Some(else_ct), Some(bits))
+                            if then_ct.is_integer() && else_ct.is_integer() =>
+                        {
+                            IrConst::I64(CType::ternary_value_as_i64(&then_ct, &else_ct, bits))
+                        }
+                        _ => value,
+                    },
+                )
             }
 
             // __builtin_types_compatible_p

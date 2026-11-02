@@ -926,8 +926,7 @@ impl ElfWriter {
                 Ok(())
             }
             Directive::Loc(file, line, column, options) => {
-                self.base.debug_loc(*file, *line, *column, *options);
-                Ok(())
+                self.base.debug_loc(*file, *line, *column, *options)
             }
             Directive::Ignored => Ok(()),
             Directive::Cfi(name, _) => Err(format!(

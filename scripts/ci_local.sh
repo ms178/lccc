@@ -245,6 +245,22 @@ gate "asm-operand-diagnostics" fast \
     CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 \
     GCC="${GCC16:-gcc-16}" \
     bash tests/regression/check_asm_operand_diagnostics.sh
+# The frontend is audited against two independent oracles (gcc and clang: `-E`
+# token streams, run-time values at every level, accept/reject agreement), the
+# frame addressing of emitted assembly is audited statically (imm32 encoding,
+# anchor legality, extent) and a seeded expression fuzzer covers what a fixed
+# corpus cannot. One gate, because six separate gate spawns would cost more
+# than the checks.
+gate "frontend-ternary-common-type" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
+gate "frontend-preprocessor-rules" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_preprocessor_rules.sh
+gate "frontend-duplicate-definition" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_duplicate_definition.sh
+gate "frontend-differential-family" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_differential.sh
+gate "frontend-promotion-sweep" fast \
+    python3 tests/regression/check_frontend_promotion_sweep.py --lccc "$LCCC"
 gate "asm-flag-outputs" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \
@@ -2771,6 +2787,21 @@ gate "mask-test-fold" fast \
 # an assertion now), the attribution and the values at five levels.
 gate "cross-domain-sext-cmp" fast \
     bash tests/regression/check_cross_domain_sext_cmp.sh
+
+# Parity is the population count modulo two, and every backend answers it
+# shorter than the count (x86 reads PF after an XOR fold, the RISCs index the
+# 0x6996 table).  The same round made RISC-V's count branch-free; the gate pins
+# the emission on all four backends, the attribution, the pinned counts and the
+# values at five levels.
+gate "parity-and-popcount" fast \
+    bash tests/regression/check_parity_and_popcount.sh
+
+# The defined-zero leading-zero count is a sentinel (`mov $63; bsr; xor $31`),
+# not the diamond it used to be: no branch, no label, three instructions -- what
+# Clang emits for the guarded question.  The gate pins the shape on both x86
+# backends and the values, `clz(0)` included, at five levels.
+gate "clz-zero-sentinel" fast \
+    bash tests/regression/check_clz_zero_sentinel.sh
 
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
