@@ -526,3 +526,17 @@ object still fails strict objtool on two dead stac/clac helper findings.
 See `BOOLEAN-MERGE-UACCESS-AUDIT-2026-11-02.md` and its raw measurement JSON.
 Newly confirmed target-specific hardening-option omissions are explicitly
 listed there and remain unfinished. All-13/zero-warning readiness is not claimed.
+
+## Authenticated ICX return-thunk driver follow-up
+
+Hosted job 125449496511 on 75c49af7f provisioned real ICX 2026.2 and passed
+its enum callback ABI gate, but the callback mitigation gate failed: Intel's
+driver warned #10430 that `-mfunction-return=thunk-extern` was unsupported.
+The checker rejected that warning as required; this was not a vendor pass.
+The checker now forwards that option explicitly through `-Xclang` for ICX.
+No warning suppression, flag dropping, JMP assertion removal, or runtime-test
+skip was added. Local 233 contracts still pass; Clang 23.1.4 independently
+accepts the cc1 forwarding form and emits the required return JMP at O0/O2/Os.
+Five driver mappings and nonzero/warning rejection were checked locally.
+Actual ICX acceptance of the forwarding form remains pending hosted execution;
+Clang proxy evidence is not counted as an Intel result.

@@ -34,6 +34,17 @@ def run(argv):
     return result.stdout
 
 
+def return_thunk_flags(compiler):
+    """Request the same return-thunk contract through each vendor's driver.
+
+    ICX 2026.2 warns and ignores the GCC-style driver spelling. Forward the
+    Clang cc1 option explicitly instead; the native gate must still prove
+    support without warnings and satisfy the JMP/object/runtime assertions.
+    """
+    option = '-mfunction-return=thunk-extern'
+    return ['-Xclang', option] if compiler == 'icx' else [option]
+
+
 def sections(obj):
     names = {}
     for line in run(['readelf', '-SW', obj]).splitlines():
@@ -126,7 +137,7 @@ def main():
                         'w!=(((long long)3<<32)|7) || v[0]!=3 || v[1]!=3 || v[2]!=4; }\n')
                 for opt in ('-O0', '-O2', '-Os'):
                     assembly = work / f'{name}-return.s'
-                    flags = [opt, '-mfunction-return=thunk-extern', '-fcf-protection=branch']
+                    flags = [opt, *return_thunk_flags(name), '-fcf-protection=branch']
                     run([compiler, *flags, '-S', thunk_source, '-o', assembly])
                     text = assembly.read_text()
                     assert not re.search(r'^\s*j(?!mp\b)\w+\s+__x86_return_thunk', text, re.M), (name, opt, text)
