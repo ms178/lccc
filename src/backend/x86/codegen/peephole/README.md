@@ -23,8 +23,9 @@ unnecessary extensions that this optimizer systematically eliminates.
 10. [Phase 5b: Never-Read Store Elimination](#phase-5b-never-read-store-elimination)
 11. [Phase 6: Callee-Save Elimination](#phase-6-callee-save-elimination)
 12. [Phase 7: Frame Compaction](#phase-7-frame-compaction)
-13. [Design Decisions and Tradeoffs](#design-decisions-and-tradeoffs)
-14. [Files](#files)
+13. [Register-Clobber Oracle for push/pop Elimination](#register-clobber-oracle-for-pushpop-elimination)
+14. [Design Decisions and Tradeoffs](#design-decisions-and-tradeoffs)
+15. [Files](#files)
 
 ---
 
@@ -645,13 +646,26 @@ frame allocation.
 `types::line_writes_gp_family(info, text, fam)`, which combines three exact
 sources and never a heuristic:
 
-1. the classified destination (`LineKind` pre-parses it once);
-2. `implicit_write_refs` — the write half of the architectural
-   `classify_implicit_operands` table (`cqto` → `%rdx`, `idivq %r11` →
-   `%rax:%rdx`, `cpuid` → four families, `rep stosq` → `%rdi:%rcx`,
-   `pcmpistri` → `%rcx`, …);
+1. the architectural implicit writes — one `classify_implicit_operands` call
+   supplies both halves, so the read guard below costs nothing extra (`cqto` →
+   `%rdx`, `idivq %r11` → `%rax:%rdx`, `cpuid` → four families, `rep stosq` →
+   `%rdi:%rcx`, `pcmpistri` → `%rcx`, …);
+2. the classified destination, *suppressed when the line implicitly reads the
+   same family*: the classifier names `%rax` as the primary destination of
+   `cqto`/`cdq`/`cltd` because it returns one family, but `%rax` is those
+   instructions' implicit input. Without the suppression
+   `pushq %rax; cqto; popq %rax` could never be removed;
 3. `names_a_second_destination` for the `xchg`/`xadd`/`cmpxchg` family, whose
    *other* destination AT&T's "last operand is the destination" rule hides.
+
+The pair *scan* around it is a separate proof and lives in
+`eliminate_push_pop_pairs`: the span must not contain a label, a branch, a call,
+a `ret`, an indirect jump, inline asm, a nested `push`/`pop`, a non-inert or CFI
+directive, or any mention of the stack pointer (`%rsp`/`%esp`/`%sp` — spelled
+out per width, because `%rsp` does not contain the substring `%sp`). A label
+instead of a branch would still be a second entry point into the span, and the
+`pop` is then reachable without the `push`. `LineInfo::is_barrier` answers the
+control-flow half, so the list cannot drift from the rest of the pass pipeline.
 
 Reading a register is deliberately not a write, and an instruction with no
 implicit operands (the fast-path list) costs one integer compare. The predicate

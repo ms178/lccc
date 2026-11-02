@@ -541,14 +541,18 @@ pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool 
         return true;
     }
     let bit = 1u16 << fam;
+    // One classification supplies both halves: this predicate runs on every
+    // copy/graph edge of every pass, and asking the oracle twice for its two
+    // projections doubled the dominant cost.
+    let (implicit_reads, implicit_writes) = classify_implicit_operands(trimmed.as_bytes());
     // 1. Architectural implicit writes: exact.
-    if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
+    if implicit_writes & bit != 0 {
         return true;
     }
     // 2. The classified destination (explicit AT&T destination or the primary
     //    implicit one), suppressed when the instruction implicitly reads the
     //    family without writing it (the `cqto`-family %rax misclassification).
-    get_dest_reg(info) == fam && implicit_read_refs(trimmed.as_bytes()) & bit == 0
+    get_dest_reg(info) == fam && implicit_reads & bit == 0
 }
 
 /// Does the line fully REDEFINE GP family `fam` at ≥32 bits (a 32-bit write
