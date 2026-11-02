@@ -27,7 +27,7 @@ fn execute(insts: &[Instruction], x: u64) -> u64 {
     values[0] = x;
     let get = |o: &Operand, values: &[u64; 16]| match o {
         Operand::Value(v) => values[v.0 as usize],
-        Operand::Const(c) => (c.to_i128().unwrap_or(0) as u64) & u64::MAX,
+        Operand::Const(c) => c.to_i128().unwrap_or(0) as u64,
     };
     for i in insts {
         let value = match i {
