@@ -31,8 +31,19 @@ def gh(path, payload=None):
     args = ['gh', 'api', path]
     if payload is not None:
         args += ['--method', 'POST', '--input', '-']
-    return subprocess.run(args, input=payload, capture_output=True, check=True,
-                          timeout=180).stdout
+    try:
+        return subprocess.run(args, input=payload, capture_output=True, check=True,
+                              timeout=180).stdout
+    except subprocess.CalledProcessError as error:
+        # capture_output must not hide the actual API failure. Never publish
+        # signed storage URLs or the token when surfacing it through Checks.
+        detail = error.stderr.decode('utf-8', errors='replace')
+        detail = re.sub(r'https?://\S+', '<URL redacted>', detail)
+        for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
+            token = os.environ.get(name)
+            if token:
+                detail = detail.replace(token, '<token redacted>')
+        raise RuntimeError(f'GitHub API request failed ({error.returncode}): {detail[:1500]}') from error
 
 
 def export_file(repo, name, data):
@@ -104,5 +115,14 @@ def main():
             print(f'::notice title=CI diagnostic transport::{escaped}', flush=True)
 
 
+def run_cli():
+    try:
+        main()
+    except Exception as error:
+        text = str(error).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+        print(f'::error title=CI diagnostic transport failed::{text}', flush=True)
+        raise
+
+
 if __name__ == '__main__':
-    main()
+    run_cli()

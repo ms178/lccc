@@ -1,4 +1,6 @@
 import hashlib
+import io
+import subprocess
 import importlib.util
 import json
 import re
@@ -25,6 +27,28 @@ class TransportTests(unittest.TestCase):
         # Job-level permissions reset every omitted scope to none. Downloading
         # Actions logs/artifacts needs read; publishing blobs needs contents write.
         self.assertEqual(permissions, {'actions': 'read', 'contents': 'write'})
+
+    def test_api_failure_is_visible_without_credentials(self):
+        error = subprocess.CalledProcessError(1, ['gh'], stderr=
+            b'gh: HTTP 403 token-secret https://storage.invalid/log?sig=secret\n')
+        with patch.dict(transport.os.environ, {'GH_TOKEN': 'token-secret'}), \
+                patch.object(transport.subprocess, 'run', side_effect=error):
+            with self.assertRaises(RuntimeError) as caught:
+                transport.gh('repos/a/b/actions/runs')
+        message = str(caught.exception)
+        self.assertIn('HTTP 403', message)
+        self.assertNotIn('token-secret', message)
+        self.assertNotIn('sig=secret', message)
+        self.assertNotIn('storage.invalid', message)
+
+    def test_cli_failure_is_annotated_and_still_fails(self):
+        output = io.StringIO()
+        with patch.object(transport, 'main', side_effect=RuntimeError('bad%\nline\r')), \
+                patch('sys.stdout', output):
+            with self.assertRaises(RuntimeError):
+                transport.run_cli()
+        self.assertIn('::error title=CI diagnostic transport failed::bad%25%0Aline%0D',
+                      output.getvalue())
 
     def test_ids(self):
         self.assertEqual(transport.parse_run_ids('1,42'), [1, 42])
