@@ -115,13 +115,6 @@ pub struct Preprocessor {
     /// Prepended to the main source's preprocessed output so that pragma
     /// synthetic tokens (e.g., visibility push/pop) take effect.
     force_include_output: String,
-    /// `__TIMESTAMP__` bodies keyed by physical path.
-    ///
-    /// A header that is re-entered under different macro state costs one `stat`
-    /// in its whole compilation instead of one per inclusion; the cache is
-    /// keyed by the resolved path, which is exactly what `#pragma once` and the
-    /// include-guard map already key on.
-    pub(super) timestamp_bodies: FxHashMap<PathBuf, String>,
     /// Cache for include path resolution.
     /// Maps (include_path, is_system, current_dir_key) to the resolved filesystem path.
     /// This avoids repeated `stat()` calls when the same header is included from
@@ -192,7 +185,6 @@ impl Preprocessor {
             fenv_access_requested: false,
             redefine_extname_pragmas: Vec::new(),
             force_include_output: String::new(),
-            timestamp_bodies: FxHashMap::default(),
             include_resolve_cache: FxHashMap::default(),
             include_guard_macros: FxHashMap::default(),
             directive_expanding: FxHashSet::default(),
@@ -1060,47 +1052,9 @@ impl Preprocessor {
         // including file was found (through symlinks), not the symlink target.
         let path = PathBuf::from(filename);
         let abs = super::includes::make_absolute(&path);
+        self.macros.push_file_scope(&abs);
         self.include_stack.push(abs);
         self.include_origins.push(None);
-        self.refresh_file_scope_builtins();
-    }
-
-    /// Re-materialise the builtins whose value depends on *which* file is being
-    /// preprocessed: `__INCLUDE_LEVEL__` (0 for the main file, one deeper per
-    /// `#include`) and `__TIMESTAMP__` (the modification time of the physical
-    /// file, or `SOURCE_DATE_EPOCH` when that is set).
-    ///
-    /// `__FILE__` is deliberately not touched here: its value is the *presumed*
-    /// name, which `#line` rewrites and which callers pass in their own spelling
-    /// (relative from the main driver, absolute from a force-include), so only
-    /// the call sites know it. Everything else about the builtin — `#ifdef`,
-    /// `#undef`, `-dM`, line splicing — is handled once, by the macro table.
-    ///
-    /// Must be called after every push and every pop of `include_stack`: the
-    /// level is derived from the stack, so calling it in the wrong order would
-    /// report the parent's depth inside the child.
-    pub(super) fn refresh_file_scope_builtins(&mut self) {
-        let level = self.include_stack.len().saturating_sub(1);
-        self.macros.set_include_level(level);
-
-        // With `SOURCE_DATE_EPOCH` set the timestamp does not depend on the
-        // file at all, so there is nothing to cache and nothing to stat.
-        let body = if crate::common::host_time::source_date_epoch().is_some() {
-            crate::common::host_time::timestamp_body(None)
-        } else {
-            match self.include_stack.last() {
-                Some(path) => match self.timestamp_bodies.get(path) {
-                    Some(cached) => cached.clone(),
-                    None => {
-                        let body = crate::common::host_time::timestamp_body(Some(path));
-                        self.timestamp_bodies.insert(path.clone(), body.clone());
-                        body
-                    }
-                },
-                None => crate::common::host_time::timestamp_body(None),
-            }
-        };
-        self.macros.set_builtin_body("__TIMESTAMP__", &body);
     }
 
     /// Get preprocessing errors.
@@ -1286,7 +1240,7 @@ impl Preprocessor {
         // Save and set __FILE__ (uses set_file to avoid full MacroDef allocation)
         let old_file = self.macros.get_file_body().map(|s| s.to_string());
         self.macros.set_file(format!("\"{}\"", resolved.display()));
-        self.refresh_file_scope_builtins();
+        self.macros.push_file_scope(&resolved);
 
         // Preprocess the included content (macros persist; any pragma synthetic tokens
         // like __ccc_visibility_push_hidden are collected and prepended to main output)
@@ -1305,11 +1259,11 @@ impl Preprocessor {
         // can only be computed once the child is gone.
         self.include_stack.pop();
         self.include_origins.pop();
+        self.macros.pop_file_scope();
 
         if let Some(old) = old_file {
             self.macros.set_file(old);
         }
-        self.refresh_file_scope_builtins();
     }
 
     /// Process a preprocessor directive line.
