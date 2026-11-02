@@ -4492,22 +4492,19 @@ fn simplify_cmp(
 
     // A comparison whose operand cannot reach the constant is a constant, and
     // so is one whose operand cannot escape it: `(int)(unsigned char)c <= 255`
-    // is true, `(int)(unsigned char)c > 255` is false, `(int)(signed char)c <
-    // 128` is true.  The interval comes from the operand ([`CmpRange`]): a
-    // widening cast's source type, or the compare width's own domain, which
-    // also answers `x > INT_MAX` and `u <=u 0xffffffff`.
+    // is true, `(int)(unsigned char)c > 255` is false.  The interval comes from
+    // the operand ([`CmpRange`]): a widening cast's source type, or the compare
+    // width's own domain, which also answers `u <=u 0xffffffff`.
     //
-    // This runs BEFORE the narrowing below, and that order is the point.  A
-    // full-domain question has a constant answer, and narrowing would turn it
-    // into a compare at the narrow width that no later rule can fold on its own
-    // (`cmpb $255, %dil; setbe` for `c <= 255`): it was `range_fold_branch`'s
-    // paired-half "narrowed full-domain" case that caught the shape, where the
+    // This runs BEFORE the narrowing below: a full-domain question has a
+    // constant answer, and narrowing would turn it into a compare at the narrow
+    // width that no later rule can fold on its own (`cmpb $255, %dil; setbe`
+    // for `c <= 255`), which is `range_fold_branch`'s paired-half case -- the
     // two halves of `(zext c >= 0) && (zext c <= 255)` used to fold as a pair
     // and the single half did not.
     //
-    // The same guards carry the second question one interval cannot reach: an
-    // unsigned question about a sign-extended value is a question about its
-    // sign bit ([`cross_domain_sext_cmp`]), and the fold is tried first.
+    // The same guards carry an unsigned question about a sign-extended value:
+    // it is a question about the sign bit ([`cross_domain_sext_cmp`]).
     if !simplify_skip("cmprange")
         && ty.size() <= 8
         && let Some(c) = const_i64
@@ -4521,7 +4518,10 @@ fn simplify_cmp(
                 src: Operand::Const(IrConst::I8(answer)),
             });
         }
-        let dies = cast_dies_if_narrowed.get(val.0 as usize).copied().unwrap_or(false);
+        let dies = cast_dies_if_narrowed
+            .get(val.0 as usize)
+            .copied()
+            .unwrap_or(false);
         if let Some(test) = cross_domain_sext_cmp(dest, effective_op, ty, *val, cdef, dies, c) {
             return Some(test);
         }
