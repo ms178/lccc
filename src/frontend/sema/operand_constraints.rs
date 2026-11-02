@@ -1029,6 +1029,7 @@ mod tests {
         // An enumeration quotes its compatible type once promoted, so the
         // enum spelling itself only matters for a bare `type_name` call.
         let e = CType::Enum(EnumType {
+            identity: None,
             name: Some("E".into()),
             variants: vec![("A".into(), 0)],
             is_packed: false,

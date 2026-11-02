@@ -1062,14 +1062,18 @@ impl<'a> ExprTypeChecker<'a> {
                 // Every integer property of the result (size, signedness,
                 // rank, promotion, `_Generic` match) is that of its
                 // compatible type, so no width rule lives here.
-                CType::Enum(crate::common::type_builder::enum_type_of(
+                let mut resolved = crate::common::type_builder::enum_type_of(
                     name,
                     variants,
                     *is_packed,
                     name.as_ref().and_then(|n| self.types.enum_types.get(n)),
                     underlying.as_deref().map(|u| self.resolve_type_spec(u)),
                     |v| v.value.as_ref().and_then(|e| self.eval_const_expr(e)),
-                ))
+                );
+                resolved.identity =
+                    self.types
+                        .enum_identity(name.as_deref(), variants.as_deref(), false);
+                CType::Enum(resolved)
             }
             TypeSpecifier::Struct(
                 tag,

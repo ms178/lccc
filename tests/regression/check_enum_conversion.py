@@ -35,6 +35,21 @@ CASES = {name: PREFIX + body for name, body in {
     'shadow_constant': 'void f(void){{enum {A0=1}; enum B b=A0; (void)b;} enum B b=A0; (void)b;}',
     'pragma': '#pragma GCC diagnostic push\n#pragma GCC diagnostic ignored "-Wenum-conversion"\nenum B b=A0;\n#pragma GCC diagnostic pop\nenum B c=A0;',
 }.items()}
+# Synthetic, non-kernel reductions of incomplete enum snapshots captured by
+# a function-pointer member before a later definition completes the tag.
+CASES.update({
+    'forward_callback': 'enum E; struct Ops {int (*get)(enum E);}; enum E {E0}; int f(struct Ops *p, enum E x) {return p->get(x);}',
+    'forward_callback_typedef': 'enum E; typedef enum E E; typedef int (*Get)(E); struct Ops {Get get;}; enum E {E0=7}; int f(struct Ops *p, E x) {return p->get(x);}',
+    'forward_direct': 'enum E; void sink(enum E); enum E {E0=-1, E1=99}; void f(enum E x) {sink(x);}',
+    'forward_return': 'enum E; enum E source(void); enum E {E0}; enum E f(void) {return source();}',
+    'forward_indirect_assignment': 'enum E; struct Ops {int (*get)(enum E);}; enum E {E0}; int f(struct Ops *p) {enum E x=E0; return p->get(x);}',
+    'same_spelling_shadow': 'enum E {K}; typedef enum E Outer; void f(Outer x) {enum E {K}; enum E y=x; (void)y;}',
+    'same_spelling_pointer_shadow': 'enum E {K}; typedef enum E Outer; void f(Outer x) {enum E {K}; struct S {enum E y;}; struct S s={x}; (void)s;}',
+    'forward_shadow': 'enum E {K}; typedef enum E Outer; void f(Outer x) {enum E; struct Ops {void (*put)(enum E);}; enum E {K}; struct Ops p={0}; p.put(x);}',
+    'scope_restore': 'enum E {K}; typedef enum E Outer; void sink(Outer); void f(Outer x) {{enum E {K}; enum E y=K; (void)y;} sink(x);}',
+    'anonymous_shadow': 'typedef enum {K} Outer; void f(Outer x) {enum {K} y=x; (void)y;}',
+    'anonymous_typedef': 'typedef enum {K} E; void sink(E); void f(E x) {sink(x);}',
+})
 FLAGS = [[], ['-Wall'], ['-Wextra'], ['-Wenum-conversion'],
     ['-Werror=enum-conversion'], ['-Wextra', '-Werror'],
     ['-Wextra', '-Wno-enum-conversion'],

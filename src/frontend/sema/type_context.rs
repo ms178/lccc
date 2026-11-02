@@ -16,7 +16,8 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, CType, PtrQuals, RcLayout, StructLayout};
 use crate::frontend::parser::ast::{DerivedDeclarator, ParamDecl, TypeSpecifier};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::num::NonZeroU64;
 use std::rc::Rc;
 
 /// Information about a function typedef (e.g., `typedef int func_t(int, int);`).
@@ -193,6 +194,8 @@ pub struct TypeScopeFrame {
     pub enum_types_added: Vec<String>,
     pub enum_types_shadowed: Vec<(String, crate::common::types::EnumType)>,
     pub enum_types_tracked: FxHashSet<String>,
+    enum_ids_changed: Vec<(String, Option<NonZeroU64>)>,
+    enum_ids_tracked: FxHashSet<String>,
     /// Keys newly inserted into `struct_layouts`.
     pub struct_layouts_added: Vec<String>,
     /// Keys that were overwritten in `struct_layouts`: (key, previous_value).
@@ -235,6 +238,8 @@ impl TypeScopeFrame {
             enum_types_added: Vec::new(),
             enum_types_shadowed: Vec::new(),
             enum_types_tracked: FxHashSet::default(),
+            enum_ids_changed: Vec::new(),
+            enum_ids_tracked: FxHashSet::default(),
             struct_layouts_added: Vec::new(),
             struct_layouts_shadowed: Vec::new(),
             record_alias_added: Vec::new(),
@@ -261,6 +266,9 @@ impl TypeScopeFrame {
 /// to the lowerer by ownership for IR emission.
 #[derive(Debug)]
 pub struct TypeContext {
+    next_enum_id: Cell<Option<NonZeroU64>>,
+    enum_tag_ids: RefCell<FxHashMap<String, NonZeroU64>>,
+    anonymous_enum_ids: RefCell<FxHashMap<(u32, u32), NonZeroU64>>,
     /// Struct/union layouts indexed by tag name.
     /// Uses Rc<StructLayout> so lookups/clones are cheap refcount bumps
     /// instead of deep-copying all field names and types.
@@ -349,6 +357,9 @@ pub struct TypeContext {
 impl TypeContext {
     pub fn new() -> Self {
         let mut tc = Self {
+            next_enum_id: Cell::new(Some(NonZeroU64::MIN)),
+            enum_tag_ids: RefCell::default(),
+            anonymous_enum_ids: RefCell::default(),
             struct_layouts: RefCell::new(FxHashMap::default()),
             record_alias: RefCell::new(FxHashMap::default()),
             enum_constants: FxHashMap::default(),
@@ -745,6 +756,16 @@ impl TypeContext {
     /// enum_constants, struct_layouts, ctype_cache, and typedefs.
     pub fn pop_scope(&mut self) {
         if let Some(frame) = self.scope_stack.get_mut().pop() {
+            for (name, previous) in frame.enum_ids_changed.into_iter().rev() {
+                match previous {
+                    Some(id) => {
+                        self.enum_tag_ids.get_mut().insert(name, id);
+                    }
+                    None => {
+                        self.enum_tag_ids.get_mut().remove(&name);
+                    }
+                }
+            }
             // Last-write-first: each entry holds the value that write
             // replaced, so restoring in reverse rebuilds the pre-scope state
             // exactly.  `None` marks a name this scope introduced.
@@ -927,6 +948,59 @@ impl TypeContext {
             }
         }
         ty
+    }
+
+    fn fresh_enum_identity(&self) -> Option<NonZeroU64> {
+        // Exhaustion is unreachable for a parsed TU (source offsets are u32),
+        // but do not wrap, recycle an ID, or add a hot-path panic anyway.
+        let id = self.next_enum_id.get()?;
+        self.next_enum_id.set(id.checked_add(1));
+        Some(id)
+    }
+
+    /// Resolve declaration identity without depending on completion, packing,
+    /// or an enum's current list of values. A definition/standalone tag
+    /// declaration may shadow a visible outer tag; a mere reference may not.
+    /// The same scoped undo mechanism as enum definitions restores visibility.
+    pub fn enum_identity(
+        &self,
+        name: Option<&str>,
+        variants: Option<&[crate::frontend::parser::ast::EnumVariant]>,
+        declares: bool,
+    ) -> Option<NonZeroU64> {
+        if let Some(name) = name {
+            let mut scopes = self.scope_stack.borrow_mut();
+            let current = scopes
+                .last()
+                .is_none_or(|f| f.enum_ids_tracked.contains(name));
+            let mut ids = self.enum_tag_ids.borrow_mut();
+            if (!declares || current)
+                && let Some(id) = ids.get(name)
+            {
+                return Some(*id);
+            }
+            let id = self.fresh_enum_identity()?;
+            let previous = ids.insert(name.to_string(), id);
+            if let Some(frame) = scopes.last_mut()
+                && frame.enum_ids_tracked.insert(name.to_string())
+            {
+                frame.enum_ids_changed.push((name.to_string(), previous));
+            }
+            Some(id)
+        } else {
+            // An AST definition can be resolved repeatedly (typeof, casts,
+            // typedefs). Preprocessed source positions distinguish otherwise
+            // identical anonymous definitions without a process-global ID.
+            let span = variants?.first()?.span;
+            let mut ids = self.anonymous_enum_ids.borrow_mut();
+            let key = (span.file_id, span.start);
+            if let Some(id) = ids.get(&key) {
+                return Some(*id);
+            }
+            let id = self.fresh_enum_identity()?;
+            ids.insert(key, id);
+            Some(id)
+        }
     }
 
     /// The enum tag `name` declared in the innermost scope, if any (C11
@@ -1274,11 +1348,75 @@ mod enum_type_scope_tests {
 
     fn enum_type(name: &str, variant: (&str, i64), is_packed: bool) -> EnumType {
         EnumType {
+            identity: None,
             name: Some(name.to_string()),
             variants: vec![(variant.0.to_string(), variant.1)],
             is_packed,
             fixed: None,
         }
+    }
+
+    #[test]
+    fn enum_identity_exhaustion_neither_wraps_nor_breaks_existing_types() {
+        let ctx = TypeContext::new();
+        ctx.next_enum_id.set(Some(std::num::NonZeroU64::MAX));
+        let last = ctx.enum_identity(Some("Last"), None, false);
+        assert_eq!(last, Some(std::num::NonZeroU64::MAX));
+        assert_eq!(ctx.enum_identity(Some("Overflow"), None, false), None);
+        assert_eq!(ctx.enum_identity(Some("Last"), None, false), last);
+    }
+
+    #[test]
+    fn enum_identity_is_compact_and_never_reused_across_scope_lifetimes() {
+        use std::collections::HashSet;
+        use std::num::NonZeroU64;
+        assert_eq!(std::mem::size_of::<Option<NonZeroU64>>(), 8);
+        let mut ctx = TypeContext::new();
+        let outer = ctx.enum_identity(Some("E"), None, false);
+        let mut seen = HashSet::new();
+        seen.insert(outer);
+        for _ in 0..1024 {
+            ctx.push_scope();
+            let inner = ctx.enum_identity(Some("E"), None, true);
+            assert!(
+                seen.insert(inner),
+                "scope lifetimes must not recycle identity"
+            );
+            ctx.pop_scope();
+            assert_eq!(outer, ctx.enum_identity(Some("E"), None, false));
+        }
+    }
+
+    #[test]
+    fn enum_identity_survives_completion_and_scope_undo() {
+        let mut ctx = TypeContext::new();
+        let outer = ctx.enum_identity(Some("E"), None, false);
+        assert!(outer.is_some());
+        assert_eq!(outer, ctx.enum_identity(Some("E"), None, true));
+        ctx.push_scope();
+        assert_eq!(outer, ctx.enum_identity(Some("E"), None, false));
+        let inner = ctx.enum_identity(Some("E"), None, true);
+        assert_ne!(
+            outer, inner,
+            "a shadow cannot inherit the outer declaration"
+        );
+        assert_eq!(inner, ctx.enum_identity(Some("E"), None, true));
+        ctx.push_scope();
+        let nested = ctx.enum_identity(Some("E"), None, true);
+        assert_ne!(inner, nested);
+        ctx.pop_scope();
+        assert_eq!(inner, ctx.enum_identity(Some("E"), None, false));
+        ctx.pop_scope();
+        assert_eq!(outer, ctx.enum_identity(Some("E"), None, false));
+    }
+
+    #[test]
+    fn enum_identity_local_names_do_not_escape_or_get_recycled() {
+        let mut ctx = TypeContext::new();
+        ctx.push_scope();
+        let local = ctx.enum_identity(Some("E"), None, false);
+        ctx.pop_scope();
+        assert_ne!(local, ctx.enum_identity(Some("E"), None, false));
     }
 
     #[test]

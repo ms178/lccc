@@ -3383,6 +3383,11 @@ jobs:
         "$binary" --version | tee intel-evidence/version.txt
         "$binary" -E -dM -x c /dev/null > intel-evidence/macros.txt
         sha256sum "$binary" > intel-evidence/binary.sha256
+    - name: Enum callback ABI against authenticated ICX, GCC and Clang
+      run: |
+        set -euo pipefail
+        trap 'status=$?; if [ "$status" -ne 0 ]; then python3 scripts/ci_annotate_log.py --title "enum forward callback ABI" intel-evidence/enum-forward-abi.log; fi; exit "$status"' EXIT
+        python3 tests/regression/check_enum_forward_abi.py --require-icx 2>&1 | tee intel-evidence/enum-forward-abi.log
     - name: Verify real native compilation and all local dispatch modes
       env:
         LCCC_TEST_REAL_ICX: '1'

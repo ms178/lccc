@@ -1065,6 +1065,10 @@ pub struct StructField {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EnumType {
+    /// Translation-unit-local nominal identity. Forward references and their
+    /// completed definition retain the same identity; lexical shadows do not.
+    /// None is reserved for synthetic types without a declaration context.
+    pub identity: Option<std::num::NonZeroU64>,
     pub name: Option<String>,
     pub variants: Vec<(String, i64)>,
     /// When true (__attribute__((packed))), the enum uses the smallest

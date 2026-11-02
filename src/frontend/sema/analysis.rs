@@ -42,6 +42,7 @@ use crate::frontend::sema::operand_constraints::{self, AssignmentCtx, MemberOper
 use crate::ir::reexports::IrConst;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -1171,6 +1172,13 @@ impl SemanticAnalyzer {
         // C23 constexpr: checked before the specifier registers its tag.
         if decl.is_constexpr() {
             self.check_constexpr_declaration(decl);
+        }
+        if decl.declarators.is_empty()
+            && let TypeSpecifier::Enum(Some(tag), None, _, Some(_)) = &decl.type_spec
+        {
+            self.result
+                .type_context
+                .enum_identity(Some(tag), None, true);
         }
         self.collect_enum_constants_from_type_spec(&decl.type_spec, decl.span);
 
@@ -2518,8 +2526,13 @@ impl SemanticAnalyzer {
         // Inside the body an enumerator has its provisional type -- with a
         // fixed type, the enumerated type, already complete -- and the enum's
         // completion below retypes all of them together.
+        let identity =
+            self.result
+                .type_context
+                .enum_identity(name.as_deref(), Some(variants), true);
         let fixed_enum = fixed.as_ref().map(|f| {
             CType::Enum(crate::common::types::EnumType {
+                identity,
                 name: name.clone(),
                 variants: Vec::new(),
                 is_packed,
@@ -2607,6 +2620,7 @@ impl SemanticAnalyzer {
             };
         }
         let enum_type = crate::common::types::EnumType {
+            identity,
             name: name.clone(),
             variants: values,
             is_packed,
@@ -2709,6 +2723,10 @@ impl SemanticAnalyzer {
                     self.result.type_context.insert_enum_type_scoped(
                         tag.clone(),
                         crate::common::types::EnumType {
+                            identity: self
+                                .result
+                                .type_context
+                                .enum_identity(Some(tag), None, true),
                             name: Some(tag.clone()),
                             variants: Vec::new(),
                             is_packed: *is_packed,
@@ -5296,23 +5314,42 @@ impl SemanticAnalyzer {
             .is_some_and(|from_ty| self.rejects_address_space(&from_ty, to, from))
     }
 
-    fn enum_conversion_source(&self, expr: &Expr) -> Option<CType> {
+    fn enum_conversion_source(
+        &self,
+        expr: &Expr,
+    ) -> Option<Cow<'_, crate::common::types::EnumType>> {
         match expr {
-            Expr::Identifier(name, _) if self.symbol_table.is_enumerator(name) => self
-                .result
-                .type_context
-                .enum_constants
-                .get(name)
-                .and_then(|c| c.origin.as_ref())
-                .map(|origin| CType::Enum((**origin).clone())),
+            Expr::Identifier(name, _) => match self.symbol_table.lookup_ordinary(name) {
+                Some((symbol, false)) => match &symbol.ty {
+                    CType::Enum(ty) => Some(Cow::Borrowed(ty)),
+                    _ => None,
+                },
+                _ => self
+                    .result
+                    .type_context
+                    .enum_constants
+                    .get(name)
+                    .and_then(|c| c.origin.as_deref())
+                    .map(Cow::Borrowed),
+            },
             Expr::Comma(_, rhs, _) => self.enum_conversion_source(rhs),
-            // Arithmetic and conditional operators erase enumerator
-            // provenance; explicit casts instead have their target C type.
-            _ => self.expr_type_checker().infer_expr_ctype(expr),
+            // Arithmetic and conditional operators erase enumerator provenance;
+            // explicit casts instead have their target C type. Only complex
+            // expressions need inferred ownership. Named objects/constants use
+            // borrowed metadata, avoiding a copy of every enumerator per use.
+            _ => match self.expr_type_checker().infer_expr_ctype(expr) {
+                Some(CType::Enum(ty)) => Some(Cow::Owned(ty)),
+                _ => None,
+            },
         }
     }
 
     fn check_enum_conversion(&self, expr: &Expr, to: &CType, span: Span) {
+        // Non-enum destinations are the common case: do not even resolve the
+        // source-scoped warning policy for scalar/pointer conversions.
+        let CType::Enum(target) = to else {
+            return;
+        };
         if !self
             .diagnostics
             .borrow()
@@ -5320,17 +5357,18 @@ impl SemanticAnalyzer {
         {
             return;
         }
-        let CType::Enum(target) = to else {
+        let Some(source) = self.enum_conversion_source(expr) else {
             return;
         };
-        let Some(CType::Enum(source)) = self.enum_conversion_source(expr) else {
-            return;
+        let same = match (source.identity, target.identity) {
+            (Some(a), Some(b)) => a == b,
+            _ => source.as_ref() == target,
         };
-        if source != *target {
+        if !same {
             self.diagnostics.borrow_mut().warning_with_kind(
                 format!(
-                    "implicit conversion from '{}' to '{}'",
-                    CType::Enum(source),
+                    "implicit conversion from 'enum {}' to '{}'",
+                    source.name.as_deref().unwrap_or("<anonymous>"),
                     to
                 ),
                 span,
@@ -10916,14 +10954,15 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             .and_then(|n| self.result.type_context.enum_types.get(n));
         // The fixed type of a definition (`enum E : T { ... }`) is attached
         // by `type_builder`; a body-less reference inherits the visible one.
-        CType::Enum(type_builder::enum_type_of(
-            name,
-            variants,
-            is_packed,
-            completed,
-            None,
-            |v| v.value.as_ref().and_then(|e| self.eval_const_expr(e)),
-        ))
+        let mut resolved =
+            type_builder::enum_type_of(name, variants, is_packed, completed, None, |v| {
+                v.value.as_ref().and_then(|e| self.eval_const_expr(e))
+            });
+        resolved.identity =
+            self.result
+                .type_context
+                .enum_identity(name.as_deref(), variants.as_deref(), false);
+        CType::Enum(resolved)
     }
 
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType {
@@ -11859,6 +11898,7 @@ mod pointer_argument_compat_tests {
         // `unsigned int *` is expected, and GCC accepts that under
         // -Werror=incompatible-pointer-types.
         let pg_level_ty = EnumType {
+            identity: None,
             name: Some("pg_level".to_string()),
             variants: vec![
                 ("PG_LEVEL_NONE".to_string(), 0),
@@ -11890,6 +11930,7 @@ mod pointer_argument_compat_tests {
         // A negative enumerator makes the compatible type `int`, so the
         // unsigned form must NOT be accepted for that enum.
         let signed_enum = CType::Enum(EnumType {
+            identity: None,
             name: Some("signed_e".to_string()),
             variants: vec![("A".to_string(), -1), ("B".to_string(), 0)],
             is_packed: false,
@@ -12565,5 +12606,77 @@ mod builtin_return_flow_tests {
         ] {
             assert_eq!(warnings(body), 1, "{body}");
         }
+    }
+}
+
+#[cfg(test)]
+mod enum_conversion_metadata_tests {
+    use super::*;
+    use crate::common::types::EnumType;
+
+    fn large_enum(analyzer: &SemanticAnalyzer) -> EnumType {
+        EnumType {
+            identity: analyzer
+                .result
+                .type_context
+                .enum_identity(Some("E"), None, true),
+            name: Some("E".into()),
+            variants: (0..4096).map(|i| (format!("K{i}"), i)).collect(),
+            is_packed: false,
+            fixed: None,
+        }
+    }
+
+    fn symbol(name: &str, ty: CType) -> Symbol {
+        Symbol {
+            name: name.into(),
+            ty,
+            explicit_alignment: None,
+            type_align: None,
+            address_space: AddressSpace::Default,
+        }
+    }
+
+    #[test]
+    fn named_enum_source_borrows_instead_of_copying_the_variant_table() {
+        let mut analyzer = SemanticAnalyzer::new();
+        let ty = large_enum(&analyzer);
+        analyzer.symbol_table.declare(symbol("x", CType::Enum(ty)));
+        let expr = Expr::Identifier("x".into(), Span::dummy());
+        let Some(Cow::Borrowed(found)) = analyzer.enum_conversion_source(&expr) else {
+            panic!("an enum object must borrow its declaration metadata");
+        };
+        let CType::Enum(stored) = &analyzer.symbol_table.lookup("x").unwrap().ty else {
+            unreachable!();
+        };
+        assert!(std::ptr::eq(found, stored));
+        assert_eq!(found.variants.len(), 4096);
+    }
+
+    #[test]
+    fn enumerator_provenance_borrows_without_changing_its_language_type() {
+        let mut analyzer = SemanticAnalyzer::new();
+        let origin = Rc::new(large_enum(&analyzer));
+        analyzer.symbol_table.declare(symbol("K0", CType::Int));
+        analyzer.symbol_table.mark_enumerator("K0");
+        analyzer.result.type_context.insert_enum_scoped(
+            "K0".into(),
+            EnumConstant {
+                value: 0,
+                ty: CType::Int,
+                origin: Some(Rc::clone(&origin)),
+            },
+        );
+        let expr = Expr::Identifier("K0".into(), Span::dummy());
+        let Some(Cow::Borrowed(found)) = analyzer.enum_conversion_source(&expr) else {
+            panic!("enumerator provenance must borrow the completed enum");
+        };
+        assert!(std::ptr::eq(found, origin.as_ref()));
+        assert_eq!(analyzer.symbol_table.lookup("K0").unwrap().ty, CType::Int);
+        analyzer.symbol_table.push_scope();
+        analyzer.symbol_table.declare(symbol("K0", CType::Int));
+        assert!(analyzer.enum_conversion_source(&expr).is_none());
+        analyzer.symbol_table.pop_scope();
+        assert!(analyzer.enum_conversion_source(&expr).is_some());
     }
 }

@@ -305,6 +305,8 @@ def main() -> int:
     check_rejected_negative_levels(lccc, gcc)
     from check_enum_conversion import check as check_enums
     check_enums(lccc, gcc)
+    from check_enum_forward_abi import run as check_enum_abi
+    check_enum_abi(lccc, gcc=gcc)
     from check_verbose_asm import run as check_assembly_comments
     check_assembly_comments(lccc)
     return 0

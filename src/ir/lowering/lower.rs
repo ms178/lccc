@@ -3212,6 +3212,7 @@ impl Lowerer {
                 });
                 let fixed_enum = fixed.as_ref().map(|f| {
                     CType::Enum(crate::common::types::EnumType {
+                        identity: None,
                         name: name.clone(),
                         variants: Vec::new(),
                         is_packed: *is_packed,
@@ -3247,6 +3248,7 @@ impl Lowerer {
                     next_val = next_val.wrapping_add(1);
                 }
                 let enum_type = crate::common::types::EnumType {
+                    identity: None,
                     name: name.clone(),
                     variants: variant_values,
                     is_packed: *is_packed,
@@ -3270,6 +3272,7 @@ impl Lowerer {
                     self.types.insert_enum_type_scoped(
                         tag.clone(),
                         crate::common::types::EnumType {
+                            identity: None,
                             name: Some(tag.clone()),
                             variants: Vec::new(),
                             is_packed: *is_packed,

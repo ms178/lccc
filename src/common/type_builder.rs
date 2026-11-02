@@ -376,6 +376,7 @@ pub fn enum_type_of(
     value: impl FnMut(&EnumVariant) -> Option<i64>,
 ) -> crate::common::types::EnumType {
     crate::common::types::EnumType {
+        identity: completed.and_then(|et| et.identity),
         name: name.clone(),
         variants: match variants {
             Some(vars) => enum_variant_values(vars, value),
