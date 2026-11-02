@@ -218,16 +218,24 @@ impl X86Codegen {
     /// instructions on every input's critical path; the nonzero path here is
     /// `test; jnz; bsr; xor` with the jump well predicted, so it is kept.
     fn emit_clz32_rax_baseline(&mut self) {
-        let nz = self.state.fresh_label("clz_nz");
-        let done = self.state.fresh_label("clz_done");
-        self.state.emit("    testl %eax, %eax");
-        self.state.out.emit_jcc_label("    jnz", &nz);
-        self.state.emit("    movl $32, %eax");
-        self.state.out.emit_jmp_label(&done);
-        self.state.out.emit_named_label(&nz);
-        self.state.emit("    bsrl %eax, %eax");
+        // `bsr` leaves its destination untouched when its source is zero --
+        // the same architectural guarantee `emit_ctz32_rax_baseline` leans on
+        // for `bsf`, and what Clang emits for a `clz` that must answer 32 at
+        // zero (`mov $63; bsr; xor $31`).  Preloading the result with 63 makes
+        // the zero case come out of the same `xor $31` as every other input
+        // (63 ^ 31 == 32), so the branch arm this used to carry -- test, jnz,
+        // mov $32, jmp -- is gone: four instructions, none of them a branch,
+        // where the old form was six with a taken jump.
+        //
+        // The sentinel has to reach %eax before `bsr` reads the operand, so the
+        // operand is staged in %rcx; the dead-scratch peephole removes the
+        // bracketing pair whenever nothing live holds that register.
+        self.state.emit("    pushq %rcx");
+        self.state.emit("    movl %eax, %ecx");
+        self.state.emit("    movl $63, %eax");
+        self.state.emit("    bsrl %ecx, %eax");
         self.state.emit("    xorl $31, %eax");
-        self.state.out.emit_named_label(&done);
+        self.state.emit("    popq %rcx");
     }
 
     /// 32-bit trailing-zero count of %eax without TZCNT, defined at zero.
@@ -279,16 +287,13 @@ impl X86Codegen {
             }
             IrType::I32 | IrType::U32 => self.emit_clz32_rax_baseline(),
             _ => {
-                let nz = self.state.fresh_label("clz_nz");
-                let done = self.state.fresh_label("clz_done");
-                self.state.emit("    testq %rax, %rax");
-                self.state.out.emit_jcc_label("    jnz", &nz);
-                self.state.emit("    movl $64, %eax");
-                self.state.out.emit_jmp_label(&done);
-                self.state.out.emit_named_label(&nz);
-                self.state.emit("    bsrq %rax, %rax");
-                self.state.emit("    xorq $63, %rax");
-                self.state.out.emit_named_label(&done);
+                // The same sentinel, one width up: 127 ^ 63 == 64.
+                self.state.emit("    pushq %rcx");
+                self.state.emit("    movq %rax, %rcx");
+                self.state.emit("    movl $127, %eax");
+                self.state.emit("    bsrq %rcx, %rax");
+                self.state.emit("    xorl $63, %eax");
+                self.state.emit("    popq %rcx");
             }
         }
     }

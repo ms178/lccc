@@ -2344,16 +2344,24 @@ impl I686Codegen {
     /// BSR leaves dst undefined for src == 0; the explicit fixup preserves
     /// the IR's defined Clz(0) == 32 semantics (constant folding matches).
     pub(super) fn emit_clz32_baseline(&mut self, src: &str, dst: &str) {
-        let nz = self.state.fresh_label("clz_nz");
-        let done = self.state.fresh_label("clz_done");
-        emit!(self.state, "    testl %{s}, %{s}", s = src);
-        emit!(self.state, "    jnz {}", nz);
-        emit!(self.state, "    movl $32, %{d}", d = dst);
-        emit!(self.state, "    jmp {}", done);
-        emit!(self.state, "{}:", nz);
-        emit!(self.state, "    bsrl %{s}, %{d}", s = src, d = dst);
-        emit!(self.state, "    xorl $31, %{d}", d = dst);
-        emit!(self.state, "{}:", done);
+        // `bsr` leaves its destination untouched when its source is zero --
+        // the same guarantee `emit_ctz32_baseline` leans on for `bsf` -- so a
+        // destination preloaded with 63 answers 32 for a zero operand after the
+        // shared `xor $31`, and no branch is needed.  When source and
+        // destination are the same register the operand has to be staged,
+        // because the sentinel must be in place before `bsr` reads it.
+        if src == dst {
+            emit!(self.state, "    pushl %ecx");
+            emit!(self.state, "    movl %{s}, %ecx", s = src);
+            emit!(self.state, "    movl $63, %{d}", d = dst);
+            emit!(self.state, "    bsrl %ecx, %{d}", d = dst);
+            emit!(self.state, "    xorl $31, %{d}", d = dst);
+            emit!(self.state, "    popl %ecx");
+        } else {
+            emit!(self.state, "    movl $63, %{d}", d = dst);
+            emit!(self.state, "    bsrl %{s}, %{d}", s = src, d = dst);
+            emit!(self.state, "    xorl $31, %{d}", d = dst);
+        }
     }
 
     /// ctz32 on a 32-bit register without TZCNT: BSF(src) into dst, with

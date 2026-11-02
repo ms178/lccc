@@ -2115,6 +2115,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_parity_and_popcount.sh
+    - name: Verify the defined-zero clz sentinel
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_clz_zero_sentinel.sh
     - name: Verify basic-block SLP v6 contracts
       env:
         CCC: target/fastbuild/lccc

@@ -950,6 +950,61 @@ x86 backends by the scratch-save peephole -- but only when the liveness proof
 holds: `-mregparm=3` can keep an argument live in `%ecx`, and then the pair is
 real work, which is why it is emitted rather than assumed away.
 
+### 19. The zero-guarded count is a sentinel, not a diamond — `x86`/`i686` `clz`
+
+`Clz` in this IR is defined at zero (`clz(0) == width`, which is also what the
+constant folder answers), so the baseline x86 lowering -- no `LZCNT` -- used a
+diamond: `test; jnz; mov $32; jmp; .Lclz_nz: bsr; xor $31`.  On the common path
+that is `test; jnz` in place of nothing, and on the zero path a taken `jmp`;
+statically it is six instructions and two branches for a three-instruction
+answer, and every one of those labels is a branch target the front end pays for
+in the instruction cache.
+
+`bsr` leaves its destination untouched when its source is zero -- the same
+architectural guarantee this backend already leans on for `bsf` in
+`emit_ctz32_rax_baseline` ("32-bit `bsf` zero fixup" in *What is not done*
+below), and exactly what Clang emits for a `clz` that has to answer 32 at zero:
+
+```asm
+        movl    $63, %eax       # 63 ^ 31 == 32: the zero answer, preloaded
+        bsrl    %edi, %eax      # untouched when %edi is 0
+        xorl    $31, %eax       # 31 - bsr(x), or 32
+```
+
+So the result register is preloaded with `63` and the zero case falls out of the
+same `xor`, with no branch and no second copy of the answer.  The operand has to
+be staged when the source and the result are the same register (`%eax` here, as
+in every accumulator path), which is what the `%rcx` bracketing pair is for --
+the dead-scratch peephole removes it whenever no live value holds that register,
+so the emitted body is four instructions, none of them a branch.  The 64-bit
+form is the same sentinel one width up (`127 ^ 63 == 64`), and i686's
+`emit_clz32_baseline` takes the sentinel too, including the source-equals-
+destination staging and a direct `bsr %src, %dst` when they differ.
+
+| (`-O2`, x86-64) | before | **now** | GCC 16.2 | Clang 23.1.4 |
+| --- | --- | --- | --- | --- |
+| defined-zero `clz32`: instructions (no `ret`) | 6 | **4** (3 when the operand is already staged) | 5 | 3 |
+| defined-zero `clz32`: branches | 2 | **0** | 1 | 0 |
+| `1u << (32 - __builtin_clz(x-1))` | 12 | **9** | 6 | 7 |
+
+The comparison is the guarded question in all four columns: GCC's five are
+`mov $32; test; je; bsr; xor` -- the diamond, kept because `__builtin_clz(0)` is
+undefined for it and the guard is the *source's* -- and Clang's three are this
+sentinel.  LCCC now emits Clang's three, plus the one staging copy when the
+operand is not already in a second register.  The remaining `next_pow2` gap is
+not the count: it is `1 << (32 - clz(v))` against `1 << (bsr(v) + 1)`, a
+shift-amount rewrite the IR does not have, plus the `$1` materialization.
+
+Verified: every value of the 32-bit domain (16 M multiplicative strides) and 2 M
+`u64` strides, both with and without the complementary operand, plus the edges
+and every single-bit operand, against a longhand reference at `-O0`/`-O1`/`-O2`/
+`-O3`/`-Os` (`clz failures=0`); the in-tree `clz_zero_guard.c`,
+`guarded_clz_ctz_ternary.c`, `clz_safe_guards.c` differentials pass, and
+`check_clz_ctz_target_isa.sh`, `check_clz_zero_guard_fold.sh`,
+`check_ptr_iv_collapse_codegen.sh` and `check_vectorize_isa_gate.sh` still pin
+the shapes (including that the defined-zero diamond must *not* reappear on paths
+where the guard has been folded away).
+
 ## What the LLVM tracker already knows about these shapes
 
 The round started from a differential probe, and the gaps it found have

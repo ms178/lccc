@@ -2787,6 +2787,13 @@ gate "cross-domain-sext-cmp" fast \
 gate "parity-and-popcount" fast \
     bash tests/regression/check_parity_and_popcount.sh
 
+# The defined-zero leading-zero count is a sentinel (`mov $63; bsr; xor $31`),
+# not the diamond it used to be: no branch, no label, three instructions -- what
+# Clang emits for the guarded question.  The gate pins the shape on both x86
+# backends and the values, `clz(0)` included, at five levels.
+gate "clz-zero-sentinel" fast \
+    bash tests/regression/check_clz_zero_sentinel.sh
+
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
 # need a kernel tree: executable bytes must be summed by section FLAG (the boot
