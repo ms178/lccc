@@ -3468,6 +3468,7 @@ impl ArchCodegen for I686Codegen {
                 IrUnaryOp::Clz | IrUnaryOp::ClzNonZero => self.emit_i64_clz(),
                 IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => self.emit_i64_ctz(),
                 IrUnaryOp::Popcount => self.emit_i64_popcount(),
+                IrUnaryOp::Parity => self.emit_i64_parity_impl(),
                 IrUnaryOp::Bswap => self.emit_i64_bswap(),
                 IrUnaryOp::BitReverse | IrUnaryOp::IsConstant => {
                     unreachable!("{op:?} never reaches the i686 unary dispatch")
@@ -3492,6 +3493,7 @@ impl ArchCodegen for I686Codegen {
             IrUnaryOp::Ctz => self.emit_int_ctz(ty),
             IrUnaryOp::CtzNonZero => self.emit_int_ctz_nonzero(ty),
             IrUnaryOp::Popcount => self.emit_int_popcount(ty),
+            IrUnaryOp::Parity => self.emit_int_parity_impl(ty),
             IrUnaryOp::Bswap => self.emit_int_bswap(ty),
             IrUnaryOp::BitReverse | IrUnaryOp::IsConstant => {
                 unreachable!("{op:?} never reaches the i686 unary dispatch")
@@ -4481,6 +4483,7 @@ impl ArchCodegen for I686Codegen {
         fn emit_int_ctz_nonzero(&mut self, ty: IrType) => emit_int_ctz_nonzero_impl;
         fn emit_int_bswap(&mut self, ty: IrType) => emit_int_bswap_impl;
         fn emit_int_popcount(&mut self, ty: IrType) => emit_int_popcount_impl;
+        fn emit_int_parity(&mut self, ty: IrType) => emit_int_parity_impl;
         fn emit_int_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_binop_impl;
         // comparison
         fn emit_float_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_float_cmp_impl;

@@ -152,27 +152,28 @@ impl Lowerer {
         Some(Operand::Value(dest))
     }
 
-    /// Lower __builtin_parity{,l,ll} - implemented as popcount & 1.
+    /// Lower __builtin_parity{,l,ll} - the XOR of every bit, as 0 or 1.
+    ///
+    /// This used to be lowered as `Popcount & 1`, which is correct but asks the
+    /// backend for a number it does not need: the whole population count goes
+    /// into a register only for its low bit to be kept.  `IrUnaryOp::Parity`
+    /// states the question the builtin actually asks, so each backend answers
+    /// it with its own short form (x86 reads the parity flag of a byte the XOR
+    /// fold produces, the RISCs index a 16-bit table with a nibble).  The
+    /// `definitions`/`declarations` tables already declare these at int width.
     pub(super) fn lower_parity_intrinsic(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
         if args.is_empty() {
             return Some(Operand::Const(IrConst::I64(0)));
         }
         let ty = Self::intrinsic_type_from_suffix(name);
-        // Cast arg to the intrinsic's operand width.
         let arg = self.lower_expr_with_type(&args[0], ty);
-        let pop = self.fresh_value();
+        let dest = self.fresh_value();
         self.emit(Instruction::UnaryOp {
-            dest: pop,
-            op: IrUnaryOp::Popcount,
+            dest,
+            op: IrUnaryOp::Parity,
             src: arg,
             ty,
         });
-        let one = if ty == IrType::I64 {
-            IrConst::I64(1)
-        } else {
-            IrConst::I32(1)
-        };
-        let dest = self.emit_binop_val(IrBinOp::And, Operand::Value(pop), Operand::Const(one), ty);
         Some(Operand::Value(dest))
     }
 

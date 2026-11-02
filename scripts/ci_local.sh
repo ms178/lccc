@@ -2779,6 +2779,14 @@ gate "cmp-imm32-pattern" fast \
 gate "cross-domain-sext-cmp" fast \
     bash tests/regression/check_cross_domain_sext_cmp.sh
 
+# Parity is the population count modulo two, and every backend answers it
+# shorter than the count (x86 reads PF after an XOR fold, the RISCs index the
+# 0x6996 table).  The same round made RISC-V's count branch-free; the gate pins
+# the emission on all four backends, the attribution, the pinned counts and the
+# values at five levels.
+gate "parity-and-popcount" fast \
+    bash tests/regression/check_parity_and_popcount.sh
+
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
 # need a kernel tree: executable bytes must be summed by section FLAG (the boot

@@ -4277,16 +4277,24 @@ impl Driver {
         }
     }
 
-    /// Whether the target has a direct hardware population-count lowering
-    /// (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
-    /// registers are permitted). Used by `loop_idiom` so `while (x) { x &= x - 1; n++; }`
-    /// folds to `IrUnaryOp::Popcount` only when the backend lowers `Popcount`
-    /// without a software bit-count loop (GCC 16 / Clang 23 / ICX 2026 parity).
+    /// Whether the target lowers `Popcount` in constant time -- a hardware
+    /// count (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
+    /// registers are permitted) or the branch-free SWAR sequence RISC-V now
+    /// emits.  Used by `loop_idiom` so `while (x) { x &= x - 1; n++; }` folds to
+    /// `IrUnaryOp::Popcount` only when the result is at least as cheap as the
+    /// loop it replaces (GCC 16 / Clang 23 / ICX 2026 parity).
+    ///
+    /// RISC-V answered `false` while its `Popcount` was Kernighan's loop -- five
+    /// instructions per set bit behind a data-dependent branch -- because the
+    /// fold would have replaced one loop with another.  The SWAR lowering is
+    /// straight-line, so the fold is now the cheaper of the two for every input
+    /// with more than a couple of bits set, which is every input a bit-counting
+    /// idiom is written for.
     pub(crate) fn resolved_fast_popcount(&self) -> bool {
         match self.target {
             Target::X86_64 | Target::I686 => self.resolved_popcnt(),
             Target::Aarch64 => !self.general_regs_only,
-            Target::Riscv64 => false,
+            Target::Riscv64 => true,
         }
     }
 

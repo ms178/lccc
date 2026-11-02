@@ -1104,6 +1104,9 @@ impl ArchCodegen for RiscvCodegen {
     fn emit_int_popcount(&mut self, ty: IrType) {
         self.emit_popcount(ty)
     }
+    fn emit_int_parity(&mut self, ty: IrType) {
+        self.emit_parity(ty)
+    }
 
     // ---- Float binop body uses different name ----
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
