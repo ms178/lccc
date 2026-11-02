@@ -3660,53 +3660,10 @@ fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
 /// and neither the budget exemption nor the uncapped admission may fire.
 /// Inline-asm input operands that name symbols directly are covered through
 /// `input_symbols`; the template text itself can still name a symbol
-/// (`asm("call foo")`), hence the conservative substring scan over the
+/// (`asm("call foo")`), hence the conservative shared symbol-reference scan over the
 /// (typically very few) templates.
 fn collect_value_referenced_functions(module: &IrModule) -> (FxHashSet<String>, Vec<String>) {
-    let mut names: FxHashSet<String> = FxHashSet::default();
-    let mut asm_templates: Vec<String> = Vec::new();
-    for function in &module.functions {
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                match instruction {
-                    Instruction::GlobalAddr { name, .. } => {
-                        names.insert(name.clone());
-                    }
-                    Instruction::InlineAsm {
-                        template,
-                        input_symbols,
-                        ..
-                    } => {
-                        asm_templates.push(template.clone());
-                        for sym in input_symbols {
-                            if let Some(s) = sym {
-                                names.insert(s.clone());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    for global in &module.globals {
-        global.init.for_each_ref(&mut |r| {
-            names.insert(r.to_string());
-        });
-    }
-    for (_, target, _) in &module.aliases {
-        names.insert(target.clone());
-    }
-    for (_, resolver, _, _) in &module.ifuncs {
-        names.insert(resolver.clone());
-    }
-    for ctor in &module.constructors {
-        names.insert(ctor.clone());
-    }
-    for dtor in &module.destructors {
-        names.insert(dtor.clone());
-    }
-    (names, asm_templates)
+    module.value_referenced_symbols()
 }
 
 /// Whether `name` is referenced as a value (see
@@ -3715,11 +3672,12 @@ fn function_referenced_as_value(
     name: &str,
     referenced: &FxHashSet<String>,
     asm_templates: &[String],
+    asm_context: &crate::common::asm_scan::AsmSymbolContext,
 ) -> bool {
     if referenced.contains(name) {
         return true;
     }
-    asm_templates.iter().any(|t| t.contains(name))
+    asm_context.any_blob_references(asm_templates, name)
 }
 
 /// Module-wide facts shared by every callee snapshot in one inliner invocation.
@@ -3729,6 +3687,7 @@ struct CalleeContext {
     call_counts: FxHashMap<String, usize>,
     value_referenced: FxHashSet<String>,
     asm_templates: Vec<String>,
+    asm_context: crate::common::asm_scan::AsmSymbolContext,
     call_site_counts: FxHashMap<String, usize>,
     /// For callees with exactly one entry call site: the function holding it.
     sole_caller: FxHashMap<String, String>,
@@ -3761,6 +3720,7 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         call_counts,
         value_referenced,
         asm_templates,
+        asm_context: module.asm_symbol_context(),
         call_site_counts,
         sole_caller,
         debug_callee: std::env::var("CCC_INLINE_DEBUG").is_ok(),
@@ -4055,10 +4015,14 @@ fn callee_data_for(
                 .unwrap_or(0);
         let has_single_call_site = total_calls == 1;
         let survives_via_reference = has_single_call_site
-            && (function_referenced_as_value(&func.name, &value_referenced, &asm_templates)
-                || asm_alias.is_some_and(|a| {
-                    function_referenced_as_value(a, &value_referenced, &asm_templates)
-                }));
+            && (function_referenced_as_value(
+                &func.name,
+                &value_referenced,
+                &asm_templates,
+                &ctx.asm_context,
+            ) || asm_alias.is_some_and(|a| {
+                function_referenced_as_value(a, &value_referenced, &asm_templates, &ctx.asm_context)
+            }));
         let fits_single_call_site_static = func.is_static
             && !func.is_inline
             && !is_small_static
@@ -7890,11 +7854,84 @@ mod value_reference_tests {
     }
 
     #[test]
+    fn top_level_asm_is_an_additional_unknown_caller() {
+        let mut module = module_with_global_addr_to("unrelated");
+        module.toplevel_asm.push(".quad callee".into());
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        assert!(function_referenced_as_value(
+            "callee",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
+    }
+
+    #[test]
+    fn opcode_proof_and_cross_blob_opaque_context_agree_with_dce() {
+        let mut module = module_with_global_addr_to("unrelated");
+        module.toplevel_asm.push("stac".into());
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        assert!(!function_referenced_as_value(
+            "stac",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
+        module.toplevel_asm.push(r#".include "macros.inc""#.into());
+        let (referenced, asm) = collect_value_referenced_functions(&module);
+        assert!(function_referenced_as_value(
+            "stac",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
+    }
+
+    #[test]
+    fn explicit_decorated_operand_is_not_an_opcode() {
+        for operand in ["stac", "$stac+8", "*stac", "stac@GOTPCREL"] {
+            let mut module = module_with_global_addr_to("unrelated");
+            module.functions[0].blocks[0]
+                .instructions
+                .push(Instruction::InlineAsm {
+                    template: "jmp %P0".into(),
+                    outputs: vec![],
+                    inputs: vec![],
+                    clobbers: vec![],
+                    operand_types: vec![],
+                    goto_labels: vec![],
+                    input_symbols: vec![Some(operand.into())],
+                    seg_overrides: vec![],
+                });
+            let (referenced, asm) = collect_value_referenced_functions(&module);
+            assert!(
+                function_referenced_as_value(
+                    "stac",
+                    &referenced,
+                    &asm,
+                    &module.asm_symbol_context()
+                ),
+                "{operand}"
+            );
+        }
+    }
+
+    #[test]
     fn global_addr_reference_blocks_single_site_exemption() {
         let module = module_with_global_addr_to("callee");
         let (referenced, asm) = collect_value_referenced_functions(&module);
-        assert!(function_referenced_as_value("callee", &referenced, &asm));
-        assert!(!function_referenced_as_value("other", &referenced, &asm));
+        assert!(function_referenced_as_value(
+            "callee",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
+        assert!(!function_referenced_as_value(
+            "other",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
     }
 
     #[test]
@@ -7920,7 +7957,12 @@ mod value_reference_tests {
             is_nocommon: false,
         }];
         let (referenced, asm) = collect_value_referenced_functions(&module);
-        assert!(function_referenced_as_value("callee", &referenced, &asm));
+        assert!(function_referenced_as_value(
+            "callee",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
     }
 
     #[test]
@@ -7935,7 +7977,12 @@ mod value_reference_tests {
         let (referenced, asm) = collect_value_referenced_functions(&module);
         // A direct call alone must NOT mark the callee as referenced-as-value:
         // the callee still dies when its only call site is inlined.
-        assert!(!function_referenced_as_value("callee", &referenced, &asm));
+        assert!(!function_referenced_as_value(
+            "callee",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
     }
 
     #[test]
@@ -7954,7 +8001,12 @@ mod value_reference_tests {
                 seg_overrides: Vec::new(),
             });
         let (referenced, asm) = collect_value_referenced_functions(&module);
-        assert!(function_referenced_as_value("callee", &referenced, &asm));
+        assert!(function_referenced_as_value(
+            "callee",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
     }
 
     #[test]
@@ -7975,7 +8027,12 @@ mod value_reference_tests {
                 seg_overrides: Vec::new(),
             });
         let (referenced, asm) = collect_value_referenced_functions(&module);
-        assert!(function_referenced_as_value("callee", &referenced, &asm));
+        assert!(function_referenced_as_value(
+            "callee",
+            &referenced,
+            &asm,
+            &module.asm_symbol_context()
+        ));
     }
 }
 
@@ -9136,6 +9193,7 @@ mod extern_admission_tests {
             call_counts: Default::default(),
             value_referenced: Default::default(),
             asm_templates: Vec::new(),
+            asm_context: Default::default(),
             call_site_counts: Default::default(),
             sole_caller: Default::default(),
             debug_callee: false,
@@ -10482,6 +10540,7 @@ mod phase0_tests {
             call_counts: Default::default(),
             value_referenced: Default::default(),
             asm_templates: Vec::new(),
+            asm_context: Default::default(),
             call_site_counts: Default::default(),
             sole_caller: Default::default(),
             debug_callee: false,

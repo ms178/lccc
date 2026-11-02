@@ -202,6 +202,7 @@ fn propagate_invariant_fn_ptr_params(
     func_tables: &[(ValueDefTable, FxHashMap<Value, Value>)],
 ) -> FxHashMap<(String, usize), String> {
     let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
+    let asm_context = module.asm_symbol_context();
     let mut eligible_callees: FxHashMap<String, Vec<bool>> = module
         .functions
         .iter()
@@ -211,7 +212,12 @@ fn propagate_invariant_fn_ptr_params(
                 && !f.is_weak
                 && !f.is_variadic
                 && !module.asm_labels.contains_key(&f.name)
-                && !function_referenced_as_value(&f.name, &value_referenced, &asm_templates)
+                && !function_referenced_as_value(
+                    &f.name,
+                    &value_referenced,
+                    &asm_templates,
+                    &asm_context,
+                )
         })
         .map(|f| {
             let scalar_params = f

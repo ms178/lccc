@@ -1,19 +1,10 @@
-//! Word-boundary scanning of assembler text for symbol mentions.
+//! Shared assembler identifier scanning and conservative reference proofs.
 //!
-//! Two consumers need the same question answered — "does this assembler
-//! text name this symbol?" — from opposite sides of the tree:
-//!
-//! * `passes::dead_statics` uses it to keep a symbol whose address the TU
-//!   references only from top-level `asm("...")`.
-//! * `passes::builtin_policy` (the A13/A14 symbol inventory) treats a name
-//!   the TU's top-level assembly mentions as opaque: no call to it is
-//!   assumed to be the library function, and no pass synthesizes a call
-//!   that could reach it.  A mention, not a parse: GAS defines symbols in
-//!   too many ways for an enumeration to be safe.
-//!
-//! Keeping one implementation means the two cannot disagree about what
-//! counts as a mention, and a miss is a shared, testable fact rather than
-//! two independent guesses.
+//! Builtin-policy opacity uses raw whole-identifier mentions: GAS defines
+//! symbols in too many ways for an enumeration to be safe. DCE and inlining
+//! share those boundaries but may distinguish a fixed-zero-operand x86
+//! instruction from an address reference. That limited proof is disabled
+//! across the entire assembly environment when macros/includes are opaque.
 
 /// Is `c` part of an assembler identifier (the base character set the
 /// symbol grammar shares with C, plus `.` and `$`)?
@@ -73,9 +64,276 @@ pub(crate) fn any_blob_mentions<S: AsRef<str>>(blobs: &[S], name: &str) -> bool 
     blobs.iter().any(|b| asm_mentions_symbol(b.as_ref(), name))
 }
 
+/// Extract the base symbol from an inline-asm operand (`foo+8`, `foo-4`,
+/// `foo@GOTPCREL`, `*foo`, `$foo`).
+pub(crate) fn asm_symbol_base(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    while start < bytes.len()
+        && !(bytes[start].is_ascii_alphabetic() || bytes[start] == b'_' || bytes[start] == b'.')
+    {
+        start += 1;
+    }
+    let mut end = start;
+    while end < bytes.len() && is_asm_ident_char(bytes[end]) {
+        end += 1;
+    }
+    if start < end { &s[start..end] } else { s }
+}
+
+/// Fixed-zero-operand x86 mnemonics, shared with assembler validation.
+pub(crate) fn is_x86_zero_operand_mnemonic(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "vzeroupper"
+            | "vzeroall"
+            | "cpuid"
+            | "leave"
+            | "leaveq"
+            | "hlt"
+            | "pause"
+            | "syscall"
+            | "sysret"
+            | "ud2"
+            | "cwtl"
+            | "cltq"
+            | "cqto"
+            | "cltd"
+            | "cwtd"
+            | "endbr64"
+            | "endbr32"
+            | "cbtw"
+            | "cbw"
+            | "cwde"
+            | "cdqe"
+            | "cwd"
+            | "lfence"
+            | "sfence"
+            | "mfence"
+            | "rdtsc"
+            | "rdtscp"
+            | "cdq"
+            | "cqo"
+            | "stac"
+            | "clac"
+            | "clui"
+            | "stui"
+            | "serialize"
+            | "rdpkru"
+            | "wrpkru"
+            | "wbnoinvd"
+            | "clzero"
+            | "rdpru"
+            | "mcommit"
+    )
+}
+
+/// Escapes in quoted data (e.g. EXPORT_SYMBOL's "\\0") do not define
+/// macros. Unquoted backslashes can form identifiers or continue statements.
+/// Ambiguous/unterminated quoting remains opaque rather than guessing.
+fn opaque_asm_quoting(text: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in text.bytes() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && matches!(byte, b'\\' | b'\'') {
+            return true;
+        }
+    }
+    quoted || escaped
+}
+
+/// Assembly-wide facts: a macro in one blob can override an opcode in another.
+/// Default is deliberately conservative, including in synthetic IR contexts.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AsmSymbolContext {
+    distinguish_x86_opcodes: bool,
+}
+
+impl AsmSymbolContext {
+    pub(crate) fn new<'a>(blobs: impl IntoIterator<Item = &'a str>, machine: u16) -> Self {
+        let distinguish_x86_opcodes = matches!(machine, 3 | 62)
+            && !blobs.into_iter().any(|text| {
+                opaque_asm_quoting(text)
+                    || [".macro", ".include", ".altmacro", ".purgem"]
+                        .iter()
+                        .any(|directive| {
+                            text.as_bytes()
+                                .windows(directive.len())
+                                .any(|part| part.eq_ignore_ascii_case(directive.as_bytes()))
+                        })
+            });
+        Self {
+            distinguish_x86_opcodes,
+        }
+    }
+
+    /// Unlike a raw mention, a standalone known opcode does not take the
+    /// same-named C symbol's address. Unknown targets/macros remain opaque.
+    pub(crate) fn references_symbol(&self, asm: &str, name: &str) -> bool {
+        if !self.distinguish_x86_opcodes || !is_x86_zero_operand_mnemonic(name) {
+            return asm_mentions_symbol(asm, name);
+        }
+        // Split only at actual statement boundaries. Preserve quoted text,
+        // comments and multiline expressions verbatim; even uncertain mentions
+        // remain roots. Only quoted-data escapes are eligible for filtering.
+        let bytes = asm.as_bytes();
+        let mut start = 0;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut line_comment = false;
+        let mut block_comment = false;
+        let mut depth = 0usize;
+        for (i, &byte) in bytes.iter().enumerate() {
+            if block_comment {
+                if byte == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    block_comment = false;
+                }
+                continue;
+            }
+            if line_comment {
+                if byte != b'\n' {
+                    continue;
+                }
+                line_comment = false;
+            }
+            if let Some(delimiter) = quote {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            if byte == b'"' || byte == b'\'' {
+                quote = Some(byte);
+            } else if byte == b'#' || (byte == b'/' && bytes.get(i + 1) == Some(&b'/')) {
+                line_comment = true;
+            } else if byte == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                block_comment = true;
+            } else if matches!(byte, b'(' | b'[' | b'{') {
+                depth += 1;
+            } else if matches!(byte, b')' | b']' | b'}') {
+                depth = depth.saturating_sub(1);
+            } else if depth == 0 && matches!(byte, b'\n' | b';') {
+                let statement = &asm[start..i];
+                if statement.trim() != name && asm_mentions_symbol(statement, name) {
+                    return true;
+                }
+                start = i + 1;
+            }
+        }
+        let statement = &asm[start..];
+        statement.trim() != name && asm_mentions_symbol(statement, name)
+    }
+
+    pub(crate) fn any_blob_references<S: AsRef<str>>(&self, blobs: &[S], name: &str) -> bool {
+        blobs
+            .iter()
+            .any(|text| self.references_symbol(text.as_ref(), name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn references(text: &str, name: &str, machine: u16) -> bool {
+        AsmSymbolContext::new([text], machine).references_symbol(text, name)
+    }
+
+    #[test]
+    fn standalone_x86_instructions_are_not_symbol_addresses() {
+        for machine in [3, 62] {
+            for name in ["stac", "clac", "cpuid", "serialize", "vzeroupper"] {
+                for text in [
+                    name.to_string(),
+                    format!(" \t{name}\n"),
+                    format!("{name}; {name}\n"),
+                ] {
+                    assert!(!references(&text, name, machine), "{machine}: {text:?}");
+                    assert!(
+                        asm_mentions_symbol(&text, name),
+                        "opacity stays conservative"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_export_data_escapes_do_not_hide_instruction_positions() {
+        for metadata in [
+            r#".ascii "" "\0"; .quad exported"#,
+            r#".ascii "escaped\\\";stac;data"; .quad exported"#,
+        ] {
+            let context = AsmSymbolContext::new([metadata, "stac"], 62);
+            assert!(!context.references_symbol("stac", "stac"), "{metadata}");
+            assert!(context.references_symbol(".quad stac", "stac"));
+        }
+        assert!(references(r#".ascii "unterminated; stac"#, "stac", 62));
+    }
+
+    #[test]
+    fn operands_labels_directives_and_mixed_mentions_survive() {
+        for name in ["stac", "clac"] {
+            for text in [
+                format!("call {name}"),
+                format!(".quad {name}"),
+                format!("{name}:"),
+                format!(".set alias, {name}+8"),
+                format!("{name}; .quad ${name}"),
+                format!("movq {name}@GOTPCREL(%rip), %rax"),
+                format!(".quad ({name})"),
+                format!(".quad (\n{name}\n)"),
+                format!(r#".quad "{name}""#),
+                format!(r#".ascii "x;{name};y""#),
+                format!("1: {name}"),
+                format!("# {name}\n"),
+                format!("/*\n{name}\n*/"),
+                format!("{name} # comment"),
+            ] {
+                assert!(references(&text, name, 62), "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_x86_and_unknown_names_remain_opaque() {
+        for machine in [0, 40, 183, 243] {
+            assert!(references("stac; clac", "stac", machine));
+            assert!(references("stac; clac", "clac", machine));
+        }
+        assert!(references("unknown", "unknown", 62));
+        assert!(!references("stac_extra; xstac; .text.stac", "stac", 62));
+        assert!(!references("stac", "", 62));
+        assert!(AsmSymbolContext::default().references_symbol("stac", "stac"));
+    }
+
+    #[test]
+    fn opaque_context_in_another_blob_disables_the_proof() {
+        for opaque in [
+            ".macro op",
+            ".MACRO op",
+            r#".include "other.inc""#,
+            ".altmacro",
+            ".purgem op",
+            "\\argument",
+        ] {
+            for machine in [3, 62] {
+                let context = AsmSymbolContext::new([opaque, "stac"], machine);
+                assert!(context.references_symbol("stac", "stac"), "{opaque}");
+            }
+        }
+        assert!(references(".quad \\\nstac", "stac", 62));
+    }
 
     #[test]
     fn whole_identifiers_only() {

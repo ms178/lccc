@@ -540,3 +540,16 @@ accepts the cc1 forwarding form and emits the required return JMP at O0/O2/Os.
 Five driver mappings and nonzero/warning rejection were checked locally.
 Actual ICX acceptance of the forwarding form remains pending hosted execution;
 Clang proxy evidence is not counted as an Intel result.
+
+## Assembly caller/retention follow-up
+
+The newer local cohort passes 7635 lib units (10 existing ignores), 251
+four-target/native-oracle contracts and all-target Clippy. Actual usercopy.o
+now passes strict UACCESS and the configured objtool checks, including IBT's
+required link mode; its text shrinks 1183->1151 bytes. Callback and scalar
+parameter specialization now share non-C caller exposure facts. See
+ASM-SYMBOL-CALLER-AUDIT-2026-11-02.md for failures caught during development,
+positive/negative controls, alternatives and limits. The authenticated ICX
+2026.2 lane passed on 86b0b1a57, not yet this newer cohort. Main integration,
+mitigation-option defects, warning/options completion and current full kernel/
+QEMU/all-green acceptance remain pending.

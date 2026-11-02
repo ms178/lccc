@@ -843,6 +843,19 @@ fn propagate_constant_arguments(module: &mut IrModule) -> usize {
         return 0;
     }
 
+    // A local linkage name is NOT a closed caller set when it is exposed
+    // through assembly, aliases, address operands, or retention/export metadata.
+    // Use the same whole-module facts as callback propagation and inlining;
+    // inspecting only GlobalAddr misses valid non-C entry points.
+    let (value_referenced, asm_templates) = module.value_referenced_symbols();
+    let asm_context = module.asm_symbol_context();
+    func_param_consts.retain(|name, _| {
+        !value_referenced.contains(name) && !asm_context.any_blob_references(&asm_templates, name)
+    });
+    if func_param_consts.is_empty() {
+        return 0;
+    }
+
     // Step 2: Scan all call sites and update per-param constant state.
     for func in &module.functions {
         if func.is_declaration {
@@ -875,41 +888,10 @@ fn propagate_constant_arguments(module: &mut IrModule) -> usize {
                         }
                     }
                 }
-                // Note: indirect calls (CallIndirect) are not scanned here, but safety
-                // is ensured by the GlobalAddr check below -- any function whose address
-                // is taken (prerequisite for indirect calls) has all its params marked Varying.
+                // Indirect/non-C callers were conservatively excluded by the
+                // shared value-reference facts before collecting constants.
             }
         }
-    }
-
-    // Also check for address-taken functions: if a function's address is taken
-    // (used in GlobalAddr), it could be called indirectly with unknown arguments.
-    // Mark all its params as Varying.
-    for func in &module.functions {
-        if func.is_declaration {
-            continue;
-        }
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if let Instruction::GlobalAddr { name, .. } = inst {
-                    if let Some(param_states) = func_param_consts.get_mut(name.as_str()) {
-                        for state in param_states.iter_mut() {
-                            *state = ParamState::Varying;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Also check global initializers for address-taken references
-    for global in &module.globals {
-        global.init.for_each_ref(&mut |name| {
-            if let Some(param_states) = func_param_consts.get_mut(name) {
-                for state in param_states.iter_mut() {
-                    *state = ParamState::Varying;
-                }
-            }
-        });
     }
 
     // Step 3: Build a map of function_name -> vec of (param_idx, constant) for
@@ -1011,5 +993,149 @@ mod eval_depth_tests {
             d = d.nested();
         }
         assert!(d.exhausted());
+    }
+}
+
+#[cfg(test)]
+mod caller_exposure_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrFunction, IrParam, Value};
+
+    fn module() -> IrModule {
+        let mut target = IrFunction::new(
+            "target".into(),
+            IrType::I32,
+            vec![IrParam {
+                ty: IrType::I32,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: vec![],
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }],
+            false,
+        );
+        target.is_static = true;
+        target.next_value_id = 1;
+        target.next_label = 1;
+        target.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(0)))),
+            source_spans: vec![],
+        });
+        let mut caller = IrFunction::new("caller".into(), IrType::Void, vec![], false);
+        caller.next_label = 1;
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Call {
+                func: "target".into(),
+                info: CallInfo {
+                    args: vec![Operand::Const(IrConst::I32(7))],
+                    return_type: IrType::I32,
+                    ..Default::default()
+                },
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        let mut module = IrModule::new();
+        module.functions = vec![target, caller];
+        module
+    }
+
+    fn asm(template: &str, symbol: Option<&str>) -> Instruction {
+        Instruction::InlineAsm {
+            template: template.into(),
+            outputs: vec![],
+            inputs: vec![],
+            clobbers: vec![],
+            operand_types: vec![],
+            goto_labels: vec![],
+            input_symbols: symbol.map(|s| vec![Some(s.into())]).unwrap_or_default(),
+            seg_overrides: vec![],
+        }
+    }
+
+    #[test]
+    fn closed_local_caller_still_specializes() {
+        let mut module = module();
+        assert_eq!(propagate_constant_arguments(&mut module), 1);
+        assert!(matches!(
+            module.functions[0].blocks[0].instructions[0],
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(7)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn opaque_callers_do_not_specialize_the_outlined_body() {
+        let exposures: &[fn(&mut IrModule)] = &[
+            |m| m.toplevel_asm.push(".quad target".into()),
+            |m| {
+                m.functions[1].blocks[0]
+                    .instructions
+                    .push(asm("call target", None))
+            },
+            |m| {
+                m.functions[1].blocks[0]
+                    .instructions
+                    .push(asm("jmp %P0", Some("$target+8")))
+            },
+            |m| m.aliases.push(("alias".into(), "target".into(), false)),
+            |m| {
+                m.ifuncs
+                    .push(("indirect".into(), "target".into(), false, None))
+            },
+            |m| m.constructors.push("target".into()),
+            |m| m.destructors.push("target".into()),
+            |m| m.functions[0].is_used = true,
+            |m| {
+                m.retained_functions.insert("target".into());
+            },
+            |m| {
+                m.externally_visible_symbols.insert("target".into());
+            },
+            |m| {
+                m.asm_labels.insert("target".into(), "asm_target".into());
+            },
+            |m| {
+                m.symver_directives
+                    .push(("target".into(), "exported@@VERSION".into()))
+            },
+            |m| {
+                m.functions[1].blocks[0]
+                    .instructions
+                    .push(Instruction::GlobalAddr {
+                        dest: Value(0),
+                        name: "target".into(),
+                    });
+                m.functions[1].next_value_id = 1;
+            },
+        ];
+        for (index, expose) in exposures.iter().enumerate() {
+            let mut module = module();
+            expose(&mut module);
+            assert_eq!(
+                propagate_constant_arguments(&mut module),
+                0,
+                "exposure {index}"
+            );
+            assert!(
+                matches!(
+                    module.functions[0].blocks[0].instructions[0],
+                    Instruction::ParamRef { .. }
+                ),
+                "exposure {index}"
+            );
+        }
     }
 }

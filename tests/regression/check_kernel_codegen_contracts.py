@@ -222,6 +222,11 @@ def main():
                      HERE / 'boolean_phi_cast_branch.c', '-o', bool_runtime])
                 run(([emulator] if emulator else []) + [bool_runtime])
                 checks += 1
+                asm_callback = work / f'{name}-{opt}-asm-callback-entry'
+                run([compiler, opt, '-fno-pie', '-nostdlib', '-static', start,
+                     HERE / 'asm_callback_entry.c', '-o', asm_callback])
+                run(([emulator] if emulator else []) + [asm_callback])
+                checks += 1
                 modes = ('none', 'branch', 'full') if architecture in ('x86', 'i686') else (None,)
                 for mode in modes:
                     output = work/f'{name}-runtime'
