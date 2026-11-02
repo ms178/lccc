@@ -284,24 +284,25 @@ mod host {
         fn tzset();
     }
 
-    /// `TZ` is read once: the zone cannot change under a running compile, and
-    /// `tzset` is not thread-safe, so paying for it on every expansion would be
-    /// both wasteful and a data race the moment preprocessing is parallelised.
-    fn ensure_tz_loaded() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            // SAFETY: called exactly once, before any other localtime call.
-            unsafe { tzset() };
-        });
-    }
-
     pub(super) fn localtime(secs: i64) -> Option<Civil> {
-        ensure_tz_loaded();
+        /// `TZ` is read once per process: the zone cannot change under a running
+        /// compile, and `tzset` is not thread-safe, so calling it on every
+        /// expansion would be both wasteful and a data race the moment
+        /// preprocessing is parallelised. `Once` makes the first caller do it and
+        /// every later caller pay one relaxed load and a branch.
+        static TZ_LOADED: std::sync::Once = std::sync::Once::new();
+
         let mut tm = Tm::zeroed();
-        // SAFETY: `secs` and `tm` are valid for the call; `tm` is a full
-        // `struct tm` including the GNU tail fields, so the callee's writes stay
-        // inside the object, and the returned pointer is either null or `&mut tm`.
-        let ok = unsafe { localtime_r(&secs, &mut tm) };
+        // SAFETY, for both calls: `call_once` runs `tzset` exactly once and
+        // before any `localtime_r` in this process, which is the ordering the
+        // local-time API requires and the reason the two calls share one block;
+        // `secs` and `tm` are valid for the call, `tm` is a full `struct tm`
+        // including the GNU tail fields so the callee's writes stay inside the
+        // object, and the returned pointer is either null or `&mut tm`.
+        let ok = unsafe {
+            TZ_LOADED.call_once(|| tzset());
+            localtime_r(&secs, &mut tm)
+        };
         if ok.is_null() {
             return None;
         }

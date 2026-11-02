@@ -31,9 +31,20 @@
 #     UTC unconditionally, which disagrees with both oracles for every hour
 #     outside UTC+0.
 #
+#   * the level belongs to the *file stack*, not to the line map: `#line 100
+#     "other.c"` moves `__FILE__` and must leave `__INCLUDE_LEVEL__` alone, and
+#     a `-include` chain nests (1, then 2) exactly like an `#include` one.
+#
+#   * the same is true where the preprocessor is driven as a filter for another
+#     language: `-x assembler-with-cpp` is how the kernel preprocesses `.S` files,
+#     and both oracles report level 0 in the `.s` file and level 1 inside the
+#     header it includes.
+#
 #   * `-dM` lists feature macros, not the compiler's own builtins: neither gcc-16
 #     nor clang-23 prints `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`,
-#     `__TIMESTAMP__`, `__INCLUDE_LEVEL__`, `__BASE_FILE__` or `__COUNTER__`.
+#     `__TIMESTAMP__`, `__INCLUDE_LEVEL__`, `__BASE_FILE__` or `__COUNTER__` --
+#     but a definition the *source* supplied of one of those names is listed,
+#     whether it came from `-D` or from a `#define` in an included header.
 #
 # Every expectation is stated twice where that is possible: once as an exact
 # value (so the test cannot drift with lccc) and once as "the oracles agree"
@@ -67,7 +78,7 @@ preprocess() { "$1" -E -P "${@:3}" "$2" 2>/dev/null; }
 norm() { tr -s ' \t\n' ' ' | sed -e 's/^ //' -e 's/ $//'; }
 expect_line() {
     # $1 = haystack function output, $2 = label, $3 = exact line fragment
-    printf '%s\n' "$1" | grep -qF "$3" || fail "$2: expected '$3' in: $1"
+    grep -qF -- "$3" <<<"$1" || fail "$2: expected '$3' in: $1"
 }
 
 # --- 1. __INCLUDE_LEVEL__: nesting, aliases, #if, -include -------------------
@@ -348,16 +359,114 @@ out=$(TZ=America/New_York SOURCE_DATE_EPOCH=1000000000 "$CCC" -E -P "$tmp/dt.c")
 expect_line "$out" "date/SOURCE_DATE_EPOCH" 'const char *d = "Sep  9 2001";'
 expect_line "$out" "time/SOURCE_DATE_EPOCH" 'const char *t = "01:46:40";'
 
-# --- 5. -dM excludes the builtins, and includes the feature macros ----------
+# --- 5. The level belongs to the file stack, not to the line map ------------
+# `#line` rewrites the presumed file and line; it does not move the token to
+# another file, so the level must not move either (measured on both oracles).
+cat >"$tmp/line.c" <<'C'
+#line 100 "other.c"
+int after_line = __INCLUDE_LEVEL__;
+const char *presumed = __FILE__;
+C
+mine=$(preprocess "$CCC" "$tmp/line.c")
+expect_line "$mine" "#line level" "int after_line = 0;"
+expect_line "$mine" "#line file" 'const char *presumed = "other.c";'
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    ref=$(preprocess "$oracle_bin" "$tmp/line.c")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "#line: $oracle_bin disagrees: '$ref'"
+done
+
+# --- 6. A -include chain nests like an #include chain -----------------------
+# A force-included file runs at level 1; the file it includes runs at level 2.
+cat >"$tmp/deep_driver.c" <<'C'
+int driver_level = __INCLUDE_LEVEL__;
+C
+cat >"$tmp/deep_outer.h" <<'C'
+#include "deep_inner.h"
+int outer_level = __INCLUDE_LEVEL__;
+C
+cat >"$tmp/deep_inner.h" <<'C'
+int inner_level = __INCLUDE_LEVEL__;
+C
+mine=$(preprocess "$CCC" "$tmp/deep_driver.c" -I"$tmp" -include deep_outer.h)
+expect_line "$mine" "-include chain" "int inner_level = 2;"
+expect_line "$mine" "-include chain" "int outer_level = 1;"
+expect_line "$mine" "-include chain" "int driver_level = 0;"
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    ref=$(preprocess "$oracle_bin" "$tmp/deep_driver.c" -I"$tmp" -include deep_outer.h)
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "-include chain: $oracle_bin disagrees: '$ref'"
+done
+
+# --- 7. The level in assembler-with-cpp -------------------------------------
+# `-x assembler-with-cpp` is how the kernel preprocesses `.S` files: the builtin
+# has to work in that mode too, and the header it includes is one level deeper.
+cat >"$tmp/asm_level.s" <<'C'
+#include "asm_level.h"
+.data
+.byte __INCLUDE_LEVEL__
+C
+printf 'int in_header = __INCLUDE_LEVEL__;\n' >"$tmp/asm_level.h"
+mine=$(preprocess "$CCC" "$tmp/asm_level.s" -x assembler-with-cpp -I"$tmp")
+expect_line "$mine" "asm-with-cpp" "int in_header = 1;"
+expect_line "$mine" "asm-with-cpp" ".byte 0"
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    ref=$(preprocess "$oracle_bin" "$tmp/asm_level.s" -x assembler-with-cpp -I"$tmp")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "asm-with-cpp: $oracle_bin disagrees: '$ref'"
+done
+
+# --- 8. A header that takes over a name keeps it, and -dM says so -----------
+# The definition arrives through an `#include`, not through `-D`, so the
+# ownership flag has to be set by the ordinary `#define` path.
+cat >"$tmp/takeover_header.h" <<'C'
+#define __TIME__ "from header"
+#define __FILE__ "header file"
+C
+cat >"$tmp/takeover_main.c" <<'C'
+#include "takeover_header.h"
+const char *t = __TIME__;
+const char *f = __FILE__;
+C
+mine=$(preprocess "$CCC" "$tmp/takeover_main.c" -I"$tmp")
+expect_line "$mine" "in-source takeover" 'const char *t = "from header";'
+expect_line "$mine" "in-source takeover" 'const char *f = "header file";'
+mine_dump=$("$CCC" -dM -E -I"$tmp" "$tmp/takeover_main.c")
+for spec in '__TIME__ "from header"' '__FILE__ "header file"'; do
+    grep -qF -- "#define $spec" <<<"$mine_dump" \
+        || fail "-dM: an in-source definition must be listed: '#define $spec'"
+done
+for oracle in "$GCC:$have_gcc" "$CLANG:$have_clang"; do
+    oracle_bin=${oracle%:*}
+    [ "${oracle##*:}" = "1" ] || continue
+    ref=$(preprocess "$oracle_bin" "$tmp/takeover_main.c" -I"$tmp")
+    [ "$(printf '%s' "$mine" | norm)" = "$(printf '%s' "$ref" | norm)" ] \
+        || fail "in-source takeover: $oracle_bin disagrees: '$ref'"
+    ref_dump=$("$oracle_bin" -dM -E -I"$tmp" "$tmp/takeover_main.c" 2>/dev/null)
+    for name in __TIME__ __FILE__; do
+        mine_listed=$(grep -c "^#define $name " <<<"$mine_dump")
+        ref_listed=$(grep -c "^#define $name " <<<"$ref_dump")
+        [ "$mine_listed" = "$ref_listed" ] \
+            || fail "-dM: in-source '$name' listing ($mine_listed) differs from $oracle_bin ($ref_listed)"
+    done
+done
+
+# --- 9. -dM excludes the builtins, and includes the feature macros ----------
 dump=$("$CCC" -dM -E -x c /dev/null)
 for name in __FILE__ __LINE__ __DATE__ __TIME__ __TIMESTAMP__ __INCLUDE_LEVEL__ \
             __BASE_FILE__ __COUNTER__; do
-    if printf '%s\n' "$dump" | grep -q "^#define $name\b"; then
+    if grep -q "^#define $name\b" <<<"$dump"; then
         fail "-dM: '$name' must not be listed as a definition"
     fi
 done
 for name in __GNUC__ __STDC_VERSION__ __x86_64__; do
-    if ! printf '%s\n' "$dump" | grep -q "^#define $name\b"; then
+    if ! grep -q "^#define $name\b" <<<"$dump"; then
         fail "-dM: '$name' must still be listed (the filter must not over-reach)"
     fi
 done
@@ -376,7 +485,7 @@ done
 # shellcheck disable=SC2086
 user_dump=$("$CCC" -dM -E $user_defs -x c /dev/null)
 for name in $specs; do
-    if ! printf '%s\n' "$user_dump" | grep -qF "#define $name \"x\""; then
+    if ! grep -qF -- "#define $name \"x\"" <<<"$user_dump"; then
         fail "-dM: a user-supplied definition must be listed: '#define $name \"x\"'"
     fi
 done
@@ -403,7 +512,7 @@ if [ "$have_gcc" -eq 1 ]; then
     ref=$("$GCC" -dM -E -x c /dev/null)
     for name in __FILE__ __LINE__ __DATE__ __TIME__ __TIMESTAMP__ __INCLUDE_LEVEL__ \
                 __BASE_FILE__ __COUNTER__; do
-        if printf '%s\n' "$ref" | grep -q "^#define $name\b"; then
+        if grep -q "^#define $name\b" <<<"$ref"; then
             fail "-dM: the oracle lists '$name', so the rule this gate encodes is wrong"
         fi
     done
