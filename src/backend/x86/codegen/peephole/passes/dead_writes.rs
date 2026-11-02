@@ -1810,6 +1810,42 @@ mod tests {
         }
     }
 
+    /// gcc.c-torture 981130-1: `if (a == b) exit (0); else abort ();`. The
+    /// `xorl` stages exit's argument, and the flags it writes really are
+    /// dead at the sibling call, so only the register guard protects it;
+    /// that guard once read `jmp abort@PLT`'s zero-argument marker (past
+    /// `.LBB2:`) as exit's and the program exited with status 1.
+    #[test]
+    fn argument_staging_before_a_sibling_call_survives() {
+        let asm = concat!(
+            "check:\n",
+            ".cfi_startproc\n",
+            "    cmpl %esi, %edi\n",
+            "    jne .LBB2\n",
+            ".LBB1:\n",
+            "    xorl %edi, %edi\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            "    jmp exit@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 1\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".LBB2:\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    # LCCC_CALL_FP 0\n",
+            "    jmp abort@PLT\n",
+            "    # LCCC_TAIL_CALL\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    # LCCC_CALL_FP 0\n",
+            ".cfi_endproc\n",
+        );
+        let out = run_dead_write_fixpoint(asm);
+        assert!(out.contains("xorl %edi, %edi"), "{out}");
+        // The same staging for a callee that takes no argument is dead.
+        let out = run_dead_write_fixpoint(&asm.replace("CALL_ARGS 1", "CALL_ARGS 0"));
+        assert!(!out.contains("xorl %edi, %edi"), "{out}");
+    }
+
     #[test]
     fn dead_flag_write_to_gpr_rbp_is_retired_but_frame_rbp_is_not() {
         let gpr = run_dead_flag_writes(concat!(
