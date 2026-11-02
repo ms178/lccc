@@ -2402,7 +2402,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     (parse_condjmp(cond_s), parse_jmp_target(jmp_s))
                 {
                     if let Some(label_name) = label_s.strip_suffix(':') {
-                        if cond_target == label_name {
+                        if cond_target == label_name && jmp_target.trim().starts_with(".L") {
+                            // External return/indirect thunks must keep their
+                            // unconditional transfer ABI, just as on x86-64.
                             if let Some(inv_cc) = invert_cc(cc) {
                                 let new_line = format!("    j{} {}", inv_cc, jmp_target.trim());
                                 store.replace(i, new_line);

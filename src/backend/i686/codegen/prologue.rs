@@ -1949,15 +1949,54 @@ impl I686Codegen {
             self.state.emit("    vzeroupper");
         }
         self.emit_epilogue(frame_size);
-        if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
-            // i386 SysV sret: callee pops the hidden pointer.
-            // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
-            // function_value semantics) — nothing is on the stack to pop.
-            self.state.emit("    ret $4");
-        } else if self.is_fastcall && !self.is_variadic && self.fastcall_stack_cleanup > 0 {
-            // Variadic fastcall callees receive everything on the stack and
-            // pop nothing (plain `ret`); the caller owns the cleanup.
-            emit!(self.state, "    ret ${}", self.fastcall_stack_cleanup);
+        let cleanup =
+            if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
+                // i386 SysV sret: callee pops the hidden pointer.
+                // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
+                // function_value semantics) — nothing is on the stack to pop.
+                4
+            } else if self.is_fastcall && !self.is_variadic {
+                // Variadic fastcall is caller-cleaned cdecl.
+                self.fastcall_stack_cleanup
+            } else {
+                0
+            };
+        if self.state.function_return_thunk {
+            if cleanup == 0 {
+                self.state.emit("    jmp __x86_return_thunk");
+            } else if self.current_return_i686_ext_vector_gp3 {
+                // ECX is the third return lane, so it cannot carry the PC.
+                // Relocate the PC over the dead argument area while preserving
+                // every return register, then use the ordinary stack thunk.
+                self.state.emit("    pushl %eax");
+                if self.state.emit_cfi {
+                    self.state.emit("    .cfi_adjust_cfa_offset 4");
+                }
+                self.state.emit("    movl 4(%esp), %eax");
+                emit!(self.state, "    movl %eax, {}(%esp)", cleanup + 4);
+                self.state.emit("    popl %eax");
+                emit!(self.state, "    leal {}(%esp), %esp", cleanup);
+                if self.state.emit_cfi {
+                    emit!(self.state, "    .cfi_def_cfa_offset {}", 4 - cleanup as i64);
+                }
+                self.state.emit("    jmp __x86_return_thunk");
+            } else {
+                // GCC's external-thunk ABI for RET imm16: ECX carries the
+                // return PC, with the callee-cleaned arguments already gone.
+                // Preserve EAX:EDX (including aggregate/scalar return values).
+                self.state.emit("    popl %ecx");
+                if self.state.emit_cfi {
+                    self.state.emit("    .cfi_register 8, 1");
+                    self.state.emit("    .cfi_def_cfa_offset 0");
+                }
+                emit!(self.state, "    leal {}(%esp), %esp", cleanup);
+                if self.state.emit_cfi {
+                    emit!(self.state, "    .cfi_def_cfa_offset -{}", cleanup);
+                }
+                self.state.emit("    jmp __x86_return_thunk_ecx");
+            }
+        } else if cleanup != 0 {
+            emit!(self.state, "    ret ${}", cleanup);
         } else {
             self.state.emit("    ret");
         }

@@ -79,6 +79,49 @@ def main():
                              '.section .note.GNU-stack,"",%progbits\n')
             if name in ('gcc', 'clang', 'icx'):
                 print(run([compiler, '--version']).splitlines()[0])
+            # Standalone return-transfer ABI fixture, not Linux kernel code.
+            # Linux's runtime patcher requires JMP sites, not Jcc-to-thunk.
+            if architecture in ('x86', 'i686'):
+                thunk_source = work / 'return-transfer.c'
+                thunk_source.write_text(
+                    'volatile unsigned enabled;\n'
+                    '__attribute__((noinline)) void conditional_return(unsigned x) {\n'
+                    ' if (x < enabled) return; __asm__ volatile("nop" ::: "memory"); }\n'
+                    '__asm__(".text\\n.globl __x86_return_thunk\\n" '
+                    '"__x86_return_thunk: ret\\n");\n'
+                    'int main(void) { enabled=2; conditional_return(0); '
+                    'conditional_return(3); return 0; }\n')
+                if name == 'i686':
+                    # Callee cleanup must preserve return lanes and the caller
+                    # stack, including the extension that returns in ECX.
+                    thunk_source.write_text(thunk_source.read_text().replace(
+                        'int main(void)', 'int simple_main(void)') +
+                        '__asm__(".text\\n.globl __x86_return_thunk_ecx\\n" '
+                        '"__x86_return_thunk_ecx: pushl %ecx; ret\\n");\n'
+                        'struct Four { int a,b,c,d; };\n'
+                        '__attribute__((noinline)) struct Four record(int x) { '
+                        'return (struct Four){x,x+1,x+2,x+3}; }\n'
+                        '__attribute__((noinline,fastcall)) long long wide(int a,int b,int c,int d) { '
+                        'return ((long long)(unsigned)(a+b)<<32) | (unsigned)(c+d); }\n'
+                        'typedef int V __attribute__((ext_vector_type(3)));\n'
+                        '__attribute__((noinline,fastcall)) V vector(int a,int b,int c,int d) { '
+                        'return (V){a+b,c,d}; }\n'
+                        'int main(void) { struct Four r=record(5); '
+                        'long long w=wide(1,2,3,4); V v=vector(1,2,3,4); '
+                        'return simple_main() || r.a!=5 || r.d!=8 || '
+                        'w!=(((long long)3<<32)|7) || v[0]!=3 || v[1]!=3 || v[2]!=4; }\n')
+                for opt in ('-O0', '-O2', '-Os'):
+                    assembly = work / f'{name}-return.s'
+                    flags = [opt, '-mfunction-return=thunk-extern', '-fcf-protection=branch']
+                    run([compiler, *flags, '-S', thunk_source, '-o', assembly])
+                    text = assembly.read_text()
+                    assert not re.search(r'^\s*j(?!mp\b)\w+\s+__x86_return_thunk', text, re.M), (name, opt, text)
+                    assert re.search(r'^\s*jmp\s+__x86_return_thunk', text, re.M), (name, opt, text)
+                    output = work / f'{name}-return-runtime'
+                    run([compiler, *flags, '-fno-pie', '-nostdlib', '-static',
+                         start, thunk_source, '-o', output])
+                    run(([emulator] if emulator else []) + [output])
+                    checks += 2
             for opt in ('-O0', '-O2', '-Os'):
                 obj = work/f'{name}-sections.o'
                 run([compiler, opt, '-c', HERE/'function_prototype_sections.c', '-o', obj])

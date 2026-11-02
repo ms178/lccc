@@ -55,6 +55,7 @@ require_gcc_oracle "check_seg_gs_runtime" || exit 1
 #                     and pointer elements, loads, stores, immediate stores and
 #                     read-modify-write, checked on a GS mirror. Oracle gcc -O2.
 programs=(
+    "tests/regression/seg_gs_runtime/seg_gs_store_abi.c -O2"
     "tests/regression/seg_gs_runtime/seg_gs_runtime.c -O2"
     "tests/regression/seg_gs_runtime/seg_gs_audit.c -O0"
     "tests/regression/seg_gs_runtime/seg_gs_overread.c -O0"

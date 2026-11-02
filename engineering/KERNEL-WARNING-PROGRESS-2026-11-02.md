@@ -397,3 +397,80 @@ There is no successful full-link/guest result at this checkpoint. Unsupported
 option warnings remain visible; all thirteen families/options, zero warnings,
 full objtool/guest validation, ICX 2026.2, measured gains and green hosted CI
 remain unresolved. This autosave is PENDING, not a readiness declaration.
+
+## Recovered guest faults and compiler repairs (pending full rebuild)
+
+The diagnostic exporter is now hosted-green (run 41472547163, job
+125370433113). An explicit job permission map had omitted Actions read access;
+that scope is now present without Actions write. The subsequently surfaced
+failure was gh's terminal-escape guard rejecting raw evidence. Only captured
+log/ZIP downloads opt in to binary bytes; normal JSON requests retain the guard.
+Bytes are compressed/blob-exported, never displayed on a terminal. Eight tests
+cover minimal permissions, exact binary preservation, wrong blob identities,
+input validation, credential/URL redaction and error propagation.
+
+Recovered the old 902789 kernel logs and artifact via the published Git blobs,
+verifying Git object IDs, per-part and complete-file SHA256s and lengths. The
+artifact SHA256 is
+`ad34de8d7698ea665013d9bee0e1e524a21666e1736ac845346908ebb5e59d2d`.
+Unlike the previously accessible log tail, the complete serial log establishes:
+
+* At 0.035s, `apply_returns` reports a conditional branch at a return-thunk
+  patch site; at 0.241s it reports an unpatched return thunk.
+* At 1.337s, the async storage-probe worker faults in
+  `update_alloc_hint_after_get`: a volatile GS store uses the stored value as
+  its address. The worker exits with interrupts disabled and boot never reaches
+  the smoke marker. Thus describing the old result only as an unexplained
+  timeout was incomplete.
+
+Two independently reduced, executed compiler defects explain those observations:
+
+1. `eliminate_binop_push_pop_pattern` redirected a load before calling
+   `mark_nop` on three pinned instructions. Pinning correctly refused those
+   deletions, leaving the old move to overwrite the new address register.
+   Ordered peephole dumps reproduce the first bad transformation precisely;
+   disabling phase 1 for diagnosis makes the reduced fixture pass. The fix
+   checks all four edited lines before performing ANY change. Production
+   peepholes and volatile pinning remain enabled. Unit tests pin each of the
+   four lines independently and retain the unpinned optimization positive.
+2. Basic branch inversion changed `Jcc local; JMP __x86_return_thunk` into a
+   conditional external thunk transfer. Linux's runtime return-site patcher
+   requires an unconditional JMP. Both x86 backends now limit this basic rule
+   to assembler-local targets; proven marked external sibling-call folding
+   remains separate. Existing local-label and 256-edge reference-index tests
+   remain unchanged and pass.
+
+Cross-target testing also exposed i686 silently ignoring the return-thunk
+option. It now emits the external-thunk ABI, including GCC 16.2's ECX-carried
+return-PC form for callee-cleaned sret/fastcall arguments. The extension whose
+third vector return lane occupies ECX instead preserves all return registers
+and relocates the PC before using the ordinary thunk. Standalone ABI tests
+execute caller-cleaned, record-return, wide fastcall and three-lane vector
+returns under qemu-i386. They are not Linux kernel oracle builds.
+
+Final fix validation:
+
+* Optimized fastbuild PASS; Clippy `-D warnings` PASS (18.70s).
+* x86-64 peephole units: 1803 PASS, zero failures, five existing ignored tests.
+* i686 peephole units: 401 PASS, zero failures, one existing ignored test.
+  Unit harness uses fastbuild opt-level 0/debug 0; compiler binaries use normal
+  optimized fastbuild. No ignored tests were added or validators disabled.
+* Kernel-pattern suite: 107 object/runtime contracts PASS across four LCCC
+  targets, GCC 16.2 and Clang 23.1.4; ICX explicitly unmeasured.
+* Entire GS runtime suite PASS, including the new standalone ABI fixture at
+  O0/O1/O2/O3 and full-buffer byte checks for signed/unsigned 8/16/32/64-bit
+  volatile stores. Existing indexed-fold shape checks remain enabled.
+* Actual patched Linux `kernel/cpu.o` and `lib/sbitmap.o` rebuild PASS through
+  the canonical harness. Genuine objtool `--rethunk --ibt --link --dry-run
+  --Werror` passes both objects without diagnostics. These are focused object
+  checks, NOT final vmlinux validation.
+* Boot-first gate remains 31024/32768, GNU flat bytes identical, 24 ISA scans
+  PASS, SHA256 unchanged from the preceding checkpoint.
+
+Stopped the older full local build after reproducing its compiler defect; it
+was NOT a completed link. A new full build with compiler identity invalidation
+and the repaired compiler is running, followed by strict traced QEMU on success.
+Logs: `/home/user/kernel-full-fixed.log`, then
+`/home/user/kernel-qemu-fixed{,-result}.log`. No new full-link/guest result is
+claimed yet. All-thirteen warning/option completion, zero warnings, measured
+runtime/code-size gains and current-head green CI remain outstanding.

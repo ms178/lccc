@@ -1834,7 +1834,16 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             if let Some(label_name) = label_line.strip_suffix(':') {
                                 if label_name == cond_target {
                                     let inv_cc = invert_cc(cc);
-                                    if inv_cc != cc && all_editable(infos, &[i, j]) {
+                                    // Only an ordinary local CFG edge may be
+                                    // inverted here. External transfers need the
+                                    // marked sibling-call proof in jump_thread.
+                                    // In particular, Linux patches unconditional
+                                    // return-thunk JMP sites; Jcc-to-thunk is not
+                                    // a patchable return and triggers WARNs.
+                                    if inv_cc != cc
+                                        && jmp_target.starts_with(".L")
+                                        && all_editable(infos, &[i, j])
+                                    {
                                         let new_line = format!("    j{} {}", inv_cc, jmp_target);
                                         label_refs.replace_line(store, &mut infos[i], i, new_line);
                                         label_refs.mark_nop(store, &mut infos[j], j); // Remove the jmp
@@ -15828,5 +15837,32 @@ mod dead_sign_extension_frame_tests {
     fn frameless_rbp_store_keeps_the_extension() {
         let out = run(&format!("    pushq %rbx\n{BODY}"));
         assert!(out.contains("cltq"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod return_thunk_branch_tests {
+    use super::*;
+
+    #[test]
+    fn external_thunk_transfers_are_not_inverted_into_conditional_jumps() {
+        for target in [
+            "__x86_return_thunk",
+            "__x86_return_thunk@PLT",
+            "__x86_indirect_thunk_r11",
+            "ordinary_external@PLT",
+        ] {
+            let text = format!(
+                "f:\n.cfi_startproc\n    testl %edi, %edi\n    je .LBB1\n    jmp {target}\n.LBB1:\n    ud2\n.cfi_endproc\n"
+            );
+            let mut store = LineStore::new(text);
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            combined_local_pass(&mut store, &mut infos);
+            let out = store.build_result(|i| infos[i].is_nop());
+            assert!(out.contains(&format!("jmp {target}")), "{out}");
+            assert!(!out.contains(&format!("jne {target}")), "{out}");
+        }
     }
 }

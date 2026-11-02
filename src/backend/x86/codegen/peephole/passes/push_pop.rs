@@ -169,6 +169,18 @@ pub(super) fn eliminate_binop_push_pop_pattern(
             let move_idx = real_indices[1];
             let pop_idx = real_indices[2];
 
+            // This is one atomic rewrite. mark_nop deliberately refuses a
+            // pinned deletion, so redirecting the load first would leave the
+            // old move in place and overwrite the new destination (notably a
+            // volatile per-CPU store's address). Check EVERY edit up front.
+            if [i, load_idx, move_idx, pop_idx]
+                .iter()
+                .any(|&k| infos[k].pinned)
+            {
+                i += 1;
+                continue;
+            }
+
             if let LineKind::Pop { reg: pop_reg_id } = infos[pop_idx].kind {
                 if pop_reg_id == push_reg_id {
                     // Check no stack-modifying instructions between push and pop
@@ -453,5 +465,39 @@ mod dead_scratch_save_tests {
         let out =
             run("    pushq %rcx\n    .loc 1 7 3\n    movl %eax, %ecx\n    popq %rcx\n    ret\n");
         assert!(!out.contains("pushq %rcx"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod pinned_push_pop_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_push_pop_rewrite_is_atomic_for_every_edit() {
+        let text = "    pushq %rax\n    movq %r10, %rax\n    movq %rax, %rcx\n    popq %rax\n";
+        for pinned in 0..4 {
+            let mut store = LineStore::new(text.to_string());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            infos[pinned].pinned = true;
+            assert!(!eliminate_binop_push_pop_pattern(&mut store, &mut infos));
+            assert_eq!(store.build_result(|i| infos[i].is_nop()), text);
+        }
+    }
+
+    #[test]
+    fn unpinned_push_pop_rewrite_still_redirects_and_removes_all_three_lines() {
+        let mut store = LineStore::new(
+            "    pushq %rax\n    movq %r10, %rax\n    movq %rax, %rcx\n    popq %rax\n".to_string(),
+        );
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(eliminate_binop_push_pop_pattern(&mut store, &mut infos));
+        assert_eq!(
+            store.build_result(|i| infos[i].is_nop()).trim(),
+            "movq %r10, %rcx"
+        );
     }
 }

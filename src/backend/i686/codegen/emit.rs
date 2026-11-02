@@ -751,6 +751,7 @@ impl I686Codegen {
         self.state.disable_regalloc = opts.disable_regalloc;
         self.state.apply_tls_options(opts);
         self.state.cf_protection_branch = opts.cf_protection_branch;
+        self.state.function_return_thunk = opts.function_return_thunk;
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.state.no_plt = opts.no_plt;
