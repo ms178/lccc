@@ -601,6 +601,16 @@ directives) and "the text mentions the stack pointer in any spelling". The windo
 also grows from three lines to eight now that its proof obligations are stated
 once.
 
+**8a. Both clobber predicates asked the oracle twice per line.** `line_writes_gp_family`
+and `helpers::writes_family` each needed the implicit *read* half and the
+implicit *write* half, and each fetched them with a separate
+`classify_implicit_operands` call -- a prefix walk plus a table match, on the
+hottest predicate in the file (once per line of every push/pop span, and once per
+copy/graph edge of every pass). One call yields both halves, and the resulting
+answer is identical by construction because the second call was of the same pure
+function with the same input. `classify_implicit_operands` is now `pub(super)` so
+the passes module can share one classification instead of projecting it twice.
+
 **8. The i686 CFG fixpoint was doing O(rounds x lines) oracle work.** Each round
 called `line_reg_use_def` for every line, and that function asked
 `line_references_reg` once per register family — nine `classify_implicit_operands`

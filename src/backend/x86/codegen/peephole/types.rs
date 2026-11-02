@@ -2538,10 +2538,15 @@ pub(super) fn line_writes_gp_family(info: &LineInfo, text: &str, fam: RegId) -> 
         return false;
     }
     let bit = 1u16 << fam;
+    // Both exact halves come from ONE classification of the mnemonic: the
+    // oracle is a table lookup plus a prefix walk, and this predicate is called
+    // once per line of every push/pop span, so asking it twice for the two
+    // halves would double the work of the hottest query in the file.
+    let (implicit_reads, implicit_writes) = classify_implicit_operands(text.as_bytes());
     // The architectural write set is exact and wins over everything else: an
     // instruction that both reads and writes a family implicitly (`idivq` on
     // `%rax`, `cltq`) is decided here.
-    if implicit_write_refs(text.as_bytes()) & bit != 0 {
+    if implicit_writes & bit != 0 {
         return true;
     }
     // The classified destination is only trusted when the line does not
@@ -2552,7 +2557,7 @@ pub(super) fn line_writes_gp_family(info: &LineInfo, text: &str, fam: RegId) -> 
     // `passes::helpers::writes_family` applies, and the two are cross-checked by
     // `helpers::writes_family_tests::agrees_with_the_shared_oracle`.
     let dest_is_a_write = matches!(info.kind, LineKind::Other { dest_reg } if dest_reg == fam)
-        && implicit_read_refs(text.as_bytes()) & bit == 0;
+        && implicit_reads & bit == 0;
     match info.kind {
         LineKind::Other { .. } => dest_is_a_write || names_a_second_destination(text, info, fam),
         LineKind::LoadRbp { reg, .. } => reg == fam,
@@ -2581,7 +2586,7 @@ pub(super) fn implicit_r_w_full(b: &[u8]) -> (u16, u16, u16) {
 /// EXACT for every instruction listed; unknown mnemonics yield (0, 0) —
 /// callers that need a MAY model must add their own conservative fallback
 /// (that is what `load_op_fuse::may_write_families` layers on top).
-fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
+pub(super) fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
     const RAX: u16 = 1 << 0;
     const RCX: u16 = 1 << 1;
     const RDX: u16 = 1 << 2;
