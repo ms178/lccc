@@ -24182,9 +24182,14 @@ f:
         // Rule 2: the value is wanted (`(uint8_t)` stored somewhere), the flags
         // are not.  `movzbl %al, %eax` is three bytes where `andl $255, %eax`
         // is six, and it produces the identical 32-bit value.
-        let asm = pair_fn("    andl $255, %eax\n    movl %eax, 4(%esp)\n");
+        // The store goes through a pointer argument, not a frame slot: a slot
+        // store here is dead (nothing reads `4(%esp)` before the return), and a
+        // dead-store pass would delete the only consumer of the masked value
+        // and leave the AND to be deleted for an unrelated reason.
+        let asm = pair_fn("    andl $255, %eax\n    movl %eax, (%edi)\n");
         let out = peephole_optimize(asm);
         assert!(!out.contains("andl $255"), "byte mask shortened:\n{out}");
+        assert!(out.contains("movzbl %al, %eax"), "zero extension:\n{out}");
         // The emitted text must still be what the i686 assembler accepts.
         let obj = std::env::temp_dir().join("lccc_movzbl_mask.o");
         let path = obj.to_string_lossy().into_owned();
@@ -24196,12 +24201,13 @@ f:
 
     #[test]
     fn dead_and_word_mask_becomes_movzwl() {
-        let asm = pair_fn("    andl $65535, %eax\n    movl %eax, 4(%esp)\n");
+        let asm = pair_fn("    andl $65535, %eax\n    movl %eax, (%edi)\n");
         let out = peephole_optimize(asm);
         assert!(!out.contains("andl $65535"), "word mask shortened:\n{out}");
-        let wide = pair_fn("    andl $65535, %edi\n    movl %edi, 4(%esp)\n");
+        assert!(out.contains("movzwl %ax, %eax"), "word zero extension:\n{out}");
+        let wide = pair_fn("    andl $65535, %ebx\n    movl %ebx, (%edi)\n");
         let out = peephole_optimize(wide);
-        assert!(!out.contains("andl $65535"), "word mask on %edi:\n{out}");
+        assert!(!out.contains("andl $65535"), "word mask on %ebx:\n{out}");
     }
 
     #[test]
@@ -24209,12 +24215,12 @@ f:
         // `movzx` writes no flags, so any later reader of the AND's flags
         // vetoes the shortening; only the redundant-test shape (rule 1, which
         // deletes the AND outright) may consume them.
-        // The reader sits *directly* after the AND: anywhere later and a
-        // store-narrowing pass can make the AND itself dead (`andl` + a word
-        // store becomes a byte store, and then nothing reads the masked value
-        // and rule 1 is entitled to delete it). Here the `je` consumes the
-        // flags the AND defined, which is the licence `movzx` does not have.
-        let asm = pair_fn("    andl $255, %eax\n    je .Lok\n    movl %eax, 4(%esp)\n.Lok:\n");
+        // The `je` sits *directly* after the AND and consumes the flags the AND
+        // defined -- the licence `movzx` does not have. The value stays live on
+        // the fall-through (a store through a pointer argument, which no
+        // dead-store pass may remove), so rule 1's value-deadness check refuses
+        // the `testb` fold as well and the AND must survive untouched.
+        let asm = pair_fn("    andl $255, %eax\n    je .Lok\n    movl %eax, (%edi)\n.Lok:\n");
         let out = peephole_optimize(asm);
         assert!(out.contains("andl $255"), "live flags keep the AND:\n{out}");
         assert!(!out.contains("movzbl %al"), "no zero extension:\n{out}");
