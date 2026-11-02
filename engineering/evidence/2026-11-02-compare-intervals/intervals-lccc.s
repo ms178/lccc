@@ -281,9 +281,8 @@ keep_uint_ge_max:
     # LCCC_RET_XMM_BITS 512
     # LCCC_RET_RDX 0
     # LCCC_RET_RAX 1
-    movl $4294967295, %ecx
     xorl %eax, %eax
-    cmpl %ecx, %edi
+    cmpl $-1, %edi
     setae %al
     ret
 .cfi_endproc
