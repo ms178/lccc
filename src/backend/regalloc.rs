@@ -11867,7 +11867,7 @@ fn collect_i686_scratch_hazard_points_refined(
             // "constant divisor: never clean" rule below.
             let divrem_tail = divrem_pairs.tail_points.contains(&(bi, ii));
             let (ecx_clean, edx_clean) = match inst {
-                Instruction::BinOp { op, ty, rhs, .. }
+                Instruction::BinOp { op, ty, .. }
                     if is_gpr32(ty)
                         && divrem_tail
                         && matches!(

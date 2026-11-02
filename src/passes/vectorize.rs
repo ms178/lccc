@@ -1479,7 +1479,7 @@ fn analyze_loop_pattern(
                 }
             }
             let reaches_exit_cmp = header.instructions.iter().any(|candidate| {
-                matches!(candidate, Instruction::Cmp { lhs, rhs, .. }
+                matches!(candidate, Instruction::Cmp { lhs, .. }
                     if matches!(lhs, Operand::Value(v) if derived.contains(v)))
             });
             if reaches_exit_cmp {
@@ -4317,7 +4317,7 @@ fn analyze_reduction_pattern(
         }
         if header.instructions.iter().any(|candidate| {
             matches!(candidate,
-            Instruction::Cmp { lhs, rhs, .. }
+            Instruction::Cmp { lhs, .. }
                 if matches!(lhs, Operand::Value(v) if derived.contains(v)))
         }) {
             iv = Some(*dest);
