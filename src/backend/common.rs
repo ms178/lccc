@@ -1451,15 +1451,36 @@ pub struct AsmOutput {
     /// When true, stack slot references use RSP-relative addressing instead of RBP.
     /// Set when the frame pointer is omitted (-fomit-frame-pointer).
     pub use_rsp_addressing: bool,
-    /// Total frame size (needed to convert rbp-relative offsets to rsp-relative).
-    /// RBP-relative: offset(%rbp) where offset is negative
-    /// RSP-relative: (frame_size + offset)(%rsp) since RSP = RBP - frame_size
+    /// The live `%rsp` delta that a slot displacement has to account for, on top
+    /// of the frame itself.
+    ///
+    /// The invariant, stated once because every `%rsp`-anchored access depends
+    /// on it: after the prologue
+    ///
+    /// ```text
+    ///     %rbp - %rsp == frame_size + rsp_frame_size        (frame-pointer mode)
+    ///     %rsp          == entry %rsp - rsp_frame_size      (frame-pointer omitted)
+    /// ```
+    ///
+    /// so a slot at `offset` from `%rbp` is at `rsp_frame_size + offset` from
+    /// `%rsp` in the omitted mode and at `frame_size + rsp_frame_size + offset`
+    /// (the anchor) in frame-pointer mode. The two differ in what the counter
+    /// *means* because the modes pay for the frame differently: with a frame
+    /// pointer the callee-saved pushes are paid out of the frame (`local_size`
+    /// is reduced by exactly the pushed bytes), so they do not appear here,
+    /// while call staging and the atomic loops move `%rsp` past the frame and
+    /// do. Without a frame pointer the whole allocation is the counter.
+    ///
+    /// The value is live: it is bumped around every push and staging window, so
+    /// an access in between is spelled from the `%rsp` of that instant.
     pub rsp_frame_size: i64,
     /// x86 frame-pointer mode only: `Some(frame_size)` when the frame is too
     /// large for every slot offset to be an `imm32` `%rbp` displacement, so an
-    /// access can be anchored on `%rsp` instead (`%rsp` sits exactly
-    /// `frame_size` below `%rbp` at every slot access: the prologue finishes
-    /// there, and only call staging moves it, never across an access).
+    /// access can be anchored on `%rsp` instead. `%rsp` sits `frame_size`
+    /// below `%rbp` once the prologue has run, and every later move is
+    /// accounted for by [`Self::rsp_frame_size`], which the access arithmetic
+    /// adds -- so the anchor stays exact *inside* a call-staging window, where
+    /// an access and a moved `%rsp` do coexist.
     ///
     /// x86 encodes `disp(%rbp)` in 32 signed bits, so a frame above 2 GiB has
     /// slot offsets with **no encoding at all** -- a legal 3 GiB automatic

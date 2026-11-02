@@ -3332,14 +3332,16 @@ impl X86Codegen {
             // Reset RSP-relative addressing flag: a previous FPO function may have
             // set it, and the AsmOutput is shared across all functions in the module.
             self.state.out.use_rsp_addressing = false;
-            // `rsp_frame_size` is the live %rsp displacement below the frame
-            // base in *both* modes (the FPO path sets it to the whole frame at
-            // the end of this function; here the base is the post-prologue
-            // %rsp, so it starts at zero and tracks only the temporaries that
-            // call staging and the atomic loops push). A previous function's
-            // value must not leak into this one: the shared AsmOutput outlives
-            // the function, and a stale non-zero base would make every
-            // `%rsp`-anchored slot access of a >2 GiB frame off by that much.
+            // `AsmOutput::rsp_frame_size` keeps one invariant in both modes
+            // (`%rbp - %rsp == frame_size + rsp_frame_size` here, `%rsp ==
+            // entry %rsp - rsp_frame_size` when the frame pointer is omitted).
+            // In this mode the frame itself is not in the counter -- the
+            // callee-saved pushes below are paid for out of `local_size` -- so
+            // it starts at zero and tracks only what moves `%rsp` past the
+            // frame: call staging and the atomic loops. A previous function's
+            // value must not leak in: the shared AsmOutput outlives the
+            // function, and a stale non-zero counter would put every
+            // anchor-relative slot access of a >2 GiB frame off by that much.
             self.state.out.rsp_frame_size = 0;
             // CFI for this frame comes from backend::cfi_synth.
             self.state.emit("    pushq %rbp");
@@ -5220,11 +5222,21 @@ pub(super) enum StackAdjust {
 }
 
 impl StackAdjust {
-    /// The immediate form's mnemonic.
+    /// The immediate form's mnemonic, indented like every other instruction.
+    ///
+    /// The indentation belongs here, not at the call site: `emit_instr_imm_reg`
+    /// writes the mnemonic verbatim, and this was `"subq"` while the register
+    /// form below was `"    subq %r11, %rsp"`, so any frame that took the
+    /// immediate path emitted a column-0 instruction inside an otherwise
+    /// indented body. Nothing in the assembler cares, but every text consumer
+    /// does: `tests/regression/check_seg_pointee_chain_asm.sh` finds a function
+    /// body by scanning to the first line that starts in column 0, so the
+    /// prologue's `subq $32, %rsp` truncated the body to two instructions and
+    /// the `%fs`/`%gs` sequence it asserts was reported missing.
     fn mnemonic(self) -> &'static str {
         match self {
-            Self::Allocate => "subq",
-            Self::Release => "addq",
+            Self::Allocate => "    subq",
+            Self::Release => "    addq",
         }
     }
 

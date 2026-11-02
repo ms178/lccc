@@ -1327,10 +1327,20 @@ pub fn emit_machinst_with_tune(
                     fmt_reg(dst, OpSize::S64)
                 )),
                 None => {
+                    // A slot no anchor can name is materialised here, and the
+                    // materialised form takes the displacement the anchor would
+                    // have used, unfiltered: `movq $disp, %reg` has no imm32
+                    // limit, which is the whole reason this arm exists.
+                    //
+                    // The sum cannot overflow i64: it is the slot's distance
+                    // from the live `%rsp`, and both endpoints are inside one
+                    // process's stack, which is far below isize::MAX. So the
+                    // plain add is exact and the invariant is stated rather
+                    // than paid for -- a checked add plus `expect` on this path
+                    // would be a contract check masquerading as error handling.
                     let disp = if out.use_rsp_addressing {
-                        out.rsp_frame_size
-                            .checked_add(*slot)
-                            .expect("frame arithmetic overflowed i64")
+                        debug_assert!(out.rsp_frame_size.checked_add(*slot).is_some());
+                        out.rsp_frame_size + *slot
                     } else {
                         *slot
                     };
