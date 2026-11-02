@@ -6672,7 +6672,7 @@ fn resolve_stack_vregs(
             }
             MachOperand::Mem {
                 base: MachReg::Vreg(id),
-                offset,
+                ..
             } if !ra.contains_key(id) => {
                 // Can't have a stack-slot-based-memory operand. Keep as vreg
                 // for the window allocator to home; without a slot it trips

@@ -354,13 +354,12 @@ pub enum ImmediateValue {
     SymbolPlusOffset(String, i64),
     /// Symbol with @modifier, e.g., symbol@GOTPCREL
     // Constructed by parser; handled by encoder for GOT/TLS relocations.
-    // The expectation is scoped to the shipped build, mirroring
-    // `Displacement::SymbolMod` below: any unit test that drives the
-    // full `encode()` dispatch makes the encoder's `SymbolMod` match
-    // arms reachable, which keeps the variant live under `cfg(test)` —
-    // leaving the expectation asserted there would fail `-D warnings`
-    // on the `lib test` target.
-    #[cfg_attr(all(not(feature = "gcc_assembler"), not(test)), expect(dead_code))]
+    // Whether this counts as dead depends on the build (`not(test)` and
+    // `gcc_assembler` both change it), and the crate allows `dead_code`
+    // crate-wide, so no per-item expectation is asserted here: an
+    // `#[expect(dead_code)]` would be *unfulfilled* -- and therefore a
+    // `-D warnings` failure -- in whichever of those builds keeps the
+    // variant live, which is what the `lib test` target does.
     SymbolMod(String, String),
     /// Symbol difference: sym_a - sym_b (e.g., $_DYNAMIC-1b)
     SymbolDiff(String, String),

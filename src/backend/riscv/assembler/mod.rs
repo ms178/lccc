@@ -31,9 +31,13 @@ pub fn assemble_with_args(
     asm_text: &str,
     output_path: &str,
     extra_args: &[String],
+    debug: Option<crate::backend::elf::DwarfConfig>,
 ) -> Result<(), String> {
     let statements = parse_asm(asm_text)?;
     let mut writer = ElfWriter::new();
+    if let Some(debug) = debug {
+        writer.base.set_debug_config(debug);
+    }
 
     // Collect ABI and arch info from extra args (last value wins, matching GCC behavior)
     let mut abi_name: Option<String> = None;
@@ -124,8 +128,8 @@ mod data_expression_contracts {
                 let out = TempFile::try_new("riscv", "invalid-data", "o")
                     .expect("reserve private RISC-V negative-test output");
                 let asm = format!(".data\n.{directive} {expr}\n");
-                let error =
-                    assemble_with_args(&asm, &out.path().to_string_lossy(), &[]).expect_err(&asm);
+                let error = assemble_with_args(&asm, &out.path().to_string_lossy(), &[], None)
+                    .expect_err(&asm);
                 assert!(
                     !out.path().exists(),
                     "{asm} unexpectedly produced an object"
@@ -149,7 +153,7 @@ mod data_expression_contracts {
                 let out = TempFile::try_new("riscv", "valid-data", "o")
                     .expect("reserve private RISC-V positive-test output");
                 let asm = format!(".data\nstart: .{directive} {expr}\nend:\n");
-                assemble_with_args(&asm, &out.path().to_string_lossy(), &[])
+                assemble_with_args(&asm, &out.path().to_string_lossy(), &[], None)
                     .unwrap_or_else(|error| panic!("{asm}: {error}"));
                 assert!(out.path().metadata().unwrap().len() > 0);
             }

@@ -21,13 +21,20 @@ use elf_writer::ElfWriter;
 /// Assemble AT&T syntax i686 assembly text into a 32-bit ELF object file.
 ///
 /// This is the default assembler (used when the `gcc_assembler` feature is disabled).
-pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
+pub fn assemble(
+    asm_text: &str,
+    output_path: &str,
+    debug: Option<crate::backend::elf::DwarfConfig>,
+) -> Result<(), String> {
     let items = parse_asm(asm_text)?;
     let items = crate::backend::x86::assembler::cfi::lower_cfi(
         items,
         crate::backend::x86::assembler::cfi::CfiArch::I386,
     )?;
-    let obj = ElfWriter::new();
+    let mut obj = ElfWriter::new();
+    if let Some(debug) = debug {
+        obj.set_debug_config(debug);
+    }
     let elf_bytes = obj.build(&items)?;
     std::fs::write(output_path, &elf_bytes)
         .map_err(|e| format!("Failed to write object file: {}", e))?;

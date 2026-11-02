@@ -3174,12 +3174,29 @@ mod debug_line_tests {
         );
         w.base.finish_debug_sections(8, 258, 257).unwrap();
         let line = &w.base.sections[".debug_line"];
+        // Version 5 names the prologue's paths through `.debug_line_str`, so
+        // the code address is the `.text` relocation alone.
         let targets: Vec<_> = line
             .relocs
             .iter()
+            .filter(|r| r.symbol_name == ".text")
             .map(|r| (r.reloc_type, r.symbol_name.as_str(), r.addend))
             .collect();
         assert_eq!(targets, [(257, ".text", 0)]);
+        let paths: Vec<_> = line
+            .relocs
+            .iter()
+            .filter(|r| r.symbol_name == ".debug_line_str")
+            .collect();
+        assert!(!paths.is_empty(), "the prologue names its paths");
+        assert!(
+            paths.iter().all(|r| r.reloc_type == 258),
+            "path offsets are 32-bit relocations: {:?}",
+            paths
+                .iter()
+                .map(|r| (r.reloc_type, r.symbol_name.as_str(), r.addend))
+                .collect::<Vec<_>>()
+        );
         let info = &w.base.sections[".debug_info"];
         assert!(
             info.relocs

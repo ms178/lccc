@@ -2142,6 +2142,33 @@ impl Driver {
                 // a future spelling must not silently turn debug OFF.
                 "-g0" | "-ggdb0" => self.debug_info = false,
                 "-g" | "-ggdb" => self.debug_info = true,
+                // `-gdwarf-<N>` selects the dialect the assembler writes.  The
+                // range is the one GCC 16.2 accepts *and* this writer
+                // implements, so it is a real implementation with no
+                // diagnostic.  `-gdwarf-1`/`-gdwarf-6` fall through to the
+                // generic `-g<selector>` arm, which rejects them exactly as
+                // GCC does (measured on 14.2 and 16.2) -- accepting and
+                // ignoring them was the old blanket's bug.
+                arg if dwarf_version_selector(arg).is_some() => {
+                    self.debug_info = true;
+                    if let Some(version) = dwarf_version_selector(arg) {
+                        self.dwarf_version = version;
+                    }
+                }
+                // `-gdwarf` asks for the DWARF format at its default version,
+                // which is exactly what a bare `-g` produces here (GCC 16.2
+                // emits version 5 for it, measured), so it is honoured with no
+                // diagnostic.
+                "-gdwarf" => self.debug_info = true,
+                // `-gdwarf32`/`-gdwarf64` select the 32- or 64-bit *unit
+                // format* and never enable debug info by themselves: measured
+                // on GCC 16.2, neither produces a debug section without `-g`.
+                // The 32-bit format is the one every object here uses, so
+                // `-gdwarf32` asks for the state that already holds and needs
+                // no action; the 64-bit format is not implemented, so it is
+                // diagnosed rather than silently emitting the wrong one.
+                "-gdwarf32" => {}
+                "-gdwarf64" => unknown_option_tolerated("-gdwarf64", strict_options)?,
                 "-gsplit-dwarf" => {
                     self.debug_info = true;
                     eprintln!(
@@ -2154,7 +2181,7 @@ impl Driver {
                         "lccc: warning: compressed debug sections (-gz) are not \
                          supported; emitting uncompressed debug info"
                     );
-                    unknown_option_tolerated("-gz", strict_options)?;
+                    unsupported_tolerated("-gz", strict_options)?;
                 }
                 arg if arg.starts_with("-gz=") => {
                     // `-gz=<method>` only selects a compression method, so it
@@ -2170,7 +2197,7 @@ impl Driver {
                          supported; emitting uncompressed debug info",
                         arg
                     );
-                    unknown_option_tolerated(arg, strict_options)?;
+                    unsupported_tolerated(arg, strict_options)?;
                 }
                 // A `-gno-<feature>` modifier asks for a feature to be OFF.
                 // LCCC implements none of the features these modifiers name,
@@ -3925,6 +3952,18 @@ pub fn unknown_option(arg: &str, strict: bool) -> Result<(), String> {
 /// LCCC honours the selectors it implements in the literal arms above; every
 /// selector this function accepts but does not implement is diagnosed once
 /// per compilation and fatal under `LCCC_STRICT_OPTIONS=1`.
+/// The version a `-gdwarf-<N>` argument selects, for the versions this writer
+/// implements (2 through 5: the range GCC 16.2 accepts, measured).
+fn dwarf_version_selector(arg: &str) -> Option<u8> {
+    match arg.strip_prefix("-gdwarf-")? {
+        "2" => Some(2),
+        "3" => Some(3),
+        "4" => Some(4),
+        "5" => Some(5),
+        _ => None,
+    }
+}
+
 fn gnu_debug_selector_known(selector: &str) -> bool {
     if let Some(n) = selector.strip_prefix("dwarf-") {
         // 5 is the newest version GCC 14.2 and 16.2 emit.
@@ -4042,6 +4081,23 @@ pub fn unknown_option_tolerated(arg: &str, strict: bool) -> Result<(), String> {
          to make this an error",
         arg
     );
+    Ok(())
+}
+
+/// A recognised option LCCC accepts but cannot honour.
+///
+/// The caller has already printed the specific warning; all that remains is
+/// the `LCCC_STRICT_OPTIONS=1` escalation, which turns the same tolerance into
+/// the error a capability probe must read. Printing the generic
+/// "unrecognized ... tolerated" text on top of a specific explanation was
+/// double-reporting: a `-gz=zlib` build saw two warnings about one option.
+pub fn unsupported_tolerated(arg: &str, strict: bool) -> Result<(), String> {
+    if strict {
+        return Err(format!(
+            "command-line option '{}' is not implemented by LCCC; LCCC_STRICT_OPTIONS is set",
+            arg
+        ));
+    }
     Ok(())
 }
 
@@ -6346,16 +6402,25 @@ mod cli_tests {
     /// diagnosed (and fatal under strict), and GNU-rejected ones fail.
     #[test]
     fn debug_selector_boundary_matches_gnu() {
-        for arg in ["-g", "-g1", "-g2", "-g3", "-g0", "-ggdb", "-ggdb3"] {
+        // `-gdwarf-<N>` is a real feature now, so it is honoured quietly and
+        // strict mode must not call it unimplemented (see
+        // `gdwarf_selects_the_emitted_dialect` for the version it records).
+        for arg in [
+            "-g",
+            "-g1",
+            "-g2",
+            "-g3",
+            "-g0",
+            "-ggdb",
+            "-ggdb3",
+            "-gdwarf-2",
+            "-gdwarf-3",
+            "-gdwarf-4",
+            "-gdwarf-5",
+        ] {
             assert!(try_flag(arg).is_ok(), "{arg} must be honoured");
         }
         for arg in [
-            "-gdwarf",
-            "-gdwarf-2",
-            "-gdwarf-4",
-            "-gdwarf-5",
-            "-gdwarf32",
-            "-gdwarf64",
             "-gstabs",
             "-gxcoff+",
             "-gcoff3",
@@ -6363,9 +6428,6 @@ mod cli_tests {
             "-gcodeview",
             "-gbtf",
             "-gctf",
-            "-gz=none",
-            "-gz=zlib",
-            "-gz=zstd",
             "-grecord-gcc-switches",
             "-gcolumn-info",
             "-gvariable-location-views",
@@ -6375,10 +6437,23 @@ mod cli_tests {
             "-gno-column-info",
             "-gno-pubnames",
             "-gno-strict-dwarf",
+            // `-gdwarf64` selects a unit format this compiler does not write,
+            // so it stays diagnosed (and strict-fatal) even though the 32-bit
+            // format of `-gdwarf32` is what everything already uses.
+            "-gdwarf64",
         ] {
             assert!(try_flag(arg).is_ok(), "{arg} must be tolerated");
             assert!(
                 super::unknown_option_tolerated(arg, true).is_err(),
+                "{arg}: strict mode must not report it as implemented"
+            );
+        }
+        // `-gz` selects compression LCCC does not implement: one warning, and
+        // strict mode escalates it like every other tolerated request.
+        for arg in ["-gz", "-gz=none", "-gz=zlib", "-gz=zstd"] {
+            assert!(try_flag(arg).is_ok(), "{arg} must be tolerated");
+            assert!(
+                super::unsupported_tolerated(arg, true).is_err(),
                 "{arg}: strict mode must not report it as implemented"
             );
         }
@@ -6399,6 +6474,78 @@ mod cli_tests {
             let err = try_flag(arg).expect_err(arg);
             assert!(err.contains(arg), "{err}");
         }
+    }
+
+    /// `-gdwarf-<N>` selects the dialect the assembler writes: the version is
+    /// recorded, debug info is on, and the flag is honoured rather than
+    /// tolerated, so strict mode accepts it and nothing is printed.  The range
+    /// is GCC 16.2's (2..=5); every other spelling stays an error.
+    #[test]
+    fn gdwarf_selects_the_emitted_dialect() {
+        for (arg, version) in [
+            ("-gdwarf-2", 2u8),
+            ("-gdwarf-3", 3),
+            ("-gdwarf-4", 4),
+            ("-gdwarf-5", 5),
+        ] {
+            let mut d = Driver::new();
+            let args = vec!["ccc".to_string(), arg.to_string(), "x.c".to_string()];
+            d.parse_cli_args(&args)
+                .expect("the selector is implemented");
+            assert!(d.debug_info, "{arg} enables debug info");
+            assert_eq!(d.dwarf_version, version, "{arg}");
+            // A later selector wins, exactly like GNU's last-one-wins.
+            let mut d = Driver::new();
+            let args = vec![
+                "ccc".to_string(),
+                "-gdwarf-2".to_string(),
+                arg.to_string(),
+                "x.c".to_string(),
+            ];
+            d.parse_cli_args(&args).unwrap();
+            assert_eq!(d.dwarf_version, version, "{arg} wins over -gdwarf-2");
+        }
+        // Without any selector the default is the dialect GCC 16.2 emits for a
+        // bare `-g`.
+        let mut d = Driver::new();
+        let args = vec!["ccc".to_string(), "-g".to_string(), "x.c".to_string()];
+        d.parse_cli_args(&args).unwrap();
+        assert_eq!(d.dwarf_version, 5);
+        let unparsed = Driver::new();
+        assert_eq!(
+            unparsed.dwarf_version, 5,
+            "the field must be initialised before any flag is parsed"
+        );
+        for arg in ["-gdwarf-1", "-gdwarf-6", "-gdwarf-7", "-gdwarf-32"] {
+            assert!(try_flag(arg).is_err(), "{arg} must be rejected");
+        }
+        // `-gdwarf` is the format at its default version: debug on, dialect
+        // unchanged.  `-gdwarf32`/`-gdwarf64` select the unit *format* and
+        // never enable debug info (measured: GCC 16.2 emits no debug section
+        // for either without -g); the 32-bit format is the one used here, so
+        // that spelling is satisfied by construction.
+        let mut d = Driver::new();
+        let args = vec!["ccc".to_string(), "-gdwarf".to_string(), "x.c".to_string()];
+        d.parse_cli_args(&args).unwrap();
+        assert!(d.debug_info, "-gdwarf enables debug info");
+        assert_eq!(d.dwarf_version, 5);
+        let mut d = Driver::new();
+        let args = vec![
+            "ccc".to_string(),
+            "-gdwarf32".to_string(),
+            "x.c".to_string(),
+        ];
+        d.parse_cli_args(&args).unwrap();
+        assert!(!d.debug_info, "-gdwarf32 must not enable debug info");
+        let mut d = Driver::new();
+        let args = vec![
+            "ccc".to_string(),
+            "-gdwarf64".to_string(),
+            "x.c".to_string(),
+        ];
+        d.parse_cli_args(&args).unwrap();
+        assert!(!d.debug_info, "-gdwarf64 must not enable debug info");
+        assert_eq!(d.dwarf_version, 5, "a format selector picks no version");
     }
 
     /// `-g0`/`-ggdb0` keep their GCC meaning: an explicit OFF.

@@ -463,6 +463,9 @@ pub struct ElfWriterBase {
     /// Bytes of directive-generated fill materialized so far by this
     /// writer — bounded by [`MAX_TOTAL_DIRECTIVE_FILL`] (see there).
     fill_budget_used: usize,
+    /// The DWARF dialect the `.loc` rows are written in, and the language the
+    /// compile units declare (`-gdwarf-<N>`, `-std=`).
+    debug_config: super::dwarf::DwarfConfig,
     /// `.file N "name"` records in directive order.
     debug_files: Vec<(u32, String)>,
     /// `.loc` rows as (label at the row's address, file, line, column): a
@@ -524,9 +527,16 @@ impl ElfWriterBase {
             code_align_floor: 0,
             text_align,
             fill_budget_used: 0,
+            debug_config: super::dwarf::DwarfConfig::assembler(super::dwarf::DWARF_DEFAULT_VERSION),
             debug_files: Vec::new(),
             debug_rows: Vec::new(),
         }
+    }
+
+    /// Select the DWARF dialect for the `.loc` rows this writer will emit
+    /// (`-gdwarf-<N>` and the language `-std=` implies).
+    pub fn set_debug_config(&mut self, config: super::dwarf::DwarfConfig) {
+        self.debug_config = config;
     }
 
     /// Ensure a section exists. If it doesn't, create it with the given properties.
@@ -573,23 +583,25 @@ impl ElfWriterBase {
         self.debug_rows.push((label, file, line, column, options));
     }
 
-    /// GNU as `dwarf2_finish`: the `.loc` rows become a DWARF v4
-    /// `.debug_line`, and an input without its own `.debug_info` gets compile
-    /// units for it (see `elf::dwarf`).  `abs32` and `abs_addr` are the
-    /// 32-bit and `address_size`-byte absolute relocations.  Under
-    /// [`Self::keep_code_labels`] (RISC-V linker relaxation) every code
-    /// address is relocated against a label at it, which the linker moves
-    /// when it deletes bytes.  Call after the last section change and before
-    /// [`Self::write_elf`].
+    /// GNU as `dwarf2_finish`: the `.loc` rows become a `.debug_line`, and an
+    /// input without its own `.debug_info` gets compile units for it (see
+    /// `elf::dwarf`).  `abs32` and `abs_addr` are the 32-bit and
+    /// `address_size`-byte absolute relocations, and `config` selects the
+    /// DWARF dialect (`-gdwarf-<N>`) and the language the unit declares
+    /// (`-std=`).  Under [`Self::keep_code_labels`] (RISC-V linker relaxation)
+    /// every code address is relocated against a label at it, which the linker
+    /// moves when it deletes bytes.  Call after the last section change and
+    /// before [`Self::write_elf`].
     pub fn finish_debug_sections(
         &mut self,
         address_size: usize,
         abs32: u32,
         abs_addr: u32,
     ) -> Result<(), String> {
+        let config = self.debug_config;
         use super::dwarf::{
-            DwarfFunction, DwarfLineLocation, DwarfSectionInfo, build_dwarf_info_sections,
-            build_dwarf_line_section,
+            DwarfFunction, DwarfLineLocation, DwarfSectionInfo, DwarfStrings,
+            build_dwarf_info_sections, build_dwarf_line_section,
         };
         if self.debug_rows.is_empty() || self.sections.contains_key(".debug_line") {
             return Ok(());
@@ -673,20 +685,31 @@ impl ElfWriterBase {
         let mut labelled: Option<&mut dyn FnMut(usize, u64) -> String> =
             if relax { Some(&mut symbol_at) } else { None };
         let mut built = Vec::new();
-        if let Some((line, units)) = build_dwarf_line_section(
+        // Two string tables, as DWARF 5 splits them: the line programs name
+        // their paths in `.debug_line_str`, the units and subprograms their
+        // names in `.debug_str`. Each is emitted last, once nothing more can
+        // be interned into it.
+        let mut strings = DwarfStrings::new();
+        let mut line_strings = DwarfStrings::new();
+        if let Some(line) = build_dwarf_line_section(
             &self.debug_files,
             &locations,
             &section_info,
             address_size,
             abs_addr,
+            abs32,
+            &comp_dir,
+            config,
+            &mut line_strings,
             labelled.as_deref_mut(),
         )? {
-            built.push(line);
             if !self.sections.contains_key(".debug_info")
                 && !self.sections.contains_key(".debug_abbrev")
             {
-                if let Some((info, abbrev)) = build_dwarf_info_sections(
-                    &units,
+                if let Some(info) = build_dwarf_info_sections(
+                    &line.units,
+                    &self.debug_files,
+                    &locations,
                     &section_info,
                     &functions,
                     primary_file,
@@ -695,12 +718,19 @@ impl ElfWriterBase {
                     address_size,
                     abs32,
                     abs_addr,
+                    config,
+                    &mut strings,
+                    &mut line_strings,
                     labelled,
                 )? {
-                    built.extend([info, abbrev]);
+                    built.extend([info.info, info.abbrev]);
+                    built.extend(info.aranges);
                 }
             }
+            built.push(line.line);
         }
+        built.extend(strings.into_section(".debug_str"));
+        built.extend(line_strings.into_section(".debug_line_str"));
         // Labels `symbol_at` made up (section ends, function ends).
         let made: Vec<(String, (String, u64))> = if relax {
             at_labels

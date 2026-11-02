@@ -1025,6 +1025,12 @@ gate "dwarf-line-tables" fast \
     python3 tests/regression/check_dwarf_line_tables.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
         --gcc "${GCC16:-gcc-16}"
+gate "dwarf-versions" fast \
+    python3 tests/regression/check_dwarf_versions.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --lccc-arm target/fastbuild/lccc-arm \
+        --lccc-riscv target/fastbuild/lccc-riscv \
+        --gcc "${GCC16:-gcc-16}"
 # RVC: .text and relocations byte-identical to GNU as on RV64 and RV32
 # (spelling-based compression, branch relaxation, `li`); SKIP without
 # riscv64 binutils.
@@ -2763,6 +2769,13 @@ gate "range-fold-branch" fast \
 # controls in the same gate keep the sign-extended rule honest.
 gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
+
+# The unsigned reading of a sign extension is two halves, and a constant
+# between them is a sign test.  The gate checks the emission on every backend
+# (the rule once made an AArch64 byte compare two instructions longer, which is
+# an assertion now), the attribution and the values at five levels.
+gate "cross-domain-sext-cmp" fast \
+    bash tests/regression/check_cross_domain_sext_cmp.sh
 
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
