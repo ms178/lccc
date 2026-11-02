@@ -673,37 +673,14 @@ fn fold_constant_terminators(func: &mut IrFunction) -> usize {
     folded
 }
 
-/// `CondBranch(c, T, F)` where `T` and `F` are distinct, instruction-free
-/// blocks returning the integer constants 1 and 0 (in either order) returns
-/// the condition itself:
-///
-/// ```text
-///   if (a < b) return 1; return 0;           ->  return a < b;
-///   if ((m >> i) & 1) return 0; return 1;    ->  return !((m >> i) & 1);
-/// ```
-///
-/// GCC 16.2 (phiopt) and Clang 23.1.4 (SimplifyCFG) return the flag; LCCC
-/// kept a data-dependent branch into two return blocks (`cmpl; jge; movl $1,
-/// %eax; ret; xorl %eax, %eax; ret` for `xorl; cmpl; setl; ret`), which costs
-/// a misprediction per unpredictable bit test (sqlite3's `MASKBIT` guard,
-/// `if (iCol >= 64 || (mask & MASKBIT(iCol)) == 0) return 0; return 1;`).
-///
-/// How the condition becomes the returned boolean, which is exactly 0 or 1
-/// like the constants it replaces:
-/// * a `Cmp` already is one (the frontend types its result `I32`): returned
-///   as is, or recomputed with the inverted predicate -- integer predicates,
-///   and float `==`/`!=`, whose inversion is exact under NaN; an ordered
-///   float predicate is refused (`!(a < b)` is not `a >= b`);
-/// * a `BitTest` is one in its own type: cast, or compared `== 0`;
-/// * any other integer value is compared `!= 0` / `== 0`, the test
-///   `CondBranch` itself performs.
-///
-/// The boolean is cast to the return type unless it already has it. `T` and
-/// `F` keep their other predecessors and are swept with their last one.
-/// `CCC_NO_BOOL_RETURN` keeps every such branch (bisection). The
-/// compare and cast that replace the branch read only values the branch read
-/// (or that dominate the compare it read), so the rewrite is sound on every
-/// path, at every width, for every target.
+/// `CCC_NO_BOOL_RETURN`: keep every boolean-return branch (A/B measurement and
+/// bisection). Presence is the answer, read once per process.
+fn bool_return_disabled() -> bool {
+    static DISABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_BOOL_RETURN").is_some());
+    *DISABLED
+}
+
 /// Whether `block` ends in the shape the backend fuses with an asm-goto's own
 /// flags (`collect_asm_goto_cc_branch_values`): `asm goto(... : "=@cc<cc>"(obj)
 /// ...)`, then `cond = load obj`, then the branch on `cond`. The branch costs
@@ -737,6 +714,39 @@ fn branches_on_asm_goto_flag_output(block: &BasicBlock, cond: Value) -> bool {
             .starts_with("@cc")
 }
 
+/// `CondBranch(c, T, F)` where `T` and `F` are distinct, instruction-free
+/// blocks returning the integer constants 1 and 0 (in either order) returns
+/// the condition itself:
+///
+/// ```text
+///   if (a < b) return 1; return 0;           ->  return a < b;
+///   if ((m >> i) & 1) return 0; return 1;    ->  return !((m >> i) & 1);
+/// ```
+///
+/// GCC 16.2 (phiopt) and Clang 23.1.4 (SimplifyCFG) return the flag; LCCC
+/// kept a data-dependent branch into two return blocks (`cmpl; jge; movl $1,
+/// %eax; ret; xorl %eax, %eax; ret` for `xorl; cmpl; setl; ret`), which costs
+/// a misprediction per unpredictable bit test (sqlite3's `MASKBIT` guard,
+/// `if (iCol >= 64 || (mask & MASKBIT(iCol)) == 0) return 0; return 1;`).
+///
+/// How the condition becomes the returned boolean, which is exactly 0 or 1
+/// like the constants it replaces:
+/// * a `Cmp` already is one (the frontend types its result `I32`): returned
+///   as is, or recomputed with the inverted predicate -- integer predicates,
+///   and float `==`/`!=`, whose inversion is exact under NaN; an ordered
+///   float predicate is refused (`!(a < b)` is not `a >= b`);
+/// * a `BitTest` is one in its own type: cast, or compared `== 0`;
+/// * any other integer value is compared `!= 0` / `== 0`, the test
+///   `CondBranch` itself performs.
+///
+/// The boolean is cast to the return type unless it already has it. `T` and
+/// `F` keep their other predecessors and are swept with their last one. A
+/// branch on an asm-goto `@cc` flag output is left to the backend's flag
+/// fusion (`branches_on_asm_goto_flag_output`), and `CCC_NO_BOOL_RETURN`
+/// keeps every such branch (bisection). The compare and cast that replace the
+/// branch read only values the branch read
+/// (or that dominate the compare it read), so the rewrite is sound on every
+/// path, at every width, for every target.
 fn fold_boolean_return_branches(
     func: &mut IrFunction,
     label_to_idx: &FxHashMap<BlockId, usize>,
@@ -785,9 +795,9 @@ fn fold_boolean_return_branches(
             plans.push((bi, *cond, on_true));
         }
     }
-    // The kill switch is read only once a candidate exists: the scan above is
-    // the common, allocation-free path.
-    if plans.is_empty() || std::env::var_os("CCC_NO_BOOL_RETURN").is_some() {
+    // The kill switch is consulted only once a candidate exists: the scan above
+    // is the common, allocation-free path.
+    if plans.is_empty() || bool_return_disabled() {
         return 0;
     }
     let wanted: FxHashSet<Value> = plans.iter().map(|&(_, cond, _)| cond).collect();

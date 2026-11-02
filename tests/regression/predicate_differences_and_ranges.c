@@ -45,7 +45,9 @@ __attribute__((noinline)) static int range_crossing_bitand(int x) { return (x > 
 __attribute__((noinline)) static int range_union(int x) { return (x > 3) | (x > 10); }
 __attribute__((noinline)) static int member_gap(unsigned x) { return (x == 0u) | (x == 2u); }
 __attribute__((noinline)) static int two_values(int a, int b) { return (a > 3) & (b < 10); }
-/* Not a window: the two halves exclude each other instead of intersecting. */
+/* Not a window: the two halves cover every int, so the join is the constant 1
+   (GCC 16.2 and Clang 23.1.4 return it, and so does LCCC's comparison-dominance
+   fold); the run-time check below keeps the answer honest at every level. */
 __attribute__((noinline)) static int range_crossing_control(int x) { return (x > -8) | (x < 8); }
 
 /* ---- sign magnitude ----------------------------------------------------- */

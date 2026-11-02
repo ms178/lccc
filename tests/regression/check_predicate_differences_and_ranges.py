@@ -12,9 +12,14 @@ What this pins, and how:
   carries the arithmetic-shift mask instead of a conditional move.  Counting
   alone is not enough for any of them.
 * **controls** -- `diff_control` (constant 5, not 0), `member_gap` ({0, 2},
-  not consecutive), `two_values` (two different values), `range_crossing_control`
-  (an outside test) and `abs_control` (arms disagreeing on the value) are one
-  token away from a folded shape and must keep their original shape.
+  not consecutive), `two_values` (two different values) and `abs_control` (arms
+  disagreeing on the value) are one token away from a folded shape and must
+  keep their original shape.  `range_crossing_control`, `(x > -8) | (x < 8)`,
+  was listed with them as "an outside test", but its two halves cover every
+  int: it is the constant 1, which GCC 16.2 and Clang 23.1.4 return and the
+  comparison-dominance fold now returns too.  It must therefore contain no
+  comparison (or be gone, once interprocedural propagation has used the
+  constant), and `CCC_NO_COMPARE_DOMINANCE=1` must bring both comparisons back.
   `range_union` (`(x > 3) | (x > 10)`) is pinned in two pieces instead, because
   two rules meet on it: it is NOT one interval, so `interval` must not merge it
   into a window, but it IS a disjunction whose weaker disjunct decides it, so
@@ -81,6 +86,14 @@ def body(text, name):
     ]
 
 
+def body_if_present(text, name):
+    """`body`, or None when `name` was removed (a static function whose
+    constant result interprocedural propagation has already used)."""
+    if not re.search(r"^" + re.escape(name) + r":\s*$", text, re.M):
+        return None
+    return body(text, name)
+
+
 def asm(cc, path, env=None, extra=()):
     return run([cc, "-O2", "-S", "-o", "-", path, *extra], env=env).decode()
 
@@ -143,7 +156,7 @@ def main():
         # ---- controls: one token away, must not fold ----------------------
         if not has_subtraction(body(text, "diff_control")):
             problems.append("diff_control folded although its constant is 5, not 0")
-        for name in ("member_gap", "two_values", "range_crossing_control"):
+        for name in ("member_gap", "two_values"):
             if len(compares(body(text, name))) < 2:
                 problems.append(
                     f"{name} lost a comparison although it is not one interval: "
@@ -166,6 +179,23 @@ def main():
             problems.append(
                 f"range_union: CCC_NO_COMPARE_DOMINANCE=1 does not restore the "
                 f"second comparison: {union_off}"
+            )
+
+        # ---- the tautology: two halves that cover every int ---------------
+        cover = body_if_present(text, "range_crossing_control")
+        if cover is not None and compares(cover):
+            problems.append(
+                f"range_crossing_control: still compares although (x > -8) | "
+                f"(x < 8) holds for every int: {cover}"
+            )
+        cover_off = body(
+            asm(lccc, SOURCE, env={**os.environ, "CCC_NO_COMPARE_DOMINANCE": "1"}),
+            "range_crossing_control",
+        )
+        if len(compares(cover_off)) < 2:
+            problems.append(
+                f"range_crossing_control: CCC_NO_COMPARE_DOMINANCE=1 does not "
+                f"restore both comparisons: {cover_off}"
             )
 
         control = body(text, "abs_control")
@@ -241,8 +271,8 @@ def main():
         raise SystemExit(1)
     print(
         "PASS predicate differences and ranges: difference compares, interval and "
-        "membership tests, sign-magnitude selects, five controls, disabled-pass "
-        "attribution"
+        "membership tests, sign-magnitude selects, four controls, one tautology, "
+        "disabled-pass attribution"
     )
 
 
