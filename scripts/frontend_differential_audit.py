@@ -50,9 +50,13 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 AUDIT_ROOT = ROOT / 'tests/frontend_audit'
+# Oracle discovery: the pinned toolchain name first, then the distribution's
+# own spelling. A gate that silently skipped because the runner shipped `gcc`
+# instead of `gcc-16` would report "0/0 cases agree" and pass -- so the
+# fallback is explicit and the resolved binary is printed in the report line.
 DEFAULT_ORACLES = {
-    'gcc': 'gcc-16',
-    'clang': 'clang-23',
+    'gcc': ('gcc-16', 'gcc'),
+    'clang': ('clang-23', 'clang'),
 }
 # Cases are compiled and run with an unlimited stack: the huge-frame regression
 # beside this audit deliberately allocates gigabytes of locals, and a data-driven
@@ -274,10 +278,12 @@ def main(argv: list[str]) -> int:
         return 2
 
     oracles: dict[str, str] = {}
-    for name, exe in DEFAULT_ORACLES.items():
-        found = shutil.which(exe)
-        if found:
-            oracles[name] = found
+    for name, candidates in DEFAULT_ORACLES.items():
+        for exe in candidates:
+            found = shutil.which(exe)
+            if found:
+                oracles[name] = found
+                break
     for spec in args.oracle or ():
         name, _, exe = spec.partition('=')
         found = shutil.which(exe)
@@ -286,7 +292,8 @@ def main(argv: list[str]) -> int:
             return 2
         oracles[name] = found
     if not oracles:
-        print('error: no oracle compiler available (looked for gcc-16, clang-23)', file=sys.stderr)
+        print('error: no oracle compiler available '
+              '(looked for gcc-16/gcc and clang-23/clang)', file=sys.stderr)
         return 2
 
     families = args.family or ['pp', 'run', 'diag']

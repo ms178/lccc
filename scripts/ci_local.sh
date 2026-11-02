@@ -245,6 +245,20 @@ gate "asm-operand-diagnostics" fast \
     CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 \
     GCC="${GCC16:-gcc-16}" \
     bash tests/regression/check_asm_operand_diagnostics.sh
+# The frontend is audited against two independent oracles (gcc and clang: `-E`
+# token streams, run-time values at every level, accept/reject agreement), the
+# frame addressing of emitted assembly is audited statically (imm32 encoding,
+# anchor legality, extent) and a seeded expression fuzzer covers what a fixed
+# corpus cannot. One gate, because six separate gate spawns would cost more
+# than the checks.
+gate "frontend-ternary-common-type" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_ternary_common_type.sh
+gate "frontend-preprocessor-rules" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_preprocessor_rules.sh
+gate "frontend-duplicate-definition" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_duplicate_definition.sh
+gate "frontend-differential-family" fast \
+    env CCC="$LCCC" bash tests/regression/check_frontend_differential.sh
 gate "asm-flag-outputs" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
     CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \

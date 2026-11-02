@@ -538,13 +538,28 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
 gcc_include = ""
 
 
+def default_gcc_oracle() -> str:
+    """The pinned oracle first, then the distribution's `gcc`.
+
+    Every contract in this tree is written against gcc-16, and a bare `gcc` is a
+    different compiler on most hosts: the sandbox this was found on resolves
+    `/usr/bin/gcc` to Debian's 12.2, which cannot even parse `-std=gnu23`. That
+    turned 31 comparisons into SKIP-COMPARE and two gates into false failures
+    (their own oracle self-check failed while lccc passed), i.e. the corpus
+    silently stopped testing what it claims to test. Pinning the discovery here
+    makes the default invocation mean what the docs say it means.
+    """
+    return shutil.which("gcc-16") or "gcc"
+
+
 def main(argv: list[str] | None = None) -> int:
     global gcc_include
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--filter", default="", help="substring match on test name")
     parser.add_argument("--lccc", type=Path, default=DEFAULT_LCCC,
                         help=f"lccc binary (default {DEFAULT_LCCC})")
-    parser.add_argument("--gcc", default=os.environ.get("GCC_BIN", "gcc"))
+    parser.add_argument("--gcc", default=os.environ.get("GCC_BIN") or default_gcc_oracle(),
+                        help="GCC oracle (default: GCC_BIN, else the pinned gcc-16, else gcc)")
     parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 2)
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", type=Path, help="write machine-readable results")
