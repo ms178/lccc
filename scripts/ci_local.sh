@@ -2748,6 +2748,7 @@ gate "range-fold-branch" fast \
 # controls in the same gate keep the sign-extended rule honest.
 gate "cmp-imm32-pattern" fast \
     bash tests/regression/check_cmp_imm32_pattern.sh
+    bash tests/regression/check_scratch_save_elimination.sh
 
 # The boot-size harnesses only run against a prepared kernel tree, so a silent
 # measurement error in them is invisible to every other gate.  These two do not
