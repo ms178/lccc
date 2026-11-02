@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   diagnostic-transport:
-    if: github.event_name == 'workflow_dispatch' && inputs.source_run_ids != ''
+    if: (github.event_name == 'workflow_dispatch' && inputs.source_run_ids != '') || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'kernel-host-prerequisites'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

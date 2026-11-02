@@ -12,6 +12,7 @@ import json
 import os
 import re
 import subprocess
+from urllib.parse import quote
 
 PART_BYTES = 8 * 1024 * 1024
 
@@ -52,7 +53,26 @@ def main():
     repo = os.environ['GITHUB_REPOSITORY']
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
         raise ValueError('invalid repository')
-    run_ids = parse_run_ids(os.environ['SOURCE_RUN_IDS'])
+    requested = os.environ.get('SOURCE_RUN_IDS', '')
+    if requested:
+        run_ids = parse_run_ids(requested)
+    else:
+        event = json.loads(open(os.environ['GITHUB_EVENT_PATH']).read())
+        pr = event['pull_request']
+        if pr['head']['repo']['full_name'] != repo:
+            raise ValueError('automatic export requires a same-repository PR')
+        branch = quote(pr['head']['ref'], safe='')
+        candidates = json.loads(gh(f'repos/{repo}/actions/runs?branch={branch}&status=failure&per_page=100'))
+        selected = {}
+        for run in candidates['workflow_runs']:
+            if any(p['number'] == event['number'] for p in run['pull_requests']):
+                selected.setdefault(run['workflow_id'], run['id'])
+            if len(selected) == 2:
+                break
+        run_ids = list(selected.values())
+        if not run_ids:
+            print('No previous failed PR runs to export')
+            return
     for run_id in run_ids:
         run = json.loads(gh(f'repos/{repo}/actions/runs/{run_id}'))
         if run['repository']['full_name'] != repo or run['status'] != 'completed':
@@ -74,7 +94,7 @@ def main():
             manifest += export_file(repo, f'run{run_id}-job{job["id"]}.log.gz',
                                     gzip.compress(data, mtime=0))
         for artifact in pages('artifacts', 'artifacts'):
-            if artifact['expired']:
+            if artifact['expired'] or not artifact['name'].startswith('kernel-61858-'):
                 continue
             data = gh(f'repos/{repo}/actions/artifacts/{int(artifact["id"])}/zip')
             manifest += export_file(repo, f'run{run_id}-artifact{artifact["id"]}.zip', data)
