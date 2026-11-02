@@ -554,33 +554,38 @@ impl MacroTable {
         self.file_stack.borrow_mut().pop();
     }
 
-    /// Replacement list for `__INCLUDE_LEVEL__` (a decimal integer): the depth
-    /// of the file the token is in, which is not necessarily the file whose
-    /// macro body mentioned it.
-    fn include_level_body(&self) -> String {
+    /// Append `__INCLUDE_LEVEL__`'s replacement list (a decimal integer): the
+    /// depth of the file the token is in, which is not necessarily the file
+    /// whose macro body mentioned it.
+    ///
+    /// Formats straight into the caller's buffer, like `__LINE__` does, rather
+    /// than returning a `String`: this runs once per use of the macro, and a
+    /// builtin that allocates per use would be the one thing in the expansion
+    /// loop that does.
+    fn push_include_level(&self, result: &mut String) {
         let mut buf = itoa::Buffer::new();
         let level = self.file_stack.borrow().len().saturating_sub(1);
-        buf.format(level).to_string()
+        result.push_str(buf.format(level));
     }
 
-    /// Replacement list for `__TIMESTAMP__`, computed on first use in a file and
-    /// then cached per physical path.
-    fn timestamp_body(&self) -> String {
-        let path = self.file_stack.borrow().last().cloned();
-        match path {
+    /// Append `__TIMESTAMP__`'s replacement list, computed on first use in a
+    /// file and then cached per physical path.
+    ///
+    /// Formats into the caller's buffer and reads the cache by reference, so a
+    /// file that names the macro a thousand times still pays one `stat` and one
+    /// `String` for it.
+    fn push_timestamp(&self, result: &mut String) {
+        let Some(path) = self.file_stack.borrow().last().cloned() else {
             // No file at all (a virtual buffer): the documented unknown form.
-            None => crate::common::host_time::timestamp_body(None),
-            Some(path) => {
-                if let Some(cached) = self.timestamp_bodies.borrow().get(&path) {
-                    return cached.clone();
-                }
-                let body = crate::common::host_time::timestamp_body(Some(&path));
-                self.timestamp_bodies
-                    .borrow_mut()
-                    .insert(path, body.clone());
-                body
-            }
+            return crate::common::host_time::push_unknown_timestamp(result);
+        };
+        if let Some(cached) = self.timestamp_bodies.borrow().get(&path) {
+            result.push_str(cached);
+            return;
         }
+        let body = crate::common::host_time::timestamp_body(Some(&path));
+        result.push_str(&body);
+        self.timestamp_bodies.borrow_mut().insert(path, body);
     }
 
     /// Get the current __FILE__ macro body.
@@ -976,11 +981,11 @@ impl MacroTable {
             // preprocessed, and it must be read at the *use site* (an alias macro
             // must report the expander's file, not the file that wrote the body).
             if ident == "__INCLUDE_LEVEL__" && self.builtin_expands(ident) {
-                result.push_str(&self.include_level_body());
+                self.push_include_level(result);
                 return i;
             }
             if ident == "__TIMESTAMP__" && self.builtin_expands(ident) {
-                result.push_str(&self.timestamp_body());
+                self.push_timestamp(result);
                 return i;
             }
 

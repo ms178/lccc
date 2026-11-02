@@ -218,6 +218,14 @@ pub fn date_time_bodies() -> (String, String) {
     (quote(&civil.date()), quote(&civil.time()))
 }
 
+/// Append the quoted "no modification time" form directly, for callers that
+/// already have a buffer (the preprocessor's expansion loop).
+pub fn push_unknown_timestamp(out: &mut String) {
+    out.push('"');
+    out.push_str(UNKNOWN_TIMESTAMP);
+    out.push('"');
+}
+
 fn quote(s: &str) -> String {
     format!("\"{}\"", s)
 }
