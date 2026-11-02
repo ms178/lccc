@@ -2238,7 +2238,10 @@ mod dialect_severity_redteam_tests {
             .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::Extra))
             .map(|entry| entry.name)
             .collect();
-        assert_eq!(wextra, ["sign-compare", "cast-function-type"]);
+        assert_eq!(
+            wextra,
+            ["enum-conversion", "sign-compare", "cast-function-type"]
+        );
         assert!(
             !WARNING_REGISTRY
                 .iter()
