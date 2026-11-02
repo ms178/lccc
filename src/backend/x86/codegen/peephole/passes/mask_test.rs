@@ -60,10 +60,12 @@
 //! being dead ([`flags_dead_after`]). No register-liveness question arises: the
 //! value in `%R` after `movzbl %Rb, %R32` is bit-for-bit the value after
 //! `and $255, %R` in both widths — the 32-bit destination write zero-extends
-//! exactly as the mask does, which is also why this rule is restricted to
-//! `imm == 0xFF` (any narrower mask would leave bits that `movzx` keeps). That
-//! restriction does not apply to rule 1: `testb $imm, %Rb` tests precisely the
-//! bits a narrower mask would have kept.
+//! exactly as the mask does, which is also why this rule is restricted to the
+//! masks `movzx` reproduces *exactly*, `0xFF` and `0xFFFF`: any narrower mask
+//! would leave bits that `movzx` keeps. That restriction does not apply to
+//! rule 1: `testb $imm, %Rb` tests precisely the bits a narrower mask would
+//! have kept. `andl $0xFFFF, %R` is six bytes with a 32-bit immediate; the
+//! `movzwl %Rw, %Rl` that computes the same value is three.
 //!
 //! Both rules are skip-switchable (`CCC_PEEPHOLE_SKIP=mask_test`) and both are
 //! idempotent: neither output contains an `and{l,q} $imm, %R` line with a mask
@@ -100,9 +102,26 @@ use super::super::types::*;
 use super::flag_peepholes::flags_dead_after;
 use super::liveness::FileLiveness;
 
-/// The largest mask the byte forms can express: everything above bit 7 is
+/// The largest mask the *byte* forms can express: everything above bit 7 is
 /// already zero, which is what makes the byte-wide test equivalent.
 const MAX_BYTE_MASK: u64 = 0xFF;
+
+/// The largest mask either rule can say anything about.  Anything wider has no
+/// single narrower instruction that computes the same value, so both rules
+/// leave it alone (fail closed in [`parse_inplace_mask`]).
+const MAX_MASK: u64 = 0xFFFF;
+
+/// The `and` masks `movzx` reproduces exactly, as `(mnemonic, REG_NAMES row of
+/// the source register)`: a full byte (`movzbl`) and a full word (`movzwl`).
+/// Both write a 32-bit destination, whose zero-extension into the upper half of
+/// the register is exactly what the wider `and` also does.
+fn movzx_form(imm: u64) -> Option<(&'static str, usize)> {
+    match imm {
+        MAX_BYTE_MASK => Some(("movzbl", 3)),
+        0xFFFF => Some(("movzwl", 2)),
+        _ => None,
+    }
+}
 
 /// Parse `andl $imm, %reg` / `andq $imm, %reg` for a GP register, returning the
 /// mask and the register family. Memory destinations, other widths and
@@ -129,7 +148,7 @@ fn parse_inplace_mask(t: &str) -> Option<(u64, RegId)> {
     } else {
         imm.parse::<u64>().ok()?
     };
-    (1..=MAX_BYTE_MASK).contains(&imm).then_some((imm, fam))
+    (1..=MAX_MASK).contains(&imm).then_some((imm, fam))
 }
 
 /// A `setcc`/`jcc` whose condition does not consult `%sf`.
@@ -289,6 +308,7 @@ pub(super) fn fold_inplace_mask_test(store: &mut LineStore, infos: &mut [LineInf
         }
         let reader = find_reader(store, infos, i, fam);
         if let Some((reader, mid)) = reader
+            && imm <= MAX_BYTE_MASK
             && condition_ignores_sf(infos[reader].trimmed(store.get(reader)))
         {
             let bit = 1u16 << fam;
@@ -310,13 +330,18 @@ pub(super) fn fold_inplace_mask_test(store: &mut LineStore, infos: &mut [LineInf
                 continue;
             }
         }
-        // Rule 2: the value is wanted, the flags are not. Same value, four bytes
-        // instead of seven. Restricted to a full-byte mask (see the module
-        // documentation): `movzx` performs exactly that mask.
-        if imm == MAX_BYTE_MASK && flags_dead_after(store, infos, i + 1) {
+        // Rule 2: the value is wanted, the flags are not. Same value, fewer
+        // bytes -- and no immediate to decode. Restricted to the masks `movzx`
+        // reproduces exactly (see the module documentation).
+        let ext = if flags_dead_after(store, infos, i + 1) {
+            movzx_form(imm)
+        } else {
+            None
+        };
+        if let Some((suffix, row)) = ext {
             let l = REG_NAMES[1][fam as usize];
-            let byte = REG_NAMES[3][fam as usize];
-            replace_line(store, &mut infos[i], i, format!("    movzbl {byte}, {l}"));
+            let src = REG_NAMES[row][fam as usize];
+            replace_line(store, &mut infos[i], i, format!("    {suffix} {src}, {l}"));
             changed = true;
         }
         i += 1;
@@ -357,11 +382,21 @@ mod mask_test_tests {
         run_asm(body_asm(body))
     }
 
+    /// `run` for a function that returns nothing in `%rax`.
+    fn run_void(body: &str) -> String {
+        run_asm(void_body_asm(body))
+    }
+
     /// The witness from the performance backlog: a self-mask followed by a
     /// zero test and a branch is one `testb`.
     #[test]
     fn mask_plus_zero_test_becomes_one_byte_test() {
-        let out = run("    andl $255, %r10\n    testq %r10, %r10\n    je .L1\n    ret\n");
+        // The branch target is defined on purpose: a jump to an unknown label
+        // leaves the whole function unanalysable (`classify` refuses it), and
+        // then no liveness-gated rewrite of this pass can fire.
+        let out = run(
+            "    andl $255, %r10\n    testq %r10, %r10\n    je .L1\n    ret\n.L1:\n    ret\n",
+        );
         assert!(out.contains("testb %r10b, %r10b"), "{out}");
         assert!(!out.contains("andl $255"), "{out}");
         assert!(!out.contains("testq"), "{out}");
@@ -383,7 +418,9 @@ mod mask_test_tests {
     /// A `cmp $0` zero test is the same question as `test`.
     #[test]
     fn a_cmp_zero_test_is_deleted_too() {
-        let out = run("    andl $3, %r8d\n    cmpl $0, %r8d\n    jne .L3\n    ret\n");
+        let out = run(
+            "    andl $3, %r8d\n    cmpl $0, %r8d\n    jne .L3\n    ret\n.L3:\n    ret\n",
+        );
         assert!(out.contains("testb $3, %r8b"), "{out}");
         assert!(!out.contains("cmpl $0"), "{out}");
     }
@@ -397,16 +434,24 @@ mod mask_test_tests {
         assert!(out.contains("sete %al"), "{out}");
     }
 
-    /// SF is the one flag the two forms disagree on: a sign test must refuse.
+    /// SF is the one flag the two forms disagree on: a sign test must refuse
+    /// the `testb` fold, so the mask (and the zero test feeding the reader)
+    /// stays.  Rule 2 may still shorten the encoding where the flags are dead
+    /// -- `movzbl` computes the identical value and touches no flag, which the
+    /// `testq` after it immediately redefines anyway.
     #[test]
     fn a_sign_reader_keeps_the_mask() {
+        let with_test =
+            run("    andl $255, %r10\n    testq %r10, %r10\n    js .L4\n    ret\n.L4:\n    ret\n");
+        assert!(!with_test.contains("testb"), "{with_test}");
+        assert!(with_test.contains("testq %r10, %r10"), "{with_test}");
         for body in [
-            "    andl $255, %r10\n    testq %r10, %r10\n    js .L4\n    ret\n",
-            "    andl $255, %r10\n    jns .L4\n    ret\n",
+            "    andl $255, %r10\n    jns .L4\n    ret\n.L4:\n    ret\n",
             "    andl $255, %r10\n    setl %al\n    ret\n",
         ] {
             let out = run(body);
             assert!(out.contains("andl $255, %r10"), "{body} -> {out}");
+            assert!(!out.contains("testb"), "{body} -> {out}");
         }
     }
 
@@ -420,23 +465,54 @@ mod mask_test_tests {
     /// The value must be dead after the reader.
     #[test]
     fn a_value_live_after_the_reader_keeps_the_mask() {
+        // A bare `je` is the reader: it writes no flags, so rule 2 cannot
+        // re-encode the mask and the only question left is value liveness.
         let out = run(
-            "    andl $255, %r10\n    testq %r10, %r10\n    je .L7\n    addq %r10, %rax\n    ret\n",
+            "    andl $255, %r10\n    je .L7\n    addq %r10, %rax\n    ret\n.L7:\n    ret\n",
         );
         assert!(out.contains("andl $255, %r10"), "{out}");
+        assert!(out.contains("addq %r10, %rax"), "{out}");
     }
 
-    /// Masks wider than a byte are out of scope: `testb` could not express them.
+    /// Rule 1 is byte-only: `testb $imm, %Rb` cannot express a wider mask, and
+    /// the pass must not silently narrow one.  `0xFFFF` is left out here: it is
+    /// a whole word, which rule 2 *can* express exactly (`movzwl`), and it is
+    /// covered by the zero-extension tests below.
     #[test]
-    fn a_wide_mask_is_left_alone() {
+    fn a_word_mask_is_not_a_byte_test() {
         for body in [
-            "    andl $256, %r10\n    testq %r10, %r10\n    je .L8\n    ret\n",
-            "    andl $65535, %eax\n    testl %eax, %eax\n    je .L8\n    ret\n",
-            "    andl $-1, %eax\n    testl %eax, %eax\n    je .L8\n    ret\n",
+            "    andl $256, %r10\n    testq %r10, %r10\n    je .L8\n    ret\n.L8:\n    ret\n",
+            "    andl $0x10000, %eax\n    testl %eax, %eax\n    je .L8\n    ret\n.L8:\n    ret\n",
+        ] {
+            let out = run(body);
+            assert!(out.contains("andl"), "{body} -> {out}");
+            assert!(!out.contains("testb"), "{body} -> {out}");
+        }
+    }
+
+    /// A mask with no `movzx` equivalent, or one whose immediate is not a
+    /// mask at all, is left alone in both rules.
+    #[test]
+    fn an_unrepresentable_mask_is_left_alone() {
+        for body in [
+            "    andl $256, %r10\n    movq %r10, (%rdi)\n    ret\n",
+            "    andl $-1, %eax\n    movl %eax, (%rdi)\n    ret\n",
+            "    andl $0x10000, %eax\n    movl %eax, (%rdi)\n    ret\n",
         ] {
             let out = run(body);
             assert!(out.contains("andl"), "{body} -> {out}");
         }
+    }
+
+    /// The word form is the second mask `movzx` reproduces exactly: six bytes
+    /// of `andl $65535` become three of `movzwl`.
+    #[test]
+    fn a_word_mask_becomes_a_word_zero_extension() {
+        let out = run("    andl $65535, %r10\n    movq %r10, (%rdi)\n    ret\n");
+        assert!(out.contains("movzwl %r10w, %r10d"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+        let wide = run("    andq $65535, %r9\n    movq %r9, (%rdi)\n    ret\n");
+        assert!(wide.contains("movzwl %r9w, %r9d"), "{wide}");
     }
 
     /// A memory destination is a different instruction; leave it.
@@ -486,7 +562,9 @@ mod mask_test_tests {
     /// Running the pass on its own output changes nothing.
     #[test]
     fn the_rewrite_is_idempotent() {
-        let once = run("    andl $255, %r10\n    testq %r10, %r10\n    je .Lc\n    ret\n.Lc:\n    ret\n");
+        let once = run(
+            "    andl $255, %r10\n    testq %r10, %r10\n    je .Lc\n    ret\n.Lc:\n    ret\n",
+        );
         let mut store = LineStore::new(once.clone());
         let mut infos: Vec<LineInfo> = (0..store.len())
             .map(|i| classify_line(store.get(i)))
@@ -502,11 +580,17 @@ mod mask_test_tests {
         // `%rsp` and `%rbp` are the frame registers: a mask of either is not a
         // shape any emitter produces, and liveness correctly refuses to call
         // them dead, so they are out of scope rather than special-cased.
+        //
+        // The `pop` is what makes the masked value dead: `RET_LIVE` keeps the
+        // callee-saved families live at a `ret` (the function must have
+        // restored them), so a fold on a bare `ret` could only ever fire for
+        // the caller-saved ones.  The void marker drops `%rax` for the same
+        // reason -- a fixture without it is read as "this `ret` reads `%rax`".
         for fam in (0..16usize).filter(|f| *f != 4 && *f != 5) {
             let q = REG_NAMES[0][fam];
-            let out = run_asm(void_body_asm(&format!(
-                "    andq $255, {q}\n    je .Ld\n.Ld:\n    ret\n"
-            )));
+            let out = run_void(&format!(
+                "    andq $255, {q}\n    je .Ld\n.Ld:\n    pop {q}\n    ret\n"
+            ));
             assert!(
                 out.contains(&format!("testb {}", REG_NAMES[3][fam])),
                 "{q} -> {out}"
