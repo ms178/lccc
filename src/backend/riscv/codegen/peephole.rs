@@ -1137,12 +1137,23 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
                 return None;
             }
             // Sext-wide producers: only instructions whose RV64 semantics
-            // GUARANTEE sext32 canonical results — the *w family, addiw,
-            // srai (sign-shifting keeps the sign-extension), and lui
-            // (sign-extended imm20).  slli/srli are 64-bit shifts: their
-            // results are NOT sext32 in general (e.g. `slli rX,rX,32`
-            // of a negative sext32 value zero-fills the top half), so a
-            // following `sext.w rX,rX` is real code, never a no-op.
+            // GUARANTEE sext32 canonical results whatever their input — the
+            // *w family (register and immediate forms), lui (sign-extended
+            // imm20), and `srai` by 32 or more, which leaves at least 33
+            // copies of bit 63 on top.  A shorter `srai` keeps sext32 only
+            // of a sext32 input, which this def-local view cannot see:
+            // `srai rX,rX,3` of 0x10_0000_0000 is 0x2_0000_0000, so a
+            // following `sext.w` (a `long` -> `int` truncation) is real
+            // code.  slli/srli are 64-bit shifts: their results are NOT
+            // sext32 in general (e.g. `slli rX,rX,32` of a negative sext32
+            // value zero-fills the top half), so a following
+            // `sext.w rX,rX` is real code, never a no-op.
+            let long_srai = mnem == "srai"
+                && rest
+                    .rsplit(',')
+                    .next()
+                    .and_then(|imm| parse_asm_i64(imm.trim()))
+                    .is_some_and(|k| (32..64).contains(&k));
             let wide = matches!(
                 mnem,
                 "addw"
@@ -1156,8 +1167,11 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
                     | "srlw"
                     | "sraw"
                     | "addiw"
-                    | "srai"
-            ) || mnem == "lui";
+                    | "slliw"
+                    | "srliw"
+                    | "sraiw"
+            ) || mnem == "lui"
+                || long_srai;
             Some((dst, wide))
         }
         _ => None,
@@ -3410,6 +3424,37 @@ mod jump_near_tests {
         let input = "f:\n    ld t0, 0(s0)\n    sext.w t0, t0\n    mv t1, t0\n    ret\n";
         let out = peephole_optimize(input.to_string());
         assert!(out.contains("sext.w t0, t0"), "\n{}", out);
+    }
+
+    #[test]
+    fn a_short_srai_is_not_a_sext32_producer() {
+        // `(int)(x >> 3)` for a `long x`: srai by 3 of 0x10_0000_0000 is
+        // 0x2_0000_0000, whose `sext.w` is 0 -- the truncation is real code.
+        for k in [1, 3, 31] {
+            let input = format!(
+                "f:\n    ld t0, 0(s0)\n    srai t0, t0, {k}\n    sext.w t0, t0\n    mv t1, t0\n    ret\n"
+            );
+            let out = peephole_optimize(input.clone());
+            assert!(out.contains("sext.w t0, t0"), "k={k}\n{out}");
+        }
+    }
+
+    #[test]
+    fn a_long_srai_and_the_w_immediates_are_sext32_producers() {
+        for producer in [
+            "srai t0, t0, 32",
+            "srai t0, t0, 63",
+            "slliw t0, t0, 3",
+            "srliw t0, t0, 1",
+            "sraiw t0, t0, 31",
+            "addiw t0, t0, -1",
+        ] {
+            let input = format!(
+                "f:\n    ld t0, 0(s0)\n    {producer}\n    sext.w t0, t0\n    mv t1, t0\n    ret\n"
+            );
+            let out = peephole_optimize(input.clone());
+            assert!(!out.contains("sext.w t0, t0"), "{producer}\n{out}");
+        }
     }
 
     #[test]
