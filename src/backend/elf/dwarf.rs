@@ -44,21 +44,9 @@
 //! [`DwarfConfig::for_c`] maps `__STDC_VERSION__` onto the language code GCC
 //! 16.2 records for the same dialect, header version included: `DW_LANG_C89`,
 //! `DW_LANG_C99`, and for version 5 `DW_LANG_C11` plus the
-//! `DW_AT_language_name`/`DW_AT_language_version` pair that tells a debugger the
-//! unit is C17 or C23 (DWARF has no C17 code).  Versions 2..4 clamp to C99,
+//! `DW_AT_language_name` (`DW_LNAME_C`) / `DW_AT_language_version` pair that
+//! tells a debugger the unit is C17 or C23 (DWARF 5 has no C17 code).  Versions 2..4 clamp to C99,
 //! exactly as GCC does, because DWARF 4 and older never defined a newer code.
-//!
-//! # Addresses
-//!
-//! # Address map
-//!
-//! Each unit also contributes a set to `.debug_aranges`, the table a consumer
-//! reads first so that turning a program counter into a compile unit costs a
-//! binary search instead of a walk over every unit header: the set names the
-//! unit's offset in `.debug_info` and lists the addresses it covers, both as
-//! relocations.  A relaxing target (RISC-V) gets no map: its range lengths are
-//! computed before the linker deletes bytes, and a map that is slightly too long
-//! would claim code belonging to the next unit -- a scan is better than a lie.
 //!
 //! # Addresses
 //!
@@ -70,7 +58,17 @@
 //! (GNU as: `DWARF2_USE_FIXED_ADVANCE_PC` under `linkrelax`).  A row then
 //! costs a `DW_LNE_set_address` instead of an address advance, and
 //! `DW_AT_high_pc` is an address, not a length.
-
+//!
+//! # Address map
+//!
+//! Each unit also contributes a set to `.debug_aranges`, the table a consumer
+//! reads first so that turning a program counter into a compile unit costs a
+//! binary search instead of a walk over every unit header: the set names the
+//! unit's offset in `.debug_info` and lists the addresses it covers, both as
+//! relocations.  A relaxing target (RISC-V) gets no map: its range lengths are
+//! computed before the linker deletes bytes, and a map that is slightly too long
+//! would claim code belonging to the next unit -- a scan is better than a lie.
+//!
 use super::{ObjReloc, ObjSection, SHT_PROGBITS, parse_string_literal};
 use crate::common::fx_hash::FxHashMap;
 
@@ -329,7 +327,7 @@ pub(crate) struct DwarfConfig {
     /// `DW_LANG_Mips_Assembler`.
     pub language: u16,
     /// `DW_AT_language_name`, emitted for C17 and newer on version 5 (GCC
-    /// 16.2 emits `DW_LANG_C` there because DWARF has no C17 code).
+    /// 16.2 emits `DW_LNAME_C` there because DWARF has no C17 code).
     pub language_name: Option<u16>,
     /// `DW_AT_language_version`: the `__STDC_VERSION__` year, so a debugger can
     /// tell C17 from C23 inside a `DW_LANG_C11` unit.
@@ -390,7 +388,7 @@ impl DwarfConfig {
             },
             // DWARF 5 has no code for C17/C23; the version attribute is what
             // distinguishes them, and GCC emits it only from C17 on.
-            language_name: year.filter(|year| *year >= 201710).map(|_| DW_LANG_C_NAME),
+            language_name: year.filter(|year| *year >= 201710).map(|_| DW_LNAME_C),
             language_version: year.filter(|year| *year >= 201710),
         }
     }
@@ -1534,9 +1532,11 @@ const DW_LNCT_DIRECTORY_INDEX: u64 = 0x02;
 const DW_LANG_C89: u16 = 0x0001;
 const DW_LANG_C99: u16 = 0x000c;
 const DW_LANG_C11: u16 = 0x001d;
-/// `DW_LANG_C`: the language *name* code for C, paired with
-/// `DW_AT_language_version`.
-const DW_LANG_C_NAME: u16 = 0x0003;
+/// `DW_LNAME_C`: the source language *name* code for C
+/// (<https://dwarfstd.org/languages-v6.html>), paired with
+/// `DW_AT_language_version`.  This is the name-namespace code, not
+/// `DW_LANG_C` (0x0002): `DW_AT_language_name` speaks the former.
+const DW_LNAME_C: u16 = 0x0003;
 /// `DW_LANG_Mips_Assembler`, what GAS records for assembly sources.
 const DW_LANG_MIPS_ASSEMBLER: u16 = 0x8001;
 
@@ -2102,7 +2102,7 @@ mod tests {
                 (DW_AT_COMP_DIR, 0),
                 (DW_AT_PRODUCER, 0),
                 (DW_AT_LANGUAGE, u64::from(DW_LANG_C11)),
-                (DW_AT_LANGUAGE_NAME, u64::from(DW_LANG_C_NAME)),
+                (DW_AT_LANGUAGE_NAME, u64::from(DW_LNAME_C)),
                 (DW_AT_LANGUAGE_VERSION, 202311),
                 (DW_AT_LOW_PC, 0),
                 (DW_AT_HIGH_PC, 0x40),
@@ -2504,7 +2504,7 @@ mod tests {
         ] {
             let config = case(5, Some(Some(stdc)));
             assert_eq!(config.language, DW_LANG_C11, "{stdc}");
-            assert_eq!(config.language_name, Some(DW_LANG_C_NAME), "{stdc}");
+            assert_eq!(config.language_name, Some(DW_LNAME_C), "{stdc}");
             assert_eq!(config.language_version, Some(year), "{stdc}");
         }
         // Versions 2..4 stop at DW_LANG_C99, as GCC does for every newer dialect.
