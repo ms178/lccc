@@ -808,11 +808,11 @@ encountering invalid input:
   lowering phases.  This means some constructs that are syntactically valid
   but semantically illegal will parse successfully.
 
-- **Typedef scope is approximated.**  Typedef names are tracked globally with
-  a shadowing set for local scopes.  This is correct for the vast majority of
-  code but does not model C's full block-scope typedef rules with complete
-  precision (e.g., a typedef introduced inside a `for` loop initializer may
-  remain visible longer than the standard specifies).
+- **Typedef lookup is parser-side syntax state.** Block and `for`-initializer
+  typedef declarations are now unwound at their scope boundaries, including
+  restoration of shadowed aliases and their parser-side qualifiers. This table
+  guides grammar disambiguation and selected parse-time queries; it is not a
+  replacement for semantic type resolution or compatibility checking.
 
 - **`_Atomic` is parsed but not fully modeled.**  `_Atomic(T)` is treated as
   equivalent to `T` -- the atomic qualification is syntactically consumed but

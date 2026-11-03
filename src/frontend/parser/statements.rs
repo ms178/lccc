@@ -40,6 +40,7 @@ impl Parser {
         let saved_local_constants = self.local_constants.clone();
         let saved_shadowed = self.shadowed_typedefs.clone();
         let enum_mark = self.enum_scope_log.len();
+        let typedef_mark = self.typedef_scope_mark();
         self.block_depth += 1;
 
         // Save declaration attribute flags so that storage-class specifiers
@@ -161,6 +162,7 @@ impl Parser {
         }
 
         self.expect_closing(&TokenKind::RBrace, open_brace);
+        self.restore_typedef_scope(typedef_mark);
         self.shadowed_typedefs = saved_shadowed;
         self.local_constants = saved_local_constants;
         self.block_depth -= 1;
@@ -515,6 +517,7 @@ impl Parser {
 
         let saved_shadowed = self.shadowed_typedefs.clone();
         let enum_mark = self.enum_scope_log.len();
+        let typedef_mark = self.typedef_scope_mark();
 
         let init = if matches!(self.peek(), TokenKind::Semicolon) {
             self.advance();
@@ -543,6 +546,7 @@ impl Parser {
         self.expect_closing(&TokenKind::RParen, open);
 
         let body = self.parse_stmt();
+        self.restore_typedef_scope(typedef_mark);
         self.shadowed_typedefs = saved_shadowed;
         self.restore_enum_scope(enum_mark);
         Stmt::For(init, cond, inc, Box::new(body), span)
@@ -833,5 +837,47 @@ impl Parser {
             }
         }
         labels
+    }
+}
+
+#[cfg(test)]
+mod typedef_scope_tests {
+    use super::Parser;
+    use crate::frontend::lexer::Lexer;
+
+    fn parse(source: &str) -> Parser {
+        let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+        parser.parse();
+        parser
+    }
+
+    #[test]
+    fn block_scope_typedef_does_not_escape_its_compound_statement() {
+        let parser = parse("int f(void) { { typedef long Local; } Local value; return 0; }");
+        assert!(parser.error_count > 0, "block-local typedef leaked outward");
+    }
+
+    #[test]
+    fn for_initializer_typedef_does_not_escape_the_loop() {
+        let parser =
+            parse("int f(void) { for (typedef long Local; 0; ) {} Local value; return 0; }");
+        assert!(
+            parser.error_count > 0,
+            "for-initializer typedef leaked outward"
+        );
+    }
+
+    #[test]
+    fn inner_typedef_restores_outer_name_and_qualifier_metadata() {
+        let parser = parse(
+            "typedef int Alias; int f(void) { { typedef volatile long Alias; Alias inner; } Alias outer; return 0; }",
+        );
+        assert_eq!(parser.error_count, 0);
+        assert!(parser.typedefs.contains("Alias"));
+        assert!(!parser.typedef_base_volatile.contains("Alias"));
+        assert!(matches!(
+            parser.typedef_type_specs.get("Alias"),
+            Some(crate::frontend::parser::ast::TypeSpecifier::Int)
+        ));
     }
 }

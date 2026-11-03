@@ -129,9 +129,9 @@ impl SemanticAnalyzer {
     /// defines, or declares for the first time.
     fn underspecified_tag(&self, spec: &TypeSpecifier) -> Option<String> {
         let (kind, tag, defines) = match spec {
-            TypeSpecifier::Struct(tag, fields, ..) => ("struct", tag, fields.is_some()),
-            TypeSpecifier::Union(tag, fields, ..) => ("union", tag, fields.is_some()),
-            TypeSpecifier::Enum(tag, variants, ..) => ("enum", tag, variants.is_some()),
+            TypeSpecifier::Struct(tag, fields, .., _) => ("struct", tag, fields.is_some()),
+            TypeSpecifier::Union(tag, fields, .., _) => ("union", tag, fields.is_some()),
+            TypeSpecifier::Enum(tag, variants, .., _) => ("enum", tag, variants.is_some()),
             _ => return None,
         };
         let name = tag.as_deref().unwrap_or("<anonymous>");

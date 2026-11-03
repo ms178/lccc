@@ -187,7 +187,7 @@ value = (int_part + frac_part) * 2^exp
 
 where `frac_part = hex_frac_digits / 16^(number_of_frac_digits)`.
 
-Hex floats use a simplified suffix parser that recognizes `f`/`F` and `l`/`L` but does not handle imaginary suffixes (`i`/`j`). This matches typical usage -- imaginary hex floats are extremely rare in practice.
+Hexadecimal floats use the common floating-suffix parser, including GCC imaginary `i`/`j` suffixes and the `f`/`l` type suffixes. Imaginary hexadecimal literals retain their double, float, or long-double token category just like decimal imaginary literals.
 
 ### Binary Integers
 

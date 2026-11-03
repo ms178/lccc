@@ -10,7 +10,7 @@
 use super::pipeline::Preprocessor;
 use super::utils::{
     bytes_to_str, c23_dialect, is_digit_separator, is_ident_cont_byte, is_ident_start_byte,
-    is_literal_prefix, push_char_at, skip_literal_bytes,
+is_literal_prefix, push_char_at, skip_literal_bytes,
 };
 
 impl Preprocessor {
@@ -113,7 +113,7 @@ impl Preprocessor {
             // Skip string and char literals verbatim: `"__has_attribute"` in
             // a string must not be rewritten.
             if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
-                let end = skip_literal_bytes(bytes, i, bytes[i]).min(len);
+let end = skip_literal_bytes(bytes, i, bytes[i]).min(len);
                 result.push_str(&line[i..end]);
                 i = end;
                 continue;
@@ -150,7 +150,7 @@ impl Preprocessor {
                 }
                 continue;
             }
-            i = push_char_at(&mut result, line, i);
+i = push_char_at(&mut result, line, i);
         }
         result
     }
@@ -914,5 +914,18 @@ mod has_attribute_tests {
             );
         }
         assert!(!Preprocessor::is_supported_attribute("no_such_attribute"));
+    }
+}
+
+#[cfg(test)]
+mod has_macro_utf8_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_has_macro_expansion_preserves_utf8_literals() {
+        let mut pp = Preprocessor::new();
+        let source = "const char *s = \"é\"; int c = '__has_feature'; int f = __has_feature(x);";
+        let expected = "const char *s = \"é\"; int c = '__has_feature'; int f = 0;";
+        assert_eq!(pp.resolve_has_macros_in_code(source, 1), expected);
     }
 }
