@@ -1,9 +1,9 @@
-//! Reuse both outputs of identical, adjacent register-only divisions.
+//! Reuse both outputs of identical register-only divisions.
 //!
 //! The accepted window is deliberately small: each division has the same
 //! register dividend, the same register divisor and the same signed/unsigned
-//! high-half setup. Between them is exactly one register copy of a result,
-//! whose destination cannot clobber an input or either result. There are no
+//! high-half setup. Between them are only explicit register moves, whose
+//! destinations cannot clobber an input or either result. There are no
 //! memory loads or stores to alias and no instructions are reordered.
 //! A successful first division proves that the repeated division with the
 //! same inputs cannot fault. DIV's undefined flags are not relied upon: the
@@ -40,25 +40,19 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         if destination.trim() != REG_NAMES[width][0] || matches!(source_reg, 0 | 2 | 4) {
             continue;
         }
-        let mut lines = [infos.len(); 7];
-        lines[0] = first;
-        for k in 1..lines.len() {
-            lines[k] = next_non_debug(store, infos, lines[k - 1] + 1, infos.len());
-            if lines[k] == infos.len() {
-                break;
-            }
-        }
-        if lines[6] >= infos.len() || !all_editable(infos, &lines) {
+        let setup_idx = next_non_debug(store, infos, first + 1, infos.len());
+        if setup_idx >= infos.len() {
             continue;
         }
-        if lines
-            .iter()
-            .any(|&i| infos[i].volatile_access || infos[i].is_nop())
-        {
+        let div_idx = next_non_debug(store, infos, setup_idx + 1, infos.len());
+        if div_idx >= infos.len() || !all_editable(infos, &[first, setup_idx, div_idx]) {
             continue;
         }
-        let setup = infos[lines[1]].trimmed(store.get(lines[1]));
-        let div = infos[lines[2]].trimmed(store.get(lines[2]));
+        if infos[setup_idx].volatile_access || infos[div_idx].volatile_access {
+            continue;
+        }
+        let setup = infos[setup_idx].trimmed(store.get(setup_idx));
+        let div = infos[div_idx].trimmed(store.get(div_idx));
         let signed = match (width, setup) {
             (1, "xorl %edx, %edx") | (0, "xorq %rdx, %rdx") => false,
             (1, "cltd" | "cdq") | (0, "cqto" | "cqo") => true,
@@ -79,33 +73,60 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         if matches!(divisor_reg, 0 | 2 | 4) {
             continue;
         }
-        let result_copy = infos[lines[3]].trimmed(store.get(lines[3]));
-        let Some(copy_args) = result_copy.strip_prefix(if width == 1 { "movl " } else { "movq " })
-        else {
+        // Only explicitly understood register moves may cross the window.
+        // In particular, no memory effects or implicit outputs are assumed.
+        let mut cursor = div_idx + 1;
+        let mut copies = 0;
+        let mut candidate = infos.len();
+        while cursor < infos.len() && cursor <= div_idx.saturating_add(32) {
+            let i = next_non_debug(store, infos, cursor, infos.len());
+            if i >= infos.len() || i > div_idx.saturating_add(32)
+                || !all_editable(infos, &[i]) || infos[i].volatile_access
+            {
+                break;
+            }
+            let text = infos[i].trimmed(store.get(i));
+            if text == stage {
+                candidate = i;
+                break;
+            }
+            let Some(args) = text.strip_prefix(if width == 1 { "movl " } else { "movq " }) else {
+                break;
+            };
+            let Some((src, dst)) = args.split_once(',') else {
+                break;
+            };
+            if register_at_width(src.trim(), width).is_none() {
+                break;
+            }
+            let Some(dest) = register_at_width(dst.trim(), width) else {
+                break;
+            };
+            if matches!(dest, 0 | 2 | 4) || dest == source_reg || dest == divisor_reg {
+                break;
+            }
+            copies += 1;
+            cursor = i + 1;
+        }
+        if candidate == infos.len() || copies == 0 {
             continue;
-        };
-        let Some((copy_source, copy_dest)) = copy_args.split_once(',') else {
+        }
+        let setup_b = next_non_debug(store, infos, candidate + 1, infos.len());
+        if setup_b >= infos.len() {
             continue;
-        };
-        if !matches!(copy_source.trim(), "%eax" | "%edx" | "%rax" | "%rdx")
-            || ![REG_NAMES[width][0], REG_NAMES[width][2]].contains(&copy_source.trim())
+        }
+        let div_b = next_non_debug(store, infos, setup_b + 1, infos.len());
+        if div_b >= infos.len()
+            || !all_editable(infos, &[candidate, setup_b, div_b])
+            || infos[setup_b].volatile_access
+            || infos[div_b].volatile_access
+            || infos[setup_b].trimmed(store.get(setup_b)) != setup
+            || infos[div_b].trimmed(store.get(div_b)) != div
+            || !flags_dead_after(store, infos, div_b + 1)
         {
             continue;
         }
-        let Some(copy_reg) = register_at_width(copy_dest.trim(), width) else {
-            continue;
-        };
-        if matches!(copy_reg, 0 | 2 | 4) || copy_reg == source_reg || copy_reg == divisor_reg {
-            continue;
-        }
-        if infos[lines[4]].trimmed(store.get(lines[4])) != stage
-            || infos[lines[5]].trimmed(store.get(lines[5])) != setup
-            || infos[lines[6]].trimmed(store.get(lines[6])) != div
-            || !flags_dead_after(store, infos, lines[6] + 1)
-        {
-            continue;
-        }
-        for &i in &lines[4..] {
+        for &i in &[candidate, setup_b, div_b] {
             mark_nop(&mut infos[i]);
         }
         changed = true;
@@ -151,6 +172,15 @@ mod tests {
             assert_eq!(output.matches(div).count(), 1, "{output}");
             assert!(output.contains(copy), "{output}");
         }
+    }
+
+    #[test]
+    fn crosses_multiple_safe_register_moves_but_not_a_clobber() {
+        let body = "movq %rdi, %rax\ncqto\nidivq %rsi\nmovq %rax, %r8\nmovq %rdx, %r9\nmovq %rdi, %rax\ncqto\nidivq %rsi\nret\n";
+        let (changed, output) = apply(body);
+        assert!(changed, "{output}");
+        assert_eq!(output.matches("idivq").count(), 1);
+        assert!(!apply(&body.replace("movq %rdx, %r9", "movq %rdx, %rdi")).0);
     }
 
     #[test]
