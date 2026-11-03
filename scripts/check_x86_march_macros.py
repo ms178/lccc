@@ -117,8 +117,51 @@ def main(argv):
             fails += 1
         else:
             passes += 1
+    # Explicit flag rows. The `-march=` sweep above proves the per-CPU
+    # resolution of every modeled announcement; this proves the flag
+    # *combinations* against the same oracle -- a denial that must win, a later
+    # grant that must re-open, and an ISA level that implies a narrower one
+    # (`-mavx` implies SSE4.2, hence `__CRC32__`; `-mavx512f` alone has EVEX
+    # only at 512 bits, so `__EVEX256__` needs `-mavx512vl`). Only modeled
+    # macros are compared: the unmodeled list printed below is the documented
+    # gap, and within the modeled set a macro must never disagree with GCC
+    # about whether it is on.
+    flag_rows = (
+        '-msse4.2', '-msse4.2 -mno-sse4.2', '-mno-sse4.2 -msse4.2',
+        '-mavx', '-mavx -mno-sse4.2', '-mno-sse4.2 -mavx', '-mavx2',
+        '-mfma', '-mno-sse2 -mavx2', '-mavx512f', '-mavx512vl',
+        '-mavx512f -mavx512vl', '-mavx512vl -mno-avx512vl',
+        '-march=x86-64-v3 -mno-sse4.2', '-march=x86-64-v4 -mno-avx512vl',
+    )
+    # One documented row divergence, excluded rather than "fixed" into a false
+    # denial: `-mavx -mno-sse4.2` makes GCC reset the AVX-implied SSE4.2 level
+    # and, with it, `__POPCNT__` (`-mavx` defines it, the later `-mno-sse4.2`
+    # removes it; measured). lccc answers the capability question instead --
+    # POPCNT exists on every AVX CPU, its lowering is resolved-popcnt-gated,
+    # and `-mno-popcnt -mavx` turns it off in both compilers -- so lccc keeps
+    # the macro, which is true of the code it emits. Undefining it would claim
+    # the instruction is unavailable when the backend will happily emit it.
+    flag_row_divergences = {('-mavx -mno-sse4.2', '__POPCNT__')}
+    flag_cases = 0
+    for flags in flag_rows:
+        args = flags.split()
+        label = f'-m64 {flags}'
+        flag_cases += 1
+        g, l = dump(gcc, args), dump(lccc, args)
+        if g is None or l is None:
+            print(f'FAIL {label}: {"gcc" if g is None else "lccc"} rejects it')
+            fails += 1
+            continue
+        waived = {m for row, m in flag_row_divergences if row == flags}
+        gs = {m for m in g if m in modeled} - waived
+        ls = {m for m in l if m in modeled} - waived
+        if gs != ls:
+            print(f'FAIL {label}: ISA lccc-only {sorted(ls - gs)} gcc-only {sorted(gs - ls)}')
+            fails += 1
+        else:
+            passes += 1
     print(f'unmodeled GCC ISA macros (never defined by lccc): {" ".join(sorted(gcc_isa - modeled))}')
-    print(f'{passes} PASS, {fails} FAIL of {len(cases)} (CPU name, mode) cases')
+    print(f'{passes} PASS, {fails} FAIL of {len(cases) + flag_cases} (CPU name, mode, flag row) cases')
     sys.exit(1 if fails else 0)
 
 

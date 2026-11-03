@@ -727,5 +727,52 @@ for row in "${alg_rows[@]}"; do
     fi
 done
 
+# --- 12. An ISA announcement implies the narrower ones GCC pairs it with ----
+# Two feature macros state the same ISA bit as a macro lccc already announced,
+# so a translation unit that probes the first one used to be told the compiler
+# has no such path at all:
+#
+#   * `__CRC32__` IS the SSE4.2 CRC32 instruction. GCC defines it in exactly
+#     the rows where it defines `__SSE4_2__` (all 102 `-march=` names, -m64 and
+#     -m32) and neither otherwise, so a `#ifdef __CRC32__` probe against lccc
+#     concluded "no CRC32 path" while the backend could emit the instruction.
+#   * `__EVEX256__` is the EVEX-encoded 256-bit form, which exists exactly when
+#     AVX-512VL does; `-mavx512f` alone has EVEX only at 512 bits, and GCC
+#     defines it without `-mavx512vl` in no row.
+#
+# `scripts/check_x86_march_macros.py` diffs these against the oracle on every
+# CPU row -- but only once they are "modeled", i.e. defined for at least one
+# CPU, so it cannot notice a future removal. These four rows are the pinned
+# half: the pairing must survive a refactor of the flag resolution.
+# expect <flags> <macro> <defined|absent>
+expect_macro() {
+    local flags=$1 macro=$2 want=$3 have
+    # shellcheck disable=SC2086  # the flag list is a word list on purpose
+    have=$("$CCC" $flags -dM -E -x c /dev/null 2>/dev/null \
+        | awk -v n="$macro" '$2==n{print "defined"}')
+    if [ "$want" = defined ] && [ "$have" != defined ]; then
+        fail "$macro [$flags]: must be defined"
+    elif [ "$want" = absent ] && [ "$have" = defined ]; then
+        fail "$macro [$flags]: must not be defined"
+    fi
+}
+expect_macro "-msse4.2" __CRC32__ defined
+expect_macro "-mavx" __CRC32__ defined
+expect_macro "-msse4.2 -mno-sse4.2" __CRC32__ absent
+expect_macro "-mavx512vl" __EVEX256__ defined
+expect_macro "-mavx512f" __EVEX256__ absent
+expect_macro "-mavx512vl -mno-avx512vl" __EVEX256__ absent
+if [ "$have_gcc" -eq 1 ]; then
+    for row in "-msse4.2:__CRC32__:defined" "-mavx512vl:__EVEX256__:defined" \
+               "-mavx512f:__EVEX256__:absent"; do
+        flags=${row%%:*}; rest=${row#*:}; macro=${rest%%:*}; want=${rest##*:}
+        # shellcheck disable=SC2086
+        have=$("$GCC" $flags -dM -E -x c /dev/null 2>/dev/null \
+            | awk -v n="$macro" '$2==n{print "defined"}')
+        [ "${have:-absent}" = "$want" ] \
+            || fail "$macro [$flags]: gcc-16 says '${have:-absent}', the rule this gate encodes says '$want'"
+    done
+fi
+
 [ "$status" -eq 0 ] && echo "preprocessor-builtin-scope: ok"
 exit "$status"

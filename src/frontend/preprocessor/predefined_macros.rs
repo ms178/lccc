@@ -972,6 +972,14 @@ impl Preprocessor {
         }
         if sse4_2 {
             self.define_simple_macro("__SSE4_2__", "1");
+            // `__CRC32__` announces the CRC32 instruction, which IS the SSE4.2
+            // string/dword extension: GCC defines the two together in every
+            // row where `__SSE4_2__` is defined and neither otherwise
+            // (measured across all 102 `-march=` names, -m64 and -m32).
+            // Defining `__SSE4_2__` without it made a `#ifdef __CRC32__`
+            // probe conclude the compiler has no CRC32 path and take the
+            // scalar fallback.
+            self.define_simple_macro("__CRC32__", "1");
         }
         if avx {
             self.define_simple_macro("__AVX__", "1");
@@ -1027,6 +1035,11 @@ impl Preprocessor {
         }
         if avx512vl {
             self.define_simple_macro("__AVX512VL__", "1");
+            // EVEX-encoded 256-bit forms exist exactly when AVX-512VL does
+            // (`-mavx512vl`; `-mavx512f` alone has EVEX only at 512 bits, and
+            // GCC likewise defines `__EVEX256__` without it — measured on
+            // every AVX-512 CPU row).
+            self.define_simple_macro("__EVEX256__", "1");
         }
         if avx512ifma {
             self.define_simple_macro("__AVX512IFMA__", "1");
