@@ -2101,6 +2101,10 @@ jobs:
       run: >-
         python3 scripts/check_x86_mflag_macros.py target/fastbuild/lccc
         --gcc "${{ steps.gcc162.outputs.bin }}"
+    - name: Verify x86 -mprefer-vector-width= against GCC 16.2
+      run: >-
+        python3 scripts/check_x86_prefer_vector_width.py target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify range-fold branch contracts
       env:
         CCC: target/fastbuild/lccc

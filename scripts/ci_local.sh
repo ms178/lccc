@@ -1065,6 +1065,12 @@ gate "x86-march-macro-parity" fast \
     python3 scripts/check_x86_march_macros.py "$LCCC" "${GCC16:-gcc-16}"
 gate "x86-mflag-macro-parity" fast \
     python3 scripts/check_x86_mflag_macros.py "$LCCC" --gcc "${GCC16:-gcc-16}"
+# `-mprefer-vector-width=` is a cost-model request, so its gate is a codegen
+# gate, not a macro gate: it compares the register class lccc picks against
+# GCC for the same command line, proves the flag moves no predefined macro,
+# and pins GCC's rejection wording.
+gate "x86-prefer-vector-width" fast \
+    python3 scripts/check_x86_prefer_vector_width.py "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 

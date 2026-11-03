@@ -75,7 +75,8 @@ const PREDEFINED_OBJECT_MACROS: &[(&str, &str)] = &[
     // --- GCC 16.2 predefined environment (measured 2026-10-27) -------
     // Spellings and values are byte-identical to `gcc-16 -dM -E` on
     // x86-64 so the macro-parity gate diffs to zero on these rows.
-    ("__BIGGEST_ALIGNMENT__", "16"),
+    // `__BIGGEST_ALIGNMENT__` is NOT here: it is target-dependent, see
+    // `define_predefined_macros`.
     ("__CHAR8_TYPE__", "unsigned char"),
     ("__FINITE_MATH_ONLY__", "0"),
     ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
@@ -565,6 +566,33 @@ impl Preprocessor {
             }
         }
 
+        // GCC's `__BIGGEST_ALIGNMENT__` is `BIGGEST_ALIGNMENT` — the *same*
+        // number that caps C11 `_Alignof` for non-user-aligned types
+        // (`min_align_of_type`). It therefore has to come from the target
+        // model at run time, not from the table above: on x86 GCC widens it
+        // with the requested ISA (16 baseline, 32 under `-mavx`, 64 under
+        // `-mavx512f`, -m32 included), exactly the value `Driver::run`
+        // publishes to `set_target_biggest_alignment` before the
+        // preprocessor is built. A pinned 16 — which this file and
+        // `builtin_macros::EXTRA_GCC_PREDEFINES` both carried — under-aligns
+        // every `__BIGGEST_ALIGNMENT__`-sized buffer as soon as a 32/64-byte
+        // object exists (an `__m256`/`__m512` spill, a `vector_size(32|64)`
+        // local), while `_Alignof` in the same TU already reports 32/64:
+        // a self-inconsistent translation unit. Measured GCC 16.2: 16/32/64
+        // for default/`-mavx`/`-mavx512f`; 32 under `-mno-sse2 -mavx2` and
+        // `-mno-sse -mavx` (the ISA request decides, not the SSE denials);
+        // back to 16 after `-mno-avx512f`. Clang 23.1.4 pins 16 and is
+        // internally inconsistent (`_Alignof(v64)` is 64 there), so GCC is
+        // the only coherent oracle.
+        // `to_string()` is the right spelling by construction: GCC's macro is
+        // a plain decimal integer object-like macro, with no suffix and no
+        // parentheses, and `set_target_biggest_alignment` has already
+        // asserted the value is a power of two. One small allocation per
+        // translation unit, against the per-token traffic of a preprocessor
+        // run.
+        let biggest_alignment = crate::common::types::target_biggest_alignment();
+        self.define_simple_macro("__BIGGEST_ALIGNMENT__", &biggest_alignment.to_string());
+
         // `__DATE__` and `__TIME__` are *not* materialised here. They are the
         // only predefined macros whose value can be a diagnostic (a malformed
         // `SOURCE_DATE_EPOCH`), and they are sampled once per translation unit
@@ -871,6 +899,29 @@ impl Preprocessor {
         }
     }
 
+    /// Define `__XSAVE__` for the active x86 target.
+    ///
+    /// XSAVE is its own CPUID bit (leaf 1, ECX 26) with its own `-mxsave`
+    /// flag, and it is *not* implied by AVX: Goldmont, Goldmont Plus,
+    /// Tremont, Lujiazui and Bobcat (`btver1`) carry it without AVX, while
+    /// `-mavx -mno-xsave` keeps AVX and drops it — so deriving the macro from
+    /// the AVX level, as an earlier draft of this gate did, is wrong in both
+    /// directions (measured, gcc-16.2 `-dM -E`, six `(CPU, mode)` rows
+    /// diverged). The driver resolves the bit from the `-march=` row and the
+    /// `-mxsave`/`-mno-xsave` pair. No-op on non-x86 targets, like
+    /// [`Self::set_fxsr_macro`].
+    pub fn set_xsave_macro(&mut self, on: bool) {
+        let is_x86 = self.macros.is_defined("__x86_64__") || self.macros.is_defined("__i386__");
+        if !is_x86 {
+            return;
+        }
+        if on {
+            self.define_simple_macro("__XSAVE__", "1");
+        } else {
+            self.macros.undefine("__XSAVE__");
+        }
+    }
+
     /// Define extended SIMD feature macros (__SSE3__, __AVX__, __AVX2__, etc.)
     /// when the corresponding -msse3, -mavx, -mavx2 flags are passed.
     /// Projects like blosc use #ifdef __AVX2__ to select optimized code paths.
@@ -946,6 +997,14 @@ impl Preprocessor {
         }
         if sse4_2 {
             self.define_simple_macro("__SSE4_2__", "1");
+            // `__CRC32__` announces the CRC32 instruction, which IS the SSE4.2
+            // string/dword extension: GCC defines the two together in every
+            // row where `__SSE4_2__` is defined and neither otherwise
+            // (measured across all 102 `-march=` names, -m64 and -m32).
+            // Defining `__SSE4_2__` without it made a `#ifdef __CRC32__`
+            // probe conclude the compiler has no CRC32 path and take the
+            // scalar fallback.
+            self.define_simple_macro("__CRC32__", "1");
         }
         if avx {
             self.define_simple_macro("__AVX__", "1");
@@ -1001,6 +1060,11 @@ impl Preprocessor {
         }
         if avx512vl {
             self.define_simple_macro("__AVX512VL__", "1");
+            // EVEX-encoded 256-bit forms exist exactly when AVX-512VL does
+            // (`-mavx512vl`; `-mavx512f` alone has EVEX only at 512 bits, and
+            // GCC likewise defines `__EVEX256__` without it — measured on
+            // every AVX-512 CPU row).
+            self.define_simple_macro("__EVEX256__", "1");
         }
         if avx512ifma {
             self.define_simple_macro("__AVX512IFMA__", "1");

@@ -117,8 +117,78 @@ def main(argv):
             fails += 1
         else:
             passes += 1
+    # Explicit flag rows. The `-march=` sweep above proves the per-CPU
+    # resolution of every modeled announcement; this proves the flag
+    # *combinations* against the same oracle -- a denial that must win, a later
+    # grant that must re-open, and an ISA level that implies a narrower one
+    # (`-mavx` implies SSE4.2, hence `__CRC32__`; `-mavx512f` alone has EVEX
+    # only at 512 bits, so `__EVEX256__` needs `-mavx512vl`). Only modeled
+    # macros are compared: the unmodeled list printed below is the documented
+    # gap, and within the modeled set a macro must never disagree with GCC
+    # about whether it is on.
+    # The POPCNT rows encode GCC's unwind rule: an `-mno-sse4.2` (or
+    # `-mno-sse4.1`, `-mno-sse2`, `-mno-sse`) denial withdraws the
+    # AVX-implied SSE4.2 level *and* the POPCNT that rides on it, while an
+    # explicit `-mpopcnt`/`-mabm` grant and a `-march=` row survive in either
+    # order. The ladder-independence rows pin the measured split between the
+    # announcement and the intrinsic gate: `-mno-sse`/`-mno-sse2`/
+    # `-mgeneral-regs-only` keep `__AES__`/`__PCLMUL__`/`__GFNI__` standing
+    # while the SSE macros go away, and the XSAVE rows pin its own bit
+    # (Goldmont/Tremont/Lujiazui/Bobcat carry it without AVX, and
+    # `-mno-xsave` takes AVX down with it in GCC).
+    flag_rows = (
+        '-msse4.2', '-msse4.2 -mno-sse4.2', '-mno-sse4.2 -msse4.2',
+        '-mavx', '-mavx -mno-sse4.2', '-mno-sse4.2 -mavx', '-mavx2',
+        '-mfma', '-mno-sse2 -mavx2', '-mavx512f', '-mavx512vl',
+        '-mavx512f -mavx512vl', '-mavx512vl -mno-avx512vl',
+        '-march=x86-64-v3 -mno-sse4.2', '-march=x86-64-v4 -mno-avx512vl',
+        '-mpopcnt -mavx -mno-sse4.2', '-mavx -mno-sse4.2 -mpopcnt',
+        '-msse4.2 -mno-popcnt', '-mno-popcnt -msse4.2',
+        '-mno-sse4.1 -msse4.2', '-msse4.2 -mno-sse4.1',
+        '-mabm -mno-sse4.2', '-march=amdfam10 -mno-sse4.2',
+        '-march=x86-64-v3 -mno-sse4.2', '-mno-sse4.2 -march=x86-64-v3',
+        '-mxsave', '-mno-xsave', '-mavx -mno-xsave', '-mno-xsave -mavx',
+        '-mno-xsave -mxsave', '-mxsave -mno-xsave',
+        '-mno-xsave -march=x86-64-v3', '-march=x86-64-v3 -mno-xsave -mavx',
+        '-march=goldmont -mno-xsave', '-mno-xsave -march=goldmont',
+        '-mno-sse -maes', '-mno-sse2 -mpclmul', '-mno-sse -mgfni',
+        '-march=skylake -mno-sse', '-mno-sse -march=skylake',
+        '-march=goldmont -mno-sse2', '-mno-sse2 -march=goldmont',
+        '-march=znver4 -mno-sse', '-mno-sse -march=znver4',
+        '-mgeneral-regs-only -march=haswell', '-mgeneral-regs-only -maes',
+    )
+    # One measured divergence, kept out of the comparison instead of being
+    # "fixed" into a false announcement. GCC's `-mno-xsave` clears MASK_AVX
+    # without cascading into the dependent option bits, so a `-march=` row that
+    # granted SHA512/SM3/SM4 keeps announcing them while GCC itself rejects
+    # every one of those intrinsics there (measured: `-march=clearwaterforest
+    # -mno-xsave` + `_mm256_sha512msg1_epi64` is an implicit-declaration error).
+    # lccc's extension model drops an announcement together with the
+    # instruction class it needs, which is the stricter and safer direction:
+    # no `#ifdef` can be told about an instruction this target cannot emit.
+    flag_row_exclusions = {
+        '-march=clearwaterforest -mno-xsave': {'__SHA512__', '__SM3__', '__SM4__'},
+    }
+    flag_cases = 0
+    for flags in flag_rows:
+        args = flags.split()
+        label = f'-m64 {flags}'
+        flag_cases += 1
+        g, l = dump(gcc, args), dump(lccc, args)
+        if g is None or l is None:
+            print(f'FAIL {label}: {"gcc" if g is None else "lccc"} rejects it')
+            fails += 1
+            continue
+        excluded = flag_row_exclusions.get(flags, set())
+        gs = {m for m in g if m in modeled} - excluded
+        ls = {m for m in l if m in modeled} - excluded
+        if gs != ls:
+            print(f'FAIL {label}: ISA lccc-only {sorted(ls - gs)} gcc-only {sorted(gs - ls)}')
+            fails += 1
+        else:
+            passes += 1
     print(f'unmodeled GCC ISA macros (never defined by lccc): {" ".join(sorted(gcc_isa - modeled))}')
-    print(f'{passes} PASS, {fails} FAIL of {len(cases)} (CPU name, mode) cases')
+    print(f'{passes} PASS, {fails} FAIL of {len(cases) + flag_cases} (CPU name, mode, flag row) cases')
     sys.exit(1 if fails else 0)
 
 

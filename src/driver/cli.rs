@@ -287,6 +287,11 @@ impl Driver {
         self.enable_bmi2 = false;
         self.enable_lzcnt = false;
         self.enable_popcnt = false;
+        self.enable_xsave = false;
+        // Re-armed by the `-march=` handler that this reset serves; POPCNT
+        // that a CPU row grants as its own bit survives an SSE4.2-level
+        // denial (see `Driver::apply_x86_feature_dependencies`).
+        self.arch_grants_popcnt = false;
         self.enable_movbe = false;
         self.enable_cx16 = false;
         self.enable_rdrnd = false;
@@ -569,7 +574,26 @@ impl Driver {
                 .into_iter()
                 .find(|extra| extra.option() == name)
         }) {
-            self.set_x86_extras(extra.requires_extras());
+            self.grant_x86_extra_explicitly(extra);
+            // ... and the *base* features it requires, or the grant would be
+            // dropped again by `drop_x86_extras_without_requirements` in the
+            // same call. The one measurable case is XSAVE: AMX state is an
+            // XSAVE component, so `-mamx-tile` defines `__XSAVE__` on a plain
+            // `-march=x86-64` target (measured, gcc-16.2, -m64 and -m32).
+            // Only XSAVE is granted here: every other entry in the table's
+            // requirement sets is a vector class (SSE..AVX2, AVX-512) whose
+            // grant the user asked for explicitly elsewhere, and quietly
+            // widening those would be a permission change hidden in an
+            // option, not an implication GCC makes.
+            //
+            // The sub-extensions of a container do not inherit this: GCC's
+            // `-mamx-int8`/`-mamx-bf16` grant AMX-TILE but leave MASK_XSAVE
+            // alone, so `__XSAVE__` stays undefined there (measured, gcc-16.2).
+            let xsave_bit = 1u64 << crate::common::x86_features::X86Feature::Xsave as u8;
+            if extra.requires() & xsave_bit != 0 && extra.requires_extras() == 0 {
+                self.enable_xsave = true;
+                self.xsave_explicitly_disabled = false;
+            }
         }
         self.drop_x86_extras_without_requirements();
         true
@@ -624,6 +648,7 @@ impl Driver {
             || self.apply_x86_sse_level_mflag(arg)
             || self.apply_x86_avx512_mno_mflag(arg)
             || self.apply_x86_isa_toggle(arg)
+            || self.apply_x86_state_save_mflag(arg)
         {
             return true;
         }
@@ -731,6 +756,9 @@ impl Driver {
                 // FMA ⇒ AVX ⊃ SSE4.2 ⇒ POPCNT (GCC, measured on
                 // gcc 14.2: `-mfma -march=x86-64` defines `__POPCNT__`).
                 self.enable_popcnt = true;
+                // ... and FMA ⇒ AVX ⇒ XSAVE (gcc-16.2: `-mno-xsave -mfma`
+                // defines both `__AVX__` and `__XSAVE__`).
+                self.grant_xsave_from_avx();
             }
             // Last-explicit ISA decision wins (GCC): a later `-mbmi`
             // lifts an earlier `-mno-bmi` sticky denial.
@@ -763,13 +791,6 @@ impl Driver {
                 self.abm_explicitly_disabled = false;
                 self.enable_popcnt = true;
                 self.popcnt_explicitly_disabled = false;
-            }
-            "-mfxsr" => {
-                // Measured last-wins pair; the flag overrides the -march row.
-                self.fxsr_override = Some(true);
-            }
-            "-mno-fxsr" => {
-                self.fxsr_override = Some(false);
             }
             "-mcx16" => {
                 self.enable_cx16 = true;
@@ -984,6 +1005,13 @@ impl Driver {
         self.avx_explicitly_disabled = true;
         self.fma_explicitly_disabled = true;
         self.sse41_explicitly_disabled = true;
+        // `-mgeneral-regs-only` also clears MASK_MMX and, unlike the SSE
+        // levels, nothing revives it later: `-mgeneral-regs-only -maes` (or
+        // `-msse2`) reopens the SSE pair but GCC 16.2 still has no `__MMX__`,
+        // and only an explicit `-mmmx` brings it back (`-maes -mgeneral-regs-
+        // only` drops it again; measured `-dM`, both orders, -m64 and -m32).
+        // That is exactly the sticky `-mno-mmx` state this bit models.
+        self.mmx_explicitly_disabled = true;
         self.enable_sse2 = false;
         self.enable_sse3 = false;
         self.enable_ssse3 = false;
@@ -1041,6 +1069,52 @@ impl Driver {
         // AVX ⊃ SSE4.2 ⇒ POPCNT (GCC, measured on gcc 14.2:
         // `-mavx -march=x86-64` defines `__POPCNT__`).
         self.enable_popcnt = true;
+        self.grant_xsave_from_avx();
+    }
+
+    /// The extended-state save/restore options: `FXSAVE`/`FXRSTOR` (an `x87`
+    /// + SSE image) and `XSAVE`/`XRSTOR` (a CPUID-enumerated component
+    /// envelope).  They share a group because they are the same decision at two
+    /// generations — which architectural state the compiler may assume is
+    /// saved — and because both are last-explicit-wins pairs that override the
+    /// `-march=` row.
+    ///
+    /// `XSAVE` is its own CPUID bit (leaf 1, ECX 26) with its own option and
+    /// is NOT an implication of AVX: Goldmont, Goldmont Plus, Tremont,
+    /// Lujiazui and Bobcat have it without AVX (measured, gcc-16.2 `-dM`:
+    /// those rows define `__XSAVE__` and no `__AVX__`).  `-mno-xsave`
+    /// therefore also clears the extensions whose state lives in an XSAVE
+    /// component (measured: `-mamx-tile -mno-xsave` leaves neither
+    /// `__XSAVE__` nor `__AMX_TILE__`).
+    fn apply_x86_state_save_mflag(&mut self, arg: &str) -> bool {
+        match arg {
+            "-mxsave" => {
+                self.enable_xsave = true;
+                self.xsave_explicitly_disabled = false;
+            }
+            "-mno-xsave" => {
+                self.enable_xsave = false;
+                self.xsave_explicitly_disabled = true;
+                self.withhold_xsave_dependent_extras();
+            }
+            "-mfxsr" => self.fxsr_override = Some(true),
+            "-mno-fxsr" => self.fxsr_override = Some(false),
+            _ => return false,
+        }
+        true
+    }
+
+    /// AVX implies XSAVE: the `ymm` state is only reachable through
+    /// `XSETBV`/`XSAVE` state components, so GCC's `-mavx` option grants
+    /// XSAVE and a later `-mno-xsave` takes AVX with it (measured, gcc-16.2:
+    /// `-mavx -mno-xsave` leaves neither `__AVX__` nor `__XSAVE__`, while
+    /// `-mno-xsave -mavx` restores both — last explicit decision wins).
+    fn grant_xsave_from_avx(&mut self) {
+        if self.sse_explicitly_disabled {
+            return;
+        }
+        self.enable_xsave = true;
+        self.xsave_explicitly_disabled = false;
     }
 
     fn grant_avx2_class(&mut self) {
@@ -1055,6 +1129,7 @@ impl Driver {
         // contains AVX contains SSE4.2, so the implied integer feature rides
         // with the explicit flag.
         self.enable_popcnt = true;
+        self.grant_xsave_from_avx();
     }
 
     fn enable_x86_avx2_profile(&mut self) {
@@ -1101,6 +1176,8 @@ impl Driver {
         self.enable_abm |= row.feature_bits() & crate::backend::x86::arch_table::ABM != 0
             && !self.abm_explicitly_disabled;
         self.enable_popcnt |= row.has(F::Popcnt);
+        self.arch_grants_popcnt |= row.has(F::Popcnt);
+        self.enable_xsave |= row.has(F::Xsave);
         self.enable_cx16 |= row.has(F::Cx16);
         self.enable_bmi |= row.has(F::Bmi);
         self.enable_bmi2 |= row.has(F::Bmi2);
@@ -1114,6 +1191,23 @@ impl Driver {
             if row.has_extra(extra) {
                 *self.x86_extra_slot(extra) = true;
             }
+        }
+        // AES-NI, PCLMUL and GFNI are not rungs of the SSE ladder: GCC's
+        // option layer tracks them independently of the vector levels, so a
+        // row that carries them keeps announcing them under an explicit
+        // `-mno-sse`/`-mno-sse2`/`-mgeneral-regs-only` veto (measured,
+        // gcc-16.2 `-dM`: `-march=goldmont -mno-sse2` keeps `__AES__` and
+        // `__PCLMUL__`, `-march=znver4 -mno-sse` keeps `__GFNI__` too, while
+        // the SSE macros disappear). Only the *intrinsic* gate needs SSE2
+        // (`crate::backend::x86::isa::features_permit`), which is why GCC
+        // defines the macro and still rejects the call. Apply them here, so
+        // the denial below cannot drop a row-granted extension.
+        for (feature, slot) in [
+            (F::Aes, &mut self.enable_aes),
+            (F::Pclmul, &mut self.enable_pclmul),
+            (F::Gfni, &mut self.enable_gfni),
+        ] {
+            *slot |= row.has(feature);
         }
         if self.sse_explicitly_disabled {
             self.drop_x86_extras_without_requirements();
@@ -1131,11 +1225,9 @@ impl Driver {
             (F::Avx2, &mut self.enable_avx2),
             (F::Fma, &mut self.enable_fma),
             (F::F16c, &mut self.enable_f16c),
-            (F::Aes, &mut self.enable_aes),
-            (F::Pclmul, &mut self.enable_pclmul),
+            // (Aes and Pclmul are applied above, before the SSE-ladder veto.)
             (F::Vaes, &mut self.enable_vaes),
             (F::Vpclmulqdq, &mut self.enable_vpclmulqdq),
-            (F::Gfni, &mut self.enable_gfni),
             (F::AvxVnni, &mut self.enable_avxvnni),
             (F::AvxVnniInt8, &mut self.enable_avxvnniint8),
             (F::AvxVnniInt16, &mut self.enable_avxvnniint16),
@@ -1192,6 +1284,7 @@ impl Driver {
             F::Sse42 => &mut self.enable_sse4_2,
             F::Popcnt => &mut self.enable_popcnt,
             F::Cx16 => &mut self.enable_cx16,
+            F::Xsave => &mut self.enable_xsave,
             F::Avx => &mut self.enable_avx,
             F::Avx2 => &mut self.enable_avx2,
             F::Fma => &mut self.enable_fma,
@@ -1242,10 +1335,17 @@ impl Driver {
         let mut bits = crate::backend::x86::isa::with_feature(0, F::Sse, sse);
         bits = crate::backend::x86::isa::with_feature(bits, F::Sse2, sse2);
         for feature in F::ALL {
+            // XSAVE is resolved, not raw: a sticky `-mno-xsave` outranks a
+            // later `-march=` row's bit, and every extra that requires XSAVE
+            // (AMX, AVX-IFMA, ...) must be dropped with it.
+            if feature == F::Xsave {
+                continue;
+            }
             if self.x86_feature_slot(feature).is_some_and(|on| *on) {
                 bits |= 1 << feature as u8;
             }
         }
+        bits = crate::backend::x86::isa::with_feature(bits, F::Xsave, self.resolved_xsave());
         if self.enable_abm {
             bits |= crate::backend::x86::arch_table::ABM;
         }
@@ -1289,6 +1389,25 @@ impl Driver {
         self.enable_abm = after & ABM != 0;
     }
 
+    /// Clear every extension whose state is an XSAVE component, and forget
+    /// the explicit grants (a later `-mxsave`/`-mamx-tile` re-grants).
+    ///
+    /// GCC does the same in its option layer: `-mamx-tile -mno-xsave` leaves
+    /// neither `__XSAVE__` nor `__AMX_TILE__`, and `-mavxifma -mno-xsave`
+    /// loses `__AVXIFMA__` with the AVX it implies (measured, gcc-16.2).
+    /// Dropping the `-m`-granted record as well is what lets the later
+    /// `-mxsave`/`-mamx-tile` re-grant stand unopposed.
+    fn withhold_xsave_dependent_extras(&mut self) {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let xsave_bit = 1u64 << crate::common::x86_features::X86Feature::Xsave as u8;
+        for extra in E::ALL {
+            if extra.requires() & xsave_bit != 0 {
+                *self.x86_extra_slot(extra) = false;
+                self.x86_extras_explicit &= !(1 << extra as u8);
+            }
+        }
+    }
+
     /// Disable every macro-only extension a required feature has left
     /// ([`crate::backend::x86::arch_table::X86ExtraFeature::requires`]):
     /// GCC's `-mno-avx2` removes AVXIFMA and keeps SHA512, `-mno-avx`
@@ -1302,8 +1421,16 @@ impl Driver {
             let extras = self.x86_extras();
             let mut changed = false;
             for extra in E::ALL {
-                let lacking =
-                    extra.requires() & !bits != 0 || extra.requires_extras() & !extras != 0;
+                // An explicitly requested extension keeps its grant when the
+                // only missing prerequisite is XSAVE itself: GCC's
+                // `-mamx-int8` defines `__AMX_TILE__`/`__AMX_INT8__` without
+                // `__XSAVE__` (measured), and `-mno-xsave` still removes them
+                // because that arm clears the XSAVE-dependent grants outright.
+                let mut required = extra.requires();
+                if self.x86_extras_explicit & (1 << extra as u8) != 0 {
+                    required &= !(1u64 << crate::common::x86_features::X86Feature::Xsave as u8);
+                }
+                let lacking = required & !bits != 0 || extra.requires_extras() & !extras != 0;
                 let slot = self.x86_extra_slot(extra);
                 if *slot && lacking {
                     *slot = false;
@@ -1332,6 +1459,58 @@ impl Driver {
             if bits & 1 << extra as u8 != 0 {
                 *self.x86_extra_slot(extra) = true;
             }
+        }
+    }
+
+    /// Grant `extra` (and the extensions it contains) because the user asked
+    /// for it by name, and remember that the grant was explicit: an explicit
+    /// `-mamx-int8` keeps `__AMX_TILE__` standing without `__XSAVE__`, which
+    /// is what GCC 16.2 does, while the same feature reached only through
+    /// `-march=` still needs every prerequisite
+    /// ([`Self::drop_x86_extras_without_requirements`]).
+    fn grant_x86_extra_explicitly(
+        &mut self,
+        extra: crate::backend::x86::arch_table::X86ExtraFeature,
+    ) {
+        *self.x86_extra_slot(extra) = true;
+        self.x86_extras_explicit |= 1 << extra as u8;
+        let contained = extra.requires_extras();
+        self.set_x86_extras(contained);
+        self.x86_extras_explicit |= contained;
+    }
+
+    /// Apply GCC's x86 feature dependencies to the resolved flag state.
+    ///
+    /// POPCNT is SSE4.2-class in GCC's model: every way of *ending* with the
+    /// SSE4.2 level denied takes POPCNT with it — `-mno-sse`, `-mno-sse2`,
+    /// `-mno-sse3`, `-mno-ssse3`, `-mno-sse4.1`, `-mno-sse4.2`, `-mno-avx`
+    /// and `-mno-avx2` all do (measured on gcc-16.2, `-dM -E`) — unless
+    /// POPCNT was granted by an option that names it or by the `-march=`
+    /// row, which GCC records in `ix86_isa_flags_explicit`:
+    ///
+    /// * `-mavx -mno-sse4.2` -> no `__POPCNT__` (the grant was implied);
+    /// * `-mpopcnt -mavx -mno-sse4.2` and `-mavx -mno-sse4.2 -mpopcnt` ->
+    ///   `__POPCNT__` stays (the user named it);
+    /// * `-march=x86-64-v3 -mno-sse4.2`, `-march=amdfam10 -mno-sse4.2` and
+    ///   `-mabm -mno-sse4.2` -> `__POPCNT__` stays (CPU row / named option).
+    ///
+    /// Before this pass lccc kept POPCNT in all of those rows, so it announced
+    /// — and `-O2` emitted, `resolved_popcnt` gates the `popcnt` lowering —
+    /// an instruction the requested ISA had just withdrawn: a `-march=x86-64
+    /// -mavx -mno-sse4.2` object could carry `popcnt` on a pre-SSE4.2 CPU.
+    /// Clang 23.1.4 agrees with GCC on every row above, so lccc was the only
+    /// one of the three telling the other story.
+    ///
+    /// `__CRC32__` needs no rule of its own: it rides `__SSE4_2__`, which is
+    /// already resolved correctly.
+    fn apply_x86_feature_dependencies(&mut self) {
+        if self.enable_sse4_2 || self.popcnt_explicitly_disabled {
+            return;
+        }
+        let named_by_option = self.x86_isa_flag_was_enabled("-mpopcnt", "-mno-popcnt")
+            || self.x86_isa_flag_was_enabled("-mabm", "-mno-abm");
+        if !named_by_option && !self.arch_grants_popcnt {
+            self.enable_popcnt = false;
         }
     }
 
@@ -2813,6 +2992,28 @@ impl Driver {
                         self.replay_x86_explicit_isa_flags();
                     }
                 }
+                // `-mprefer-vector-width=` / the `-mprefer-avx128` alias. A
+                // cost-model request, not an ISA grant: it narrows the
+                // shapes the vectorizers pick, never the instruction set.
+                // GCC 16.2 accepts 128/256/512/none and rejects anything
+                // else with the same wording, so `none` ("let the tuning
+                // decide", the default) maps to `None` here.
+                "-mprefer-avx128" => self.x86_prefer_vector_bits = Some(128),
+                arg if arg.starts_with("-mprefer-vector-width=") => {
+                    let value = &arg["-mprefer-vector-width=".len()..];
+                    self.x86_prefer_vector_bits = match value {
+                        "128" => Some(128),
+                        "256" => Some(256),
+                        "512" => Some(512),
+                        "none" => None,
+                        _ => {
+                            return Err(format!(
+                                "unrecognized argument in option '{arg}'; valid arguments to \
+                                 '-mprefer-vector-width=' are: 128 256 512 none"
+                            ));
+                        }
+                    };
+                }
                 arg if arg.starts_with("-mtune=") => {
                     let tune = &arg["-mtune=".len()..];
                     match self.target {
@@ -3725,6 +3926,12 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                 }
             }
             i += 1;
+        }
+        // GCC's x86 feature-dependency pass (`ix86_option_override`'s
+        // post-processing) runs on the FINAL flag state, because the answer
+        // depends on the resolved ladder and on which grants were explicit.
+        if matches!(self.target, Target::X86_64 | Target::I686) {
+            self.apply_x86_feature_dependencies();
         }
         if let Some(dialect) = self.tls_dialect.as_deref() {
             check_tls_dialect(&self.target, dialect)?;
@@ -7385,5 +7592,282 @@ mod prefetch_isa_tests {
         }
         assert!(!parse(&["i686-ccc", "-mno-mmx"]).resolved_i686_mmx());
         assert!(!parse(&["ccc", "-mno-mmx", "-mmmx"]).mmx_explicitly_disabled);
+    }
+}
+
+#[cfg(test)]
+mod x86_macro_gate_tests {
+    //! Precedence rules behind the predefined-macro gate, pinned where they
+    //! are decided. Every expectation is GCC 16.2's measured `-dM` output for
+    //! the same command line; `scripts/check_x86_march_macros.py` runs the
+    //! whole matrix through the real preprocessor against the oracle, so
+    //! these assertions are the fast unit-level mirror of it, not a second
+    //! source of truth.
+    use crate::common::x86_features::X86Feature as F;
+    use crate::driver::Driver;
+
+    fn parse(flags: &[&str]) -> Driver {
+        let mut d = Driver::new();
+        let args: Vec<String> = std::iter::once("ccc")
+            .chain(flags.iter().copied())
+            .chain(std::iter::once("x.c"))
+            .map(str::to_string)
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok(), "{flags:?}");
+        d
+    }
+
+    fn features(flags: &[&str]) -> crate::common::x86_features::EffectiveFeatures {
+        parse(flags).effective_x86_features()
+    }
+
+    /// `__XSAVE__` is CPUID leaf 1 ECX bit 26 with its own `-mxsave`, not an
+    /// implication of AVX in either direction: five GCC CPU rows carry it
+    /// without AVX, and `-mno-xsave` takes AVX down with it because the `ymm`
+    /// state lives in an XSAVE component.
+    #[test]
+    fn xsave_is_its_own_bit_not_an_avx_implication() {
+        for cpu in ["btver1", "goldmont", "goldmont-plus", "lujiazui", "tremont"] {
+            let flag = format!("-march={cpu}");
+            let d = parse(&[flag.as_str()]);
+            assert!(d.resolved_xsave(), "{cpu}");
+            let f = d.effective_x86_features();
+            assert!(f.contains(F::Xsave), "{cpu}");
+            assert!(!f.contains(F::Avx), "{cpu} has XSAVE and no AVX");
+        }
+        // AVX rows imply it (the state component is what makes `ymm` live).
+        for cpu in ["haswell", "znver4", "x86-64-v3", "icelake-server"] {
+            let flag = format!("-march={cpu}");
+            let d = parse(&[flag.as_str()]);
+            assert!(
+                d.resolved_xsave() && d.effective_x86_features().contains(F::Avx),
+                "{cpu}"
+            );
+        }
+        // The v1 baseline has neither.
+        assert!(!parse(&["-march=x86-64"]).resolved_xsave());
+        assert!(!features(&["-march=x86-64"]).contains(F::Xsave));
+
+        // Explicit flag, last-wins in both directions.
+        assert!(parse(&["-mxsave"]).resolved_xsave());
+        assert!(!parse(&["-mno-xsave"]).resolved_xsave());
+        assert!(!parse(&["-mxsave", "-mno-xsave"]).resolved_xsave());
+        assert!(parse(&["-mno-xsave", "-mxsave"]).resolved_xsave());
+        // `-mno-xsave` removes AVX (GCC 16.2: neither macro survives) and a
+        // later AVX/FMA grant reopens both.
+        for flags in [
+            &["-mavx", "-mno-xsave"][..],
+            &["-mno-xsave", "-march=x86-64-v3"],
+            &["-mavx", "-mno-xsave", "-march=x86-64-v3"],
+        ] {
+            let f = features(flags);
+            assert!(!f.contains(F::Xsave) && !f.contains(F::Avx), "{flags:?}");
+        }
+        for flags in [
+            &["-mno-xsave", "-mavx"][..],
+            &["-mavx", "-mno-xsave", "-mavx2"],
+            &["-mno-xsave", "-mfma"],
+            &["-march=x86-64-v3", "-mno-xsave", "-mavx"],
+        ] {
+            let f = features(flags);
+            assert!(f.contains(F::Xsave) && f.contains(F::Avx), "{flags:?}");
+        }
+        // A sticky `-mno-xsave` still outranks every `-march=` CPU row.
+        for cpu in ["goldmont", "x86-64-v3", "znver4"] {
+            let flag = format!("-march={cpu}");
+            let d = parse(&["-mno-xsave", flag.as_str()]);
+            assert!(!d.resolved_xsave(), "{cpu}");
+        }
+    }
+
+    /// AMX state is an XSAVE component, and GCC's option layer says so in one
+    /// direction only: `-mamx-tile` sets MASK_XSAVE with it, while
+    /// `-mamx-int8`/`-mamx-bf16` grant the tile container and leave MASK_XSAVE
+    /// alone; `-mno-xsave` clears all three (measured, gcc-16.2).
+    #[test]
+    fn amx_grants_follow_gccs_one_way_xsave_cascade() {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let mut d = parse(&["-mamx-tile"]);
+        assert!(d.resolved_xsave() && *d.x86_extra_slot(E::AmxTile));
+
+        for flag in ["-mamx-int8", "-mamx-bf16"] {
+            let mut d = parse(&[flag]);
+            assert!(!d.resolved_xsave(), "{flag} must not grant XSAVE");
+            assert!(*d.x86_extra_slot(E::AmxTile), "{flag} grants the container");
+        }
+        assert!(*parse(&["-mamx-int8"]).x86_extra_slot(E::AmxInt8));
+        assert!(*parse(&["-mamx-bf16"]).x86_extra_slot(E::AmxBf16));
+
+        // The denial cascades through everything XSAVE carries.
+        for flags in [
+            &["-mamx-tile", "-mno-xsave"][..],
+            &["-mamx-int8", "-mno-xsave"],
+            &["-mamx-bf16", "-mno-xsave"],
+        ] {
+            let mut d = parse(flags);
+            for extra in [E::AmxTile, E::AmxInt8, E::AmxBf16] {
+                assert!(!*d.x86_extra_slot(extra), "{extra:?} {flags:?}");
+            }
+            assert!(!d.resolved_xsave(), "{flags:?}");
+        }
+        // A later grant reopens it, like every other last-wins pair.
+        let mut d = parse(&["-mno-xsave", "-mamx-tile"]);
+        assert!(d.resolved_xsave() && *d.x86_extra_slot(E::AmxTile));
+        // An `-march=` row that grants an XSAVE-dependent extension keeps it
+        // only while XSAVE itself is granted.
+        let mut d = parse(&["-march=clearwaterforest", "-mno-xsave"]);
+        assert!(!d.resolved_xsave());
+        assert!(!*d.x86_extra_slot(E::Sha512));
+    }
+
+    /// AES-NI, PCLMUL and GFNI are announced from the option bits even when
+    /// the SSE ladder is denied — GCC defines the macro and still rejects the
+    /// intrinsic, which is the split `features_permit` implements.
+    #[test]
+    fn a_ladder_denial_keeps_the_ladder_independent_extensions() {
+        use crate::backend::x86::isa::features_permit;
+        for (flags, want_aes, want_pclmul, want_gfni, want_sse2) in [
+            (
+                &["-march=skylake", "-mno-sse"][..],
+                true,
+                true,
+                false,
+                false,
+            ),
+            (&["-mno-sse", "-march=goldmont"], true, true, false, false),
+            (&["-march=goldmont", "-mno-sse2"], true, true, false, false),
+            (&["-march=znver4", "-mno-sse"], true, true, true, false),
+            (&["-mno-sse2", "-march=tremont"], true, true, true, false),
+            (
+                &["-mgeneral-regs-only", "-march=haswell"],
+                false,
+                true,
+                false,
+                false,
+            ),
+            // `-maes`/`-mpclmul` reopen the SSE2 class (GCC: `__SSE2__` is
+            // predefined under `-mno-sse -maes`), `-mgfni` does not.
+            (&["-mno-sse", "-maes"], true, false, false, true),
+            (&["-mno-sse", "-mpclmul"], false, true, false, true),
+            (&["-mno-sse", "-mgfni"], false, false, true, false),
+            (&["-mno-sse"], false, false, false, false),
+        ] {
+            let f = features(flags);
+            assert_eq!(f.contains(F::Aes), want_aes, "AES {flags:?}");
+            assert_eq!(f.contains(F::Pclmul), want_pclmul, "PCLMUL {flags:?}");
+            assert_eq!(f.contains(F::Gfni), want_gfni, "GFNI {flags:?}");
+            assert_eq!(f.contains(F::Sse2), want_sse2, "SSE2 {flags:?}");
+            // The intrinsic gate is the *stricter* of the two decisions and
+            // the only place SSE2 is required: on the rows where the ladder
+            // really is denied the announcement stands and the call is
+            // refused, exactly as GCC does (measured: `-march=znver4
+            // -mno-sse` defines `__AES__` and rejects `_mm_aesenc_si128`).
+            for feature in [F::Aes, F::Pclmul, F::Gfni] {
+                let announced = f.contains(feature);
+                assert_eq!(
+                    features_permit(f, feature),
+                    announced && want_sse2,
+                    "{feature:?} permission {flags:?}"
+                );
+            }
+        }
+    }
+
+    /// The measured GCC unwind matrix for POPCNT: an `-mno-*` denial on the
+    /// SSE4.2 level withdraws the AVX-implied POPCNT, while an explicit grant
+    /// or a `-march=` row survives in either order.
+    #[test]
+    fn popcnt_follows_the_measured_gcc_unwind_matrix() {
+        for (flags, want) in [
+            (&["-mavx"][..], true),
+            (&["-mavx", "-mno-sse4.2"], false),
+            // A later AVX-family grant re-establishes SSE4.2 and POPCNT
+            // (GCC: `-mno-sse2 -mavx2` and `-mno-sse -mfma` define both).
+            (&["-mno-sse4.2", "-mavx"], true),
+            (&["-mno-sse2", "-mavx2"], true),
+            (&["-mno-sse", "-mfma"], true),
+            (&["-mpopcnt", "-mavx", "-mno-sse4.2"], true),
+            (&["-mavx", "-mno-sse4.2", "-mpopcnt"], true),
+            (&["-msse4.2", "-mno-popcnt"], false),
+            (&["-mno-popcnt", "-msse4.2"], false),
+            (&["-mno-sse4.1", "-msse4.2"], true),
+            (&["-msse4.2", "-mno-sse4.1"], false),
+            (&["-mabm", "-mno-sse4.2"], true),
+            (&["-march=amdfam10", "-mno-sse4.2"], true),
+            (&["-march=x86-64-v3", "-mno-sse4.2"], true),
+            (&["-mno-sse4.2", "-march=x86-64-v3"], true),
+        ] {
+            assert_eq!(
+                features(flags).contains(F::Popcnt),
+                want,
+                "POPCNT {flags:?}"
+            );
+        }
+        // CRC32/SSE4.2 ride the same unwind.
+        assert!(!features(&["-msse4.2", "-mno-sse4.1"]).contains(F::Sse42));
+        assert!(features(&["-mno-sse4.1", "-msse4.2"]).contains(F::Sse42));
+    }
+
+    /// `-mgeneral-regs-only` is a sticky `-mno-mmx`: the SSE levels come back
+    /// with `-maes`/`-msse*`, `__MMX__` does not until an explicit `-mmmx`.
+    #[test]
+    fn general_regs_only_withholds_mmx_until_regranted() {
+        assert!(parse(&["-mgeneral-regs-only"]).mmx_explicitly_disabled);
+        assert!(parse(&["-mgeneral-regs-only", "-maes"]).mmx_explicitly_disabled);
+        assert!(parse(&["-mgeneral-regs-only", "-msse2"]).mmx_explicitly_disabled);
+        assert!(parse(&["-mmmx", "-mgeneral-regs-only"]).mmx_explicitly_disabled);
+        assert!(!parse(&["-mgeneral-regs-only", "-maes", "-mmmx"]).mmx_explicitly_disabled);
+    }
+
+    /// `-mprefer-vector-width=`: GCC 16.2's vocabulary and last-wins
+    /// resolution, with `none` meaning "let the tuning decide".
+    #[test]
+    fn prefer_vector_width_is_parsed_and_resolved() {
+        assert_eq!(parse(&[]).x86_prefer_vector_bits, None);
+        assert_eq!(
+            parse(&["-mprefer-vector-width=128"]).x86_prefer_vector_bits,
+            Some(128)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=256"]).x86_prefer_vector_bits,
+            Some(256)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=512"]).x86_prefer_vector_bits,
+            Some(512)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=none"]).x86_prefer_vector_bits,
+            None
+        );
+        // The deprecated alias GCC still accepts.
+        assert_eq!(
+            parse(&["-mprefer-avx128"]).x86_prefer_vector_bits,
+            Some(128)
+        );
+        // Last one wins, `none` included.
+        assert_eq!(
+            parse(&["-mprefer-vector-width=128", "-mprefer-vector-width=256"])
+                .x86_prefer_vector_bits,
+            Some(256)
+        );
+        assert_eq!(
+            parse(&["-mprefer-vector-width=128", "-mprefer-vector-width=none"])
+                .x86_prefer_vector_bits,
+            None
+        );
+        // The default is the tuning row's datapath, floored at 256 so a
+        // 128-bit datapath does not silently halve every loop step.
+        assert_eq!(parse(&["-mavx2"]).resolved_prefer_vector_bits(), 256);
+        assert_eq!(
+            parse(&["-mavx2", "-mprefer-vector-width=128"]).resolved_prefer_vector_bits(),
+            128
+        );
+        // Rejection uses GCC's wording (build systems parse the list).
+        let mut d = Driver::new();
+        let args = ["ccc", "-mprefer-vector-width=64", "x.c"].map(str::to_string);
+        let err = d.parse_cli_args(&args).unwrap_err();
+        assert!(err.contains("unrecognized argument in option"), "{err}");
+        assert!(err.contains("128 256 512 none"), "{err}");
     }
 }

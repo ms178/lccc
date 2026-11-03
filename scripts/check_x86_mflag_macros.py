@@ -38,14 +38,69 @@ MACROS = sorted({m for _, m in GEN.FEATURE_MACROS} | {m for _, m in GEN.EXTRA_MA
 OPTIONS = sorted({GEN.OPTION_NAMES[v] for v, _ in GEN.FEATURE_MACROS}
                  | {o for _, _, o, _ in GEN.PSEUDO} | set(GEN.EXTRA_OPTIONS)
                  | set(GEN.EXTRA_OPTION_NAMES.values()))
-# Deliberate divergences, each with its reason (flags -> macros lccc omits):
-# GCC keeps announcing AES, PCLMUL and GFNI with the SSE register file off
-# but rejects their intrinsics there (they need SSE2): lccc's macros only
-# promise intrinsics that compile.
-FORKS = {'__AES__', '__PCLMUL__', '__GFNI__'}
-SSE_OFF = ('-mno-sse', '-mno-sse2', '-mgeneral-regs-only')
+# Deliberate divergences, each with its reason. AES/PCLMUL/GFNI used to be one
+# (GCC announces them with the SSE register file off while rejecting their
+# intrinsics there); lccc now matches GCC's announcement and keeps the SSE2
+# requirement in the intrinsic gate instead, so that fork is gone and a
+# regression on it fails this script again.
+#
+# The one remaining class is an option-layer cascade, not a capability
+# difference.  GCC's `-mno-xsave` clears MASK_AVX without cascading into the
+# dependent option bits, so `-msha512 -mno-xsave` (on ANY base, and
+# `-march=clearwaterforest -mno-xsave` for the pair) still announces
+# `__SHA512__`/`__SM3__`/`__SM4__` while the very same command line *rejects*
+# `_mm256_sha512msg1_epi64` from sha512intrin.h (measured, gcc-16.2): the
+# oracle contradicts itself.  lccc drops the announcement together with the
+# AVX state component it needs — stricter, never weaker, and a `#ifdef` probe
+# can no longer select a path the intrinsic gate refuses.
+#
+# The rule is one-sided in both directions, so nothing is hidden:
+#   * `missing` is masked, because lccc dropping a macro the oracle only
+#     announces by accident is the intended behaviour;
+#   * `extra` is never masked, and when `-mno-xsave` is the LAST decision the
+#     three macros must be absent from lccc's dump even though the oracle
+#     prints them -- that is what keeps the stricter behaviour from silently
+#     regressing back into the contradiction.
+XSAVE_CASCADE_MACROS = {'__SHA512__', '__SM3__', '__SM4__'}
+
+
+def masked(flags):
+    """Macros the oracle announces but lccc deliberately drops."""
+    return XSAVE_CASCADE_MACROS if '-mno-xsave' in flags else set()
 # Refused with a diagnostic, as documented: lccc has no AVX10 code generation.
 REFUSED = {'avx10.1', 'avx10.2'}
+# Ordered pairs that pin the one cascade the single-option matrix cannot see:
+# XSAVE is an *option-layer* bit, so `-mno-xsave` has to withdraw the
+# extensions whose state it saves while `-mxsave`/an implying option re-arms
+# them, and the later spelling always wins.  `--pairs` covers this exhaustively
+# but is far too slow for CI, so the interesting orderings are enumerated here
+# and run on every base by default.
+CASCADES = [
+    ('-mno-xsave', '-mavx'),
+    ('-mavx', '-mno-xsave'),
+    ('-mno-xsave', '-mfma'),
+    ('-mfma', '-mno-xsave'),
+    ('-mno-xsave', '-mavx2'),
+    ('-mavx2', '-mno-xsave'),
+    ('-mno-xsave', '-mamx-tile'),
+    ('-mamx-tile', '-mno-xsave'),
+    ('-mamx-tile', '-mxsave'),
+    ('-mno-xsave', '-mamx-int8'),
+    ('-mamx-int8', '-mno-xsave'),
+    ('-mno-xsave', '-mamx-bf16'),
+    ('-mno-xsave', '-mavxifma'),
+    ('-mavxifma', '-mno-xsave'),
+    ('-mno-xsave', '-mavxneconvert'),
+    ('-mno-xsave', '-msha512'),
+    ('-msha512', '-mno-xsave'),
+    ('-mno-xsave', '-maes'),
+    ('-maes', '-mno-xsave'),
+    ('-mno-xsave', '-mgfni'),
+    ('-mno-sse2', '-maes'),
+    ('-maes', '-mno-sse2'),
+    ('-mno-sse', '-mpclmul'),
+    ('-mno-sse', '-mgfni'),
+]
 ENV = dict(os.environ, LC_ALL='C')
 
 
@@ -93,6 +148,10 @@ def cases(bases, pairs):
                 yield flags + [f'-m{option}', f'-mno-{option}']
                 yield flags + [f'-mno-{option}', f'-m{option}']
 
+    for base in bases:
+        for cascade in CASCADES:
+            yield base.split() + list(cascade)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
@@ -119,9 +178,14 @@ def main():
         if got is None:
             refused = any(f.removeprefix('-m').removeprefix('no-') in unmodelled | REFUSED for f in flags[-2:])
             return flags, 'lccc-rejects', refused
-        if any(f in SSE_OFF for f in flags):
-            want, got = want - FORKS, got - FORKS
-        return flags, (sorted(want - got), sorted(got - want)), want == got
+        dropped = masked(flags)
+        extra = got - want
+        if flags[-1:] == ['-mno-xsave']:
+            # Oracle self-contradiction: GCC announces these and rejects their
+            # intrinsics on the same command line, so lccc must drop them.
+            extra |= got & XSAVE_CASCADE_MACROS
+        missing = want - got - dropped
+        return flags, (sorted(missing), sorted(extra)), not extra and not missing
 
     total = failed = 0
     with ThreadPoolExecutor(args.j) as pool:

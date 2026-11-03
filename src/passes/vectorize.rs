@@ -188,6 +188,12 @@ thread_local! {
     // vectorizer to 128-bit forms rather than disable it — `-mno-avx2` (or no
     // AVX2 grant at all) still leaves the SSE2 register file legal.
     static X86_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Preferred vector register width in bits (128/256), from
+    // `-mprefer-vector-width=` and the `-mtune=` row's SIMD datapath.
+    // 256 default: the widest class these passes implement (there is no
+    // AVX-512 emitter), so a build that says nothing behaves exactly as
+    // before the option existed.
+    static X86_PREFER_VECTOR_BITS: std::cell::Cell<u16> = const { std::cell::Cell::new(256) };
     // SSE4.1 availability for the 128-bit lowerings that have no SSE2
     // spelling (`pmulld`).  `-mno-avx` alone keeps it (x86-64-v2 hardware);
     // `-march=x86-64` / `-mno-sse4.1` clear it.
@@ -305,7 +311,12 @@ pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool, avx512vl: bo
     X86_SIMD_AVAILABLE.with(|available| available.set(simd));
     X86_SSE1_AVAILABLE.with(|available| available.set(simd));
     // AVX2 is a subset of "SIMD at all"; never let a caller assert AVX2 while
-    // SIMD itself is forbidden.
+    // SIMD itself is forbidden. This cell is the *hardware* permission and
+    // stays one: an explicit `vector_size(32)` type keeps its 256-bit
+    // register image under `-mprefer-vector-width=128` (GCC does the same),
+    // and the frontend's packed lowering reads the same families. The width
+    // *preference* is a separate question asked at every auto-vectorization
+    // width choice through [`x86_avx2_width_wanted`].
     X86_AVX2_AVAILABLE.with(|available| available.set(avx2 && simd));
     X86_SSE41_AVAILABLE.with(|available| available.set(sse41 && simd));
     // Same subset discipline: VL permission without the SIMD register file
@@ -358,6 +369,47 @@ pub(crate) fn x86_simd_available_pub() -> bool {
 // and for every pass that is not the post-if-conversion rerun.
 thread_local! {
     static LATE_MINMAX_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record the preferred vector width for this translation unit.
+///
+/// `bits` is the width the *cost model* should aim for; it is clamped to the
+/// classes these passes implement (128 or 256 -- there is no AVX-512
+/// emitter, so `-mprefer-vector-width=512` means "the widest available",
+/// i.e. 256). Called by `run_passes` next to [`Self::set_x86_simd_isa`], so a
+/// worker thread compiling the next TU cannot inherit the previous one's
+/// preference.
+pub(crate) fn set_x86_prefer_vector_bits(bits: u16) {
+    X86_PREFER_VECTOR_BITS.with(|cell| cell.set(bits.clamp(128, 512)));
+}
+
+/// Preferred vector width in bits for this translation unit (128 or 256).
+pub(crate) fn x86_prefer_vector_bits_pub() -> u16 {
+    X86_PREFER_VECTOR_BITS.with(std::cell::Cell::get)
+}
+
+/// Whether the 256-bit class is *wanted*: the request is not capped at 128.
+fn x86_prefer_wide() -> bool {
+    x86_prefer_vector_bits_pub() >= 256
+}
+
+/// `-mprefer-vector-width=` for the SLP driver (same discipline as
+/// [`x86_prefer_vector_bits_pub`]).
+pub(crate) fn x86_prefer_wide_pub() -> bool {
+    x86_prefer_wide()
+}
+
+/// Whether an **auto-vectorization** width decision may pick the 256-bit
+/// class: the target must have it (hardware permission) *and* the request
+/// must not cap the width at 128 bits.
+///
+/// This is the single predicate every loop/map/stencil/SLP/strided width
+/// choice reads, and it deliberately does **not** gate the explicit
+/// `vector_size` lowering: a user-written 32-byte vector type is a promise
+/// about the type, not a cost-model hint (GCC keeps one `vpaddd %ymm` for it
+/// under `-mprefer-vector-width=128`, measured).
+fn x86_avx2_width_wanted() -> bool {
+    x86_avx2_available() && x86_prefer_wide()
 }
 
 /// AVX2 (256-bit ymm) availability for passes that emit YMM-shaped
@@ -731,7 +783,7 @@ fn vectorize_with_analysis_mode(
         };
         if let Some(mut pattern) = matmul_pattern {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
-            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_available();
+            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_width_wanted();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
             // The AArch64 two-wide lowering emits both halves per iteration,
             // consuming four doubles. Use the real machine-step width for the
@@ -839,7 +891,7 @@ fn vectorize_with_analysis_mode(
             && ((!force_two_wide && !force_sse2 && x86_strict_recip_avx2_enabled())
                 || (x86_64_vector_intrinsics_available()
                     && x86_simd_available_pub()
-                    && !x86_avx2_available()))
+                    && !x86_avx2_width_wanted()))
             && let Some(strict_pattern) =
                 analyze_strict_computed_recip_reduction(func, loop_info, cfg)
             && let Some(changes) = transform_strict_computed_recip_reduction(func, &strict_pattern)
@@ -919,7 +971,7 @@ fn vectorize_with_analysis_mode(
             && !force_two_wide
             && !late_minmax_only()
             && !force_sse2
-            && x86_avx2_available()
+            && x86_avx2_width_wanted()
             && let Some(adler_pattern) = analyze_adler_loop(func, loop_info, cfg)
         {
             // Adler-32 rolling-checksum epic (`s1 += b; s2 += s1`): the
@@ -1144,7 +1196,7 @@ fn vectorize_with_analysis_mode(
             }
 
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
-            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_available();
+            let use_sse2 = force_two_wide || force_sse2 || !x86_avx2_width_wanted();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
 
             // Same profitability gate as the matmul path (the reduction path
@@ -1200,7 +1252,7 @@ fn vectorize_with_analysis_mode(
             {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
-                let avx2 = !neon && !force_two_wide && !map_sse_forced() && x86_avx2_available();
+                let avx2 = !neon && !force_two_wide && !map_sse_forced() && x86_avx2_width_wanted();
                 // I64/U64 map intrinsics are two-lane XMM operations even on
                 // AVX2 targets.  Advertising four lanes here advances the IV
                 // by 32 bytes but only loads/stores 16, silently dropping
@@ -1233,7 +1285,8 @@ fn vectorize_with_analysis_mode(
                         analyze_stencil_pattern(func, loop_info, symbol_facts)
                     {
                         if !neon {
-                            let avx2 = !force_two_wide && !map_sse_forced() && x86_avx2_available();
+                            let avx2 =
+                                !force_two_wide && !map_sse_forced() && x86_avx2_width_wanted();
                             if debug {
                                 eprintln!(
                                     "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
@@ -4514,7 +4567,7 @@ fn analyze_reduction_pattern(
     //   vector form (wider back-end). Decision per the pre-registered
     //   rule: the lift STANDS on this number. The kill switch stays for
     //   differential coverage (red-team gate leg 6).
-    if neon || (x86_avx2_available() && std::env::var("CCC_NO_LOOP_VEC_MAX").is_err()) {
+    if neon || (x86_avx2_width_wanted() && std::env::var("CCC_NO_LOOP_VEC_MAX").is_err()) {
         let latch_label = func.blocks[latch_idx].label;
         'max_search: for inst in &header.instructions {
             let Instruction::Phi {
@@ -5399,7 +5452,7 @@ fn analyze_reduction_pattern(
                 ..
             }
         ) && element_type == IrType::I64
-            && (x86_avx2_available() || (x86_simd_available() && !neon));
+            && (x86_avx2_width_wanted() || (x86_simd_available() && !neon));
         if element_type != IrType::I32 && !guard_widening_i32 {
             set_reject("conditional-sum guard needs an I32 element type (masked equal-width form)");
             return None;
@@ -10984,7 +11037,7 @@ impl ByteSumWidth {
 /// the x86 arms (its callers test `neon` first); the late min/max-only
 /// rerun is excluded by the callers as well.
 fn byte_sum_width(force_sse2: bool) -> Option<ByteSumWidth> {
-    if x86_avx2_available() && !force_sse2 {
+    if x86_avx2_width_wanted() && !force_sse2 {
         Some(ByteSumWidth::Ymm32)
     } else if x86_simd_available() && x86_64_vector_intrinsics_available() {
         Some(ByteSumWidth::Xmm16)
@@ -17457,7 +17510,7 @@ fn parse_byte_map_expr(
             // (`avx2 == true` in `transform_map_vector`), so keep SSE2 16-bit
             // lanes on `MapExpr::Select`.
             let u_minmax_hw =
-                elem_bytes == 1 || (!map_sse_forced() && !sse2_forced() && x86_avx2_available());
+                elem_bytes == 1 || (!map_sse_forced() && !sse2_forced() && x86_avx2_width_wanted());
             if u_minmax_hw {
                 if let MapExpr::Cmp(cmp_op, cl, cr) = &cond_expr {
                     if matches!(cmp_op, IrCmpOp::Ult | IrCmpOp::Ule) {
@@ -21527,7 +21580,7 @@ fn transform_strict_computed_recip_reduction(
             Operand::Value(byte_offset_phi),
             Operand::Value(scratch),
         ]);
-        if x86_avx2_available() {
+        if x86_avx2_width_wanted() {
             let one_splat = fresh_strict_value(&mut next_value_id);
             prefix.push(Instruction::Intrinsic {
                 dest: Some(one_splat),
@@ -21615,7 +21668,7 @@ fn transform_strict_computed_recip_reduction(
                 ty: IrType::U64,
             });
             remainder_iv_operand = Operand::Const(IrConst::I32((vec_iters * 4) as i32));
-        } else if x86_avx2_available() {
+        } else if x86_avx2_width_wanted() {
             let is_ge4 = fresh_strict_value(&mut next_value_id);
             let n_clamped = fresh_strict_value(&mut next_value_id);
             let n_u64 = fresh_strict_value(&mut next_value_id);
@@ -32176,7 +32229,7 @@ mod map_unroll_policy_tests {
         assert!(x86_sse1_available());
         // The ordinary setter is also used by tests/worker reuse; fail closed.
         let simd = x86_simd_available();
-        let avx2 = x86_avx2_available();
+        let avx2 = x86_avx2_width_wanted();
         let sse41 = x86_sse41_available();
         let vl = x86_avx512vl_available_pub();
         set_x86_simd_isa(false, false, false, false);
@@ -35313,7 +35366,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
                 }
                 continue;
             }
-            let avx2 = !map_sse_forced() && !sse2_forced() && x86_avx2_available();
+            let avx2 = !map_sse_forced() && !sse2_forced() && x86_avx2_width_wanted();
             // The I64/U64 intrinsic family has only two-lane XMM forms.
             let avx2 = avx2 && !matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
             let n = transform_map_vector(func, &pattern, avx2, false, fp_contract);
@@ -35486,7 +35539,7 @@ fn vectorize_function_mode(
     // skipped for the late min/max rerun, and the CCC_NO_GENERATOR_MAP kill
     // switch restores the scalar generator for A/B measurement.
     let (gen_enabled, gen_trace) = generator_map_policy();
-    let gen_changes = if gen_enabled && !late_minmax_only() && x86_avx2_available() {
+    let gen_changes = if gen_enabled && !late_minmax_only() && x86_avx2_width_wanted() {
         generator_map::transform_function(func, gen_trace)
     } else {
         0
@@ -38571,5 +38624,64 @@ mod outside_rewrite_availability_tests {
         assert_eq!(incoming[0].0, Operand::Value(Value(10)));
         assert_eq!(incoming[1].0, Operand::Value(Value(10)));
         assert_eq!(updates, 1, "only the exit reader is redirected");
+    }
+}
+
+#[cfg(test)]
+mod prefer_vector_width_tests {
+    //! `-mprefer-vector-width=` is a cost-model cap on the widths the
+    //! *auto-vectorizers* pick, never an ISA permission and never a promise
+    //! about an explicit `vector_size(32)` type: the hardware permission and
+    //! the width preference are two separate cells, and only
+    //! [`x86_avx2_width_wanted`] conjoins them.
+    use super::{
+        set_x86_prefer_vector_bits, set_x86_simd_isa, x86_avx2_available_pub,
+        x86_avx2_width_wanted, x86_prefer_vector_bits_pub, x86_simd_available_pub,
+        x86_sse41_available_pub,
+    };
+
+    #[test]
+    fn a_128_bit_preference_withholds_the_256_bit_class_only() {
+        // Baseline: AVX2 permission without a preference uses 256-bit shapes.
+        set_x86_prefer_vector_bits(256);
+        set_x86_simd_isa(true, true, true, false);
+        assert!(x86_avx2_available_pub());
+        assert!(x86_avx2_width_wanted());
+        assert!(x86_sse41_available_pub());
+
+        // 128-bit preference: the register class and every 128-bit lowering
+        // stay legal (so an explicit `vector_size(32)` type keeps its `ymm`
+        // image), the auto-vectorizers stop *choosing* 256-bit shapes.
+        set_x86_prefer_vector_bits(128);
+        set_x86_simd_isa(true, true, true, true);
+        assert!(
+            x86_avx2_available_pub(),
+            "the hardware permission is unchanged"
+        );
+        assert!(
+            !x86_avx2_width_wanted(),
+            "a 128-bit preference withholds ymm shapes"
+        );
+        assert!(x86_sse41_available_pub(), "the register class stays legal");
+        assert!(x86_simd_available_pub());
+
+        // 512 clamps to the widest implemented class (there is no AVX-512
+        // emitter), and the stored value says what was asked for.
+        set_x86_prefer_vector_bits(512);
+        assert_eq!(x86_prefer_vector_bits_pub(), 512);
+        set_x86_simd_isa(true, true, true, false);
+        assert!(x86_avx2_width_wanted());
+
+        // An ISA denial still wins over any preference.
+        set_x86_prefer_vector_bits(256);
+        set_x86_simd_isa(true, false, true, false);
+        assert!(!x86_avx2_available_pub() && !x86_avx2_width_wanted());
+        set_x86_simd_isa(false, true, true, false);
+        assert!(!x86_avx2_available_pub() && !x86_avx2_width_wanted());
+
+        // Leave the thread-local state as the default for any test that runs
+        // next on this thread under `--test-threads=1`.
+        set_x86_simd_isa(false, false, false, false);
+        set_x86_prefer_vector_bits(256);
     }
 }

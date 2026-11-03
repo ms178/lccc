@@ -1463,7 +1463,8 @@ impl VectorSchedule {
     fn new(p: &StridedI32ReducePattern) -> Option<Self> {
         // Both widths share one lane meaning per stream kind (`load`), so
         // proven and unproven streams mix and the choice is the ISA alone.
-        let width = if x86_avx2_available() && !sse2_forced() {
+        // Auto-vectorization width: honour `-mprefer-vector-width=128`.
+        let width = if super::x86_avx2_width_wanted() && !sse2_forced() {
             StridedWidth::X8
         } else {
             StridedWidth::X4
