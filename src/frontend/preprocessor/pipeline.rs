@@ -654,6 +654,9 @@ impl Preprocessor {
                     }
                 }
             }
+            // A `SOURCE_DATE_EPOCH` the compiler rejected is reported at the token
+            // that asked for it, which is where GCC puts it.
+            self.report_invalid_source_date_epoch(source_line_num);
         }
 
         // Pragmas queued by the final line's expansion.
@@ -1161,7 +1164,6 @@ impl Preprocessor {
             }
         }
         self.macros.define(MacroDef {
-            is_time_builtin: false,
             name: name.to_string(),
             is_function_like: false,
             params: Vec::new(),
@@ -1699,6 +1701,29 @@ impl Preprocessor {
         let expanded = self.resolve_defined_in_expr(&expanded, diag_line);
         let condition = self.evaluate_pp_condition(&expanded, diag_line);
         self.conditionals.handle_elif(condition);
+    }
+
+    /// Diagnose a `SOURCE_DATE_EPOCH` the compiler could not accept, once, at the
+    /// token that first asked for a value derived from it.
+    ///
+    /// The message and the severity are GCC 16.2's (Clang words it differently but
+    /// also rejects the value), and so is the timing: a malformed value that no
+    /// macro ever reads is not an error -- Clang fails the build at start-up even
+    /// then, which would fail a build that GCC accepts. The macro that asked still
+    /// expands, to the sampled value, exactly as GCC's does.
+    fn report_invalid_source_date_epoch(&mut self, line: usize) {
+        if !self.macros.take_invalid_source_date_epoch() {
+            return;
+        }
+        self.errors.push(PreprocessorDiagnostic {
+            kind: crate::common::error::WarningKind::Cpp,
+            file: self.current_file(),
+            line: line.max(1),
+            col: 1,
+            message: "environment variable 'SOURCE_DATE_EPOCH' must expand to a \
+                      non-negative integer less than or equal to 253402300799"
+                .to_string(),
+        });
     }
 
     fn handle_line_directive(&mut self, rest: &str, source_line_num: usize) {

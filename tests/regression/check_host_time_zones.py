@@ -64,6 +64,9 @@ FIXED = [
 
 SEED = 20261102
 
+# The largest instant both reference compilers accept: 9999-12-31T23:59:59Z.
+MAX_SOURCE_DATE_EPOCH = 253_402_300_799
+
 
 def observations(seed: int) -> list[int]:
     rng = random.Random(seed)
@@ -126,7 +129,10 @@ def main(argv: list[str]) -> int:
                     print(f"FAIL TZ={zone} @{stamp}: lccc={got!r} want={want!r}")
 
     # SOURCE_DATE_EPOCH: reproducible, UTC, and shared by all three macros.
-    for stamp in stamps:
+    # Only instants both reference compilers accept are candidates: a negative or
+    # five-digit-year value is *rejected* by GCC 16.2 and Clang 23.1.4 (and by
+    # lccc, which diagnoses it), so it cannot carry a reproducible value.
+    for stamp in [s for s in stamps if 0 <= s <= MAX_SOURCE_DATE_EPOCH]:
         env = dict(os.environ)
         env.pop("TZ", None)
         env["SOURCE_DATE_EPOCH"] = str(stamp)

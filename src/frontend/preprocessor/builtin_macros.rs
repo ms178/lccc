@@ -18,7 +18,6 @@ use super::macro_defs::{MacroDef, MacroTable};
 /// Helper to define a simple object-like macro.
 fn def(macros: &mut MacroTable, name: &str, body: &str) {
     macros.define(MacroDef {
-        is_time_builtin: false,
         name: name.to_string(),
         is_function_like: false,
         params: Vec::new(),
@@ -369,7 +368,6 @@ fn define_extra_gcc_predefines(macros: &mut MacroTable) {
     }
     for &(name, params, body) in EXTRA_GCC_FUNC_PREDEFINES {
         macros.define(MacroDef {
-            is_time_builtin: false,
             name: name.to_string(),
             is_function_like: true,
             params: params.iter().map(|p| p.to_string()).collect(),

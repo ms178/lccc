@@ -417,6 +417,22 @@ impl X86Codegen {
             }
             return;
         }
+        // A byte holds at most eight bits, and a sound count of eight bits
+        // needs neither a 24-bit scan nor a scratch register: `x * 0x08040201`
+        // spreads the eight bits into separate nibbles (three bits of shift,
+        // so `>> 3` aligns them), `& 0x11111111` isolates one bit per nibble,
+        // and the second multiplier sums the eight nibbles into the top nibble.
+        // Five instructions, exact for every byte (clang's shape).  The
+        // operand is already zero-extended by the mask above, so the whole
+        // 32-bit SWAR -- including its push/pop of %rcx -- is skipped.
+        if matches!(ty, IrType::I8 | IrType::U8) {
+            self.state.emit("    imull $0x08040201, %eax, %eax");
+            self.state.emit("    shrl $3, %eax");
+            self.state.emit("    andl $0x11111111, %eax");
+            self.state.emit("    imull $0x11111111, %eax, %eax");
+            self.state.emit("    shrl $28, %eax");
+            return;
+        }
         // POPCNT (0F B8) is #UD on pre-Nehalem/Barcelona x86-64 — it is a
         // v2 feature, not v1. Baseline fallback: the classic O(1) SWAR
         // Hamming-weight sequence (the same code GCC emits for `__builtin_

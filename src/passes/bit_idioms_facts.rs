@@ -403,6 +403,9 @@ fn fold(
     if let Some(replacement) = count_merge::fold(inst, cx, facts, fresh) {
         return Some(replacement);
     }
+    if let Some(replacement) = count_width::fold(inst, cx, fresh) {
+        return Some(replacement);
+    }
     if let Some(replacement) = guards::fold(inst, cx, facts, fresh) {
         return Some(replacement);
     }
@@ -1076,6 +1079,9 @@ mod guards;
 
 #[path = "bit_idioms_count_merge.rs"]
 mod count_merge;
+
+#[path = "bit_idioms_count_width.rs"]
+mod count_width;
 
 #[path = "bit_idioms_logic.rs"]
 mod logic;

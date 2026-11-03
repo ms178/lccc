@@ -691,7 +691,6 @@ impl Preprocessor {
                     // C23 `nullptr_t` and `unreachable()`).
                     if include_path == "stdarg.h" {
                         self.macros.define(MacroDef {
-                            is_time_builtin: false,
                             name: "va_start".to_string(),
                             is_function_like: true,
                             params: vec!["ap".to_string()],
@@ -703,7 +702,6 @@ impl Preprocessor {
                             && !self.macros.is_defined("__STDC_VERSION_STDARG_H__")
                         {
                             self.macros.define(MacroDef {
-                                is_time_builtin: false,
                                 name: "__STDC_VERSION_STDARG_H__".to_string(),
                                 is_function_like: false,
                                 params: Vec::new(),
@@ -718,7 +716,6 @@ impl Preprocessor {
                     {
                         if !self.macros.is_defined("unreachable") {
                             self.macros.define(MacroDef {
-                                is_time_builtin: false,
                                 name: "unreachable".to_string(),
                                 is_function_like: true,
                                 params: Vec::new(),
@@ -729,7 +726,6 @@ impl Preprocessor {
                         }
                         if !self.macros.is_defined("__STDC_VERSION_STDDEF_H__") {
                             self.macros.define(MacroDef {
-                                is_time_builtin: false,
                                 name: "__STDC_VERSION_STDDEF_H__".to_string(),
                                 is_function_like: false,
                                 params: Vec::new(),
@@ -740,7 +736,6 @@ impl Preprocessor {
                         }
                         if !self.macros.is_defined("_GCC_NULLPTR_T") {
                             self.macros.define(MacroDef {
-                                is_time_builtin: false,
                                 name: "_GCC_NULLPTR_T".to_string(),
                                 is_function_like: false,
                                 params: Vec::new(),
@@ -1648,7 +1643,6 @@ impl Preprocessor {
                 // so one variadic macro serves every dialect: `va_start(ap)`
                 // and `va_start(ap, last)` both lower identically.
                 self.macros.define(MacroDef {
-                    is_time_builtin: false,
                     name: "va_start".to_string(),
                     is_function_like: true,
                     params: vec!["ap".to_string()],
@@ -1657,7 +1651,6 @@ impl Preprocessor {
                     body: "__builtin_va_start(ap)".to_string(),
                 });
                 self.macros.define(MacroDef {
-                    is_time_builtin: false,
                     name: "va_end".to_string(),
                     is_function_like: true,
                     params: vec!["ap".to_string()],
@@ -1666,7 +1659,6 @@ impl Preprocessor {
                     body: "__builtin_va_end(ap)".to_string(),
                 });
                 self.macros.define(MacroDef {
-                    is_time_builtin: false,
                     name: "va_copy".to_string(),
                     is_function_like: true,
                     params: vec!["dest".to_string(), "src".to_string()],
@@ -1678,7 +1670,6 @@ impl Preprocessor {
                 // It's handled by the parser as a special built-in, so we define
                 // the macro to expand to __builtin_va_arg which the lexer recognizes.
                 self.macros.define(MacroDef {
-                    is_time_builtin: false,
                     name: "va_arg".to_string(),
                     is_function_like: true,
                     params: vec!["ap".to_string(), "type".to_string()],
@@ -1691,7 +1682,6 @@ impl Preprocessor {
             }
             "stdcountof.h" => {
                 self.macros.define(MacroDef {
-                    is_time_builtin: false,
                     name: "countof".to_string(),
                     is_function_like: false,
                     params: Vec::new(),
@@ -1702,7 +1692,6 @@ impl Preprocessor {
             }
             "stdckdint.h" => {
                 self.macros.define(MacroDef {
-                    is_time_builtin: false,
                     name: "__STDC_VERSION_STDCKDINT_H__".to_string(),
                     is_function_like: false,
                     params: Vec::new(),
@@ -1716,7 +1705,6 @@ impl Preprocessor {
                     ("ckd_mul", "__builtin_mul_overflow"),
                 ] {
                     self.macros.define(MacroDef {
-                        is_time_builtin: false,
                         name: name.to_string(),
                         is_function_like: true,
                         params: vec!["r".to_string(), "a".to_string(), "b".to_string()],
@@ -1734,7 +1722,6 @@ impl Preprocessor {
                     ("__STDC_ENDIAN_NATIVE__", "__BYTE_ORDER__"),
                 ] {
                     self.macros.define(MacroDef {
-                        is_time_builtin: false,
                         name: name.to_string(),
                         is_function_like: false,
                         params: Vec::new(),
@@ -1760,7 +1747,6 @@ impl Preprocessor {
                     "stdc_bit_ceil",
                 ] {
                     self.macros.define(MacroDef {
-                        is_time_builtin: false,
                         name: base.to_string(),
                         is_function_like: true,
                         params: vec!["x".to_string()],
@@ -1771,7 +1757,6 @@ impl Preprocessor {
                 }
                 for base in ["stdc_rotate_left", "stdc_rotate_right"] {
                     self.macros.define(MacroDef {
-                        is_time_builtin: false,
                         name: base.to_string(),
                         is_function_like: true,
                         params: vec!["x".to_string(), "c".to_string()],

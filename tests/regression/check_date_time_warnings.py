@@ -28,6 +28,14 @@ FIXTURES = [
 ]
 
 
+# All three dynamic builtins must use the ownership-aware warning path, not a
+# flag on their (now deliberately empty) macro replacement definitions.
+for builtin in ('__TIME__', '__TIMESTAMP__'):
+    for name, text, count in list(FIXTURES):
+        if name in ('alias', 'unused', 'stringified', 'redefined', 'restored'):
+            FIXTURES.append((f'{name}-{builtin}', text.replace('__DATE__', builtin), count))
+
+
 def run(lccc: list[str], gcc: list[str], clang: list[str] | None = None) -> None:
     # check_warning_precedence imports the historical two-argument API.
     # Keep that caller compatible without dropping the mandatory Clang controls.
