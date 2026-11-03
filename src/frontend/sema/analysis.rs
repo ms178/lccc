@@ -11052,6 +11052,12 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         } else {
             std::borrow::Cow::Borrowed(&base_key)
         };
+        let repeated_definition = fields.is_some()
+            && name.as_ref().is_some_and(|tag| {
+                self.result
+                    .type_context
+                    .tag_definition_seen_in_current_scope(tag, span)
+            });
         if fields.is_some()
             && let Some(tag) = name
             && self.result.type_context.record_tag_definition(tag, span)
@@ -11081,7 +11087,8 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                         // correspond, so dropping the `!` inverts the whole
                         // mechanism (verified -- it silently restored the
                         // TAG-ID-1 miscompile and the gate went red).
-                        !prev.fields.is_empty()
+                        !repeated_definition
+                            && !prev.fields.is_empty()
                             && (!record_layouts_correspond(prev, new_layout, &layouts) || !self.c23)
                     })
                 };

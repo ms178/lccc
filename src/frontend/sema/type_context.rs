@@ -780,6 +780,28 @@ impl TypeContext {
         false
     }
 
+    /// Whether this exact AST definition was already resolved in the active
+    /// lexical scope. Replaying it must not manufacture a new record identity;
+    /// a definition in a fresh inner scope must still shadow the outer tag.
+    pub fn tag_definition_seen_in_current_scope(&self, name: &str, span: Span) -> bool {
+        let scopes = self.scope_stack.borrow();
+        let contains = |sites: &TagDefinitionSites| {
+            sites.first == span
+                || sites
+                    .additional
+                    .as_ref()
+                    .is_some_and(|more| more.contains(&span))
+        };
+        if let Some(scope) = scopes.last() {
+            scope.tag_definitions.get(name).is_some_and(contains)
+        } else {
+            self.file_scope_tag_definitions
+                .borrow()
+                .get(name)
+                .is_some_and(contains)
+        }
+    }
+
     /// Record a complete tag definition in the active lexical scope.
     /// Returns true once for each distinct redefinition site; repeated semantic
     /// resolution of one AST node (same span) cannot duplicate its diagnostic.
@@ -1645,6 +1667,33 @@ mod typedef_cvr_scope_tests {
 mod tag_definition_scope_tests {
     use super::TypeContext;
     use crate::common::source::Span;
+
+    #[test]
+    fn definition_replay_checks_exact_sites_only_in_the_current_scope() {
+        let mut types = TypeContext::new();
+        let first = Span::new(1, 2, 0);
+        let second = Span::new(3, 4, 0);
+        let other_file = Span::new(1, 2, 1);
+        assert!(!types.tag_definition_seen_in_current_scope("S", first));
+        types.record_tag_definition("S", first);
+        assert!(types.tag_definition_seen_in_current_scope("S", first));
+        assert!(!types.tag_definition_seen_in_current_scope("S", second));
+        assert!(!types.tag_definition_seen_in_current_scope("S", other_file));
+        assert!(!types.tag_definition_seen_in_current_scope("T", first));
+        types.record_tag_definition("S", second);
+        assert!(types.tag_definition_seen_in_current_scope("S", second));
+        types.push_scope();
+        assert!(!types.tag_definition_seen_in_current_scope("S", first));
+        types.record_tag_definition("S", first);
+        assert!(types.tag_definition_seen_in_current_scope("S", first));
+        assert!(!types.tag_definition_seen_in_current_scope("S", second));
+        types.pop_scope();
+        assert!(types.tag_definition_seen_in_current_scope("S", first));
+        assert!(types.tag_definition_seen_in_current_scope("S", second));
+        types.push_scope();
+        assert!(!types.tag_definition_seen_in_current_scope("S", first));
+        types.pop_scope();
+    }
 
     #[test]
     fn duplicate_site_is_reported_once_and_scopes_are_isolated() {
