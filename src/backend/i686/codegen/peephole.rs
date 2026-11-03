@@ -8612,12 +8612,20 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // destination is %eax or the divisor register; anything else
             // (including flags producers and unknown destinations) ends the
             // block.
-            let dest = match &infos[p].kind {
-                LineKind::Move { dst, src } => {
+            let dest = match infos[p].kind {
+                LineKind::Move { dst, .. } => dst,
+                LineKind::LoadEbp { reg, .. } => reg,
+                LineKind::Other { dest_reg } => dest_reg,
+                _ => return Some((staging, read_regs, read_slots)),
+            };
+            if dest == REG_NONE || (dest != REG_EAX && dest != divisor) {
+                return Some((staging, read_regs, read_slots));
+            }
+            match &infos[p].kind {
+                LineKind::Move { src, .. } => {
                     read_regs.push(*src);
-                    *dst
                 }
-                LineKind::LoadEbp { reg, offset, size } => {
+                LineKind::LoadEbp { offset, size, .. } => {
                     read_slots.push((*offset, size_bytes(*size)));
                     if text.contains("(%esp)") {
                         read_regs.push(REG_ESP);
@@ -8626,9 +8634,8 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     } else {
                         return None;
                     }
-                    *reg
                 }
-                LineKind::Other { dest_reg } => {
+                LineKind::Other { .. } => {
                     // Only a literal immediate or a plain register is a
                     // known source. An indirect load can alias any store.
                     let Some(rest) = text.strip_prefix("movl ") else {
@@ -8650,12 +8657,8 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     {
                         return None;
                     }
-                    *dest_reg
                 }
-                _ => return Some((staging, read_regs, read_slots)),
-            };
-            if dest == REG_NONE || (dest != REG_EAX && dest != divisor) {
-                return Some((staging, read_regs, read_slots));
+                _ => unreachable!(),
             }
             // Partial-width writes leave old register bits in place. They
             // cannot establish the complete repeated dividend or divisor.
@@ -16289,12 +16292,13 @@ mod tests {
             &valid.replace("movl %esi, %eax", "movl (%ebx), %eax")
         ));
         assert!(!apply(&valid.replace("ret\n", "setne %bl\nret\n")));
-        assert!(!apply(&valid.replace(
-            "movl %edx, %edi",
-            "movl %edx, %edi\nmovl %ebx, %ecx"
-        )));
+        assert!(!apply(
+            &valid.replace("movl %edx, %edi", "movl %edx, %edi\nmovl %ebx, %ecx")
+        ));
         assert!(!apply(&valid.replace("movl %esi, %eax", "movl %esi, %ecx")));
-        assert!(!apply(&valid.replace("movl %esi, %eax", "movw 4(%esp), %ax")));
+        assert!(!apply(
+            &valid.replace("movl %esi, %eax", "movw 4(%esp), %ax")
+        ));
         let stack = valid
             .replace("movl %esi, %eax", "movl 4(%esp), %eax")
             .replace("movl %edx, %edi", "movl %edx, %edi\nmovl %ebx, 4(%ebp)");
