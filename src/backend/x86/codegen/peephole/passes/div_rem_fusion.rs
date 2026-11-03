@@ -36,7 +36,8 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             continue;
         };
         let source_reg = register_at_width(source.trim(), width);
-        let stack_base = direct_stack_slot(source.trim()).map(|(base, _)| usize::from(base));
+        let stack_slot = direct_stack_slot(source.trim());
+        let stack_base = stack_slot.map(|(base, _)| usize::from(base));
         if destination.trim() != REG_NAMES[width][0]
             || source_reg.is_none() && stack_base.is_none()
             || source_reg.is_some_and(|reg| matches!(reg, 0 | 2 | 4))
@@ -76,8 +77,8 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         if matches!(divisor_reg, 0 | 2 | 4) {
             continue;
         }
-        // Only explicitly understood register moves may cross the window.
-        // In particular, no memory effects or implicit outputs are assumed.
+        // Cross only instructions with explicitly modeled effects. Any
+        // unrecognized memory write, implicit output or barrier stops us.
         let mut cursor = div_idx + 1;
         let mut copies = 0;
         let mut candidate = infos.len();
@@ -94,6 +95,50 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             if text == stage {
                 candidate = i;
                 break;
+            }
+            // Register-only comparisons have no GPR or memory outputs. The
+            // removed divide's flags are independently proven dead below.
+            let cmp = ["cmpl ", "cmpq ", "testl ", "testq "]
+                .iter()
+                .find_map(|prefix| text.strip_prefix(prefix).map(|args| (*prefix, args)));
+            if let Some((opcode, args)) = cmp {
+                let cmp_width =
+                    usize::from(opcode.starts_with("cmpl") || opcode.starts_with("testl"));
+                if let Some((src, dst)) = args.split_once(',') {
+                    let src = src.trim();
+                    let source_ok = register_at_width(src, cmp_width).is_some()
+                        || src
+                            .strip_prefix('$')
+                            .is_some_and(|v| v.parse::<i64>().is_ok());
+                    if source_ok && register_at_width(dst.trim(), cmp_width).is_some() {
+                        copies += 1;
+                        cursor = i + 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            // A direct stack store is safe only if it cannot overlap a stack
+            // dividend. Distinct stack bases may alias and are not compared.
+            if let Some(args) = text.strip_prefix(if width == 1 { "movl " } else { "movq " }) {
+                if let Some((src, dst)) = args.split_once(',') {
+                    if register_at_width(src.trim(), width).is_some() {
+                        if let Some((base, offset)) = direct_stack_slot(dst.trim()) {
+                            let size = if width == 1 { 4_i64 } else { 8_i64 };
+                            let safe = stack_slot.is_none_or(|(read_base, read_offset)| {
+                                let a = i64::from(offset);
+                                let b = i64::from(read_offset);
+                                base == read_base && (a + size <= b || b + size <= a)
+                            });
+                            if !safe {
+                                break;
+                            }
+                            copies += 1;
+                            cursor = i + 1;
+                            continue;
+                        }
+                    }
+                }
             }
             let Some(args) = text.strip_prefix(if width == 1 { "movl " } else { "movq " }) else {
                 break;
@@ -227,7 +272,7 @@ mod tests {
     fn fused_stack_division_matches_unfused_on_hardware() {
         use std::process::Command;
 
-        let body = "movq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nmovq %rdx, %r8\nmovq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nxorq %r8, %rax\nret\n";
+        let body = "movq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nmovq %rdx, %r8\nmovq %rax, -24(%rsp)\ncmpq %r8, %rdi\nmovq -8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nxorq %r8, %rax\nret\n";
         let (changed, fused) = apply(body);
         assert!(changed);
         assert_eq!(fused.matches("divq").count(), 1);
@@ -286,6 +331,18 @@ int main(void) {
             .expect("hardware regression must run");
         let _ = std::fs::remove_dir_all(dir);
         assert!(status.success(), "hardware regression returned {status}");
+    }
+
+    #[test]
+    fn crosses_only_non_aliasing_stack_stores_and_register_compares() {
+        let body = "movq 8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nmovq %rax, 24(%rsp)\ncmpq %r8, %r9\nmovq 8(%rsp), %rax\nxorq %rdx, %rdx\ndivq %rsi\nret\n";
+        assert!(apply(body).0);
+        assert!(!apply(&body.replace("24(%rsp)", "15(%rsp)")).0);
+        assert!(!apply(&body.replace("24(%rsp)", "24(%rbp)")).0);
+        assert!(!apply(&body.replace("cmpq %r8, %r9", "cmpq (%r8), %r9")).0);
+        assert!(!apply(&body.replace("ret\n", "lahf\nret\n")).0);
+        let register = body.replace("8(%rsp)", "%rdi");
+        assert!(apply(&register).0);
     }
 
     #[test]
