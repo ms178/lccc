@@ -385,15 +385,23 @@ pub(crate) fn insert_fn_entry_locs(asm: String, locs: &FxHashMap<String, FnEntry
         };
         if pending.remove(name) {
             let rows = locs[name];
-            if let Some((file, row, column)) = rows.decl {
-                body.push(format!(".loc {file} {row} {column} is_stmt 0\n"));
-            }
             let (file, row, column) = rows.body;
-            // `is_stmt` is sticky in GAS (and in the assembler that reads this):
-            // without the explicit restore the declarator row above would turn
-            // every later row of the function into a non-statement, which is
-            // exactly what a debugger must not see.
-            body.push(format!(".loc {file} {row} {column} is_stmt 1\n"));
+            match rows.decl {
+                Some((decl_file, decl_row, decl_column)) => {
+                    body.push(format!(
+                        ".loc {decl_file} {decl_row} {decl_column} is_stmt 0\n"
+                    ));
+                    // `is_stmt` is sticky in GAS (and in the assembler that reads
+                    // this): without the explicit restore the declarator row
+                    // above would turn every later row of the function into a
+                    // non-statement, which is exactly what a debugger must not
+                    // see.  A function with no declarator row never changes the
+                    // flag, so its body row stays bare -- byte for byte what
+                    // codegen would have written on its own.
+                    body.push(format!(".loc {file} {row} {column} is_stmt 1\n"));
+                }
+                None => body.push(format!(".loc {file} {row} {column}\n")),
+            }
         }
     }
     flush(&mut body, &mut out);

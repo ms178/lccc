@@ -1126,21 +1126,13 @@ pub(crate) fn build_dwarf_line_section(
             // Relocatable per-row addresses (a relaxing target) cannot ride in a
             // special opcode: each row names its own symbol, so it keeps a
             // `DW_LNE_set_address`.
-            let plan = if symbol_at.is_some() {
-                None
-            } else {
-                Some(RowMotion::plan(advance, line_delta, u64::from(opcode_base)))
-            };
-            match plan {
-                Some(motion) => {
-                    if let Some(delta) = motion.line_advance {
-                        unit.push(3); // DW_LNS_advance_line
-                        write_sleb128(delta, &mut unit);
-                    }
-                    motion.address.push(&mut unit);
-                }
-                None => {
-                    if let Some(symbol_at) = symbol_at.as_deref_mut() {
+            let motion = match symbol_at.as_deref_mut() {
+                // A relaxing target names every row's address with a label: the
+                // linker deletes bytes between rows, so a distance would move.
+                // A row sitting at the address already named -- the sequence
+                // start, or the previous row -- needs no second relocation.
+                Some(symbol_at) => {
+                    if advance != 0 {
                         let symbol_name = symbol_at(section_index, row.offset);
                         push_set_address(
                             &mut unit,
@@ -1151,16 +1143,23 @@ pub(crate) fn build_dwarf_line_section(
                             symbol_name,
                             0,
                         );
-                    } else {
-                        unit.push(2); // DW_LNS_advance_pc
-                        write_uleb128(advance, &mut unit);
                     }
                     if line_delta != 0 {
                         unit.push(3); // DW_LNS_advance_line
                         write_sleb128(line_delta, &mut unit);
                     }
+                    None
                 }
-            }
+                None => {
+                    let motion = RowMotion::plan(advance, line_delta, u64::from(opcode_base));
+                    if let Some(delta) = motion.line_advance {
+                        unit.push(3); // DW_LNS_advance_line
+                        write_sleb128(delta, &mut unit);
+                    }
+                    motion.address.push(&mut unit);
+                    Some(motion)
+                }
+            };
             address = row.offset;
             if next_file != current_file {
                 unit.push(4); // DW_LNS_set_file
@@ -1215,7 +1214,7 @@ pub(crate) fn build_dwarf_line_section(
                 write_uleb128(discriminator, &mut unit);
             }
             // A special opcode emits the row; otherwise copy does so.
-            unit.push(plan.map_or(1, |motion| motion.row));
+            unit.push(motion.map_or(1, |motion| motion.row));
         }
 
         let end_offset = code_section.size;
@@ -3126,7 +3125,9 @@ mod tests {
             let mut at = 0;
             let unit_length = read_u32(data, &mut at) as usize;
             assert_eq!(unit_length + 4, data.len(), "version {version} length");
-            assert_eq!(read_u16(data, &mut at), version as u16);
+            // The line program's dialect has a floor of 3: a `-gdwarf-2` unit
+            // still gets a version 3 table, as gcc's does.
+            assert_eq!(read_u16(data, &mut at), version.max(3) as u16);
             if version >= 5 {
                 // Version 5's line header names the address size and the
                 // segment selector size before its length.

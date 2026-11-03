@@ -698,6 +698,11 @@ def main() -> int:
         return 0
     except (GateFailure, OSError, subprocess.SubprocessError) as error:
         print(f"FAIL: {error}", file=sys.stderr)
+        # A workflow's log is not always readable from where a failure is
+        # triaged; an annotation carries the message to the pull request itself.
+        # Only Actions reads this syntax, so nothing changes locally.
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error title=dwarf line tables::{error}")
         return 1
 
 
