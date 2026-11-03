@@ -635,6 +635,15 @@ bits for the 32-bit form. No helper, branch, spill, or FP/SIMD instruction is
 introduced by this sequence. This is an ISA correctness repair, not evidence
 that software popcount is faster than the unconstrained NEON implementation.
 
+Both shapes read *whole registers* -- the eight byte lanes of `cnt`, the 32- or
+64-bit SWAR -- so a narrow operand (`u8`/`u16`, and their signed forms) is
+masked to its own width first (`and w0, w0, #0xff` / `#0xffff`).  Nothing else
+guarantees that: the emitters normalise a value when they materialise it (a
+byte load, a parameter spill), not on every use, and a sign extension fills the
+register with ones the count must not see.  Parity shares the mask: with SIMD it
+is the count plus `and #1`, without SIMD the `eor` fold starts from the same
+masked accumulator.
+
 ## Inline Assembly Support
 
 The backend implements the GCC-compatible inline assembly interface with AArch64-specific

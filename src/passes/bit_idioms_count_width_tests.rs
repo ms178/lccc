@@ -277,13 +277,12 @@ fn narrowed(op: IrUnaryOp, from: IrType, to: IrType) -> Vec<Instruction> {
 }
 
 /// `(from, to)` pairs the narrow-count rule accepts, per operation.  A parity is
-/// shorter at any narrower width; a popcount only when the narrower scan is a
-/// different algorithm (a byte's multiplier form, or 32 bits instead of 64), so
-/// a 16-bit count over an already-promoted value is left promoted.
+/// shorter at a byte or halfword; a popcount also when the narrower scan is a
+/// different algorithm (a byte or halfword lane scan, or 32 bits instead of 64).
 fn narrows(op: IrUnaryOp, from: IrType, to: IrType) -> bool {
     match op {
-        IrUnaryOp::Parity => true,
-        IrUnaryOp::Popcount => from.size() == 1 || (to.size() == 8 && from.size() <= 4),
+        IrUnaryOp::Parity => from.size() <= 2,
+        IrUnaryOp::Popcount => from.size() <= 2 || (to.size() == 8 && from.size() <= 4),
         _ => false,
     }
 }
@@ -310,14 +309,9 @@ fn a_count_of_a_zero_extension_runs_at_the_narrow_width() {
                 }
                 other => panic!("expected the narrow count first, got {other:?}"),
             }
-            assert!(matches!(
-                replacement[1],
-                Instruction::Cast {
-                    from_ty: f,
-                    to_ty: t,
-                    ..
-                } if f == from && t == to
-            ));
+            // The value already fits `from`, so the step back to `to` is a copy
+            // rather than an extension the back end has to re-normalise.
+            assert!(matches!(replacement[1], Instruction::Copy { src, .. } if src == v(9)));
             for x in 0..=0xffffu64 {
                 assert_eq!(
                     execute(&replacement, x),
@@ -388,18 +382,29 @@ fn replacements_use_the_fresh_id_contiguously() {
 }
 
 #[test]
-fn other_targets_keep_the_promoted_form() {
-    // The rewrite is sound everywhere, but only the x86 back ends widen a narrow
-    // count for free; the Arm and Riscv64 emitters mask and copy, so narrowing
-    // there would pay for the extension and save nothing.
-    for insts in [
-        narrowed(IrUnaryOp::Parity, IrType::U8, IrType::U32),
-        narrowed(IrUnaryOp::Popcount, IrType::U8, IrType::U32),
-    ] {
-        assert!(rewrite_on(AARCH64, &insts, &[1; 16], Value(9)).is_none());
+fn narrowing_is_target_independent_and_extends_by_a_copy() {
+    // The rewrite used to be gated on the target: only x86 widened a narrow
+    // result for free, so Arm and Riscv64 kept the promoted form.  The step
+    // back to the consumer's width is a `Copy` now -- it says what an extension
+    // of an at-most-eight-bit value is -- so every back end gets the narrow
+    // scan.
+    for machine in [X86_64, AARCH64] {
+        for insts in [
+            narrowed(IrUnaryOp::Parity, IrType::U8, IrType::U32),
+            narrowed(IrUnaryOp::Popcount, IrType::U8, IrType::U32),
+        ] {
+            let replacement = rewrite_on(machine, &insts, &[1; 16], Value(9)).unwrap();
+            match &replacement[1] {
+                Instruction::Copy { dest, src } => {
+                    assert_eq!(*dest, Value(2));
+                    assert_eq!(*src, v(9));
+                }
+                other => panic!("expected the extension to be a copy, got {other:?}"),
+            }
+        }
     }
-    // The masked count is a win on every target -- it replaces a 64-bit scan
-    // plus an `and` with a 64-bit parity -- it just does not narrow there.
+    // The masked count narrows nowhere -- it replaces a 64-bit scan plus an
+    // `and` with a 64-bit parity, at the count's own width.
     let replacement = rewrite_on(
         AARCH64,
         &masked(IrType::U64, IrType::U32),

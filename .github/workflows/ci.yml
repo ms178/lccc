@@ -2900,6 +2900,10 @@ jobs:
         # not merely assemble: freestanding AArch64/RISC-V checksums under QEMU,
         # with the fold enabled and disabled at every optimization level.
         python3 tests/regression/check_bit_width_runtime.py --run
+        # Narrow counts read whole registers, so the values -- not just the
+        # shapes -- are certified on the non-host backends: the same freestanding
+        # checksum runs natively and under QEMU at every optimization level.
+        python3 tests/regression/check_narrow_count_runtime.py --run
         # ZERO-REM-1: the map vectorizer's scalar remainder mirror must be
         # omitted (not merely unreachable) when a constant trip count makes
         # it dead, on every shape where that is provable and on none where
