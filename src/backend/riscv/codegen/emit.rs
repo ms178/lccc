@@ -169,9 +169,10 @@ pub struct RiscvCodegen {
     pub(super) va_named_stack_bytes: usize,
     /// Dest value-ids of Clz/Ctz/Popcount results on ≤32-bit integer types:
     /// provably in [0, 32], so their I32→I64 widening casts need no `sext.w`
-    /// (the loop emitters build the count from 0 upward in a full 64-bit
-    /// register; a `lw` of the stored 4-byte value sign-extends a non-negative
-    /// value, which is the identity). Per-definition, never propagated
+    /// (the count emitters leave a non-negative total in a full 64-bit
+    /// register -- the branch-free clz/ctz/popcount tails all end in an `andi`
+    /// bounded sum; a `lw` of the stored 4-byte value sign-extends a
+    /// non-negative value, which is the identity). Per-definition, never propagated
     /// through derived arithmetic (the x86-64 backend's bitop_nonneg_values
     /// transfer).
     pub(super) bitop_nonneg_values: FxHashSet<u32>,

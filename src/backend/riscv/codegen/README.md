@@ -687,14 +687,21 @@ operations, while CRC32C lives in `intrinsics.rs`:
 
 ### CLZ (Count Leading Zeros)
 
-Scans from the MSB using a mask (`1 << (bits-1)`) that shifts right each
-iteration. Returns the bit width for zero input. Operates on 32-bit (with
-zero-extension) or 64-bit values.
+Branch-free. `clz` is `bits - bitlen`, and `bitlen` is the population count of
+the operand smeared downward (`x |= x >> 1`, `x >> 2`, `x >> 4`, ...), which
+turns on every bit below the highest set bit; the complement of that has
+exactly `clz` low ones, so the count module below supplies the answer. A zero
+operand smears to zero and counts as the full width, which preserves the
+"returns the bit width for zero" contract. Two instructions per smearing
+stage (`log2(bits)` stages) plus the count, against a per-bit scan that ran up
+to `bits` trips through two unpredictable branches.
 
 ### CTZ (Count Trailing Zeros)
 
-Checks bit 0 via `andi t3, t0, 1` and shifts right each iteration until a
-set bit is found or all bits are checked.
+Branch-free. `(x - 1) & ~x` keeps exactly the bits below the lowest set bit,
+so its population count is the trailing-zero count; for a zero operand both
+halves are all ones and the count is the full width, again preserving the
+zero contract.
 
 ### BSWAP (Byte Swap)
 
@@ -707,8 +714,10 @@ Type-specific straight-line code:
 
 ### POPCOUNT (Population Count)
 
-Brian Kernighan's algorithm: repeatedly clear the lowest set bit with
-`n & (n - 1)` and count iterations. 32-bit values are zero-extended first.
+Branch-free SWAR: pair counts (`sub` of the masked shift), then nibble, byte
+and word sums over the type's lanes. 32-bit values are zero-extended first so
+a sign bit is never counted; 8- and 16-bit values keep their masks inside the
+`andi` immediate range.
 
 ### CRC32C
 

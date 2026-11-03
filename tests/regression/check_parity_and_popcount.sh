@@ -94,6 +94,13 @@ int pc8(u8 x)         { return __builtin_popcount(x); }
 int pc16(u16 x)       { return __builtin_popcount(x); }
 int pc32(u32 x)       { return __builtin_popcount(x); }
 int pc64(u64 x)       { return __builtin_popcountl(x); }
+/* The scans a bit-scan-less backend has to synthesise: RISC-V's lowering of
+ * both counts is branch-free since round 10 (the per-bit loops ran two
+ * unpredictable branches per trip, up to 64 on a 64-bit operand). */
+int clz32(u32 x)      { return __builtin_clz(x); }
+int clz64(u64 x)      { return __builtin_clzll(x); }
+int ctz32(u32 x)      { return __builtin_ctz(x); }
+int ctz64(u64 x)      { return __builtin_ctzll(x); }
 /* The idiom the simplify rule exists for: a parity flag spelled as the low
  * bit of a count. */
 int par_of_count(u32 x){ return __builtin_popcount(x) & 1; }
@@ -238,6 +245,29 @@ for f in pc32 pc64; do
     grep -q '0x55555555' <<<"$body" || fail "$f lost the SWAR masks on RISC-V"
 done
 
+# ---- 5b. RISC-V clz/ctz are branch-free ----------------------------------
+# Both counts used to be per-bit scans: a mask shifted right until a set bit
+# turned up, two branches per trip, `bits` trips for a small operand (64 for a
+# 64-bit zero-extended one).  They are now a smear plus the branch-free count
+# (`clz`) and a mask plus the count (`ctz`), so no branch may survive, and the
+# SWAR masks of the count must be there -- a sequence without them is a scan
+# that came back.
+for f in clz32 clz64 ctz32 ctz64; do
+    body=$(fn_body "$f" "$tmp/rv.s")
+    grep -qE '\bbeq?z|\bbne?z|\bjal|\bj\s|\bcall' <<<"$body" &&
+        fail "$f still contains a branch on RISC-V"
+    grep -q '0x55555555' <<<"$body" ||
+        fail "$f: no SWAR count behind the RISC-V lowering"
+done
+for f in clz32 clz64; do
+    grep -qE '^\s+or\s+t0, t0, t1' <<<"$(fn_body "$f" "$tmp/rv.s")" ||
+        fail "$f: no smear cascade on RISC-V"
+done
+for f in ctz32 ctz64; do
+    grep -qE '^\s+not\s+t2, t0' <<<"$(fn_body "$f" "$tmp/rv.s")" ||
+        fail "$f: no (x - 1) & ~x mask on RISC-V"
+done
+
 # Pinned counts for the other backends: the numbers the round was measured at.
 pinrv() { local got; got=$(count_of "$1" "$tmp/rv.s"); [ "$got" = "$2" ] || fail "$1: $got instructions on RISC-V, pinned $2"; }
 pinrv par32 17
@@ -306,4 +336,4 @@ for opt in -O0 -O1 -O2 -O3 -Os; do
         [ "$out" = "$want" ] || fail "opt levels disagree: $out vs $want"
     fi
 done
-echo "check_parity_and_popcount: OK (parity is a flag/table question on every backend, a byte counts in five instructions, narrow counts run at their own width on every backend, popcount is branch-free on RISC-V, values agree with the model at $want)"
+echo "check_parity_and_popcount: OK (parity is a flag/table question on every backend, a byte counts in five instructions, narrow counts run at their own width on every backend, popcount and both bit scans are branch-free on RISC-V, values agree with the model at $want)"
