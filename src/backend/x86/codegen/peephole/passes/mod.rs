@@ -30,6 +30,7 @@ mod copy_coalesce;
 mod copy_propagation;
 mod dead_code;
 mod dead_writes;
+mod div_rem_fusion;
 mod ebb_reuse;
 mod epilogue_merge;
 mod flag_peepholes;
@@ -47,6 +48,7 @@ mod load_mask_test;
 mod load_op_fuse;
 mod local_patterns;
 mod loop_trampoline;
+mod logical_narrow_test;
 mod mask_test;
 mod memory_fold;
 mod narrow_copy_fold;
@@ -2385,6 +2387,13 @@ fn peephole_optimize_inner(
     // shortened text rather than a mask they would have to look through.
     if !sk("mask_test") {
         mask_test::fold_inplace_mask_test(&mut store, &mut infos);
+    }
+
+    if !sk("div_rem_fusion") {
+        div_rem_fusion::run(&mut store, &mut infos);
+    }
+    if !sk("logical_narrow_test") {
+        logical_narrow_test::run(&mut store, &mut infos);
     }
 
     if !sk("sext_test") {
