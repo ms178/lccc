@@ -8612,33 +8612,58 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // destination is %eax or the divisor register; anything else
             // (including flags producers and unknown destinations) ends the
             // block.
-            let dest = match &infos[p].kind {
-                LineKind::Move { dst, src } => {
-                    read_regs.push(*src);
-                    *dst
-                }
-                LineKind::LoadEbp { reg, offset, size } => {
-                    read_slots.push((*offset, size_bytes(*size)));
-                    *reg
-                }
-                LineKind::Other { dest_reg } => {
-                    // `movl %src, %dst` style: recover the source register.
-                    let rest = text.strip_prefix("movl ").map(|r| r.trim()).unwrap_or("");
-                    if let Some(comma) = rest.find(',') {
-                        let src_name = rest[..comma].trim();
-                        if src_name.starts_with('%') && !src_name.contains('(') {
-                            let src = register_family(src_name);
-                            if src <= REG_GP_MAX {
-                                read_regs.push(src);
-                            }
-                        }
-                    }
-                    *dest_reg
-                }
+            let dest = match infos[p].kind {
+                LineKind::Move { dst, .. } => dst,
+                LineKind::LoadEbp { reg, .. } => reg,
+                LineKind::Other { dest_reg } => dest_reg,
                 _ => return Some((staging, read_regs, read_slots)),
             };
             if dest == REG_NONE || (dest != REG_EAX && dest != divisor) {
                 return Some((staging, read_regs, read_slots));
+            }
+            match &infos[p].kind {
+                LineKind::Move { src, .. } => {
+                    read_regs.push(*src);
+                }
+                LineKind::LoadEbp { offset, size, .. } => {
+                    read_slots.push((*offset, size_bytes(*size)));
+                    if text.contains("(%esp)") {
+                        read_regs.push(REG_ESP);
+                    } else if text.contains("(%ebp)") {
+                        read_regs.push(REG_EBP);
+                    } else {
+                        return None;
+                    }
+                }
+                LineKind::Other { .. } => {
+                    // Only a literal immediate or a plain register is a
+                    // known source. An indirect load can alias any store.
+                    let Some(rest) = text.strip_prefix("movl ") else {
+                        return Some((staging, read_regs, read_slots));
+                    };
+                    let Some((source, _)) = rest.split_once(',') else {
+                        return Some((staging, read_regs, read_slots));
+                    };
+                    let source = source.trim();
+                    if source.starts_with('%') {
+                        let reg = register_family(source);
+                        if reg > REG_GP_MAX {
+                            return None;
+                        }
+                        read_regs.push(reg);
+                    } else if !source
+                        .strip_prefix('$')
+                        .is_some_and(|v| v.parse::<i32>().is_ok())
+                    {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+            // Partial-width writes leave old register bits in place. They
+            // cannot establish the complete repeated dividend or divisor.
+            if !text.starts_with("movl ") {
+                return None;
             }
             staging.push((p, text.to_string()));
             if staging.len() > MAX_SETUP {
@@ -8691,6 +8716,11 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             LineKind::LoadEbp { reg, .. } => Some(*reg),
             LineKind::SetCC { reg } => Some(*reg),
             LineKind::StoreEbp { offset, size, .. } => {
+                // The classifier combines ESP and EBP slots; without a
+                // proven relation between the bases, any store may alias.
+                if !read_slots.is_empty() {
+                    return false;
+                }
                 // Stack write: check range overlap with staging slot reads.
                 let w_lo = *offset as i64;
                 let w_hi = w_lo + size_bytes(*size) as i64;
@@ -8704,7 +8734,10 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 None
             }
             LineKind::Other { dest_reg } => {
-                if *dest_reg == REG_NONE {
+                // Unknown opcodes can have implicit outputs that the single
+                // destination field cannot describe. Only MOV has one known
+                // explicit register destination in this path.
+                if !text.starts_with("movl ") || *dest_reg == REG_NONE {
                     // Unparsed destination (includes indirect memory
                     // operands): conservative abort.
                     return false;
@@ -8748,7 +8781,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     {
         let mut i = 0;
         while i < len {
-            if infos[i].is_nop() {
+            if infos[i].is_nop() || infos[i].kind == LineKind::InlineAsm {
                 i += 1;
                 continue;
             }
@@ -8763,13 +8796,44 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 i += 1;
                 continue;
             }
+            if infos[div_idx].kind == LineKind::InlineAsm {
+                i = div_idx + 1;
+                continue;
+            }
             let div_text = trimmed(store, &infos[div_idx], div_idx).to_string();
             let Some(divisor) = div_reg(&div_text) else {
                 i = div_idx + 1;
                 continue;
             };
             match collect_staging(store, infos, i, divisor) {
-                Some((staging, read_regs, read_slots)) => {
+                Some((staging, mut read_regs, read_slots)) => {
+                    // DIV overwrites EAX/EDX, and the staging itself may
+                    // overwrite its divisor. Those values cannot be inputs
+                    // to a repeated staging block without a separate proof.
+                    let stages_divisor = staging.iter().any(|(idx, _)| match infos[*idx].kind {
+                        LineKind::Move { dst, .. } => dst == divisor,
+                        LineKind::LoadEbp { reg, .. } => reg == divisor,
+                        LineKind::Other { dest_reg } => dest_reg == divisor,
+                        _ => false,
+                    });
+                    let reloads_eax = staging.iter().any(|(idx, _)| match infos[*idx].kind {
+                        LineKind::Move { dst, .. } => dst == REG_EAX,
+                        LineKind::LoadEbp { reg, .. } => reg == REG_EAX,
+                        LineKind::Other { dest_reg } => dest_reg == REG_EAX,
+                        _ => false,
+                    });
+                    if !reloads_eax
+                        || matches!(divisor, REG_EAX | REG_EDX | REG_ESP)
+                        || read_regs.contains(&REG_EAX)
+                        || read_regs.contains(&REG_EDX)
+                        || (stages_divisor && read_regs.contains(&divisor))
+                    {
+                        i = div_idx + 1;
+                        continue;
+                    }
+                    // The divisor is read by DIV even when no staging move
+                    // mentions it; it must survive the intervening window.
+                    read_regs.push(divisor);
                     let staging_first = staging.last().map(|(p, _)| *p).unwrap_or(i);
                     sites.push(Site {
                         marker: i,
@@ -8817,13 +8881,18 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 break;
             }
             let same = site_a.div_text == site_b.div_text
+                && trimmed(store, &infos[site_a.marker], site_a.marker)
+                    == trimmed(store, &infos[site_b.marker], site_b.marker)
                 && site_a.staging.len() == site_b.staging.len()
                 && site_a
                     .staging
                     .iter()
                     .zip(site_b.staging.iter())
                     .all(|(x, y)| x.1 == y.1);
-            if !same || site_b.staging.is_empty() {
+            if !same
+                || site_b.staging.is_empty()
+                || !flags_definitely_dead_after(store, infos, site_b.div)
+            {
                 break;
             }
             // Verify the window strictly between A's div and B's staging
@@ -16206,6 +16275,89 @@ fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn div_fusion_checks_setup_inputs_and_flag_liveness() {
+        fn apply(body: &str) -> bool {
+            let mut store = LineStore::new(body.to_string());
+            let mut infos = classify_all(&store);
+            fuse_div_rem_pairs(&mut store, &mut infos)
+        }
+        let valid = "movl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\nmovl %edx, %edi\nmovl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\nret\n";
+        assert!(apply(valid));
+        assert!(!apply(&valid.replacen("xorl %edx, %edx", "cltd", 1)));
+        assert!(!apply(&valid.replace("movl %esi, %eax", "movl %edx, %eax")));
+        assert!(!apply(&valid.replace("divl %ecx", "divl %eax")));
+        assert!(!apply(
+            &valid.replace("movl %esi, %eax", "movl (%ebx), %eax")
+        ));
+        assert!(!apply(&valid.replace("ret\n", "setne %bl\nret\n")));
+        assert!(!apply(
+            &valid.replace("movl %edx, %edi", "movl %edx, %edi\nmovl %ebx, %ecx")
+        ));
+        assert!(!apply(&valid.replace("movl %esi, %eax", "movl %esi, %ecx")));
+        assert!(!apply(
+            &valid.replace("movl %esi, %eax", "movw 4(%esp), %ax")
+        ));
+        let stack = valid
+            .replace("movl %esi, %eax", "movl 4(%esp), %eax")
+            .replace("movl %edx, %edi", "movl %edx, %edi\nmovl %ebx, 4(%ebp)");
+        assert!(!apply(&stack));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn i686_div_fusion_matches_unfused_on_hardware() {
+        use std::process::Command;
+
+        let body = "movl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\nmovl %edx, %edi\nmovl %esi, %eax\nxorl %edx, %edx\ndivl %ecx\naddl %edi, %eax\nret\n";
+        let mut store = LineStore::new(body.to_string());
+        let mut infos = classify_all(&store);
+        assert!(fuse_div_rem_pairs(&mut store, &mut infos));
+        let fused = store.build_result(|i| infos[i].is_nop());
+        assert_eq!(fused.matches("divl").count(), 1);
+        let source = format!(
+            ".text\n.globl _start\n_start:\nmovl $100000, %ebx\n1:\nmovl %ebx, %esi\nmovl $17, %ecx\ncall original\nmovl %eax, %ebp\ncall fused\ncmpl %ebp, %eax\njne 2f\ndecl %ebx\njnz 1b\nxorl %ebx, %ebx\njmp 3f\n2: movl $1, %ebx\n3: movl $1, %eax\nint $0x80\noriginal:\n{body}\nfused:\n{fused}\n"
+        );
+        let dir = std::env::temp_dir().join(format!("lccc_i686_div_exec_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asm = dir.join("test.s");
+        let obj = dir.join("test.o");
+        let exe = dir.join("test");
+        std::fs::write(&asm, source).unwrap();
+        let output = Command::new("as")
+            .arg("--32")
+            .arg(&asm)
+            .arg("-o")
+            .arg(&obj)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new("ld")
+            .args(["-m", "elf_i386"])
+            .arg(&obj)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status = Command::new(&exe)
+            .status()
+            .expect("i686 hardware regression must run");
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            status.success(),
+            "i686 hardware regression returned {status}"
+        );
+    }
 
     /// `void b_shr(u32 x, u32 n) { if ((x >> n) & 1) hit(n); }` at -O1: the
     /// exact pre-peephole text of the miscompile.  With `jc` unclassified the

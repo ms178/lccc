@@ -5174,15 +5174,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }),
                 jump.target_addend,
             );
-            // A leading 0x67 address-size override (the i686 `addr16`
-            // word or a 16-bit counter spelling) sits between the jump
-            // opcode and its displacement byte; so does a dead 0x66 (the
-            // 64-bit `data16` word) in front of `66 eb/7x rel8`.
-            let disp_at = jump.offset as usize
-                + match self.sections[sec_idx].data.get(jump.offset as usize) {
-                    Some(&0x66) | Some(&0x67) => 2,
-                    _ => 1,
-                };
+            // Every relaxed/short-only jump ends with its rel8 field.
+            // Use the recorded final instruction length rather than guessing
+            // from the first prefix: multiple legacy prefixes are possible.
+            let disp_at = jump.offset + jump.len - 1;
             let Some(target_off) = target else {
                 // Unresolvable target (undefined/external). A short-only
                 // branch (jecxz/loop: never relaxed BY the engine, hence
@@ -5226,8 +5221,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
                 continue;
             };
-            // The 67-prefixed short form is 3 bytes: the displacement
-            // ends at disp_at + 1, not offset + 2.
+            // The displacement is relative to the end of the instruction.
             let end_of_instr = disp_at as i64 + 1;
             let disp = target_off as i64 - end_of_instr as i64;
             // A surviving short jump must be representable exactly. Out
@@ -7701,6 +7695,26 @@ ret
         };
         let _ = std::fs::remove_dir_all(&dir);
         res.expect_err("input must be rejected")
+    }
+
+    #[test]
+    fn i686_prefixed_short_branches_patch_the_last_byte() {
+        let dir = std::env::temp_dir().join(format!("lccc_pc8_prefix_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _scratch = ScratchDir(dir.clone());
+        let out = dir.join("m.o");
+        assemble32(
+            ".text\ndata16 jcxz 1f\ndata16 jcxz ext\nnop\n1: data16 jcxz 1b\n",
+            out.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let obj = std::fs::read(out).unwrap();
+        // Legacy prefixes precede E3; displacement bytes are 05, FF, FC.
+        assert!(obj.windows(13).any(|w| w
+            == [
+                0x67, 0x66, 0xe3, 0x05, 0x67, 0x66, 0xe3, 0xff, 0x90, 0x67, 0x66, 0xe3, 0xfc,
+            ]));
     }
 
     /// Short-only branches to externals assemble (GAS emits a real PC8
