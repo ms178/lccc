@@ -3040,6 +3040,11 @@ gate "arm-popcount-contract" fast \
 gate "bit-width-runtime" fast \
     python3 tests/regression/check_bit_width_runtime.py
 
+# The narrow-count emitters mask and lane-scan whole registers; the values are
+# certified on the emulated backends, not just the instruction shapes above.
+gate "narrow-count-runtime" fast \
+    python3 tests/regression/check_narrow_count_runtime.py
+
 gate "popcount-loop-contract" fast \
     python3 tests/regression/check_popcount_loop_contract.py
 

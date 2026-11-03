@@ -16,7 +16,10 @@
 //! Both rewrites keep the value bit for bit and only ever replace a scan with a
 //! cheaper one at a narrower width.  A shared count is left alone -- replacing
 //! one of its two uses would put a second scan beside it -- and the extension
-//! chain is only walked, never deleted.
+//! chain is only walked, never deleted.  Where a rewrite does run, the step back
+//! to the consumer's type is a `Copy`: a count of an n-bit operand fits n bits,
+//! so there is nothing to extend, and saying so is what lets every back end run
+//! its narrow scan (see `scaled`).
 use super::*;
 
 /// The constant `op` denotes at `bits`, looking through the copies and constant
@@ -78,45 +81,45 @@ fn narrow_source(cx: &Context<'_>, op: Operand, ty: IrType) -> Option<(Operand, 
 
 /// Where narrowing a count actually buys instructions.
 ///
-/// The rewrite is always sound, but a narrower count only pays when the
-/// extension back to the consumer's width is free and the narrow scan is
-/// genuinely shorter:
+/// The rewrite is always sound; this gate is about instruction count.  The
+/// result of a narrow count is a small value -- at most eight bits for a byte
+/// count -- so extending it back to the consumer's width is free as long as
+/// the extension is spelled as what it is, a copy (see [`scaled`]).  That
+/// leaves the question of whether the narrow scan is itself shorter:
 ///
-/// * x86-64 and i686 keep integers in a 32-bit (or 64-bit) register, so a
-///   value produced at `u8`/`u16` already has clean high bits and the `Cast`
-///   costs nothing; ARM and Riscv64 emit a mask plus copies for it, and their
-///   narrow count paths still run the full-width sequence, so a narrower scan
-///   there would pay for the extension and save nothing.  (Teaching those two
-///   back ends narrow counts is what would lift this gate; until then they keep
-///   the promoted form, which is what the frontend already hands them.)
-/// * `parity` of a narrower value is a shorter fold at any narrower width --
-///   x86 reads the low byte's PF, so one `testb` settles a byte;
-/// * `popcount` has a five-instruction multiplier form for a byte, and a
-///   64-bit count halves when it runs at 32 bits; a 16-bit count over an
-///   already-promoted value would still run the 32-bit scan, so it is left
-///   alone (the extension would be pure cost).
+/// * `parity` of a byte or halfword is a shorter fold than the 32-bit one on
+///   every target: two `eor`/`xor` stages less on Arm and Riscv64, and x86
+///   reads the low byte's PF, so one `testb` settles a byte;
+/// * `popcount` has a five-instruction multiplier form for a byte on x86, a
+///   three-instruction `cnt` on Arm, and a lane-wise byte scan on Riscv64; a
+///   16-bit count still runs a 32-bit scan on x86, so it buys nothing there
+///   but costs nothing either;
+/// * a 64-bit count halves when it runs at 32 bits.
+///
+/// `clz`/`ctz` are excluded: their narrow forms are the wide ones (the
+/// hardware scans whatever width the register has), so narrowing would only
+/// move work into the extension.
 fn profitable(op: IrUnaryOp, width: usize, current: IrType) -> bool {
     let current = current.size() * 8;
     if width >= current {
         return false;
     }
     match op {
-        IrUnaryOp::Parity => true,
-        IrUnaryOp::Popcount => width == 8 || (current == 64 && width <= 32),
+        IrUnaryOp::Parity => width <= 16,
+        IrUnaryOp::Popcount => width <= 16 || (current == 64 && width <= 32),
         _ => false,
     }
 }
 
-/// Whether the back ends of the current target widen a narrow result for free.
-fn free_extension() -> bool {
-    use crate::common::types::target_arch_name;
-
-    matches!(target_arch_name(), "x86-64" | "i686")
-}
-
-/// `UnaryOp` at `width`, extended to `dest_ty` when the two differ.  The
-/// extension keeps the IR type-correct after the operation has been narrowed:
-/// the value is unchanged, but its declared type is the width it ran at.
+/// `UnaryOp` at `width`, handed to `dest_ty` when the two differ.
+///
+/// The value is unchanged, and a count of a `width`-bit operand cannot exceed
+/// `width`, so the result already fits the narrow type: the step back to the
+/// consumer's width is a copy, not an extension.  Spelling it as a `Cast`
+/// asked every back end to re-normalise an operand that was already clean --
+/// `and w4, w19, #0xff` and a chain of `mv`s on Arm/Riscv64 -- for a value
+/// that is at most 64.  A `Copy` states the same thing and costs nothing on
+/// all four back ends.
 fn scaled(
     dest: Value,
     fresh: Value,
@@ -140,11 +143,9 @@ fn scaled(
             src,
             ty: width,
         },
-        Instruction::Cast {
+        Instruction::Copy {
             dest,
             src: Operand::Value(fresh),
-            from_ty: width,
-            to_ty: dest_ty,
         },
     ]
 }
@@ -192,9 +193,8 @@ fn masked_count(cx: &Context<'_>, inst: &Instruction, fresh: Value) -> Option<Ve
     }
     // The count runs at the narrowest width it can, when that width is one
     // the back end counts cheaply; otherwise it keeps its own operand.
-    let narrow = narrow_source(cx, *src, *count_ty).filter(|&(_, width)| {
-        free_extension() && profitable(IrUnaryOp::Parity, width.size() * 8, *count_ty)
-    });
+    let narrow = narrow_source(cx, *src, *count_ty)
+        .filter(|&(_, width)| profitable(IrUnaryOp::Parity, width.size() * 8, *count_ty));
     let (src, width) = narrow.unwrap_or((*src, *count_ty));
     // The simplifier's `fold_popcount_mask_to_parity` owns every same-width
     // shape (it compares sizes, not spellings: an `unsigned` count masked by an
@@ -216,7 +216,7 @@ fn narrow_count(cx: &Context<'_>, inst: &Instruction, fresh: Value) -> Option<Ve
         return None;
     }
     let (src, width) = narrow_source(cx, *src, *ty)?;
-    if !free_extension() || !profitable(*op, width.size() * 8, *ty) {
+    if !profitable(*op, width.size() * 8, *ty) {
         return None;
     }
     Some(scaled(*dest, fresh, *op, src, width, *ty))

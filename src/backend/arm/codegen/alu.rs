@@ -346,7 +346,30 @@ impl ArmCodegen {
         }
     }
 
+    /// Mask a narrow count operand to its own width.
+    ///
+    /// The count and parity lowerings read whole registers, so a value whose
+    /// declared type is narrower than the register must not carry anything
+    /// above that type.  Nothing else guarantees it: the emitters normalise a
+    /// value when they *materialise* it (a byte load, a parameter spill), not
+    /// on every use, and a sign extension fills the register with ones.
+    pub(super) fn emit_narrow_count_mask(&mut self, ty: IrType) {
+        match ty {
+            IrType::I8 | IrType::U8 => self.state.emit("    and w0, w0, #0xff"),
+            IrType::I16 | IrType::U16 => self.state.emit("    and w0, w0, #0xffff"),
+            _ => {}
+        }
+    }
+
     pub(super) fn emit_int_popcount_impl(&mut self, ty: IrType) {
+        // Both shapes below count the bits of a whole register -- the byte
+        // lanes of `cnt`, or the 32/64-bit SWAR -- so a narrow operand has to
+        // lose what its type does not own first.  That is not a formality: a
+        // sign-extended `i8` carries 56 ones the count must not see, and the
+        // narrow count types are now emitted directly (the frontend's zero
+        // extension is gone), so the mask is the only thing standing between a
+        // byte count and the wrong answer.
+        self.emit_narrow_count_mask(ty);
         if self.general_regs_only {
             // Count within 2-, 4-, then 8-bit lanes. Each byte holds 0..8;
             // multiplying by repeated 0x01 sums the bytes into the top byte
@@ -354,7 +377,10 @@ impl ArmCodegen {
             // call, memory access, or forbidden FP/SIMD register is needed.
             // x0 is the unary accumulator; x1 is reserved emitter scratch,
             // never an allocated SSA home (ARM_CALLER_SAVED excludes it).
-            let narrow = matches!(ty, IrType::I32 | IrType::U32);
+            let narrow = matches!(
+                ty,
+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+            );
             let (r, pairs, nibbles, bytes, ones, shift) = if narrow {
                 (
                     "w",
@@ -397,7 +423,10 @@ impl ArmCodegen {
                 .emit_fmt(format_args!("    lsr {r}0, {r}0, #{shift}"));
             return;
         }
-        if ty == IrType::I32 || ty == IrType::U32 {
+        if matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        ) {
             self.state.emit("    fmov s0, w0");
         } else {
             self.state.emit("    fmov d0, x0");
@@ -434,6 +463,7 @@ impl ArmCodegen {
             self.state.emit("    and w0, w0, #1");
             return;
         }
+        self.emit_narrow_count_mask(ty);
         if narrow_32 {
             self.state.emit("    eor w1, w0, w0, lsr #16");
         } else {
