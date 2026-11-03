@@ -9,6 +9,8 @@ lfs (%esi),%edx
 lgsw (%edi),%dx
 lssl 8(%ebp),%ebx
 les symbol,%eax
+addr16 les symbol,%eax
+addr16 lfs 0x1234,%cx
 
 ;;; far_pointer_16
 .text
