@@ -14651,11 +14651,15 @@ fn materialize_return_bool_i686(store: &mut LineStore, infos: &mut [LineInfo]) -
             continue;
         }
         let cmp = trimmed(store, &infos[i], i);
-        let Some((op, args)) = cmp.split_once(' ') else { continue };
+        let Some((op, args)) = cmp.split_once(' ') else {
+            continue;
+        };
         if !matches!(op, "cmpb" | "cmpw" | "cmpl" | "testb" | "testw" | "testl") {
             continue;
         }
-        let Some((left, right)) = args.split_once(',') else { continue };
+        let Some((left, right)) = args.split_once(',') else {
+            continue;
+        };
         let safe_operand = |operand: &str| {
             let operand = operand.trim();
             if operand.starts_with('%') {
@@ -16216,9 +16220,8 @@ mod tests {
         }
         // Deleted lines retain their original text in the store; never
         // resurrect a previously removed extension based on that stale text.
-        let mut store = LineStore::new(
-            "cmpl $0, %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n".to_string(),
-        );
+        let mut store =
+            LineStore::new("cmpl $0, %edx\nsetne %cl\nmovzbl %cl, %eax\nret\n".to_string());
         let mut infos = classify_all(&store);
         infos[2].kind = LineKind::Nop;
         assert!(!materialize_return_bool_i686(&mut store, &mut infos));

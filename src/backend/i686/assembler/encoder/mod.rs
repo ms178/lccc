@@ -1511,8 +1511,8 @@ impl InstructionEncoder {
 
             // Far-pointer loads select the offset width from the destination;
             // the segment selector is always the following 16-bit field.
-            "les" | "lesw" | "lesl" | "lds" | "ldsw" | "ldsl" | "lfs" | "lfsw"
-            | "lfsl" | "lgs" | "lgsw" | "lgsl" | "lss" | "lssw" | "lssl" => {
+            "les" | "lesw" | "lesl" | "lds" | "ldsw" | "ldsl" | "lfs" | "lfsw" | "lfsl" | "lgs"
+            | "lgsw" | "lgsl" | "lss" | "lssw" | "lssl" => {
                 self.encode_load_far_pointer(ops, mnemonic)
             }
 

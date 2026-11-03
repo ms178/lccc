@@ -467,8 +467,21 @@ impl super::InstructionEncoder {
         let gp_num = |name: &str| -> Result<u8, String> {
             if !matches!(
                 name,
-                "ax" | "cx" | "dx" | "bx" | "sp" | "bp" | "si" | "di"
-                    | "eax" | "ecx" | "edx" | "ebx" | "esp" | "ebp" | "esi" | "edi"
+                "ax" | "cx"
+                    | "dx"
+                    | "bx"
+                    | "sp"
+                    | "bp"
+                    | "si"
+                    | "di"
+                    | "eax"
+                    | "ecx"
+                    | "edx"
+                    | "ebx"
+                    | "esp"
+                    | "ebp"
+                    | "esi"
+                    | "edi"
             ) || reg_size(name) != size
             {
                 return Err("invalid general register for segment move".to_string());

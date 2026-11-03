@@ -14,7 +14,9 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             continue;
         }
         let text = infos[i].trimmed(store.get(i));
-        let Some((op, args)) = text.split_once(' ') else { continue };
+        let Some((op, args)) = text.split_once(' ') else {
+            continue;
+        };
         let (source_width, dest_width, test) = match op {
             "movsbl" => (3, 1, "testl"),
             "movswl" => (2, 1, "testl"),
@@ -22,7 +24,9 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             "movswq" => (2, 0, "testq"),
             _ => continue,
         };
-        let Some((src, dst)) = args.split_once(',') else { continue };
+        let Some((src, dst)) = args.split_once(',') else {
+            continue;
+        };
         let (src, dst) = (src.trim(), dst.trim());
         let Some(fam) = REG_NAMES[dest_width].iter().position(|&name| name == dst) else {
             continue;
@@ -57,7 +61,9 @@ mod tests {
 
     fn apply(body: &str) -> (bool, String) {
         let mut store = LineStore::new(body.into());
-        let mut infos: Vec<_> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         super::super::pin_inline_asm_regions(&store, &mut infos);
         let changed = run(&mut store, &mut infos);
         (changed, store.build_result(|i| infos[i].is_nop()))
