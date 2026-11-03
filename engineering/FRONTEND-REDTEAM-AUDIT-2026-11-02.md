@@ -95,3 +95,11 @@ The rebase validation exposed two local harness-selection issues, not compiler-r
 A full fastbuild CI run on the rebased tree before those environment/harness corrections reported 560 passed, 5 failed, 9 skipped. The failures were RA harness compiler selection, the MSRV path, and the three Valgrind-dependent gates; focused reruns after correcting those inputs passed. The complete fastbuild suite is being rerun after these fixes; its final result must be recorded before delivery. Fast-mode skips remain skips, not passes.
 
 The previous hosted 23/23 result applies to the pre-rebase commit. Hosted CI must be rerun on the rebased head before claiming the PR is green. The current source review remains in progress; no assertion of zero defects or perfect performance is made.
+
+### Final validation after rebase
+
+The full fastbuild local CI rerun on the rebased code commit `dc03956` completed with **565 passed, 0 failed, 9 skipped**. The runner confirmed the 4 GiB swap was active. It built the fastbuild binaries, passed unit tests, Clippy, rustfmt, MSRV, frontend/ABI, regression, codegen/runtime, differential, and linker gates. Nine skips remain explicit in fast mode and environment-specific optional checks; none are counted as passes. GCC 16.2 and Clang 23.1.4 were used where configured, and the i386 linker suite intentionally used GCC/G++ 12 because the cached GCC 16 bundle lacks usable i386 C++ multilib.
+
+Hosted CI on the rebased code commit `dc03956` completed with **23/23 checks passed**, including the authenticated ICX 2026.2 integration, GCC 16.2/Clang 23.1.4 oracles, assertion-enabled and release test suites, SSA and regression corpora, benchmarks, frontend/ABI and codegen/runtime shards, assembler/linker contracts, and MSRV. GitHub reports the PR as mergeable after rebasing onto `662b771`.
+
+The code snapshot `/home/user/ms178-1.patch` is regenerated from `origin/main` through the validated code commit. A later audit-note-only update records these outcomes; no source or test logic changed after `dc03956`. This is evidence for the listed configurations, not proof of zero remaining defects or an absolute performance optimum.
