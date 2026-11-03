@@ -61,6 +61,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         ("__builtin_modf", "modf"),
         ("__builtin_modff", "modff"),
         ("__builtin_strncasecmp", "strncasecmp"),
+        ("__builtin_bcopy", "bcopy"),
     ] {
         m.insert(builtin, BuiltinInfo::simple(libc_name));
     }
@@ -4354,7 +4355,7 @@ pub fn gcc_compat_builtin_ctype(name: &str) -> Option<CType> {
     match name {
         "bcmp" | "__builtin_bcmp" | "__builtin_memcmp_eq" | "__builtin_ilogb"
         | "__builtin_strncasecmp" => Some(CType::Int),
-        "__builtin_bzero" | "__builtin_stack_restore" => Some(CType::Void),
+        "__builtin_bzero" | "__builtin_bcopy" | "__builtin_stack_restore" => Some(CType::Void),
         "strdup" | "strndup" | "__builtin_strdup" | "__builtin_strndup" => Some(char_ptr()),
         "__builtin_stack_save" => Some(void_ptr()),
         "__builtin_modff" => Some(CType::Float),
@@ -4414,6 +4415,8 @@ pub fn libc_alias_param_types(libc_name: &str) -> Option<Vec<crate::common::type
         // int/long in a size_t slot: without this conversion the upper half of
         // %rdx is garbage on LP64 (the pr59229.c defect class).
         "bzero" => vec![p, size_t],
+        // void bcopy(const void *, void *, size_t)
+        "bcopy" => vec![p, p, size_t],
         "strndup" => vec![p, size_t],
         // void *memchr(const void *, int, size_t)
         "memchr" | "rawmemchr" | "memrchr" => vec![p, i32t, size_t],
@@ -4524,6 +4527,7 @@ mod gcc17_torture_builtin_tests {
             "__builtin_cexpi",
             "__builtin_cpow",
             "__builtin_strncasecmp",
+            "__builtin_bcopy",
         ] {
             assert!(is_builtin(name), "{name} is not registered");
             assert!(resolve_builtin(name).is_some(), "{name} has no info");
@@ -4553,6 +4557,7 @@ mod gcc17_torture_builtin_tests {
             "__builtin_bzero",
             "__builtin_modff",
             "__builtin_strncasecmp",
+            "__builtin_bcopy",
         ] {
             assert!(matches!(
                 resolve_builtin(name).map(|b| &b.kind),
@@ -4582,6 +4587,10 @@ mod gcc17_torture_builtin_tests {
         let st = if target_ptr_size() == 8 { IrType::U64 } else { IrType::U32 };
         assert_eq!(libc_alias_param_types("bzero"), Some(vec![IrType::Ptr, st]));
         assert_eq!(libc_alias_param_types("strndup"), Some(vec![IrType::Ptr, st]));
+        assert_eq!(
+            libc_alias_param_types("bcopy"),
+            Some(vec![IrType::Ptr, IrType::Ptr, st])
+        );
         assert_eq!(
             libc_alias_param_types("bcmp"),
             Some(vec![IrType::Ptr, IrType::Ptr, st])
