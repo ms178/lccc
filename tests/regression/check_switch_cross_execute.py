@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Run self-checking switch and memory fixtures on AArch64/RV64 without a cross libc.
+"""Run self-checking switch, memory and codegen fixtures on AArch64/RV64 without a cross libc.
 
 Requires LCCC target drivers, Clang's integrated assembler, a GNU target linker or LLD (including Rust's bundled LLD), and QEMU user emulators. printf/puts are intentionally
 no-ops: every selected fixture checks its own result through main's exit code.
 No output comparison or target-performance claim is made by this smoke gate.
+
+Fixtures in LEVELS pin backend lowering, assembler and peephole contracts whose
+defects showed only at some optimization levels; they run at each listed level
+instead of toggling one IR pass at -O2, and are assembled by LCCC itself (`-c`)
+rather than by Clang, so its integrated assembler is under test as well.
 """
 import argparse
 import os
@@ -20,7 +25,40 @@ FIXTURES = (
     "switch_lut_narrow_index", "switch_lut_two_val_modulo",
     "narrow_big_endian_cross", "join_store_forward_cross",
     "conditional_store_readonly_cross", "strided_reduction_cross",
+    "switch_i128_high_half", "switch_i128_wide_cases", "complex_float_return_cross",
+    "divrem_pair_cross", "urem_by_one_cross", "va_arg_align16_cross",
+    "overaligned_aggregate_arg_cross", "indirect_variadic_call_cross",
 )
+ALL_LEVELS = ("-O0", "-O1", "-O2", "-Os")
+LEVELS = {
+    # 128-bit selectors: the low half alone was compared (AArch64, RV64) and
+    # wide case values were truncated to i64 (every target).
+    "switch_i128_high_half": ALL_LEVELS,
+    "switch_i128_wide_cases": ALL_LEVELS,
+    # RV64 global dead-store census missing FP loads (-O2, -O3, -Os).
+    "complex_float_return_cross": ALL_LEVELS,
+    # AArch64: `mov x6, w3` from the fused div/rem pair, `and w0, w0, #0` for
+    # `x % 1`, and the assembler refusing `and w2, w2, #-16` in va_arg.
+    "divrem_pair_cross": ALL_LEVELS,
+    "urem_by_one_cross": ALL_LEVELS,
+    "va_arg_align16_cross": ALL_LEVELS,
+    # AArch64 over-aligned alloca address staged in x17, the aggregate
+    # argument base register: the copy faulted at -O1 and up.
+    "overaligned_aggregate_arg_cross": ALL_LEVELS,
+    # Member/element/cast callees of variadic type classified as fixed calls
+    # (RV64: unnamed doubles in FP registers that va_arg never reads).
+    "indirect_variadic_call_cross": ALL_LEVELS,
+}
+# Two-unit psABI fixtures under interop/: `<name>_callee.c` and
+# `<name>_caller.c`, linked LCCC-with-LCCC and LCCC-with-Clang in both
+# directions.  A caller and a callee that merely agree with each other pass
+# the single-unit fixtures above while disagreeing with every other compiler.
+INTEROP = ("psabi_pair_interop", "psabi_float_interop")
+INTEROP_LEVELS = ("-O0", "-O2")
+CLANG_FREESTANDING = ("-O2", "-ffreestanding", "-fno-builtin", "-fno-pic", "-fno-pie",
+                      "-fno-stack-protector", "-nostdlibinc")
+# No linker relaxation for Clang's RV64 objects: the startup code sets no gp.
+CLANG_TARGET_FLAGS = {"aarch64": (), "riscv64": ("-mno-relax",)}
 CONTROL_PASSES = {
     "narrow_big_endian_cross": "byte_load",
     "join_store_forward_cross": "join_store_forward",
@@ -108,25 +146,63 @@ def main():
             startup = start.with_suffix(".o")
             subprocess.run([args.clang, target, "-c", str(start), "-o", str(startup)], check=True, timeout=30)
             for fixture in FIXTURES:
-                for disable in [False, True]:
+                pass_name = CONTROL_PASSES.get(fixture, "switch_lut")
+                if fixture in LEVELS:
+                    variants = [(level, None, level) for level in LEVELS[fixture]]
+                else:
+                    variants = [("-O2", None, f"{pass_name}=on"),
+                                ("-O2", pass_name, f"{pass_name}=off")]
+                for level, disabled, label in variants:
                     env = os.environ.copy()
                     # Replace, rather than inherit, pass controls: a host's
                     # bisection environment must not silently erase coverage.
                     env.pop("CCC_DISABLE_PASSES", None)
-                    pass_name = CONTROL_PASSES.get(fixture, "switch_lut")
-                    if disable:
-                        env["CCC_DISABLE_PASSES"] = pass_name
+                    if disabled:
+                        env["CCC_DISABLE_PASSES"] = disabled
                     asm, obj, exe = (work / name for name in ["test.s", "test.o", "test"])
-                    subprocess.run([str(args.lccc_dir / driver), "-O2", "-isystem", str(Path(resource) / "include"), "-S",
-                                    str(ROOT / "tests/regression" / f"{fixture}.c"),
-                                    "-o", str(asm)], env=env, check=True, timeout=30)
-                    subprocess.run([args.clang, target, "-c", str(asm), "-o", str(obj)], check=True, timeout=30)
+                    source = str(ROOT / "tests/regression" / f"{fixture}.c")
+                    include = ["-isystem", str(Path(resource) / "include")]
+                    if fixture in LEVELS:
+                        # LCCC's own assembler and ELF writer, as `-c` uses
+                        # them by default: it once refused `and w2, w2, #-16`.
+                        subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
+                                        "-o", str(obj)], env=env, check=True, timeout=30)
+                    else:
+                        subprocess.run([str(args.lccc_dir / driver), level, *include, "-S", source,
+                                        "-o", str(asm)], env=env, check=True, timeout=30)
+                        subprocess.run([args.clang, target, "-c", str(asm), "-o", str(obj)],
+                                       check=True, timeout=30)
                     subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start",
                                     str(startup), str(obj), "-o", str(exe)], check=True, timeout=30)
                     subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)],
                                    check=True, timeout=30)
                     count += 1
-                    print(f"PASS {arch} {fixture} {pass_name}={'off' if disable else 'on'}", flush=True)
+                    print(f"PASS {arch} {fixture} {label}", flush=True)
+            include = ["-isystem", str(Path(resource) / "include")]
+            clang_flags = [target, *CLANG_FREESTANDING, *CLANG_TARGET_FLAGS[arch], *include]
+            for fixture in INTEROP:
+                base = ROOT / "tests/regression/interop" / fixture
+                units = {}
+                for unit in ("callee", "caller"):
+                    source = str(base) + f"_{unit}.c"
+                    units[unit, "clang"] = work / f"{unit}-clang.o"
+                    subprocess.run([args.clang, *clang_flags, "-c", source, "-o", str(units[unit, "clang"])],
+                                   check=True, timeout=30)
+                    for level in INTEROP_LEVELS:
+                        units[unit, level] = work / f"{unit}-lccc{level}.o"
+                        subprocess.run([str(args.lccc_dir / driver), level, *include, "-c", source,
+                                        "-o", str(units[unit, level])], check=True, timeout=30)
+                for level in INTEROP_LEVELS:
+                    for callee, caller in (((level), (level)), ((level), "clang"), ("clang", (level))):
+                        exe = work / "interop"
+                        subprocess.run([*linker, "-m", emulation, "-static", "-e", "_start", str(startup),
+                                        str(units["callee", callee]), str(units["caller", caller]),
+                                        "-o", str(exe)], check=True, timeout=30)
+                        subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)], check=True, timeout=30)
+                        count += 1
+                        label = f"callee={'clang' if callee == 'clang' else 'lccc' + callee} " \
+                                f"caller={'clang' if caller == 'clang' else 'lccc' + caller}"
+                        print(f"PASS {arch} {fixture} {label}", flush=True)
     print(f"{count} cross-target execution contracts passed")
     return 0
 

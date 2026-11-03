@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import patch
 
-from check_switch_cross_execute import CONTROL_PASSES, FIXTURES, main, select_linker
+from check_switch_cross_execute import CONTROL_PASSES, FIXTURES, LEVELS, main, select_linker
 
 
 class LinkerDiscoveryTests(unittest.TestCase):
@@ -14,6 +14,17 @@ class LinkerDiscoveryTests(unittest.TestCase):
                                  ('strided_reduction_cross', 'vectorize')]:
             self.assertIn(fixture, FIXTURES)
             self.assertEqual(CONTROL_PASSES[fixture], control)
+
+    def test_level_sensitive_fixtures_run_at_every_level(self):
+        # These defects showed at -O0, -O1 or -Os while -O2 took other paths.
+        for fixture in ['switch_i128_high_half', 'switch_i128_wide_cases',
+                        'complex_float_return_cross', 'divrem_pair_cross',
+                        'urem_by_one_cross', 'va_arg_align16_cross',
+                        'overaligned_aggregate_arg_cross']:
+            self.assertIn(fixture, FIXTURES)
+            self.assertEqual(LEVELS[fixture], ('-O0', '-O1', '-O2', '-Os'))
+        self.assertLessEqual(set(LEVELS), set(FIXTURES))
+        self.assertFalse(set(LEVELS) & set(CONTROL_PASSES))
 
     @patch('check_switch_cross_execute.subprocess.check_output', side_effect=RuntimeError('probe'))
     @patch('sys.argv', ['check_switch_cross_execute.py'])

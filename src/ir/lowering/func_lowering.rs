@@ -356,7 +356,7 @@ impl Lowerer {
                                 }
                             };
                             let rv_class = layout.classify_riscv_float_fields(ctx);
-                            (Some(layout.align), classes, rv_class)
+                            (Some(self.record_arg_align(&layout)), classes, rv_class)
                         } else if let Some((classes, _)) = sysv_abi.clone() {
                             // A vector: no record layout.
                             (Some(self.ctype_align(&param_ctype)), classes, None)

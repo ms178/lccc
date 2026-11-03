@@ -159,7 +159,9 @@ impl RiscvCodegen {
         // parameters. A struct that occupies 2 GP regs counts as 2, not 1.
         // This is critical for va_start to correctly point to the first variadic arg.
         if func.is_variadic {
-            // For variadic callee, call_abi_config() already has variadic_floats_in_gp: true.
+            // Named parameters classify as named even in a variadic
+            // function: floats in FP registers, 2×XLEN arguments without
+            // even-register rounding (psABI; GCC and Clang alike).
             let classification =
                 crate::backend::call_abi::classify_params_full(func, &self.call_abi_config_impl());
             // Use the effective GP register index (includes alignment gaps for I128/F128 pairs)
@@ -409,8 +411,7 @@ impl RiscvCodegen {
             // closing `ret`.
             && self.riscv_caller_pool_eligible(func)
             && {
-                let mut config = self.call_abi_config_impl();
-                config.variadic_floats_in_gp = func.is_variadic;
+                let config = self.call_abi_config_impl();
                 let classes = crate::backend::call_abi::classify_params(func, &config);
                 !classes.iter().any(|c| {
                     matches!(
@@ -533,10 +534,11 @@ impl RiscvCodegen {
             }
         }
 
-        // Use shared parameter classification. On RISC-V, variadic functions
-        // route float params through GP regs; non-variadic use FP regs.
-        let mut config = self.call_abi_config_impl();
-        config.variadic_floats_in_gp = func.is_variadic;
+        // Use shared parameter classification.  Every declared parameter is
+        // named, so a variadic function receives its named floats in FP
+        // registers like any other; only the unnamed ones (read by va_arg
+        // from the GP save area) travel in GP registers.
+        let config = self.call_abi_config_impl();
         let param_classes = classify_params(func, &config);
         // Save param classes for ParamRef instructions
         self.state.param_classes = param_classes.clone();

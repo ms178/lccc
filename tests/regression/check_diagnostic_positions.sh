@@ -120,6 +120,73 @@ row "nested conditional colon" - conditional_nested.c conditional_nested.c -std=
 row "GNU conditional colon" - conditional_gnu.c conditional_gnu.c -std=gnu17
 row "conditional macro operand" - conditional_macro.c conditional_macro.c -std=gnu17
 
+# C11 6.8.4.2p3 constraints on one switch: no two case constants with the
+# same value after conversion to the promoted controlling type, at most one
+# default.  LCCC used to accept all of these silently (the later label won or
+# lost depending on the dispatch order); GCC blames the later label's
+# `case`/`default` keyword.
+cat > case_duplicate.c <<'C'
+int f(int x) {
+    switch (x) { case 1: return 1; case 2: return 2; case 1: return 3; }
+    return 0;
+}
+C
+cat > case_in_range.c <<'C'
+int f(unsigned char x) {
+    switch (x) { case 1 ... 5: return 1; case 3: return 2; }
+    return 0;
+}
+C
+cat > case_range_overlap.c <<'C'
+int f(long x) {
+    switch (x) { case 9: return 1; case 2 ... 10: return 2; }
+    return 0;
+}
+C
+cat > case_converted_duplicate.c <<'C'
+int f(unsigned x) {
+    switch (x) { case -1: return 1; case 0xffffffffu: return 2; }
+    return 0;
+}
+C
+cat > default_twice.c <<'C'
+int f(int x) {
+    switch (x) { default: return 0; case 1: return 1; default: return 2; }
+}
+C
+row "duplicate case value"            2:54 case_duplicate.c case_duplicate.c
+row "case inside an earlier range"    2:42 case_in_range.c case_in_range.c
+row "range over an earlier case"      2:36 case_range_overlap.c case_range_overlap.c
+row "duplicate after conversion"      2:37 case_converted_duplicate.c case_converted_duplicate.c
+row "second default label"            2:55 default_twice.c default_twice.c
+
+# The same rules must not reject a valid switch: 128-bit cases that differ
+# only above bit 63, a nested switch reusing its parent's values, and the
+# unsigned images of distinct negative values.
+cat > case_distinct.c <<'C'
+long f(__int128 v, int x, unsigned char c) {
+    switch (v) {
+    case 0: return 1;
+    case (__int128)1 << 64: return 2;
+    case -1: return 3;
+    case 0xffffffffffffffffull: return 4;
+    }
+    switch (x) {
+    case 1: switch (x) { case 1: return 5; default: break; } break;
+    case 2 ... 4: return 6;
+    }
+    switch (c) { case 255: return 7; case -2: return 8; }
+    return 0;
+}
+C
+if "$CCC" -S -o /dev/null case_distinct.c 2>case_distinct.err && [ ! -s case_distinct.err ]; then
+    pass=$((pass + 1))
+else
+    echo "FAIL distinct case values: lccc rejected or warned" >&2
+    sed 's/^/      /' case_distinct.err >&2
+    fail=$((fail + 1))
+fi
+
 # The include line itself is still blamed for a missing header -- the phantom
 # line was never the "not found" diagnostic's problem, and pinning it here keeps
 # the fix from turning into "stop reporting includes at all".

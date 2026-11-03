@@ -274,33 +274,12 @@ impl RiscvCodegen {
     // ---- Alloca alignment ----
 
     pub(super) fn emit_alloca_aligned_addr_impl(&mut self, slot: StackSlot, val_id: u32) {
-        let align = self
-            .state
-            .alloca_over_align(val_id)
-            .expect("alloca must have over-alignment for aligned addr emission");
-        // Compute s0 + slot_offset into t5 (pointer register)
-        self.emit_addi_s0("t5", slot.0);
-        // Align: t5 = (t5 + align-1) & -align
-        self.state
-            .emit_fmt(format_args!("    li t6, {}", align - 1));
-        self.state.emit("    add t5, t5, t6");
-        self.state.emit_fmt(format_args!("    li t6, -{}", align));
-        self.state.emit("    and t5, t5, t6");
+        // t5 is the pointer register of the aligned-alloca protocol.
+        self.emit_alloca_addr("t5", val_id, slot.0);
     }
 
     pub(super) fn emit_alloca_aligned_addr_to_acc_impl(&mut self, slot: StackSlot, val_id: u32) {
-        let align = self
-            .state
-            .alloca_over_align(val_id)
-            .expect("alloca must have over-alignment for aligned addr emission");
-        // Compute s0 + slot_offset into t0 (accumulator)
-        self.emit_addi_s0("t0", slot.0);
-        // Align: t0 = (t0 + align-1) & -align
-        self.state
-            .emit_fmt(format_args!("    li t6, {}", align - 1));
-        self.state.emit("    add t0, t0, t6");
-        self.state.emit_fmt(format_args!("    li t6, -{}", align));
-        self.state.emit("    and t0, t0, t6");
+        self.emit_alloca_addr("t0", val_id, slot.0);
         // t0 now holds an aligned address, not any previous SSA value.
         self.state.reg_cache.invalidate_acc();
     }

@@ -334,11 +334,53 @@ impl LValue {
 /// A single level of switch statement context, pushed/popped as switches nest.
 #[derive(Debug)]
 pub(super) struct SwitchFrame {
-    pub cases: Vec<(i64, BlockId)>,
+    /// Case values converted to `expr_type`.  Stored at 128 bits so that an
+    /// `__int128` switch keeps `case 0xffffffffffffffffull:` (2^64 - 1) apart
+    /// from `case -1:` and `case (__int128)1 << 64:` apart from `case 0:`;
+    /// for narrower types the value is the sign extension of the old i64.
+    pub cases: Vec<(i128, BlockId)>,
     /// GNU case ranges: (low, high, label)
-    pub case_ranges: Vec<(i64, i64, BlockId)>,
+    pub case_ranges: Vec<(i128, i128, BlockId)>,
     pub default_label: Option<BlockId>,
     pub expr_type: IrType,
+}
+
+impl SwitchFrame {
+    /// `v` mapped to a u128 whose unsigned order is the order of the switch
+    /// type: unsigned types compare their bit patterns at their width (a
+    /// narrow case is the sign extension of its i64 bits), signed types
+    /// their values (sign bit flipped).
+    fn order_key(&self, v: i128) -> u128 {
+        if !self.expr_type.is_unsigned() {
+            (v as u128) ^ (1 << 127)
+        } else if matches!(self.expr_type, IrType::U128) {
+            v as u128
+        } else {
+            u128::from(v as i64 as u64)
+        }
+    }
+
+    /// Whether the GNU range `low ... high` names no value of the switch type.
+    pub(super) fn is_empty_range(&self, low: i128, high: i128) -> bool {
+        self.order_key(low) > self.order_key(high)
+    }
+
+    /// Whether a label for the values `low..=high` would repeat a value an
+    /// earlier `case` of this switch already names (C11 6.8.4.2p3).  An
+    /// empty GNU range (`low > high`) names no value.
+    pub(super) fn overlaps(&self, low: i128, high: i128) -> bool {
+        let (low, high) = (self.order_key(low), self.order_key(high));
+        if low > high {
+            return false;
+        }
+        self.cases
+            .iter()
+            .any(|&(v, _)| (low..=high).contains(&self.order_key(v)))
+            || self.case_ranges.iter().any(|&(l, h, _)| {
+                let (l, h) = (self.order_key(l), self.order_key(h));
+                l <= h && l <= high && low <= h
+            })
+    }
 }
 
 /// Consolidated function signature metadata.
@@ -612,5 +654,62 @@ pub(super) fn object_access_is_volatile(
         object_volatile
     } else {
         base_type_volatile
+    }
+}
+
+#[cfg(test)]
+mod switch_frame_tests {
+    use super::SwitchFrame;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::BlockId;
+
+    fn frame(ty: IrType, cases: &[i128], ranges: &[(i128, i128)]) -> SwitchFrame {
+        SwitchFrame {
+            cases: cases.iter().map(|&v| (v, BlockId(0))).collect(),
+            case_ranges: ranges.iter().map(|&(l, h)| (l, h, BlockId(0))).collect(),
+            default_label: None,
+            expr_type: ty,
+        }
+    }
+
+    #[test]
+    fn signed_ranges_order_by_value() {
+        let f = frame(IrType::I32, &[-5], &[(10, 20)]);
+        assert!(f.overlaps(-5, -5));
+        assert!(f.overlaps(-10, -5));
+        assert!(!f.overlaps(-4, 9));
+        assert!(f.overlaps(20, 30));
+        assert!(!f.overlaps(21, 30));
+        assert!(f.is_empty_range(3, -3));
+        assert!(!f.overlaps(30, -30), "an empty range names nothing");
+    }
+
+    #[test]
+    fn unsigned_ranges_order_by_bit_pattern() {
+        // A U64 case 2^64 - 1 is the i64 -1: it sorts above every positive
+        // value, so `1 ... -1` (1 to 2^64 - 1) covers it and `-1 ... 1` is empty.
+        let f = frame(IrType::U64, &[-1], &[]);
+        assert!(f.overlaps(1, -1));
+        assert!(f.is_empty_range(-1, 1));
+        assert!(!f.overlaps(-1, 1));
+        let g = frame(IrType::U128, &[u128::MAX as i128], &[(0, 10)]);
+        assert!(g.overlaps(1 << 100, -1));
+        assert!(g.overlaps(5, 5));
+        assert!(!g.overlaps(11, 1 << 100));
+    }
+
+    #[test]
+    fn empty_ranges_already_recorded_overlap_nothing() {
+        let f = frame(IrType::I64, &[], &[(9, 1)]);
+        assert!(!f.overlaps(5, 5));
+        assert!(!f.overlaps(0, 100));
+    }
+
+    #[test]
+    fn wide_cases_differing_above_bit_63_are_distinct() {
+        let f = frame(IrType::I128, &[0, -1, u64::MAX as i128], &[]);
+        assert!(!f.overlaps(1 << 64, 1 << 64));
+        assert!(f.overlaps(u64::MAX as i128, u64::MAX as i128));
+        assert!(!f.overlaps(i128::from(i64::MIN), i128::from(i64::MIN)));
     }
 }

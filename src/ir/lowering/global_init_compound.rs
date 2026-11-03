@@ -452,6 +452,19 @@ impl Lowerer {
         None
     }
 
+    /// The alignment that places a struct or union argument (register-pair
+    /// parity, stack slot, `va_arg` cursor).  AAPCS64 uses the record's
+    /// natural alignment -- that of its most-aligned member -- and ignores a
+    /// record-level `aligned(N)` (GCC `aarch64_function_arg_alignment`,
+    /// Clang alike); the other psABIs use the record's full alignment.
+    pub(super) fn record_arg_align(&self, layout: &crate::common::types::StructLayout) -> usize {
+        if self.target == crate::backend::Target::Aarch64 {
+            layout.member_align
+        } else {
+            layout.align
+        }
+    }
+
     /// Get a StructLayout for a CType if it's a struct or union.
     pub(super) fn get_struct_layout_for_ctype(
         &self,

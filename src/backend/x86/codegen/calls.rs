@@ -2117,7 +2117,7 @@ impl X86Codegen {
             &info.struct_arg_classes,
             &info.struct_arg_riscv_float_classes,
             &info.struct_arg_is_f128_sse,
-            info.is_variadic,
+            info.is_variadic.then_some(info.num_fixed_args),
             &config,
         );
         if classes
