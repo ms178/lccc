@@ -10,7 +10,7 @@
 use super::pipeline::Preprocessor;
 use super::utils::{
     bytes_to_str, c23_dialect, is_digit_separator, is_ident_cont_byte, is_ident_start_byte,
-is_literal_prefix, push_char_at, skip_literal_bytes,
+    is_literal_prefix, push_char_at, skip_literal_bytes,
 };
 
 impl Preprocessor {
@@ -113,7 +113,7 @@ impl Preprocessor {
             // Skip string and char literals verbatim: `"__has_attribute"` in
             // a string must not be rewritten.
             if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
-let end = skip_literal_bytes(bytes, i, bytes[i]).min(len);
+                let end = skip_literal_bytes(bytes, i, bytes[i]).min(len);
                 result.push_str(&line[i..end]);
                 i = end;
                 continue;
@@ -150,7 +150,7 @@ let end = skip_literal_bytes(bytes, i, bytes[i]).min(len);
                 }
                 continue;
             }
-i = push_char_at(&mut result, line, i);
+            i = push_char_at(&mut result, line, i);
         }
         result
     }

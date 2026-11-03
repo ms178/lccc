@@ -76,16 +76,22 @@ Ran seeded, temporary differential probes through the current `-E -P` implementa
 
 After rebasing onto `main`, the full Rust suite exposed an existing doctest failure in `src/backend/x86/codegen/memory.rs`: an indented assembly example in a Rust doc comment was parsed as Rust code. Changed it to a fenced `text` block. This documentation-only fix is included in the current local fastbuild validation.
 
-## Remaining scope / delivery
+## Delivery and follow-up log — 2026-11-03
 
-The broader lexer, preprocessor, parser, and semantic source review is still in progress; results above do not establish that the entire frontend is defect-free. ICX 2026.2 was unavailable in the restored cache/environment and was not used. No PR or hosted-CI result is claimed. The working patch has been re-applied cleanly onto the latest `origin/main` at `03b3aea` after the remote advanced during this audit; there are no unresolved conflict markers. The complete fastbuild suite is being rerun against this exact tree before delivery. Then refresh `/home/user/ms178-1.patch`, inspect the full diff, push only `arena/f0871c61-lccc`, open the PR, and report hosted CI checks. Keep the fast preset's 9 skips and local GCC12 linker-suite toolchain mix explicit. Do not describe zero issues or perfect quality as proven.
+The earlier sections above preserve the evidence and decisions made at each audit stage. The audit does not claim every frontend defect has been found; the broader source review remains incomplete.
 
-## Delivery update — 2026-11-03
+### First delivery (before `main` advanced)
 
-This section supersedes the pending-delivery statements above; the earlier entries remain as the audit log at the time they were written.
+- Rebased onto `main` at `03b3aea`, committed as `6ea4461`, and opened PR [#1088](https://github.com/ms178/lccc/pull/1088).
+- Hosted CI on that commit passed all 23 reported checks, including GCC 16.2, Clang 23.1.4, and authenticated ICX 2026.2 integration.
+- The local fastbuild run at that point reported 557 passed, 6 failed, 8 skipped. The failures included missing Valgrind, a selected GCC 12 sanitizer-option incompatibility, and a missing MSRV-toolchain path; the initial Arm XML failures were resolved with the expected cache-path alias. Those local-run totals are historical, not the final rerun.
 
-- Rebased the patch onto `origin/main` at `03b3aea` and committed on `arena/f0871c61-lccc` as `6ea4461` (33 files; 895 insertions, 151 deletions). The PR is [#1088](https://github.com/ms178/lccc/pull/1088).
-- The final local `./scripts/ci_local.sh --fast` run completed with **557 passed, 6 failed, 8 skipped**. The four remaining failures were environment/capability issues: the RA harness's `-fsanitize-trap` option is unsupported by the available GCC 12; GCC 16.2, Clang 23.1.4, and Valgrind were unavailable locally, preventing the oracle-toolchain, layout-tie, and FMA oracle checks. Two Arm XML gates initially failed because the restored XML cache used a different directory-name capitalization; after adding the expected local cache alias, provisioning passed and the doccheck validated **526/526** AArch64 golden words. The full local fast run was not repeated after this cache-only correction, so its recorded overall total remains 557/6/8.
-- The fast preset skips debug-assertion/SSA-related slow work and benchmark/Callgrind work as specified by the runner; do not count skipped gates as passes.
-- Hosted CI on the pushed commit completed with **23/23 reported checks passed**. This includes GCC 16.2 and Clang 23.1.4 oracle-backed contracts, authenticated ICX 2026.2 integration, debug-assertion and release unit suites, SSA and regression corpora, benchmark corpus, frontend/ABI and codegen/runtime shards, assembler/linker contracts, and MSRV.
-- The full source review remains in progress and the audit makes no claim that every frontend defect has been found. Local ICX/GCC16/Clang/Valgrind comparisons remain unavailable; hosted CI provides the toolchain-backed checks just listed. The snapshot `/home/user/ms178-1.patch` was saved before commit and is refreshed to the committed diff at delivery.
+### Rebase/conflict resolution and test follow-up
+
+`origin/main` advanced to `662b771`, making PR #1088 conflicting. Rebased the PR branch onto that commit. The sole content conflict was in `src/frontend/preprocessor/expr_eval.rs`. Resolution preserves `main`'s byte-safe `push_char_at` and `skip_literal_bytes` cursor helpers and C literal-prefix handling, while retaining the PR's UTF-8 regression coverage and bounded literal-slice behavior. `cargo fmt` and a fastbuild build of `lccc` and `lccc-ld` succeeded; the focused `ordinary_has_macro_expansion_preserves_utf8_literals` unit test passed.
+
+The rebase validation exposed two local harness-selection issues, not compiler-result mismatches: the RA smoke test hard-coded the executable name `gcc` and selected GCC 12 despite a GCC 16.2 oracle being installed, and the MSRV gate needed the restored 1.97.0 toolchain prefix. The RA harness now accepts `--gcc`/`GCC`, preferring `gcc-16` when available and falling back to `gcc`; its 20-kernel checksum and UBSan smoke passed with GCC 16.2. The MSRV gate passed when pointed at the restored 1.97.0 toolchain. Installing Valgrind and `libc6-dbg` from the verified local cache enabled the oracle-toolchain, layout-tie, and FMA gates; all three passed in focused reruns. Tag redefinition differential tests passed 17/17 across LCCC, GCC 16.2, and Clang 23.1.4.
+
+A full fastbuild CI run on the rebased tree before those environment/harness corrections reported 560 passed, 5 failed, 9 skipped. The failures were RA harness compiler selection, the MSRV path, and the three Valgrind-dependent gates; focused reruns after correcting those inputs passed. The complete fastbuild suite is being rerun after these fixes; its final result must be recorded before delivery. Fast-mode skips remain skips, not passes.
+
+The previous hosted 23/23 result applies to the pre-rebase commit. Hosted CI must be rerun on the rebased head before claiming the PR is green. The current source review remains in progress; no assertion of zero defects or perfect performance is made.
