@@ -225,6 +225,21 @@ keeps them there:
   -mno-xsave` leaves neither macro) because the `ymm` state lives in an XSAVE
   component — a later `-mavx`/`-mavx2`/`-mfma` reopens both.
 
+  The veto has one second-order consequence the oracle gets wrong, and lccc
+  deliberately does not copy it: GCC's `-mno-xsave` clears `MASK_AVX` without
+  cascading into the dependent option bits, so `-msha512 -mno-xsave` — and
+  `-march=clearwaterforest -mno-xsave`, with `__SM3__`/`__SM4__` — still
+  *announces* those macros while the same command line rejects
+  `_mm256_sha512msg1_epi64`, `_mm_sm3msg1_epi32` and `_mm_sm4key4_epi32` from
+  `sha512intrin.h`/`sm3intrin.h`. lccc drops the announcement with the state
+  component it needs, which is the stricter reading and never weaker: a
+  `#ifdef __SHA512__` probe can no longer select a path the intrinsic gate
+  refuses. `scripts/check_x86_mflag_macros.py` pins this from both sides —
+  the three macros are masked out of the *missing* direction only, and must be
+  absent from lccc whenever `-mno-xsave` is the last decision — across the 24
+  ordered `CASCADES` that run on every `-march=` base, so neither the
+  announcement nor the drop can drift silently.
+
 `__SSE_MATH__`/`__SSE2_MATH__` state which scalar float math the code
 generator does in SSE; the ISA level alone doesn't determine it. x86-64
 does all of it in SSE. The i686 backend does F32 in SSE only with SSE2,
@@ -307,7 +322,7 @@ instructions.
 | `abm_flags_match_gcc`, `isa_flags_follow_gccs_option_masks` (unit) | `-m` option order, cancellation and implications, measured cases |
 | `x86_cpu_name_macros_match_gcc` (unit) | CPU-name and tuning macros, measured cases |
 | `scripts/check_x86_march_macros.py LCCC` | Every CPU, `-m64` and `-m32`: ISA, CPU-name and `-mtune=` macros against GCC |
-| `scripts/check_x86_mflag_macros.py LCCC [--pairs]` | Every `-m` ISA option, alone and in ordered pairs, on five bases: macros against GCC |
+| `scripts/check_x86_mflag_macros.py LCCC [--pairs]` | Every `-m` ISA option, alone on six bases, plus the 24 ordered XSAVE/SSE-denial `CASCADES` that decide the option-layer mixes (`--pairs` widens it to every ordering): macros against GCC |
 | `scripts/check_x86_prefer_vector_width.py LCCC` | `-mprefer-vector-width=` codegen class per row against GCC, macro neutrality, rejection wording |
 | `x86_macro_gate_tests` (unit) | XSAVE precedence, the AES/PCLMUL/GFNI announcement split, the POPCNT unwind matrix, sticky `-mno-mmx`, `-mprefer-vector-width=` parsing |
 | `check_intrinsic_feature_gate.sh` | Intrinsic verdicts under `target()` option order, compared with GCC |
