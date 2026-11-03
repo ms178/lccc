@@ -1509,6 +1509,9 @@ impl<'a> ExprTypeChecker<'a> {
         if let Some(op) = crate::common::avx_widen::AvxWiden::raw_builtin(name) {
             return Some(CType::Vector(Box::new(op.result_element()), 32));
         }
+        if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
+            return Some(ct);
+        }
         match name {
             // BMI2 BZHI returns its operand type.
             "__builtin_ia32_bzhi_si" | "__builtin_ia32_pdep_si" | "__builtin_ia32_pext_si" => {
@@ -2015,6 +2018,9 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     fn infer_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
+        if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
+            return Some(ct);
+        }
         use crate::frontend::sema::{gcc16_builtins, stdbit};
         if stdbit::is_stdc_bit_builtin(name) {
             let arg0_ct = args

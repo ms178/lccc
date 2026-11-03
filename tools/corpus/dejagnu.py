@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import re
 import shlex
-from typing import Sequence
 
 # dg-options / dg-additional-options, followed by whitespace.  The rest of the
 # directive is parsed structurally below, so this only has to find the start.
@@ -45,6 +44,10 @@ _TARGET = re.compile(r"\{\s*target\b")
 _QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
 # Bare -flag tokens outside quotes (e.g. `{ dg-options -Wa,--no-verify }`).
 _BARE_FLAG = re.compile(r"(?<![\w.-])(--?[A-Za-z0-9][^\s{}\"']*)")
+# `--param NAME=N` is spelled as TWO argv entries.  A Tcl brace-list is a list
+# of flags, not an arbitrary argv, so a non-flag token is kept ONLY as the
+# value of that one option; everything else (`;`, paths, bare words) is dropped.
+_PARAM_VALUE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*=[^\s;{}'\"]+")
 
 
 def _balanced(text: str, start: int) -> tuple[str, int] | None:
@@ -65,15 +68,36 @@ def _balanced(text: str, start: int) -> tuple[str, int] | None:
     return None
 
 
-def _quoted_tokens(body: str) -> list[str]:
+def _quoted_tokens(body: str) -> tuple[list[str], bool]:
+    """Return (tokens, unsupported).
+
+    ``unsupported`` is set for backslash escapes or unbalanced quotes: a
+    Tcl string we cannot decode exactly must not become a silently different
+    compiler invocation.  The caller skips the whole directive in that case.
+    """
     tokens: list[str] = []
     for match in _QUOTED.finditer(body):
+        raw = match.group(1)
+        if "\\" in raw:
+            return [], True
         try:
-            tokens.extend(shlex.split(match.group(1)))
+            tokens.extend(shlex.split(raw))
         except ValueError:
-            # An unbalanced quote inside the Tcl string: do not guess.
-            return []
-    return tokens
+            return [], True
+    return tokens, False
+
+
+def _brace_list_tokens(tokens: list[str]) -> list[str]:
+    """A brace list is a list of FLAGS: keep flags and --param values only."""
+    kept: list[str] = []
+    previous = ""
+    for token in tokens:
+        if token.startswith("-"):
+            kept.append(token)
+        elif previous == "--param" and _PARAM_VALUE.fullmatch(token):
+            kept.append(token)
+        previous = token
+    return kept
 
 
 def extract_option_flags(text: str, *, limit: int = 8192) -> tuple[str, ...]:
@@ -84,12 +108,19 @@ def extract_option_flags(text: str, *, limit: int = 8192) -> tuple[str, ...]:
     unterminated contributes nothing (a partial read must never turn into a
     silently different compiler invocation).
     """
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    # ONE bounded window for both the search and the structural parse.  Passing
+    # the full text to _balanced would let an unterminated directive near the
+    # boundary find a stray `}` in the C source *after* the window and turn a
+    # truncated input into a plausible-looking option list.
+    window = text[:limit]
     flags: list[str] = []
-    for match in _START.finditer(text[:limit]):
+    for match in _START.finditer(window):
         # Find the directive's closing brace from the opening `{` of the match,
         # so a target qualifier that follows the flags is still visible.
         opening = match.start()
-        group = _balanced(text, opening)
+        group = _balanced(window, opening)
         if group is None:
             continue
         body, _end = group
@@ -97,33 +128,26 @@ def extract_option_flags(text: str, *, limit: int = 8192) -> tuple[str, ...]:
             continue
         # ``body`` starts one character after ``opening`` (the `{`), so the
         # match end measured from ``opening`` must lose that one character.
+        # The offset can never exceed ``len(body)``: the match itself is part
+        # of the balanced group that produced ``body``.
         payload = body[match.end() - opening - 1:]
-        tokens: list[str] = _quoted_tokens(payload)
-        if not tokens and not _QUOTED.search(payload):
+        tokens, unsupported = _quoted_tokens(payload)
+        if unsupported:
+            continue
+        if _QUOTED.search(payload):
+            # Quoted spelling: retain the exact argv the old runner passed
+            # (including separated `--param NAME=N` values).  A brace list is
+            # a list of *flags*, so filter it; the single quoted string is a
+            # literal option string and is preserved verbatim.
+            is_brace_list = not payload.lstrip().startswith('"')
+            flags.extend(_brace_list_tokens(tokens) if is_brace_list else tokens)
+        else:
             # A Tcl list can also spell ONE flag without quotes, e.g.
             # `{ dg-options -Wa,--no-verify }`.  Only accept bare tokens when
             # the payload has no quoted strings at all: a mixed/unknown Tcl
             # list must not leak its stray words into the compiler argv.
-            tokens.extend(m.group(0) for m in _BARE_FLAG.finditer(payload))
-        flags.extend(token for token in tokens if token.startswith("-"))
+            flags.extend(m.group(0) for m in _BARE_FLAG.finditer(payload))
     return tuple(flags)
 
 
-def flags_for_source(path, *, limit: int = 8192) -> tuple[str, ...]:
-    """Convenience wrapper for a source file (errors are the caller's)."""
-    from pathlib import Path
-
-    return extract_option_flags(Path(path).read_text(errors="replace"), limit=limit)
-
-
-def with_flags(command: Sequence[str], flags: Sequence[str]) -> list[str]:
-    """Insert flags before positional source operands (identity helper).
-
-    Kept here so callers that assemble argv do not each have to re-decide
-    where directives belong; the native runners place them with the other
-    compile-only flags, ahead of the source path.
-    """
-    return [*command, *flags]
-
-
-__all__ = ["extract_option_flags", "flags_for_source", "with_flags"]
+__all__ = ["extract_option_flags"]

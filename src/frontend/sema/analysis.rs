@@ -8372,10 +8372,18 @@ dereference it before applying '->' to it?"
                                 );
                             } else {
                                 let incomplete = match pointee.as_ref() {
-                                    CType::Void | CType::Array(_, None) => true,
+                                    CType::Void => true,
                                     CType::Struct(k) | CType::Union(k) => {
                                         !self.defined_structs.borrow().contains(&**k)
                                     }
+                                    // GNU zero-length and variable-length arrays
+                                    // are COMPLETE types even though their size
+                                    // is 0 or not a compile-time constant.
+                                    // gcc-16.2 accepts them (gcc.c-torture/
+                                    // compile/pr98087.c); the lowering already
+                                    // treats `size == 0` as a no-op, so no
+                                    // bytes are ever written here.
+                                    CType::Array(..) => false,
                                     _ => false,
                                 };
                                 if incomplete {

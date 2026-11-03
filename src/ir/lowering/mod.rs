@@ -14,6 +14,7 @@ pub(crate) mod expr_builtins;
 mod expr_builtins_c2y;
 mod expr_builtins_fpclass;
 mod expr_builtins_gcc16;
+mod expr_builtins_gcc17;
 mod expr_builtins_intrin;
 mod expr_builtins_lcccsimd;
 mod expr_builtins_overflow;

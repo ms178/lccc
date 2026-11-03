@@ -445,6 +445,9 @@ impl Lowerer {
         if crate::common::avx_widen::AvxWiden::raw_builtin(name).is_some() {
             return Some(IrType::Ptr);
         }
+        if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
+            return Some(IrType::from_ctype(&ct));
+        }
         match name {
             // x86 vector scalar extractions with 64-bit results (long long /
             // unsigned long long). Without these the call was typed with the
@@ -2416,6 +2419,9 @@ impl Lowerer {
     }
 
     pub(super) fn get_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
+        if let Some(ct) = crate::frontend::sema::builtins::gcc_compat_builtin_ctype(name) {
+            return Some(ct);
+        }
         use crate::frontend::sema::{gcc16_builtins, stdbit};
         if stdbit::is_stdc_bit_builtin(name) {
             let arg0_ct = args
