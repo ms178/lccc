@@ -995,18 +995,6 @@ pub(crate) fn build_dwarf_line_section(
         return Ok(None);
     }
 
-    // The line program's own dialect.  GNU tools write a version 3 line table
-    // even for `-gdwarf-2` (measured: gcc 12.2 and 16.2 both do), because the
-    // newer header is what carries `prologue_end` and `epilogue_begin`, and no
-    // version 2 reader rejects it; gcc has emitted it since 2011.  The unit
-    // keeps the version the command line asked for -- only the line table's
-    // floor moves, which is what gives a `-gdwarf-2` build the same row markers
-    // as the newer dialects.
-    let config = DwarfConfig {
-        version: config.version.max(3),
-        ..config
-    };
-
     let file_table = debug_file_table(files)?;
     // Version 5 addresses its file table by number: slot 0 is the primary file,
     // slot *i* is `.file i`.  Versions 2..4 number their entries from 1, so the
@@ -3129,9 +3117,7 @@ mod tests {
             let mut at = 0;
             let unit_length = read_u32(data, &mut at) as usize;
             assert_eq!(unit_length + 4, data.len(), "version {version} length");
-            // The line program's dialect has a floor of 3: a `-gdwarf-2` unit
-            // still gets a version 3 table, as gcc's does.
-            assert_eq!(read_u16(data, &mut at), version.max(3) as u16);
+            assert_eq!(read_u16(data, &mut at), version as u16);
             if version >= 5 {
                 // Version 5's line header names the address size and the
                 // segment selector size before its length.
@@ -3140,30 +3126,37 @@ mod tests {
                 at += 2;
             }
             let header_length = read_u32(data, &mut at) as usize;
-            // The line program's dialect has a floor of 3 (`-gdwarf-2` units get
-            // a version 3 table, as gcc's do), so a version 2 unit's prologue is
-            // byte for byte a version 3 unit's.
-            let line_version = std::cmp::max(version, 3);
-            let expected = match line_version {
-                4 => fixed[2].1 + tables[2].1,
-                5 => fixed[3].1 + v5_tables,
-                _ => fixed[1].1 + tables[1].1,
+            let expected = match version {
+                2..=4 => fixed[version as usize - 2].1 + tables[version as usize - 2].1,
+                _ => fixed[3].1 + v5_tables,
             };
             assert_eq!(header_length, expected, "version {version} prologue");
             // After `minimum_instruction_length` come `default_is_stmt`,
             // `line_base`, `line_range` and `opcode_base`; DWARF 4 inserted
             // `maximum_operations_per_instruction` before `default_is_stmt`.
             assert_eq!(data[at], 1, "minimum_instruction_length");
-            let extra = usize::from(line_version >= 4);
+            let extra = usize::from(version >= 4);
             assert_eq!(data[at + 1 + extra], 1, "default_is_stmt");
             let table = at + 5 + extra;
-            assert_eq!(data[table - 1], 13, "opcode_base");
-            assert_eq!(
-                &data[table..table + 12],
-                &STANDARD_OPCODE_LENGTHS,
-                "version {line_version} standard opcode table"
-            );
-            if line_version >= 4 {
+            if version >= 3 {
+                assert_eq!(data[table - 1], 13, "opcode_base");
+                assert_eq!(
+                    &data[table..table + 12],
+                    &STANDARD_OPCODE_LENGTHS,
+                    "version {version} standard opcode table"
+                );
+            } else {
+                // A version 2 line program has nine standard opcodes, and gcc
+                // 16.2 writes exactly that for `-gdwarf-2` (measured): the
+                // table's dialect follows the unit's.
+                assert_eq!(data[table - 1], 10, "version 2 opcode_base");
+                assert_eq!(
+                    &data[table..table + 9],
+                    &STANDARD_OPCODE_LENGTHS[..9],
+                    "DWARF 2 has nine standard opcodes"
+                );
+            }
+            if version >= 4 {
                 assert_eq!(data[at + 1], 1, "maximum_operations_per_instruction");
                 assert_eq!(data[at + 2], 1, "default_is_stmt");
             } else {
@@ -3952,9 +3945,7 @@ mod tests {
     /// The directory and file tables of a version 2..4 prologue, read the way
     /// a consumer reads them: NUL-terminated names and LEB128 indices.
     fn inline_tables(data: &[u8], unit_version: u16) -> (Vec<String>, Vec<(u64, String)>) {
-        // The line program's dialect has a floor of 3 even under `-gdwarf-2`
-        // (see `build_dwarf_line_section`); the unit version decides the rest.
-        let version = unit_version.max(3);
+        let version = unit_version;
         let mut at = 4;
         assert_eq!(read_u16(data, &mut at), version, "line program version");
         let header_length = read_u32(data, &mut at) as usize;

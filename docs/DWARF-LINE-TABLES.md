@@ -162,13 +162,13 @@ A subprogram is described twice, and both descriptions have to be right:
   for the declaration position. Units assembled from `.loc` rows alone declare
   no `DW_AT_decl_column`: a statement's column is not the declarator's.
 * The first row after the prologue carries `prologue_end` and the row at the
-  first epilogue instruction `epilogue_begin`. Those are version 3 opcodes, so
-  the line program is version 3 or newer **whatever the unit dialect is** --
-  gcc writes a version 3 line table even under `-gdwarf-2` (measured on 12.2 and
-  16.2; it has done so since 2011) and no version 2 reader rejects it, so a
-  `-gdwarf-2` build gets the same markers as the newer ones. A `.loc` whose
-  instruction the peephole removes is dropped with it, so the marker is
-  re-attached to the first row the function kept -- still after the prologue.
+  first epilogue instruction `epilogue_begin`. Both are version 3 opcodes, and
+  the line program's dialect is the unit's -- gcc 16.2 writes a version 2 line
+  table for `-gdwarf-2` (measured; 12.2 wrote 3, which was the older behaviour)
+  -- so a `-gdwarf-2` build states neither rather than describing its own header
+  with opcodes it never defined. A `.loc` whose instruction the peephole removes
+  is dropped with it, so the marker is re-attached to the first row the function
+  kept -- still after the prologue.
 
 Row density is per **statement**, not per source line: two statements on one
 line are two rows at their own columns, which is what makes `next` stop between

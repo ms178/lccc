@@ -466,8 +466,13 @@ CU_FORM_PARITY = {
     4: ("low_pc", "high_pc", "stmt_list", "language"),
     5: ("low_pc", "high_pc", "stmt_list", "language", "producer", "name", "comp_dir"),
 }
+# The line program's own header fields.  Its *version* is compared against the
+# unit's rather than the oracle's: gcc 16.2 writes a version 2 table for
+# `-gdwarf-2`, and gcc 12.2 wrote version 3 for the same flag (measured), so the
+# version is a fact about the writer's age, not about the dialect.  What the
+# dialect pins -- and what a consumer decodes -- is the rest of the header, and
+# the rule that the table speaks its unit's version.
 LINE_KEYS = (
-    "version",
     "address_size",
     "segment_selector",
     "minimum_instruction_length",
@@ -586,7 +591,25 @@ def check_version_and_dialect(
         )
     ours_line = line_profile(ours_dump)
     reference_line = line_profile(reference_dump)
-    compare_profiles(version, dialect, reference_line, ours_line, LINE_KEYS)
+    require(
+        ours_line["version"] == version,
+        f"{label}: the line program is version {ours_line['version']}, its unit "
+        f"is version {version}",
+    )
+    keys = LINE_KEYS
+    if version == 2:
+        # A version 2 line program has nine standard opcodes, so its opcode base
+        # is 10.  gcc 12.2 padded a `-gdwarf-2` program with the version 3 table
+        # (opcode base 13) instead; gcc 16.2 writes the version 2 shape, which
+        # is what the dialect says and what LCCC writes, so the oracle is asked
+        # for everything except the field its own age decides.
+        keys = tuple(key for key in LINE_KEYS if key not in ("opcode_base", "opcode_args"))
+        require(
+            ours_line["opcode_base"] == 10,
+            f"{label}: a version 2 line program has nine standard opcodes, so "
+            f"its opcode base is 10, not {ours_line['opcode_base']}",
+        )
+    compare_profiles(version, dialect, reference_line, ours_line, keys)
     # The unit names the source the driver was handed -- an absolute path here
     # -- and the directory the compilation ran in. GCC 16.2 spells both the
     # same way, which the profile comparison above already enforces; this

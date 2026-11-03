@@ -339,11 +339,11 @@ def check_object(
         f"only {len(inside)} statement rows ({inside})",
     )
 
-    # The markers are version 3 opcodes, and the line program of *every*
-    # dialect is version 3 or newer -- gcc writes a version 3 line table even
-    # under `-gdwarf-2` (measured: gcc 12.2 and 16.2), and so does LCCC.
+    # The markers are version 3 opcodes, and the line program's dialect is the
+    # unit's (gcc 16.2 writes a version 2 table for `-gdwarf-2`, measured), so a
+    # version 2 program states neither.
     flags = flag_rows(readelf, path)
-    for name in expected:
+    for name in expected if version >= 3 else ():
         low = infos[name]["low_pc"]
         high = end_of(name)
         for flag in ("prologue_end", "epilogue_begin"):
@@ -359,6 +359,12 @@ def check_object(
             or infos[name]["high_pc"] == 0,
             f"{label}: {name}'s prologue_end sits at its first address, so the "
             f"prologue it should end was never skipped",
+        )
+    if version < 3:
+        require(
+            not flags["prologue_end"] and not flags["epilogue_begin"],
+            f"{label}: a version {version} program carries version 3 opcodes "
+            f"({flags})",
         )
     return label
 
