@@ -12,6 +12,22 @@ impl RiscvCodegen {
         self.operand_to_t0_t1(op);
     }
 
+    /// `emit_switch_wide`'s guard: branch to `label` unless the high half
+    /// of the pair (t1, after `emit_load_acc_pair`) is `required_high`
+    /// (0 or -1).  Leaves t0, the low half, intact; the long-range `jump`
+    /// is relaxed to one branch by the peephole when the target is near.
+    pub(super) fn switch_branch_unless_high(&mut self, required_high: i64, label: &str) {
+        let ok = self.state.fresh_label("hi_ok");
+        if required_high == 0 {
+            self.state.emit_fmt(format_args!("    beqz t1, {ok}"));
+        } else {
+            self.state.emit("    addi t2, t1, 1");
+            self.state.emit_fmt(format_args!("    beqz t2, {ok}"));
+        }
+        self.state.emit_fmt(format_args!("    jump {label}, t6"));
+        self.state.emit_fmt(format_args!("{ok}:"));
+    }
+
     pub(super) fn emit_store_acc_pair_impl(&mut self, dest: &Value) {
         self.store_t0_t1_to(dest);
     }

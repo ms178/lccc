@@ -1006,10 +1006,18 @@ pub(crate) fn encode_bitmask_imm(val: u64, is_64: bool) -> Option<(u32, u32, u32
     let width = if is_64 { 64 } else { 32 };
     // Masking a value that does not fit the operand width would encode a
     // different immediate (`and w0, w1, #0x100000001` must not become `#1`).
-    if !is_64 && val > 0xFFFF_FFFF {
+    // Upper bits that are all ones are the 64-bit spelling of a negative
+    // 32-bit immediate: `and w2, w2, #-16` is `#0xfffffff0` to GNU as and
+    // LLVM (whose isLogicalImm admits all-zero or all-one upper halves), and
+    // GCC prints its SImode masks that way.  Rejecting it failed every
+    // 16-byte-aligned `va_arg` (gcc.c-torture execute/pr92904.c).
+    if !is_64 && (val >> 32) != 0 && (val >> 32) != 0xFFFF_FFFF {
         return None;
     }
     let val = if !is_64 { val & 0xFFFFFFFF } else { val };
+    if val == 0 || (!is_64 && val == 0xFFFFFFFF) {
+        return None;
+    }
 
     // Try each possible element size: 2, 4, 8, 16, 32, 64
     for size in [2u32, 4, 8, 16, 32, 64] {

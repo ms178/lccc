@@ -387,16 +387,30 @@ impl RiscvCodegen {
     /// Compute the address of an alloca into `dest`, handling over-aligned allocas.
     /// For normal allocas: `dest = s0 + offset`.
     /// For over-aligned allocas: `dest = (s0 + offset + align-1) & -align`.
+    ///
+    /// The over-aligned form works in `dest` alone: the rounding bias folds
+    /// into the frame offset, and the low bits clear with `andi` (whose
+    /// 12-bit immediate holds `-align` up to 2048) or a shift pair.  The
+    /// old sequence staged both constants in t6 and so destroyed a `dest`
+    /// of t6 (the AArch64 twin of this helper faulted that way through
+    /// x17: gcc.c-torture execute/pr92904.c).
     pub(super) fn emit_alloca_addr(&mut self, dest: &str, val_id: u32, offset: i64) {
         if let Some(align) = self.state.alloca_over_align(val_id) {
-            self.emit_addi_s0(dest, offset);
-            self.state
-                .emit_fmt(format_args!("    li t6, {}", align - 1));
-            self.state
-                .emit_fmt(format_args!("    add {}, {}, t6", dest, dest));
-            self.state.emit_fmt(format_args!("    li t6, -{}", align));
-            self.state
-                .emit_fmt(format_args!("    and {}, {}, t6", dest, dest));
+            self.emit_addi_s0(dest, offset + align as i64 - 1);
+            if align <= 2048 {
+                self.state.emit_fmt(format_args!(
+                    "    andi {}, {}, {}",
+                    dest,
+                    dest,
+                    -(align as i64)
+                ));
+            } else {
+                let shift = align.trailing_zeros();
+                self.state
+                    .emit_fmt(format_args!("    srli {}, {}, {}", dest, dest, shift));
+                self.state
+                    .emit_fmt(format_args!("    slli {}, {}, {}", dest, dest, shift));
+            }
         } else {
             self.emit_addi_s0(dest, offset);
         }
@@ -933,6 +947,20 @@ impl ArchCodegen for RiscvCodegen {
 
     fn emit_jump_indirect(&mut self) {
         self.state.emit("    jr t0");
+    }
+
+    fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        if matches!(ty, IrType::I128 | IrType::U128) && !cases.is_empty() {
+            self.emit_switch_wide(val, cases, default, Self::switch_branch_unless_high);
+        } else {
+            self.emit_switch_by_density(val, cases, default, ty);
+        }
     }
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {

@@ -907,7 +907,15 @@ fn const_as_u128_masked(c: &IrConst, ty: IrType) -> Option<u128> {
     Some((c.to_i128()? as u128) & mask)
 }
 
-fn constant_switch_target(
+/// The successor `Switch { cases, default, ty }` takes for the constant
+/// selector `c`, or `None` when `c` or `ty` is not an integer.  Both sides
+/// compare as `ty`-width bit patterns: a case is an i64 that the selector
+/// width truncates or sign-extends, and the constant's carrier variant need
+/// not match `ty` (an `I32(-1)` selector of a U32 switch, an `I128` whose low
+/// half equals a case).  Every pass that folds a Switch on a constant --
+/// this one, SCCP and the IPCP return evaluator -- must agree with the
+/// backends here, so they share this function.
+pub(crate) fn constant_switch_target(
     c: &IrConst,
     ty: IrType,
     cases: &[(i64, BlockId)],

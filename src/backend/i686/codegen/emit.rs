@@ -3521,7 +3521,7 @@ impl ArchCodegen for I686Codegen {
         dest: Option<Value>,
         return_type: IrType,
         is_variadic: bool,
-        _num_fixed_args: usize,
+        num_fixed_args: usize,
         struct_arg_sizes: &[Option<usize>],
         struct_arg_aligns: &[Option<usize>],
         struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
@@ -3608,7 +3608,7 @@ impl ArchCodegen for I686Codegen {
             struct_arg_classes.get(skip..).unwrap_or(&[]),
             struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
             struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
-            is_variadic,
+            is_variadic.then(|| num_fixed_args.saturating_sub(skip)),
             &config,
         );
         if skip == 1 {

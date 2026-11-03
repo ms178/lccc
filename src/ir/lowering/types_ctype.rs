@@ -523,6 +523,7 @@ impl Lowerer {
                     is_transparent_union: false,
                     reverse_sso,
                     user_align: false,
+                    member_align: 1,
                 };
                 self.types.insert_struct_layout_from_ref(&key, empty_layout);
             }
@@ -545,6 +546,7 @@ impl Lowerer {
                 is_transparent_union: false,
                 reverse_sso,
                 user_align: false,
+                member_align: 1,
             };
             self.types.insert_struct_layout_from_ref(&key, empty_layout);
             wrap(key)

@@ -1918,12 +1918,18 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
             func_of[b] = f;
         }
     }
-    let mut groups: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    // Grouped per function: blocks only merge within one, and grouping the
+    // unit made the pairwise search quadratic in a large file (memclr.c's
+    // 2,816 functions all end in the same blocks).
+    let mut groups: FxHashMap<(usize, &str), Vec<usize>> = FxHashMap::default();
     for b in 0..nb {
         if unusable[b] || body[b].trim().is_empty() {
             continue;
         }
-        groups.entry(body[b].as_str()).or_default().push(b);
+        groups
+            .entry((func_of[b], body[b].as_str()))
+            .or_default()
+            .push(b);
     }
     for members in groups.values() {
         if members.len() < 2 {
@@ -1934,9 +1940,6 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
                 let from = labels[dup].clone();
                 let to = labels[keep].clone();
                 if from.is_empty() || to.is_empty() || keep == dup {
-                    continue;
-                }
-                if func_of[keep] != func_of[dup] {
                     continue;
                 }
                 if is_function_boundary(&lines[starts[dup]]) {
@@ -5398,6 +5401,44 @@ fn sp_displacements(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Ve
     Some(disps)
 }
 
+/// How an instruction that names a `[sp, ...]` slot touches it.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameAccess {
+    /// Reads this many bytes from the slot.
+    Load(i32),
+    /// Writes the slot and reads nothing from memory.
+    Store,
+    /// Anything else -- vector structure loads, exclusives, atomics,
+    /// prefetches: unsized, so every store stays.
+    Unknown,
+}
+
+fn frame_access_bytes(line: &str) -> FrameAccess {
+    let mut words = line.split_whitespace();
+    let mnem = words.next().unwrap_or("");
+    let reg_bytes = match words.next().and_then(|r| r.bytes().next()) {
+        Some(b'x' | b'd') => 8,
+        Some(b'w' | b's') => 4,
+        Some(b'q') => 16,
+        Some(b'h') => 2,
+        Some(b'b') => 1,
+        _ => 0,
+    };
+    match mnem {
+        "ldr" | "ldur" if reg_bytes > 0 => FrameAccess::Load(reg_bytes),
+        "ldp" | "ldnp" if reg_bytes > 0 => FrameAccess::Load(2 * reg_bytes),
+        "ldrb" | "ldurb" | "ldrsb" | "ldursb" => FrameAccess::Load(1),
+        "ldrh" | "ldurh" | "ldrsh" | "ldursh" => FrameAccess::Load(2),
+        "ldrsw" | "ldursw" => FrameAccess::Load(4),
+        "ldpsw" => FrameAccess::Load(8),
+        // Plain and release stores only: `stadd`/`stset`... are atomic
+        // read-modify-writes despite the prefix.
+        "str" | "stur" | "stp" | "stnp" | "strb" | "strh" | "sturb" | "sturh" | "stlr"
+        | "stlrb" | "stlrh" => FrameAccess::Store,
+        _ => FrameAccess::Unknown,
+    }
+}
+
 fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
     let mut changed = false;
     // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
@@ -5470,30 +5511,24 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
                 if trimmed.contains("]!") || trimmed.contains("], #") {
                     continue;
                 }
-                let load_size = if trimmed.starts_with("ldp ") {
-                    Some(16) // ldp loads two 8-byte registers
-                } else if trimmed.starts_with("ldr x") || trimmed.starts_with("ldur x") {
-                    Some(8)
-                } else if trimmed.starts_with("ldr w")
-                    || trimmed.starts_with("ldur w")
-                    || trimmed.starts_with("ldrsw ")
-                {
-                    Some(4)
-                } else if trimmed.starts_with("ldrh ") || trimmed.starts_with("ldrsh ") {
-                    Some(2)
-                } else if trimmed.starts_with("ldrb ") || trimmed.starts_with("ldrsb ") {
-                    Some(1)
-                } else if trimmed.starts_with("ldr ") || trimmed.starts_with("ldur ") {
-                    Some(8) // default to 8 for unqualified ldr
-                } else {
-                    None
+                if !trimmed.contains("[sp") {
+                    continue;
+                }
+                // The census must be complete -- a store whose only reader
+                // it misses is deleted -- so every access is sized by its
+                // mnemonic and register class.  `ldr q0` reads 16 bytes (it
+                // was counted as 8, so `str x1, [sp, #24]` feeding the high
+                // half of a binary128 or vector reload looked dead), and an
+                // access it cannot size (ld1, ldxr, ldadd, a register
+                // offset, ...) keeps every store of the function.
+                let load_size = match frame_access_bytes(trimmed) {
+                    FrameAccess::Load(bytes) => bytes,
+                    FrameAccess::Store => continue,
+                    FrameAccess::Unknown => return false,
                 };
-                if let Some(sz) = load_size {
-                    if trimmed.contains("[sp") {
-                        if let Some(off) = extract_sp_offset(trimmed) {
-                            push_load(off as i64 + sp_disp, sz, &mut loaded_ranges);
-                        }
-                    }
+                match extract_sp_offset(trimmed) {
+                    Some(off) => push_load(off as i64 + sp_disp, load_size, &mut loaded_ranges),
+                    None => return false,
                 }
             }
         }
@@ -9609,5 +9644,66 @@ f:
             !result.contains("    b .Ltramp"),
             "the pipeline kept a trampoline hop: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod frame_store_census_tests {
+    use super::*;
+
+    fn leaf(body: &str) -> String {
+        format!(
+            ".text\n.globl f\n.type f, %function\nf:\n.cfi_startproc\n{body}.cfi_endproc\n.size f, .-f\n"
+        )
+    }
+
+    fn has(out: &str, line: &str) -> bool {
+        out.lines().any(|l| l.trim() == line)
+    }
+
+    /// Sizes by mnemonic and register class; unsized forms are `Unknown`.
+    #[test]
+    fn frame_accesses_are_sized_by_mnemonic_and_register() {
+        use FrameAccess::*;
+        for (line, want) in [
+            ("ldr q0, [sp, #16]", Load(16)),
+            ("ldr d1, [sp, #8]", Load(8)),
+            ("ldr s2, [sp, #4]", Load(4)),
+            ("ldr h3, [sp, #2]", Load(2)),
+            ("ldr b4, [sp, #1]", Load(1)),
+            ("ldur x5, [sp, #3]", Load(8)),
+            ("ldp q0, q1, [sp, #32]", Load(32)),
+            ("ldp w0, w1, [sp, #8]", Load(8)),
+            ("ldnp x0, x1, [sp, #16]", Load(16)),
+            ("ldpsw x0, x1, [sp]", Load(8)),
+            ("ldrsh w0, [sp, #6]", Load(2)),
+            ("str q0, [sp, #16]", Store),
+            ("stlr x0, [sp]", Store),
+            ("ld1 {v0.16b}, [sp]", Unknown),
+            ("ldxr x0, [sp]", Unknown),
+            ("stadd w0, [sp]", Unknown),
+            ("prfm pldl1keep, [sp, #64]", Unknown),
+        ] {
+            assert_eq!(frame_access_bytes(line), want, "{line}");
+        }
+    }
+
+    /// `ldr q0` reads the high half the integer store wrote.
+    #[test]
+    fn a_q_register_reload_keeps_the_store_to_its_high_half() {
+        let out = peephole_optimize(leaf(
+            "    sub sp, sp, #32\n    str x1, [sp, #24]\n    str x2, [sp, #16]\n    ldr q0, [sp, #16]\n    add sp, sp, #32\n    ret\n",
+        ));
+        assert!(has(&out, "str x1, [sp, #24]"), "{out}");
+        assert!(has(&out, "str x2, [sp, #16]"), "{out}");
+    }
+
+    /// A frame access the census cannot size keeps every store.
+    #[test]
+    fn an_unsized_frame_access_disables_the_census() {
+        let out = peephole_optimize(leaf(
+            "    sub sp, sp, #16\n    str x1, [sp, #8]\n    ld1 {v0.16b}, [sp]\n    add sp, sp, #16\n    ret\n",
+        ));
+        assert!(has(&out, "str x1, [sp, #8]"), "{out}");
     }
 }

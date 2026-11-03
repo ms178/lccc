@@ -1286,15 +1286,24 @@ impl ArmCodegen {
     /// For normal allocas: `dest = sp + offset`.
     /// For over-aligned allocas: `dest = (sp + offset + align-1) & -align`.
     /// `offset` is the raw stack slot offset (already adjusted for call setup if needed).
+    ///
+    /// The rounding bias folds into the frame offset and `-align` is a
+    /// logical immediate for every power of two, so the over-aligned form is
+    /// two instructions and needs no scratch register.  It used to stage
+    /// both constants in x17, which overwrote a `dest` of x17 -- the base
+    /// register of by-value aggregate arguments and of binary128 accesses --
+    /// with the mask, so the copy read from address `-align`
+    /// (gcc.c-torture execute/pr92904.c at -O1: a union with a 32-byte
+    /// aligned member passed to a variadic function).
     pub(super) fn emit_alloca_addr(&mut self, dest: &str, val_id: u32, offset: i64) {
         if let Some(align) = self.state.alloca_over_align(val_id) {
-            self.emit_add_sp_offset(dest, offset);
-            self.load_large_imm("x17", (align - 1) as i64);
-            self.state
-                .emit_fmt(format_args!("    add {}, {}, x17", dest, dest));
-            self.load_large_imm("x17", -(align as i64));
-            self.state
-                .emit_fmt(format_args!("    and {}, {}, x17", dest, dest));
+            self.emit_add_sp_offset(dest, offset + align as i64 - 1);
+            self.state.emit_fmt(format_args!(
+                "    and {}, {}, #{}",
+                dest,
+                dest,
+                -(align as i64)
+            ));
         } else {
             self.emit_add_sp_offset(dest, offset);
         }
@@ -2229,35 +2238,32 @@ impl ArmCodegen {
     }
 
     /// Phase 3: Move GP int args from temp regs to actual arg registers.
+    /// Phase 3: move each staged scalar to the register the classifier gave
+    /// it.  The register comes from the class itself: re-deriving it with a
+    /// running count dropped the AAPCS64 C.8 even-register skip of a
+    /// 16-byte-aligned composite, so in `f(int a, struct N n, int b)` (N
+    /// with a 16-aligned member) `b` went to x3 -- which the pair load of
+    /// `n` into x2/x3 then overwrote -- while every callee, LCCC's own
+    /// included, read x4.
     pub(super) fn emit_call_move_temps_to_arg_regs(
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
     ) {
-        let mut int_reg_idx = 0usize;
-        let mut gp_tmp_idx = 0usize;
-        for (i, _) in args.iter().enumerate() {
-            match arg_classes[i] {
-                CallArgClass::I128RegPair { .. } => {
-                    if int_reg_idx % 2 != 0 {
-                        int_reg_idx += 1;
-                    }
-                    int_reg_idx += 2;
-                }
-                CallArgClass::StructByValReg { size, .. } => {
-                    int_reg_idx += if size <= 8 { 1 } else { 2 };
-                }
-                CallArgClass::IntReg { .. } => {
-                    if gp_tmp_idx < 8 && int_reg_idx < 8 {
-                        self.state.emit_fmt(format_args!(
-                            "    mov {}, {}",
-                            ARM_ARG_REGS[int_reg_idx], ARM_TMP_REGS[gp_tmp_idx]
-                        ));
-                        int_reg_idx += 1;
-                    }
-                    gp_tmp_idx += 1;
-                }
-                _ => {}
+        let staged = arg_classes
+            .iter()
+            .take(args.len())
+            .filter_map(|class| match *class {
+                CallArgClass::IntReg { reg_idx } => Some(reg_idx),
+                _ => None,
+            })
+            .take(ARM_TMP_REGS.len());
+        for (gp_tmp_idx, reg_idx) in staged.enumerate() {
+            if let Some(arg_reg) = ARM_ARG_REGS.get(reg_idx) {
+                self.state.emit_fmt(format_args!(
+                    "    mov {}, {}",
+                    arg_reg, ARM_TMP_REGS[gp_tmp_idx]
+                ));
             }
         }
     }
@@ -2431,7 +2437,7 @@ impl ArmCodegen {
             // capture must target it too or the incoming value desyncs
             // from its readers by the alignment pad. x11 holds the
             // effective base for the whole arm (x9/x10 are the per-arm
-            // staging registers, x17 is emit_alloca_addr's scratch).
+            // staging registers).
             let over_aligned = self
                 .state
                 .alloca_over_align(dest_val.0)
@@ -3067,6 +3073,20 @@ impl ArchCodegen for ArmCodegen {
 
     fn emit_jump_indirect(&mut self) {
         self.state.emit("    br x0");
+    }
+
+    fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        if matches!(ty, IrType::I128 | IrType::U128) && !cases.is_empty() {
+            self.emit_switch_wide(val, cases, default, Self::switch_branch_unless_high);
+        } else {
+            self.emit_switch_by_density(val, cases, default, ty);
+        }
     }
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
