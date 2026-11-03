@@ -921,6 +921,7 @@ fn build_outlined_function(
         ret_eightbyte_classes: Vec::new(),
         ret_is_f128_sse: false,
         // Synthesized: the outlined body has no opening brace of its own.
+        decl_span: crate::common::source::Span::dummy(),
         body_span: crate::common::source::Span::dummy(),
         terminator_spans: Default::default(),
     }

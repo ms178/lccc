@@ -415,6 +415,20 @@ pub struct IrFunction {
     /// Set by vectorization and other transformation passes to avoid duplicate labels.
     /// A value of 0 means "not yet computed" (will fall back to scanning).
     pub next_label: u32,
+    /// The declarator's name token of the definition, when both the source and
+    /// the path that produced this function record one.
+    ///
+    /// DWARF names a subprogram's *declaration* position -- `DW_AT_decl_line`
+    /// and `DW_AT_decl_column` point at the declarator's name, not at the body's
+    /// opening brace and not at the definition's first token (a return type on
+    /// its own line starts earlier, and both gcc 12.2 and clang 21 report the
+    /// name's position).  The assembler-facing `-g` channel is `.loc`, which
+    /// only carries positions the line table can state; this span is what
+    /// codegen turns into a non-statement row at the function's first address,
+    /// so the writer can read the declaration position back off it.
+    /// `Span::dummy()` for a function no source spelling produced (a clone, an
+    /// outlined region, a test fixture).
+    pub decl_span: crate::common::source::Span,
     /// Opening brace of the definition's body: under `-g` it is the
     /// function's first line-table row, placed before the prologue as GCC
     /// does, so debuggers can attribute the entry and skip the prologue to
@@ -640,6 +654,7 @@ impl IrFunction {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: SspInfo::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         }

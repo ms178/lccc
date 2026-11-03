@@ -449,14 +449,30 @@ CU_KEYS = (
 # `DW_FORM_string` up to version 4, which costs their bytes once and keeps a
 # unit with no function names out of `.debug_str` entirely, while GCC already
 # has a string table for the names it emits and points at it).
+# Constant-class forms a `DW_AT_high_pc` offset may use from version 4 on.
+CONSTANT_CLASS_FORMS = frozenset(
+    {
+        "DW_FORM_udata",
+        "DW_FORM_sdata",
+        "DW_FORM_data1",
+        "DW_FORM_data2",
+        "DW_FORM_data4",
+        "DW_FORM_data8",
+    }
+)
 CU_FORM_PARITY = {
     2: ("low_pc", "high_pc", "stmt_list", "language"),
     3: ("low_pc", "high_pc", "stmt_list", "language"),
     4: ("low_pc", "high_pc", "stmt_list", "language"),
     5: ("low_pc", "high_pc", "stmt_list", "language", "producer", "name", "comp_dir"),
 }
+# The line program's own header fields.  Its *version* is compared against the
+# unit's rather than the oracle's: gcc 16.2 writes a version 2 table for
+# `-gdwarf-2`, and gcc 12.2 wrote version 3 for the same flag (measured), so the
+# version is a fact about the writer's age, not about the dialect.  What the
+# dialect pins -- and what a consumer decodes -- is the rest of the header, and
+# the rule that the table speaks its unit's version.
 LINE_KEYS = (
-    "version",
     "address_size",
     "segment_selector",
     "minimum_instruction_length",
@@ -549,6 +565,25 @@ def check_version_and_dialect(
             attribute in reference_forms,
             f"{label}: GCC 16.2 declares no DW_AT_{attribute} for the unit",
         )
+        if attribute == "high_pc" and version >= 4:
+            # DWARF 4 redefined this attribute: up to version 3 the form is of
+            # address class and the value is the end address, from version 4 a
+            # form of *constant* class holds the function's length instead --
+            # an offset from `low_pc`.  The width is then a size choice, not a
+            # dialect rule, and LCCC makes the better one: the narrowest
+            # ULEB128 that holds the offset (one byte for anything under 128)
+            # where GCC pads every unit to `DW_FORM_data8`.  Every consumer
+            # reads a constant-class form (readelf, `addr2line` and gdb were
+            # checked), so the class is pinned here and the width is not; the
+            # offset itself is pinned by `check_dwarf_decl_positions.py`, which
+            # recomputes every subprogram's range from the object.
+            require(
+                ours_forms.get(attribute) in CONSTANT_CLASS_FORMS,
+                f"{label}: DW_AT_{attribute} is {ours_forms.get(attribute)}, "
+                f"not a constant-class form (GCC 16.2 encodes it as "
+                f"{reference_forms.get(attribute)})",
+            )
+            continue
         require(
             ours_forms.get(attribute) == reference_forms.get(attribute),
             f"{label}: DW_AT_{attribute} is {ours_forms.get(attribute)}, "
@@ -556,7 +591,25 @@ def check_version_and_dialect(
         )
     ours_line = line_profile(ours_dump)
     reference_line = line_profile(reference_dump)
-    compare_profiles(version, dialect, reference_line, ours_line, LINE_KEYS)
+    require(
+        ours_line["version"] == version,
+        f"{label}: the line program is version {ours_line['version']}, its unit "
+        f"is version {version}",
+    )
+    keys = LINE_KEYS
+    if version == 2:
+        # A version 2 line program has nine standard opcodes, so its opcode base
+        # is 10.  gcc 12.2 padded a `-gdwarf-2` program with the version 3 table
+        # (opcode base 13) instead; gcc 16.2 writes the version 2 shape, which
+        # is what the dialect says and what LCCC writes, so the oracle is asked
+        # for everything except the field its own age decides.
+        keys = tuple(key for key in LINE_KEYS if key not in ("opcode_base", "opcode_args"))
+        require(
+            ours_line["opcode_base"] == 10,
+            f"{label}: a version 2 line program has nine standard opcodes, so "
+            f"its opcode base is 10, not {ours_line['opcode_base']}",
+        )
+    compare_profiles(version, dialect, reference_line, ours_line, keys)
     # The unit names the source the driver was handed -- an absolute path here
     # -- and the directory the compilation ran in. GCC 16.2 spells both the
     # same way, which the profile comparison above already enforces; this

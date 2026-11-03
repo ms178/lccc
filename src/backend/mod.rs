@@ -40,6 +40,7 @@ pub(crate) mod i686;
 pub(crate) mod riscv;
 pub mod x86;
 
+use crate::backend::state::FnEntryRows;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{IrModule, TlsModel};
 use std::fmt::Write as _;
@@ -341,36 +342,110 @@ fn finish_fn_boundaries(
     }
 }
 
-/// Insert each function's `-g` entry row (`CodegenState::fn_entry_locs`)
+/// Insert each function's `-g` entry rows (`CodegenState::fn_entry_locs`)
 /// directly after its `NAME:` label, as GCC places `.loc` ahead of the
 /// prologue. Runs after the peephole, zero-call-used-regs and CFI
 /// finishing, whose entry matchers need the exact label/`.cfi_startproc`/
 /// prologue shape -- a `.loc` inside it disabled dead-store elimination
 /// and CFI synthesis. Only the first `NAME:` of each recorded function is
 /// taken, so a same-named label in later top-level asm is left alone.
-pub(crate) fn insert_fn_entry_locs(
-    asm: String,
-    locs: &FxHashMap<String, (u32, u32, u32)>,
-) -> String {
+///
+/// The declarator row comes first and carries `is_stmt 0`: it states where the
+/// declaration starts (`DW_AT_decl_line`/`DW_AT_decl_column`) without claiming
+/// to be a statement, so a debugger neither lists it nor stops on it.  The
+/// body row that follows is the function's first statement row, at the same
+/// address, exactly as gcc and clang start the line program at the opening
+/// brace.
+pub(crate) fn insert_fn_entry_locs(asm: String, locs: &FxHashMap<String, FnEntryRows>) -> String {
     if locs.is_empty() {
         return asm;
     }
     let mut pending: FxHashSet<&str> = locs.keys().map(String::as_str).collect();
-    let mut out = String::with_capacity(asm.len() + locs.len() * 16);
+    // The lines of the function being walked, so the prologue marker can be
+    // repaired once its body is known (see `add_missing_prologue_end`).
+    let mut body: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(asm.len() + locs.len() * 32);
+    let flush = |body: &mut Vec<String>, out: &mut String| {
+        add_missing_prologue_end(body);
+        for line in body.drain(..) {
+            out.push_str(&line);
+        }
+    };
     for line in asm.split_inclusive('\n') {
-        out.push_str(line);
+        let starts_function = line
+            .trim()
+            .strip_suffix(':')
+            .is_some_and(|name| pending.contains(name));
+        if starts_function {
+            flush(&mut body, &mut out);
+        }
+        body.push(line.to_string());
         let Some(name) = line.trim().strip_suffix(':') else {
             continue;
         };
         if pending.remove(name) {
-            if !line.ends_with('\n') {
-                out.push('\n');
+            let rows = locs[name];
+            let (file, row, column) = rows.body;
+            match rows.decl {
+                Some((decl_file, decl_row, decl_column)) => {
+                    body.push(format!(
+                        ".loc {decl_file} {decl_row} {decl_column} is_stmt 0\n"
+                    ));
+                    // `is_stmt` is sticky in GAS (and in the assembler that reads
+                    // this): without the explicit restore the declarator row
+                    // above would turn every later row of the function into a
+                    // non-statement, which is exactly what a debugger must not
+                    // see.  A function with no declarator row never changes the
+                    // flag, so its body row stays bare -- byte for byte what
+                    // codegen would have written on its own.
+                    body.push(format!(".loc {file} {row} {column} is_stmt 1\n"));
+                }
+                None => body.push(format!(".loc {file} {row} {column}\n")),
             }
-            let (file, row, column) = locs[name];
-            let _ = writeln!(out, ".loc {file} {row} {column}");
         }
     }
+    flush(&mut body, &mut out);
     out
+}
+
+/// Ensure the function in `body` states where its prologue ends.
+///
+/// Codegen marks the first row after the prologue, and the peephole holds a
+/// `.loc` until the instruction it introduces survives: when that statement is
+/// optimized away entirely (measured on i686: `int a = value;` folded into the
+/// parameter store), the row -- and the marker with it -- is dropped, and the
+/// function loses the one piece of information a debugger's prologue skip
+/// needs.  The row that survives is still after the prologue, so the marker
+/// belongs on the first row the function kept.  Nothing is moved when codegen's
+/// marker survived: this only fills a hole, it never re-states a position.
+fn add_missing_prologue_end(body: &mut [String]) {
+    let rows: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.trim_start()
+                .strip_prefix(".loc")
+                .is_some_and(|rest| rest.starts_with([' ', '\t']))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    // The first two rows are the function's entry rows (`NAME:` is directly
+    // before them); a body without a third row has nothing to mark.
+    let Some(&first) = rows.get(2) else {
+        return;
+    };
+    if rows
+        .iter()
+        .any(|&index| body[index].contains(" prologue_end"))
+    {
+        return;
+    }
+    let line = &mut body[first];
+    if let Some(stripped) = line.strip_suffix('\n') {
+        *line = format!("{stripped} prologue_end\n");
+    } else {
+        line.push_str(" prologue_end");
+    }
 }
 
 /// Remove the `.cfi_startproc`/`.cfi_endproc` function delimiters that the
@@ -937,13 +1012,36 @@ mod fn_boundary_marker_tests {
 #[cfg(test)]
 mod fn_entry_loc_tests {
     use super::insert_fn_entry_locs;
+    use crate::backend::state::FnEntryRows;
     use crate::common::fx_hash::FxHashMap;
 
-    fn locs(entries: &[(&str, (u32, u32, u32))]) -> FxHashMap<String, (u32, u32, u32)> {
+    fn locs(entries: &[(&str, (u32, u32, u32))]) -> FxHashMap<String, FnEntryRows> {
         entries
             .iter()
-            .map(|(n, l)| ((*n).to_string(), *l))
+            .map(|(n, l)| {
+                (
+                    (*n).to_string(),
+                    FnEntryRows {
+                        decl: None,
+                        body: *l,
+                    },
+                )
+            })
             .collect()
+    }
+
+    /// A declarator row precedes the body row, and both land after the label.
+    #[test]
+    fn declarator_row_precedes_the_body_row() {
+        let asm = "f:\n.cfi_startproc\n    ret\n.cfi_endproc\n    .size f, .-f\n";
+        let mut rows = locs(&[("f", (1, 17, 1))]);
+        rows.get_mut("f").unwrap().decl = Some((1, 16, 5));
+        let out = insert_fn_entry_locs(asm.to_string(), &rows);
+        assert_eq!(
+            out,
+            "f:\n.loc 1 16 5 is_stmt 0\n.loc 1 17 1 is_stmt 1\n.cfi_startproc\n    ret\n\
+             .cfi_endproc\n    .size f, .-f\n"
+        );
     }
 
     /// The row goes right after the label, ahead of the CFI and prologue,

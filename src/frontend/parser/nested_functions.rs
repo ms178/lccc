@@ -161,6 +161,10 @@ impl Parser {
         // One declarator: the function name and its parameter list.
         let (name, derived, decl_mode, _decl_common, _decl_aligned, _) =
             self.parse_declarator_with_attrs();
+        // The declarator's name token, captured before the parameter list and
+        // the body parse further declarations and overwrite the slot (see the
+        // same capture in `parse_function_definition`).
+        let def_name_span = self.attrs.last_decl_name_span;
         // The return type's base qualifiers, before the body's declarations
         // overwrite the per-declarator slots.
         let (ret_base_volatile, ret_base_restrict) = (
@@ -344,6 +348,7 @@ impl Parser {
             attrs,
             is_kr: is_kr_style,
             span: start,
+            name_span: def_name_span,
             body_span,
         })
     }

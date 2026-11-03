@@ -241,7 +241,13 @@ def require_compressed_inputs_link_identically(
             not any(name.startswith(".zdebug") for name in sections),
             f"{tag} {form}: a legacy .zdebug name reached the output",
         )
-        if form == "zlib-gabi":
+        if form == "zlib-gabi" and not elf64_sections(compressed[0])[".debug_info"][0] & 0x800:
+            # `objcopy` compresses only when the stream would be smaller, so a
+            # small unit keeps a plain section and there is no stream to append
+            # to.  Say so rather than asserting a rejection the premise no
+            # longer supports.
+            print(f"SKIP {tag}: objcopy left .debug_info uncompressed, no stream to test")
+        elif form == "zlib-gabi":
             # The section payload is exactly one stream, not a stream plus
             # arbitrary padding. BFD 2.47 rejects an appended NUL; make sure
             # the decoder's bit lookahead cannot silently accept it again.
@@ -367,6 +373,17 @@ def ordinal_rows(readelf: str, objdump: str, path: Path) -> list[tuple[str, str,
     return rows
 
 
+def section_size(readelf: str, path: Path, section: str) -> int:
+    """`sh_size` of `section` in `path`, whatever its ELF class."""
+    for raw in run([readelf, "-SW", str(path)]).splitlines():
+        fields = raw.split()
+        if section in fields:
+            index = fields.index(section)
+            # Name Type Address Off Size ES Flg Lk Inf Al
+            return int(fields[index + 4], 16)
+    raise GateFailure(f"{path} has no {section} section")
+
+
 def cross_leg(name: str, triple: str, lccc: str, work: Path) -> str:
     tools = {tool: shutil.which(f"{triple}-{tool}") for tool in ("gcc", "ld", "readelf", "objdump")}
     missing = [f"{triple}-{tool}" for tool, path in tools.items() if path is None]
@@ -391,6 +408,24 @@ def cross_leg(name: str, triple: str, lccc: str, work: Path) -> str:
             )
             got, want = ordinal_rows(readelf, objdump, ours), ordinal_rows(readelf, objdump, theirs)
             require(got == want, f"{name} {opt} {stem}.o rows differ from GNU as:\n{got}\n{want}")
+            # Same rows, no more bytes than the encoding needs.  On a target
+            # whose code the linker may relax, a row's address cannot be a
+            # distance -- `DW_LNS_advance_pc` would move when the linker deletes
+            # bytes between two rows -- so every row carries its own address
+            # relocation (`DW_LNE_set_address`: address_size + 3 bytes, and
+            # `DW_LNS_advance_line` + `DW_LNS_copy` instead of a special opcode).
+            # That is a correctness requirement, so the bound allows exactly
+            # that much: a byte more means this writer paid for something no
+            # relaxation needs.
+            our_size = section_size(readelf, ours, ".debug_line")
+            gas_size = section_size(readelf, theirs, ".debug_line")
+            allowance = 0 if triple.startswith("x86_64") or triple.startswith("i686") else len(got) * (8 + 5)
+            require(
+                our_size <= gas_size + allowance,
+                f"{name} {opt} {stem}.o: .debug_line is {our_size} bytes, GNU as "
+                f"encodes the same rows in {gas_size} (allowance {allowance} for "
+                f"{len(got)} per-row address relocations)",
+            )
             rows += len(got)
             objects["lccc"].append(ours)
             objects["gas"].append(theirs)
@@ -668,6 +703,11 @@ def main() -> int:
         return 0
     except (GateFailure, OSError, subprocess.SubprocessError) as error:
         print(f"FAIL: {error}", file=sys.stderr)
+        # A workflow's log is not always readable from where a failure is
+        # triaged; an annotation carries the message to the pull request itself.
+        # Only Actions reads this syntax, so nothing changes locally.
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error title=dwarf line tables::{error}")
         return 1
 
 

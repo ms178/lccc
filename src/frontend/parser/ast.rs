@@ -424,6 +424,17 @@ pub struct FunctionDef {
     pub alignment: Option<usize>,
     pub is_kr: bool,
     pub span: Span,
+    /// The declarator's name token, when the definition names the function.
+    ///
+    /// This is the anchor DWARF wants and the source does not otherwise keep:
+    /// `DW_AT_decl_line`/`DW_AT_decl_column` of a subprogram name the line and
+    /// column the *declarator* starts on (`int main(void)` -> `16:5`), which is
+    /// neither the definition's first token (a multi-line return type starts
+    /// earlier) nor the body's opening brace (one line later in the usual
+    /// brace-on-its-own-line style). Measured against gcc 12.2 and clang 21:
+    /// both point there, and both start the line table at the brace instead --
+    /// so codegen needs both spans, not one.
+    pub name_span: Option<Span>,
     /// The body from its opening brace (the function's first `-g` line
     /// row) through its closing brace (the epilogue's row).
     pub body_span: Span,
