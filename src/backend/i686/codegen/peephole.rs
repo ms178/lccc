@@ -8644,7 +8644,10 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             return None;
                         }
                         read_regs.push(reg);
-                    } else if !source.strip_prefix('$').is_some_and(|v| v.parse::<i32>().is_ok()) {
+                    } else if !source
+                        .strip_prefix('$')
+                        .is_some_and(|v| v.parse::<i32>().is_ok())
+                    {
                         return None;
                     }
                     *dest_reg
@@ -16267,9 +16270,12 @@ mod tests {
         assert!(!apply(&valid.replacen("xorl %edx, %edx", "cltd", 1)));
         assert!(!apply(&valid.replace("movl %esi, %eax", "movl %edx, %eax")));
         assert!(!apply(&valid.replace("divl %ecx", "divl %eax")));
-        assert!(!apply(&valid.replace("movl %esi, %eax", "movl (%ebx), %eax")));
+        assert!(!apply(
+            &valid.replace("movl %esi, %eax", "movl (%ebx), %eax")
+        ));
         assert!(!apply(&valid.replace("ret\n", "setne %bl\nret\n")));
-        let stack = valid.replace("movl %esi, %eax", "movl 4(%esp), %eax")
+        let stack = valid
+            .replace("movl %esi, %eax", "movl 4(%esp), %eax")
             .replace("movl %edx, %edi", "movl %edx, %edi\nmovl %ebx, 4(%ebp)");
         assert!(!apply(&stack));
     }

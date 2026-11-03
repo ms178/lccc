@@ -80,8 +80,10 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let mut candidate = infos.len();
         while cursor < infos.len() && cursor <= div_idx.saturating_add(32) {
             let i = next_non_debug(store, infos, cursor, infos.len());
-            if i >= infos.len() || i > div_idx.saturating_add(32)
-                || !all_editable(infos, &[i]) || infos[i].volatile_access
+            if i >= infos.len()
+                || i > div_idx.saturating_add(32)
+                || !all_editable(infos, &[i])
+                || infos[i].volatile_access
             {
                 break;
             }
