@@ -106,3 +106,28 @@ No unsupported option is relabeled as implemented by this change.
 This list includes confirmed pre-existing defects, not promises of universal
 correctness or imaginary expert approvals. Full final-head kernel/QEMU evidence,
 all remaining families/options and final green CI are **not established**.
+
+## Confirmed validation gap fixed: kernel workflow selection
+
+The inherited kernel workflow selected changes to seven harness files, but no
+compiler-source or Cargo/toolchain changes. A source-only compiler PR therefore
+could be green without rebuilding/booting a kernel. This is a coverage defect,
+not evidence that a kernel had passed for such a PR.
+
+Add compiler/linker sources, build inputs, toolchain locks and direct boot-harness
+dependencies to the positive path filters. Keep documentation-only changes out:
+we do not pay for a full kernel build just to edit this audit note. The filter
+contract test file itself is included in the trigger. The existing workflow's real
+link, objtool and QEMU steps are unchanged; no condition is weakened.
+
+Regression witness: the new contract suite fails **21 subcases** against the
+inherited filter; the expanded **six tests pass** after the change, including compiler
+changes on all four backends, linker/build-input coverage and negative doc cases.
+The existing CI lane-plan check passes. Full pinned-toolchain Python corpus
+revalidation is pending at this note's first write.
+
+Pinned-toolchain Python corpus run completed: **1150 tests, zero failures, five
+skips**. The no-negative-glob contract was added after that process loaded its
+suite; the expanded six-test filter suite was run separately and passed. CI
+will discover the full expanded suite from the committed files. No combined
+count is fabricated by summing overlapping runs.
