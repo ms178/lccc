@@ -59,7 +59,18 @@ RANGE_FOLDED = (
     "range_crossing",
     "range_crossing_bitand",
 )
-MAGNITUDE_FOLDED = ("abs_select", "abs_select64", "absdiff_select")
+MAGNITUDE_FOLDED = (
+    "abs_select",
+    "abs_select64",
+    "absdiff_select",
+    # Narrow operands compared at their own width (GVN must wake the select
+    # up once it has unified the two sign extensions; see passes/mod.rs).
+    "abs_short",
+    "abs_short_ret",
+    "abs_schar",
+    "abs_int_wide",
+    "absdiff_short",
+)
 CONTROLS = ("diff_control", "range_union", "member_gap", "two_values", "abs_control")
 
 
@@ -260,14 +271,30 @@ def main():
             version = ""
         if re.fullmatch(r"16\.\d+(?:\.\d+)?", version):
             gtext = asm(gcc, SOURCE, extra=("-fno-ipa-icf",))
-            exempt = {}
+            # Measured gaps, each pinned to lccc's exact count so it cannot
+            # silently grow.  `abs_short_ret`: lccc keeps narrow values
+            # sign-extended in registers, so the 4-instruction int core sits
+            # between the parameter's `movswl` and the return conversion's
+            # `movswl`; GCC and Clang compute at 16 bits (`negw; cmovs`).
+            # `abs_int_wide`: GCC and Clang compute |x| at 32 bits and let the
+            # 32-bit `neg`/`cmovs` zero the upper half (|INT_MIN| = 2^31 fits
+            # in 32 unsigned bits); lccc negates the `movslq`-widened value.
+            exempt = {
+                "abs_short_ret": (6, "narrow values are kept sign-extended"),
+                "abs_int_wide": (5, "64-bit negate of the sign-extended operand"),
+            }
             for name in DIFF_FOLDED + RANGE_FOLDED + MAGNITUDE_FOLDED:
                 ours, theirs = len(body(text, name)), len(body(gtext, name))
-                if ours > theirs:
+                if name in exempt and ours > exempt[name][0]:
+                    problems.append(
+                        f"{name}: {ours} instructions, more than the pinned "
+                        f"{exempt[name][0]} ({exempt[name][1]})"
+                    )
+                elif ours > theirs:
                     if name in exempt:
                         print(
                             f"note: {name}: {ours} vs GCC {theirs} instructions "
-                            f"({exempt[name]})"
+                            f"({exempt[name][1]})"
                         )
                     else:
                         problems.append(

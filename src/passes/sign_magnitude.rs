@@ -37,9 +37,14 @@
 //! types the C frontend uses for `int` and `long`, only for a select whose
 //! arms are exactly `Neg(x)` and `x` (or the two subtractions of the same
 //! pair, in either order), and only when the compared value is the same value
-//! the arms operate on.  A narrow type is refused: the frontend promotes
-//! arithmetic to `int`, so a narrow select is a different program, and a
-//! 8-bit `AShr` mask is not the abstraction the backend expects here.
+//! the arms operate on -- or the narrower signed value they sign-extend.  The
+//! latter is how C spells `|x|` for a `short` or `signed char` `x`: the
+//! compare runs at the operand's width (`cmp.i16 x, 0`) and the arms at the
+//! promoted width (`neg.i32 sext(x)`, `sext(x)`); a sign extension preserves
+//! order, so the two compares agree on every input.  A narrow select is
+//! refused: the frontend promotes arithmetic to `int`, so a narrow select is
+//! a different program, and a 8-bit `AShr` mask is not the abstraction the
+//! backend expects here.
 //!
 //! The identity is what GCC 16.2 and Clang 23.1.4 emit on RISC-V (`sraiw;
 //! xor; subw`), and it stays the final shape on i686, whose baseline has no
@@ -89,11 +94,51 @@ fn const_is(operand: &Operand, value: i64) -> bool {
     matches!(operand, Operand::Const(c) if c.to_i64() == Some(value))
 }
 
+/// Whether a signed compare of `v` at type `t` orders exactly like the same
+/// compare of `x` at type `ty`: `v` is `x` itself, or `x` is the sign
+/// extension `sext(v)` from the narrower signed type `t`.  A sign extension
+/// is strictly monotone -- it maps every value of `t` to the same integer in
+/// `ty` -- so `v < c` and `x < c` agree for every constant `c` that `t` holds
+/// (the accepted thresholds are -1, 0 and 1, which every signed type holds),
+/// and `a > b` agrees with `sext(a) > sext(b)`.  This is the shape C hands
+/// over for a `short` or `signed char` operand: the compare is narrowed to
+/// the operand's own width while the arithmetic is promoted to `int`.  A zero
+/// extension is refused: it reorders the negative half of a signed `t`.
+fn same_signed_order(
+    defs: &[Option<Instruction>],
+    v: Value,
+    t: IrType,
+    x: Value,
+    ty: IrType,
+) -> bool {
+    if v == x {
+        return t == ty;
+    }
+    matches!(
+        defs.get(x.0 as usize).and_then(Option::as_ref),
+        Some(Instruction::Cast {
+            src: Operand::Value(n),
+            from_ty,
+            to_ty,
+            ..
+        }) if *n == v
+            && *from_ty == t
+            && *to_ty == ty
+            && t.is_signed()
+            && t.size() < ty.size()
+    )
+}
+
 /// The compare selecting the `-x` arm: true for every negative `x`, false
 /// for every positive one.  At `x == 0` the two arms agree (`-0 == 0`), so
 /// the compare may go either way there: `x < 0` and `x <= -1` exclude zero,
 /// `x <= 0` and `x < 1` include it, and all four select `|x|`.
-fn proves_negative(inst: Option<&Instruction>, x: Value, ty: IrType) -> bool {
+fn proves_negative(
+    defs: &[Option<Instruction>],
+    inst: Option<&Instruction>,
+    x: Value,
+    ty: IrType,
+) -> bool {
     match inst {
         Some(Instruction::Cmp {
             op,
@@ -101,7 +146,7 @@ fn proves_negative(inst: Option<&Instruction>, x: Value, ty: IrType) -> bool {
             rhs,
             ty: t,
             ..
-        }) if *v == x && *t == ty => match op {
+        }) if same_signed_order(defs, *v, *t, x, ty) => match op {
             IrCmpOp::Slt => const_is(rhs, 0) || const_is(rhs, 1),
             IrCmpOp::Sle => const_is(rhs, -1) || const_is(rhs, 0),
             _ => false,
@@ -113,7 +158,12 @@ fn proves_negative(inst: Option<&Instruction>, x: Value, ty: IrType) -> bool {
 /// The compare selecting the `x` arm: true for every positive `x`, false for
 /// every negative one, either way at zero (`x >= 0`, `x > -1`, `x > 0`,
 /// `x >= 1`) -- the mirror of [`proves_negative`].
-fn proves_nonneg(inst: Option<&Instruction>, x: Value, ty: IrType) -> bool {
+fn proves_nonneg(
+    defs: &[Option<Instruction>],
+    inst: Option<&Instruction>,
+    x: Value,
+    ty: IrType,
+) -> bool {
     match inst {
         Some(Instruction::Cmp {
             op,
@@ -121,7 +171,7 @@ fn proves_nonneg(inst: Option<&Instruction>, x: Value, ty: IrType) -> bool {
             rhs,
             ty: t,
             ..
-        }) if *v == x && *t == ty => match op {
+        }) if same_signed_order(defs, *v, *t, x, ty) => match op {
             IrCmpOp::Sge => const_is(rhs, 0) || const_is(rhs, 1),
             IrCmpOp::Sgt => const_is(rhs, -1) || const_is(rhs, 0),
             _ => false,
@@ -217,9 +267,9 @@ fn replacement(
             continue;
         }
         let proven = if negative_when_true {
-            proves_negative(cond_inst, source, *ty)
+            proves_negative(defs, cond_inst, source, *ty)
         } else {
-            proves_nonneg(cond_inst, source, *ty)
+            proves_nonneg(defs, cond_inst, source, *ty)
         };
         if !proven {
             continue;
@@ -251,10 +301,14 @@ fn replacement(
                 rhs: Operand::Value(r),
                 ty: t,
                 ..
-            }) if *t == *ty && *l == diff_lhs && *r == diff_rhs => match (op, greater_when_true) {
-                (IrCmpOp::Sgt, true) | (IrCmpOp::Sle, false) => true,
-                _ => false,
-            },
+            }) if same_signed_order(defs, *l, *t, diff_lhs, *ty)
+                && same_signed_order(defs, *r, *t, diff_rhs, *ty) =>
+            {
+                match (op, greater_when_true) {
+                    (IrCmpOp::Sgt, true) | (IrCmpOp::Sle, false) => true,
+                    _ => false,
+                }
+            }
             _ => false,
         };
         if !proven {
@@ -657,5 +711,277 @@ mod tests {
             ty: IrType::I32,
         };
         assert_eq!(run(&mut func), 0);
+    }
+
+    /// `x: narrow` compared at its own width, the arms on `sext(x): wide`:
+    /// the IR the C frontend emits for `short x; return x < 0 ? -x : x;`.
+    fn narrow_abs_function(
+        narrow: IrType,
+        cast_from: IrType,
+        wide: IrType,
+        cond_op: IrCmpOp,
+        cond_const: i64,
+        neg_arm_true: bool,
+    ) -> IrFunction {
+        let mut func = IrFunction::new("narrow_abs_test".into(), wide, vec![], false);
+        let v = Operand::Value;
+        let (t, f) = if neg_arm_true {
+            (v(Value(3)), v(Value(2)))
+        } else {
+            (v(Value(2)), v(Value(3)))
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: narrow,
+                },
+                Instruction::Cmp {
+                    dest: Value(1),
+                    op: cond_op,
+                    lhs: v(Value(0)),
+                    rhs: Operand::Const(IrConst::from_i64(cond_const, narrow)),
+                    ty: narrow,
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: v(Value(0)),
+                    from_ty: cast_from,
+                    to_ty: wide,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(3),
+                    op: IrUnaryOp::Neg,
+                    src: v(Value(2)),
+                    ty: wide,
+                },
+                Instruction::Select {
+                    dest: Value(4),
+                    cond: v(Value(1)),
+                    true_val: t,
+                    false_val: f,
+                    ty: wide,
+                },
+            ],
+            terminator: Terminator::Return(Some(v(Value(4)))),
+            source_spans: vec![],
+        });
+        func.next_value_id = 5;
+        func
+    }
+
+    const ACCEPTED_SPELLINGS: [(IrCmpOp, i64, bool); 8] = [
+        (IrCmpOp::Slt, 0, true),
+        (IrCmpOp::Sle, -1, true),
+        (IrCmpOp::Sle, 0, true),
+        (IrCmpOp::Slt, 1, true),
+        (IrCmpOp::Sge, 0, false),
+        (IrCmpOp::Sgt, -1, false),
+        (IrCmpOp::Sgt, 0, false),
+        (IrCmpOp::Sge, 1, false),
+    ];
+
+    #[test]
+    fn a_narrow_compare_of_the_extended_operand_is_an_absolute_value() {
+        for (narrow, wide) in [
+            (IrType::I8, IrType::I32),
+            (IrType::I16, IrType::I32),
+            (IrType::I8, IrType::I64),
+            (IrType::I16, IrType::I64),
+            (IrType::I32, IrType::I64),
+        ] {
+            for (op, c, neg_true) in ACCEPTED_SPELLINGS {
+                let mut func = narrow_abs_function(narrow, narrow, wide, op, c, neg_true);
+                assert_eq!(run(&mut func), 1, "{narrow:?}->{wide:?} {op:?} {c}");
+                let insts = &func.blocks[0].instructions;
+                let width = i64::from(wide.size() as u32 * 8 - 1);
+                // The identity runs at the promoted width on `sext(x)`.
+                assert!(
+                    insts.iter().any(|i| matches!(
+                        i,
+                        Instruction::BinOp {
+                            op: IrBinOp::AShr,
+                            lhs: Operand::Value(Value(2)),
+                            rhs: Operand::Const(k),
+                            ty,
+                            ..
+                        } if *ty == wide && k.to_i64() == Some(width)
+                    )),
+                    "{narrow:?}->{wide:?} {op:?} {c}: {insts:?}"
+                );
+                assert!(matches!(
+                    insts.last(),
+                    Some(Instruction::BinOp {
+                        op: IrBinOp::Sub,
+                        dest: Value(4),
+                        ty,
+                        ..
+                    }) if *ty == wide
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_extension_or_a_truncation_is_not_an_order_preserving_witness() {
+        // `zext(u16)` reorders the negative half of the 16-bit pattern: a
+        // signed compare of the narrow bits says nothing about the sign of
+        // the widened value.
+        let mut zext =
+            narrow_abs_function(IrType::U16, IrType::U16, IrType::I32, IrCmpOp::Slt, 0, true);
+        assert_eq!(run(&mut zext), 0);
+        // A compare typed I16 on a value the cast reads as U16: the types
+        // disagree, so the witness is refused.
+        let mut mismatched =
+            narrow_abs_function(IrType::I16, IrType::U16, IrType::I32, IrCmpOp::Slt, 0, true);
+        assert_eq!(run(&mut mismatched), 0);
+        // A truncation `i64 -> i32` discards the sign bit the compare saw.
+        let mut trunc =
+            narrow_abs_function(IrType::I64, IrType::I64, IrType::I32, IrCmpOp::Slt, 0, true);
+        assert_eq!(run(&mut trunc), 0);
+        // A threshold the identity does not express stays a select.
+        let mut off =
+            narrow_abs_function(IrType::I16, IrType::I16, IrType::I32, IrCmpOp::Slt, 2, true);
+        assert_eq!(run(&mut off), 0);
+    }
+
+    #[test]
+    fn every_narrow_input_agrees_with_the_promoted_identity() {
+        // Exhaustive over every 8-bit and 16-bit value, every accepted
+        // spelling: the select the frontend wrote (narrow compare, promoted
+        // arms) equals the identity computed on the sign-extended value.
+        let identity = |x: i32| (x ^ (x >> 31)).wrapping_sub(x >> 31);
+        let narrow_inputs =
+            (i32::from(i16::MIN)..=i32::from(i16::MAX)).map(|n| (n, n as i16 as i32));
+        for (op, c, neg_true) in ACCEPTED_SPELLINGS {
+            for (n, wide) in narrow_inputs.clone() {
+                let cond = match op {
+                    IrCmpOp::Slt => n < c as i32,
+                    IrCmpOp::Sle => n <= c as i32,
+                    IrCmpOp::Sgt => n > c as i32,
+                    IrCmpOp::Sge => n >= c as i32,
+                    _ => unreachable!(),
+                };
+                let (t, f) = if neg_true {
+                    (wide.wrapping_neg(), wide)
+                } else {
+                    (wide, wide.wrapping_neg())
+                };
+                assert_eq!(
+                    if cond { t } else { f },
+                    identity(wide),
+                    "{op:?} {c} at {n}"
+                );
+            }
+        }
+    }
+
+    fn narrow_absdiff_function(lhs_from: IrType, rhs_from: IrType) -> IrFunction {
+        let mut func = IrFunction::new("narrow_absdiff_test".into(), IrType::I32, vec![], false);
+        let v = Operand::Value;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I16,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I16,
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Sgt,
+                    lhs: v(Value(0)),
+                    rhs: v(Value(1)),
+                    ty: IrType::I16,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: v(Value(0)),
+                    from_ty: lhs_from,
+                    to_ty: IrType::I32,
+                },
+                Instruction::Cast {
+                    dest: Value(4),
+                    src: v(Value(1)),
+                    from_ty: rhs_from,
+                    to_ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Sub,
+                    lhs: v(Value(3)),
+                    rhs: v(Value(4)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Sub,
+                    lhs: v(Value(4)),
+                    rhs: v(Value(3)),
+                    ty: IrType::I32,
+                },
+                Instruction::Select {
+                    dest: Value(7),
+                    cond: v(Value(2)),
+                    true_val: v(Value(5)),
+                    false_val: v(Value(6)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(v(Value(7)))),
+            source_spans: vec![],
+        });
+        func.next_value_id = 8;
+        func
+    }
+
+    #[test]
+    fn a_narrow_difference_compare_is_an_absolute_difference_only_when_both_sides_extend() {
+        let mut both = narrow_absdiff_function(IrType::I16, IrType::I16);
+        assert_eq!(run(&mut both), 1);
+        assert!(matches!(
+            both.blocks[0].instructions.last(),
+            Some(Instruction::BinOp {
+                op: IrBinOp::Sub,
+                dest: Value(7),
+                ty: IrType::I32,
+                ..
+            })
+        ));
+        // One side zero-extended: `a > b` at 16 bits no longer orders the
+        // promoted pair.
+        let mut mixed = narrow_absdiff_function(IrType::I16, IrType::U16);
+        assert_eq!(run(&mut mixed), 0);
+        // Exhaustive agreement on a 16-bit grid that covers both extrema
+        // and every sign combination: the promoted difference of two
+        // sign-extended shorts never wraps, so the identity is `|a - b|`.
+        let identity = |x: i32| (x ^ (x >> 31)).wrapping_sub(x >> 31);
+        let grid = [
+            i16::MIN,
+            i16::MIN + 1,
+            -300,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            300,
+            i16::MAX - 1,
+            i16::MAX,
+        ];
+        for a in grid {
+            for b in grid {
+                let (wa, wb) = (i32::from(a), i32::from(b));
+                let select = if a > b { wa - wb } else { wb - wa };
+                assert_eq!(select, identity(wa.wrapping_sub(wb)), "{a} {b}");
+            }
+        }
     }
 }

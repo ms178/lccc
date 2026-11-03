@@ -3109,7 +3109,15 @@ pub(crate) fn run_passes(
         //           AArch64, RISC-V, i686 and x86-64 -Os kept the branchy
         //           select (`abs_select`: 18 RISC-V instructions with a branch
         //           instead of `sraiw; xor; subw`).
-        if !dis.simplify && should_run!(3, 0, 1, 2, 4, 7, 8, 10) {
+        //           GVN (5) is an upstream for the same reason: merging two
+        //           equal values is what makes this phase's operand-identity
+        //           patterns visible.  `short x; x < 0 ? -x : x` reaches
+        //           `signmag` as `neg(sext x)` against a second, equal
+        //           `sext x`; GVN unifies them later in the iteration, and
+        //           without this wake-up the select was never revisited
+        //           (x86-64: 7 instructions where `movswl; mov; neg; cmovs`
+        //           does it in 4).
+        if !dis.simplify && should_run!(3, 0, 1, 2, 4, 5, 7, 8, 10) {
             let n = timed_pass!(
                 "simplify",
                 run_on_visited(module, &dirty, &mut changed, |func| {
