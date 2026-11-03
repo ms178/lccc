@@ -11143,6 +11143,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 requires_designators: false,
                 reverse_sso: false,
                 user_align: struct_aligned.is_some(),
+                member_align: 1,
             };
             self.result
                 .type_context
@@ -11602,6 +11603,7 @@ mod record_layouts_correspond_tests {
             requires_designators: false,
             reverse_sso: false,
             user_align: false,
+            member_align: align,
         }
     }
 

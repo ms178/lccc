@@ -476,8 +476,15 @@ contracts from a numerical binary32 oracle: 42 signed boundary inputs and
 x86 ABIs at five optimization levels. It checks quiet-NaN classification and
 signed zero, not NaN payloads or floating-environment exception flags.
 
-`python3 tests/regression/check_switch_cross_execute.py` runs nine self-checking
-switch fixtures with LUT lowering on/off under AArch64 and RV64 QEMU (36 runs).
+`python3 tests/regression/check_switch_cross_execute.py` runs self-checking
+fixtures under AArch64 and RV64 QEMU (140 runs): 13 switch and memory fixtures
+with their IR pass on and off at -O2; 8 backend fixtures (`LEVELS`: 128-bit
+switches, the RV64 FP-load dead-store census, AArch64 div/rem and bitmask
+encodings, over-aligned aggregate arguments, variadic calls through member,
+element and cast callees) at -O0, -O1, -O2 and -Os, assembled by LCCC's own
+assembler (`-c`); and 2 two-unit psABI fixtures under `interop/` (register
+pairs and alignment; floating-point arguments) linked LCCC-with-LCCC and
+LCCC-with-Clang in both directions at -O0 and -O2.
 It requires the fastbuild target drivers, Clang 23.1.4, GNU target linkers or LLD,
 QEMU user emulators, and host C declaration headers. The executable uses a
 minimal syscall startup and no cross libc; printf/puts are no-ops, so acceptance

@@ -540,8 +540,17 @@ impl ArmCodegen {
                 return;
             }
             if op == IrBinOp::URem {
-                self.operand_to_x0(lhs);
                 let mask = (1u64 << shift) - 1;
+                if mask == 0 {
+                    // `x % 1` is 0.  AArch64 has no all-zero logical
+                    // immediate, so `and w0, w0, #0` cannot be encoded
+                    // (gcc.c-torture execute/pr53645.c at -O1, a vector
+                    // remainder by { 1, 4, 2, 8 } lowered lane by lane).
+                    self.state.emit("    mov x0, #0");
+                    self.store_x0_to(dest);
+                    return;
+                }
+                self.operand_to_x0(lhs);
                 if use_32bit {
                     self.state
                         .emit_fmt(format_args!("    and w0, w0, #{}", mask));
@@ -1230,8 +1239,14 @@ impl ArmCodegen {
     /// Store x3 (the fused pair's second result) to a value's location.
     /// Mirror of `store_x0_to` with the source register changed; no
     /// accumulator claim (the value sits in x3, not the x0 accumulator).
-    pub(super) fn store_x3_to(&mut self, dest: &Value, use_32bit: bool) {
-        let src = if use_32bit { "w3" } else { "x3" };
+    ///
+    /// Always the X view, exactly as `store_x0_to`: a 32-bit `msub`/`sdiv`
+    /// into w3 already zeroed bits 63:32, and a register home is named by
+    /// its X name -- the W view produced `mov x6, w3` (no such instruction:
+    /// gcc.c-torture execute/arith-rand.c failed to assemble at -O1 and up)
+    /// and `fmov d8, w3`.
+    pub(super) fn store_x3_to(&mut self, dest: &Value) {
+        let src = "x3";
         if self
             .state
             .value_use_counts
@@ -1298,7 +1313,7 @@ impl ArmCodegen {
             if !tail_dead {
                 self.state
                     .emit_fmt(format_args!("    msub {}3, {}0, {}2, {}1", w, w, w, w));
-                self.store_x3_to(&tail, use_32bit);
+                self.store_x3_to(&tail);
             }
             self.store_x0_to(dest);
         } else {
@@ -1308,7 +1323,7 @@ impl ArmCodegen {
             self.state
                 .emit_fmt(format_args!("    msub {}0, {}3, {}2, {}1", w, w, w, w));
             if !tail_dead {
-                self.store_x3_to(&tail, use_32bit);
+                self.store_x3_to(&tail);
             }
             self.store_x0_to(dest);
         }

@@ -278,6 +278,27 @@ pub struct PendingVecMemfold {
     pub width: u32,
 }
 
+/// `-g`: the two rows a function's first address carries.
+///
+/// DWARF names a subprogram's *declaration* position and starts its line
+/// program at the *body*: measured against gcc 12.2 and clang 21, a function
+/// `int main(void)\n{\n...` reports `DW_AT_decl_line` 16 (the declarator) while
+/// the line table's first row is line 17 (the opening brace), and both
+/// compilers report the column of the name (`16:5`).  One `.loc` cannot say
+/// both, so the entry address carries two rows: [`Self::decl`], emitted with
+/// `is_stmt 0` because a declarator is not a statement, and [`Self::body`],
+/// the function's first statement row.  A consumer that maps an address to a
+/// line takes the last row at that address (the body), exactly as the two
+/// reference compilers' tables read; the writer takes the first row (the
+/// declarator) for `DW_AT_decl_line`/`DW_AT_decl_column`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FnEntryRows {
+    /// The declarator's name position, when the source spelling is known.
+    pub decl: Option<(u32, u32, u32)>,
+    /// The body's opening brace: the function's first statement row.
+    pub body: (u32, u32, u32),
+}
+
 pub struct CodegenState {
     pub(crate) frame_report: Option<crate::backend::FrameReport>,
     pub out: AsmOutput,
@@ -821,12 +842,18 @@ pub struct CodegenState {
     /// `NAME:` through the `.cfi_endproc` right before `.size NAME, .-NAME`),
     /// so CFI the user writes in top-level asm is never touched.
     pub fn_boundary_marked: FxHashSet<String>,
-    /// `-g`: each function's entry line row `(file, line, column)` -- the
-    /// body's opening brace -- keyed by its label. Not emitted inline:
-    /// the peephole's and CFI synthesis's entry matchers rely on the exact
-    /// `NAME:` / `.cfi_startproc` / prologue shape, so the `.loc` is
+    /// `-g`: the next row emitted should carry `DW_LNS_set_prologue_end`.
+    ///
+    /// Set when a function's prologue (frame setup and the parameter stores
+    /// that belong to it) has been emitted, cleared by the next `.loc`.
+    /// Consumers use it to skip the prologue exactly -- without it gdb
+    /// single-steps through register spills that no source statement owns.
+    pub pending_prologue_end: bool,
+    /// `-g`: each function's entry rows -- keyed by its label.  Not emitted
+    /// inline: the peephole's and CFI synthesis's entry matchers rely on the
+    /// exact `NAME:` / `.cfi_startproc` / prologue shape, so the `.loc`s are
     /// inserted after all of them by [`crate::backend::insert_fn_entry_locs`].
-    pub fn_entry_locs: FxHashMap<String, (u32, u32, u32)>,
+    pub fn_entry_locs: FxHashMap<String, FnEntryRows>,
     /// i686: bytes a directly called function pops on return (`ret $N`:
     /// the i386 SysV hidden struct-return pointer, the stack arguments of a
     /// fastcall callee), keyed by callee symbol. The call's text does not
@@ -1048,6 +1075,7 @@ impl CodegenState {
             emit_cfi: true,
             fn_boundary_markers: false,
             fn_boundary_marked: FxHashSet::default(),
+            pending_prologue_end: false,
             fn_entry_locs: FxHashMap::default(),
             callee_pops_direct: FxHashMap::default(),
             callee_pops_indirect: FxHashMap::default(),

@@ -33,6 +33,8 @@ impl I686Codegen {
             use_riscv_float_struct_classification: false,
             allow_struct_split_reg_stack: false,
             align_struct_pairs: false,
+            even_pairs_for_unnamed_only: false,
+            float_overflow_to_gp: false,
             sret_uses_dedicated_reg: false,
             gcc_regparm_mode: true,
             // GCC i386 cdecl never aligns stack args beyond the 4-byte slot

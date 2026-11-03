@@ -658,6 +658,7 @@ impl Parser {
             ),
             is_kr: is_kr_style,
             span: start,
+            name_span: def_name_span,
             body_span,
         }))
     }

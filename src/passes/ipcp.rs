@@ -533,24 +533,26 @@ fn eval_const_function_at(
                     true_label,
                     false_label,
                 } => {
-                    let cond = eval_const_operand(cond, &values)?.to_i64()?;
+                    let cond = eval_const_operand(cond, &values)?;
                     predecessor = Some(block.label.0);
-                    let label = if cond != 0 { true_label } else { false_label };
+                    let label = if cond.is_nonzero() {
+                        true_label
+                    } else {
+                        false_label
+                    };
                     current_idx = *label_to_idx.get(&label.0)?;
                 }
                 Terminator::Switch {
                     val,
                     cases,
                     default,
-                    ..
+                    ty,
                 } => {
-                    let value = eval_const_operand(val, &values)?.to_i64()?;
+                    let value = eval_const_operand(val, &values)?;
                     predecessor = Some(block.label.0);
-                    let label = cases
-                        .iter()
-                        .find(|(case, _)| *case == value)
-                        .map(|(_, label)| label)
-                        .unwrap_or(default);
+                    let label = crate::passes::cfg_simplify::constant_switch_target(
+                        &value, *ty, cases, *default,
+                    )?;
                     current_idx = *label_to_idx.get(&label.0)?;
                 }
                 Terminator::IndirectBranch { .. } => return None,
@@ -953,6 +955,118 @@ enum ParamState {
     Const(IrConst),
     /// Different call sites pass different values (or a non-constant).
     Varying,
+}
+
+#[cfg(test)]
+mod switch_eval_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, IrParam, Value};
+
+    /// `f(x) { switch (x) { case 0: return 1; case -1: return 2; } return 3; }`
+    /// over a selector of type `ty`, with `cond` (when given) guarding the
+    /// switch: `if (x) switch ...; else return 4;`.
+    fn module_with_switch(ty: IrType, guard: bool) -> IrModule {
+        let param = IrParam {
+            ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: vec![],
+            is_f128_sse: false,
+            riscv_float_class: None,
+        };
+        let mut f = IrFunction::new("f".into(), IrType::I32, vec![param], false);
+        f.is_static = true;
+        let block =
+            |label: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+                label: BlockId(label),
+                source_spans: vec![crate::common::source::Span::dummy(); instructions.len()],
+                instructions,
+                terminator,
+            };
+        let ret = |v: i32| Terminator::Return(Some(Operand::Const(IrConst::I32(v))));
+        let x = Operand::Value(Value(0));
+        let switch = Terminator::Switch {
+            val: x.clone(),
+            cases: vec![(0, BlockId(1)), (-1, BlockId(2))],
+            default: BlockId(3),
+            ty,
+        };
+        let entry = vec![Instruction::ParamRef {
+            dest: Value(0),
+            param_idx: 0,
+            ty,
+        }];
+        if guard {
+            f.blocks.push(block(
+                0,
+                entry,
+                Terminator::CondBranch {
+                    cond: x,
+                    true_label: BlockId(5),
+                    false_label: BlockId(4),
+                },
+            ));
+            f.blocks.push(block(5, vec![], switch));
+        } else {
+            f.blocks.push(block(0, entry, switch));
+        }
+        for (label, value) in [(1, 1), (2, 2), (3, 3), (4, 4)] {
+            f.blocks.push(block(label, vec![], ret(value)));
+        }
+        f.next_value_id = 1;
+        f.next_label = 6;
+        let mut module = IrModule::new();
+        module.functions.push(f);
+        module
+    }
+
+    fn eval(module: &IrModule, arg: IrConst) -> Option<IrConst> {
+        let indices: FxHashMap<String, usize> = [("f".to_string(), 0)].into_iter().collect();
+        let mut memo = FxHashMap::default();
+        let mut active = FxHashSet::default();
+        let mut budget = 1_000u64;
+        eval_const_function(
+            module,
+            &indices,
+            0,
+            &[arg],
+            &mut memo,
+            &mut active,
+            &mut budget,
+        )
+    }
+
+    /// The constant evaluator dispatches a Switch exactly as the backends
+    /// do.  It used to compare `to_i64()` of the selector, so a 128-bit
+    /// argument whose low half is 0 or -1 picked `case 0` or `case -1`.
+    #[test]
+    fn a_wide_selector_takes_the_arm_of_its_full_value() {
+        let i128_module = module_with_switch(IrType::I128, false);
+        assert_eq!(
+            eval(&i128_module, IrConst::I128(1 << 64)),
+            Some(IrConst::I32(3))
+        );
+        assert_eq!(eval(&i128_module, IrConst::I128(-1)), Some(IrConst::I32(2)));
+        assert_eq!(eval(&i128_module, IrConst::I128(0)), Some(IrConst::I32(1)));
+        let u128_module = module_with_switch(IrType::U128, false);
+        assert_eq!(
+            eval(&u128_module, IrConst::I128(u64::MAX as i128)),
+            Some(IrConst::I32(3))
+        );
+        let u32_module = module_with_switch(IrType::U32, false);
+        assert_eq!(eval(&u32_module, IrConst::I32(-1)), Some(IrConst::I32(2)));
+    }
+
+    /// A condition is true when any of its bits is set, not when its low
+    /// 64 bits are.
+    #[test]
+    fn a_wide_condition_tests_every_bit() {
+        let module = module_with_switch(IrType::I128, true);
+        assert_eq!(eval(&module, IrConst::I128(1 << 64)), Some(IrConst::I32(3)));
+        assert_eq!(eval(&module, IrConst::I128(0)), Some(IrConst::I32(4)));
+    }
 }
 
 #[cfg(test)]

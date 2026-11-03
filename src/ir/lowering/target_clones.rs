@@ -443,6 +443,7 @@ impl Lowerer {
                 ..Default::default()
             },
             // Synthesized resolver: no source body.
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };

@@ -1999,11 +1999,19 @@ impl Lowerer {
                 volatile: false,
                 semantic_volatile: false,
             });
+            // The copy keeps the object's alignment; the va_list cursor
+            // moves by the argument-passing alignment, which on AArch64 is
+            // the record's natural (member) alignment -- the same rule the
+            // caller used to place it.
+            let cursor_align = match self.get_struct_layout_for_ctype(ctype) {
+                Some(layout) if self.target == Target::Aarch64 => self.record_arg_align(&layout),
+                _ => struct_align,
+            };
             self.emit(Instruction::VaArgStruct {
                 dest_ptr: alloca,
                 va_list_ptr,
                 size: struct_size,
-                align: struct_align,
+                align: cursor_align,
                 eightbyte_classes,
             });
             return Operand::Value(alloca);

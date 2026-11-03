@@ -389,6 +389,66 @@ fn folds_a_switch_with_no_matching_case_to_the_default() {
     ));
 }
 
+/// Switch folding compares at the selector's width, through the helper the
+/// CFG simplifier and the IPCP evaluator share.  The raw `to_i64` compare
+/// it replaced truncated an I128 selector -- `(__int128)1 << 64` matched
+/// `case 0`, 2^64 - 1 matched `case -1` -- and missed a U32 selector whose
+/// carrier is `I32(-1)` against the case 0xffff_ffff.
+#[test]
+fn switch_folding_compares_constants_at_the_selector_width() {
+    for (selector, ty, cases, expected) in [
+        (
+            IrConst::I128(1 << 64),
+            IrType::I128,
+            vec![(0, 1), (-1, 2)],
+            3,
+        ),
+        (
+            IrConst::I128(u64::MAX as i128),
+            IrType::U128,
+            vec![(0, 1), (-1, 2)],
+            3,
+        ),
+        (IrConst::I128(-1), IrType::I128, vec![(0, 1), (-1, 2)], 2),
+        (IrConst::I128(5), IrType::U128, vec![(5, 1), (-1, 2)], 1),
+        (
+            IrConst::I32(-1),
+            IrType::U32,
+            vec![(0xffff_ffff, 1), (1, 2)],
+            1,
+        ),
+        (
+            IrConst::I64(0x1_0000_0002),
+            IrType::I32,
+            vec![(2, 1), (1, 2)],
+            1,
+        ),
+    ] {
+        let cases: Vec<(i64, BlockId)> = cases.into_iter().map(|(v, b)| (v, BlockId(b))).collect();
+        let (stats, f) = sccp(func_of(vec![
+            blk(
+                0,
+                vec![cst(0, selector)],
+                Terminator::Switch {
+                    val: val(0),
+                    cases,
+                    default: BlockId(3),
+                    ty,
+                },
+            ),
+            blk(1, vec![], ret(None)),
+            blk(2, vec![], ret(None)),
+            blk(3, vec![], ret(None)),
+        ]));
+        assert_eq!(stats.branches_folded, 1, "{selector:?} as {ty:?}");
+        assert!(
+            matches!(f.blocks[0].terminator, Terminator::Branch(BlockId(b)) if b == expected),
+            "{selector:?} as {ty:?} must branch to b{expected}, got {:?}",
+            f.blocks[0].terminator
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Red-team reproducers
 // ═══════════════════════════════════════════════════════════════════════════

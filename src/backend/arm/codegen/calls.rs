@@ -1,6 +1,6 @@
 //! ArmCodegen: function call operations.
 
-use super::emit::{ArmCodegen, callee_saved_name};
+use super::emit::{ArmCodegen, arm_fp_name, callee_saved_name, is_arm_fp_phys};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_arg_space};
 use crate::backend::generation::is_i128_type;
 use crate::backend::traits::ArchCodegen;
@@ -9,32 +9,7 @@ use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
-        CallAbiConfig {
-            microsoft_x64: false,
-            max_int_regs: 8,
-            max_float_regs: 8,
-            align_i128_pairs: true,
-            f128_in_fp_regs: true,
-            f128_in_gp_pairs: false,
-            variadic_floats_in_gp: false,
-            large_struct_by_ref: true,
-            use_sysv_struct_classification: false,
-            use_riscv_float_struct_classification: false,
-            allow_struct_split_reg_stack: false,
-            // Composites with 16-byte natural alignment are allocated at an
-            // even-aligned register pair (or a 16-aligned stack slot), for
-            // named AND variadic arguments — GCC's aarch64 layout places
-            // struct{int} align(16) at w0/w2/w4/w6, skipping odd registers
-            // (verified against the GCC oracle on named args).
-            align_struct_pairs: true,
-            sret_uses_dedicated_reg: true,
-            gcc_regparm_mode: false,
-            // AAPCS64 caps stack-argument alignment at 2*XLEN (16);
-            // the va_arg / prologue readers cap identically.
-            stack_arg_align_cap: 16,
-            vector_xmm_regs: 0,
-            i386_ext_vector_lanes: false,
-        }
+        CallAbiConfig::aapcs64()
     }
 
     pub(super) fn emit_call_compute_stack_space_impl(
@@ -57,6 +32,23 @@ impl ArmCodegen {
     ) -> usize {
         let _ = (args, arg_classes);
         0
+    }
+
+    /// `x0` = the value homed in allocator register `reg`: the raw bits of
+    /// an FP home (d8-d14, v16-v31) by `fmov`, a GP home by `mov`.  The
+    /// stack-argument writer sees values of every class, and
+    /// `callee_saved_name` knows only GP registers: a ninth `double` kept
+    /// in d8 aborted the compiler with "invalid ARM register index".
+    fn emit_home_to_x0(&mut self, reg: crate::backend::regalloc::PhysReg) {
+        if is_arm_fp_phys(reg) {
+            self.state.emit_fmt(format_args!(
+                "    fmov x0, {}",
+                arm_fp_name(reg, IrType::F64)
+            ));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    mov x0, {}", callee_saved_name(reg)));
+        }
     }
 
     pub(super) fn emit_call_stack_args_impl(
@@ -101,9 +93,7 @@ impl ArmCodegen {
                         match arg {
                             Operand::Value(v) => {
                                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                                    let reg_name = callee_saved_name(reg);
-                                    self.state
-                                        .emit_fmt(format_args!("    mov x0, {}", reg_name));
+                                    self.emit_home_to_x0(reg);
                                 } else if let Some(slot) = self.state.get_slot(v.0) {
                                     let adjusted = slot.0 + src_adjust;
                                     if self.state.is_alloca(v.0) {
@@ -214,9 +204,7 @@ impl ArmCodegen {
                                 }
                                 if !loaded_full {
                                     if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                                        let reg_name = callee_saved_name(reg);
-                                        self.state
-                                            .emit_fmt(format_args!("    mov x0, {}", reg_name));
+                                        self.emit_home_to_x0(reg);
                                     } else if let Some(slot) = self.state.get_slot(v.0) {
                                         let adjusted = slot.0 + src_adjust;
                                         if self.state.is_alloca(v.0) {
@@ -241,9 +229,7 @@ impl ArmCodegen {
                         match arg {
                             Operand::Value(v) => {
                                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                                    let reg_name = callee_saved_name(reg);
-                                    self.state
-                                        .emit_fmt(format_args!("    mov x0, {}", reg_name));
+                                    self.emit_home_to_x0(reg);
                                 } else if let Some(slot) = self.state.get_slot(v.0) {
                                     let adjusted = slot.0 + src_adjust;
                                     if self.state.is_alloca(v.0) {

@@ -2289,6 +2289,34 @@ mod register_class_tests {
         }
     }
 
+    /// A 32-bit logical immediate may be spelled as its 64-bit sign
+    /// extension, as GNU as and LLVM accept and GCC prints (`and w0, w0,
+    /// -16`); the words are clang 23.1.4's integrated assembler's.  Any other
+    /// upper half is still refused, and so are the unencodable all-zero and
+    /// all-one patterns.
+    #[test]
+    fn a_negative_32_bit_logical_immediate_is_its_low_word() {
+        let imm = Operand::Imm;
+        assert_eq!(enc("and", &[reg("w2"), reg("w2"), imm(-16)]), 0x121c6c42);
+        assert_eq!(
+            enc("and", &[reg("w2"), reg("w2"), imm(0xffff_fff0)]),
+            0x121c6c42
+        );
+        assert_eq!(enc("and", &[reg("x3"), reg("x3"), imm(-16)]), 0x927cec63);
+        assert_eq!(enc("orr", &[reg("w4"), reg("w4"), imm(-2)]), 0x321f7884);
+        assert_eq!(
+            enc("eor", &[reg("w5"), reg("w5"), imm(0xffff_fff0)]),
+            0x521c6ca5
+        );
+        assert_eq!(enc("tst", &[reg("w6"), imm(-16)]), 0x721c6cdf);
+        for value in [0x1_0000_0001_i64, -0x1_0000_0000, 0, -1, 0xffff_ffff] {
+            assert!(
+                encode_instruction("and", &[reg("w0"), reg("w1"), imm(value)], "").is_err(),
+                "and w0, w1, #{value:#x} has no encoding"
+            );
+        }
+    }
+
     /// The conditional-select aliases: the destination is an `Rd|XZR` slot and
     /// the two register operands share one width, so `cset sp, eq` (which used
     /// to assemble as `cset xzr, eq`) and the mixed-width forms are refused.

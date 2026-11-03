@@ -6239,16 +6239,25 @@ fn generate_function_body(
     cg.state()
         .emit_fmt(format_args!(".type {}, {}", func.name, type_dir));
     cg.state().emit_fmt(format_args!("{}:", func.name));
-    // `-g`: record the body's opening brace as the function's entry row.
-    // `insert_fn_entry_locs` places it after the label once the peephole and
-    // CFI synthesis are done (see `CodegenState::fn_entry_locs`). Without
-    // this row the prologue bytes had no line and a debugger's prologue
-    // skip had no row to skip *from*: `break func` and frames stopped in
-    // the prologue had no file:line.
-    if cg.state_ref().debug_info && !file_table.is_empty() {
-        if let Some(loc) = source_mgr.and_then(|sm| entry_loc(&func.body_span, sm, file_table)) {
-            cg.state().fn_entry_locs.insert(func.name.clone(), loc);
-        }
+    // `-g`: record the function's two entry rows.  `insert_fn_entry_locs`
+    // places them after the label once the peephole and CFI synthesis are done
+    // (see `CodegenState::fn_entry_locs`).  Without the body row the prologue
+    // bytes had no line and a debugger's prologue skip had no row to skip
+    // *from*: `break func` and frames stopped in the prologue had no
+    // file:line.  The declarator row is what `DW_AT_decl_line` and
+    // `DW_AT_decl_column` are defined to name -- gcc 12.2 reports `main` at
+    // `16:5` for a body that opens on line 17 -- and the `.loc` channel is the
+    // only one the assembler accepts, so it travels as a non-statement row.
+    if cg.state_ref().debug_info
+        && !file_table.is_empty()
+        && let Some(sm) = source_mgr
+        && let Some(body) = entry_loc(&func.body_span, sm, file_table)
+    {
+        let decl = entry_loc(&func.decl_span, sm, file_table);
+        cg.state().fn_entry_locs.insert(
+            func.name.clone(),
+            crate::backend::state::FnEntryRows { decl, body },
+        );
     }
     // Function delimiters. A backend with `fn_boundary_markers` (x86-64,
     // i686) gets bare markers: after its peephole they are either expanded
@@ -6510,6 +6519,11 @@ fn generate_function_body(
         cg.state().switch_unsigned_bounds = crate::passes::integer_bounds::switch_bounds(func);
     }
     cg.emit_store_params(func);
+    // `-g`: the prologue ends here (frame setup plus the parameter stores the
+    // ABI entry needs); the next source row is where a prologue skip stops.
+    if debug_rows_enabled(cg, source_mgr, file_table) {
+        cg.state().pending_prologue_end = true;
+    }
 
     let entry_label = func.blocks.first().map(|b| b.label);
 
@@ -6884,9 +6898,8 @@ fn generate_function_body(
         );
     }
 
-    let emit_debug = cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty();
-    let mut last_debug_file: u32 = 0;
-    let mut last_debug_line: u32 = 0;
+    let emit_debug = debug_rows_enabled(cg, source_mgr, file_table);
+    let mut last_debug_row = EmittedRow::default();
     cg.state().current_program_point = 0;
     // Blocks whose address is observable. Fall-through elision of an empty
     // one would make `&&label` compare equal to the next label. CFG merge
@@ -7379,8 +7392,7 @@ fn generate_function_body(
                         span,
                         source_mgr.expect("debug mode requires source manager"),
                         file_table,
-                        &mut last_debug_file,
-                        &mut last_debug_line,
+                        &mut last_debug_row,
                     );
                 }
             }
@@ -7761,23 +7773,32 @@ fn generate_function_body(
                 .terminator_spans
                 .span_of(block.label, &block.terminator)
             {
-                emit_loc_directive(
-                    cg,
-                    &span,
-                    sm,
-                    file_table,
-                    &mut last_debug_file,
-                    &mut last_debug_line,
-                );
+                emit_loc_directive(cg, &span, sm, file_table, &mut last_debug_row);
             }
             if matches!(block.terminator, Terminator::Return(_)) {
                 closing_row = func
                     .body_span
                     .closing_delimiter()
                     .and_then(|close| entry_loc(&close, sm, file_table))
-                    .filter(|&(file, line, _)| (file, line) != (last_debug_file, last_debug_line));
-                cg.state().pending_epilogue_loc =
-                    closing_row.map(|(file, line, column)| format!(".loc {file} {line} {column}"));
+                    // A row is only redundant when it repeats the whole
+                    // position: with a statement-per-row program, the closing
+                    // brace of a one-line function sits on the same line as its
+                    // last statement but at a column of its own, and dropping it
+                    // would drop the `epilogue_begin` marker with it.
+                    .filter(|&(file, line, column)| {
+                        (file, line, column)
+                            != (
+                                last_debug_row.file,
+                                last_debug_row.line,
+                                last_debug_row.column,
+                            )
+                    });
+                // `epilogue_begin` marks the row at the first instruction of the
+                // epilogue (`finish` and the epilogue's own stepping start
+                // there); the closing brace is that row.
+                cg.state().pending_epilogue_loc = closing_row.map(|(file, line, column)| {
+                    format!(".loc {file} {line} {column} epilogue_begin")
+                });
             }
         }
         if let Some((fi, _, kind)) = fuse_idx {
@@ -7842,11 +7863,16 @@ fn generate_function_body(
         } else {
             generate_terminator(cg, &block.terminator, frame_size, block.label.0);
         }
-        if let Some((file, line, _)) = closing_row {
+        if let Some((file, line, column)) = closing_row {
             // Placed by the epilogue unless this return emitted none.
             if cg.state().pending_epilogue_loc.take().is_none() {
-                last_debug_file = file;
-                last_debug_line = line;
+                last_debug_row.file = file;
+                last_debug_row.line = line;
+                last_debug_row.column = column;
+                // The pending row's span is the closing brace, which no
+                // statement claims; clearing it keeps the next statement row
+                // from being suppressed by this one's position.
+                last_debug_row.span = None;
             }
         }
         cg.state().current_program_point += 1;
@@ -7865,6 +7891,16 @@ fn generate_function_body(
     emit_switch_to_section(cg, &func_sect, func_retain);
 }
 
+/// Whether `-g` rows can be emitted at all: the flag is on, a source manager is
+/// available and the unit has a file table to number rows against.
+fn debug_rows_enabled(
+    cg: &dyn ArchCodegen,
+    source_mgr: Option<&SourceManager>,
+    file_table: &FxHashMap<String, u32>,
+) -> bool {
+    cg.state_ref().debug_info && source_mgr.is_some() && !file_table.is_empty()
+}
+
 /// The `(file, line, column)` row of `span`, if it names a known file.
 fn entry_loc(
     span: &Span,
@@ -7879,21 +7915,47 @@ fn entry_loc(
     Some((file, loc.line, loc.column))
 }
 
+/// The last `-g` row a function emitted.
+///
+/// The span, not just `(file, line)`, is what decides whether a row is due:
+/// two statements on one source line (`int f(void) { int a = 1; return a; }`)
+/// are separate statements at separate addresses, and a debugger that only ever
+/// sees one row per line cannot step between them -- gcc and clang both emit a
+/// row per statement there.  `(file, line)` is kept as well because the
+/// epilogue's closing-brace row is compared against the last row's position.
+#[derive(Default)]
+struct EmittedRow {
+    span: Option<Span>,
+    file: u32,
+    line: u32,
+    column: u32,
+}
+
 fn emit_loc_directive(
     cg: &mut dyn ArchCodegen,
     span: &Span,
     source_mgr: &SourceManager,
     file_table: &FxHashMap<String, u32>,
-    last_file: &mut u32,
-    last_line: &mut u32,
+    last: &mut EmittedRow,
 ) {
-    if let Some((file, line, column)) = entry_loc(span, source_mgr, file_table) {
-        if file != *last_file || line != *last_line {
-            cg.state()
-                .emit_fmt(format_args!(".loc {file} {line} {column}"));
-            *last_file = file;
-            *last_line = line;
-        }
+    // `prologue_end` belongs to the first row after the prologue: that is where
+    // a debugger's prologue skip should stop, and it must be stated on a row of
+    // its own (a re-emitted position would fold into the previous row).
+    let prologue_end = std::mem::take(&mut cg.state().pending_prologue_end);
+    let Some((file, line, column)) = entry_loc(span, source_mgr, file_table) else {
+        // Unknown position: the marker still has to land somewhere, so it goes
+        // on the next row that can carry it.
+        cg.state().pending_prologue_end = prologue_end;
+        return;
+    };
+    if last.span != Some(*span) || prologue_end {
+        let marker = if prologue_end { " prologue_end" } else { "" };
+        cg.state()
+            .emit_fmt(format_args!(".loc {file} {line} {column}{marker}"));
+        last.span = Some(*span);
+        last.file = file;
+        last.line = line;
+        last.column = column;
     }
 }
 

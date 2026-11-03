@@ -436,6 +436,20 @@ pub struct CallAbiConfig {
     /// ARM AAPCS64: false (composite types never require even-aligned pairs; only
     /// fundamental types like __int128 do, which is handled by align_i128_pairs).
     pub align_struct_pairs: bool,
+    /// Whether the even-register rule of `align_i128_pairs` /
+    /// `align_struct_pairs` binds only the *unnamed* arguments of a variadic
+    /// call.  RISC-V psABI: true -- a named 2×XLEN-aligned argument takes the
+    /// next free register, only a variadic one starts at an even register
+    /// (GCC `riscv_get_arg_info`: `if (!named && ... alignment >
+    /// BITS_PER_WORD) gpr_offset += gpr_offset & 1`; Clang alike).  AAPCS64:
+    /// false -- rule C.8 rounds the NGRN for every argument.
+    pub even_pairs_for_unnamed_only: bool,
+    /// Whether a named floating-point scalar that finds every FP argument
+    /// register taken continues in the integer calling convention (next GP
+    /// register, then the stack) instead of going straight to the stack.
+    /// RISC-V psABI hardware-FP convention: true (`f(double ×9, ...)` passes
+    /// the ninth double in `a0`).  AAPCS64 / SysV: false.
+    pub float_overflow_to_gp: bool,
     /// Whether sret (struct return) uses a dedicated register (x8 on AArch64) instead of
     /// consuming a regular GP argument register slot. When true, the classification must
     /// promote the first stack-overflow GP argument to the freed GP register slot so that
@@ -546,6 +560,71 @@ pub(crate) fn i386_gnu_vector_stack_align(
 }
 
 impl CallAbiConfig {
+    /// The RV64 LP64D configuration: the single source of truth for
+    /// `RiscvCodegen::call_abi_config_impl` and the classification tests.
+    pub fn riscv_lp64d() -> CallAbiConfig {
+        CallAbiConfig {
+            microsoft_x64: false,
+            max_int_regs: 8,
+            max_float_regs: 8,
+            align_i128_pairs: true,
+            f128_in_fp_regs: false,
+            f128_in_gp_pairs: true,
+            variadic_floats_in_gp: true,
+            large_struct_by_ref: true,
+            use_sysv_struct_classification: false,
+            use_riscv_float_struct_classification: true,
+            allow_struct_split_reg_stack: true,
+            align_struct_pairs: true,
+            // psABI: only a *variadic* 2×XLEN-aligned argument starts at an
+            // even register; a named one takes the next free register.
+            even_pairs_for_unnamed_only: true,
+            // Hardware-FP convention: a named float past fa7 continues in
+            // the integer convention (next a-register, then the stack).
+            float_overflow_to_gp: true,
+            sret_uses_dedicated_reg: false,
+            gcc_regparm_mode: false,
+            // RISC-V psABI caps stack-argument alignment at 2*XLEN (16);
+            // the va_arg / prologue readers cap identically.
+            stack_arg_align_cap: 16,
+            vector_xmm_regs: 0,
+            i386_ext_vector_lanes: false,
+        }
+    }
+
+    /// The AAPCS64 configuration: the single source of truth for
+    /// `ArmCodegen::call_abi_config_impl` and the classification tests.
+    pub fn aapcs64() -> CallAbiConfig {
+        CallAbiConfig {
+            microsoft_x64: false,
+            max_int_regs: 8,
+            max_float_regs: 8,
+            align_i128_pairs: true,
+            f128_in_fp_regs: true,
+            f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+            large_struct_by_ref: true,
+            use_sysv_struct_classification: false,
+            use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false,
+            // Composites with 16-byte natural alignment -- that of their
+            // most-aligned member; a record-level `aligned(16)` does not
+            // count (`StructLayout::member_align`) -- are allocated at an
+            // even-aligned register pair (or a 16-aligned stack slot), for
+            // named AND variadic arguments (AAPCS64 C.8).
+            align_struct_pairs: true,
+            even_pairs_for_unnamed_only: false,
+            float_overflow_to_gp: false,
+            sret_uses_dedicated_reg: true,
+            gcc_regparm_mode: false,
+            // AAPCS64 caps stack-argument alignment at 2*XLEN (16);
+            // the va_arg / prologue readers cap identically.
+            stack_arg_align_cap: 16,
+            vector_xmm_regs: 0,
+            i386_ext_vector_lanes: false,
+        }
+    }
+
     /// The x86-64 SysV configuration.  The single source of truth shared by
     /// `X86Codegen::call_abi_config_impl` (prologue/call emission) and the
     /// stack-layout dead-parameter-alloca predicate
@@ -571,6 +650,8 @@ impl CallAbiConfig {
             use_riscv_float_struct_classification: false,
             allow_struct_split_reg_stack: false,
             align_struct_pairs: false,
+            even_pairs_for_unnamed_only: false,
+            float_overflow_to_gp: false,
             sret_uses_dedicated_reg: false,
             gcc_regparm_mode: false,
             // GCC >= 4.6 honors the full natural alignment of MEMORY-class
@@ -772,12 +853,8 @@ struct CoreClassification {
     int_reg_idx: usize,
 }
 
-/// Core ABI classification algorithm shared by both caller and callee paths.
-///
-/// Walks the argument list and assigns each to a register or stack class based on
-/// the ABI configuration. The `is_variadic` flag gates the `force_gp` behavior for
-/// float args in variadic functions (needed on the caller side; the callee side
-/// encodes this in `config.variadic_floats_in_gp` directly).
+/// Microsoft x64 classification using shared positional GP/FP argument slots.
+/// Aggregates not sized 1, 2, 4 or 8 bytes are passed by reference.
 fn classify_ms_x64_args(args: &[ArgInfo<'_>]) -> CoreClassification {
     // Microsoft x64 allocates a POSITION, not independent GP/FP counters.
     // Index into the existing x86 register-name table: rcx,rdx,r8,r9.
@@ -823,9 +900,19 @@ fn classify_ms_x64_args(args: &[ArgInfo<'_>]) -> CoreClassification {
     }
 }
 
+/// Core ABI classification algorithm shared by caller and callee.
+///
+/// Walks arguments using
+/// the ABI configuration.  Arguments at index `first_unnamed` and beyond are the
+/// unnamed (`...`) arguments of a variadic call: only they take the
+/// `variadic_floats_in_gp` integer-register route and, under
+/// `even_pairs_for_unnamed_only`, the even-register pair rule.  A callee
+/// classifies its own (always named) parameters with `first_unnamed ==
+/// args.len()`.  `real_variadic` says whether the call or function is
+/// variadic at all (the i686 regparm and XMM-vector rules).
 fn classify_args_core(
     args: &[ArgInfo<'_>],
-    is_variadic: bool,
+    first_unnamed: usize,
     real_variadic: bool,
     config: &CallAbiConfig,
 ) -> CoreClassification {
@@ -838,9 +925,13 @@ fn classify_args_core(
     let mut vec_xmm_idx = 0usize;
     let slot_size = crate::common::types::target_ptr_size();
 
-    for info in args {
+    for (arg_idx, info) in args.iter().enumerate() {
+        let unnamed = arg_idx >= first_unnamed;
         let force_gp =
-            is_variadic && config.variadic_floats_in_gp && info.is_float && !info.is_long_double;
+            unnamed && config.variadic_floats_in_gp && info.is_float && !info.is_long_double;
+        // The even-register rule for 2×XLEN-aligned arguments (see
+        // `even_pairs_for_unnamed_only`).
+        let even_pairs = unnamed || !config.even_pairs_for_unnamed_only;
 
         // Clang's i386 ExtVector ABI passes each logical lane in a stack slot
         // even when the surrounding function uses regparm. Unlike ordinary
@@ -1002,7 +1093,7 @@ fn classify_args_core(
             // (f128_in_gp_pairs); overflow takes the F128Stack slot. The x86
             // F128SseReg branch below must not fire — RISC-V has no XMM.
             if info.is_f128_sse && size == 16 && config.f128_in_gp_pairs {
-                if config.align_i128_pairs && int_idx % 2 != 0 {
+                if config.align_i128_pairs && even_pairs && int_idx % 2 != 0 {
                     int_idx += 1;
                 }
                 if int_idx + 1 < config.max_int_regs {
@@ -1179,7 +1270,7 @@ fn classify_args_core(
                     // (emit_va_arg_struct rounds __gr_offs the same way), so
                     // caller and callee agree.
                     let mut align_applied = false;
-                    if config.align_struct_pairs {
+                    if config.align_struct_pairs && even_pairs {
                         let struct_align = info.struct_align.unwrap_or(slot_size);
                         if struct_align > slot_size && int_idx % 2 != 0 {
                             int_idx += 1; // skip to even register
@@ -1222,7 +1313,7 @@ fn classify_args_core(
                 result.push(CoreArgClass::LargeStructStack { size });
             }
         } else if info.is_i128 {
-            if config.align_i128_pairs && int_idx % 2 != 0 {
+            if config.align_i128_pairs && even_pairs && int_idx % 2 != 0 {
                 int_idx += 1;
             }
             if int_idx + 1 < config.max_int_regs {
@@ -1255,7 +1346,7 @@ fn classify_args_core(
                     result.push(CoreArgClass::F128Stack);
                 }
             } else if config.f128_in_gp_pairs {
-                if config.align_i128_pairs && int_idx % 2 != 0 {
+                if config.align_i128_pairs && even_pairs && int_idx % 2 != 0 {
                     int_idx += 1;
                 }
                 if int_idx + 1 < config.max_int_regs {
@@ -1273,7 +1364,7 @@ fn classify_args_core(
         } else if info.is_float && !force_gp && float_idx < config.max_float_regs {
             result.push(CoreArgClass::FloatReg { reg_idx: float_idx });
             float_idx += 1;
-        } else if info.is_float && !force_gp {
+        } else if info.is_float && !force_gp && !config.float_overflow_to_gp {
             result.push(CoreArgClass::Stack);
         } else if int_idx < config.max_int_regs {
             result.push(CoreArgClass::IntReg { reg_idx: int_idx });
@@ -1302,6 +1393,8 @@ fn classify_args_core(
 /// `struct_arg_aligns`: struct alignment (for RISC-V even-register alignment).
 /// `struct_arg_classes`: per-eightbyte SysV ABI classification (x86-64 only).
 /// `struct_arg_riscv_float_classes`: RISC-V LP64D float field classification.
+/// `variadic`: `Some(n)` for a call to a variadic prototype whose arguments
+/// from index `n` on are unnamed (`n` indexes `args`); `None` otherwise.
 pub fn classify_call_args(
     args: &[Operand],
     arg_types: &[IrType],
@@ -1310,7 +1403,7 @@ pub fn classify_call_args(
     struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
     struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
     struct_arg_is_f128_sse: &[bool],
-    is_variadic: bool,
+    variadic: Option<usize>,
     config: &CallAbiConfig,
 ) -> Vec<CallArgClass> {
     // Build ArgInfo slice from call-site arrays.
@@ -1349,7 +1442,8 @@ pub fn classify_call_args(
         })
         .collect();
 
-    let core = classify_args_core(&arg_infos, is_variadic, is_variadic, config);
+    let first_unnamed = variadic.map_or(arg_infos.len(), |n| n.min(arg_infos.len()));
+    let core = classify_args_core(&arg_infos, first_unnamed, variadic.is_some(), config);
 
     // Convert CoreArgClass -> CallArgClass (drop by-ref variants that only appear
     // when large_struct_by_ref is true, which maps to IntReg/Stack on the caller side).
@@ -1494,12 +1588,11 @@ fn classify_param_slice(
 ) -> ParamClassification {
     let arg_infos: Vec<ArgInfo<'_>> = params.iter().map(param_to_arg_info).collect();
 
-    // Pass is_variadic=true here because the callee side encodes variadic behavior
-    // directly in config.variadic_floats_in_gp (set by the caller based on is_variadic).
-    // The force_gp check is: is_variadic && config.variadic_floats_in_gp && is_float.
-    // For non-variadic functions, config.variadic_floats_in_gp is false, so force_gp
-    // is false regardless of the is_variadic flag — making this safe.
-    let mut core = classify_args_core(&arg_infos, true, is_variadic, config);
+    // Every declared parameter is named, so `first_unnamed` is past the end:
+    // a variadic function receives its named floats in FP registers and its
+    // named 2×XLEN arguments without even-register rounding, exactly as a
+    // caller classifies the named prefix of the call.
+    let mut core = classify_args_core(&arg_infos, arg_infos.len(), is_variadic, config);
 
     // AArch64 ABI: when sret uses a dedicated register (x8), the classification initially
     // assigns the sret pointer to IntReg(0), consuming one GP register slot. On the caller
@@ -1964,6 +2057,8 @@ mod tests {
             use_riscv_float_struct_classification: false,
             allow_struct_split_reg_stack: false,
             align_struct_pairs: false,
+            even_pairs_for_unnamed_only: false,
+            float_overflow_to_gp: false,
             sret_uses_dedicated_reg: false,
             gcc_regparm_mode: true,
             stack_arg_align_cap: 4,
@@ -1997,7 +2092,12 @@ mod tests {
                 })
                 .collect();
             for variadic in [false, true] {
-                let result = classify_args_core(&args, variadic, variadic, &config);
+                let result = classify_args_core(
+                    &args,
+                    if variadic { 0 } else { args.len() },
+                    variadic,
+                    &config,
+                );
                 assert_eq!(result.classes.len(), count);
                 for (slot, class) in result.classes.iter().enumerate() {
                     if slot >= 4 {
@@ -2036,7 +2136,7 @@ mod tests {
                 vector(),
                 scalar(&[]),
             ];
-            let result = classify_args_core(&args, false, false, &config);
+            let result = classify_args_core(&args, args.len(), false, &config);
             assert!(matches!(
                 result.classes[0],
                 CoreArgClass::IntReg { reg_idx: 0 }
@@ -2060,7 +2160,7 @@ mod tests {
                     Some(bytes)
                 );
             }
-            let variadic = classify_args_core(&args, true, true, &config);
+            let variadic = classify_args_core(&args, 0, true, &config);
             assert!(
                 variadic
                     .classes
@@ -2081,7 +2181,7 @@ mod tests {
         let config = sysv_x86_64();
         let no_class = [EightbyteClass::NoClass];
         let args = [scalar(&[]), scalar(&no_class), scalar(&no_class)];
-        let core = classify_args_core(&args, true, true, &config);
+        let core = classify_args_core(&args, 1, true, &config);
         let regs: Vec<usize> = core
             .classes
             .iter()
@@ -2101,7 +2201,7 @@ mod tests {
         let config = i686_regparm3();
         let no_class = [EightbyteClass::NoClass];
         let args = [scalar(&no_class), scalar(&no_class), scalar(&[])];
-        let core = classify_args_core(&args, false, false, &config);
+        let core = classify_args_core(&args, args.len(), false, &config);
         assert!(matches!(core.classes[0], CoreArgClass::Stack));
         assert!(matches!(core.classes[1], CoreArgClass::Stack));
         assert!(matches!(
@@ -2188,7 +2288,7 @@ mod tests {
             })
             .collect();
         args.push(f128());
-        let core = classify_args_core(&args, false, false, &sysv_x86_64());
+        let core = classify_args_core(&args, args.len(), false, &sysv_x86_64());
         assert!(matches!(
             core.classes[8],
             CoreArgClass::StructByValStack { size: 16 }
@@ -2196,7 +2296,7 @@ mod tests {
 
         // i686 has no XMM argument registers and scalar binary128 carries no
         // aggregate eightbyte classes, so it reaches the same flagged arm.
-        let core = classify_args_core(&[f128()], false, false, &i686_regparm3());
+        let core = classify_args_core(&[f128()], 1, false, &i686_regparm3());
         assert!(matches!(
             core.classes[0],
             CoreArgClass::StructByValStack { size: 16 }
@@ -2230,5 +2330,161 @@ mod tests {
         assert_eq!(f128_sse_const_bits(IrConst::I64(0)), Some(0));
         assert_eq!(f128_sse_const_bits(IrConst::I64(9)), None);
         assert_eq!(f128_sse_const_bits(IrConst::F64(9.0)), None);
+    }
+
+    // --- RV64 LP64D vs AAPCS64: named and unnamed arguments ---------------
+
+    fn int_arg() -> ArgInfo<'static> {
+        scalar(&[])
+    }
+
+    fn double_arg() -> ArgInfo<'static> {
+        ArgInfo {
+            is_float: true,
+            ..scalar(&[])
+        }
+    }
+
+    fn i128_arg() -> ArgInfo<'static> {
+        ArgInfo {
+            is_i128: true,
+            ..scalar(&[])
+        }
+    }
+
+    fn long_double_arg() -> ArgInfo<'static> {
+        ArgInfo {
+            is_long_double: true,
+            ..scalar(&[])
+        }
+    }
+
+    /// A 16-byte record whose (natural) alignment is `align`.
+    fn record16(align: usize) -> ArgInfo<'static> {
+        ArgInfo {
+            struct_size: Some(16),
+            struct_align: Some(align),
+            ..scalar(&[])
+        }
+    }
+
+    /// The first GP register of every argument's class (None off the GP file).
+    fn gp_bases(core: &CoreClassification) -> Vec<Option<usize>> {
+        core.classes
+            .iter()
+            .map(|class| match *class {
+                CoreArgClass::IntReg { reg_idx }
+                | CoreArgClass::StructSplitRegStack { reg_idx, .. } => Some(reg_idx),
+                CoreArgClass::I128RegPair { base_reg_idx }
+                | CoreArgClass::F128GpPair { base_reg_idx }
+                | CoreArgClass::StructByValReg { base_reg_idx, .. } => Some(base_reg_idx),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// RISC-V psABI: only a *variadic* 2×XLEN-aligned argument starts at an
+    /// even register.  Clang 23.1.4 / GCC 16.2: `h(1, __int128)`,
+    /// `h(1, long double)` and `h(1, struct T)` with `struct T` aligned(16)
+    /// take a1/a2; the same values passed through `...` take a2/a3.
+    #[test]
+    fn rv64_even_pairs_bind_only_unnamed_arguments() {
+        let config = CallAbiConfig::riscv_lp64d();
+        for pair in [i128_arg(), long_double_arg(), record16(16)] {
+            let args = [int_arg(), pair, int_arg()];
+            let named = classify_args_core(&args, args.len(), false, &config);
+            assert_eq!(gp_bases(&named), [Some(0), Some(1), Some(3)]);
+            let unnamed = classify_args_core(&args, 1, true, &config);
+            assert_eq!(gp_bases(&unnamed), [Some(0), Some(2), Some(4)]);
+        }
+        // An 8-aligned 16-byte record never rounds, named or not.
+        let args = [int_arg(), record16(8)];
+        assert_eq!(
+            gp_bases(&classify_args_core(&args, 1, true, &config)),
+            [Some(0), Some(1)]
+        );
+    }
+
+    /// The last argument register: a named 2×XLEN aggregate splits between
+    /// a7 and the stack; an unnamed 16-aligned one skips a7 (even-pair
+    /// rule) and goes to the stack whole.
+    #[test]
+    fn rv64_named_aggregate_splits_at_a7_and_unnamed_one_skips_it() {
+        let config = CallAbiConfig::riscv_lp64d();
+        let mut args: Vec<ArgInfo<'_>> = (0..7).map(|_| int_arg()).collect();
+        args.push(record16(16));
+        let named = classify_args_core(&args, args.len(), false, &config);
+        assert!(matches!(
+            named.classes[7],
+            CoreArgClass::StructSplitRegStack {
+                reg_idx: 7,
+                size: 16
+            }
+        ));
+        let unnamed = classify_args_core(&args, 7, true, &config);
+        assert!(matches!(
+            unnamed.classes[7],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+        assert_eq!(unnamed.int_reg_idx, 8);
+    }
+
+    /// RISC-V: a variadic function's *named* floats use FP registers; only
+    /// the unnamed ones use the integer convention.  Clang 23.1.4:
+    /// `vf(double, ...)` called as `vf(1.5, 2.5)` passes fa0 + a0, and
+    /// `vi(int, long double, ...)` as `vi(1, 2.0L, 3)` passes a0; a1/a2; a3.
+    #[test]
+    fn rv64_variadic_named_floats_use_fp_registers() {
+        let config = CallAbiConfig::riscv_lp64d();
+        let vf = classify_args_core(&[double_arg(), double_arg()], 1, true, &config);
+        assert!(matches!(
+            vf.classes[0],
+            CoreArgClass::FloatReg { reg_idx: 0 }
+        ));
+        assert!(matches!(vf.classes[1], CoreArgClass::IntReg { reg_idx: 0 }));
+        let vi = classify_args_core(&[int_arg(), long_double_arg(), int_arg()], 2, true, &config);
+        assert_eq!(gp_bases(&vi), [Some(0), Some(1), Some(3)]);
+    }
+
+    /// RISC-V hardware-FP convention: a named double past fa7 continues in
+    /// the integer convention (Clang 23.1.4: the ninth double of
+    /// `f(double x9, long)` in a0, the long in a1), then on the stack.
+    /// AAPCS64 puts it on the stack and leaves x0 to the long.
+    #[test]
+    fn named_float_overflow_continues_in_gp_registers_on_rv64_only() {
+        let mut args: Vec<ArgInfo<'_>> = (0..9).map(|_| double_arg()).collect();
+        args.push(int_arg());
+        let rv = classify_args_core(&args, args.len(), false, &CallAbiConfig::riscv_lp64d());
+        assert!(matches!(rv.classes[8], CoreArgClass::IntReg { reg_idx: 0 }));
+        assert!(matches!(rv.classes[9], CoreArgClass::IntReg { reg_idx: 1 }));
+        let arm = classify_args_core(&args, args.len(), false, &CallAbiConfig::aapcs64());
+        assert!(matches!(arm.classes[8], CoreArgClass::Stack));
+        assert!(matches!(
+            arm.classes[9],
+            CoreArgClass::IntReg { reg_idx: 0 }
+        ));
+
+        // With every GP register taken as well, the double goes to the stack.
+        let mut full: Vec<ArgInfo<'_>> = (0..8).map(|_| int_arg()).collect();
+        full.extend((0..9).map(|_| double_arg()));
+        let rv = classify_args_core(&full, full.len(), false, &CallAbiConfig::riscv_lp64d());
+        assert!(matches!(rv.classes[16], CoreArgClass::Stack));
+    }
+
+    /// AAPCS64 C.8 rounds the NGRN for every argument of natural alignment
+    /// 16 -- named and unnamed alike -- and for no other.
+    #[test]
+    fn aapcs64_rounds_every_naturally_16_aligned_pair() {
+        let config = CallAbiConfig::aapcs64();
+        for pair in [i128_arg(), record16(16)] {
+            let args = [int_arg(), pair, int_arg()];
+            for first_unnamed in [args.len(), 1] {
+                let core = classify_args_core(&args, first_unnamed, first_unnamed == 1, &config);
+                assert_eq!(gp_bases(&core), [Some(0), Some(2), Some(4)]);
+            }
+        }
+        let args = [int_arg(), record16(8), int_arg()];
+        let core = classify_args_core(&args, args.len(), false, &config);
+        assert_eq!(gp_bases(&core), [Some(0), Some(1), Some(3)]);
     }
 }

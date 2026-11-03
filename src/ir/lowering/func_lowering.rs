@@ -356,7 +356,7 @@ impl Lowerer {
                                 }
                             };
                             let rv_class = layout.classify_riscv_float_fields(ctx);
-                            (Some(layout.align), classes, rv_class)
+                            (Some(self.record_arg_align(&layout)), classes, rv_class)
                         } else if let Some((classes, _)) = sysv_abi.clone() {
                             // A vector: no record layout.
                             (Some(self.ctype_align(&param_ctype)), classes, None)
@@ -1392,6 +1392,9 @@ impl Lowerer {
                 max_char_array_bytes: self.func().ssp_max_char_array_bytes,
                 stack_guard_alloca: None,
             },
+            decl_span: func
+                .name_span
+                .unwrap_or_else(crate::common::source::Span::dummy),
             body_span: func.body_span,
             terminator_spans: std::mem::take(&mut self.func_mut().term_spans),
         };

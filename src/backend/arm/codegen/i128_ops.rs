@@ -10,6 +10,22 @@ impl ArmCodegen {
         self.operand_to_x0_x1(op);
     }
 
+    /// `emit_switch_wide`'s guard: branch to `label` unless the high half
+    /// of the pair (x1, after `emit_load_acc_pair`) is `required_high`
+    /// (0 or -1).  Leaves x0, the low half, intact; the unconditional `b`
+    /// keeps the full branch range, as `emit_switch_case_branch` does.
+    pub(super) fn switch_branch_unless_high(&mut self, required_high: i64, label: &str) {
+        let ok = self.state.fresh_label("hi_ok");
+        if required_high == 0 {
+            self.state.emit_fmt(format_args!("    cbz x1, {ok}"));
+        } else {
+            self.state.emit("    cmn x1, #1");
+            self.state.emit_fmt(format_args!("    b.eq {ok}"));
+        }
+        self.state.emit_fmt(format_args!("    b {label}"));
+        self.state.emit_fmt(format_args!("{ok}:"));
+    }
+
     pub(super) fn emit_store_acc_pair_impl(&mut self, dest: &Value) {
         self.store_x0_x1_to(dest);
     }

@@ -9422,7 +9422,8 @@ fn x86_64_sysv_call_classes(
             .get(skip..)
             .unwrap_or(&[]),
         info.struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
-        info.is_variadic,
+        info.is_variadic
+            .then(|| info.num_fixed_args.saturating_sub(skip)),
         &CallAbiConfig::x86_64(info.calling_convention),
     );
     if classes.len() + skip != info.args.len()

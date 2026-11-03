@@ -1259,7 +1259,7 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
             struct_arg_classes.get(skip..).unwrap_or(&[]),
             struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
             struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
-            is_variadic,
+            is_variadic.then(|| num_fixed_args.saturating_sub(skip)),
             &config,
         );
         if skip == 1 {
@@ -2878,7 +2878,77 @@ pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
     ///   4. Indirect branch to addr
     ///
     /// For sparse cases, falls back to a linear chain of compare-and-branch.
+    ///
+    /// A 64-bit target that supports `__int128` must override this and send
+    /// 128-bit selectors to [`ArchCodegen::emit_switch_wide`]: the dispatch
+    /// below compares only the accumulator, i.e. the low half.
     fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        self.emit_switch_by_density(val, cases, default, ty);
+    }
+
+    /// Dispatch on a 128-bit selector (`ty` I128/U128) whose case values are
+    /// i64s, i.e. 128-bit values that are the sign extension of their low
+    /// half (the frontend lowers any other case to full-width compares).  A
+    /// case can match only when the selector's high half is 0 (case >= 0) or
+    /// -1 (case < 0), so each sign class is guarded by one compare of the
+    /// high half and then dispatched on the low half -- jump table or chain,
+    /// by the usual density rule.  `branch_unless_high(self, h, label)` must
+    /// branch to `label` unless the high half of the pair loaded by
+    /// `emit_load_acc_pair` equals `h`, leaving the whole pair intact on
+    /// both edges: the negative class tests the same pair again without
+    /// reloading it.
+    ///
+    /// Without the guard, `(__int128)1 << 64` matched `case 0:`
+    /// (gcc.c-torture execute/pr122943.c on AArch64 and RISC-V).
+    fn emit_switch_wide(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        branch_unless_high: fn(&mut Self, i64, &str),
+    ) where
+        Self: Sized,
+    {
+        let default_label = default.as_label();
+        let has_neg = cases.iter().any(|&(v, _)| v < 0);
+        let has_nonneg = cases.iter().any(|&(v, _)| v >= 0);
+        if has_neg && has_nonneg {
+            let (nonneg, neg): (Vec<(i64, BlockId)>, Vec<(i64, BlockId)>) =
+                cases.iter().partition(|&&(v, _)| v >= 0);
+            let neg_label = self.state().fresh_label("switch128_neg");
+            self.emit_load_acc_pair(val);
+            branch_unless_high(self, 0, &neg_label);
+            // The negative class's code follows, not the next block: the
+            // non-negative dispatch must end in a real jump to `default`
+            // even when `default` is the block laid out next (x86 used to
+            // fall into the negative chain there, so a selector with high
+            // half 0 and low half -1 matched `case -1:`).
+            let next_block = self.state().next_block_label.take();
+            self.emit_switch_by_density(val, &nonneg, default, IrType::I64);
+            self.state().next_block_label = next_block;
+            // Only the guard above branches here, and it left the pair in
+            // place; the cached register contents describe the end of the
+            // non-negative dispatch instead, so forget them.
+            self.state().emit_fmt(format_args!("{}:", neg_label));
+            self.state().reg_cache.invalidate_all();
+            branch_unless_high(self, -1, &default_label);
+            self.emit_switch_by_density(val, &neg, default, IrType::I64);
+        } else {
+            self.emit_load_acc_pair(val);
+            branch_unless_high(self, if has_neg { -1 } else { 0 }, &default_label);
+            self.emit_switch_by_density(val, cases, default, IrType::I64);
+        }
+    }
+
+    /// The density-based dispatch of a selector that fits the accumulator:
+    /// a jump table (with PGO hot-case hoisting) or a compare chain.
+    fn emit_switch_by_density(
         &mut self,
         val: &Operand,
         cases: &[(i64, BlockId)],

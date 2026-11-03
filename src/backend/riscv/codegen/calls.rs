@@ -8,27 +8,7 @@ use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl RiscvCodegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
-        CallAbiConfig {
-            microsoft_x64: false,
-            max_int_regs: 8,
-            max_float_regs: 8,
-            align_i128_pairs: true,
-            f128_in_fp_regs: false,
-            f128_in_gp_pairs: true,
-            variadic_floats_in_gp: true,
-            large_struct_by_ref: true,
-            use_sysv_struct_classification: false,
-            use_riscv_float_struct_classification: true,
-            allow_struct_split_reg_stack: true,
-            align_struct_pairs: true,
-            sret_uses_dedicated_reg: false,
-            gcc_regparm_mode: false,
-            // RISC-V psABI caps stack-argument alignment at 2*XLEN (16);
-            // the va_arg / prologue readers cap identically.
-            stack_arg_align_cap: 16,
-            vector_xmm_regs: 0,
-            i386_ext_vector_lanes: false,
-        }
+        CallAbiConfig::riscv_lp64d()
     }
 
     pub(super) fn emit_call_compute_stack_space_impl(

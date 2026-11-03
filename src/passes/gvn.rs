@@ -2577,6 +2577,7 @@ mod tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };
@@ -2675,6 +2676,7 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };
@@ -2761,6 +2763,7 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };
@@ -2853,6 +2856,7 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };
@@ -2949,6 +2953,7 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };
@@ -3058,6 +3063,7 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };
@@ -3140,6 +3146,7 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         }
@@ -3997,6 +4004,7 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         };
@@ -4079,6 +4087,7 @@ mod tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            decl_span: crate::common::source::Span::dummy(),
             body_span: crate::common::source::Span::dummy(),
             terminator_spans: Default::default(),
         }

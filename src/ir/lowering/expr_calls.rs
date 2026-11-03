@@ -73,6 +73,21 @@ impl Lowerer {
         if let Some(sig) = self.fptr_variable_sig(name) {
             return sig.is_variadic;
         }
+        self.callee_type_is_variadic(callee)
+    }
+
+    /// Whether the prototype a callee expression's type designates declares
+    /// `...` -- the answer for every callee that is not a plain identifier:
+    /// a member (`ops->log`), an element (`tbl[i]`), a dereference, a cast,
+    /// a call result.
+    fn callee_type_is_variadic(&self, callee: &Expr) -> bool {
+        if let Expr::Deref(inner, _) = callee {
+            if let Expr::Identifier(name, _) = inner.as_ref() {
+                if self.fptr_variable_is_variadic(name, inner) {
+                    return true;
+                }
+            }
+        }
         self.get_expr_ctype(callee)
             .and_then(|ct| ct.get_function_type().map(|ft| ft.variadic))
             .unwrap_or(false)
@@ -290,7 +305,13 @@ impl Lowerer {
                 self.is_function_variadic(name)
             }
         } else {
-            false
+            // `ops->log(fmt, x)`, `tbl[i](n, x)`, `(*fpp)(...)`: the callee's
+            // type decides as well.  Answering `false` here left %al unset
+            // on x86-64 -- a variadic callee then skips its XMM save area
+            // and `va_arg` reads stale vector registers (measured:
+            // `tbl[0](2, 4.0, 0.25)` summed to 4 at -O0) -- and sent RISC-V
+            // variadic floats to FP registers no `va_arg` reads.
+            self.callee_type_is_variadic(stripped_func)
         };
 
         // Decompose complex double/float arguments into (real, imag) pairs for ABI compliance
@@ -435,65 +456,57 @@ impl Lowerer {
             struct_arg_is_f128_sse.insert(0, false);
         }
 
-        // Determine number of fixed args for variadic calls
-        let (call_variadic, num_fixed_args) = if let Expr::Identifier(name, _) = stripped_func {
-            let variadic = call_is_variadic;
-            let n_fixed = if variadic {
-                let variadic_sig = if self.is_func_ptr_variable(name) {
+        // Determine number of fixed args for variadic calls.  The hidden sret
+        // pointer is argument 0 and counts as named: `num_fixed_args` indexes
+        // `args`.  When nothing describes the named part -- a library
+        // function recognised only by name, a `f(...)` prototype with no
+        // named parameter -- every argument is unnamed: the classification
+        // the callee's `va_arg` reads (RISC-V floats in GP registers, AArch64
+        // and RISC-V pairs even-aligned).
+        let call_variadic = call_is_variadic;
+        let num_fixed_args = if call_variadic {
+            let variadic_sig = match stripped_func {
+                Expr::Identifier(name, _) if self.is_func_ptr_variable(name) => {
                     self.fptr_variable_sig(name)
-                } else {
-                    self.func_meta.sigs.get(name.as_str())
-                };
-                if let Some(sig) = variadic_sig {
-                    let fixed_param_ctypes = if !sig.param_ctypes.is_empty() {
-                        Some(&sig.param_ctypes)
-                    } else {
-                        param_ctypes_for_decompose.as_ref()
-                    };
-                    // The hidden sret pointer is argument 0 and counts as
-                    // named: `num_fixed_args` indexes `args`.
-                    let sret_slots = usize::from(sret_alloca.is_some());
-                    if let Some(param_ctypes) = fixed_param_ctypes {
-                        let decomposes_cld = self.decomposes_complex_long_double();
-                        let decomposes_cd = self.decomposes_complex_double();
-                        let decomposes_cf = self.decomposes_complex_float();
-                        param_ctypes
-                            .iter()
-                            .map(|ct| {
-                                match ct {
-                                    CType::ComplexDouble if decomposes_cd => 2,
-                                    // Fixed ComplexFloat params are decomposed into 2 FP regs
-                                    // on 64-bit targets (not x86-64 packed, not i686 struct)
-                                    CType::ComplexFloat
-                                        if decomposes_cf && !self.uses_packed_complex_float() =>
-                                    {
-                                        2
-                                    }
-                                    CType::ComplexLongDouble if decomposes_cld => 2,
-                                    CType::ExtVector(..)
-                                        if crate::common::types::target_is_32bit() =>
-                                    {
-                                        ct.i386_ext_vector_ir_args()
-                                    }
-                                    _ => 1,
-                                }
-                            })
-                            .sum::<usize>()
-                            + sret_slots
-                    } else if !sig.param_types.is_empty() {
-                        sig.param_types.len() + sret_slots
-                    } else {
-                        arg_vals.len()
-                    }
-                } else {
-                    arg_vals.len()
                 }
-            } else {
-                arg_vals.len()
+                Expr::Identifier(name, _) => self.func_meta.sigs.get(name.as_str()),
+                _ => None,
             };
-            (variadic, n_fixed)
+            let sret_slots = usize::from(sret_alloca.is_some());
+            let fixed_param_ctypes = variadic_sig
+                .map(|sig| &sig.param_ctypes)
+                .filter(|ctypes| !ctypes.is_empty())
+                .or(param_ctypes_for_decompose.as_ref());
+            if let Some(param_ctypes) = fixed_param_ctypes {
+                let decomposes_cld = self.decomposes_complex_long_double();
+                let decomposes_cd = self.decomposes_complex_double();
+                let decomposes_cf = self.decomposes_complex_float();
+                param_ctypes
+                    .iter()
+                    .map(|ct| {
+                        match ct {
+                            CType::ComplexDouble if decomposes_cd => 2,
+                            // Fixed ComplexFloat params are decomposed into 2 FP regs
+                            // on 64-bit targets (not x86-64 packed, not i686 struct)
+                            CType::ComplexFloat
+                                if decomposes_cf && !self.uses_packed_complex_float() =>
+                            {
+                                2
+                            }
+                            CType::ComplexLongDouble if decomposes_cld => 2,
+                            CType::ExtVector(..) if crate::common::types::target_is_32bit() => {
+                                ct.i386_ext_vector_ir_args()
+                            }
+                            _ => 1,
+                        }
+                    })
+                    .sum::<usize>()
+                    + sret_slots
+            } else {
+                variadic_sig.map_or(0, |sig| sig.param_types.len()) + sret_slots
+            }
         } else {
-            (false, arg_vals.len())
+            arg_vals.len()
         };
 
         // Dispatch: direct call, function pointer call, or indirect call
@@ -1839,9 +1852,9 @@ impl Lowerer {
                 .collect()
         };
 
-        // Build struct_arg_aligns: for each struct arg, record its alignment.
-        // This is used by RISC-V to even-align register pairs for 2×XLEN-aligned structs
-        // (e.g., struct containing long double with 16-byte alignment).
+        // Build struct_arg_aligns: for each struct arg, the alignment that
+        // places it -- even register pairs for 2×XLEN-aligned records on
+        // AArch64 and (variadic) RISC-V, stack slot padding everywhere.
         let struct_arg_aligns: Vec<Option<usize>> = arg_abi_ctypes
             .iter()
             .enumerate()
@@ -1850,7 +1863,7 @@ impl Lowerer {
                 match ctype {
                     Some(ct @ CType::Struct(_)) | Some(ct @ CType::Union(_)) => self
                         .get_struct_layout_for_ctype(ct)
-                        .map(|layout| layout.align),
+                        .map(|layout| self.record_arg_align(&layout)),
                     // Vectors carry their natural alignment (size for ext
                     // vectors: 32 for 32-byte, 64 for 64-byte). The x86-64
                     // backend uses this both for the per-argument padding in
@@ -1879,7 +1892,7 @@ impl Lowerer {
             .collect();
 
         let (struct_arg_classes, struct_arg_riscv_float_classes) =
-            self.call_arg_abi_classes(func_name, args, &struct_arg_sizes);
+            self.call_arg_abi_classes(func, func_name, args, &struct_arg_sizes);
 
         (
             arg_vals,
@@ -1898,6 +1911,7 @@ impl Lowerer {
     /// the caller built for the same `args`.
     fn call_arg_abi_classes(
         &self,
+        func: &Expr,
         func_name: Option<&str>,
         args: &[Expr],
         struct_arg_sizes: &[Option<usize>],
@@ -1939,23 +1953,49 @@ impl Lowerer {
             })
             .collect();
 
-        // Build struct_arg_riscv_float_classes: propagate RISC-V float classification from FuncSig.
-        // Variadic args beyond fixed params get None — on RISC-V LP64D, variadic
-        // struct args are passed in GP registers, not FP registers.
+        // Build struct_arg_riscv_float_classes: the RISC-V LP64D float
+        // classification of each *named* by-value aggregate.  Unnamed
+        // (variadic) arguments get None -- they use the integer convention.
+        // The named prefix comes from the callee's signature (a function, or
+        // a local or global function-pointer variable), else from the callee
+        // expression's function type; an unprototyped callee takes every
+        // argument as named (GCC/Clang).  A class the signature did not
+        // record -- function-pointer signatures carry none, and member,
+        // element or cast callees have no signature at all -- is derived from
+        // the argument's own layout: leaving a named `struct { double x, y; }`
+        // in GP registers there disagreed with every callee, LCCC's own
+        // included (fa0/fa1).
+        let sig = func_name.and_then(|n| self.fptr_variable_sig(n));
+        let named = match sig {
+            Some(sig) if sig.is_variadic => sig.param_types.len(),
+            Some(_) => args.len(),
+            None => match self
+                .get_expr_ctype(func)
+                .as_ref()
+                .and_then(CType::get_function_type)
+            {
+                Some(ft) if ft.variadic => ft.params.len(),
+                Some(_) => args.len(),
+                None => 0,
+            },
+        };
         let struct_arg_riscv_float_classes: Vec<Option<crate::common::types::RiscvFloatClass>> =
-            if let Some(ref classes) = func_name.and_then(|n| {
-                self.func_meta
-                    .sigs
-                    .get(n)
-                    .map(|s| s.param_riscv_float_classes.clone())
-            }) {
-                args.iter()
-                    .enumerate()
-                    .map(|(i, _a)| if i < classes.len() { classes[i] } else { None })
-                    .collect()
-            } else {
-                args.iter().map(|_a| None).collect()
-            };
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if i >= named || struct_arg_sizes.get(i).copied().flatten().is_none() {
+                        return None;
+                    }
+                    if let Some(registered) = sig.and_then(|s| s.param_riscv_float_classes.get(i)) {
+                        return *registered;
+                    }
+                    self.get_expr_ctype(a)
+                        .and_then(|ct| self.get_struct_layout_for_ctype(&ct))
+                        .and_then(|layout| {
+                            layout.classify_riscv_float_fields(&*self.types.borrow_struct_layouts())
+                        })
+                })
+                .collect();
 
         (struct_arg_classes, struct_arg_riscv_float_classes)
     }
@@ -2143,16 +2183,11 @@ impl Lowerer {
                 // cases where c_type is None but a declared fptr_sig or known_functions provide info.
                 let is_noop_deref = self.is_function_pointer_deref(inner);
                 // A call through a dereferenced function pointer still follows
-                // the pointed-to type's signature: if that type declares `...`,
-                // the call IS variadic (floats belong in GP regs on rv64, AL=1
-                // on x86-64, GP-only on aarch64).  The hard-coded `false` sent
-                // the 5.0 of `(*fp)(buf, "%.0f", 5.0)` to fa0 instead of a2 and
-                // aborted glibc's vsprintf on rv64 (gcc.c-torture 930513-1).
-                let deref_variadic = match &**inner {
-                    Expr::Identifier(name, _) => self.fptr_variable_is_variadic(name, inner),
-                    _ => false,
-                };
-                let n = arg_vals.len();
+                // the pointed-to type's signature: `is_variadic` and
+                // `num_fixed_args` come from it (`callee_type_is_variadic`).
+                // A hard-coded `false` sent the 5.0 of `(*fp)(buf, "%.0f",
+                // 5.0)` to fa0 instead of a2 and aborted glibc's vsprintf on
+                // rv64 (gcc.c-torture 930513-1).
                 let sas = struct_arg_sizes;
                 let saa = struct_arg_aligns;
                 let sac = struct_arg_classes;
@@ -2171,8 +2206,8 @@ impl Lowerer {
                         args: arg_vals,
                         arg_types,
                         return_type: indirect_ret_ty,
-                        is_variadic: deref_variadic,
-                        num_fixed_args: n,
+                        is_variadic,
+                        num_fixed_args,
                         struct_arg_sizes: sas,
                         struct_arg_aligns: saa,
                         struct_arg_classes: sac,

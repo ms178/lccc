@@ -100,6 +100,7 @@ use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand,
     Terminator, Value,
 };
+use crate::passes::cfg_simplify::constant_switch_target;
 use crate::passes::constant_fold;
 use crate::passes::use_def::UseDefInfo;
 
@@ -815,23 +816,17 @@ fn evaluate_terminator(term: &Terminator, block_idx: u32, state: &mut SccpState)
             val,
             cases,
             default,
-            ..
+            ty,
         } => match resolve(val, state) {
             LatticeVal::Top => {}
             LatticeVal::Constant(c) => {
-                let target = match c.to_i64() {
-                    Some(v) => cases
-                        .iter()
-                        .find(|(case, _)| *case == v)
-                        .map_or(default, |(_, label)| label),
+                let Some(target) = constant_switch_target(&c, *ty, cases, *default) else {
                     // Non-integer switch value: malformed IR. Stay conservative
                     // rather than guessing the default arm.
-                    None => {
-                        mark_all_switch_targets(cases, default, block_idx, state);
-                        return;
-                    }
+                    mark_all_switch_targets(cases, default, block_idx, state);
+                    return;
                 };
-                if let Some(&to) = state.label_to_idx.get(target) {
+                if let Some(&to) = state.label_to_idx.get(&target) {
                     mark_edge_executable(block_idx, to, state);
                 }
             }
@@ -1296,14 +1291,12 @@ fn fold_terminator(term: &Terminator, state: &SccpState) -> Option<Terminator> {
             val,
             cases,
             default,
-            ..
+            ty,
         } => {
-            let v = const_of_operand(val, state)?.to_i64()?;
-            let target = cases
-                .iter()
-                .find(|(case, _)| *case == v)
-                .map_or(*default, |(_, label)| *label);
-            Some(Terminator::Branch(target))
+            let c = const_of_operand(val, state)?;
+            Some(Terminator::Branch(constant_switch_target(
+                &c, *ty, cases, *default,
+            )?))
         }
         _ => None,
     }

@@ -1254,6 +1254,15 @@ pub struct StructLayout {
     /// field's `DECL_USER_ALIGN` with the type's (measured: `struct { v32 v
     /// __attribute__((aligned(8))); }` → `_Alignof` 16).
     pub user_align: bool,
+    /// The alignment of the most-aligned member as laid out (after packing
+    /// and member `aligned`/`_Alignas` requests, a member record counting
+    /// with its own full alignment), i.e. the record's alignment before a
+    /// record-level `aligned(N)` raises it.  This is the AAPCS64 *natural
+    /// alignment* of a composite (GCC `aarch64_function_arg_alignment`,
+    /// Clang alike): `struct __attribute__((aligned(16))) { long long a, b; }`
+    /// has `align` 16 but `member_align` 8, so it takes no even-register
+    /// skip, while a record containing that struct has 16 for both.
+    pub member_align: usize,
 }
 
 /// Builder for struct layout computation with bitfield state tracking.
@@ -1550,6 +1559,7 @@ impl StructLayoutBuilder {
             requires_designators: false,
             reverse_sso: self.reverse_sso,
             user_align: self.user_align,
+            member_align: self.max_align,
         }
     }
 }
@@ -1589,6 +1599,7 @@ impl StructLayout {
             requires_designators: false,
             reverse_sso: false,
             user_align: false,
+            member_align: 1,
         }
     }
 
@@ -1604,6 +1615,7 @@ impl StructLayout {
             requires_designators: false,
             reverse_sso: false,
             user_align: false,
+            member_align: 1,
         }
     }
 
@@ -1880,6 +1892,7 @@ impl StructLayout {
             requires_designators: false,
             reverse_sso,
             user_align,
+            member_align: max_align,
         }
     }
 
@@ -5369,6 +5382,67 @@ mod conditional_type_tests {
         let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
         assert_eq!(l2.align, 2);
         assert_eq!(l2.size, 2);
+    }
+
+    /// AAPCS64 places a composite by its *natural* alignment, the maximum of
+    /// its members' (GCC `aarch64_function_arg_alignment`, Clang's unadjusted
+    /// alignment): a record-level `aligned(N)` raises the object's alignment
+    /// but not that one.  `member_align` keeps it across
+    /// `apply_struct_aligned`.
+    #[test]
+    fn member_align_is_the_natural_alignment_without_record_attributes() {
+        let ctx: super::FxHashMap<String, super::RcLayout> = Default::default();
+        let field = |name: &str, ty: CType, alignment: Option<usize>| super::StructField {
+            own_cvr: None,
+            name: name.into(),
+            ty,
+            bit_width: None,
+            alignment,
+            type_align: None,
+            is_packed: false,
+            base_volatile: false,
+            base_const: false,
+            object_volatile: false,
+            object_const: false,
+            counted_by: None,
+            pointer_quals: Vec::new(),
+        };
+        let pair = [
+            field("a", CType::LongLong, None),
+            field("b", CType::LongLong, None),
+        ];
+
+        // struct __attribute__((aligned(16))) T { long long a, b; }
+        let mut t = super::StructLayout::for_struct_with_packing(&pair, None, &ctx, false);
+        t.apply_struct_aligned(Some(16));
+        assert_eq!((t.size, t.align, t.member_align), (16, 16, 8));
+
+        // struct { long long a; _Alignas(16) long long b; }: a member-level
+        // request is part of the natural alignment.
+        let member = [
+            field("a", CType::LongLong, None),
+            field("b", CType::LongLong, Some(16)),
+        ];
+        let m = super::StructLayout::for_struct_with_packing(&member, None, &ctx, false);
+        assert_eq!((m.size, m.align, m.member_align), (32, 16, 16));
+
+        // struct __attribute__((packed, aligned(4))) { char c; long long x; }
+        let packed = [
+            field("c", CType::Char, None),
+            field("x", CType::LongLong, None),
+        ];
+        let mut p = super::StructLayout::for_struct_with_packing(&packed, Some(1), &ctx, false);
+        p.apply_struct_aligned(Some(4));
+        assert_eq!((p.size, p.align, p.member_align), (12, 4, 1));
+
+        // union __attribute__((aligned(16))) { long long a; double d; }
+        let members = [
+            field("a", CType::LongLong, None),
+            field("d", CType::Double, None),
+        ];
+        let mut u = super::StructLayout::for_union_with_packing(&members, None, &ctx, false);
+        u.apply_struct_aligned(Some(16));
+        assert_eq!((u.size, u.align, u.member_align), (16, 16, 8));
     }
 }
 

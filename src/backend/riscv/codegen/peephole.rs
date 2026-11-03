@@ -911,46 +911,59 @@ fn rewrite_far_jumps_to_near(lines: &mut [String], kinds: &mut [LineKind], n: us
 /// an opaque line: `.space`, `.rept`, inline `.insn` and large alignments can
 /// contribute an unbounded number of bytes that a line census cannot estimate.
 /// A target that is not defined in this text has no census at all.
-fn interval_is_near(
-    lines: &[String],
-    kinds: &[LineKind],
-    n: usize,
-    from: usize,
-    target: &str,
-) -> bool {
-    let mut target_pos = None;
-    for (m, kind) in kinds.iter().enumerate().take(n) {
-        if *kind == LineKind::Label && label_name(&lines[m]) == Some(target) {
-            target_pos = Some(m);
-            break;
+/// The first definition of every label, by name: built once per pass so
+/// that resolving a branch target is a lookup, not a scan of the unit (the
+/// scan made `fuse_branch_over_jump` quadratic -- 52 s of the 87 s that
+/// gcc.c-torture execute/memclr.c's 2,816 functions took at -O0).
+fn label_positions(lines: &[String], kinds: &[LineKind], n: usize) -> FxHashMap<String, usize> {
+    let mut positions = FxHashMap::default();
+    for m in 0..n {
+        if kinds[m] == LineKind::Label {
+            if let Some(name) = label_name(&lines[m]) {
+                positions.entry(name.to_string()).or_insert(m);
+            }
         }
     }
-    let Some(to) = target_pos else {
-        return false;
-    };
+    positions
+}
+
+/// Whether a branch at `from` can reach the label at `to` in its +/-4 KiB:
+/// no function boundary, directive or opaque line in between, and at most
+/// 3,000 bytes of instructions counted at 32 bytes each (the far pseudo-ops
+/// expand).  The scan stops at the first reason to refuse, so its cost is
+/// bounded by the budget, not by the distance.
+fn interval_is_near(lines: &[String], kinds: &[LineKind], from: usize, to: usize) -> bool {
     let (a, b) = if from < to { (from, to) } else { (to, from) };
-    if (a + 1..b).any(|m| {
-        (kinds[m] == LineKind::Label && !label_name(&lines[m]).unwrap_or("").starts_with('.'))
-            || kinds[m] == LineKind::Directive
-            || lines[m] == OPAQUE_LINE
-    }) {
-        return false;
+    let mut insns = 0usize;
+    for m in a..=b {
+        let interior = m > a && m < b;
+        if interior
+            && ((kinds[m] == LineKind::Label
+                && !label_name(&lines[m]).unwrap_or("").starts_with('.'))
+                || kinds[m] == LineKind::Directive
+                || lines[m] == OPAQUE_LINE)
+        {
+            return false;
+        }
+        if !matches!(
+            kinds[m],
+            LineKind::Nop | LineKind::Label | LineKind::Directive
+        ) {
+            insns += 1;
+            if insns.saturating_mul(32) > 3_000 {
+                return false;
+            }
+        }
     }
-    let insns = (a..=b)
-        .filter(|&m| {
-            !matches!(
-                kinds[m],
-                LineKind::Nop | LineKind::Label | LineKind::Directive
-            )
-        })
-        .count();
-    insns.saturating_mul(32) <= 3_000
+    true
 }
 
 fn fuse_branch_over_jump(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     if std::env::var("CCC_NO_BRANCH_OVER_JUMP").is_ok() {
         return false;
     }
+    // Labels are never rewritten here, so one map serves the whole sweep.
+    let labels = label_positions(lines, kinds, n);
     let mut changed = false;
     for i in 0..n {
         if kinds[i] != LineKind::Branch {
@@ -981,10 +994,18 @@ fn fuse_branch_over_jump(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         };
         // Only local labels in this function are candidates.  The census also
         // refuses intervals that cross a global symbol (a function boundary).
-        if !target.starts_with(".L") || !interval_is_near(lines, kinds, n, i, target) {
+        if !target.starts_with(".L") {
             continue;
         }
-        let inv = invert_branch_mnemonic(op).unwrap();
+        let Some(&to) = labels.get(target) else {
+            continue;
+        };
+        if !interval_is_near(lines, kinds, i, to) {
+            continue;
+        }
+        let Some(inv) = invert_branch_mnemonic(op) else {
+            continue;
+        };
         lines[i] = format!("    {} {}, {}", inv, operands, target);
         kinds[i] = LineKind::Branch;
         kinds[j] = LineKind::Nop;
@@ -1091,6 +1112,7 @@ fn thread_trampolines(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                 resolved.insert(name, final_target);
             }
         }
+        let positions = label_positions(lines, kinds, n);
         let mut rewrites = Vec::new();
         for i in 0..n {
             if kinds[i] != LineKind::Jump {
@@ -1106,7 +1128,12 @@ fn thread_trampolines(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
             // must be proven to reach the new target by the same census that
             // gates the branch-over-jump fusion.
             let is_far_pseudo = lines[i].trim().starts_with("jump ");
-            if !is_far_pseudo && !interval_is_near(lines, kinds, n, i, final_target) {
+            let near = || {
+                positions
+                    .get(final_target)
+                    .is_some_and(|&to| interval_is_near(lines, kinds, i, to))
+            };
+            if !is_far_pseudo && !near() {
                 continue;
             }
             if let Some(rewritten) = retarget_jump_line(&lines[i], final_target) {
@@ -2072,12 +2099,32 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
     // block placement on every run (RS-1: five serial compilations, five
     // distinct SHA-256s), which breaks reproducible builds, cached objects and
     // every `diff`-based gate. `FxHashMap` is the tree's deterministic map.
-    let mut groups: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    // Blocks merge only within their function.  A branch into another
+    // function's copy would run under that function's CFI (wrong unwind
+    // tables for every backtrace through it) and could leave the +/-4 KiB
+    // range of a near branch; and grouping the whole unit made the pairwise
+    // search below quadratic in a large file (memclr.c's 2,816 functions
+    // all end in the same blocks).
+    let mut function_of = vec![0usize; nb];
+    let mut function = 0usize;
+    for b in 0..nb {
+        let first = (starts[b]..end(b)).find(|&k| kinds[k] != LineKind::Nop);
+        if let Some(k) = first {
+            if kinds[k] == LineKind::Label && !lines[k].trim_start().starts_with('.') {
+                function += 1;
+            }
+        }
+        function_of[b] = function;
+    }
+    let mut groups: FxHashMap<(usize, &str), Vec<usize>> = FxHashMap::default();
     for b in 0..nb {
         if unusable[b] || body[b].trim().is_empty() {
             continue;
         }
-        groups.entry(body[b].as_str()).or_default().push(b);
+        groups
+            .entry((function_of[b], body[b].as_str()))
+            .or_default()
+            .push(b);
     }
     for members in groups.values() {
         if members.len() < 2 {
@@ -2713,25 +2760,34 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
                 let size = if is_word { 4 } else { 8 };
                 loaded_ranges.push((offset, size));
             }
+            LineKind::Nop => {}
             _ => {
-                // Check for loads in Other/Alu instructions that reference s0 offsets
+                // Every other line that names a frame slot.  The census must
+                // be complete: a store whose only reader it misses is deleted.
+                // The FP loads were missing, so `sd t0, -72(s0); flw fa1,
+                // -72(s0)` -- a `__complex__ float` result staged through an
+                // integer register -- lost its store at -O2 (gcc.c-torture
+                // execute/pr38969.c).
                 let trimmed = lines[i].trim();
-                let load_size = if trimmed.starts_with("ld ") {
-                    Some(8)
-                } else if trimmed.starts_with("lw ") || trimmed.starts_with("lwu ") {
-                    Some(4)
-                } else if trimmed.starts_with("lh ") || trimmed.starts_with("lhu ") {
-                    Some(2)
-                } else if trimmed.starts_with("lb ") || trimmed.starts_with("lbu ") {
-                    Some(1)
-                } else {
-                    None
+                if !trimmed.contains("(s0)") {
+                    continue;
+                }
+                let load_size = match trimmed.split_whitespace().next().unwrap_or("") {
+                    "ld" | "fld" => Some(8),
+                    "lw" | "lwu" | "flw" => Some(4),
+                    "lh" | "lhu" | "flh" => Some(2),
+                    "lb" | "lbu" => Some(1),
+                    "flq" => Some(16),
+                    // A store writes the slot; it keeps no other store alive.
+                    "sd" | "sw" | "sh" | "sb" | "fsd" | "fsw" | "fsh" | "fsq" => None,
+                    // An atomic, a vector access or anything else unsized:
+                    // keep every store.
+                    _ => return false,
                 };
                 if let Some(sz) = load_size {
-                    if trimmed.contains("(s0)") {
-                        if let Some(off) = extract_s0_offset_from_line(trimmed) {
-                            loaded_ranges.push((off, sz));
-                        }
+                    match extract_s0_offset_from_line(trimmed) {
+                        Some(off) => loaded_ranges.push((off, sz)),
+                        None => return false,
                     }
                 }
             }
@@ -3111,7 +3167,14 @@ mod tests {
 
     #[test]
     fn test_adjacent_store_load_elimination() {
+        // The reload is forwarded from the store.  Nothing reads the slot
+        // afterwards, so the global dead-store census may drop the store too.
         let input = "    sd t0, -24(s0)\n    ld t0, -24(s0)\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("ld t0, -24(s0)"));
+        // Once the slot's address reaches a callee, the store must stay.
+        let input =
+            "    sd t0, -24(s0)\n    ld t0, -24(s0)\n    addi a0, s0, -24\n    call g\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("sd t0, -24(s0)"));
         assert!(!result.contains("ld t0, -24(s0)"));
@@ -3141,11 +3204,15 @@ mod tests {
 
     #[test]
     fn test_gsf_same_reg_elimination() {
-        // Store t0 then load t0 from same slot (non-adjacent) — load is dead
+        // Store t0 then load t0 from same slot (non-adjacent) — load is dead.
+        // The slot's address escapes to a callee afterwards, so the store
+        // itself must survive the dead-store census.
         let input = "\
     sd t0, -24(s0)\n\
     addi t1, t1, 4\n\
     ld t0, -24(s0)\n\
+    addi a0, s0, -24\n\
+    call g\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(result.contains("sd t0, -24(s0)"));
@@ -3872,5 +3939,55 @@ mod inline_asm_and_return_tests {
                 "{keep} -> {out}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_store_census_tests {
+    use super::peephole_optimize;
+
+    fn code_lines(asm: &str) -> Vec<String> {
+        asm.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// The global dead-store census counts every reader of a frame slot.
+    /// An FP load is a reader: a `__complex__ float` result staged through
+    /// an integer register (gcc.c-torture execute/pr38969.c) lost the `sd`
+    /// before the `flw` at -O2.
+    #[test]
+    fn a_slot_read_only_by_an_fp_load_keeps_its_store() {
+        for (load, width) in [("flw fa1", 4), ("fld fa1", 8), ("flh fa1", 2)] {
+            let asm = format!(
+                "f:\n    ld t0, -64(s0)\n    sd t0, -72(s0)\n    {load}, -72(s0)\n    ret\n"
+            );
+            let out = code_lines(&peephole_optimize(asm.clone()));
+            assert!(
+                out.iter().any(|l| l == "sd t0, -72(s0)"),
+                "{width}-byte FP reader lost its store:\n{asm} -> {out:?}"
+            );
+        }
+    }
+
+    /// A slot named by an instruction the census cannot size (an atomic, a
+    /// vector access) keeps every store in the unit.
+    #[test]
+    fn an_unsized_frame_access_disables_the_census() {
+        let asm =
+            "f:\n    li t0, 5\n    sd t0, -24(s0)\n    lr.d t1, (s0)\n    mv a0, t1\n    ret\n";
+        let out = code_lines(&peephole_optimize(asm.to_string()));
+        assert!(out.iter().any(|l| l == "sd t0, -24(s0)"), "{out:?}");
+    }
+
+    /// The census still deletes a store nothing reads, FP loads of other
+    /// slots notwithstanding.
+    #[test]
+    fn a_store_no_load_reaches_is_still_deleted() {
+        let asm = "f:\n    li t0, 5\n    sd t0, -24(s0)\n    flw fa0, -40(s0)\n    ret\n";
+        let out = code_lines(&peephole_optimize(asm.to_string()));
+        assert!(!out.iter().any(|l| l == "sd t0, -24(s0)"), "{out:?}");
+        assert!(out.iter().any(|l| l == "flw fa0, -40(s0)"), "{out:?}");
     }
 }

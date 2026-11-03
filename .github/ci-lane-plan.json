@@ -348,7 +348,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 526.33,
+      "predicted_gate_seconds": 526.54,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -739,6 +739,10 @@
         {
           "measured_s": 1.21,
           "name": "python3 tests/regression/check_dwarf_line_tables.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --gcc gcc-16"
+        },
+        {
+          "measured_s": 0.21,
+          "name": "python3 tests/regression/check_dwarf_decl_positions.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --lccc-arm target/fastbuild/lccc-arm --lccc-riscv target/fastbuild/lccc-riscv"
         },
         {
           "measured_s": 5.71,
