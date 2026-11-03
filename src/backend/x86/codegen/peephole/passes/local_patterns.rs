@@ -1062,10 +1062,7 @@ fn match_highbit_sub(t: &[String; 5]) -> Option<HighbitSubRewrite> {
                 format!("    bsrq {s}, {d64}"),
             )
         } else {
-            (
-                format!("    movl $-1, {d}"),
-                format!("    bsrl {s}, {d}"),
-            )
+            (format!("    movl $-1, {d}"), format!("    bsrl {s}, {d}"))
         };
         // One instruction carries both the addend and the move out of `D`;
         // with no addend that degrades to a plain move.
@@ -1243,7 +1240,11 @@ mod highbit_sub_tests {
         // still refused (the preload would have to reach R before the scan).
         let mut wrong_src = HB32;
         wrong_src[4] = "subl %esi, %edx";
-        assert!(run(&body(&wrong_src)).iter().any(|l| l == "subl %esi, %edx"));
+        assert!(
+            run(&body(&wrong_src))
+                .iter()
+                .any(|l| l == "subl %esi, %edx")
+        );
         // A preload other than 2W-1 is not the zero-defined count.
         let mut wrong = HB32;
         wrong[0] = "movl $32, %esi";
