@@ -16,6 +16,19 @@ use crate::backend::x86::assembler::encoder::{
 };
 use crate::backend::x86::assembler::parser::*;
 
+/// A short-only branch ends in opcode and rel8, after any legacy prefixes.
+fn is_short_only_encoding(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 || !matches!(bytes[bytes.len() - 2], 0xe2 | 0xe3) {
+        return false;
+    }
+    bytes[..bytes.len() - 2].iter().all(|b| {
+        matches!(
+            b,
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+        )
+    })
+}
+
 /// i686 architecture implementation for the shared ELF writer.
 pub struct I686Arch;
 
@@ -42,11 +55,7 @@ impl X86Arch for I686Arch {
                 if let Operand::Label(_) = &instr.operands[0] {
                     let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
                     let is_conditional = mnem != "jmp";
-                    // A leading 0x67 (the `addr16` word splice or a 16-bit
-                    // counter spelling) puts the displacement at +2 instead
-                    // of +1; the short-only form is still exactly 3 bytes.
-                    let has_67_head = instr_len == 3 && encoder.bytes[0] == 0x67;
-                    if is_short_only && (instr_len == 2 || (instr_len == 3 && has_67_head)) {
+                    if is_short_only && is_short_only_encoding(&encoder.bytes) {
                         // Short-only jumps have no long form; register as already relaxed
                         Some(JumpDetection {
                             is_conditional: true,
@@ -338,12 +347,11 @@ fn code16_encode_inner(
             if let Operand::Label(_) = &instr.operands[0] {
                 let is_conditional = mnem != "jmp";
                 let is_short_only = matches!(mnem, "jecxz" | "jcxz" | "loop");
-                let has_67_head = instr_len == 3 && encoder.bytes[0] == 0x67;
                 // In 16-bit mode a near jump carries a 16-bit
                 // displacement, so the long forms are one byte shorter
                 // than in 32-bit mode.
                 let expected_len = if is_conditional { 4 } else { 3 };
-                if is_short_only && (instr_len == 2 || has_67_head) {
+                if is_short_only && is_short_only_encoding(&encoder.bytes) {
                     Some(JumpDetection {
                         is_conditional,
                         already_short: true,
